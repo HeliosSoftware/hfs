@@ -336,7 +336,8 @@ async fn test_run_view_definition_unsupported_format() {
         .json(&request_body)
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    // Spec: unsupported `_format` → 400 Bad Request + OperationOutcome.
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
 
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");

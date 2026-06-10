@@ -73,9 +73,11 @@ impl std::error::Error for ServerError {}
 impl From<SofError> for ServerError {
     fn from(err: SofError) -> Self {
         match &err {
-            SofError::UnsupportedContentType(_) => {
-                ServerError::UnsupportedMediaType(err.to_string())
-            }
+            // Spec (operations-common, Output Formats): an unsupported
+            // `_format` value SHALL be rejected with 400 Bad Request +
+            // OperationOutcome — 415 is reserved for transport-level
+            // Content-Type/Content-Encoding problems.
+            SofError::UnsupportedContentType(_) => ServerError::BadRequest(err.to_string()),
             SofError::InvalidSource(_)
             | SofError::SourceNotFound(_)
             | SofError::UnsupportedSourceProtocol(_) => ServerError::BadRequest(err.to_string()),

@@ -803,6 +803,14 @@ mod sof_export_tests {
             .add_header(X_TENANT_ID, "test-tenant")
             .await;
         assert_eq!(dl.status_code(), StatusCode::OK);
+        // The shard is a JSON array, so it must be served as
+        // `application/json` — not the ndjson fallthrough.
+        assert_eq!(
+            dl.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
         let body = dl.text();
         assert!(
             body.trim_start().starts_with('['),

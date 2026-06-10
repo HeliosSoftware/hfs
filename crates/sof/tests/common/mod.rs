@@ -449,17 +449,12 @@ async fn run_view_definition_handler(
     // (overly-strict) production behavior; aligned to the new lenient
     // rule per audit item #14.
 
+    // Per spec (operations-common, Output Formats): an unsupported
+    // `_format` value → 400 Bad Request + OperationOutcome (mirrors the
+    // production mapping of SofError::UnsupportedContentType).
     let content_type = match parse_content_type(accept, format, header_param) {
         Ok(ct) => ct,
-        Err(e) => match e {
-            helios_sof::SofError::UnsupportedContentType(_) => {
-                return error_response(
-                    axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    &e.to_string(),
-                );
-            }
-            _ => return error_response(axum::http::StatusCode::BAD_REQUEST, &e.to_string()),
-        },
+        Err(e) => return error_response(axum::http::StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
     // Create ViewDefinition and Bundle

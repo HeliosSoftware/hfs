@@ -157,8 +157,9 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         shards = completed_files.len(),
                         "export job completed"
                     );
-                    jobs.insert(
-                        jid,
+                    set_status_if_running(
+                        &jobs,
+                        &jid,
                         JobStatus::Completed {
                             files: completed_files,
                             submitted_at,
@@ -170,8 +171,9 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                 }
                 Err(message) => {
                     warn!(job_id = %jid, error = %message, "export job failed");
-                    jobs.insert(
-                        jid,
+                    set_status_if_running(
+                        &jobs,
+                        &jid,
                         JobStatus::Failed {
                             message,
                             submitted_at,
@@ -236,8 +238,23 @@ fn ext_for(format: &str) -> &'static str {
     }
 }
 
+/// Transitions `jid` to `status` only if the job is still `Running`.
+///
+/// A job cancelled mid-run keeps its `Cancelled` state: the spec requires
+/// status polls after a DELETE to return 404, so a background task that
+/// finishes anyway must not resurrect the job to Completed/Failed.
+fn set_status_if_running(jobs: &DashMap<String, JobStatus>, jid: &str, status: JobStatus) {
+    if let Some(mut entry) = jobs.get_mut(jid) {
+        if matches!(&*entry, JobStatus::Running { .. }) {
+            *entry = status;
+        }
+    }
+}
+
 /// Records job progress, capped at 99 while running so callers don't see
 /// "100%" until the manifest is actually available from the status poll.
+/// A job that is no longer `Running` (e.g. cancelled mid-run) is left
+/// untouched — see [`set_status_if_running`].
 fn record_progress(
     jobs: &DashMap<String, JobStatus>,
     jid: &str,
@@ -246,8 +263,9 @@ fn record_progress(
     total: u32,
 ) {
     let percent = ((done * 100) / total.max(1)).min(99) as u8;
-    jobs.insert(
-        jid.to_string(),
+    set_status_if_running(
+        jobs,
+        jid,
         JobStatus::Running {
             percent,
             submitted_at,
@@ -645,6 +663,89 @@ fn csv_cell(v: &serde_json::Value) -> String {
         other => {
             let s = other.to_string();
             format!("\"{}\"", s.replace('"', "\"\""))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::export::sink::InMemorySink;
+    use async_trait::async_trait;
+    use helios_persistence::core::sof_runner::{RowStream, SofError, ViewFilters};
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use tokio::sync::Notify;
+
+    /// A `SofRunner` that blocks until `release` is notified, then yields an
+    /// empty row stream. Lets a test hold a job in the Running state for as
+    /// long as it needs.
+    struct BlockingRunner {
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SofRunner for BlockingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            self.release.notified().await;
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "blocking-test-runner"
+        }
+    }
+
+    /// Spec (#363): status polls after a DELETE return 404, so a job
+    /// cancelled while running must stay Cancelled — the background task
+    /// finishing later must not overwrite the state with Completed.
+    #[tokio::test]
+    async fn cancelled_job_is_not_resurrected_by_late_completion() {
+        let release = Arc::new(Notify::new());
+        let runner = Arc::new(BlockingRunner {
+            release: Arc::clone(&release),
+        });
+        let controller =
+            InMemoryController::new(runner, InMemorySink::new("http://localhost"), None);
+
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork::Views(vec![NamedView {
+                name: "patients".to_string(),
+                view: serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }),
+            }]),
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+
+        // The runner is blocked, so the job is still Running — cancel it.
+        assert!(controller.cancel("t1", &job_id));
+        assert!(matches!(
+            controller.get_status("t1", &job_id),
+            Some(JobStatus::Cancelled)
+        ));
+
+        // Unblock the background task and give it time to run to completion.
+        // The Cancelled state must survive.
+        release.notify_one();
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            match controller.get_status("t1", &job_id) {
+                Some(JobStatus::Cancelled) => {}
+                other => panic!("cancelled job must stay Cancelled, got {other:?}"),
+            }
         }
     }
 }

@@ -520,6 +520,38 @@ mod tests {
         assert_eq!(json["service"], "sof-server");
     }
 
+    // ── Unsupported `_format` ─────────────────────────────────────────────
+
+    /// Spec (operations-common, Output Formats): an unsupported `_format`
+    /// value SHALL be rejected with 400 Bad Request + OperationOutcome —
+    /// for the body parameter as well as the query parameter. (The stub
+    /// suite in `tests/` used to entrench 415 for the body path.)
+    #[tokio::test]
+    async fn test_unsupported_body_format_returns_400() {
+        let server = TestServer::new(create_app()).unwrap();
+
+        let mut body = run_request_body();
+        body["parameter"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "_format", "valueCode": "text/plain"}));
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .json(&body)
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "unsupported body _format must be 400, got {}: {}",
+            response.status_code(),
+            response.text()
+        );
+        let json: serde_json::Value = response.json();
+        assert_eq!(json["resourceType"], "OperationOutcome");
+    }
+
     // ── HTTP compression ──────────────────────────────────────────────────
 
     /// A minimal valid `$viewdefinition-run` Parameters body.

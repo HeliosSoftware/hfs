@@ -583,7 +583,11 @@ pub struct ServerConfig {
     pub export_s3_region: Option<String>,
 
     /// Pre-signed URL TTL (seconds) for S3 export sink.
-    #[arg(long, env = "HFS_EXPORT_PRESIGN_TTL_SECS", default_value = "3600")]
+    ///
+    /// Defaults to 24 hours: the SQL-on-FHIR spec requires `output.location`
+    /// download URLs to remain valid for at least 24 hours after export
+    /// completion (matching the `Expires` header on the completion poll).
+    #[arg(long, env = "HFS_EXPORT_PRESIGN_TTL_SECS", default_value = "86400")]
     pub export_presign_ttl_secs: u64,
 
     /// Maximum concurrent export jobs.
@@ -682,7 +686,7 @@ impl Default for ServerConfig {
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
             export_s3_region: None,
-            export_presign_ttl_secs: 3600,
+            export_presign_ttl_secs: 86_400,
             export_max_concurrency: 4,
             export_shard_rows: 500_000,
             export_controller: "memory".to_string(),
@@ -793,7 +797,7 @@ impl ServerConfig {
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
             export_s3_region: None,
-            export_presign_ttl_secs: 3600,
+            export_presign_ttl_secs: 86_400,
             export_max_concurrency: 4,
             export_shard_rows: 500_000,
             export_controller: "memory".to_string(),

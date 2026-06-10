@@ -1285,6 +1285,9 @@ where
                 "application/vnd.apache.parquet"
             } else if filename.ends_with(".fhir.ndjson") {
                 "application/fhir+ndjson"
+            } else if filename.ends_with(".json") {
+                // `_format=json` shards hold a single JSON array of rows.
+                "application/json"
             } else {
                 "application/x-ndjson"
             };
