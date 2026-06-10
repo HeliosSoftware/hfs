@@ -31,6 +31,11 @@ pub(crate) fn collect_multi(pairs: &[(String, String)], key: &str) -> Vec<String
         .collect()
 }
 
+/// Returns the first value for `key`, if any.
+pub(crate) fn first_value(pairs: &[(String, String)], key: &str) -> Option<String> {
+    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
 /// Returns the last value for `key`, if any.
 ///
 /// Use for genuinely single-valued control params (`_format`, `_count`,
