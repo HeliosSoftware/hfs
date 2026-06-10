@@ -82,7 +82,7 @@ Options:
 | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
 | `DATABASE_URL` | fhir.db | Database connection string |
 | `HFS_DATA_DIR` | ./data | Path to FHIR data directory (search parameters) |
-| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_ENABLE_CORS` | true | Enable CORS |
 | `HFS_CORS_ORIGINS` | * | Allowed CORS origins |

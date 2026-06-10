@@ -158,7 +158,7 @@ No command-line flags. All configuration is via environment variables.
 | `SOF_SERVER_PORT` | `8080` | Port to listen on |
 | `SOF_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `SOF_LOG_LEVEL` | `info` | Log level |
-| `SOF_MAX_BODY_SIZE` | `10485760` | Max request body (bytes) |
+| `SOF_MAX_BODY_SIZE` | `10485760` | Max request body (bytes; applies to the decompressed body for compressed requests) |
 | `SOF_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `SOF_ENABLE_CORS` | `true` | Enable CORS |
 | `SOF_CORS_ORIGINS` | `*` | Allowed CORS origins |

@@ -216,10 +216,21 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 #### Limits
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | 20 | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | 1000 | Maximum search result page size |
+
+#### HTTP compression
+
+All three HTTP servers (`hfs`, `sof-server`, `hts`) accept request bodies sent
+with `Content-Encoding: gzip` (also `deflate`, `br`, `zstd`); unsupported
+encodings are rejected with `415`. Responses are compressed when the client
+sends `Accept-Encoding` (with `Content-Encoding` and `Vary: Accept-Encoding`
+set). SOF never re-compresses `application/parquet` / `application/zip`
+output. Body-size limits (`HFS_MAX_BODY_SIZE`, `SOF_MAX_BODY_SIZE`,
+`HTS_MAX_BODY_SIZE`) are enforced on the *decompressed* body, so highly
+compressed payloads cannot bypass them.
 
 #### CORS
 | Variable | Default | Description |
@@ -373,7 +384,7 @@ FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 cargo run --bin fhirpath-
 | `SOF_SERVER_PORT` | 8080 | Server port |
 | `SOF_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `SOF_LOG_LEVEL` | info | Log level |
-| `SOF_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+| `SOF_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `SOF_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `SOF_ENABLE_CORS` | true | Enable CORS |
 | `SOF_CORS_ORIGINS` | * | Allowed origins |
@@ -524,6 +535,7 @@ HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
 | `HTS_DATABASE_URL` | ./data/hts.db | Database location — SQLite file path, or `postgresql://user:pass@host/db` for Postgres |
 | `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` default; `postgres` when built with `--features postgres`) |
 | `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files imported on startup. The Docker image sets this to `/app/terminology-data`. See bootstrap sync below. |
+| `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
 
