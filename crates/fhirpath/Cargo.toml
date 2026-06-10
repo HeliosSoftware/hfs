@@ -43,7 +43,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8" }
 tower = { version = "0.5" }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-full", "decompression-full"] }
 http = { version = "1.0" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -53,6 +53,7 @@ axum-test = "18.0"
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 futures = "0.3"
+flate2 = "1" # gzip/deflate test payloads for HTTP compression tests
 
 [[bin]]
 name = "fhirpath-cli"
