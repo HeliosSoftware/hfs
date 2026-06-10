@@ -52,7 +52,7 @@ async-trait = "0.1"
 # Web framework
 axum = { version = "0.8", features = ["json", "query", "matched-path", "ws"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "compression-full", "decompression-full"] }
 http = "1.0"
 mime = "0.3"
 
@@ -85,6 +85,9 @@ reqwest = { version = "0.12", features = ["json"] }
 [dev-dependencies]
 # HTTP testing
 axum-test = "18.0"
+
+# gzip test payloads for HTTP compression tests
+flate2 = "1"
 
 # Temp files
 tempfile = "3"

@@ -57,6 +57,8 @@ impl FhirResource {
 pub enum FhirResourceRejection {
     /// JSON parsing failed.
     InvalidJson(String),
+    /// Request body exceeds the configured size limit.
+    PayloadTooLarge(String),
     /// Missing resourceType field.
     MissingResourceType,
     /// Unsupported content type.
@@ -71,6 +73,9 @@ impl IntoResponse for FhirResourceRejection {
             FhirResourceRejection::InvalidJson(msg) => RestError::BadRequest {
                 message: format!("Invalid JSON: {}", msg),
             },
+            FhirResourceRejection::PayloadTooLarge(msg) => {
+                RestError::PayloadTooLarge { message: msg }
+            }
             FhirResourceRejection::MissingResourceType => RestError::BadRequest {
                 message: "Resource must contain resourceType".to_string(),
             },
@@ -100,10 +105,15 @@ where
             .unwrap_or("application/json")
             .to_string();
 
-        // Extract body bytes
-        let bytes = Bytes::from_request(req, state)
-            .await
-            .map_err(|e| FhirResourceRejection::InvalidJson(e.to_string()))?;
+        // Extract body bytes. A length-limit rejection must keep its 413
+        // status instead of collapsing into a generic 400 "invalid JSON".
+        let bytes = Bytes::from_request(req, state).await.map_err(|e| {
+            if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+                FhirResourceRejection::PayloadTooLarge(e.body_text())
+            } else {
+                FhirResourceRejection::InvalidJson(e.body_text())
+            }
+        })?;
 
         // Parse body based on content type
         let value: Value = if content_type.contains("xml") {

@@ -350,6 +350,8 @@ Options:
       --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
       --enable-cors                Enable CORS [env: HTS_ENABLE_CORS=] [default: true]
       --cors-origins <ORIGINS>     Allowed CORS origins [env: HTS_CORS_ORIGINS=] [default: *]
+      --max-body-size <BYTES>      Maximum request body size in bytes [env: HTS_MAX_BODY_SIZE=]
+                                   [default: 10485760]
       --max-expansion-size <N>     Max codes in a ValueSet expansion [env: HTS_MAX_EXPANSION_SIZE=]
                                    [default: 3500]
   -h, --help                       Print help
@@ -368,7 +370,12 @@ Options:
 | `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` or `postgres`) |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
+| `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
+
+Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
+`zstd`) are decompressed transparently; unsupported encodings are rejected
+with `415`. Responses are compressed when the client sends `Accept-Encoding`.
 
 ## Storage Backends
 
