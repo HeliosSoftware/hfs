@@ -1774,4 +1774,446 @@ mod sof_export_tests {
             "exportId must be unchanged after spurious cancel"
         );
     }
+
+    // =========================================================================
+    // 31. `_format=fhir` on $viewdefinition-export: each output file holds
+    //     newline-delimited Parameters resources, served as
+    //     application/fhir+ndjson (spec PR #365 Common Operation Behavior).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_fhir_format() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        // Typed columns so the Parameters parts carry the right value[x].
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{
+                "column": [
+                    {"path": "id", "name": "patient_id", "type": "string"},
+                    {"path": "name.family", "name": "family", "type": "string"},
+                    {"path": "active", "name": "active", "type": "boolean"}
+                ]
+            }]
+        });
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export?_format=fhir")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&view)
+            .await;
+        assert_eq!(
+            submit_resp.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit_resp.text()
+        );
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let params = manifest["parameter"].as_array().unwrap();
+        // Manifest echoes the requested format.
+        let fmt = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("_format"))
+            .and_then(|p| p["valueCode"].as_str());
+        assert_eq!(fmt, Some("fhir"));
+
+        let file_url = params
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("output"))
+            .flat_map(|p| p["part"].as_array().unwrap().iter())
+            .find(|part| part["name"].as_str() == Some("location"))
+            .and_then(|part| part["valueUri"].as_str())
+            .expect("manifest must carry a download location")
+            .to_string();
+        assert!(
+            file_url.ends_with(".fhir.ndjson"),
+            "fhir export files use the .fhir.ndjson extension: {file_url}"
+        );
+
+        let path = file_url.strip_prefix("http://localhost").unwrap();
+        let download = server
+            .get(path)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(download.status_code(), StatusCode::OK);
+        let ct = download
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            ct, "application/fhir+ndjson",
+            "fhir export files are served as application/fhir+ndjson"
+        );
+
+        let body = download.text();
+        let lines: Vec<Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each line must be valid JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2, "one Parameters per row: {body}");
+        for line in &lines {
+            assert_eq!(line["resourceType"], json!("Parameters"));
+            let parts = line["parameter"].as_array().unwrap();
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| p["name"] == json!("family") && p["valueString"].is_string()),
+                "row must carry a typed family parameter: {line}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // 32. $sqlquery-export: kick-off → poll (200 + manifest) → download.
+    // =========================================================================
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+
+    const LIB_TYPE_SYSTEM: &str = "https://sql-on-fhir.org/ig/CodeSystem/LibraryTypesCodes";
+
+    /// Seeds a ViewDefinition flattening Patient to (patient_id, family,
+    /// active) and returns the relative reference used in
+    /// `relatedArtifact.resource`.
+    async fn seed_patient_flat_view(backend: &SqliteBackend) -> String {
+        let vd = json!({
+            "resourceType": "ViewDefinition",
+            "id": "patient-flat",
+            "url": "http://example.org/sof/ViewDefinition/patient-flat",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{
+                "column": [
+                    {"path": "id", "name": "patient_id", "type": "string"},
+                    {"path": "name.family", "name": "family", "type": "string"},
+                    {"path": "active", "name": "active", "type": "boolean"}
+                ]
+            }]
+        });
+        backend
+            .create_or_update(
+                &test_tenant(),
+                "ViewDefinition",
+                "patient-flat",
+                vd,
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed view definition");
+        "ViewDefinition/patient-flat".to_string()
+    }
+
+    fn sql_library(sql: &str, depends_on_ref: &str, label: &str) -> Value {
+        json!({
+            "resourceType": "Library",
+            "id": "demo-lib",
+            "name": "PatientFamilies",
+            "status": "active",
+            "type": {"coding": [{"system": LIB_TYPE_SYSTEM, "code": "sql-query"}]},
+            "content": [{"contentType": "application/sql", "data": B64.encode(sql.as_bytes())}],
+            "relatedArtifact": [{
+                "type": "depends-on",
+                "label": label,
+                "resource": depends_on_ref
+            }]
+        })
+    }
+
+    fn sqlquery_export_body(library: Value, name: Option<&str>) -> Value {
+        let mut parts = vec![json!({"name": "queryResource", "resource": library})];
+        if let Some(n) = name {
+            parts.insert(0, json!({"name": "name", "valueString": n}));
+        }
+        json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "query", "part": parts}]
+        })
+    }
+
+    #[tokio::test]
+    async fn test_sqlquery_export_happy_path_ndjson() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let vd_ref = seed_patient_flat_view(&backend).await;
+
+        let library = sql_library(
+            "SELECT patient_id, family FROM pt WHERE active = 1 ORDER BY family",
+            &vd_ref,
+            "pt",
+        );
+        let body = sqlquery_export_body(library, Some("families"));
+
+        let submit_resp = server
+            .post("/$sqlquery-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(
+            submit_resp.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit_resp.text()
+        );
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let params = manifest["parameter"].as_array().unwrap();
+
+        // Output entry carries the query name from the kick-off.
+        let output = params
+            .iter()
+            .find(|p| p["name"].as_str() == Some("output"))
+            .expect("manifest must have an output entry");
+        let output_parts = output["part"].as_array().unwrap();
+        let out_name = output_parts
+            .iter()
+            .find(|p| p["name"].as_str() == Some("name"))
+            .and_then(|p| p["valueString"].as_str());
+        assert_eq!(out_name, Some("families"));
+
+        let file_url = output_parts
+            .iter()
+            .find(|p| p["name"].as_str() == Some("location"))
+            .and_then(|p| p["valueUri"].as_str())
+            .expect("output must carry a location")
+            .to_string();
+        let path = file_url.strip_prefix("http://localhost").unwrap();
+        let download = server
+            .get(path)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(download.status_code(), StatusCode::OK);
+
+        let rows: Vec<Value> = download
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // ORDER BY family → Jones before Smith.
+        assert_eq!(rows[0]["family"], json!("Jones"));
+        assert_eq!(rows[1]["family"], json!("Smith"));
+    }
+
+    #[tokio::test]
+    async fn test_sqlquery_export_fhir_format() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let vd_ref = seed_patient_flat_view(&backend).await;
+
+        let library = sql_library(
+            "SELECT patient_id, family, active FROM pt ORDER BY patient_id",
+            &vd_ref,
+            "pt",
+        );
+        let body = sqlquery_export_body(library, None);
+
+        let submit_resp = server
+            .post("/$sqlquery-export?_format=fhir")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(
+            submit_resp.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit_resp.text()
+        );
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let params = manifest["parameter"].as_array().unwrap();
+        // No `name` part supplied → falls back to Library.name.
+        let out_name = params
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("output"))
+            .flat_map(|p| p["part"].as_array().unwrap().iter())
+            .find(|p| p["name"].as_str() == Some("name"))
+            .and_then(|p| p["valueString"].as_str());
+        assert_eq!(out_name, Some("PatientFamilies"));
+
+        let file_url = params
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("output"))
+            .flat_map(|p| p["part"].as_array().unwrap().iter())
+            .find(|p| p["name"].as_str() == Some("location"))
+            .and_then(|p| p["valueUri"].as_str())
+            .unwrap()
+            .to_string();
+        assert!(file_url.ends_with(".fhir.ndjson"), "{file_url}");
+
+        let path = file_url.strip_prefix("http://localhost").unwrap();
+        let download = server
+            .get(path)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(download.status_code(), StatusCode::OK);
+        let ct = download
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/fhir+ndjson");
+
+        let lines: Vec<Value> = download
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert_eq!(line["resourceType"], json!("Parameters"));
+            let parts = line["parameter"].as_array().unwrap();
+            // `active` came from a boolean-typed VD column → valueBoolean.
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| p["name"] == json!("active") && p["valueBoolean"] == json!(true)),
+                "active must be a typed boolean parameter: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sqlquery_export_instance_level() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let vd_ref = seed_patient_flat_view(&backend).await;
+
+        // Seed the Library so the instance route can read it by id.
+        let library = sql_library("SELECT family FROM pt", &vd_ref, "pt");
+        backend
+            .create_or_update(
+                &test_tenant(),
+                "Library",
+                "demo-lib",
+                library,
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed library");
+
+        let submit_resp = server
+            .post("/Library/demo-lib/$sqlquery-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            submit_resp.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit_resp.text()
+        );
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
+        let status = manifest["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some("status"))
+            .and_then(|p| p["valueCode"].as_str());
+        assert_eq!(status, Some("completed"));
+    }
+
+    #[tokio::test]
+    async fn test_sqlquery_export_missing_query_returns_422() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let resp = server
+            .post("/$sqlquery-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&json!({"resourceType": "Parameters", "parameter": []}))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            resp.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sqlquery_export_missing_prefer_returns_400() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let resp = server
+            .post("/$sqlquery-export")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&json!({"resourceType": "Parameters", "parameter": []}))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_sqlquery_export_unknown_library_reference_404() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "query", "part": [
+                {"name": "queryReference",
+                 "valueReference": {"reference": "Library/does-not-exist"}}
+            ]}]
+        });
+        let resp = server
+            .post("/$sqlquery-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND, "{}", resp.text());
+    }
+
+    #[tokio::test]
+    async fn test_sqlquery_export_rejects_non_select_sql() {
+        let (server, backend) = create_test_server_with_export().await;
+        let vd_ref = seed_patient_flat_view(&backend).await;
+        let library = sql_library("DELETE FROM pt", &vd_ref, "pt");
+        let resp = server
+            .post("/$sqlquery-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&sqlquery_export_body(library, None))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "non-SELECT SQL must be rejected at kick-off: {}",
+            resp.text()
+        );
+    }
 }

@@ -1,14 +1,21 @@
-//! `$viewdefinition-export` operation handler.
+//! `$viewdefinition-export` and `$sqlquery-export` operation handlers.
 //!
-//! Implements the SQL-on-FHIR async bulk export operation:
+//! Implements the SQL-on-FHIR async bulk export operations:
 //!
 //! | Route | Method | Description |
 //! |-------|--------|-------------|
-//! | `/ViewDefinition/$viewdefinition-export` | POST | Submit an export job |
+//! | `/$viewdefinition-export`, `/ViewDefinition/$viewdefinition-export` | POST | Submit a view export job |
 //! | `/ViewDefinition/{id}/$viewdefinition-export` | POST | Submit for stored view |
+//! | `/$sqlquery-export`, `/Library/$sqlquery-export` | POST | Submit a SQL query export job |
+//! | `/Library/{id}/$sqlquery-export` | POST | Submit for stored Library |
 //! | `/export/{job-id}/status` | GET | Poll for job status / fetch manifest |
 //! | `/export/{job-id}/status` | DELETE | Cancel job |
 //! | `/export/{job-id}/{filename}` | GET | Download output file |
+//!
+//! Both operations share the status/cancel/download flow and the output
+//! format set (`ndjson` default, `csv`, `json`, `parquet`, `fhir` — the
+//! latter producing newline-delimited `Parameters` files served as
+//! `application/fhir+ndjson`).
 //!
 //! ## Submit response (202)
 //!
@@ -43,8 +50,12 @@ use helios_persistence::types::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::references::resolve_resource_canonical_or_relative;
+use super::sqlquery::{sqlquery_err_to_rest, validate_select_only};
 use crate::error::RestError;
-use crate::export::controller::{ExportTask, JobStatus, NamedView};
+use crate::export::controller::{
+    ExportTask, ExportWork, JobStatus, NamedSqlQuery, NamedView, SqlExportLimits, SqlTableSource,
+};
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
 
@@ -66,8 +77,10 @@ const ALLOWED_BODY_PARAMS: &[&str] = &[
 /// Output formats this server can serialize. The spec binds `_format` to
 /// the extensible `OutputFormatCodes` value set; we reject anything outside
 /// this list with 400 per the spec's "reject unsupported parameters" rule
-/// rather than silently downgrading the output to NDJSON.
-const SUPPORTED_FORMATS: &[&str] = &["ndjson", "csv", "json", "parquet"];
+/// rather than silently downgrading the output to NDJSON. `fhir` exports
+/// each output as a file of newline-delimited `Parameters` resources
+/// (`application/fhir+ndjson`) per the spec's Common Operation Behavior.
+const SUPPORTED_FORMATS: &[&str] = &["ndjson", "csv", "json", "parquet", "fhir"];
 
 /// Query parameters for `$viewdefinition-export`.
 ///
@@ -137,7 +150,9 @@ where
     let body_value = body.map(|axum::Json(v)| v);
 
     if let Some(b) = body_value.as_ref() {
-        if let Some(resp) = validate_unknown_body_params(b) {
+        if let Some(resp) =
+            validate_unknown_body_params(b, ALLOWED_BODY_PARAMS, "$viewdefinition-export")
+        {
             return Ok(resp);
         }
     }
@@ -178,7 +193,11 @@ where
     // "system, type" — none are defined at instance level, where the
     // ViewDefinition is identified entirely by the URL path. Reject any
     // attempt to supply them with 400 + OperationOutcome.
-    if let Some(resp) = reject_instance_level_params(raw_query.as_deref(), body.as_ref()) {
+    if let Some(resp) = reject_instance_level_params(
+        raw_query.as_deref(),
+        body.as_ref(),
+        "$viewdefinition-export",
+    ) {
         return Ok(resp);
     }
     // body and query are guaranteed empty of spec params at this point; we
@@ -219,6 +238,392 @@ where
     .await
 }
 
+// ============================================================================
+// Submit: POST /$sqlquery-export and /Library/$sqlquery-export
+// ============================================================================
+
+/// Top-level Parameters body parameter names recognised by
+/// `$sqlquery-export`. Anything outside this list is rejected with 400 per
+/// the spec's "reject unsupported parameters" rule.
+const SQLQUERY_ALLOWED_BODY_PARAMS: &[&str] = &[
+    "query",
+    "view",
+    "_format",
+    "header",
+    "patient",
+    "group",
+    "_since",
+    "clientTrackingId",
+    "source",
+];
+
+/// Submit a `$sqlquery-export` job (system and type level).
+///
+/// Accepts a FHIR `Parameters` resource with one or more `query` parameters
+/// whose `part` entries supply `name`, `queryReference` or `queryResource`,
+/// and optional per-query `parameters` bindings; optional `view` parameters
+/// supply ViewDefinition table sources for the Libraries' `depends-on`
+/// entries (resolved from storage when not supplied inline). Top-level filter
+/// parameters mirror `$viewdefinition-export`.
+pub async fn sqlquery_export_handler<S>(
+    tenant: TenantExtractor,
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    body: Option<axum::Json<Value>>,
+) -> Result<Response, RestError>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    if let Err(resp) = check_prefer_async(&headers) {
+        return Ok(resp);
+    }
+    let params = match parse_export_query(raw_query.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return Ok(resp),
+    };
+    let body_value = body.map(|axum::Json(v)| v);
+
+    if let Some(b) = body_value.as_ref() {
+        if let Some(resp) =
+            validate_unknown_body_params(b, SQLQUERY_ALLOWED_BODY_PARAMS, "$sqlquery-export")
+        {
+            return Ok(resp);
+        }
+    }
+    if let Some(resp) = reject_unsupported_source(&params, body_value.as_ref()) {
+        return Ok(resp);
+    }
+
+    let Some(body) = body_value else {
+        return Ok(missing_query_response());
+    };
+    if body.get("resourceType").and_then(|v| v.as_str()) != Some("Parameters") {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "Expected Parameters, got '{}'",
+                body.get("resourceType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+            ),
+        });
+    }
+
+    let table_sources = extract_table_source_views(&state, &tenant, &body).await?;
+    let queries = extract_sql_queries_from_body(&state, &tenant, &body, &table_sources).await?;
+    if queries.is_empty() {
+        return Ok(missing_query_response());
+    }
+
+    let inputs = merge_export_inputs(&params, Some(&body));
+
+    submit_sqlquery_export_job(&state, &tenant, queries, inputs).await
+}
+
+/// Submit a `$sqlquery-export` job for a stored Library (instance level).
+///
+/// The bound Library identified by the URL path is the query source; per the
+/// spec, every input parameter is scoped to system/type level only, so any
+/// query or body parameter is rejected. `Library.parameter` declarations must
+/// all carry defaults (there is no way to supply bindings at instance level).
+pub async fn sqlquery_export_stored_handler<S>(
+    tenant: TenantExtractor,
+    State(state): State<AppState<S>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    body: Option<axum::Json<Value>>,
+) -> Result<Response, RestError>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    if let Err(resp) = check_prefer_async(&headers) {
+        return Ok(resp);
+    }
+    if let Some(resp) =
+        reject_instance_level_params(raw_query.as_deref(), body.as_ref(), "$sqlquery-export")
+    {
+        return Ok(resp);
+    }
+    drop(body);
+
+    let stored = state
+        .storage()
+        .read(tenant.context(), "Library", &id)
+        .await
+        .map_err(|e| RestError::InternalError {
+            message: format!("failed to read Library: {e}"),
+        })?
+        .ok_or_else(|| RestError::NotFound {
+            resource_type: "Library".to_string(),
+            id: id.clone(),
+        })?;
+    let library_json = stored.content().clone();
+
+    let query = prepare_named_sqlquery(&state, &tenant, None, &library_json, None, &[]).await?;
+
+    let inputs = merge_export_inputs(&ExportQueryParams::default(), None);
+    submit_sqlquery_export_job(&state, &tenant, vec![query], inputs).await
+}
+
+/// 422 response for bodies that don't supply at least one valid query.
+fn missing_query_response() -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        axum::Json(json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "invalid",
+                "diagnostics": "at least one SQLQuery Library is required (use `query.queryResource` or `query.queryReference`)"}]
+        })),
+    )
+        .into_response()
+}
+
+/// A ViewDefinition table source supplied via a body `view` parameter:
+/// optional friendly name plus the resolved ViewDefinition JSON. These are
+/// materialized as tables for the SQL to query against — they do not produce
+/// their own `output` entries.
+struct SuppliedTableView {
+    name: Option<String>,
+    view: Value,
+}
+
+/// Extracts and resolves the body's `view` table-source parameters.
+async fn extract_table_source_views<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    body: &Value,
+) -> Result<Vec<SuppliedTableView>, RestError>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    let entries = body
+        .get("parameter")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out: Vec<SuppliedTableView> = Vec::new();
+    for p in &entries {
+        if p.get("name").and_then(|n| n.as_str()) != Some("view") {
+            continue;
+        }
+        let parts = p.get("part").and_then(|v| v.as_array());
+        let mut name: Option<String> = None;
+        let mut inline: Option<Value> = None;
+        let mut reference: Option<String> = None;
+        if let Some(arr) = parts {
+            for part in arr {
+                match part.get("name").and_then(|v| v.as_str()) {
+                    Some("name") => {
+                        name = part
+                            .get("valueString")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    Some("viewResource") => inline = part.get("resource").cloned(),
+                    Some("viewReference") => {
+                        reference = part
+                            .get("valueReference")
+                            .and_then(|r| r.get("reference"))
+                            .and_then(|v| v.as_str())
+                            .or_else(|| part.get("valueString").and_then(|v| v.as_str()))
+                            .map(|s| s.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let view = match (inline, reference) {
+            (Some(v), _) => v,
+            (None, Some(r)) => {
+                resolve_resource_canonical_or_relative(
+                    state,
+                    tenant.context(),
+                    "ViewDefinition",
+                    &r,
+                )
+                .await?
+            }
+            (None, None) => {
+                return Err(RestError::BadRequest {
+                    message: "each `view` parameter must supply `viewResource` or `viewReference`"
+                        .to_string(),
+                });
+            }
+        };
+        out.push(SuppliedTableView { name, view });
+    }
+    Ok(out)
+}
+
+/// Extracts the body's `query` parameters, resolving Libraries and their
+/// `depends-on` ViewDefinitions and binding `Library.parameter` values, so
+/// the background job has everything it needs without storage access.
+async fn extract_sql_queries_from_body<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    body: &Value,
+    table_sources: &[SuppliedTableView],
+) -> Result<Vec<NamedSqlQuery>, RestError>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    let entries = body
+        .get("parameter")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out: Vec<NamedSqlQuery> = Vec::new();
+    for p in &entries {
+        if p.get("name").and_then(|n| n.as_str()) != Some("query") {
+            continue;
+        }
+        let parts = p.get("part").and_then(|v| v.as_array());
+        let mut name: Option<String> = None;
+        let mut inline: Option<Value> = None;
+        let mut reference: Option<String> = None;
+        let mut bindings_resource: Option<Value> = None;
+        if let Some(arr) = parts {
+            for part in arr {
+                match part.get("name").and_then(|v| v.as_str()) {
+                    Some("name") => {
+                        name = part
+                            .get("valueString")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    Some("queryResource") => inline = part.get("resource").cloned(),
+                    Some("queryReference") => {
+                        reference = part
+                            .get("valueReference")
+                            .and_then(|r| r.get("reference"))
+                            .and_then(|v| v.as_str())
+                            .or_else(|| part.get("valueString").and_then(|v| v.as_str()))
+                            .map(|s| s.to_string());
+                    }
+                    Some("parameters") => bindings_resource = part.get("resource").cloned(),
+                    _ => {}
+                }
+            }
+        }
+        let library_json = match (inline, reference) {
+            (Some(_), Some(_)) => {
+                return Err(RestError::BadRequest {
+                    message: "supply at most one of `queryReference` or `queryResource` per query"
+                        .to_string(),
+                });
+            }
+            (Some(v), None) => v,
+            (None, Some(r)) => {
+                resolve_resource_canonical_or_relative(state, tenant.context(), "Library", &r)
+                    .await?
+            }
+            (None, None) => {
+                return Err(RestError::BadRequest {
+                    message:
+                        "each `query` parameter must supply `queryResource` or `queryReference`"
+                            .to_string(),
+                });
+            }
+        };
+        out.push(
+            prepare_named_sqlquery(
+                state,
+                tenant,
+                name,
+                &library_json,
+                bindings_resource.as_ref(),
+                table_sources,
+            )
+            .await?,
+        );
+    }
+    Ok(out)
+}
+
+/// Parses and validates one SQLQuery Library and packages it as a
+/// [`NamedSqlQuery`]: validates the SQL is a single SELECT, enforces the
+/// depends-on cap, resolves every `depends-on` ViewDefinition (preferring
+/// supplied `view` table sources, matched by canonical `url` or by name
+/// against the depends-on label, then falling back to storage resolution),
+/// and binds `Library.parameter` values.
+async fn prepare_named_sqlquery<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    name_hint: Option<String>,
+    library_json: &Value,
+    supplied_params: Option<&Value>,
+    table_sources: &[SuppliedTableView],
+) -> Result<NamedSqlQuery, RestError>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    let library =
+        helios_sof::sqlquery::parse_sqlquery_library(library_json).map_err(sqlquery_err_to_rest)?;
+
+    let max_vds = state.config().sof_sqlquery_max_vds;
+    if library.depends_on.len() > max_vds {
+        return Err(RestError::UnprocessableEntity {
+            message: format!(
+                "Library declares {} depends-on ViewDefinitions; max allowed is {}",
+                library.depends_on.len(),
+                max_vds
+            ),
+        });
+    }
+
+    validate_select_only(&library.sql)?;
+
+    let mut tables: Vec<SqlTableSource> = Vec::with_capacity(library.depends_on.len());
+    for dep in &library.depends_on {
+        let supplied = table_sources
+            .iter()
+            .find(|t| t.view.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
+            .or_else(|| {
+                table_sources
+                    .iter()
+                    .find(|t| t.name.as_deref() == Some(dep.label.as_str()))
+            });
+        let view = match supplied {
+            Some(t) => t.view.clone(),
+            None => {
+                resolve_resource_canonical_or_relative(
+                    state,
+                    tenant.context(),
+                    "ViewDefinition",
+                    &dep.url,
+                )
+                .await?
+            }
+        };
+        tables.push(SqlTableSource {
+            label: dep.label.clone(),
+            view,
+        });
+    }
+
+    let bindings = helios_sof::sqlquery::bind_supplied_params(&library.parameters, supplied_params)
+        .map_err(sqlquery_err_to_rest)?;
+
+    let name = name_hint
+        .or_else(|| {
+            library_json
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "output".to_string());
+
+    Ok(NamedSqlQuery {
+        name,
+        sql: library.sql,
+        tables,
+        bindings,
+    })
+}
+
 /// Returns `Err(Response)` with 400 + OperationOutcome if the spec-required
 /// `Prefer: respond-async` header is missing. Returns `Ok(())` if present.
 #[allow(clippy::result_large_err)]
@@ -256,6 +661,7 @@ fn check_prefer_async(headers: &HeaderMap) -> Result<(), Response> {
 fn reject_instance_level_params(
     raw_query: Option<&str>,
     body: Option<&axum::Json<Value>>,
+    op: &str,
 ) -> Option<Response> {
     let raw = raw_query.unwrap_or("");
     if let Some((k, _)) = url::form_urlencoded::parse(raw.as_bytes()).next() {
@@ -269,7 +675,7 @@ fn reject_instance_level_params(
                         "code": "not-supported",
                         "diagnostics": format!(
                             "parameter '{k}' is not supported at the instance-level \
-                             $viewdefinition-export endpoint; spec scopes all input \
+                             {op} endpoint; spec scopes all input \
                              parameters to system and type level only"
                         )
                     }]
@@ -299,7 +705,7 @@ fn reject_instance_level_params(
                             "code": "not-supported",
                             "diagnostics": format!(
                                 "body parameter '{name}' is not supported at the \
-                                 instance-level $viewdefinition-export endpoint; spec \
+                                 instance-level {op} endpoint; spec \
                                  scopes all input parameters to system and type level only"
                             )
                         }]
@@ -440,6 +846,97 @@ where
         return Ok(resp);
     }
 
+    dispatch_export_job(state, tenant, ExportWork::Views(views), inputs).await
+}
+
+/// Common submit logic for `$sqlquery-export`: validate, dispatch to the
+/// controller, return 202. Mirrors [`submit_export_job`] with query-specific
+/// checks (the per-query SQL/Library/binding validation happened during
+/// extraction).
+async fn submit_sqlquery_export_job<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    queries: Vec<NamedSqlQuery>,
+    inputs: ExportInputs,
+) -> Result<Response, RestError>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
+    if !SUPPORTED_FORMATS.contains(&inputs.format.as_str()) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "not-supported",
+                    "diagnostics": format!(
+                        "unsupported `_format` value '{}'; supported: {}",
+                        inputs.format,
+                        SUPPORTED_FORMATS.join(", ")
+                    )
+                }]
+            })),
+        )
+            .into_response());
+    }
+
+    // The completion manifest groups files by output name; duplicates would
+    // silently collapse into one `output` entry (same rule as views).
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for q in &queries {
+        if !seen.insert(q.name.as_str()) {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": "invalid",
+                        "diagnostics": format!(
+                            "duplicate query name '{}'; each submitted query must have a unique \
+                             name (set `query.part[name=name].valueString` or `Library.name` \
+                             to disambiguate)",
+                            q.name
+                        )
+                    }]
+                })),
+            )
+                .into_response());
+        }
+    }
+
+    if let Some(resp) = validate_patient_group_refs(state, tenant, &inputs).await? {
+        return Ok(resp);
+    }
+
+    // Execution caps mirror the synchronous `$sqlquery-run` configuration.
+    let limits = SqlExportLimits {
+        max_source_rows_per_vd: state.config().sof_sqlquery_max_source_rows_per_vd,
+        max_rows: state.config().sof_sqlquery_max_rows,
+        timeout_secs: state.config().sof_sqlquery_timeout_secs,
+    };
+
+    dispatch_export_job(
+        state,
+        tenant,
+        ExportWork::SqlQueries { queries, limits },
+        inputs,
+    )
+    .await
+}
+
+/// Shared tail of every export kick-off: require the controller, build the
+/// task, submit, and return the spec's `202 Accepted` kick-off response.
+async fn dispatch_export_job<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    work: ExportWork,
+    inputs: ExportInputs,
+) -> Result<Response, RestError>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
+{
     // Require export controller to be configured
     let controller = match state.export_controller() {
         Some(c) => c,
@@ -458,8 +955,8 @@ where
 
     // Build filters (G4, G5). patient / group multiple values match resources
     // from any of the referenced compartments. Spec defines no `_limit` for
-    // `$viewdefinition-export` (unlike `$viewdefinition-run`); limit stays
-    // unset so exports are bounded only by the underlying data set.
+    // the export operations (unlike the run operations); limit stays unset so
+    // exports are bounded only by the underlying data set.
     let filters = helios_persistence::core::sof_runner::ViewFilters {
         limit: None,
         since: inputs.since,
@@ -468,7 +965,7 @@ where
     };
 
     let task = ExportTask {
-        views,
+        work,
         tenant: tenant.context().clone(),
         filters,
         format: inputs.format.clone(),
@@ -778,11 +1275,16 @@ where
         )
             .into_response()),
         Some(data) => {
-            // Determine Content-Type from extension (G3: include Parquet)
+            // Determine Content-Type from extension (G3: include Parquet).
+            // `.fhir.ndjson` (newline-delimited Parameters resources from
+            // `_format=fhir`) must be checked before the plain ndjson
+            // fallthrough.
             let content_type = if filename.ends_with(".csv") {
                 "text/csv; charset=utf-8"
             } else if filename.ends_with(".parquet") {
                 "application/vnd.apache.parquet"
+            } else if filename.ends_with(".fhir.ndjson") {
+                "application/fhir+ndjson"
             } else {
                 "application/x-ndjson"
             };
@@ -863,11 +1365,11 @@ fn parse_export_query(raw: Option<&str>) -> Result<ExportQueryParams, Response> 
 
 /// Rejects body parameters whose `name` is not in [`ALLOWED_BODY_PARAMS`].
 /// Returns `Some(400 response)` on the first offender.
-fn validate_unknown_body_params(body: &Value) -> Option<Response> {
+fn validate_unknown_body_params(body: &Value, allowed: &[&str], op: &str) -> Option<Response> {
     let entries = body.get("parameter").and_then(|v| v.as_array())?;
     for entry in entries {
         let name = entry.get("name").and_then(|n| n.as_str())?;
-        if !ALLOWED_BODY_PARAMS.contains(&name) {
+        if !allowed.contains(&name) {
             return Some(
                 (
                     StatusCode::BAD_REQUEST,
@@ -877,7 +1379,7 @@ fn validate_unknown_body_params(body: &Value) -> Option<Response> {
                             "severity": "error",
                             "code": "not-supported",
                             "diagnostics": format!(
-                                "unsupported body parameter '{name}' for $viewdefinition-export"
+                                "unsupported body parameter '{name}' for {op}"
                             )
                         }]
                     })),

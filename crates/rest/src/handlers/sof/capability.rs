@@ -15,6 +15,7 @@
 //!     { "name": "supportsViewDefinitionRun",    "valueBoolean": true  },
 //!     { "name": "supportsViewDefinitionExport", "valueBoolean": false },
 //!     { "name": "supportsSqlQueryRun",          "valueBoolean": true  },
+//!     { "name": "supportsSqlQueryExport",       "valueBoolean": false },
 //!     { "name": "supportsInDbRunner",           "valueBoolean": false },
 //!     { "name": "supportsRelativeReference",    "valueBoolean": true  },
 //!     { "name": "supportsCanonicalReference",   "valueBoolean": true  },
@@ -72,6 +73,7 @@ where
         bool_param("supportsViewDefinitionRun", true),
         bool_param("supportsViewDefinitionExport", supports_export),
         bool_param("supportsSqlQueryRun", true),
+        bool_param("supportsSqlQueryExport", supports_export),
         bool_param("supportsInDbRunner", supports_indb),
         // Spec SHALL: document which ViewDefinition reference formats are
         // supported. We support:

@@ -22,17 +22,75 @@ pub struct NamedView {
     pub view: Value,
 }
 
+/// One table source for a SQL query export: a resolved ViewDefinition that is
+/// materialized under `label` for the SQL to query against. Table sources do
+/// not produce their own `output` entries in the manifest.
+#[derive(Debug, Clone)]
+pub struct SqlTableSource {
+    /// Table alias the SQL references (the `relatedArtifact.label`).
+    pub label: String,
+    /// The resolved ViewDefinition JSON.
+    pub view: Value,
+}
+
+/// A single named SQL query to be run as part of a `$sqlquery-export` job.
+///
+/// The kickoff handler resolves the Library and its `depends-on`
+/// ViewDefinitions, validates the SQL, and binds `Library.parameter` values
+/// before submitting, so the background job only materializes and executes.
+#[derive(Debug, Clone)]
+pub struct NamedSqlQuery {
+    /// `query.name` from the spec — drives `output.name` in the manifest.
+    pub name: String,
+    /// The validated (SELECT-only) SQL text from the Library.
+    pub sql: String,
+    /// Resolved table sources, in `relatedArtifact` declaration order.
+    pub tables: Vec<SqlTableSource>,
+    /// Bound `Library.parameter` values for the SQL's `:name` placeholders.
+    pub bindings: Vec<helios_sof::sqlquery::BoundParam>,
+}
+
+/// Execution caps for SQL query export work. Mirrors the `$sqlquery-run`
+/// server configuration so exports and synchronous runs enforce the same
+/// resource limits.
+#[derive(Debug, Clone, Copy)]
+pub struct SqlExportLimits {
+    /// Maximum rows materialized per depends-on ViewDefinition.
+    pub max_source_rows_per_vd: usize,
+    /// Maximum rows returned by the user SQL.
+    pub max_rows: usize,
+    /// SQL execution timeout in seconds.
+    pub timeout_secs: u64,
+}
+
+/// The work an export job performs — one variant per kick-off operation.
+#[derive(Debug, Clone)]
+pub enum ExportWork {
+    /// `$viewdefinition-export`: run each named ViewDefinition. Spec is
+    /// `1..*`; running produces one or more output entries per view in the
+    /// manifest.
+    Views(Vec<NamedView>),
+    /// `$sqlquery-export`: materialize each query's table sources and run
+    /// its SQL. One or more output entries per query in the manifest.
+    SqlQueries {
+        /// The set of (named) queries to run. Spec is `1..*`.
+        queries: Vec<NamedSqlQuery>,
+        /// Execution caps shared by every query in the job.
+        limits: SqlExportLimits,
+    },
+}
+
 /// Input task for a new export job.
 #[derive(Debug, Clone)]
 pub struct ExportTask {
-    /// The set of (named) ViewDefinitions to run. Spec is `1..*`; running
-    /// produces one or more output entries per view in the manifest.
-    pub views: Vec<NamedView>,
+    /// The work to perform (views or SQL queries).
+    pub work: ExportWork,
     /// Tenant that owns this export.
     pub tenant: TenantContext,
-    /// Row filters (limit, patient, etc.).
+    /// Row filters (limit, patient, etc.). For SQL query work these apply to
+    /// the materialized table sources.
     pub filters: ViewFilters,
-    /// Output format: `"ndjson"`, `"csv"`, `"json"`, or `"parquet"`.
+    /// Output format: `"ndjson"`, `"csv"`, `"json"`, `"parquet"`, or `"fhir"`.
     pub format: String,
     /// Whether to include a CSV header row (CSV format only).
     pub header: bool,

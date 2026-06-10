@@ -1,4 +1,5 @@
-//! Export job infrastructure for `$viewdefinition-export`.
+//! Export job infrastructure for `$viewdefinition-export` and
+//! `$sqlquery-export`.
 //!
 //! This module defines:
 //! - [`ExportJobController`] — trait for managing async export jobs
@@ -12,7 +13,10 @@ pub mod in_memory;
 pub mod planner;
 pub mod sink;
 
-pub use controller::{CompletedFile, ExportError, ExportJobController, ExportTask, JobStatus};
+pub use controller::{
+    CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobStatus,
+    NamedSqlQuery, SqlExportLimits, SqlTableSource,
+};
 pub use in_memory::InMemoryController;
 pub use planner::DEFAULT_SHARD_ROWS;
 #[cfg(feature = "s3")]

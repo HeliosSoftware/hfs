@@ -429,6 +429,22 @@ where
             "/Library/{id}/$sqlquery-run",
             post(handlers::sof::sqlquery_run_instance_handler::<S>),
         )
+        // SQL-on-FHIR v2 `$sqlquery-export` — async export of SQL query
+        // results; system, type, and instance levels. Shares the
+        // /export/{job-id}/* status, cancel, and download routes with
+        // `$viewdefinition-export`.
+        .route(
+            "/$sqlquery-export",
+            post(handlers::sof::sqlquery_export_handler::<S>),
+        )
+        .route(
+            "/Library/$sqlquery-export",
+            post(handlers::sof::sqlquery_export_handler::<S>),
+        )
+        .route(
+            "/Library/{id}/$sqlquery-export",
+            post(handlers::sof::sqlquery_export_stored_handler::<S>),
+        )
 }
 
 /// Creates a minimal set of routes for testing.

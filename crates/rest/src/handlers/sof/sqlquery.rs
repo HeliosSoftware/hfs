@@ -380,7 +380,7 @@ fn wants_fhir_binary(format: &str, headers: &HeaderMap) -> bool {
 
 /// Sniff SQL to confirm a single `SELECT`/CTE statement. The spec doesn't
 /// strictly require this but every reference impl rejects DDL/DML here.
-fn validate_select_only(sql: &str) -> Result<(), RestError> {
+pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
     use sqlparser::ast::Statement;
     use sqlparser::dialect::SQLiteDialect;
     use sqlparser::parser::Parser;
@@ -556,7 +556,7 @@ fn build_response(ct: &'static str, body: Vec<u8>) -> Response {
     (StatusCode::OK, [(header::CONTENT_TYPE, ct)], body).into_response()
 }
 
-fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
+pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
     match e {
         SqlQueryError::MalformedLibrary(msg) => RestError::UnprocessableEntity { message: msg },
         SqlQueryError::MissingSql => RestError::UnprocessableEntity {

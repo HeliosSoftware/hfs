@@ -219,7 +219,8 @@ where
 /// Builds the `rest[0].operation` list, including SOF operations.
 ///
 /// `viewdefinition-run` and `sqlquery-run` are always declared when SOF is enabled.
-/// `viewdefinition-export` is declared only when an export controller is wired.
+/// `viewdefinition-export` and `sqlquery-export` are declared only when an
+/// export controller is wired.
 fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
     state: &AppState<S>,
 ) -> Vec<serde_json::Value> {
@@ -246,6 +247,10 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
         ops.push(serde_json::json!({
             "name": "viewdefinition-export",
             "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-export"
+        }));
+        ops.push(serde_json::json!({
+            "name": "sqlquery-export",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-export"
         }));
     }
 
