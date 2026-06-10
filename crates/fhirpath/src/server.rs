@@ -12,6 +12,7 @@
 //! - **Variable Support**: Pass variables to expressions
 //! - **Context Expressions**: Evaluate expressions with context
 //! - **CORS Support**: Configurable cross-origin resource sharing
+//! - **HTTP Compression**: Transparent request decompression and response compression
 //! - **Health Check**: Basic health check endpoint
 //!
 //! ## API Endpoints
@@ -52,6 +53,18 @@
 //! - `FHIRPATH_LOG_LEVEL` / `--log-level`: Log level (default: info)
 //! - `FHIRPATH_ENABLE_CORS` / `--enable-cors`: Enable CORS (default: true)
 //! - `FHIRPATH_CORS_ORIGINS` / `--cors-origins`: Allowed origins (default: *)
+//! - `FHIRPATH_MAX_BODY_SIZE` / `--max-body-size`: Max request body size in
+//!   bytes, measured after decompression (default: 10485760)
+//!
+//! ## HTTP Compression
+//!
+//! Request bodies sent with `Content-Encoding: gzip` (or `deflate`, `br`,
+//! `zstd`) are decompressed transparently before parsing; unsupported
+//! encodings are rejected with `415 Unsupported Media Type`. Responses are
+//! compressed when the client advertises support via `Accept-Encoding`, with
+//! `Content-Encoding` and `Vary: Accept-Encoding` set accordingly. Because the
+//! body-size limit is enforced on the decompressed body, a small
+//! highly-compressed payload cannot bypass `FHIRPATH_MAX_BODY_SIZE`.
 //!
 //! ## Usage Example
 //!
@@ -70,14 +83,22 @@
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use clap::Parser;
 use http::{HeaderValue, Method};
 use std::net::SocketAddr;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+
+/// Default maximum request body size in bytes (10 MiB), measured after
+/// decompression. Mirrors `HFS_MAX_BODY_SIZE` / `SOF_MAX_BODY_SIZE` /
+/// `HTS_MAX_BODY_SIZE`.
+const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 use crate::handlers::{evaluate_fhirpath, health_check};
 
@@ -98,6 +119,8 @@ pub struct ServerConfig {
     pub cors_methods: String,
     /// Allowed CORS headers (comma-separated list, "*" for any)
     pub cors_headers: String,
+    /// Maximum request body size in bytes, measured after decompression
+    pub max_body_size: usize,
     /// Terminology server URL (defaults based on FHIR version)
     pub terminology_server: Option<String>,
 }
@@ -111,8 +134,10 @@ impl Default for ServerConfig {
             enable_cors: true,
             cors_origins: "*".to_string(),
             cors_methods: "GET,POST,OPTIONS".to_string(),
-            cors_headers: "Accept,Accept-Language,Content-Type,Content-Language,Authorization"
-                .to_string(),
+            cors_headers:
+                "Accept,Accept-Language,Content-Type,Content-Language,Authorization,Content-Encoding"
+                    .to_string(),
+            max_body_size: DEFAULT_MAX_BODY_SIZE,
             terminology_server: None,
         }
     }
@@ -124,7 +149,7 @@ impl Default for ServerConfig {
     author,
     version,
     about = "FHIRPath HTTP server",
-    long_about = "HTTP server providing FHIRPath expression evaluation for fhirpath-lab integration\n\nEnvironment variables:\n  FHIRPATH_SERVER_PORT - Server port (default: 3000)\n  FHIRPATH_SERVER_HOST - Server host (default: 127.0.0.1)\n  FHIRPATH_LOG_LEVEL - Log level: error, warn, info, debug, trace (default: info)\n  FHIRPATH_ENABLE_CORS - Enable CORS: true/false (default: true)\n  FHIRPATH_CORS_ORIGINS - Allowed origins (comma-separated, * for any) (default: *)\n  FHIRPATH_CORS_METHODS - Allowed methods (comma-separated, * for any) (default: GET,POST,OPTIONS)\n  FHIRPATH_CORS_HEADERS - Allowed headers (comma-separated, * for any) (default: common headers)\n  FHIRPATH_TERMINOLOGY_SERVER - Terminology server URL (default: version-specific test servers)"
+    long_about = "HTTP server providing FHIRPath expression evaluation for fhirpath-lab integration\n\nEnvironment variables:\n  FHIRPATH_SERVER_PORT - Server port (default: 3000)\n  FHIRPATH_SERVER_HOST - Server host (default: 127.0.0.1)\n  FHIRPATH_LOG_LEVEL - Log level: error, warn, info, debug, trace (default: info)\n  FHIRPATH_ENABLE_CORS - Enable CORS: true/false (default: true)\n  FHIRPATH_CORS_ORIGINS - Allowed origins (comma-separated, * for any) (default: *)\n  FHIRPATH_CORS_METHODS - Allowed methods (comma-separated, * for any) (default: GET,POST,OPTIONS)\n  FHIRPATH_CORS_HEADERS - Allowed headers (comma-separated, * for any) (default: common headers)\n  FHIRPATH_MAX_BODY_SIZE - Max request body size in bytes, measured after decompression (default: 10485760)\n  FHIRPATH_TERMINOLOGY_SERVER - Terminology server URL (default: version-specific test servers)"
 )]
 pub struct ServerArgs {
     /// Port to bind the server to
@@ -169,9 +194,17 @@ pub struct ServerArgs {
     #[arg(
         long,
         env = "FHIRPATH_CORS_HEADERS",
-        default_value = "Accept,Accept-Language,Content-Type,Content-Language,Authorization"
+        default_value = "Accept,Accept-Language,Content-Type,Content-Language,Authorization,Content-Encoding"
     )]
     pub cors_headers: String,
+
+    /// Maximum request body size in bytes, measured after decompression
+    #[arg(
+        long,
+        env = "FHIRPATH_MAX_BODY_SIZE",
+        default_value_t = DEFAULT_MAX_BODY_SIZE
+    )]
+    pub max_body_size: usize,
 
     /// Terminology server URL (defaults based on FHIR version)
     #[arg(long, env = "FHIRPATH_TERMINOLOGY_SERVER")]
@@ -188,6 +221,7 @@ impl From<ServerArgs> for ServerConfig {
             cors_origins: args.cors_origins,
             cors_methods: args.cors_methods,
             cors_headers: args.cors_headers,
+            max_body_size: args.max_body_size,
             terminology_server: args.terminology_server,
         }
     }
@@ -260,10 +294,29 @@ pub fn create_app(config: &ServerConfig) -> Router {
         app = app.route("/r6", post(crate::handlers::evaluate_fhirpath_r6));
     }
 
+    // Transparently decompress request bodies sent with `Content-Encoding`
+    // (gzip, deflate, br, zstd) and compress responses when the client sends
+    // `Accept-Encoding`. Unsupported request encodings get 415. Because the
+    // decompression layer replaces the request body before any extractor or
+    // handler reads it, the body-size limit below applies to the
+    // *decompressed* bytes — a small highly-compressed payload cannot bypass
+    // `FHIRPATH_MAX_BODY_SIZE`. Kept inside the CORS layer so 415/413 error
+    // responses still carry CORS headers for browser clients.
+    app = app
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new());
+
     // Add CORS if enabled
     if config.enable_cors {
         app = app.layer(build_cors_layer(config));
     }
+
+    // Raise the body-size limit from axum's 2 MiB default to the configured
+    // ceiling so `FHIRPATH_MAX_BODY_SIZE` / `--max-body-size` actually takes
+    // effect. Without this, axum's `DefaultBodyLimit` extractor rejects any
+    // request > 2 MiB with 413 before the handler runs. Mirrors the pattern
+    // used in `crates/rest/src/lib.rs` and `crates/sof/src/server.rs`.
+    app = app.layer(DefaultBodyLimit::max(config.max_body_size));
 
     // Add tracing
     app = app.layer(TraceLayer::new_for_http());
@@ -405,8 +458,9 @@ mod tests {
         assert_eq!(config.cors_methods, "GET,POST,OPTIONS");
         assert_eq!(
             config.cors_headers,
-            "Accept,Accept-Language,Content-Type,Content-Language,Authorization"
+            "Accept,Accept-Language,Content-Type,Content-Language,Authorization,Content-Encoding"
         );
+        assert_eq!(config.max_body_size, 10 * 1024 * 1024);
     }
 
     #[test]
@@ -419,6 +473,7 @@ mod tests {
             cors_origins: "http://example.com".to_string(),
             cors_methods: "GET,POST".to_string(),
             cors_headers: "Content-Type".to_string(),
+            max_body_size: 2048,
             terminology_server: None,
         };
 
@@ -430,6 +485,7 @@ mod tests {
         assert_eq!(config.cors_origins, "http://example.com");
         assert_eq!(config.cors_methods, "GET,POST");
         assert_eq!(config.cors_headers, "Content-Type");
+        assert_eq!(config.max_body_size, 2048);
     }
 
     #[tokio::test]
