@@ -329,6 +329,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     let mut global_type_hierarchy = std::collections::HashMap::new();
     let mut all_resources = Vec::new();
     let mut all_complex_types = Vec::new();
+    let mut all_primitive_types = Vec::new();
 
     // First pass: parse all JSON files and collect all StructureDefinitions
     let bundles: Vec<_> = visit_dirs(&version_dir)?
@@ -365,10 +366,13 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         }
 
         // Extract global information
-        if let Some((hierarchy, resources, complex_types)) = extract_bundle_info(bundle) {
+        if let Some((hierarchy, resources, complex_types, primitive_types)) =
+            extract_bundle_info(bundle)
+        {
             global_type_hierarchy.extend(hierarchy);
             all_resources.extend(resources);
             all_complex_types.extend(complex_types);
+            all_primitive_types.extend(primitive_types);
         }
     }
 
@@ -393,6 +397,8 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     all_resources.dedup();
     all_complex_types.sort();
     all_complex_types.dedup();
+    all_primitive_types.sort();
+    all_primitive_types.dedup();
 
     // Load compartment definitions for this version
     let compartment_definitions = load_compartment_definitions(&version_dir);
@@ -403,6 +409,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         &global_type_hierarchy,
         &all_resources,
         &all_complex_types,
+        &all_primitive_types,
         &compartment_definitions,
     )?;
 
@@ -646,6 +653,7 @@ type BundleInfo = (
     std::collections::HashMap<String, String>,
     Vec<String>,
     Vec<String>,
+    Vec<String>,
 );
 
 /// Extracts type hierarchy and resource information from a bundle
@@ -653,6 +661,7 @@ fn extract_bundle_info(bundle: &Bundle) -> Option<BundleInfo> {
     let mut type_hierarchy = std::collections::HashMap::new();
     let mut resources = Vec::new();
     let mut complex_types = Vec::new();
+    let mut primitive_types = Vec::new();
 
     if let Some(entries) = bundle.entry.as_ref() {
         for entry in entries {
@@ -670,6 +679,8 @@ fn extract_bundle_info(bundle: &Bundle) -> Option<BundleInfo> {
                             resources.push(def.name.clone());
                         } else if def.kind == "complex-type" && !def.r#abstract {
                             complex_types.push(def.name.clone());
+                        } else if def.kind == "primitive-type" && !def.r#abstract {
+                            primitive_types.push(def.name.clone());
                         }
                     }
                 }
@@ -677,7 +688,7 @@ fn extract_bundle_info(bundle: &Bundle) -> Option<BundleInfo> {
         }
     }
 
-    Some((type_hierarchy, resources, complex_types))
+    Some((type_hierarchy, resources, complex_types, primitive_types))
 }
 
 /// Generates global constructs (Resource enum, type hierarchy, etc.) once at the end
@@ -686,6 +697,7 @@ fn generate_global_constructs(
     type_hierarchy: &std::collections::HashMap<String, String>,
     all_resources: &[String],
     all_complex_types: &[String],
+    all_primitive_types: &[String],
     compartment_definitions: &[CompartmentDefinition],
 ) -> io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
@@ -760,6 +772,28 @@ fn generate_global_constructs(
         writeln!(file, "        vec![")?;
         for complex_type in all_complex_types {
             writeln!(file, "            \"{}\",", complex_type)?;
+        }
+        writeln!(file, "        ]")?;
+        writeln!(file, "    }}")?;
+        writeln!(file, "}}")?;
+    }
+
+    // Generate PrimitiveTypes struct and FhirPrimitiveTypeProvider implementation
+    if !all_primitive_types.is_empty() {
+        writeln!(file, "\n// --- Primitive Types Provider ---")?;
+        writeln!(file, "/// Marker struct for primitive type information")?;
+        writeln!(file, "pub struct PrimitiveTypes;")?;
+        writeln!(
+            file,
+            "\nimpl crate::FhirPrimitiveTypeProvider for PrimitiveTypes {{"
+        )?;
+        writeln!(
+            file,
+            "    fn get_primitive_type_names() -> Vec<&'static str> {{"
+        )?;
+        writeln!(file, "        vec![")?;
+        for primitive_type in all_primitive_types {
+            writeln!(file, "            \"{}\",", primitive_type)?;
         }
         writeln!(file, "        ]")?;
         writeln!(file, "    }}")?;
@@ -2479,8 +2513,8 @@ fn generate_element_documentation(element: &ElementDefinition) -> String {
                 line.to_string()
             } else {
                 // This should never happen, but if it does, add the prefix
-                eprintln!("ERROR in generate_element_documentation for {}: Line {} missing /// prefix: {}", 
-                    &element.path, i, line);
+                eprintln!("ERROR in generate_element_documentation for {}: Line {} missing /// prefix: {}",
+                    element.path, i, line);
                 format!("/// {}", line)
             }
         })

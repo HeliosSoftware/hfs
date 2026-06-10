@@ -621,10 +621,9 @@ impl SearchParameterLoader {
     }
 }
 
-#[cfg(feature = "R4")]
 impl Default for SearchParameterLoader {
     fn default() -> Self {
-        Self::new(FhirVersion::R4)
+        Self::new(FhirVersion::default_enabled())
     }
 }
 

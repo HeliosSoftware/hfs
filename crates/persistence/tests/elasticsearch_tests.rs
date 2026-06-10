@@ -252,6 +252,7 @@ mod query_builder_tests {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
             parameter: "_id".to_string(),
             direction: SortDirection::Ascending,
+            param_type: None,
         });
 
         let es_query = builder.build(&query);
@@ -1119,6 +1120,165 @@ mod es_integration {
     }
 
     #[tokio::test]
+    async fn es_integration_search_composite_code_value_quantity() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-bp",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+                    "valueQuantity": { "value": 107, "unit": "mmHg", "system": "http://unitsofmeasure.org" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".to_string(),
+                    },
+                ],
+            })
+        };
+
+        // Both components match within the same instance.
+        let hit = backend
+            .search(&tenant, &query("8480-6$ge100"))
+            .await
+            .unwrap();
+        assert_eq!(hit.resources.items.len(), 1, "code + value match → 1 hit");
+        assert_eq!(hit.resources.items[0].id(), "obs-bp");
+
+        // Quantity component fails.
+        let miss = backend
+            .search(&tenant, &query("8480-6$ge200"))
+            .await
+            .unwrap();
+        assert!(miss.resources.items.is_empty(), "value too low → no hit");
+
+        // Token component fails.
+        let miss = backend
+            .search(&tenant, &query("9999-9$ge100"))
+            .await
+            .unwrap();
+        assert!(miss.resources.items.is_empty(), "code mismatch → no hit");
+    }
+
+    #[tokio::test]
+    async fn es_integration_string_search_is_accent_insensitive() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "accent-es",
+                    "name": [{ "family": "Müller" }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        for q in ["muller", "Müller", "MULLER"] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "family".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(q)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(
+                result.resources.items.len(),
+                1,
+                "accent-insensitive family search '{q}' should match 'Müller'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn es_integration_quantity_search_ucum_equivalence() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-mass-es",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "x" }] },
+                    "valueQuantity": { "value": 1, "unit": "g", "system": "http://unitsofmeasure.org", "code": "g" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // 1 g stored; search the equivalent 1000 mg.
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::eq("1000|http://unitsofmeasure.org|mg")],
+            chain: vec![],
+            components: vec![],
+        });
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "UCUM-equivalent quantity (1000 mg) should match stored 1 g"
+        );
+        assert_eq!(result.resources.items[0].id(), "obs-mass-es");
+    }
+
+    #[tokio::test]
     async fn es_integration_tenant_isolation_delete() {
         let backend = create_backend().await;
         let tenant_a = create_tenant("tenant-a");
@@ -1312,6 +1472,100 @@ mod es_integration {
             "Search by name should find the patient"
         );
         assert_eq!(result.resources.items[0].id(), "p1");
+    }
+
+    #[tokio::test]
+    async fn es_integration_compartment_search() {
+        // Compartment membership: a resource joins the Patient compartment if it
+        // references the patient via ANY of the membership params (here `subject`
+        // OR `performer`). Resources for another patient must be excluded.
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{CompartmentMembership, SearchQuery};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // In the compartment via `subject`.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-subject",
+                    "status": "final",
+                    "code": {"text": "hr"},
+                    "subject": {"reference": "Patient/p1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // In the compartment via the NON-first param `performer` only (subject
+        // points elsewhere). This verifies the OR across membership params.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-performer",
+                    "status": "final",
+                    "code": {"text": "hr"},
+                    "subject": {"reference": "Patient/p2"},
+                    "performer": [{"reference": "Patient/p1"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Not in the compartment (references another patient).
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs-other",
+                    "status": "final",
+                    "code": {"text": "hr"},
+                    "subject": {"reference": "Patient/p2"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let mut query = SearchQuery::new("Observation");
+        query.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+
+        assert!(
+            ids.contains(&"obs-subject".to_string()),
+            "compartment must include the resource linked via `subject`"
+        );
+        assert!(
+            ids.contains(&"obs-performer".to_string()),
+            "compartment must include the resource linked via `performer`"
+        );
+        assert!(
+            !ids.contains(&"obs-other".to_string()),
+            "compartment must exclude resources of another patient"
+        );
     }
 
     #[tokio::test]
@@ -2105,6 +2359,131 @@ mod es_integration {
             !result.resources.items.is_empty(),
             "_content search should find resources containing the term"
         );
+
+        // Full-text search ranks by relevance, so the backend must populate
+        // `SearchResult.scores` (-> Bundle.entry.search.score) for the matches.
+        assert!(
+            !result.scores.is_empty(),
+            "full-text search should populate relevance scores"
+        );
+        for resource in &result.resources.items {
+            let score = result.scores.get(&resource.url());
+            assert!(
+                matches!(score, Some(s) if *s > 0.0),
+                "matched resource {} should have a positive relevance score, got {score:?}",
+                resource.url()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn es_integration_contained_search() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("contained-test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs1",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                    "subject": { "reference": "#p1" },
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "p1",
+                        "name": [{ "family": "Smith", "given": ["Contained"] }],
+                        "gender": "male"
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "top1", "name": [{ "family": "Smith" }] }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+
+        let name_query = |mode: ContainedMode, ret: ContainedReturn| {
+            let mut q = SearchQuery::new("Patient");
+            q.contained = mode;
+            q.contained_return = ret;
+            q.parameters.push(SearchParameter {
+                name: "name".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq("Smith")],
+                chain: vec![],
+                components: vec![],
+            });
+            q
+        };
+
+        // Default (_contained=off): only the top-level Patient.
+        let off = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::Off, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let off_urls: Vec<String> = off.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(
+            off_urls,
+            vec!["Patient/top1"],
+            "off excludes contained docs"
+        );
+
+        // _contained=true: the container is returned.
+        let on = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::On, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let on_urls: Vec<String> = on.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(on_urls, vec!["Observation/obs1"], "container returned");
+
+        // _containedType=contained: the contained Patient itself.
+        let contained = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::On, ContainedReturn::Contained),
+            )
+            .await
+            .unwrap();
+        assert_eq!(contained.resources.items.len(), 1);
+        assert_eq!(contained.resources.items[0].resource_type(), "Patient");
+        assert_eq!(contained.resources.items[0].id(), "p1");
+
+        // _contained=both: top-level + container.
+        let both = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::Both, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let mut both_urls: Vec<String> = both.resources.items.iter().map(|r| r.url()).collect();
+        both_urls.sort();
+        assert_eq!(both_urls, vec!["Observation/obs1", "Patient/top1"]);
     }
 
     #[tokio::test]

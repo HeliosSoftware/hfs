@@ -998,10 +998,11 @@ fn decode_pagination_offset(pagination: &Pagination) -> StorageResult<usize> {
 // Stub trait impls: S3 does not support search or conditional operations
 // ---------------------------------------------------------------------------
 
-use crate::core::search::{SearchProvider, SearchResult};
+use crate::core::search::{IncludeProvider, RevincludeProvider, SearchProvider, SearchResult};
 use crate::core::storage::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
 };
+use crate::types::IncludeDirective;
 use crate::types::SearchQuery;
 
 #[async_trait]
@@ -1044,6 +1045,36 @@ impl SearchProvider for S3Backend {
                 crate::search::SearchParameterRegistry::new(),
             ))
         })
+    }
+}
+
+#[async_trait]
+impl IncludeProvider for S3Backend {
+    async fn resolve_includes(
+        &self,
+        _tenant: &TenantContext,
+        _resources: &[StoredResource],
+        _includes: &[IncludeDirective],
+    ) -> StorageResult<Vec<StoredResource>> {
+        Err(StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: "S3".to_string(),
+            capability: "_include".to_string(),
+        }))
+    }
+}
+
+#[async_trait]
+impl RevincludeProvider for S3Backend {
+    async fn resolve_revincludes(
+        &self,
+        _tenant: &TenantContext,
+        _resources: &[StoredResource],
+        _revincludes: &[IncludeDirective],
+    ) -> StorageResult<Vec<StoredResource>> {
+        Err(StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: "S3".to_string(),
+            capability: "_revinclude".to_string(),
+        }))
     }
 }
 

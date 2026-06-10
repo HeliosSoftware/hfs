@@ -357,6 +357,12 @@ curl http://localhost:8080/metadata
 
 The server can be configured using either command-line arguments or environment variables. Command-line arguments take precedence when both are provided.
 
+Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
+`zstd`) are decompressed transparently; unsupported encodings are rejected
+with `415`. Responses are compressed when the client sends `Accept-Encoding`,
+except `application/parquet` and `application/zip` output, which is already
+compressed and returned as-is.
+
 ##### Environment Variables
 
 | Variable | Description | Default |
@@ -364,7 +370,7 @@ The server can be configured using either command-line arguments or environment 
 | `SOF_SERVER_PORT` | Server port | `8080` |
 | `SOF_SERVER_HOST` | Server host address | `127.0.0.1` |
 | `SOF_LOG_LEVEL` | Log level (error, warn, info, debug, trace) | `info` |
-| `SOF_MAX_BODY_SIZE` | Maximum request body size in bytes | `10485760` (10MB) |
+| `SOF_MAX_BODY_SIZE` | Maximum request body size in bytes (applies to the decompressed body for compressed requests) | `10485760` (10MB) |
 | `SOF_REQUEST_TIMEOUT` | Request timeout in seconds | `30` |
 | `SOF_ENABLE_CORS` | Enable CORS (true/false) | `true` |
 | `SOF_CORS_ORIGINS` | Allowed CORS origins (comma-separated, * for any) | `*` |

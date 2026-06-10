@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -148,6 +148,7 @@ fn create_schema_v1(conn: &Connection) -> StorageResult<()> {
             composite_group INTEGER,
             value_identifier_type_system TEXT,
             value_identifier_type_code TEXT,
+            value_reference_display TEXT,
             FOREIGN KEY (tenant_id, resource_type, resource_id)
                 REFERENCES resources(tenant_id, resource_type, id) ON DELETE CASCADE
         )",
@@ -264,6 +265,9 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             5 => migrate_v5_to_v6(conn)?,
             6 => migrate_v6_to_v7(conn)?,
             7 => migrate_v7_to_v8(conn)?,
+            8 => migrate_v8_to_v9(conn)?,
+            9 => migrate_v9_to_v10(conn)?,
+            10 => migrate_v10_to_v11(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -941,6 +945,94 @@ fn migrate_v7_to_v8(conn: &Connection) -> StorageResult<()> {
             .map_err(|e| migration_err(format!("create index: {e}")))?;
     }
 
+    Ok(())
+}
+
+/// v8 → v9: add `value_reference_display` for reference text modifiers
+/// (`:text`/`:code-text`/`:text-advanced` on reference params). Additive and
+/// nullable; existing rows stay NULL until the resource is reindexed.
+fn migrate_v8_to_v9(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; the column may already exist if
+    // the table was created fresh at v9, so ignore a duplicate-column error.
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_reference_display TEXT",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_display
+         ON search_index(tenant_id, resource_type, param_name, value_reference_display)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create reference_display index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 9 to version 10.
+///
+/// Adds:
+/// - UCUM-canonicalized quantity columns so quantity search matches across
+///   equivalent units (e.g. `1 g` ⇄ `1000 mg`); and
+/// - a case/accent-folded string column so string search is accent-insensitive.
+///
+/// Existing rows have NULL values in the new columns until a reindex backfills
+/// them; the handlers fall back to raw matching for those rows.
+fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore duplicate-column errors
+    // (the columns may already exist if the table was created fresh at v10).
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_quantity_canonical_value REAL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_quantity_canonical_unit TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_string_folded TEXT",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical
+         ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create canonical quantity index: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded
+         ON search_index(tenant_id, resource_type, param_name, value_string_folded)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create folded string index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 10 to version 11.
+///
+/// Adds columns supporting `_contained` search: index rows extracted from a
+/// container's `contained[]` entries are flagged `is_contained = 1` and carry
+/// the contained resource's type and local id. The row's `resource_type` /
+/// `resource_id` continue to identify the *container* (preserving the FK to
+/// `resources`), while `contained_type` records the nested resource's type.
+fn migrate_v10_to_v11(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore duplicate-column errors.
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN is_contained INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN contained_type TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN contained_local_id TEXT",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_contained
+         ON search_index(tenant_id, contained_type, is_contained, param_name)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create contained index: {e}")))?;
     Ok(())
 }
 

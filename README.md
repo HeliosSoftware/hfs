@@ -243,7 +243,7 @@ AWS_REGION=us-east-1 \
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size (bytes) |
+| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
@@ -251,6 +251,10 @@ AWS_REGION=us-east-1 \
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
 | `HFS_RETURN_GONE` | `true` | Return `410 Gone` for deleted resources (vs `404`) |
 | `HFS_REQUIRE_IF_MATCH` | `false` | Require `If-Match` header for updates |
+
+Request bodies may be sent compressed (`Content-Encoding: gzip`, `deflate`,
+`br`, or `zstd`); unsupported encodings are rejected with `415`. Responses are
+compressed when the client sends `Accept-Encoding`.
 
 **CORS**
 
@@ -562,7 +566,7 @@ Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
 # License
 
-The Helios FHIR Server is licensed under the [MIT License](LICENSE).
+The Helios FHIR Server is licensed under the [MIT License](LICENSE.md).
 
 # Community
 

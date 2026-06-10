@@ -216,10 +216,21 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 #### Limits
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | 20 | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | 1000 | Maximum search result page size |
+
+#### HTTP compression
+
+All three HTTP servers (`hfs`, `sof-server`, `hts`) accept request bodies sent
+with `Content-Encoding: gzip` (also `deflate`, `br`, `zstd`); unsupported
+encodings are rejected with `415`. Responses are compressed when the client
+sends `Accept-Encoding` (with `Content-Encoding` and `Vary: Accept-Encoding`
+set). SOF never re-compresses `application/parquet` / `application/zip`
+output. Body-size limits (`HFS_MAX_BODY_SIZE`, `SOF_MAX_BODY_SIZE`,
+`HTS_MAX_BODY_SIZE`) are enforced on the *decompressed* body, so highly
+compressed payloads cannot bypass them.
 
 #### CORS
 | Variable | Default | Description |
@@ -238,6 +249,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | hfs | Elasticsearch index name prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | (none) | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | (none) | Elasticsearch basic auth password |
+| `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | Composite-store write sync mode for ES-backed backends. One of `asynchronous`, `synchronous`, `hybrid`. With `asynchronous` (default) the write returns as soon as the primary commits and the search backend is updated on a background worker — lowest latency, but a follow-up search can race the indexing. Use `synchronous` when callers need read-your-write semantics (e.g. integration tests, bulk loads that immediately search). Ignored when the storage backend has no search secondary. |
 
 #### Multi-tenancy
 | Variable | Default | Description |
@@ -372,7 +384,7 @@ FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 cargo run --bin fhirpath-
 | `SOF_SERVER_PORT` | 8080 | Server port |
 | `SOF_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `SOF_LOG_LEVEL` | info | Log level |
-| `SOF_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+| `SOF_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `SOF_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `SOF_ENABLE_CORS` | true | Enable CORS |
 | `SOF_CORS_ORIGINS` | * | Allowed origins |
@@ -522,8 +534,28 @@ HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
 | `HTS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
 | `HTS_DATABASE_URL` | ./data/hts.db | Database location — SQLite file path, or `postgresql://user:pass@host/db` for Postgres |
 | `HTS_STORAGE_BACKEND` | sqlite | Storage backend (`sqlite` default; `postgres` when built with `--features postgres`) |
+| `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files imported on startup. The Docker image sets this to `/app/terminology-data`. See bootstrap sync below. |
+| `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_ENABLE_CORS` | true | Enable CORS |
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
+
+### Bootstrap directory sync
+
+When `HTS_BOOTSTRAP_DIR` points at a directory, HTS synchronizes its contents
+into the database **on every startup** (not just the first run). Each recognized
+file is hashed (SHA-256) and recorded in a `bootstrap_imports` ledger keyed on
+file name; a file is imported only when its hash is absent or differs from the
+recorded value. So:
+
+- **Adding a new file** to the directory imports it on the next restart.
+- **Replacing a file with a newer terminology release** re-imports it (the
+  underlying import upserts on canonical `(url, version)`, so a new version
+  coexists with the old and a same-version re-import refreshes in place).
+- **Unchanged files** are skipped without re-parsing, keeping startup fast.
+
+For RxNorm RRF *directories* the signature is derived from the immediate
+children's `(name, size)` rather than full content hashing, to avoid re-reading
+multi-gigabyte folders on every boot.
 
 ### API Endpoints
 
@@ -576,6 +608,10 @@ cargo run --bin hts -- import ./hl7.terminology.r4-6.0.0.tgz
 cargo run --bin hts -- import ./SnomedCT_InternationalRF2_*.zip --format snomed-rf2
 
 # LOINC CSV ZIP  ⚠️  requires free Regenstrief registration at loinc.org
+# Language translations under AccessoryFiles/LinguisticVariants/ (e.g.
+# frFR28LinguisticVariant.csv) are imported automatically as FHIR
+# concept.designation entries tagged with the BCP-47 language (fr-FR, de-DE, …).
+# No extra flag needed — works for both `hts import` and server bootstrap.
 cargo run --bin hts -- import ./Loinc_*.zip --format loinc
 
 # ICD-10-CM tabular XML (free, no license needed — from cms.gov)

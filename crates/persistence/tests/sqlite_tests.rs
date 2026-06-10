@@ -1146,7 +1146,258 @@ async fn test_history_system_tenant_isolation() {
 // ============================================================================
 
 use helios_persistence::core::SearchProvider;
-use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use helios_persistence::types::{
+    CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SortDirective,
+};
+
+async fn search_ids(
+    backend: &SqliteBackend,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> Vec<String> {
+    backend
+        .search(tenant, query)
+        .await
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_search_cursor_with_custom_sort() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    // Insert out of order; page size 1 to force keyset paging across pages.
+    for (id, family) in [
+        ("p-charlie", "Charlie"),
+        ("p-alice", "Alice"),
+        ("p-bob", "Bob"),
+    ] {
+        let patient =
+            json!({ "resourceType": "Patient", "id": id, "name": [{ "family": family }] });
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let mut collected = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..5 {
+        let mut q = SearchQuery::new("Patient")
+            .with_sort(
+                SortDirective::parse("family").with_param_type(Some(SearchParamType::String)),
+            )
+            .with_count(1);
+        q.cursor = cursor.clone();
+        let result = backend.search(&tenant, &q).await.unwrap();
+        for r in &result.resources.items {
+            collected.push(r.id().to_string());
+        }
+        match result.resources.page_info.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        collected,
+        vec!["p-alice", "p-bob", "p-charlie"],
+        "cursor paging with custom sort must preserve global order"
+    );
+}
+
+#[tokio::test]
+async fn test_search_cursor_default_sort_paging() {
+    // The default (no _sort) keyset still pages correctly across pages.
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    for id in ["a", "b", "c", "d"] {
+        let patient = json!({ "resourceType": "Patient", "id": id });
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0;
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let mut q = SearchQuery::new("Patient").with_count(2);
+        q.cursor = cursor.clone();
+        let result = backend.search(&tenant, &q).await.unwrap();
+        for r in &result.resources.items {
+            assert!(
+                seen.insert(r.id().to_string()),
+                "no duplicate ids across pages"
+            );
+            total += 1;
+        }
+        match result.resources.page_info.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(total, 4, "all four resources returned exactly once");
+}
+
+#[tokio::test]
+async fn test_search_sort_by_indexed_param() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    for (id, family, birth) in [
+        ("p-charlie", "Charlie", "1990-01-01"),
+        ("p-alice", "Alice", "1985-01-01"),
+        ("p-bob", "Bob", "2000-01-01"),
+    ] {
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{ "family": family }],
+            "birthDate": birth,
+        });
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    // Sort by family (string), ascending then descending.
+    let asc = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("family").with_param_type(Some(SearchParamType::String)));
+    assert_eq!(
+        search_ids(&backend, &tenant, &asc).await,
+        vec!["p-alice", "p-bob", "p-charlie"]
+    );
+
+    let desc = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("-family").with_param_type(Some(SearchParamType::String)));
+    assert_eq!(
+        search_ids(&backend, &tenant, &desc).await,
+        vec!["p-charlie", "p-bob", "p-alice"]
+    );
+
+    // Sort by birthdate (date), ascending.
+    let by_birth = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)));
+    assert_eq!(
+        search_ids(&backend, &tenant, &by_birth).await,
+        vec!["p-alice", "p-charlie", "p-bob"]
+    );
+}
+
+/// Builds the `code-value-quantity` composite query with the component types
+/// the registry would supply, mirroring what the REST layer now wires up.
+fn code_value_quantity_query(value: &str) -> SearchQuery {
+    SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code-value-quantity".to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+        ],
+    })
+}
+
+#[tokio::test]
+async fn test_search_value_quantity_choice_type() {
+    // Regression: choice-type elements (`value[x]`) must be indexed. The
+    // `value-quantity` expression is `(Observation.value as Quantity)`.
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    let observation = json!({
+        "resourceType": "Observation",
+        "id": "obs-q",
+        "status": "final",
+        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+        "valueQuantity": { "value": 72.5, "unit": "kg", "system": "http://unitsofmeasure.org" }
+    });
+    backend
+        .create(&tenant, "Observation", observation, FhirVersion::default())
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "value-quantity".to_string(),
+        param_type: SearchParamType::Quantity,
+        modifier: None,
+        values: vec![SearchValue::new(
+            helios_persistence::types::SearchPrefix::Ge,
+            "70",
+        )],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "value-quantity ge70 → 1 hit"
+    );
+    assert_eq!(result.resources.items[0].id(), "obs-q");
+}
+
+#[tokio::test]
+async fn test_search_composite_code_value_quantity() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    let observation = json!({
+        "resourceType": "Observation",
+        "id": "obs-bp",
+        "status": "final",
+        "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+        "valueQuantity": { "value": 107, "unit": "mmHg", "system": "http://unitsofmeasure.org" }
+    });
+    backend
+        .create(&tenant, "Observation", observation, FhirVersion::default())
+        .await
+        .unwrap();
+
+    // Matches: correct code AND value satisfies the quantity comparison.
+    let result = backend
+        .search(&tenant, &code_value_quantity_query("8480-6$ge100"))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "code + value both match → 1 hit"
+    );
+    assert_eq!(result.resources.items[0].id(), "obs-bp");
+
+    // Value component fails (107 is not >= 200).
+    let result = backend
+        .search(&tenant, &code_value_quantity_query("8480-6$ge200"))
+        .await
+        .unwrap();
+    assert!(result.resources.items.is_empty(), "value too low → no hit");
+
+    // Code component fails.
+    let result = backend
+        .search(&tenant, &code_value_quantity_query("9999-9$ge100"))
+        .await
+        .unwrap();
+    assert!(result.resources.items.is_empty(), "code mismatch → no hit");
+}
 
 // Note: These tests verify that search indexing infrastructure is integrated into
 // storage operations. Full end-to-end search filtering requires updating search_impl.rs
@@ -2814,7 +3065,7 @@ async fn test_fts_delete_does_not_fail() {
 // _content Parameter Tests (Full Content Search)
 // ============================================================================
 
-use helios_persistence::types::{CompositeSearchComponent, SearchModifier};
+use helios_persistence::types::SearchModifier;
 
 #[tokio::test]
 async fn test_content_search_basic() {

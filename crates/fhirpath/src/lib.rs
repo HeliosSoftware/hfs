@@ -272,7 +272,7 @@ mod conversion_functions;
 mod format_functions;
 mod interval_functions;
 mod json_utils;
-mod ucum;
+pub mod ucum;
 // Public for internal testing only - not part of the public API
 #[doc(hidden)]
 pub mod date_operation;

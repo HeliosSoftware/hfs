@@ -9,16 +9,18 @@
 //! - [`TerminologySearchProvider`] - :above, :below, :in, :not-in
 //! - [`TextSearchProvider`] - Full-text search (_text, _content, :text)
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::error::StorageResult;
-use crate::search::SearchParameterRegistry;
+use crate::search::{IndexValue, SearchParameterExtractor, SearchParameterRegistry};
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Page, ReverseChainedParameter, SearchBundle, SearchQuery, StoredResource,
+    IncludeDirective, IncludeType, Page, ReverseChainedParameter, SearchBundle, SearchParamType,
+    SearchParameter, SearchQuery, SearchValue, StoredResource,
 };
 
 use super::storage::ResourceStorage;
@@ -34,6 +36,11 @@ pub struct SearchResult {
 
     /// Total count of matches (if requested via _total).
     pub total: Option<u64>,
+
+    /// Relevance scores (`Bundle.entry.search.score`) for matched resources,
+    /// keyed by resource URL (`Type/id`). Populated by backends that compute
+    /// relevance (e.g. Elasticsearch full-text search); empty otherwise.
+    pub scores: HashMap<String, f64>,
 }
 
 impl SearchResult {
@@ -43,6 +50,7 @@ impl SearchResult {
             resources,
             included: Vec::new(),
             total: None,
+            scores: HashMap::new(),
         }
     }
 
@@ -55,6 +63,12 @@ impl SearchResult {
     /// Sets the total count.
     pub fn with_total(mut self, total: u64) -> Self {
         self.total = Some(total);
+        self
+    }
+
+    /// Sets the relevance scores, keyed by resource URL (`Type/id`).
+    pub fn with_scores(mut self, scores: HashMap<String, f64>) -> Self {
+        self.scores = scores;
         self
     }
 
@@ -110,13 +124,23 @@ impl SearchResult {
             bundle = bundle.with_previous_link(replace_cursor_param(self_link, cursor));
         }
 
-        // Add matching resources
+        // First-page link: the self URL with paging params (`_cursor` / `_offset`)
+        // stripped. Emitted only for multi-page results (when a next/previous page
+        // exists). A `last` link is intentionally not emitted: under keyset
+        // (cursor) paging the final page is not cheaply computable.
+        if self.resources.page_info.next_cursor.is_some()
+            || self.resources.page_info.previous_cursor.is_some()
+        {
+            bundle = bundle.with_link("first", strip_paging_params(self_link));
+        }
+
+        // Add matching resources, attaching a relevance score when the backend
+        // computed one for this resource (`Bundle.entry.search.score`).
         for resource in &self.resources.items {
             let full_url = format!("{}/{}", base_url, resource.url());
-            bundle = bundle.with_entry(BundleEntry::match_entry(
-                full_url,
-                resource.content().clone(),
-            ));
+            let entry = BundleEntry::match_entry(full_url, resource.content().clone())
+                .with_score(self.scores.get(&resource.url()).copied());
+            bundle = bundle.with_entry(entry);
         }
 
         // Add included resources
@@ -150,6 +174,27 @@ impl SearchResult {
 /// ```text
 /// .../Patient?_count=3&_elements=id&_cursor=…
 /// ```
+/// Returns `url` with any `_cursor=…` and `_offset=…` query parameters removed,
+/// yielding the first-page URL for a paginated search.
+fn strip_paging_params(url: &str) -> String {
+    let (base, query) = match url.find('?') {
+        Some(pos) => (&url[..pos], &url[pos + 1..]),
+        None => return url.to_string(),
+    };
+
+    let parts: Vec<String> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.starts_with("_cursor=") && !p.starts_with("_offset="))
+        .map(str::to_string)
+        .collect();
+
+    if parts.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{}", base, parts.join("&"))
+    }
+}
+
 fn replace_cursor_param(url: &str, cursor: &str) -> String {
     let (base, query) = match url.find('?') {
         Some(pos) => (&url[..pos], &url[pos + 1..]),
@@ -239,6 +284,15 @@ pub trait SearchProvider: ResourceStorage {
     /// and chained-search builders both consult it so they cannot disagree on
     /// whether a given param is a Date vs. Token vs. Reference, etc.
     fn search_param_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>>;
+
+    /// Whether this backend can evaluate `_contained=true|both` searches (which
+    /// require contained-resource indexing). Defaults to `false`; backends that
+    /// index `contained[]` entries override this. The REST layer uses it to
+    /// reject `_contained` with `501` on backends that don't support it rather
+    /// than silently returning an unfiltered result.
+    fn supports_contained_search(&self) -> bool {
+        false
+    }
 }
 
 /// Search provider that supports searching across multiple resource types.
@@ -312,6 +366,152 @@ pub trait RevincludeProvider: SearchProvider {
         resources: &[StoredResource],
         revincludes: &[IncludeDirective],
     ) -> StorageResult<Vec<StoredResource>>;
+}
+
+/// Maximum number of `:iterate` hops when transitively following includes,
+/// guarding against reference cycles.
+const MAX_INCLUDE_ITERATE_DEPTH: usize = 5;
+
+/// Upper bound on resources fetched per internal include/revinclude query, to
+/// avoid the default page size silently truncating included resources.
+const INCLUDE_FETCH_LIMIT: u32 = 10_000;
+
+/// Resolves `_include`/`_revinclude` directives for a set of primary matches,
+/// following `:iterate` directives transitively until no new resources are
+/// found (bounded by [`MAX_INCLUDE_ITERATE_DEPTH`]). Included resources are
+/// deduplicated by `type/id` and never include a primary match.
+///
+/// This is the single, backend-agnostic include-resolution path used by the
+/// REST layer for backends whose `search()` does not resolve includes inline
+/// (SQLite, Postgres). References are extracted via the search-parameter
+/// registry's FHIRPath expression — so parameters whose name differs from the
+/// JSON field (e.g. Patient `organization` → `managingOrganization`) resolve
+/// correctly — and the referenced resources are fetched with `search()`.
+pub async fn resolve_includes_iterative<S>(
+    provider: &S,
+    tenant: &TenantContext,
+    matches: &[StoredResource],
+    includes: &[IncludeDirective],
+) -> StorageResult<Vec<StoredResource>>
+where
+    S: SearchProvider + ?Sized,
+{
+    if matches.is_empty() || includes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let extractor = SearchParameterExtractor::new(provider.search_param_registry().clone());
+    let key = |r: &StoredResource| format!("{}/{}", r.resource_type(), r.id());
+
+    // Don't re-include primary matches.
+    let mut seen: HashSet<String> = matches.iter().map(&key).collect();
+    let mut included: Vec<StoredResource> = Vec::new();
+
+    let mut frontier: Vec<StoredResource> = matches.to_vec();
+    let mut first_hop = true;
+    let mut depth = 0;
+
+    loop {
+        // First hop applies all directives; later hops only `:iterate` ones.
+        let active: Vec<&IncludeDirective> =
+            includes.iter().filter(|d| first_hop || d.iterate).collect();
+        if active.is_empty() {
+            break;
+        }
+
+        let mut fetched: Vec<StoredResource> = Vec::new();
+        for directive in active {
+            match directive.include_type {
+                IncludeType::Include => {
+                    // Forward: collect references from the frontier resources,
+                    // then fetch the referenced resources by id.
+                    let mut wanted: Vec<(String, String)> = Vec::new();
+                    for res in &frontier {
+                        if res.resource_type() != directive.source_type {
+                            continue;
+                        }
+                        let def = provider
+                            .search_param_registry()
+                            .read()
+                            .get_param(res.resource_type(), &directive.search_param);
+                        let Some(def) = def else { continue };
+                        if let Ok(values) = extractor.extract_for_param(res.content(), &def) {
+                            for v in values {
+                                if let IndexValue::Reference { reference, .. } = v.value {
+                                    if let Some((t, i)) = reference.split_once('/') {
+                                        if let Some(target) = &directive.target_type {
+                                            if t != target {
+                                                continue;
+                                            }
+                                        }
+                                        wanted.push((t.to_string(), i.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Group ids by type and fetch each group.
+                    let mut by_type: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for (t, i) in wanted {
+                        by_type.entry(t).or_default().push(i);
+                    }
+                    for (rtype, ids) in by_type {
+                        let mut q = SearchQuery::new(&rtype).with_parameter(SearchParameter {
+                            name: "_id".to_string(),
+                            param_type: SearchParamType::Token,
+                            modifier: None,
+                            values: ids.iter().map(SearchValue::eq).collect(),
+                            chain: vec![],
+                            components: vec![],
+                        });
+                        q.count = Some(INCLUDE_FETCH_LIMIT);
+                        let result = provider.search(tenant, &q).await?;
+                        fetched.extend(result.resources.items);
+                    }
+                }
+                IncludeType::Revinclude => {
+                    // Reverse: find source resources that reference any frontier
+                    // resource via the directive's reference parameter.
+                    let refs: Vec<SearchValue> =
+                        frontier.iter().map(|r| SearchValue::eq(key(r))).collect();
+                    if refs.is_empty() {
+                        continue;
+                    }
+                    let mut q =
+                        SearchQuery::new(&directive.source_type).with_parameter(SearchParameter {
+                            name: directive.search_param.clone(),
+                            param_type: SearchParamType::Reference,
+                            modifier: None,
+                            values: refs,
+                            chain: vec![],
+                            components: vec![],
+                        });
+                    q.count = Some(INCLUDE_FETCH_LIMIT);
+                    let result = provider.search(tenant, &q).await?;
+                    fetched.extend(result.resources.items);
+                }
+            }
+        }
+
+        // Dedup against everything seen so far; newly-added become next frontier.
+        let mut next = Vec::new();
+        for r in fetched {
+            if seen.insert(key(&r)) {
+                next.push(r.clone());
+                included.push(r);
+            }
+        }
+
+        first_hop = false;
+        depth += 1;
+        frontier = next;
+        if frontier.is_empty() || depth >= MAX_INCLUDE_ITERATE_DEPTH {
+            break;
+        }
+    }
+
+    Ok(included)
 }
 
 /// Search provider that supports chained parameters and _has.
@@ -528,6 +728,32 @@ mod tests {
 
         assert_eq!(bundle.total, Some(1));
         assert_eq!(bundle.entry.len(), 1);
+        // No score recorded -> entry.search.score stays absent.
+        assert!(bundle.entry[0].search.as_ref().unwrap().score.is_none());
+    }
+
+    #[test]
+    fn test_search_result_to_bundle_attaches_score() {
+        let resource = StoredResource::new(
+            "Patient",
+            "123",
+            crate::tenant::TenantId::new("t1"),
+            serde_json::json!({"resourceType": "Patient", "id": "123"}),
+            FhirVersion::default(),
+        );
+        let page = Page::new(vec![resource], PageInfo::end());
+        let mut scores = HashMap::new();
+        scores.insert("Patient/123".to_string(), 0.875);
+        let result = SearchResult::new(page).with_scores(scores);
+
+        let bundle = result.to_bundle("http://example.com/fhir", "http://example.com/fhir/Patient");
+
+        assert_eq!(bundle.entry.len(), 1);
+        assert_eq!(
+            bundle.entry[0].search.as_ref().unwrap().score,
+            Some(0.875),
+            "the matched entry carries Bundle.entry.search.score"
+        );
     }
 
     /// Self-link has no query: cursor is appended with `?` (issue #69 bug 1).

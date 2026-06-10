@@ -2,23 +2,41 @@
 //!
 //! Implements FHIR type system navigation and inheritance checking for FHIRPath type operations.
 
-/// Checks if a type code is a FHIR primitive datatype. Forgiving on case so
-/// callers can pass `"Boolean"` or `"boolean"`; delegates to the canonical
-/// list in [`helios_fhir::is_primitive_type`].
-pub fn is_fhir_primitive_type(type_name: &str) -> bool {
-    helios_fhir::is_primitive_type(&lowercase_first_char(type_name))
+use helios_fhir::{FhirPrimitiveTypeProvider, FhirVersion};
+
+/// FHIR Type Hierarchy module
+///
+/// This module provides utility functions for FHIR type checking and string manipulation.
+/// It includes primitive type checking and string capitalization utilities.
+///
+/// Checks if a type is a FHIR primitive type in the given FHIR version.
+///
+/// Delegates to the macro-generated [`FhirPrimitiveTypeProvider`] implementation,
+/// which is derived from the FHIR specification (StructureDefinitions of kind
+/// `primitive-type`), rather than a hand-maintained list.
+pub fn is_fhir_primitive_type_for_version(type_name: &str, fhir_version: &FhirVersion) -> bool {
+    match fhir_version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => helios_fhir::r4::PrimitiveTypes::is_primitive_type(type_name),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => helios_fhir::r4b::PrimitiveTypes::is_primitive_type(type_name),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => helios_fhir::r5::PrimitiveTypes::is_primitive_type(type_name),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => helios_fhir::r6::PrimitiveTypes::is_primitive_type(type_name),
+        #[allow(unreachable_patterns)]
+        _ => false, // For versions not enabled by feature flags
+    }
 }
 
-/// FHIR primitive type codes are lowercase in the spec, but FHIRPath
-/// expressions often use the capitalized System form (`Boolean`,
-/// `Integer`). Lowering just the first character normalizes both shapes
-/// to the FHIR primitive code (`boolean`, `integer`, `dateTime`).
-fn lowercase_first_char(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_ascii_lowercase().to_string() + chars.as_str(),
-    }
+/// Checks if a type is a FHIR primitive type.
+///
+/// Version-agnostic convenience wrapper around [`is_fhir_primitive_type_for_version`]:
+/// returns `true` if the type is a primitive in any enabled FHIR version.
+pub fn is_fhir_primitive_type(type_name: &str) -> bool {
+    FhirVersion::enabled_versions()
+        .iter()
+        .any(|version| is_fhir_primitive_type_for_version(type_name, version))
 }
 
 /// Utility function to capitalize the first letter of a string

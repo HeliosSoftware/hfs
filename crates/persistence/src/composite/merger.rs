@@ -142,6 +142,7 @@ impl ResultMerger {
             resources: Page::new(filtered_items, primary.resources.page_info),
             included: all_included,
             total: None, // Total is now uncertain due to filtering
+            scores: primary.scores,
         })
     }
 
@@ -181,6 +182,7 @@ impl ResultMerger {
             resources: Page::new(all_resources, primary.resources.page_info),
             included: primary.included,
             total: None,
+            scores: primary.scores,
         })
     }
 
@@ -229,6 +231,7 @@ impl ResultMerger {
             resources: Page::new(filtered_items, primary.resources.page_info),
             included: primary.included,
             total: None,
+            scores: primary.scores,
         })
     }
 
@@ -375,6 +378,7 @@ impl RelevanceMerger {
             resources: Page::new(final_results, PageInfo::end()),
             included: Vec::new(),
             total: None,
+            scores: Default::default(),
         }
     }
 }
@@ -406,6 +410,7 @@ mod tests {
             resources: Page::new(resources, PageInfo::end()),
             included: Vec::new(),
             total: None,
+            scores: Default::default(),
         }
     }
 

@@ -14,11 +14,11 @@ categories = ["web-programming", "database"]
 [features]
 default = ["R4", "sqlite"]
 
-# FHIR version features (pass through to helios-fhir, helios-persistence, helios-serde, helios-sof, helios-subscriptions)
-R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-serde?/R4", "helios-sof/R4", "helios-subscriptions?/R4"]
-R4B = ["helios-fhir/R4B", "helios-persistence/R4B", "helios-serde?/R4B", "helios-sof/R4B", "helios-subscriptions?/R4B"]
-R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-serde?/R5", "helios-sof/R5", "helios-subscriptions?/R5"]
-R6 = ["helios-fhir/R6", "helios-persistence/R6", "helios-serde?/R6", "helios-sof/R6", "helios-subscriptions?/R6"]
+# FHIR version features (pass through to helios-fhir, helios-persistence, helios-audit, helios-serde, helios-sof, helios-subscriptions)
+R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-audit/R4", "helios-serde?/R4", "helios-sof/R4", "helios-subscriptions?/R4"]
+R4B = ["helios-fhir/R4B", "helios-persistence/R4B", "helios-audit/R4B", "helios-serde?/R4B", "helios-sof/R4B", "helios-subscriptions?/R4B"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-audit/R5", "helios-serde?/R5", "helios-sof/R5", "helios-subscriptions?/R5"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6", "helios-audit/R6", "helios-serde?/R6", "helios-sof/R6", "helios-subscriptions?/R6"]
 
 # Serialization format features
 xml = ["helios-fhir/xml", "dep:helios-serde", "helios-serde?/xml"]
@@ -43,7 +43,7 @@ helios-persistence = { path = "../persistence", version = "0.1.47", default-feat
 helios-serde = { path = "../serde", version = "0.1.47", optional = true, default-features = false }
 helios-sof = { path = "../sof", version = "0.1.47", default-features = false }
 helios-auth = { path = "../auth", version = "0.1.47" }
-helios-audit = { path = "../audit", version = "0.1.47" }
+helios-audit = { path = "../audit", version = "0.1.47", default-features = false }
 helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true, default-features = false }
 
 # Async runtime
@@ -53,7 +53,7 @@ async-trait = "0.1"
 # Web framework
 axum = { version = "0.8", features = ["json", "query", "matched-path", "ws"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "compression-full", "decompression-full"] }
 http = "1.0"
 mime = "0.3"
 
@@ -100,6 +100,9 @@ reqwest = { version = "0.12", features = ["json"] }
 [dev-dependencies]
 # HTTP testing
 axum-test = "18.0"
+
+# gzip test payloads for HTTP compression tests
+flate2 = "1"
 
 # Temp files
 tempfile = "3"

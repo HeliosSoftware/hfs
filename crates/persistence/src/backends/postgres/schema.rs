@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// Initialize the database schema.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -122,6 +122,7 @@ async fn create_schema_v1(client: &deadpool_postgres::Client) -> StorageResult<(
                 composite_group INTEGER,
                 value_identifier_type_system TEXT,
                 value_identifier_type_code TEXT,
+                value_reference_display TEXT,
                 CONSTRAINT fk_search_resource FOREIGN KEY (tenant_id, resource_type, resource_id)
                     REFERENCES resources(tenant_id, resource_type, id) ON DELETE CASCADE
             )",
@@ -270,6 +271,9 @@ async fn migrate_schema(
             5 => migrate_v5_to_v6(client).await?,
             6 => migrate_v6_to_v7(client).await?,
             7 => migrate_v7_to_v8(client).await?,
+            8 => migrate_v8_to_v9(client).await?,
+            9 => migrate_v9_to_v10(client).await?,
+            10 => migrate_v10_to_v11(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -628,6 +632,69 @@ async fn migrate_v7_to_v8(client: &deadpool_postgres::Client) -> StorageResult<(
             .map_err(|e| pg_error(format!("Migration v7->v8 index failed: {}", e)))?;
     }
 
+    Ok(())
+}
+
+/// v8 -> v9: add `value_reference_display` for reference text modifiers
+/// (`:text`/`:code-text` on reference params). Additive and nullable; existing
+/// rows stay NULL until the resource is reindexed.
+async fn migrate_v8_to_v9(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_reference_display TEXT",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v8->v9 failed: {}", e)))?;
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_search_reference_display
+             ON search_index(tenant_id, resource_type, param_name, value_reference_display)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v8->v9 index failed: {}", e)))?;
+    Ok(())
+}
+
+/// v9 -> v10: UCUM-canonical quantity columns + case/accent-folded string column.
+async fn migrate_v9_to_v10(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_quantity_canonical_value DOUBLE PRECISION",
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_quantity_canonical_unit TEXT",
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_string_folded TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical
+         ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded
+         ON search_index(tenant_id, resource_type, param_name, value_string_folded)",
+    ];
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v9->v10 failed: {}", e)))?;
+    }
+    Ok(())
+}
+
+/// v10 -> v11: Add columns supporting `_contained` search. Index rows extracted
+/// from a container's `contained[]` entries are flagged `is_contained = TRUE`
+/// and carry the contained resource's type and local id; the row's
+/// `resource_type` / `resource_id` continue to identify the container.
+async fn migrate_v10_to_v11(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS is_contained BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS contained_type TEXT",
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS contained_local_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_search_contained
+         ON search_index(tenant_id, contained_type, is_contained, param_name)",
+    ];
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v10->v11 failed: {}", e)))?;
+    }
     Ok(())
 }
 

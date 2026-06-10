@@ -130,12 +130,24 @@ where
                 .map(|v| v.split(',').map(|s| s.trim()).collect());
 
             let mut content = stored.content().clone();
+            let mut subsetted = false;
 
             if let Some(mode) = summary_mode {
                 content = apply_summary(&content, mode, stored.fhir_version());
+                if mode != SummaryMode::False {
+                    subsetted = true;
+                }
             }
             if let Some(ref elem_list) = elements {
-                content = apply_elements(&content, elem_list);
+                if !elem_list.is_empty() {
+                    content = apply_elements(&content, elem_list);
+                    subsetted = true;
+                }
+            }
+
+            // Flag incomplete representations with the SUBSETTED tag (FHIR spec).
+            if subsetted {
+                crate::responses::subsetting::add_subsetted_tag(&mut content);
             }
 
             // Return the resource

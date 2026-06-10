@@ -18,10 +18,10 @@ path = "src/main.rs"
 default = ["R4", "sqlite"]
 
 # FHIR version features
-R4 = ["helios-fhir/R4", "helios-rest/R4"]
-R4B = ["helios-fhir/R4B", "helios-rest/R4B"]
-R5 = ["helios-fhir/R5", "helios-rest/R5"]
-R6 = ["helios-fhir/R6", "helios-rest/R6"]
+R4 = ["helios-fhir/R4", "helios-rest/R4", "helios-audit/R4"]
+R4B = ["helios-fhir/R4B", "helios-rest/R4B", "helios-audit/R4B"]
+R5 = ["helios-fhir/R5", "helios-rest/R5", "helios-audit/R5"]
+R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-audit/R6"]
 
 # Build options
 skip-r6-download = []
@@ -51,7 +51,7 @@ helios-rest = { path = "../rest", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["audit"] }
 helios-sof = { path = "../sof", version = "0.1.47", default-features = false }
 helios-auth = { path = "../auth", version = "0.1.47" }
-helios-audit = { path = "../audit", version = "0.1.47" }
+helios-audit = { path = "../audit", version = "0.1.47", default-features = false }
 helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true, default-features = false }
 
 # Export job controller

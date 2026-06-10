@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use elasticsearch::{DeleteParts, GetParts, IndexParts};
+use elasticsearch::{DeleteByQueryParts, DeleteParts, GetParts, IndexParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
@@ -106,6 +106,50 @@ fn collect_strings(value: &Value, parts: &mut Vec<String>) {
 }
 
 /// Builds an ES document from a FHIR resource and its extracted search values.
+/// Appends a value to a JSON array field on `obj`, creating the array if needed.
+fn push_array_field(obj: &mut Value, key: &str, val: Value) {
+    match obj.get_mut(key) {
+        Some(Value::Array(arr)) => arr.push(val),
+        _ => obj[key] = json!([val]),
+    }
+}
+
+/// Merges one composite component's value into the composite instance object,
+/// placing it in the array field matching the component's value type. All
+/// components of one instance share a nested object, so a single nested query
+/// can require every component to match within the same instance.
+fn merge_composite_component(entry: &mut Value, value: &IndexValue) {
+    match value {
+        IndexValue::String(s) => push_array_field(entry, "string", json!(s)),
+        IndexValue::Token { system, code, .. } => {
+            push_array_field(entry, "token_code", json!(code));
+            if let Some(sys) = system {
+                push_array_field(entry, "token_system", json!(sys));
+            }
+        }
+        IndexValue::Number(n) => push_array_field(entry, "number", json!(n)),
+        IndexValue::Quantity {
+            value,
+            unit,
+            system,
+            ..
+        } => {
+            push_array_field(entry, "quantity_value", json!(value));
+            if let Some(u) = unit {
+                push_array_field(entry, "quantity_unit", json!(u));
+            }
+            if let Some(s) = system {
+                push_array_field(entry, "quantity_system", json!(s));
+            }
+        }
+        IndexValue::Date { value, .. } => push_array_field(entry, "date", json!(value)),
+        IndexValue::Reference { reference, .. } => {
+            push_array_field(entry, "reference", json!(reference))
+        }
+        IndexValue::Uri(u) => push_array_field(entry, "uri", json!(u)),
+    }
+}
+
 pub(crate) fn build_es_document(
     tenant_id: &str,
     resource_type: &str,
@@ -124,14 +168,28 @@ pub(crate) fn build_es_document(
     let mut quantity_params: Vec<Value> = Vec::new();
     let mut reference_params: Vec<Value> = Vec::new();
     let mut uri_params: Vec<Value> = Vec::new();
-    let mut composite_params: Vec<Value> = Vec::new();
+    // Composite instances, keyed by (param name, group) so all components of one
+    // instance land in a single nested object with inline (array) component values.
+    let mut composite_groups: std::collections::BTreeMap<(String, u32), Value> =
+        std::collections::BTreeMap::new();
 
     for ev in extracted_values {
+        // Composite component values are accumulated into their instance object
+        // rather than the per-type arrays.
+        if let Some(group) = ev.composite_group {
+            let entry = composite_groups
+                .entry((ev.param_name.clone(), group))
+                .or_insert_with(|| json!({ "name": ev.param_name, "group_id": group }));
+            merge_composite_component(entry, &ev.value);
+            continue;
+        }
+
         match &ev.value {
             IndexValue::String(s) => {
                 string_params.push(json!({
                     "name": ev.param_name,
                     "value": s,
+                    "folded": crate::search::fold_text(s),
                 }));
             }
             IndexValue::Token {
@@ -191,12 +249,23 @@ pub(crate) fn build_es_document(
                 if let Some(c) = code {
                     qty["code"] = json!(c);
                 }
+                // UCUM-canonical value/unit so quantity search matches equivalent
+                // units (g ⇄ mg). Uses the code if present, else the unit display.
+                if let Some((cv, cu)) = code
+                    .as_deref()
+                    .or(unit.as_deref())
+                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                {
+                    qty["canonical_value"] = json!(cv);
+                    qty["canonical_unit"] = json!(cu);
+                }
                 quantity_params.push(qty);
             }
             IndexValue::Reference {
                 reference,
                 resource_type: ref_type,
                 resource_id: ref_id,
+                display,
             } => {
                 let mut ref_doc = json!({
                     "name": ev.param_name,
@@ -208,6 +277,9 @@ pub(crate) fn build_es_document(
                 if let Some(ri) = ref_id {
                     ref_doc["resource_id"] = json!(ri);
                 }
+                if let Some(d) = display {
+                    ref_doc["display"] = json!(d);
+                }
                 reference_params.push(ref_doc);
             }
             IndexValue::Uri(u) => {
@@ -217,14 +289,9 @@ pub(crate) fn build_es_document(
                 }));
             }
         }
-
-        if let Some(group) = ev.composite_group {
-            composite_params.push(json!({
-                "name": ev.param_name,
-                "group_id": group,
-            }));
-        }
     }
+
+    let composite_params: Vec<Value> = composite_groups.into_values().collect();
 
     json!({
         "resource_type": resource_type,
@@ -248,6 +315,141 @@ pub(crate) fn build_es_document(
             "composite": composite_params,
         }
     })
+}
+
+/// Synthetic ES `resource_id` for a contained-resource document: the
+/// container's id plus the contained local id, so it is unique within the
+/// contained type's index and stable across re-indexing.
+pub(crate) fn contained_resource_id(container_id: &str, local_id: &str) -> String {
+    format!("{}#{}", container_id, local_id)
+}
+
+/// Builds an ES document for a contained resource (`_contained` search). The
+/// doc describes the contained resource (its `resource_type`, `content`, and
+/// `search_params`) so it matches normally within that type's index, and is
+/// tagged with the container's identity for result resolution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_es_contained_document(
+    tenant_id: &str,
+    container_type: &str,
+    container_id: &str,
+    contained_type: &str,
+    local_id: &str,
+    contained_content: &Value,
+    version_id: &str,
+    fhir_version: FhirVersion,
+    extracted_values: &[ExtractedValue],
+) -> Value {
+    let synthetic_id = contained_resource_id(container_id, local_id);
+    let mut doc = build_es_document(
+        tenant_id,
+        contained_type,
+        &synthetic_id,
+        version_id,
+        contained_content,
+        fhir_version,
+        extracted_values,
+    );
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("is_contained".to_string(), json!(true));
+        obj.insert("container_type".to_string(), json!(container_type));
+        obj.insert("container_id".to_string(), json!(container_id));
+        obj.insert("contained_local_id".to_string(), json!(local_id));
+    }
+    doc
+}
+
+impl ElasticsearchBackend {
+    /// Deletes all contained-resource docs derived from the given container
+    /// (across the tenant's indices), used before re-indexing or on container
+    /// delete so removed contained resources don't linger.
+    pub(crate) async fn delete_contained_docs(
+        &self,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+    ) -> StorageResult<()> {
+        let pattern = format!(
+            "{}_{}_*",
+            self.config().index_prefix,
+            tenant_id.to_lowercase()
+        );
+        let body = json!({
+            "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "term": { "is_contained": true } },
+                { "term": { "container_type": container_type } },
+                { "term": { "container_id": container_id } }
+            ]}}
+        });
+        // Missing indices are fine (nothing to delete).
+        let _ = self
+            .client()
+            .delete_by_query(DeleteByQueryParts::Index(&[&pattern]))
+            .ignore_unavailable(true)
+            .refresh(true)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| internal_error(format!("Failed to delete contained docs: {}", e)))?;
+        Ok(())
+    }
+
+    /// Extracts and indexes a container's `contained[]` resources as separate
+    /// `is_contained` docs in their respective type indices. When `delete_first`
+    /// is set, stale contained docs for this container are removed first
+    /// (needed on update, where contained resources may have changed/been removed).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn index_contained_docs(
+        &self,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        resource: &Value,
+        fhir_version: FhirVersion,
+        version_id: &str,
+        delete_first: bool,
+    ) -> StorageResult<()> {
+        if delete_first {
+            self.delete_contained_docs(tenant_id, container_type, container_id)
+                .await?;
+        }
+
+        for contained in self.search_extractor().extract_contained(resource) {
+            let doc = build_es_contained_document(
+                tenant_id,
+                container_type,
+                container_id,
+                &contained.contained_type,
+                &contained.local_id,
+                &contained.content,
+                version_id,
+                fhir_version,
+                &contained.values,
+            );
+            schema::ensure_index(self, tenant_id, &contained.contained_type).await?;
+            let index = self.index_name(tenant_id, &contained.contained_type);
+            let doc_id = Self::document_id(
+                &contained.contained_type,
+                &contained_resource_id(container_id, &contained.local_id),
+            );
+            let response = self
+                .client()
+                .index(IndexParts::IndexId(&index, &doc_id))
+                .body(doc)
+                .send()
+                .await
+                .map_err(|e| internal_error(format!("Failed to index contained doc: {}", e)))?;
+            if !response.status_code().is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(internal_error(format!(
+                    "Failed to index contained doc: {}",
+                    body
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -322,6 +524,25 @@ impl ResourceStorage for ElasticsearchBackend {
                 "Failed to index document (status {}): {}",
                 status, body
             )));
+        }
+
+        // Index any contained resources for `_contained` search. New resource,
+        // so no stale docs to delete first.
+        if resource
+            .get("contained")
+            .and_then(|c| c.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            self.index_contained_docs(
+                tenant_id,
+                resource_type,
+                &id,
+                &resource,
+                fhir_version,
+                version_id,
+                false,
+            )
+            .await?;
         }
 
         let now = Utc::now();
@@ -417,6 +638,19 @@ impl ResourceStorage for ElasticsearchBackend {
                 status, body
             )));
         }
+
+        // Re-sync contained docs (delete stale, then re-index) so updates that
+        // add/remove/change `contained[]` entries are reflected.
+        self.index_contained_docs(
+            tenant_id,
+            resource_type,
+            id,
+            &resource,
+            fhir_version,
+            &version_id,
+            true,
+        )
+        .await?;
 
         let now = Utc::now();
         Ok((
@@ -596,6 +830,10 @@ impl ResourceStorage for ElasticsearchBackend {
             )));
         }
 
+        // Remove any contained-resource docs derived from this container.
+        self.delete_contained_docs(tenant_id, resource_type, id)
+            .await?;
+
         Ok(())
     }
 
@@ -671,7 +909,8 @@ fn parse_stored_resource(
         .and_then(|v| v.as_str())
         .unwrap_or("4.0");
 
-    let fhir_version = FhirVersion::from_mime_param(fhir_version_str).unwrap_or_default();
+    let fhir_version = FhirVersion::from_mime_param(fhir_version_str)
+        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
 
     let last_updated = source
         .get("last_updated")

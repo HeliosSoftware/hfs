@@ -22,6 +22,6 @@ pub mod writer;
 pub use chain_builder::{ChainError, ChainLink, ChainQueryBuilder, ParsedChain};
 pub use filter_parser::{FilterExpr, FilterOp, FilterParseError, FilterParser, FilterSqlGenerator};
 pub use parameter_handlers::CompositeComponentDef;
-pub use query_builder::{QueryBuilder, SqlFragment, SqlParam};
+pub use query_builder::{KeysetKey, QueryBuilder, SortValueKind, SqlFragment, SqlParam};
 pub use strategy::{SearchStrategyCapability, SqliteSearchStrategy};
 pub use writer::{SqlValue, SqliteSearchIndexWriter};

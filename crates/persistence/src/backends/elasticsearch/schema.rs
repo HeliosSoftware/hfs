@@ -45,6 +45,16 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                 "fhir_version": { "type": "keyword" },
                 "is_deleted": { "type": "boolean" },
 
+                // `_contained` search: a doc extracted from a container's
+                // `contained[]` entry is flagged `is_contained` and carries the
+                // container's identity plus the contained resource's local id.
+                // Its `resource_type`/`search_params` describe the contained
+                // resource (so it lands in that type's index and matches normally).
+                "is_contained": { "type": "boolean" },
+                "container_type": { "type": "keyword" },
+                "container_id": { "type": "keyword" },
+                "contained_local_id": { "type": "keyword" },
+
                 // Raw FHIR JSON - stored but not indexed
                 "content": { "type": "object", "enabled": false },
 
@@ -77,7 +87,11 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                             "normalizer": "lowercase_normalizer"
                                         }
                                     }
-                                }
+                                },
+                                // Case- and accent-folded value (NFD + combining-mark
+                                // stripping, computed by the writer) for accent-
+                                // insensitive string search.
+                                "folded": { "type": "keyword" }
                             }
                         },
                         "token": {
@@ -122,7 +136,11 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 "value": { "type": "double" },
                                 "unit": { "type": "keyword" },
                                 "system": { "type": "keyword" },
-                                "code": { "type": "keyword" }
+                                "code": { "type": "keyword" },
+                                // UCUM-canonical value/unit (computed by the writer)
+                                // for unit-equivalent quantity search (g ⇄ mg).
+                                "canonical_value": { "type": "double" },
+                                "canonical_unit": { "type": "keyword" }
                             }
                         },
                         "reference": {
@@ -131,7 +149,8 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                                 "name": { "type": "keyword" },
                                 "reference": { "type": "keyword" },
                                 "resource_type": { "type": "keyword" },
-                                "resource_id": { "type": "keyword" }
+                                "resource_id": { "type": "keyword" },
+                                "display": { "type": "text" }
                             }
                         },
                         "uri": {
@@ -150,7 +169,31 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
                             "type": "nested",
                             "properties": {
                                 "name": { "type": "keyword" },
-                                "group_id": { "type": "integer" }
+                                "group_id": { "type": "integer" },
+                                // Component values stored inline (as arrays) so a
+                                // single nested query matches all components of the
+                                // same composite instance.
+                                "token_system": { "type": "keyword" },
+                                "token_code": { "type": "keyword" },
+                                "string": {
+                                    "type": "keyword",
+                                    "fields": {
+                                        "lowercase": {
+                                            "type": "keyword",
+                                            "normalizer": "lowercase_normalizer"
+                                        }
+                                    }
+                                },
+                                "number": { "type": "double" },
+                                "quantity_value": { "type": "double" },
+                                "quantity_unit": { "type": "keyword" },
+                                "quantity_system": { "type": "keyword" },
+                                "date": {
+                                    "type": "date",
+                                    "format": "strict_date_optional_time||epoch_millis||yyyy||yyyy-MM||yyyy-MM-dd"
+                                },
+                                "reference": { "type": "keyword" },
+                                "uri": { "type": "keyword" }
                             }
                         }
                     }

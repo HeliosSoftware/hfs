@@ -30,12 +30,13 @@ impl PostgresSearchIndexWriter {
     ) -> StorageResult<()> {
         match &extracted.value {
             IndexValue::String(s) => {
+                let folded = crate::search::fold_text(s);
                 client
                     .execute(
                         "INSERT INTO search_index (
                             tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_string, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            value_string, composite_group, value_string_folded
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                         &[
                             &tenant_id,
                             &resource_type,
@@ -44,6 +45,7 @@ impl PostgresSearchIndexWriter {
                             &extracted.param_url.as_str(),
                             &Some(s.as_str()),
                             &extracted.composite_group.map(|g| g as i32),
+                            &folded.as_str(),
                         ],
                     )
                     .await
@@ -139,14 +141,23 @@ impl PostgresSearchIndexWriter {
                 value,
                 unit,
                 system,
-                code: _,
+                code,
             } => {
+                // Canonicalize using the UCUM code (else the unit display) so
+                // quantity search can match equivalent units (g ⇄ mg).
+                let (canonical_value, canonical_unit) = code
+                    .as_deref()
+                    .or(unit.as_deref())
+                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                    .map(|(v, u)| (Some(v), Some(u)))
+                    .unwrap_or((None, None));
                 client
                     .execute(
                         "INSERT INTO search_index (
                             tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_quantity_value, value_quantity_unit, value_quantity_system, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                            value_quantity_value, value_quantity_unit, value_quantity_system, composite_group,
+                            value_quantity_canonical_value, value_quantity_canonical_unit
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                         &[
                             &tenant_id,
                             &resource_type,
@@ -157,6 +168,8 @@ impl PostgresSearchIndexWriter {
                             &unit.as_deref(),
                             &system.as_deref(),
                             &extracted.composite_group.map(|g| g as i32),
+                            &canonical_value,
+                            &canonical_unit.as_deref(),
                         ],
                     )
                     .await
@@ -171,13 +184,14 @@ impl PostgresSearchIndexWriter {
                 reference,
                 resource_type: _,
                 resource_id: _,
+                display,
             } => {
                 client
                     .execute(
                         "INSERT INTO search_index (
                             tenant_id, resource_type, resource_id, param_name, param_url,
-                            value_reference, composite_group
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            value_reference, composite_group, value_reference_display
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                         &[
                             &tenant_id,
                             &resource_type,
@@ -186,6 +200,7 @@ impl PostgresSearchIndexWriter {
                             &extracted.param_url.as_str(),
                             &reference.as_str(),
                             &extracted.composite_group.map(|g| g as i32),
+                            &display.as_deref(),
                         ],
                     )
                     .await
@@ -219,6 +234,157 @@ impl PostgresSearchIndexWriter {
                     })?;
             }
         }
+
+        Ok(())
+    }
+
+    /// Writes a single contained `ExtractedValue` for `_contained` search. The
+    /// row's `resource_type` / `resource_id` identify the container; the entry is
+    /// flagged `is_contained = TRUE` and carries the contained resource's type
+    /// and local id. Uses one full-column INSERT (rather than the per-type
+    /// inserts above) so all value variants share a single statement.
+    pub async fn write_contained_entry(
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        container: (&str, &str),
+        contained: (&str, &str),
+        extracted: &ExtractedValue,
+    ) -> StorageResult<()> {
+        let (container_type, container_id) = container;
+        let (contained_type, contained_local_id) = contained;
+
+        let mut value_string: Option<String> = None;
+        let mut value_string_folded: Option<String> = None;
+        let mut token_system: Option<String> = None;
+        let mut token_code: Option<String> = None;
+        let mut token_display: Option<String> = None;
+        let mut value_date: Option<DateTime<Utc>> = None;
+        let mut date_precision: Option<String> = None;
+        let mut value_number: Option<f64> = None;
+        let mut q_value: Option<f64> = None;
+        let mut q_unit: Option<String> = None;
+        let mut q_system: Option<String> = None;
+        let mut q_canonical_value: Option<f64> = None;
+        let mut q_canonical_unit: Option<String> = None;
+        let mut value_reference: Option<String> = None;
+        let mut reference_display: Option<String> = None;
+        let mut value_uri: Option<String> = None;
+        let mut id_type_system: Option<String> = None;
+        let mut id_type_code: Option<String> = None;
+        let composite_group = extracted.composite_group.map(|g| g as i32);
+
+        match &extracted.value {
+            IndexValue::String(s) => {
+                value_string = Some(s.clone());
+                value_string_folded = Some(crate::search::fold_text(s));
+            }
+            IndexValue::Token {
+                system,
+                code,
+                display,
+                identifier_type_system,
+                identifier_type_code,
+            } => {
+                token_system = system.clone();
+                token_code = Some(code.clone());
+                token_display = display.clone();
+                id_type_system = identifier_type_system.clone();
+                id_type_code = identifier_type_code.clone();
+            }
+            IndexValue::Date { value, precision } => {
+                date_precision = Some(precision.to_string());
+                let normalized = normalize_date_for_pg(value);
+                value_date = Some(
+                    DateTime::parse_from_rfc3339(&normalized)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .or_else(|_| normalized.parse::<DateTime<Utc>>())
+                        .unwrap_or_else(|_| Utc::now()),
+                );
+            }
+            IndexValue::Number(n) => value_number = Some(*n),
+            IndexValue::Quantity {
+                value,
+                unit,
+                system,
+                code,
+            } => {
+                q_value = Some(*value);
+                q_unit = unit.clone();
+                q_system = system.clone();
+                if let Some((cv, cu)) = code
+                    .as_deref()
+                    .or(unit.as_deref())
+                    .and_then(|u| helios_fhirpath::ucum::canonicalize_quantity(*value, u))
+                {
+                    q_canonical_value = Some(cv);
+                    q_canonical_unit = Some(cu);
+                }
+            }
+            IndexValue::Reference {
+                reference, display, ..
+            } => {
+                value_reference = Some(reference.clone());
+                reference_display = display.clone();
+            }
+            IndexValue::Uri(uri) => value_uri = Some(uri.clone()),
+        }
+
+        let is_contained = true;
+        let contained_type = contained_type.to_string();
+        let contained_local_id = contained_local_id.to_string();
+
+        client
+            .execute(
+                "INSERT INTO search_index (
+                    tenant_id, resource_type, resource_id, param_name, param_url,
+                    value_string, value_token_system, value_token_code, value_token_display,
+                    value_date, value_date_precision, value_number,
+                    value_quantity_value, value_quantity_unit, value_quantity_system,
+                    value_reference, value_uri, composite_group,
+                    value_identifier_type_system, value_identifier_type_code, value_reference_display,
+                    value_quantity_canonical_value, value_quantity_canonical_unit, value_string_folded,
+                    is_contained, contained_type, contained_local_id
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
+                )",
+                &[
+                    &tenant_id,
+                    &container_type,
+                    &container_id,
+                    &extracted.param_name.as_str(),
+                    &extracted.param_url.as_str(),
+                    &value_string,
+                    &token_system,
+                    &token_code,
+                    &token_display,
+                    &value_date,
+                    &date_precision,
+                    &value_number,
+                    &q_value,
+                    &q_unit,
+                    &q_system,
+                    &value_reference,
+                    &value_uri,
+                    &composite_group,
+                    &id_type_system,
+                    &id_type_code,
+                    &reference_display,
+                    &q_canonical_value,
+                    &q_canonical_unit,
+                    &value_string_folded,
+                    &is_contained,
+                    &contained_type,
+                    &contained_local_id,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                internal_error(format!(
+                    "Failed to insert contained search index entry: {}",
+                    e
+                ))
+            })?;
 
         Ok(())
     }

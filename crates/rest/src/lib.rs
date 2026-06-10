@@ -115,11 +115,19 @@
 //! | `HFS_SERVER_PORT` | 8080 | Server port |
 //! | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 //! | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
-//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; measured after decompression for compressed requests) |
 //! | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 //! | `HFS_ENABLE_CORS` | true | Enable CORS |
 //! | `HFS_CORS_ORIGINS` | * | Allowed CORS origins |
 //! | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
+//!
+//! ## HTTP Compression
+//!
+//! Request bodies sent with `Content-Encoding: gzip` (or `deflate`, `br`,
+//! `zstd`) are decompressed transparently before parsing; unsupported
+//! encodings are rejected with `415 Unsupported Media Type`. Responses are
+//! compressed when the client advertises support via `Accept-Encoding`, with
+//! `Content-Encoding` and `Vary: Accept-Encoding` set accordingly.
 //!
 //! ## Architecture
 //!
@@ -163,12 +171,14 @@ use std::sync::Arc;
 
 use axum::{Router, extract::DefaultBodyLimit};
 use helios_persistence::core::{
-    BundleProvider, ConditionalStorage, InstanceHistoryProvider, ResourceStorage, SearchProvider,
-    SystemHistoryProvider, TypeHistoryProvider,
+    BundleProvider, ConditionalStorage, IncludeProvider, InstanceHistoryProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use tower::ServiceBuilder;
 use tower_http::{
+    compression::CompressionLayer,
     cors::{Any, CorsLayer},
+    decompression::RequestDecompressionLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -197,6 +207,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -240,6 +252,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -289,6 +303,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -324,6 +340,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -359,6 +377,8 @@ where
     S: ResourceStorage
         + ConditionalStorage
         + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
         + InstanceHistoryProvider
         + TypeHistoryProvider
         + SystemHistoryProvider
@@ -600,6 +620,18 @@ where
             axum::http::StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(config.request_timeout),
         ));
+
+    // Transparently decompress request bodies sent with `Content-Encoding`
+    // (gzip, deflate, br, zstd) and compress responses when the client sends
+    // `Accept-Encoding`. Unsupported request encodings get 415. Because the
+    // decompression layer replaces the request body before any extractor or
+    // handler reads it, the body-size limit below applies to the
+    // *decompressed* bytes — a small highly-compressed payload cannot bypass
+    // `HFS_MAX_BODY_SIZE`. Kept inside the CORS layer so 415/413 error
+    // responses still carry CORS headers for browser clients.
+    let router = router
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new());
 
     // Add CORS if enabled
     let router = if config.enable_cors {
