@@ -374,7 +374,10 @@ FHIRPATH_SERVER_PORT=8080 FHIRPATH_SERVER_HOST=0.0.0.0 cargo run --bin fhirpath-
 | `FHIRPATH_LOG_LEVEL` | info | Log level |
 | `FHIRPATH_ENABLE_CORS` | true | Enable CORS |
 | `FHIRPATH_CORS_ORIGINS` | * | Allowed origins |
+| `FHIRPATH_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; measured after decompression for compressed requests) |
 | `FHIRPATH_TERMINOLOGY_SERVER` | (none) | Terminology server URL |
+
+Request bodies sent with `Content-Encoding: gzip`/`deflate`/`br`/`zstd` are decompressed transparently before parsing (unsupported encodings → `415`); responses are compressed when the client sends `Accept-Encoding`. The body-size limit is enforced on the decompressed body.
 
 ## SOF Server Configuration
 
