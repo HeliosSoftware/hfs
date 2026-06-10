@@ -183,6 +183,7 @@
 pub mod compartment;
 pub mod constants;
 pub mod data_source;
+pub mod fhir_format;
 pub mod params;
 pub mod parquet_schema;
 pub mod sqlquery;
@@ -646,7 +647,8 @@ impl ContentType {
     /// - `"application/json"` → [`ContentType::Json`]
     /// - `"application/ndjson"` → [`ContentType::NdJson`]
     /// - `"application/x-ndjson"` → [`ContentType::NdJson`]
-    /// - `"application/octet-stream"` → [`ContentType::Parquet`] (spec)
+    /// - `"application/vnd.apache.parquet"` → [`ContentType::Parquet`] (spec native media type)
+    /// - `"application/octet-stream"` → [`ContentType::Parquet`] (spec Accept-table value)
     /// - `"application/parquet"` → [`ContentType::Parquet`] (permissive alias)
     ///
     /// # Arguments
@@ -705,11 +707,28 @@ impl ContentType {
             "text/csv" | "text/csv;header=true" => Ok(ContentType::CsvWithHeader),
             "application/json" => Ok(ContentType::Json),
             "application/ndjson" | "application/x-ndjson" => Ok(ContentType::NdJson),
-            // Spec Accept-table value for parquet (audit item #8).
-            // `application/parquet` is kept as a permissive alias for
-            // backwards-compat with clients that still send it.
-            "application/octet-stream" | "application/parquet" => Ok(ContentType::Parquet),
+            // `application/vnd.apache.parquet` is the format's native media
+            // type per the spec's Common Operation Behavior table;
+            // `application/octet-stream` is the spec Accept-table value
+            // (audit item #8) and `application/parquet` is kept as a
+            // permissive alias for backwards-compat with clients that
+            // still send it.
+            "application/vnd.apache.parquet"
+            | "application/octet-stream"
+            | "application/parquet" => Ok(ContentType::Parquet),
             _ => Err(SofError::UnsupportedContentType(s.to_string())),
+        }
+    }
+
+    /// The format's native media type per the SoF v2 spec's Common Operation
+    /// Behavior output-format table. This is the `Content-Type` served for
+    /// the raw-payload (default) representation.
+    pub fn mime_type(&self) -> &'static str {
+        match self {
+            ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
+            ContentType::Json => "application/json",
+            ContentType::NdJson => "application/x-ndjson",
+            ContentType::Parquet => "application/vnd.apache.parquet",
         }
     }
 }

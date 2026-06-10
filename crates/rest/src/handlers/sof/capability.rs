@@ -85,7 +85,8 @@ where
         bool_param("supportsAbsoluteReference", true),
     ];
 
-    // Supported output formats (G2: includes parquet; fhir included for $sqlquery-run).
+    // Supported output formats (G2: includes parquet; fhir is supported by
+    // both $viewdefinition-run and $sqlquery-run).
     for fmt in ["ndjson", "json", "csv", "parquet", "fhir"] {
         params.push(json!({
             "name": "supportedFormat",

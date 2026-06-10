@@ -31,6 +31,12 @@ pub enum ServerError {
     /// Unsupported media type or format
     UnsupportedMediaType(String),
 
+    /// The representation requested via `Accept` cannot be produced
+    /// (e.g. the `application/fhir+xml` `Binary` envelope form). Surfaces
+    /// as `406 Not Acceptable` + `OperationOutcome` per the SoF v2 spec's
+    /// content-negotiation rules.
+    NotAcceptable(String),
+
     /// Internal processing error from SOF engine
     ProcessingError(SofError),
 
@@ -53,6 +59,7 @@ impl fmt::Display for ServerError {
             }
             ServerError::NotFound(msg) => write!(f, "Not found: {}", msg),
             ServerError::UnsupportedMediaType(msg) => write!(f, "Unsupported media type: {}", msg),
+            ServerError::NotAcceptable(msg) => write!(f, "Not acceptable: {}", msg),
             ServerError::ProcessingError(err) => write!(f, "Processing error: {}", err),
             ServerError::JsonError(err) => write!(f, "JSON error: {}", err),
             ServerError::InternalError(msg) => write!(f, "Internal server error: {}", msg),
@@ -102,6 +109,9 @@ impl IntoResponse for ServerError {
                 "not-supported",
                 msg.clone(),
             ),
+            ServerError::NotAcceptable(msg) => {
+                (StatusCode::NOT_ACCEPTABLE, "not-supported", msg.clone())
+            }
             ServerError::ProcessingError(err) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "processing",

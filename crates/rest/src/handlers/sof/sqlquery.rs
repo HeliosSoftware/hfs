@@ -50,7 +50,6 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use base64::Engine as _;
 use futures::Stream;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
@@ -61,7 +60,7 @@ use helios_sof::{
     extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::time::Duration;
 use tracing::warn;
 
@@ -130,6 +129,18 @@ where
     S: SearchProvider + Send + Sync + 'static,
 {
     let params = extract_sqlquery_params_from_json(&body);
+
+    // Spec Common Operation Behavior axis 2 (representation): the FHIR XML
+    // envelope form is not supported → 406, never raw bytes under a FHIR
+    // media type.
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    if helios_sof::fhir_format::accept_requires_unsupported_fhir_xml(accept) {
+        return Err(RestError::NotAcceptable {
+            message: "the application/fhir+xml representation is not supported; \
+                      use application/fhir+json"
+                .to_string(),
+        });
+    }
 
     // _format precedence: body (Parameters) > query string > Accept header
     // > `ndjson` default. SoF v2 PR #353 makes `_format` `0..1` defaulting
@@ -322,7 +333,9 @@ fn resolve_format(
                 "application/json" => Some("json"),
                 "application/x-ndjson" | "application/ndjson" => Some("ndjson"),
                 "text/csv" => Some("csv"),
-                "application/octet-stream" | "application/parquet" => Some("parquet"),
+                "application/octet-stream"
+                | "application/parquet"
+                | "application/vnd.apache.parquet" => Some("parquet"),
                 "application/fhir+json" => Some("fhir"),
                 _ => None,
             });
@@ -501,14 +514,10 @@ fn render_output(
             })?;
             let inner_ct = content_type_for(ct);
             if wrap_in_binary {
-                let binary = json!({
-                    "resourceType": "Binary",
-                    "contentType": inner_ct,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&body),
-                });
-                let bytes = serde_json::to_vec(&binary).map_err(|e| RestError::InternalError {
-                    message: format!("failed to serialize Binary wrapper: {e}"),
-                })?;
+                let bytes = helios_sof::fhir_format::wrap_in_binary_envelope(inner_ct, &body)
+                    .map_err(|e| RestError::InternalError {
+                        message: format!("failed to serialize Binary wrapper: {e}"),
+                    })?;
                 Ok(("application/fhir+json", bytes))
             } else {
                 Ok((inner_ct, body))
@@ -526,9 +535,10 @@ fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType>
         } else {
             ContentType::Csv
         }),
-        "parquet" | "application/parquet" | "application/octet-stream" => {
-            Some(ContentType::Parquet)
-        }
+        "parquet"
+        | "application/parquet"
+        | "application/octet-stream"
+        | "application/vnd.apache.parquet" => Some(ContentType::Parquet),
         _ => None,
     }
 }
@@ -538,7 +548,7 @@ fn content_type_for(ct: ContentType) -> &'static str {
         ContentType::Csv | ContentType::CsvWithHeader => "text/csv; charset=utf-8",
         ContentType::Json => "application/json",
         ContentType::NdJson => "application/x-ndjson",
-        ContentType::Parquet => "application/octet-stream",
+        ContentType::Parquet => "application/vnd.apache.parquet",
     }
 }
 

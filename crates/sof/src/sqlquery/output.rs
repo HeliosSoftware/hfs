@@ -45,7 +45,7 @@ pub fn format_fhir_parameters(result: &QueryResult) -> Result<Vec<u8>, SqlQueryE
     serde_json::to_vec(&body).map_err(|e| SqlQueryError::MalformedLibrary(e.to_string()))
 }
 
-fn value_to_fhir_part(
+pub(crate) fn value_to_fhir_part(
     name: &str,
     value: &Value,
     ty: &ColumnFhirType,

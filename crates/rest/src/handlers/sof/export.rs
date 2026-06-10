@@ -6,8 +6,7 @@
 //! |-------|--------|-------------|
 //! | `/ViewDefinition/$viewdefinition-export` | POST | Submit an export job |
 //! | `/ViewDefinition/{id}/$viewdefinition-export` | POST | Submit for stored view |
-//! | `/export/{job-id}/status` | GET | Poll for job status |
-//! | `/export/{job-id}/result` | GET | Fetch completion manifest |
+//! | `/export/{job-id}/status` | GET | Poll for job status / fetch manifest |
 //! | `/export/{job-id}/status` | DELETE | Cancel job |
 //! | `/export/{job-id}/{filename}` | GET | Download output file |
 //!
@@ -24,8 +23,10 @@
 //! ## Poll response
 //!
 //! - `202 Accepted` + `X-Progress: running` while the job is running
-//! - `303 See Other` (Location: `…/result`) when complete — clients fetch
-//!   the final manifest from the separate result URL
+//! - `200 OK` with the completion manifest `Parameters` resource in the body
+//!   when complete (per the FHIR Asynchronous Interaction Request Pattern —
+//!   there is no `303 See Other` redirect and no separate result URL)
+//! - `500 Internal Server Error` + `OperationOutcome` if the job failed
 //! - `404 Not Found` if the job ID is unknown or was cancelled
 
 use axum::{
@@ -584,107 +585,26 @@ where
                 .into_response())
         }
 
-        // Spec: terminal states (success OR failure) both 303 to the result
-        // URL. The result handler serves the success manifest with 200, or
-        // a 500 + OperationOutcome on failure.
-        Some(JobStatus::Failed { .. }) | Some(JobStatus::Completed { .. }) => {
-            let result_url = format!(
-                "{base}/export/{job_id}/result",
-                base = state.base_url().trim_end_matches('/'),
-            );
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                header::LOCATION,
-                HeaderValue::from_str(&result_url)
-                    .unwrap_or_else(|_| HeaderValue::from_static("/export/")),
-            );
-            Ok((StatusCode::SEE_OTHER, headers).into_response())
-        }
-    }
-}
-
-/// `GET /export/{job_id}/result` — completion manifest.
-///
-/// Per spec, the result URL is distinct from the status URL: clients reach
-/// here after following the `303 See Other` redirect on a completed poll.
-pub async fn get_export_result_handler<S>(
-    State(state): State<AppState<S>>,
-    tenant: TenantExtractor,
-    Path(job_id): Path<String>,
-) -> Result<Response, RestError>
-where
-    S: ResourceStorage + Send + Sync + 'static,
-{
-    let controller = match state.export_controller() {
-        Some(c) => c,
-        None => {
-            return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
-        }
-    };
-
-    match controller.get_status(tenant.tenant_id(), &job_id) {
-        None | Some(JobStatus::Cancelled) => Ok((
-            StatusCode::NOT_FOUND,
+        // Spec (Common Operation Behavior — Asynchronous Delivery): the
+        // status poll itself carries the terminal response. Failure returns
+        // the relevant error status code with an OperationOutcome body;
+        // polling-transport errors and operation failures are distinguished
+        // by the status code on the poll response itself.
+        Some(JobStatus::Failed { message, .. }) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({
-                "resourceType": "OperationOutcome",
-                "issue": [{"severity": "error", "code": "not-found",
-                    "diagnostics": format!("Export job '{job_id}' not found or was cancelled")}]
-            })),
-        )
-            .into_response()),
-
-        Some(JobStatus::Running { .. }) => Ok((
-            StatusCode::PRECONDITION_FAILED,
-            axum::Json(json!({
-                "resourceType": "OperationOutcome",
-                "issue": [{"severity": "error", "code": "exception",
-                    "diagnostics": format!("Export job '{job_id}' has not yet completed; poll /export/{job_id}/status first")}]
-            })),
-        )
-            .into_response()),
-
-        Some(JobStatus::Failed {
-            message,
-            submitted_at,
-            failed_at,
-        }) => {
-            // Spec status-code table: "500 Internal Server Error: Unexpected
-            // server error (at result URL indicates operation failure)". The
-            // body is still the canonical failed Parameters manifest with
-            // `status=failed` and an OperationOutcome in the bulk-data-style
-            // `error` part — the 500 surfaces failure to clients that only
-            // inspect the status line.
-            let duration_secs = (failed_at - submitted_at).num_seconds().max(0);
-            let status_url = format!(
-                "{base}/export/{job_id}/status",
-                base = state.base_url().trim_end_matches('/'),
-            );
-            let outcome = json!({
                 "resourceType": "OperationOutcome",
                 "issue": [{
                     "severity": "error",
                     "code": "processing",
                     "diagnostics": format!("Export job '{job_id}' failed: {message}")
                 }]
-            });
-            Ok((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({
-                    "resourceType": "Parameters",
-                    "parameter": [
-                        {"name": "exportId", "valueString": job_id},
-                        {"name": "status", "valueCode": "failed"},
-                        {"name": "location", "valueUri": status_url},
-                        {"name": "exportStartTime", "valueInstant": submitted_at.to_rfc3339()},
-                        {"name": "exportEndTime", "valueInstant": failed_at.to_rfc3339()},
-                        {"name": "exportDuration", "valueInteger": duration_secs},
-                        {"name": "error", "resource": outcome}
-                    ]
-                })),
-            )
-                .into_response())
-        }
+            })),
+        )
+            .into_response()),
 
+        // Completion is `200 OK` with the manifest in the status-poll body —
+        // no `303 See Other` redirect and no separate result resource.
         Some(JobStatus::Completed {
             files,
             submitted_at,
@@ -692,8 +612,9 @@ where
             format,
             client_tracking_id,
         }) => {
-            // Spec: result URLs SHALL be valid for at least 24 hours and MAY
-            // carry an `Expires` header. Format is IMF-fixdate per RFC 7231.
+            // Spec: the completed status URL and download URLs SHALL be valid
+            // for at least 24 hours and MAY carry an `Expires` header. Format
+            // is IMF-fixdate per RFC 7231.
             let expires_at = completed_at + chrono::Duration::hours(24);
             let expires_str = expires_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
             let mut headers = HeaderMap::new();
@@ -861,7 +782,7 @@ where
             let content_type = if filename.ends_with(".csv") {
                 "text/csv; charset=utf-8"
             } else if filename.ends_with(".parquet") {
-                "application/octet-stream"
+                "application/vnd.apache.parquet"
             } else {
                 "application/x-ndjson"
             };

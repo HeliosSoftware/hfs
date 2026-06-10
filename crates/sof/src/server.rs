@@ -326,6 +326,9 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
     // would only burn CPU for no size win.
     let compress_predicate = SizeAbove::new(32)
         .and(NotForContentType::const_new("application/parquet"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apache.parquet",
+        ))
         .and(NotForContentType::const_new("application/zip"));
 
     let mut app = Router::new()
@@ -710,7 +713,7 @@ mod tests {
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(
             response.headers().get("content-type").unwrap(),
-            "application/parquet"
+            "application/vnd.apache.parquet"
         );
         // Parquet is already compressed — the gzip layer must skip it.
         assert!(response.headers().get("content-encoding").is_none());
@@ -745,5 +748,125 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // =========================================================================
+    // SoF v2 Common Operation Behavior (spec PR #365): `fhir` output format,
+    // Binary-envelope representation, and FHIR-XML rejection.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_fhir_format_returns_parameters() {
+        let server = TestServer::new(create_app()).unwrap();
+        let mut body = run_request_body();
+        body["parameter"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"name": "_format", "valueCode": "fhir"}),
+        );
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .json(&body)
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/fhir+json"
+        );
+        let v: serde_json::Value = response.json();
+        assert_eq!(v["resourceType"], "Parameters");
+        let rows = v["parameter"].as_array().expect("parameter array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "row");
+        let parts = rows[0]["part"].as_array().expect("row parts");
+        assert!(
+            parts
+                .iter()
+                .any(|p| p["name"] == "gender" && p["valueString"] == "male"),
+            "row must carry the gender part: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_fhir_json_without_format_selects_fhir() {
+        let server = TestServer::new(create_app()).unwrap();
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("accept", "application/fhir+json")
+            .json(&run_request_body())
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let v: serde_json::Value = response.json();
+        assert_eq!(
+            v["resourceType"], "Parameters",
+            "Accept: application/fhir+json must select the fhir format: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_fhir_json_with_csv_format_returns_binary_envelope() {
+        use base64::Engine as _;
+        let server = TestServer::new(create_app()).unwrap();
+        let mut body = run_request_body();
+        body["parameter"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"name": "_format", "valueCode": "csv"}),
+        );
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("accept", "application/fhir+json")
+            .json(&body)
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/fhir+json"
+        );
+        let v: serde_json::Value = response.json();
+        assert_eq!(v["resourceType"], "Binary");
+        assert_eq!(v["contentType"], "text/csv");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(v["data"].as_str().expect("Binary.data"))
+            .expect("Binary.data must be base64");
+        let csv = String::from_utf8(decoded).expect("decoded csv is utf8");
+        assert!(csv.contains("male"), "decoded csv: {csv}");
+    }
+
+    #[tokio::test]
+    async fn test_accept_fhir_xml_returns_406() {
+        let server = TestServer::new(create_app()).unwrap();
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("accept", "application/fhir+xml")
+            .json(&run_request_body())
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::NOT_ACCEPTABLE,
+            "{}",
+            response.text()
+        );
+        let v: serde_json::Value = response.json();
+        assert_eq!(v["resourceType"], "OperationOutcome");
     }
 }

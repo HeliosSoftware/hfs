@@ -14,6 +14,7 @@ use helios_sof::{
     ContentType, RunOptions, SofBundle, SofError, SofViewDefinition,
     create_bundle_from_resources_for_version as sof_create_bundle_from_resources_for_version,
     data_source::{DataSource, UniversalDataSource},
+    fhir_format::{self, accept_requires_unsupported_fhir_xml},
     filter_resources_by_patient_and_group as sof_filter_resources_by_patient_and_group,
     filter_resources_by_since as sof_filter_resources_by_since, format_parquet_multi_file,
     get_fhir_version_string, get_newest_enabled_fhir_version,
@@ -99,6 +100,31 @@ pub async fn run_view_definition_handler(
     // default is applied downstream in `parse_content_type` / `validate_query_params`.
     let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
 
+    // Spec Common Operation Behavior axis 2 (representation): the FHIR XML
+    // envelope form is not supported → 406, never raw bytes under a FHIR
+    // media type.
+    if accept_requires_unsupported_fhir_xml(accept_header) {
+        return Err(ServerError::NotAcceptable(
+            "the application/fhir+xml representation is not supported; \
+             use application/fhir+json"
+                .to_string(),
+        ));
+    }
+
+    // The `fhir` output format lives outside the flat-format `ContentType`
+    // machinery: detect it up front (query `_format` here; the body `_format`
+    // is folded in after extraction) and strip it so the legacy validation
+    // below doesn't reject it.
+    let is_fhir_format = |f: &str| {
+        f.eq_ignore_ascii_case("fhir") || f.eq_ignore_ascii_case(fhir_format::FHIR_JSON_MIME)
+    };
+    let query_format = params.format.clone();
+    let query_format_fhir = query_format.as_deref().map(is_fhir_format).unwrap_or(false);
+    let mut params = params;
+    if query_format_fhir {
+        params.format = None;
+    }
+
     // GET / bodyless requests can't carry viewResource or resource. With no
     // body to extract a ViewDefinition from and no viewReference support
     // (sof-server is stateless), we reject early with a 400.
@@ -163,6 +189,29 @@ pub async fn run_view_definition_handler(
     };
     let format_from_body = extracted_params.format;
     let header_from_body = extracted_params.header;
+
+    // Resolve the two spec negotiation axes now that the effective `_format`
+    // request is known (body > query > Accept):
+    // - axis 1: `_format=fhir` (or `Accept: application/fhir+json` with no
+    //   `_format` anywhere) selects the `fhir` output format;
+    // - axis 2: `Accept: application/fhir+json` with an explicit flat
+    //   `_format` selects the serialized `Binary` envelope representation.
+    let body_format_fhir = format_from_body
+        .as_deref()
+        .map(is_fhir_format)
+        .unwrap_or(false);
+    let fhir_output = match format_from_body.as_deref().or(query_format.as_deref()) {
+        Some(f) => is_fhir_format(f),
+        None => fhir_format::accept_has_mime(accept_header, fhir_format::FHIR_JSON_MIME),
+    };
+    let wants_envelope =
+        !fhir_output && fhir_format::accept_has_mime(accept_header, fhir_format::FHIR_JSON_MIME);
+    // Strip `fhir` before the legacy ContentType override below.
+    let format_from_body = if body_format_fhir {
+        None
+    } else {
+        format_from_body
+    };
 
     let view_def_json = view_def_json
         .ok_or_else(|| ServerError::BadRequest("No ViewDefinition provided".to_string()))?;
@@ -321,6 +370,10 @@ pub async fn run_view_definition_handler(
         source_bundle = Some(loaded_bundle);
     }
 
+    // Keep the raw ViewDefinition JSON around when the `fhir` output format
+    // is selected — its declared `column.type`s drive the `value[x]` mapping.
+    let view_json_for_fhir = fhir_output.then(|| view_def_json.clone());
+
     // Create ViewDefinition - use the source bundle's version if available,
     // otherwise use the default (newest enabled) version
     let view_definition = if let Some(version) = source_fhir_version {
@@ -378,6 +431,23 @@ pub async fn run_view_definition_handler(
         validated_params.format
     );
 
+    // `_format=fhir`: render the typed `Parameters` resource from the
+    // structured rows. `_limit` is applied at the row level to match the
+    // flat-format pipeline's `apply_pagination_to_result`.
+    if let Some(view_json) = view_json_for_fhir {
+        let mut processed = process_view_definition(view_definition, bundle)?;
+        if let Some(limit) = validated_params.limit {
+            processed.rows.truncate(limit);
+        }
+        let body = fhir_format::format_view_fhir_parameters(&processed, &view_json)?;
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, fhir_format::FHIR_JSON_MIME)],
+            body,
+        )
+            .into_response());
+    }
+
     // Check if we need to handle multi-file Parquet output
     if validated_params.format == ContentType::Parquet
         && validated_params
@@ -427,19 +497,33 @@ pub async fn run_view_definition_handler(
             )
                 .into_response())
         } else {
-            // Per SoF v2 spec Accept table, parquet uses
-            // `application/octet-stream`; Content-Disposition makes browsers
-            // download as `.parquet` (audit item #8).
+            // Per the SoF v2 Common Operation Behavior table, parquet's
+            // native media type is `application/vnd.apache.parquet`;
+            // Content-Disposition makes browsers download as `.parquet`
+            // (audit item #8).
+            let payload = file_buffers.into_iter().next().unwrap_or_default();
+            if wants_envelope {
+                let body = fhir_format::wrap_in_binary_envelope(
+                    ContentType::Parquet.mime_type(),
+                    &payload,
+                )?;
+                return Ok((
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, fhir_format::FHIR_JSON_MIME)],
+                    body,
+                )
+                    .into_response());
+            }
             Ok((
                 StatusCode::OK,
                 [
-                    (header::CONTENT_TYPE, "application/octet-stream"),
+                    (header::CONTENT_TYPE, ContentType::Parquet.mime_type()),
                     (
                         header::CONTENT_DISPOSITION,
                         "attachment; filename=\"output.parquet\"",
                     ),
                 ],
-                file_buffers.into_iter().next().unwrap_or_default(),
+                payload,
             )
                 .into_response())
         }
@@ -459,15 +543,22 @@ pub async fn run_view_definition_handler(
             run_options,
         )?;
 
-        // Determine the MIME type for the response. Per SoF v2 spec
-        // Accept table: parquet uses `application/octet-stream`
-        // (audit item #8).
-        let mime_type = match validated_params.format {
-            ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
-            ContentType::Json => "application/json",
-            ContentType::NdJson => "application/x-ndjson",
-            ContentType::Parquet => "application/octet-stream",
-        };
+        // Determine the MIME type for the response: each format's native
+        // media type per the SoF v2 Common Operation Behavior table
+        // (parquet is `application/vnd.apache.parquet`).
+        let mime_type = validated_params.format.mime_type();
+
+        // Spec axis 2: `Accept: application/fhir+json` with an explicit flat
+        // `_format` returns the payload as a serialized `Binary` resource.
+        if wants_envelope {
+            let body = fhir_format::wrap_in_binary_envelope(mime_type, &filtered_output)?;
+            return Ok((
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, fhir_format::FHIR_JSON_MIME)],
+                body,
+            )
+                .into_response());
+        }
 
         let response = if matches!(validated_params.format, ContentType::Parquet) {
             // Add Content-Disposition for parquet so browsers download as
@@ -521,9 +612,19 @@ fn create_capability_statement() -> serde_json::Value {
         },
         "fhirVersion": fhir_version,
         // Output formats the operation produces (audit item #11 partial
-        // closeout): sof-server emits CSV, JSON, NDJSON, and Parquet
-        // depending on the `_format` parameter.
-        "format": ["application/json", "application/x-ndjson", "text/csv", "application/octet-stream"],
+        // closeout): sof-server emits CSV, JSON, NDJSON, Parquet, and FHIR
+        // Parameters depending on the `_format` parameter. Parquet's native
+        // media type is `application/vnd.apache.parquet`;
+        // `application/octet-stream` stays listed as the spec Accept-table
+        // alias.
+        "format": [
+            "application/json",
+            "application/x-ndjson",
+            "text/csv",
+            "application/vnd.apache.parquet",
+            "application/octet-stream",
+            "application/fhir+json"
+        ],
         "rest": [{
             "mode": "server",
             // System-level operation (audit item #6 + #7). sof-server is
@@ -537,7 +638,7 @@ fn create_capability_statement() -> serde_json::Value {
             "operation": [{
                 "name": "viewdefinition-run",
                 "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run",
-                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, NDJSON, and Parquet output. Invoked at the system level (POST /$viewdefinition-run) or type level (POST /ViewDefinition/$viewdefinition-run); the ViewDefinition must be supplied inline in the request body via 'viewResource' (no resource store, so 'viewReference' and instance-level URLs are not supported)."
+                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, NDJSON, Parquet, and FHIR Parameters (_format=fhir) output; flat formats may also be returned as a Binary resource envelope via 'Accept: application/fhir+json'. Invoked at the system level (POST /$viewdefinition-run) or type level (POST /ViewDefinition/$viewdefinition-run); the ViewDefinition must be supplied inline in the request body via 'viewResource' (no resource store, so 'viewReference' and instance-level URLs are not supported)."
             }]
         }]
     })
@@ -838,7 +939,7 @@ fn filter_resources_by_since(
 ///   `supportsAbsoluteReference` = `false` (no resource store, so
 ///   `viewReference` in any shape is rejected with 501 — the
 ///   capability block must reflect that truthfully).
-/// - `supportedFormat` = ndjson, json, csv, parquet (the formats the
+/// - `supportedFormat` = ndjson, json, csv, parquet, fhir (the formats the
 ///   `$viewdefinition-run` handler actually emits).
 pub async fn sof_capabilities() -> ServerResult<impl IntoResponse> {
     info!("Handling SQL-on-FHIR capabilities request");
@@ -856,12 +957,13 @@ pub async fn sof_capabilities() -> ServerResult<impl IntoResponse> {
             {"name": "supportedFormat", "valueCode": "json"},
             {"name": "supportedFormat", "valueCode": "csv"},
             {"name": "supportedFormat", "valueCode": "parquet"},
+            {"name": "supportedFormat", "valueCode": "fhir"},
             // Audit item #13: explicit declaration of the spec's
             // OutputFormatCodes value-set binding (extensible).
             // The bound codes (csv/ndjson/parquet/json/fhir) are listed
             // at the canonical CodeSystem URL. The binding is
             // `extensible`, so a client may use additional codes — but
-            // sof-server only accepts the four advertised above.
+            // sof-server only accepts the five advertised above.
             {
                 "name": "formatBinding",
                 "part": [
@@ -958,7 +1060,9 @@ mod tests {
             "application/json",
             "application/x-ndjson",
             "text/csv",
+            "application/vnd.apache.parquet",
             "application/octet-stream",
+            "application/fhir+json",
         ] {
             assert!(
                 formats.iter().any(|f| f == required),

@@ -84,31 +84,16 @@ mod sof_export_tests {
         })
     }
 
-    /// Polls the status URL until the job completes (303), then fetches and
-    /// returns the manifest from the result URL. Times out after ~2s.
+    /// Polls the status URL until the job completes (200 OK with the
+    /// manifest in the poll body — no 303 redirect). Times out after ~2s.
     async fn poll_to_manifest(server: &TestServer, status_url: &str, tenant: &str) -> Value {
         for _ in 0..40 {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             let poll = server.get(status_url).add_header(X_TENANT_ID, tenant).await;
-            if poll.status_code() == StatusCode::SEE_OTHER {
-                let result_url = poll
-                    .headers()
-                    .get("location")
-                    .expect("303 response missing Location header")
-                    .to_str()
-                    .unwrap()
-                    .to_string();
-                let result = server
-                    .get(&result_url)
-                    .add_header(X_TENANT_ID, tenant)
-                    .await;
-                assert_eq!(
-                    result.status_code(),
-                    StatusCode::OK,
-                    "result URL did not return 200: {}",
-                    result.text()
-                );
-                return result.json::<Value>();
+            match poll.status_code() {
+                StatusCode::OK => return poll.json::<Value>(),
+                StatusCode::ACCEPTED => continue,
+                other => panic!("unexpected poll status {other}: {}", poll.text()),
             }
         }
         panic!("export did not complete within 2s for {status_url}");
@@ -537,7 +522,7 @@ mod sof_export_tests {
             download_resp.text()
         );
 
-        // Content-Type must be application/octet-stream for Parquet
+        // Content-Type must be parquet's native media type
         let ct = download_resp
             .headers()
             .get("content-type")
@@ -545,7 +530,7 @@ mod sof_export_tests {
             .to_str()
             .unwrap();
         assert_eq!(
-            ct, "application/octet-stream",
+            ct, "application/vnd.apache.parquet",
             "unexpected Content-Type: {ct}"
         );
 
@@ -704,7 +689,7 @@ mod sof_export_tests {
         );
 
         // Tenant A can still see its own export — wait for it to finish.
-        // poll_to_manifest follows the 303 → $result redirect.
+        // poll_to_manifest waits for the 200 OK manifest on the status URL.
         let manifest = poll_to_manifest(&server, &location, "tenant-a").await;
         assert_eq!(manifest["resourceType"].as_str(), Some("Parameters"));
     }
@@ -904,7 +889,7 @@ mod sof_export_tests {
             .unwrap()
             .to_string();
 
-        // Poll repeatedly; capture either the in-progress (202) or completed (303)
+        // Poll repeatedly; capture either the in-progress (202) or completed (200)
         // shape and assert each body shape conforms to the spec.
         for _ in 0..40 {
             let poll = server
@@ -947,7 +932,18 @@ mod sof_export_tests {
                     });
                     assert!(n <= 99, "running percent must be <= 99, got {n}");
                 }
-                StatusCode::SEE_OTHER => return, // completed — test passes
+                StatusCode::OK => {
+                    // Completed — the manifest rides in the poll body.
+                    let body: Value = poll.json();
+                    assert_eq!(body["resourceType"].as_str(), Some("Parameters"));
+                    let params = body["parameter"].as_array().unwrap();
+                    let status = params
+                        .iter()
+                        .find(|p| p["name"].as_str() == Some("status"))
+                        .and_then(|p| p["valueCode"].as_str());
+                    assert_eq!(status, Some("completed"));
+                    return;
+                }
                 other => panic!("unexpected poll status: {other}"),
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
@@ -1023,17 +1019,17 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 17. Failed jobs: status URL returns 303 → result URL returns 500.
+    // 17. Failed jobs: the status poll itself returns 500 + OperationOutcome
+    //     (spec: no 303 redirect, no separate result URL).
     //     Uses a test-only controller that always reports `Failed`.
     // =========================================================================
 
     struct FailingController {
         tenant: String,
         job_id: String,
-        // Captured once at construction so successive polls of the result URL
-        // report a stable `exportEndTime` / `exportDuration`. Mirrors how the
-        // real `InMemoryController` records `failed_at` at the failure
-        // transition rather than on every read.
+        // Captured once at construction, mirroring how the real
+        // `InMemoryController` records `failed_at` at the failure transition
+        // rather than on every read.
         submitted_at: chrono::DateTime<chrono::Utc>,
         failed_at: chrono::DateTime<chrono::Utc>,
     }
@@ -1061,7 +1057,7 @@ mod sof_export_tests {
     }
 
     #[tokio::test]
-    async fn test_export_failed_status_returns_303_then_failed_manifest() {
+    async fn test_export_failed_status_poll_returns_500_operation_outcome() {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -1081,61 +1077,32 @@ mod sof_export_tests {
         let app = helios_rest::routing::fhir_routes::create_routes(state);
         let server = TestServer::new(app).expect("failed to create test server");
 
-        // Status endpoint must 303 to /export/fail-1/result, mirroring the
-        // success case (spec: terminal states both redirect to result URL).
-        let poll = server
-            .get("/export/fail-1/status")
-            .add_header(X_TENANT_ID, "test-tenant")
-            .await;
-        assert_eq!(
-            poll.status_code(),
-            StatusCode::SEE_OTHER,
-            "failed status should 303, got: {} {}",
-            poll.status_code(),
-            poll.text()
-        );
-        let loc = poll
-            .headers()
-            .get("location")
-            .expect("303 missing Location")
-            .to_str()
-            .unwrap();
-        // Spec: Location is an absolute URL.
-        assert!(
-            loc.starts_with("http://") && loc.ends_with("/export/fail-1/result"),
-            "expected absolute result URL, got: {loc}"
-        );
-
-        // Result endpoint returns 500 with a Parameters manifest carrying
-        // `status=failed` and an `error` part wrapping the OperationOutcome.
-        // Spec status-code table: "500 Internal Server Error: Unexpected
-        // server error (at result URL indicates operation failure)".
-        let result = server.get(loc).add_header(X_TENANT_ID, "test-tenant").await;
-        assert_eq!(result.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body: Value = result.json();
-        assert_eq!(body["resourceType"].as_str(), Some("Parameters"));
-        let params = body["parameter"].as_array().unwrap();
-        let status = params
-            .iter()
-            .find(|p| p["name"].as_str() == Some("status"))
-            .and_then(|p| p["valueCode"].as_str());
-        assert_eq!(status, Some("failed"));
-        let error_outcome = params
-            .iter()
-            .find(|p| p["name"].as_str() == Some("error"))
-            .and_then(|p| p.get("resource"))
-            .expect("manifest must include an `error` part with the OperationOutcome");
-        assert_eq!(
-            error_outcome["resourceType"].as_str(),
-            Some("OperationOutcome")
-        );
-        assert!(
-            error_outcome["issue"][0]["diagnostics"]
-                .as_str()
-                .unwrap_or("")
-                .contains("view runner exploded"),
-            "diagnostics must surface failure message: {body}"
-        );
+        // Spec (Common Operation Behavior — Asynchronous Delivery): a failed
+        // job surfaces directly on the status poll as the relevant error
+        // status code with an OperationOutcome body. There is no 303 redirect.
+        // Poll twice to confirm the terminal failure response is stable.
+        for _ in 0..2 {
+            let poll = server
+                .get("/export/fail-1/status")
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            assert_eq!(
+                poll.status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed status poll should 500, got: {} {}",
+                poll.status_code(),
+                poll.text()
+            );
+            let body: Value = poll.json();
+            assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+            assert!(
+                body["issue"][0]["diagnostics"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("view runner exploded"),
+                "diagnostics must surface failure message: {body}"
+            );
+        }
     }
 
     // =========================================================================
@@ -1175,11 +1142,11 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 19. Result response carries an `Expires` header (IMF-fixdate).
+    // 19. Completion (200 OK) poll carries an `Expires` header (IMF-fixdate).
     // =========================================================================
 
     #[tokio::test]
-    async fn test_export_result_has_expires_header() {
+    async fn test_export_completion_poll_has_expires_header() {
         let (server, backend) = create_test_server_with_export().await;
         seed_patients(&backend).await;
 
@@ -1198,30 +1165,18 @@ mod sof_export_tests {
             .unwrap()
             .to_string();
 
-        // Poll until 303, then GET the result URL directly so we can read
-        // its response headers.
-        let result_url = loop {
+        // Poll until the completing 200 OK so we can read its response
+        // headers — the manifest (and Expires) ride on the status poll.
+        let result = loop {
             let poll = server
                 .get(&location)
                 .add_header(X_TENANT_ID, "test-tenant")
                 .await;
-            if poll.status_code() == StatusCode::SEE_OTHER {
-                break poll
-                    .headers()
-                    .get("location")
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string();
+            if poll.status_code() == StatusCode::OK {
+                break poll;
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         };
-
-        let result = server
-            .get(&result_url)
-            .add_header(X_TENANT_ID, "test-tenant")
-            .await;
-        assert_eq!(result.status_code(), StatusCode::OK);
         let expires = result
             .headers()
             .get("expires")
@@ -1732,84 +1687,9 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 29. Failed job manifest reports a stable `exportEndTime` / `exportDuration`
-    //     across multiple polls of the result URL. Captured once at the failure
-    //     transition (`JobStatus::Failed.failed_at`), not recomputed per poll.
-    // =========================================================================
-
-    #[tokio::test]
-    async fn test_export_failed_manifest_export_end_time_is_stable() {
-        let backend = SqliteBackend::with_config(":memory:", Default::default())
-            .expect("failed to create SQLite backend");
-        backend.init_schema().expect("failed to init schema");
-        let backend = Arc::new(backend);
-
-        // FailingController stores submitted_at/failed_at once at construction,
-        // mirroring how the real InMemoryController records `failed_at` at the
-        // transition into Failed.
-        let submitted_at = chrono::Utc::now() - chrono::Duration::seconds(7);
-        let failed_at = chrono::Utc::now() - chrono::Duration::seconds(2);
-        let controller = FailingController {
-            tenant: "test-tenant".to_string(),
-            job_id: "stable-fail".to_string(),
-            submitted_at,
-            failed_at,
-        };
-        let config = ServerConfig::for_testing();
-        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
-            .with_export_controller(Arc::new(controller));
-        let app = helios_rest::routing::fhir_routes::create_routes(state);
-        let server = TestServer::new(app).expect("failed to create test server");
-
-        let fetch = || async {
-            let r = server
-                .get("/export/stable-fail/result")
-                .add_header(X_TENANT_ID, "test-tenant")
-                .await;
-            assert_eq!(r.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
-            let body: Value = r.json();
-            let params = body["parameter"].as_array().unwrap().clone();
-            let pick = |name: &str, field: &str| -> Option<String> {
-                params
-                    .iter()
-                    .find(|p| p["name"].as_str() == Some(name))
-                    .and_then(|p| p[field].as_str())
-                    .map(|s| s.to_string())
-            };
-            let end_time = pick("exportEndTime", "valueInstant").expect("exportEndTime missing");
-            let duration = params
-                .iter()
-                .find(|p| p["name"].as_str() == Some("exportDuration"))
-                .and_then(|p| p["valueInteger"].as_i64())
-                .expect("exportDuration missing");
-            (end_time, duration)
-        };
-
-        let (end_a, dur_a) = fetch().await;
-        // Sleep across a second boundary so a clock-recomputed value would shift.
-        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
-        let (end_b, dur_b) = fetch().await;
-
-        assert_eq!(
-            end_a, end_b,
-            "exportEndTime must be stable across polls (got {end_a} then {end_b})"
-        );
-        assert_eq!(
-            dur_a, dur_b,
-            "exportDuration must be stable across polls (got {dur_a} then {dur_b})"
-        );
-        // Sanity: the duration matches the (failed_at - submitted_at) window
-        // we constructed (5s). Allow ±1s for clock granularity in formatting.
-        assert!(
-            (4..=6).contains(&dur_a),
-            "expected ~5s duration, got {dur_a}"
-        );
-    }
-
-    // =========================================================================
     // 30. Cancel after completion is a no-op: the cancel call returns 202
     //     (the job exists) but does not overwrite the `Completed` state, so
-    //     the result URL keeps serving the manifest.
+    //     the status URL keeps serving the manifest.
     // =========================================================================
 
     #[tokio::test]
@@ -1858,32 +1738,18 @@ mod sof_export_tests {
             cancel.text()
         );
 
-        // Status URL must still 303 to the result URL (terminal state).
-        let poll = server
+        // Status URL must still serve the Completed manifest with 200.
+        let result_after = server
             .get(&status_url)
             .add_header(X_TENANT_ID, "test-tenant")
             .await;
         assert_eq!(
-            poll.status_code(),
-            StatusCode::SEE_OTHER,
-            "completed job should still 303 after spurious cancel: {} {}",
-            poll.status_code(),
-            poll.text()
+            result_after.status_code(),
+            StatusCode::OK,
+            "completed job should still 200 after spurious cancel: {} {}",
+            result_after.status_code(),
+            result_after.text()
         );
-        let result_url = poll
-            .headers()
-            .get("location")
-            .expect("303 missing Location")
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        // Result URL must still serve the same Completed manifest.
-        let result_after = server
-            .get(&result_url)
-            .add_header(X_TENANT_ID, "test-tenant")
-            .await;
-        assert_eq!(result_after.status_code(), StatusCode::OK);
         let manifest_after: Value = result_after.json();
         let status_after = manifest_after["parameter"]
             .as_array()

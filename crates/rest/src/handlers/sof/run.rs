@@ -37,11 +37,16 @@ use axum::{
 use futures::StreamExt;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{SofError, ViewFilters};
+use helios_sof::fhir_format::{
+    FHIR_JSON_MIME, accept_has_mime, accept_requires_unsupported_fhir_xml,
+    format_view_fhir_parameters, wrap_in_binary_envelope,
+};
 use helios_sof::{
     ContentType, ExtractedRunParams, RunOptions, body_has_view_definition,
     create_bundle_from_resources_for_version, extract_run_params_from_json,
     filter_resources_by_patient_and_group, filter_resources_by_since,
-    parse_view_definition_for_version, run_view_definition_with_options, split_csv_refs,
+    parse_view_definition_for_version, process_view_definition, run_view_definition_with_options,
+    split_csv_refs,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -387,16 +392,40 @@ where
         .map(|h| h == "true" || h == "1")
         .unwrap_or(true);
 
+    // Spec Common Operation Behavior axis 2 (representation): the FHIR XML
+    // envelope form is not supported → 406, never raw bytes under a FHIR
+    // media type.
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    if accept_requires_unsupported_fhir_xml(accept) {
+        return Err(RestError::NotAcceptable {
+            message: "the application/fhir+xml representation is not supported; \
+                      use application/fhir+json"
+                .to_string(),
+        });
+    }
+    let is_fhir_format = matches!(format.as_str(), "fhir" | "application/fhir+json");
+    // `Accept: application/fhir+json` with an explicit flat `_format` selects
+    // the serialized `Binary` envelope representation (`_format=fhir` is
+    // already a FHIR resource and is never wrapped).
+    let wants_envelope = !is_fhir_format && accept_has_mime(accept, FHIR_JSON_MIME);
+
     // Validate the format value up front so unknown values fail with 400 on
     // every path (inline + streaming), not only the inline one. The
     // resolved `ContentType` is threaded through downstream so we don't
-    // re-parse the format string later (audit item #15).
-    let content_type =
-        parse_content_type(&format, include_header).ok_or_else(|| RestError::BadRequest {
-            message: format!(
-                "unsupported _format value '{format}'; supported: ndjson, json, csv, parquet"
-            ),
-        })?;
+    // re-parse the format string later (audit item #15). The `fhir` format
+    // lives outside the flat-format `ContentType` enum and is rendered by
+    // `format_view_fhir_parameters` instead.
+    let content_type = if is_fhir_format {
+        None
+    } else {
+        Some(
+            parse_content_type(&format, include_header).ok_or_else(|| RestError::BadRequest {
+                message: format!(
+                    "unsupported _format value '{format}'; supported: ndjson, json, csv, parquet, fhir"
+                ),
+            })?,
+        )
+    };
 
     // Audit item #10: enforce the same `_limit` bound as sof-server so
     // both binaries reject the same out-of-range values consistently.
@@ -405,7 +434,14 @@ where
     validate_limit(params.limit)?;
 
     if !body_params.inline_resources.is_empty() {
-        return execute_view_inline(&state, &params, &body_params, view_json, content_type);
+        return execute_view_inline(
+            &state,
+            &params,
+            &body_params,
+            view_json,
+            content_type,
+            wants_envelope,
+        );
     }
 
     let runner = state
@@ -434,13 +470,37 @@ where
         .map_err(map_sof_error_to_rest)?;
     let runner_label = runner.runner_name().to_string();
 
-    // Streaming path for ndjson: forward rows incrementally.
-    if matches!(content_type, ContentType::NdJson) {
+    // `_format=fhir`: buffer the rows and render the typed `Parameters`
+    // resource, using the ViewDefinition's declared column types.
+    let Some(content_type) = content_type else {
+        let rows = drain_stream(stream).await?;
+        let result = helios_sof::rows_to_processed_result(rows);
+        let body =
+            format_view_fhir_parameters(&result, &view_json).map_err(map_sof_lib_error_to_rest)?;
+        return Ok(build_response(
+            StatusCode::OK,
+            FHIR_JSON_MIME,
+            body,
+            &runner_label,
+            "fhir",
+        ));
+    };
+
+    // Streaming path for ndjson: forward rows incrementally. An envelope
+    // request forfeits streaming — the base64 `Binary` wrapper needs the
+    // whole payload — so it falls through to the buffered path.
+    if matches!(content_type, ContentType::NdJson) && !wants_envelope {
         return Ok(streaming_ndjson_response(stream, &runner_label));
     }
 
     // Buffered paths (csv, json array, parquet) — collect the stream first.
     let (ct, body) = format_stream(stream, content_type).await?;
+    let (ct, body) = if wants_envelope {
+        let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
+        (FHIR_JSON_MIME, wrapped)
+    } else {
+        (ct, body)
+    };
     Ok(build_response(
         StatusCode::OK,
         ct,
@@ -454,19 +514,24 @@ where
 /// `helios-sof` FHIRPath evaluator. Returns fully buffered output bytes —
 /// inline runs do not stream because the evaluator materialises the entire
 /// result set before formatting.
+///
+/// `content_type` is `None` for `_format=fhir` (rendered via
+/// [`format_view_fhir_parameters`] rather than the flat-format pipeline);
+/// `wants_envelope` wraps a flat payload in a serialized `Binary` resource.
 fn execute_view_inline<S>(
     state: &AppState<S>,
     params: &RunQueryParams,
     body_params: &ExtractedRunParams,
     view_json: Value,
-    content_type: ContentType,
+    content_type: Option<ContentType>,
+    wants_envelope: bool,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
 {
     let fhir_version = state.config().default_fhir_version;
 
-    let view_definition = parse_view_definition_for_version(view_json, fhir_version)
+    let view_definition = parse_view_definition_for_version(view_json.clone(), fhir_version)
         .map_err(map_sof_lib_error_to_rest)?;
 
     let mut resources = body_params.inline_resources.clone();
@@ -522,10 +587,37 @@ where
         "dispatching $viewdefinition-run (inline)"
     );
 
+    // `_format=fhir`: render the typed `Parameters` resource from the
+    // structured rows; `_limit` is applied at the row level to match the
+    // flat-format pipeline's `apply_pagination_to_result`.
+    let Some(content_type) = content_type else {
+        let mut processed =
+            process_view_definition(view_definition, bundle).map_err(map_sof_lib_error_to_rest)?;
+        if let Some(limit) = params.limit {
+            processed.rows.truncate(limit);
+        }
+        let body = format_view_fhir_parameters(&processed, &view_json)
+            .map_err(map_sof_lib_error_to_rest)?;
+        return Ok(build_response(
+            StatusCode::OK,
+            FHIR_JSON_MIME,
+            body,
+            "in-process",
+            "fhir",
+        ));
+    };
+
     let body = run_view_definition_with_options(view_definition, bundle, content_type, options)
         .map_err(map_sof_lib_error_to_rest)?;
 
     let (ct_header, response_format) = content_type_headers(content_type);
+    let (ct_header, body) = if wants_envelope {
+        let wrapped =
+            wrap_in_binary_envelope(ct_header, &body).map_err(map_sof_lib_error_to_rest)?;
+        (FHIR_JSON_MIME, wrapped)
+    } else {
+        (ct_header, body)
+    };
 
     Ok(build_response(
         StatusCode::OK,
@@ -544,7 +636,7 @@ fn content_type_headers(ct: ContentType) -> (&'static str, &'static str) {
         ContentType::Csv | ContentType::CsvWithHeader => ("text/csv; charset=utf-8", "csv"),
         ContentType::Json => ("application/json", "json"),
         ContentType::NdJson => ("application/x-ndjson", "ndjson"),
-        ContentType::Parquet => ("application/octet-stream", "parquet"),
+        ContentType::Parquet => ("application/vnd.apache.parquet", "parquet"),
     }
 }
 
@@ -575,8 +667,9 @@ fn validate_limit(limit: Option<usize>) -> Result<(), RestError> {
 ///
 /// Accept-header values map: `application/json` → `json`,
 /// `application/x-ndjson`/`application/ndjson` → `ndjson`, `text/csv` → `csv`,
-/// `application/octet-stream`/`application/parquet` → `parquet`. Unknown or
-/// wildcard Accept values fall through to the `ndjson` default.
+/// `application/octet-stream`/`application/parquet` → `parquet`,
+/// `application/fhir+json` → `fhir`. Unknown or wildcard Accept values fall
+/// through to the `ndjson` default.
 fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> String {
     if let Some(f) = format_param {
         return f.to_lowercase();
@@ -593,7 +686,10 @@ fn resolve_format(format_param: Option<&str>, headers: &HeaderMap) -> String {
                 "application/json" => Some("json"),
                 "application/x-ndjson" | "application/ndjson" => Some("ndjson"),
                 "text/csv" => Some("csv"),
-                "application/octet-stream" | "application/parquet" => Some("parquet"),
+                "application/octet-stream"
+                | "application/parquet"
+                | "application/vnd.apache.parquet" => Some("parquet"),
+                "application/fhir+json" => Some("fhir"),
                 _ => None,
             });
         if let Some(f) = mapped {
@@ -614,9 +710,10 @@ fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType>
         } else {
             ContentType::Csv
         }),
-        "parquet" | "application/parquet" | "application/octet-stream" => {
-            Some(ContentType::Parquet)
-        }
+        "parquet"
+        | "application/parquet"
+        | "application/octet-stream"
+        | "application/vnd.apache.parquet" => Some(ContentType::Parquet),
         _ => None,
     }
 }
@@ -768,7 +865,11 @@ fn build_response(
         "x-hfs-runner",
         HeaderValue::from_str(runner_label).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
     );
-    if format == "parquet" || format == "application/octet-stream" {
+    if (format == "parquet"
+        || format == "application/octet-stream"
+        || format == "application/vnd.apache.parquet")
+        && content_type != FHIR_JSON_MIME
+    {
         headers.insert(
             header::CONTENT_DISPOSITION,
             HeaderValue::from_static("attachment; filename=\"output.parquet\""),

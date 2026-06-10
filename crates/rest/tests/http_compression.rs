@@ -208,6 +208,60 @@ async fn test_response_is_gzip_compressed_on_accept_encoding() {
     assert_eq!(json["resourceType"], "CapabilityStatement");
 }
 
+/// Parquet output is already compressed — the response-compression layer
+/// must skip it (for both parquet media-type identifiers; HFS emits the
+/// spec-native `application/vnd.apache.parquet`).
+#[tokio::test]
+async fn test_parquet_response_is_not_http_compressed() {
+    let server = create_test_server(test_config());
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "id", "path": "id", "type": "id"}]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "pq-1", "active": true}
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$viewdefinition-run?_format=parquet")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("accept-encoding", "gzip")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "{}",
+        response.text()
+    );
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/vnd.apache.parquet"
+    );
+    // Parquet is already compressed — the gzip layer must skip it.
+    assert!(
+        response.headers().get("content-encoding").is_none(),
+        "parquet response must not be re-compressed"
+    );
+    assert!(
+        response.as_bytes().starts_with(b"PAR1"),
+        "body must be raw parquet bytes"
+    );
+}
+
 #[tokio::test]
 async fn test_response_is_not_compressed_without_accept_encoding() {
     let server = create_test_server(test_config());

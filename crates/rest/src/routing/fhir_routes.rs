@@ -408,15 +408,10 @@ where
             get(handlers::sof::get_export_status_handler::<S>)
                 .delete(handlers::sof::cancel_export_handler::<S>),
         )
-        // Export result: GET /export/{job-id}/result
-        // Reached via the 303 redirect from the status endpoint on completion.
-        // Registered before the download route so the literal `result` path
-        // segment isn't captured by `{filename}`.
-        .route(
-            "/export/{job_id}/result",
-            get(handlers::sof::get_export_result_handler::<S>),
-        )
         // Export download: GET /export/{job-id}/{filename}
+        // (The completion manifest is served by the status endpoint with
+        // 200 OK per the spec's async pattern — there is no separate
+        // /result route.)
         .route(
             "/export/{job_id}/{filename}",
             get(handlers::sof::download_export_file_handler::<S>),

@@ -81,7 +81,9 @@ async fn capability_statement_handler() -> axum::response::Response {
             "application/json",
             "application/x-ndjson",
             "text/csv",
-            "application/octet-stream"
+            "application/vnd.apache.parquet",
+            "application/octet-stream",
+            "application/fhir+json"
         ],
         "rest": [{
             "mode": "server",
@@ -508,15 +510,11 @@ async fn run_view_definition_handler(
                 );
             };
 
-            // Per SoF v2 spec: parquet uses `application/octet-stream`
-            // (audit item #8). Production code does the same; mirroring
-            // here so integration tests exercise the right headers.
-            let mime_type = match content_type {
-                ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
-                ContentType::Json => "application/json",
-                ContentType::NdJson => "application/x-ndjson",
-                ContentType::Parquet => "application/octet-stream",
-            };
+            // Per SoF v2 spec: each format's native media type (parquet is
+            // `application/vnd.apache.parquet`). Production code does the
+            // same; mirroring here so integration tests exercise the right
+            // headers.
+            let mime_type = content_type.mime_type();
 
             if matches!(content_type, ContentType::Parquet) {
                 (

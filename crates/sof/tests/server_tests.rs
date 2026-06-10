@@ -966,13 +966,14 @@ async fn test_instance_level_returns_400_with_stateless_explanation() {
     );
 }
 
-/// Audit item #8: parquet output uses `application/octet-stream` per the
-/// SoF v2 spec Accept table, plus `Content-Disposition: attachment;
-/// filename="output.parquet"` so downloads land with the right
-/// extension. Pre-fix, sof-server returned `application/parquet`
-/// (non-standard).
+/// Parquet output uses its native media type
+/// `application/vnd.apache.parquet` per the SoF v2 Common Operation
+/// Behavior table, plus `Content-Disposition: attachment;
+/// filename="output.parquet"` so downloads land with the right extension.
+/// `application/octet-stream` / `application/parquet` remain accepted as
+/// request-side aliases.
 #[tokio::test]
-async fn test_parquet_response_uses_octet_stream_content_type() {
+async fn test_parquet_response_uses_native_parquet_content_type() {
     let server = common::test_server().await;
 
     let body = json!({
@@ -1013,8 +1014,8 @@ async fn test_parquet_response_uses_octet_stream_content_type() {
         .unwrap_or("")
         .to_string();
     assert_eq!(
-        ct, "application/octet-stream",
-        "parquet response must use application/octet-stream per spec, got {ct}"
+        ct, "application/vnd.apache.parquet",
+        "parquet response must use its native media type per spec, got {ct}"
     );
     let cd = response
         .headers()

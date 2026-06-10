@@ -161,7 +161,23 @@ pub fn extract_run_params_from_json(body: &Value) -> ExtractedRunParams {
             }
             "resource" => {
                 if let Some(r) = p.get("resource") {
-                    out.inline_resources.push(r.clone());
+                    // Spec (Resource Parameter and Bundle Inputs): a `Bundle`
+                    // supplied as a `resource` value is unwrapped one level —
+                    // the view runs against each `Bundle.entry[*].resource`,
+                    // never against the `Bundle` itself. Mixing discrete
+                    // resources and bundles is permitted; the effective input
+                    // is their union.
+                    if r.get("resourceType").and_then(|v| v.as_str()) == Some("Bundle") {
+                        if let Some(entries) = r.get("entry").and_then(|e| e.as_array()) {
+                            for entry in entries {
+                                if let Some(res) = entry.get("resource") {
+                                    out.inline_resources.push(res.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        out.inline_resources.push(r.clone());
+                    }
                 }
             }
             "source" => {

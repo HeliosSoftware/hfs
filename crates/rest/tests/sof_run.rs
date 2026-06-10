@@ -1545,4 +1545,258 @@ mod sof_run_tests {
             "error message must explain the upper bound: {body}"
         );
     }
+
+    // =========================================================================
+    // SoF v2 Common Operation Behavior (spec PR #365): `fhir` output format,
+    // Binary-envelope representation, and FHIR-XML rejection.
+    // =========================================================================
+
+    /// `_format=fhir` returns a FHIR `Parameters` resource with one `row`
+    /// parameter per result row, parts typed by the declared `column.type`.
+    #[tokio::test]
+    async fn test_run_fhir_format_returns_parameters() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-001", "Smith").await;
+        seed_patient(&backend, "pt-002", "Jones").await;
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=fhir")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&patient_view_definition())
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            ct.starts_with("application/fhir+json"),
+            "expected application/fhir+json, got: {ct}"
+        );
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], json!("Parameters"));
+        let rows = body["parameter"].as_array().expect("parameter array");
+        assert_eq!(rows.len(), 2, "one row parameter per result row: {body}");
+        for row in rows {
+            assert_eq!(row["name"], json!("row"));
+            let parts = row["part"].as_array().expect("row parts");
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| p["name"] == json!("family") && p["valueString"].is_string()),
+                "row must carry a typed family part: {row}"
+            );
+        }
+    }
+
+    /// `Accept: application/fhir+json` with no `_format` selects the `fhir`
+    /// output format (axis 1 of the spec's content-negotiation rules).
+    #[tokio::test]
+    async fn test_run_accept_fhir_json_selects_fhir_format() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-001", "Smith").await;
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("accept"),
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        response.assert_status(StatusCode::OK);
+        let body: Value = response.json();
+        assert_eq!(
+            body["resourceType"],
+            json!("Parameters"),
+            "Accept: application/fhir+json must select the fhir format: {body}"
+        );
+    }
+
+    /// `Accept: application/fhir+json` with an explicit flat `_format`
+    /// returns the payload wrapped in a serialized `Binary` resource
+    /// envelope (axis 2 of the spec's content-negotiation rules).
+    #[tokio::test]
+    async fn test_run_accept_fhir_json_with_csv_format_returns_binary_envelope() {
+        use base64::Engine as _;
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-001", "Smith").await;
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=csv")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("accept"),
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            ct.starts_with("application/fhir+json"),
+            "envelope must be served as application/fhir+json, got: {ct}"
+        );
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], json!("Binary"));
+        assert!(
+            body["contentType"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("text/csv"),
+            "Binary.contentType must be csv's native media type: {body}"
+        );
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body["data"].as_str().expect("Binary.data"))
+            .expect("Binary.data must be base64");
+        let csv = String::from_utf8(decoded).expect("decoded csv is utf8");
+        assert!(csv.contains("Smith"), "decoded csv: {csv}");
+    }
+
+    /// The envelope representation also applies to ndjson — the request
+    /// forfeits streaming and gets a buffered `Binary` envelope.
+    #[tokio::test]
+    async fn test_run_accept_fhir_json_with_ndjson_format_returns_binary_envelope() {
+        use base64::Engine as _;
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-001", "Smith").await;
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("accept"),
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        response.assert_status(StatusCode::OK);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], json!("Binary"));
+        assert_eq!(body["contentType"], json!("application/x-ndjson"));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body["data"].as_str().expect("Binary.data"))
+            .expect("Binary.data must be base64");
+        let ndjson = String::from_utf8(decoded).expect("decoded ndjson is utf8");
+        assert!(ndjson.contains("Smith"), "decoded ndjson: {ndjson}");
+    }
+
+    /// `Accept: application/fhir+xml` (without fhir+json) is not supported
+    /// → `406 Not Acceptable` + OperationOutcome, never raw bytes under a
+    /// FHIR media type.
+    #[tokio::test]
+    async fn test_run_accept_fhir_xml_returns_406() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-001", "Smith").await;
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=csv")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("accept"),
+                HeaderValue::from_static("application/fhir+xml"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        response.assert_status(StatusCode::NOT_ACCEPTABLE);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], json!("OperationOutcome"));
+    }
+
+    /// `_format=fhir` on the inline-resources path (in-process evaluator).
+    /// Also exercises empty-row omission: a row with no family still gets a
+    /// `row` parameter, with the NULL part omitted.
+    #[tokio::test]
+    async fn test_run_fhir_format_inline_resources() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "viewResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-a",
+                    "name": [{"family": "InlineA"}]
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-b"
+                }}
+            ]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=fhir")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let out: Value = response.json();
+        assert_eq!(out["resourceType"], json!("Parameters"));
+        let rows = out["parameter"].as_array().expect("parameter array");
+        assert_eq!(rows.len(), 2, "{out}");
+        // The family-less patient's row omits the NULL family part.
+        let part_counts: Vec<usize> = rows
+            .iter()
+            .map(|r| r["part"].as_array().map(|p| p.len()).unwrap_or(0))
+            .collect();
+        assert!(
+            part_counts.contains(&2) && part_counts.contains(&1),
+            "expected one full row and one row with the NULL part omitted: {out}"
+        );
+    }
+
+    /// Spec PR #365 worked Example 5: a `Bundle` supplied as a `resource`
+    /// value is unwrapped — the ViewDefinition runs against each
+    /// `Bundle.entry[*].resource`, equivalent to passing the entries as
+    /// discrete `resource` values.
+    #[tokio::test]
+    async fn test_run_bundle_resource_value_is_unwrapped() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "viewResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Bundle",
+                    "type": "collection",
+                    "entry": [
+                        {"resource": {"resourceType": "Patient", "id": "pt-1",
+                            "name": [{"family": "Cole", "given": ["Joanie"]}]}},
+                        {"resource": {"resourceType": "Patient", "id": "pt-2",
+                            "name": [{"family": "Doe", "given": ["John"]}]}}
+                    ]
+                }}
+            ]
+        });
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "Bundle must be unwrapped into entries: {rows:?}"
+        );
+        let families: Vec<&str> = rows.iter().filter_map(|r| r["family"].as_str()).collect();
+        assert!(families.contains(&"Cole") && families.contains(&"Doe"));
+    }
 }

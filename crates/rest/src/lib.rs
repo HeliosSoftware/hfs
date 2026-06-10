@@ -177,6 +177,7 @@ use helios_persistence::core::{
 use tower::ServiceBuilder;
 use tower_http::{
     compression::CompressionLayer,
+    compression::predicate::{NotForContentType, Predicate, SizeAbove},
     cors::{Any, CorsLayer},
     decompression::RequestDecompressionLayer,
     timeout::TimeoutLayer,
@@ -629,9 +630,22 @@ where
     // *decompressed* bytes — a small highly-compressed payload cannot bypass
     // `HFS_MAX_BODY_SIZE`. Kept inside the CORS layer so 415/413 error
     // responses still carry CORS headers for browser clients.
+    //
+    // Never re-compress Parquet or ZIP output (SoF run/export responses) —
+    // both are already compressed, so HTTP-level compression would only burn
+    // CPU for no size win. Both parquet media-type identifiers are excluded:
+    // `application/vnd.apache.parquet` (the spec's native media type) and
+    // the legacy `application/parquet` alias, matching sof-server's
+    // predicate.
+    let compress_predicate = SizeAbove::new(32)
+        .and(NotForContentType::const_new("application/parquet"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apache.parquet",
+        ))
+        .and(NotForContentType::const_new("application/zip"));
     let router = router
         .layer(RequestDecompressionLayer::new())
-        .layer(CompressionLayer::new());
+        .layer(CompressionLayer::new().compress_when(compress_predicate));
 
     // Add CORS if enabled
     let router = if config.enable_cors {
