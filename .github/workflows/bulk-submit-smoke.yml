@@ -35,7 +35,7 @@ jobs:
             echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]'
           } >> ~/.cargo/config.toml
       - name: Build HFS
-        run: cargo build -p helios-hfs --no-default-features --features R4,postgres
+        run: cargo build -p helios-hfs --no-default-features --features R4,sqlite,postgres
       - uses: actions/upload-artifact@v7
         with:
           name: hfs-bulk-submit-smoke-binary
@@ -59,8 +59,18 @@ jobs:
           path: target/debug
       - run: chmod +x target/debug/hfs
 
-      - name: Resolve runner IP
-        run: echo "RUNNER_IP=$(hostname -I | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Determine runner and Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
 
       - name: Start PostgreSQL (postgres backend only)
         if: matrix.backend == 'postgres'
@@ -73,11 +83,19 @@ jobs:
           echo "PG_CONTAINER=$PG" >> "$GITHUB_ENV"
           for i in {1..30}; do
             if docker exec "$PG" pg_isready -U helios >/dev/null 2>&1; then
-              echo "PG_PORT=$(docker port "$PG" 5432 | head -1 | sed 's/.*://')" >> "$GITHUB_ENV"
-              break
+              PG_PORT=$(docker port "$PG" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+                echo "PG_URL=postgresql://helios:helios@$DOCKER_HOST_IP:$PG_PORT/helios" >> "$GITHUB_ENV"
+                echo "PostgreSQL is ready on port $PG_PORT"
+                exit 0
+              fi
             fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
             sleep 2
           done
+          docker logs "$PG"
+          exit 1
 
       - name: Stage Data-Provider manifest + NDJSON
         run: |
@@ -112,18 +130,27 @@ jobs:
           COMMON="HFS_BASE_URL=http://$RUNNER_IP:$PORT HFS_BULK_SUBMIT_ENABLED=true HFS_BULK_SUBMIT_BATCH_SIZE=100"
           if [ "${{ matrix.backend }}" = "postgres" ]; then
             export HFS_STORAGE_BACKEND=postgres
-            export HFS_DATABASE_URL="postgresql://helios:helios@$RUNNER_IP:$PG_PORT/helios"
+            export HFS_DATABASE_URL="$PG_URL"
           else
             export HFS_STORAGE_BACKEND=sqlite
             export HFS_DATABASE_URL="$RUNNER_IP-ignored"
             rm -f ./data/hfs.db
           fi
           env $COMMON ./target/debug/hfs --port "$PORT" --host 0.0.0.0 >/tmp/hfs.log 2>&1 &
-          echo $! > /tmp/hfs.pid
+          HFS_PID=$!
+          echo "$HFS_PID" > /tmp/hfs.pid
           for i in {1..30}; do
-            if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then echo "HFS ready"; break; fi
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "HFS process exited"
+              cat /tmp/hfs.log
+              exit 1
+            fi
+            if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then echo "HFS ready"; exit 0; fi
+            echo "Attempt $i/30: HFS not ready yet..."
             sleep 2
           done
+          tail -100 /tmp/hfs.log
+          exit 1
 
       - name: Kick off $bulk-submit
         run: |
