@@ -412,15 +412,25 @@ fn prefer_snapshot(paths: Vec<String>) -> Vec<String> {
     }
 }
 
+/// Pick a single file from candidate paths, preferring Snapshot variants and
+/// sorting for determinism. Production RF2 ZIPs ship `Full/` and `Snapshot/`
+/// side by side; the Full variant must not be parsed by the snapshot-oriented
+/// single-pass parsers.
+fn pick_single(paths: Vec<String>) -> Option<String> {
+    let mut paths = prefer_snapshot(paths);
+    paths.sort();
+    paths.into_iter().next()
+}
+
 #[allow(clippy::type_complexity)]
 fn find_rf2_paths(
     path: &Path,
 ) -> Result<(String, Vec<String>, String, Vec<String>, Vec<String>), HtsError> {
     let mut zip = open_zip(path)?;
 
-    let mut concept_path: Option<String> = None;
+    let mut concept_paths: Vec<String> = Vec::new();
     let mut desc_paths: Vec<String> = Vec::new();
-    let mut rel_path: Option<String> = None;
+    let mut rel_paths: Vec<String> = Vec::new();
     let mut assoc_refset_paths: Vec<String> = Vec::new();
     let mut lang_refset_paths: Vec<String> = Vec::new();
 
@@ -444,11 +454,11 @@ fn find_rf2_paths(
         }
 
         if lower.contains("concept_") {
-            concept_path = Some(name);
+            concept_paths.push(name);
         } else if lower.contains("description_") {
             desc_paths.push(name);
         } else if lower.contains("relationship_") && !lower.contains("statedrelationship") {
-            rel_path = Some(name);
+            rel_paths.push(name);
         }
     }
 
@@ -458,6 +468,8 @@ fn find_rf2_paths(
     desc_paths.sort();
     let mut lang_refset_paths = prefer_snapshot(lang_refset_paths);
     lang_refset_paths.sort();
+    let mut assoc_refset_paths = prefer_snapshot(assoc_refset_paths);
+    assoc_refset_paths.sort();
 
     if desc_paths.is_empty() {
         return Err(HtsError::InvalidRequest(
@@ -467,14 +479,14 @@ fn find_rf2_paths(
     }
 
     Ok((
-        concept_path.ok_or_else(|| {
+        pick_single(concept_paths).ok_or_else(|| {
             HtsError::InvalidRequest(
                 "No Concept RF2 file found. Expected a file containing 'Concept_' in its path."
                     .into(),
             )
         })?,
         desc_paths,
-        rel_path.ok_or_else(|| {
+        pick_single(rel_paths).ok_or_else(|| {
             HtsError::InvalidRequest(
                 "No Relationship RF2 file found. Expected a file containing 'Relationship_' in its path."
                     .into(),
@@ -990,6 +1002,52 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
         tmp
     }
 
+    /// Like [`make_test_rf2_zip`], but the archive also carries `Full/`
+    /// variants (as production RF2 distributions do) whose extra rows would
+    /// corrupt the import if they were parsed alongside the Snapshot files.
+    fn make_full_and_snapshot_rf2_zip() -> NamedTempFile {
+        // Poison rows: an extra concept, description, and relationship that
+        // exist only in the Full files.
+        const FULL_CONCEPT_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\tdefinitionStatusId\r\n\
+123456001\t20240101\t1\t900000000000207008\t900000000000074008\r\n\
+789012001\t20240101\t1\t900000000000207008\t900000000000074008\r\n\
+555555001\t20230101\t1\t900000000000207008\t900000000000074008\r\n";
+        const FULL_DESCRIPTION_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcaseSignificanceId\r\n\
+311001\t20230101\t1\t900000000000207008\t123456001\ten\t900000000000013009\tStale full-file term\t900000000000448009\r\n";
+        const FULL_RELATIONSHIP_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\ttypeId\tcharacteristicTypeId\tmodifierId\r\n\
+444001\t20230101\t1\t900000000000207008\t123456001\t789012001\t0\t116680003\t900000000000011006\t900000000000451002\r\n";
+
+        let tmp = make_test_rf2_zip();
+        {
+            let mut zip = zip::ZipWriter::new_append(tmp.reopen().unwrap()).unwrap();
+            let opts = zip::write::FileOptions::default();
+
+            zip.start_file("Full/Terminology/sct2_Concept_Full_INT_20240101.txt", opts)
+                .unwrap();
+            zip.write_all(FULL_CONCEPT_TSV.as_bytes()).unwrap();
+
+            zip.start_file(
+                "Full/Terminology/sct2_Description_Full-en_INT_20240101.txt",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(FULL_DESCRIPTION_TSV.as_bytes()).unwrap();
+
+            zip.start_file(
+                "Full/Terminology/sct2_Relationship_Full_INT_20240101.txt",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(FULL_RELATIONSHIP_TSV.as_bytes()).unwrap();
+
+            zip.finish().unwrap();
+        }
+        tmp
+    }
+
     /// Run the description/refset parsing pipeline over the test fixtures.
     fn parse_fixture_terms() -> HashMap<String, ConceptTerms> {
         let mut errors = Vec::new();
@@ -1237,6 +1295,25 @@ BADLINE\r\n";
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 2);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
+    }
+
+    #[tokio::test]
+    async fn import_snomed_rf2_ignores_full_files_when_snapshot_present() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_full_and_snapshot_rf2_zip();
+
+        let stats = import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false)
+            .await
+            .expect("import should succeed");
+
+        // Identical to the snapshot-only archive: the Full files' poison rows
+        // (extra concept 555555001, stale description, duplicate edge) must
+        // not be parsed.
+        assert_eq!(stats.concepts, 2);
+        assert_eq!(count_rows(&backend, "concepts"), 2);
+        assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
+        assert_eq!(count_rows(&backend, "concept_designations"), 8);
     }
 
     #[tokio::test]
