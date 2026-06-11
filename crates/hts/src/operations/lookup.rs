@@ -416,7 +416,8 @@ pub async fn lookup_handler<B: TerminologyBackend>(
 ) -> Result<Response, HtsError> {
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
-    let params = extract_parameter_array(&body)?;
+    let mut params = extract_parameter_array(&body)?;
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(process_lookup(&state, params).await?, format))
 }
 
@@ -433,7 +434,8 @@ pub async fn get_lookup_handler<B: TerminologyBackend>(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
-    let params = query_params_to_fhir_params(pairs);
+    let mut params = query_params_to_fhir_params(pairs);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(process_lookup(&state, params).await?, format))
 }
 
@@ -498,10 +500,9 @@ pub async fn lookup_by_id_post<B: TerminologyBackend>(
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
-    Ok(fhir_respond(
-        process_lookup(&state, inject_system(raw_params, system)).await?,
-        format,
-    ))
+    let mut params = inject_system(raw_params, system);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
+    Ok(fhir_respond(process_lookup(&state, params).await?, format))
 }
 
 /// `GET /CodeSystem/{id}/$lookup?code=<code>`
@@ -526,10 +527,9 @@ pub async fn get_lookup_by_id<B: TerminologyBackend>(
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
-    Ok(fhir_respond(
-        process_lookup(&state, inject_system(params, system)).await?,
-        format,
-    ))
+    let mut params = inject_system(params, system);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
+    Ok(fhir_respond(process_lookup(&state, params).await?, format))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -568,7 +568,8 @@ mod tests {
         Router::new()
             .route(
                 "/CodeSystem/$lookup",
-                post(lookup_handler::<SqliteTerminologyBackend>),
+                post(lookup_handler::<SqliteTerminologyBackend>)
+                    .get(get_lookup_handler::<SqliteTerminologyBackend>),
             )
             .with_state(state)
     }
@@ -613,6 +614,92 @@ mod tests {
         let params = json["parameter"].as_array().unwrap();
         let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
         assert_eq!(display_param["valueString"], "Alpha Beta Charlie");
+    }
+
+    #[tokio::test]
+    async fn lookup_accept_language_header_selects_designation_display() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "system", "valueUri": "http://example.org/cs"},
+                {"name": "code", "valueCode": "ABC"}
+            ]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/CodeSystem/$lookup")
+                    .header("content-type", "application/json")
+                    .header("accept-language", "fr, en;q=0.8")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
+        assert_eq!(display_param["valueString"], "Alpha Bêta Charlie");
+    }
+
+    #[tokio::test]
+    async fn lookup_explicit_display_language_wins_over_accept_language_header() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "system", "valueUri": "http://example.org/cs"},
+                {"name": "code", "valueCode": "ABC"},
+                {"name": "displayLanguage", "valueCode": "en"}
+            ]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/CodeSystem/$lookup")
+                    .header("content-type", "application/json")
+                    .header("accept-language", "fr")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
+        // No `en` designation exists, so the default display is kept — the
+        // injected header must NOT have overridden the explicit parameter.
+        assert_eq!(display_param["valueString"], "Alpha Beta Charlie");
+    }
+
+    #[tokio::test]
+    async fn get_lookup_accept_language_header_selects_designation_display() {
+        let app = make_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/CodeSystem/$lookup?system=http%3A%2F%2Fexample.org%2Fcs&code=ABC")
+                    .header("accept-language", "fr")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
+        assert_eq!(display_param["valueString"], "Alpha Bêta Charlie");
     }
 
     #[tokio::test]
