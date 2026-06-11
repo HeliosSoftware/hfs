@@ -47,6 +47,7 @@ use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
 };
+use helios_sof::fhir_format::accept_requires_unsupported_fhir_xml;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -1018,10 +1019,24 @@ pub async fn get_export_status_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
     Path(job_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, RestError>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    // Spec Common Operation Behavior — Asynchronous Delivery: the `Accept`
+    // header on each poll governs that poll's response, including the
+    // completion manifest. The FHIR XML representation is not supported →
+    // 406, same as the run operations.
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    if accept_requires_unsupported_fhir_xml(accept) {
+        return Err(RestError::NotAcceptable {
+            message: "the application/fhir+xml representation is not supported; \
+                      use application/fhir+json"
+                .to_string(),
+        });
+    }
+
     let controller = match state.export_controller() {
         Some(c) => c,
         None => {

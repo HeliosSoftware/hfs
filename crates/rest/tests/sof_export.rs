@@ -177,6 +177,46 @@ mod sof_export_tests {
         );
     }
 
+    /// `Accept: application/fhir+xml` (without fhir+json) on a status poll is
+    /// not supported → `406 Not Acceptable` + OperationOutcome, same as the
+    /// run operations. The poll's `Accept` header governs the manifest
+    /// representation per Common Operation Behavior — Asynchronous Delivery.
+    #[tokio::test]
+    async fn test_export_status_poll_accept_fhir_xml_returns_406() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+
+        let location = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let poll = server
+            .get(&location)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .add_header(HeaderName::from_static("accept"), "application/fhir+xml")
+            .await;
+        assert_eq!(
+            poll.status_code(),
+            StatusCode::NOT_ACCEPTABLE,
+            "{}",
+            poll.text()
+        );
+        let body: Value = poll.json();
+        assert_eq!(body["resourceType"], json!("OperationOutcome"));
+    }
+
     // =========================================================================
     // 3. Cancel → 202 Accepted, then poll → 404
     // =========================================================================
