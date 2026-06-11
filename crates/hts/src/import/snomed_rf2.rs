@@ -3,6 +3,16 @@
 //! Reads a SNOMED CT RF2 distribution ZIP and imports active concepts,
 //! preferred terms, and `Is-a` hierarchy edges into the HTS normalized schema.
 //!
+//! All active descriptions — in every language present in the archive,
+//! including per-language description files shipped by national editions —
+//! are imported as FHIR `concept.designation` entries tagged with the RF2
+//! `languageCode` and a `use` Coding carrying the SNOMED description type
+//! (FSN / synonym). Language reference sets are consulted to pick the
+//! preferred synonym for the concept `display` (US English, then GB English)
+//! and to emit additional dialect-tagged (`en-US` / `en-GB`)
+//! `preferredForLanguage` designations, so `displayLanguage` /
+//! `Accept-Language` requests resolve to the right term.
+//!
 //! # ⚠️  LICENSE REQUIRED
 //!
 //! Real SNOMED CT data requires a license from SNOMED International.
@@ -18,7 +28,7 @@ use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
 use crate::import::bundle_builder::{
-    BuilderConcept, BuilderProperty, CodeSystemMeta, build_code_system_bundle,
+    BuilderConcept, BuilderDesignation, BuilderProperty, CodeSystemMeta, build_code_system_bundle,
 };
 
 // ── SNOMED CT constants ───────────────────────────────────────────────────────
@@ -31,6 +41,19 @@ const SNOMED_TITLE: &str = "SNOMED CT";
 const TYPE_FSN: &str = "900000000000003001";
 const TYPE_SYNONYM: &str = "900000000000013009";
 const IS_A_TYPE: &str = "116680003";
+
+/// Language refset acceptability: preferred.
+const ACCEPTABILITY_PREFERRED: &str = "900000000000548007";
+/// US English language refset.
+const REFSET_EN_US: &str = "900000000000509007";
+/// GB English language refset.
+const REFSET_EN_GB: &str = "900000000000508004";
+/// Known language refsets with their BCP-47 dialect tags.
+const LANG_REFSET_DIALECTS: &[(&str, &str)] = &[(REFSET_EN_US, "en-US"), (REFSET_EN_GB, "en-GB")];
+
+/// FHIR designation-use system for `preferredForLanguage` (matches the
+/// coding the `$expand` displayLanguage swap emits).
+const HL7_TERM_MAINT_INFRA: &str = "http://terminology.hl7.org/CodeSystem/hl7TermMaintInfra";
 
 /// Map from concept code to a list of `(type_id, destination_code)` pairs.
 type RoleProps = HashMap<String, Vec<(String, String)>>;
@@ -46,10 +69,39 @@ const ASSOC_REFSET_EQUIVALENCES: &[(&str, &str, &str)] = &[
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+/// One active RF2 description row.
+#[derive(Debug, Clone)]
+struct ParsedDescription {
+    desc_id: String,
+    concept_id: String,
+    language: String,
+    type_id: String,
+    term: String,
+}
+
+/// Owned designation, converted to a borrowed [`BuilderDesignation`] per batch.
+#[derive(Debug, Clone)]
+struct OwnedDesignation {
+    /// BCP-47 tag — RF2 `languageCode` (`en`, `de`, …) or a dialect tag
+    /// (`en-US`) for language-refset-preferred synonyms.
+    language: String,
+    use_system: &'static str,
+    /// SNOMED description type id, or `preferredForLanguage`.
+    use_code: String,
+    value: String,
+}
+
+/// Display term plus designations for one concept.
+#[derive(Debug, Clone, Default)]
+struct ConceptTerms {
+    display: String,
+    designations: Vec<OwnedDesignation>,
+}
+
 #[derive(Debug)]
 struct SnomedParseResult {
-    /// concept id → display term.
-    preferred_terms: HashMap<String, String>,
+    /// concept id → display term + designations.
+    concept_terms: HashMap<String, ConceptTerms>,
     /// (child, parent) is-a edges.
     is_a_edges: Vec<(String, String)>,
     /// source_concept_id → Vec<(type_id, destination_concept_id)> for non-IS_A relationships.
@@ -73,13 +125,15 @@ pub async fn import_snomed_rf2(
 
     let path_owned = path.to_path_buf();
     let parsed = tokio::task::spawn_blocking(move || -> Result<SnomedParseResult, HtsError> {
-        let (concept_path, desc_path, rel_path, assoc_refset_paths) = find_rf2_paths(&path_owned)?;
+        let (concept_path, desc_paths, rel_path, assoc_refset_paths, lang_refset_paths) =
+            find_rf2_paths(&path_owned)?;
 
         tracing::info!(
             concept_file = %concept_path,
-            description_file = %desc_path,
+            description_files = desc_paths.len(),
             relationship_file = %rel_path,
             assoc_refset_files = assoc_refset_paths.len(),
+            lang_refset_files = lang_refset_paths.len(),
             "Located RF2 files in archive"
         );
 
@@ -93,12 +147,33 @@ pub async fn import_snomed_rf2(
             parse_active_concepts(BufReader::new(entry), &mut parse_errors)
         };
 
-        let preferred_terms = {
-            let mut zip = open_zip(&path_owned)?;
-            let entry = zip.by_name(&desc_path).map_err(|e| {
-                HtsError::InvalidRequest(format!("Cannot open description file: {e}"))
-            })?;
-            parse_preferred_terms(BufReader::new(entry), &active_concepts, &mut parse_errors)
+        let concept_terms = {
+            let mut by_desc_id: HashMap<String, (usize, ParsedDescription)> = HashMap::new();
+            let mut next_order = 0usize;
+            for desc_path in &desc_paths {
+                let mut zip = open_zip(&path_owned)?;
+                let entry = zip.by_name(desc_path).map_err(|e| {
+                    HtsError::InvalidRequest(format!("Cannot open description file: {e}"))
+                })?;
+                parse_descriptions(
+                    BufReader::new(entry),
+                    &active_concepts,
+                    &mut next_order,
+                    &mut by_desc_id,
+                    &mut parse_errors,
+                );
+            }
+
+            let mut preferred_in: HashMap<String, HashSet<String>> = HashMap::new();
+            for refset_path in &lang_refset_paths {
+                let mut zip = open_zip(&path_owned)?;
+                let entry = zip.by_name(refset_path).map_err(|e| {
+                    HtsError::InvalidRequest(format!("Cannot open language refset file: {e}"))
+                })?;
+                parse_language_refsets(BufReader::new(entry), &mut preferred_in, &mut parse_errors);
+            }
+
+            build_concept_terms(by_desc_id, &preferred_in, &active_concepts)
         };
 
         let (is_a_edges, role_relationships) = {
@@ -127,7 +202,7 @@ pub async fn import_snomed_rf2(
         let release_version = extract_release_date(&concept_path);
 
         Ok(SnomedParseResult {
-            preferred_terms,
+            concept_terms,
             is_a_edges,
             role_relationships,
             association_refsets,
@@ -139,7 +214,7 @@ pub async fn import_snomed_rf2(
     .map_err(|e| HtsError::Internal(format!("SNOMED parser panicked: {e}")))??;
 
     let SnomedParseResult {
-        preferred_terms,
+        concept_terms,
         is_a_edges,
         role_relationships,
         association_refsets,
@@ -147,7 +222,7 @@ pub async fn import_snomed_rf2(
         parse_errors,
     } = parsed;
 
-    let concept_count = preferred_terms.len() as u32;
+    let concept_count = concept_terms.len() as u32;
     let edge_count = is_a_edges.len();
     let role_count: usize = role_relationships.values().map(|v| v.len()).sum();
     let assoc_count: usize = association_refsets.values().map(|v| v.len()).sum();
@@ -193,7 +268,7 @@ pub async fn import_snomed_rf2(
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
-    let concept_list: Vec<(String, String)> = preferred_terms.into_iter().collect();
+    let concept_list: Vec<(String, ConceptTerms)> = concept_terms.into_iter().collect();
     let total = concept_list.len();
     let total_batches = total.div_ceil(batch_size).max(1);
 
@@ -236,16 +311,33 @@ pub async fn import_snomed_rf2(
             })
             .collect();
 
+        let desig_sets: Vec<Vec<BuilderDesignation<'_>>> = chunk
+            .iter()
+            .map(|(_, terms)| {
+                terms
+                    .designations
+                    .iter()
+                    .map(|d| BuilderDesignation {
+                        language: Some(d.language.as_str()),
+                        use_system: Some(d.use_system),
+                        use_code: Some(d.use_code.as_str()),
+                        value: d.value.as_str(),
+                    })
+                    .collect()
+            })
+            .collect();
+
         let builder: Vec<BuilderConcept<'_>> = chunk
             .iter()
             .enumerate()
-            .map(|(idx, (code, display))| BuilderConcept {
+            .map(|(idx, (code, terms))| BuilderConcept {
                 code: code.as_str(),
-                display: Some(display.as_str()).filter(|s| !s.is_empty()),
+                display: Some(terms.display.as_str()).filter(|s| !s.is_empty()),
                 parent_code: parents_of
                     .get(code)
                     .and_then(|p| p.first().map(|s| s.as_str())),
                 extra_properties: extras_per[idx].as_slice(),
+                designations: desig_sets[idx].as_slice(),
                 ..Default::default()
             })
             .collect();
@@ -304,13 +396,33 @@ fn open_zip(path: &Path) -> Result<ZipArchive<std::fs::File>, HtsError> {
         .map_err(|e| HtsError::InvalidRequest(format!("Not a valid ZIP archive: {e}")))
 }
 
-fn find_rf2_paths(path: &Path) -> Result<(String, String, String, Vec<String>), HtsError> {
+/// When an archive carries Full/Snapshot/Delta variants of the same content
+/// (the standard RF2 distribution layout), keep only the Snapshot files so a
+/// component's state is read exactly once.
+fn prefer_snapshot(paths: Vec<String>) -> Vec<String> {
+    let snapshots: Vec<String> = paths
+        .iter()
+        .filter(|p| p.to_lowercase().contains("snapshot"))
+        .cloned()
+        .collect();
+    if snapshots.is_empty() {
+        paths
+    } else {
+        snapshots
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn find_rf2_paths(
+    path: &Path,
+) -> Result<(String, Vec<String>, String, Vec<String>, Vec<String>), HtsError> {
     let mut zip = open_zip(path)?;
 
     let mut concept_path: Option<String> = None;
-    let mut desc_path: Option<String> = None;
+    let mut desc_paths: Vec<String> = Vec::new();
     let mut rel_path: Option<String> = None;
     let mut assoc_refset_paths: Vec<String> = Vec::new();
+    let mut lang_refset_paths: Vec<String> = Vec::new();
 
     for i in 0..zip.len() {
         let entry = zip
@@ -325,6 +437,8 @@ fn find_rf2_paths(path: &Path) -> Result<(String, String, String, Vec<String>), 
         if lower.contains("refset") {
             if lower.contains("association") {
                 assoc_refset_paths.push(name);
+            } else if lower.contains("language") {
+                lang_refset_paths.push(name);
             }
             continue;
         }
@@ -332,10 +446,24 @@ fn find_rf2_paths(path: &Path) -> Result<(String, String, String, Vec<String>), 
         if lower.contains("concept_") {
             concept_path = Some(name);
         } else if lower.contains("description_") {
-            desc_path = Some(name);
+            desc_paths.push(name);
         } else if lower.contains("relationship_") && !lower.contains("statedrelationship") {
             rel_path = Some(name);
         }
+    }
+
+    // National editions ship one Description file per language; sort for a
+    // deterministic read order across platforms.
+    let mut desc_paths = prefer_snapshot(desc_paths);
+    desc_paths.sort();
+    let mut lang_refset_paths = prefer_snapshot(lang_refset_paths);
+    lang_refset_paths.sort();
+
+    if desc_paths.is_empty() {
+        return Err(HtsError::InvalidRequest(
+            "No Description RF2 file found. Expected a file containing 'Description_' in its path."
+                .into(),
+        ));
     }
 
     Ok((
@@ -345,12 +473,7 @@ fn find_rf2_paths(path: &Path) -> Result<(String, String, String, Vec<String>), 
                     .into(),
             )
         })?,
-        desc_path.ok_or_else(|| {
-            HtsError::InvalidRequest(
-                "No Description RF2 file found. Expected a file containing 'Description_' in its path."
-                    .into(),
-            )
-        })?,
+        desc_paths,
         rel_path.ok_or_else(|| {
             HtsError::InvalidRequest(
                 "No Relationship RF2 file found. Expected a file containing 'Relationship_' in its path."
@@ -358,6 +481,7 @@ fn find_rf2_paths(path: &Path) -> Result<(String, String, String, Vec<String>), 
             )
         })?,
         assoc_refset_paths,
+        lang_refset_paths,
     ))
 }
 
@@ -397,14 +521,17 @@ fn parse_active_concepts(reader: impl BufRead, errors: &mut Vec<String>) -> Hash
     active
 }
 
-fn parse_preferred_terms(
+/// Parse one RF2 Description file into `by_desc_id`, keyed on description id
+/// so re-stated rows (Full files, overlapping releases) keep last-state-wins
+/// semantics. Inactive rows remove any earlier state. `next_order` preserves
+/// first-seen file order for stable designation ordering.
+fn parse_descriptions(
     reader: impl BufRead,
     active_concepts: &HashSet<String>,
+    next_order: &mut usize,
+    by_desc_id: &mut HashMap<String, (usize, ParsedDescription)>,
     errors: &mut Vec<String>,
-) -> HashMap<String, String> {
-    let mut synonyms: HashMap<String, String> = HashMap::new();
-    let mut fsns: HashMap<String, String> = HashMap::new();
-
+) {
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = match line_result {
             Ok(l) => l,
@@ -424,39 +551,193 @@ fn parse_preferred_terms(
             continue;
         }
 
+        let desc_id = parts[0].trim();
         let active = parts[2].trim() == "1";
         let concept_id = parts[4].trim();
         let language = parts[5].trim();
         let type_id = parts[6].trim();
         let term = parts[7].trim();
 
-        if !active || language != "en" || !active_concepts.contains(concept_id) {
+        if !active {
+            by_desc_id.remove(desc_id);
+            continue;
+        }
+        if !active_concepts.contains(concept_id) || term.is_empty() {
             continue;
         }
 
-        match type_id {
-            TYPE_SYNONYM => {
-                synonyms
-                    .entry(concept_id.to_string())
-                    .or_insert_with(|| term.to_string());
+        let desc = ParsedDescription {
+            desc_id: desc_id.to_string(),
+            concept_id: concept_id.to_string(),
+            language: language.to_string(),
+            type_id: type_id.to_string(),
+            term: term.to_string(),
+        };
+        match by_desc_id.entry(desc_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().1 = desc;
             }
-            TYPE_FSN => {
-                fsns.entry(concept_id.to_string())
-                    .or_insert_with(|| term.to_string());
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((*next_order, desc));
+                *next_order += 1;
             }
-            _ => {}
         }
     }
+}
 
-    let mut terms: HashMap<String, String> = synonyms;
-    for concept_id in active_concepts {
-        if !terms.contains_key(concept_id) {
-            if let Some(fsn) = fsns.get(concept_id) {
-                terms.insert(concept_id.clone(), fsn.clone());
-            } else {
-                terms.entry(concept_id.clone()).or_default();
+/// Parse an RF2 Language refset file, recording which descriptions are
+/// *preferred* in which language refset.
+///
+/// Columns: `id effectiveTime active moduleId refsetId referencedComponentId
+/// acceptabilityId`.
+fn parse_language_refsets(
+    reader: impl BufRead,
+    preferred_in: &mut HashMap<String, HashSet<String>>,
+    errors: &mut Vec<String>,
+) {
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line_num == 0 || line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.splitn(8, '\t').collect();
+        if parts.len() < 7 {
+            errors.push(format!(
+                "Language refset line {}: expected ≥7 fields, got {} — skipped",
+                line_num + 1,
+                parts.len()
+            ));
+            continue;
+        }
+
+        let active = parts[2].trim() == "1";
+        let refset_id = parts[4].trim();
+        let desc_id = parts[5].trim();
+        let acceptability = parts[6].trim();
+
+        if desc_id.is_empty() || refset_id.is_empty() {
+            continue;
+        }
+        let entry = preferred_in.entry(desc_id.to_string()).or_default();
+        if active && acceptability == ACCEPTABILITY_PREFERRED {
+            entry.insert(refset_id.to_string());
+        } else {
+            // Inactive or demoted-to-acceptable rows revoke a previously
+            // recorded preference (last-state-wins across Full files).
+            entry.remove(refset_id);
+        }
+    }
+}
+
+/// Assemble per-concept display + designations from parsed descriptions.
+///
+/// Display selection: US-preferred English synonym → GB-preferred → any
+/// refset-preferred English synonym → first English synonym → English FSN →
+/// first synonym in any language → first FSN in any language.
+///
+/// Designations carry every active description (all languages), synonyms
+/// before FSNs and refset-preferred terms first within each group, so
+/// language-keyed first-match lookups resolve to the preferred term.
+/// Synonyms preferred in a known dialect refset additionally get a
+/// dialect-tagged (`en-US` / `en-GB`) `preferredForLanguage` designation.
+fn build_concept_terms(
+    by_desc_id: HashMap<String, (usize, ParsedDescription)>,
+    preferred_in: &HashMap<String, HashSet<String>>,
+    active_concepts: &HashSet<String>,
+) -> HashMap<String, ConceptTerms> {
+    let is_preferred_in = |desc: &ParsedDescription, refset: &str| {
+        preferred_in
+            .get(&desc.desc_id)
+            .is_some_and(|s| s.contains(refset))
+    };
+    let is_preferred_any = |desc: &ParsedDescription| {
+        preferred_in
+            .get(&desc.desc_id)
+            .is_some_and(|s| !s.is_empty())
+    };
+
+    // Group by concept, preserving file order.
+    let mut by_concept: HashMap<String, Vec<(usize, ParsedDescription)>> = HashMap::new();
+    for (_, (order, desc)) in by_desc_id {
+        by_concept
+            .entry(desc.concept_id.clone())
+            .or_default()
+            .push((order, desc));
+    }
+
+    let mut terms: HashMap<String, ConceptTerms> = HashMap::with_capacity(active_concepts.len());
+    for (concept_id, mut descs) in by_concept {
+        // Synonyms before FSNs before anything else; refset-preferred first
+        // within each group; original file order as the tie-breaker.
+        descs.sort_by_key(|(order, d)| {
+            let type_rank = match d.type_id.as_str() {
+                TYPE_SYNONYM => 0u8,
+                TYPE_FSN => 1,
+                _ => 2,
+            };
+            (type_rank, u8::from(!is_preferred_any(d)), *order)
+        });
+
+        let en_synonym = |pred: &dyn Fn(&ParsedDescription) -> bool| {
+            descs
+                .iter()
+                .find(|(_, d)| d.language == "en" && d.type_id == TYPE_SYNONYM && pred(d))
+                .map(|(_, d)| d.term.clone())
+        };
+        let first_term = |pred: &dyn Fn(&ParsedDescription) -> bool| {
+            descs
+                .iter()
+                .find(|(_, d)| pred(d))
+                .map(|(_, d)| d.term.clone())
+        };
+
+        let display = en_synonym(&|d| is_preferred_in(d, REFSET_EN_US))
+            .or_else(|| en_synonym(&|d| is_preferred_in(d, REFSET_EN_GB)))
+            .or_else(|| en_synonym(&|d| is_preferred_any(d)))
+            .or_else(|| en_synonym(&|_| true))
+            .or_else(|| first_term(&|d| d.language == "en" && d.type_id == TYPE_FSN))
+            .or_else(|| first_term(&|d| d.type_id == TYPE_SYNONYM))
+            .or_else(|| first_term(&|d| d.type_id == TYPE_FSN))
+            .unwrap_or_default();
+
+        let mut designations: Vec<OwnedDesignation> = Vec::with_capacity(descs.len());
+        for (_, d) in &descs {
+            designations.push(OwnedDesignation {
+                language: d.language.clone(),
+                use_system: SNOMED_URL,
+                use_code: d.type_id.clone(),
+                value: d.term.clone(),
+            });
+            if d.type_id == TYPE_SYNONYM {
+                for (refset_id, dialect) in LANG_REFSET_DIALECTS {
+                    if is_preferred_in(d, refset_id) {
+                        designations.push(OwnedDesignation {
+                            language: (*dialect).to_string(),
+                            use_system: HL7_TERM_MAINT_INFRA,
+                            use_code: "preferredForLanguage".to_string(),
+                            value: d.term.clone(),
+                        });
+                    }
+                }
             }
         }
+
+        terms.insert(
+            concept_id,
+            ConceptTerms {
+                display,
+                designations,
+            },
+        );
+    }
+
+    // Active concepts without any description keep an (empty-display) entry.
+    for concept_id in active_concepts {
+        terms.entry(concept_id.clone()).or_default();
     }
     terms
 }
@@ -643,7 +924,21 @@ id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcase
 111001\t20240101\t1\t900000000000207008\t123456001\ten\t900000000000013009\tFoo disorder\t900000000000448009\r\n\
 111002\t20240101\t1\t900000000000207008\t123456001\ten\t900000000000003001\tFoo disorder (disorder)\t900000000000448009\r\n\
 111003\t20240101\t1\t900000000000207008\t789012001\ten\t900000000000003001\tBar finding (finding)\t900000000000448009\r\n\
-111004\t20240101\t1\t900000000000207008\t999999001\ten\t900000000000013009\tInactive concept\t900000000000448009\r\n";
+111004\t20240101\t1\t900000000000207008\t999999001\ten\t900000000000013009\tInactive concept\t900000000000448009\r\n\
+111005\t20240101\t1\t900000000000207008\t123456001\ten\t900000000000013009\tFoo malady\t900000000000448009\r\n";
+
+    /// Per-language Description file as shipped by national editions.
+    const DESCRIPTION_DE_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcaseSignificanceId\r\n\
+211001\t20240101\t1\t900000000000207008\t123456001\tde\t900000000000013009\tFoo Erkrankung\t900000000000448009\r\n\
+211002\t20240101\t1\t900000000000207008\t789012001\tde\t900000000000003001\tBar Befund (Befund)\t900000000000448009\r\n";
+
+    /// `Foo malady` (111005) is US-preferred; `Foo disorder` (111001) is
+    /// GB-preferred — display selection must pick the US term despite file order.
+    const LANGUAGE_REFSET_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\trefsetId\treferencedComponentId\tacceptabilityId\r\n\
+L1\t20240101\t1\t900000000000207008\t900000000000509007\t111005\t900000000000548007\r\n\
+L2\t20240101\t1\t900000000000207008\t900000000000508004\t111001\t900000000000548007\r\n";
 
     const RELATIONSHIP_TSV: &str = "\
 id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\ttypeId\tcharacteristicTypeId\tmodifierId\r\n\
@@ -663,11 +958,25 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
             zip.write_all(CONCEPT_TSV.as_bytes()).unwrap();
 
             zip.start_file(
-                "Snapshot/Terminology/sct2_Description_Snapshot_INT_20240101.txt",
+                "Snapshot/Terminology/sct2_Description_Snapshot-en_INT_20240101.txt",
                 opts,
             )
             .unwrap();
             zip.write_all(DESCRIPTION_TSV.as_bytes()).unwrap();
+
+            zip.start_file(
+                "Snapshot/Terminology/sct2_Description_Snapshot-de_INT_20240101.txt",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(DESCRIPTION_DE_TSV.as_bytes()).unwrap();
+
+            zip.start_file(
+                "Snapshot/Refset/Language/der2_cRefset_LanguageSnapshot-en_INT_20240101.txt",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(LANGUAGE_REFSET_TSV.as_bytes()).unwrap();
 
             zip.start_file(
                 "Snapshot/Terminology/sct2_Relationship_Snapshot_INT_20240101.txt",
@@ -679,6 +988,39 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
             zip.finish().unwrap();
         }
         tmp
+    }
+
+    /// Run the description/refset parsing pipeline over the test fixtures.
+    fn parse_fixture_terms() -> HashMap<String, ConceptTerms> {
+        let mut errors = Vec::new();
+        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+
+        let mut by_desc_id = HashMap::new();
+        let mut next_order = 0;
+        parse_descriptions(
+            DESCRIPTION_TSV.as_bytes(),
+            &active,
+            &mut next_order,
+            &mut by_desc_id,
+            &mut errors,
+        );
+        parse_descriptions(
+            DESCRIPTION_DE_TSV.as_bytes(),
+            &active,
+            &mut next_order,
+            &mut by_desc_id,
+            &mut errors,
+        );
+
+        let mut preferred_in = HashMap::new();
+        parse_language_refsets(
+            LANGUAGE_REFSET_TSV.as_bytes(),
+            &mut preferred_in,
+            &mut errors,
+        );
+
+        assert!(errors.is_empty(), "unexpected parse errors: {errors:?}");
+        build_concept_terms(by_desc_id, &preferred_in, &active)
     }
 
     fn count_rows(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
@@ -702,20 +1044,121 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
     }
 
     #[test]
-    fn parse_preferred_terms_synonym_takes_priority_over_fsn() {
-        let mut errors = Vec::new();
-        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
-        let terms = parse_preferred_terms(DESCRIPTION_TSV.as_bytes(), &active, &mut errors);
+    fn display_prefers_us_preferred_synonym_then_gb_then_fsn() {
+        let terms = parse_fixture_terms();
 
+        // 111005 "Foo malady" is US-preferred and must win over the
+        // GB-preferred "Foo disorder" that appears earlier in the file.
+        assert_eq!(terms.get("123456001").unwrap().display, "Foo malady");
+        // No synonym at all → FSN fallback.
         assert_eq!(
-            terms.get("123456001").map(String::as_str),
-            Some("Foo disorder")
-        );
-        assert_eq!(
-            terms.get("789012001").map(String::as_str),
-            Some("Bar finding (finding)")
+            terms.get("789012001").unwrap().display,
+            "Bar finding (finding)"
         );
         assert!(!terms.contains_key("999999001"));
+    }
+
+    #[test]
+    fn display_without_language_refsets_keeps_first_synonym() {
+        let mut errors = Vec::new();
+        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+        let mut by_desc_id = HashMap::new();
+        let mut next_order = 0;
+        parse_descriptions(
+            DESCRIPTION_TSV.as_bytes(),
+            &active,
+            &mut next_order,
+            &mut by_desc_id,
+            &mut errors,
+        );
+        let terms = build_concept_terms(by_desc_id, &HashMap::new(), &active);
+
+        assert_eq!(terms.get("123456001").unwrap().display, "Foo disorder");
+    }
+
+    #[test]
+    fn descriptions_in_all_languages_become_designations() {
+        let terms = parse_fixture_terms();
+        let foo = terms.get("123456001").unwrap();
+
+        // German synonym from the per-language description file.
+        let de: Vec<_> = foo
+            .designations
+            .iter()
+            .filter(|d| d.language == "de")
+            .collect();
+        assert_eq!(de.len(), 1);
+        assert_eq!(de[0].value, "Foo Erkrankung");
+        assert_eq!(de[0].use_system, SNOMED_URL);
+        assert_eq!(de[0].use_code, TYPE_SYNONYM);
+
+        // English FSN retained as a designation with the FSN type code.
+        assert!(foo.designations.iter().any(|d| d.language == "en"
+            && d.use_code == TYPE_FSN
+            && d.value == "Foo disorder (disorder)"));
+
+        // Dialect-preferred synonyms get en-US / en-GB preferredForLanguage rows.
+        assert!(foo.designations.iter().any(|d| d.language == "en-US"
+            && d.use_code == "preferredForLanguage"
+            && d.use_system == HL7_TERM_MAINT_INFRA
+            && d.value == "Foo malady"));
+        assert!(
+            foo.designations
+                .iter()
+                .any(|d| d.language == "en-GB" && d.value == "Foo disorder")
+        );
+    }
+
+    #[test]
+    fn refset_preferred_synonym_ordered_before_other_designations_per_language() {
+        let terms = parse_fixture_terms();
+        let foo = terms.get("123456001").unwrap();
+
+        // First "en" designation must be a refset-preferred synonym, and all
+        // synonyms must precede the FSN (language-keyed lookups take the
+        // first match in stored order).
+        let first_en = foo
+            .designations
+            .iter()
+            .find(|d| d.language == "en")
+            .unwrap();
+        assert_eq!(first_en.use_code, TYPE_SYNONYM);
+        assert!(["Foo malady", "Foo disorder"].contains(&first_en.value.as_str()));
+
+        let fsn_pos = foo
+            .designations
+            .iter()
+            .position(|d| d.use_code == TYPE_FSN)
+            .unwrap();
+        let last_syn_pos = foo
+            .designations
+            .iter()
+            .rposition(|d| d.use_code == TYPE_SYNONYM)
+            .unwrap();
+        assert!(last_syn_pos < fsn_pos, "synonyms must precede the FSN");
+    }
+
+    #[test]
+    fn inactive_description_row_revokes_earlier_state() {
+        let mut errors = Vec::new();
+        let active = parse_active_concepts(CONCEPT_TSV.as_bytes(), &mut errors);
+
+        // Full-file style: the synonym is later inactivated.
+        let full_tsv = "\
+id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcaseSignificanceId\r\n\
+111001\t20240101\t1\t900000000000207008\t123456001\ten\t900000000000013009\tFoo disorder\t900000000000448009\r\n\
+111001\t20250101\t0\t900000000000207008\t123456001\ten\t900000000000013009\tFoo disorder\t900000000000448009\r\n";
+        let mut by_desc_id = HashMap::new();
+        let mut next_order = 0;
+        parse_descriptions(
+            full_tsv.as_bytes(),
+            &active,
+            &mut next_order,
+            &mut by_desc_id,
+            &mut errors,
+        );
+
+        assert!(by_desc_id.is_empty());
     }
 
     #[test]
@@ -794,6 +1237,67 @@ BADLINE\r\n";
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 2);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
+    }
+
+    #[tokio::test]
+    async fn import_snomed_rf2_writes_multilingual_designations() {
+        use crate::traits::CodeSystemOperations;
+        use crate::types::LookupRequest;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_rf2_zip();
+
+        import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false)
+            .await
+            .unwrap();
+
+        // 123456001: en×2 + FSN + de + en-US + en-GB = 6; 789012001: en FSN + de FSN = 2.
+        assert_eq!(count_rows(&backend, "concept_designations"), 8);
+
+        // displayLanguage=de resolves the German synonym as the display.
+        let resp = backend
+            .lookup(
+                &ctx,
+                LookupRequest {
+                    system: SNOMED_URL.into(),
+                    code: "123456001".into(),
+                    display_language: Some("de".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.display.as_deref(), Some("Foo Erkrankung"));
+
+        // Without displayLanguage the US-preferred English synonym wins.
+        let resp = backend
+            .lookup(
+                &ctx,
+                LookupRequest {
+                    system: SNOMED_URL.into(),
+                    code: "123456001".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.display.as_deref(), Some("Foo malady"));
+
+        // Dialect-tagged lookup resolves the en-GB preferred term.
+        let resp = backend
+            .lookup(
+                &ctx,
+                LookupRequest {
+                    system: SNOMED_URL.into(),
+                    code: "123456001".into(),
+                    display_language: Some("en-GB".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.display.as_deref(), Some("Foo disorder"));
     }
 
     #[tokio::test]

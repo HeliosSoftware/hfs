@@ -750,6 +750,24 @@ hts import ./SnomedCT_InternationalRF2_PRODUCTION_20250901T120000Z.zip --format 
 
 For large imports, add `--batch-size 200 --verbose` to monitor progress.
 
+Descriptions in **all languages** present in the archive (including the
+per-language Description files shipped by national extensions, e.g.
+`sct2_Description_Snapshot-de_*.txt`) are imported as FHIR
+`concept.designation` entries tagged with the RF2 language code and a `use`
+Coding carrying the SNOMED description type (FSN / synonym). Language
+reference sets are used to pick the preferred synonym for the concept
+`display` (US English first, then GB English) and to add dialect-tagged
+`en-US` / `en-GB` `preferredForLanguage` designations. `$lookup`, `$expand`,
+and `$validate-code` resolve these via the `displayLanguage` parameter or the
+`Accept-Language` HTTP header:
+
+```bash
+curl -X POST http://localhost:8090/CodeSystem/\$lookup \
+  -H "Content-Type: application/fhir+json" \
+  -H "Accept-Language: de" \
+  -d '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"http://snomed.info/sct"},{"name":"code","valueCode":"22298006"}]}'
+```
+
 ---
 
 ### LOINC

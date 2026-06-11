@@ -2465,7 +2465,8 @@ pub async fn get_validate_code_handler<B: TerminologyBackend>(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
-    let params = query_params_to_fhir_params(pairs);
+    let mut params = query_params_to_fhir_params(pairs);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     match process_validate_code(&state, params).await {
         Ok(v) => Ok(fhir_respond(v, format)),
         Err(e) => match invalid_display_language_response(&e) {
@@ -5822,7 +5823,8 @@ pub async fn get_vs_validate_code_handler<B: TerminologyBackend>(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
-    let params = query_params_to_fhir_params(pairs);
+    let mut params = query_params_to_fhir_params(pairs);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     match process_vs_validate_code(&state, params).await {
         Ok(v) => Ok(fhir_respond(v, format)),
         Err(e) => {
@@ -5868,8 +5870,10 @@ pub async fn vs_validate_by_id_post<B: TerminologyBackend>(
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
+    let mut params = inject_url(raw_params, url);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, inject_url(raw_params, url)).await?,
+        process_vs_validate_code(&state, params).await?,
         format,
     ))
 }
@@ -5890,8 +5894,10 @@ pub async fn get_vs_validate_by_id<B: TerminologyBackend>(
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
+    let mut params = inject_url(params, url);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, inject_url(params, url)).await?,
+        process_vs_validate_code(&state, params).await?,
         format,
     ))
 }
