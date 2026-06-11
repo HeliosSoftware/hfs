@@ -540,9 +540,9 @@ impl BulkSubmitProvider for PostgresBackend {
         let replaces_manifest_url: Option<String> = row.get(1);
         let status_str: String = row.get(2);
         let added_at: chrono::DateTime<Utc> = row.get(3);
-        let total: i64 = row.get(4);
-        let processed: i64 = row.get(5);
-        let failed: i64 = row.get(6);
+        let total: i32 = row.get(4);
+        let processed: i32 = row.get(5);
+        let failed: i32 = row.get(6);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -701,9 +701,9 @@ impl BulkSubmitProvider for PostgresBackend {
                     failed_entries = failed_entries + $3
                  WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6 AND manifest_id = $7",
                 &[
-                    &(results.len() as i64),
-                    &(results.iter().filter(|r| r.is_success()).count() as i64),
-                    &(error_count as i64),
+                    &(results.len() as i32),
+                    &(results.iter().filter(|r| r.is_success()).count() as i32),
+                    &(error_count as i32),
                     &tenant_id,
                     &submission_id.submitter.as_str(),
                     &submission_id.submission_id.as_str(),
