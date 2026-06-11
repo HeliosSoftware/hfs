@@ -213,7 +213,8 @@ fn build_cors(config: &HtsConfig) -> CorsLayer {
             .collect();
 
         // With explicit origins the browser enforces the allow-lists below;
-        // include `Content-Encoding` so clients can send compressed bodies.
+        // include `Content-Encoding` so clients can send compressed bodies
+        // and `Accept-Language` so they can request designation languages.
         CorsLayer::new()
             .allow_origin(origins)
             .allow_methods([
@@ -226,6 +227,7 @@ fn build_cors(config: &HtsConfig) -> CorsLayer {
             .allow_headers([
                 header::CONTENT_TYPE,
                 header::ACCEPT,
+                header::ACCEPT_LANGUAGE,
                 header::AUTHORIZATION,
                 header::CONTENT_ENCODING,
             ])
