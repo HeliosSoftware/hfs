@@ -610,10 +610,12 @@ cargo run --bin hts -- import ./hl7.terminology.r4-6.0.0.tgz
 # SNOMED CT RF2 ZIP  ⚠️  requires NRC license
 # Descriptions in all languages (incl. per-language Description files from
 # national extensions) are imported as FHIR concept.designation entries
-# tagged with the RF2 language code; language refsets pick the preferred
-# synonym for display (en-US, then en-GB) and add dialect-tagged
-# preferredForLanguage designations. Query via displayLanguage or the
-# Accept-Language header on $lookup / $expand / $validate-code.
+# tagged with the RF2 language code; every language refset marks its
+# preferred synonyms with preferredForLanguage designations (bare language
+# tag, plus a dialect tag like en-US/da-DK/fr-CA for the published national
+# refsets) and en-US→en-GB preference picks the display. Query via
+# displayLanguage or the Accept-Language header on $lookup / $expand /
+# $validate-code; matching is BCP-47-aware (de-DE finds de, fr accepts fr-CA).
 cargo run --bin hts -- import ./SnomedCT_InternationalRF2_*.zip --format snomed-rf2
 
 # LOINC CSV ZIP  ⚠️  requires free Regenstrief registration at loinc.org

@@ -9,9 +9,11 @@
 //! `languageCode` and a `use` Coding carrying the SNOMED description type
 //! (FSN / synonym). Language reference sets are consulted to pick the
 //! preferred synonym for the concept `display` (US English, then GB English)
-//! and to emit additional dialect-tagged (`en-US` / `en-GB`)
-//! `preferredForLanguage` designations, so `displayLanguage` /
-//! `Accept-Language` requests resolve to the right term.
+//! and to emit `preferredForLanguage` designations for every
+//! refset-preferred synonym — tagged with the synonym's bare RF2 language
+//! and, for the known national-edition refsets, a BCP-47 dialect tag
+//! (`en-US`, `da-DK`, `fr-CA`, …) — so `displayLanguage` /
+//! `Accept-Language` requests resolve to the right term in any language.
 //!
 //! # ⚠️  LICENSE REQUIRED
 //!
@@ -48,8 +50,32 @@ const ACCEPTABILITY_PREFERRED: &str = "900000000000548007";
 const REFSET_EN_US: &str = "900000000000509007";
 /// GB English language refset.
 const REFSET_EN_GB: &str = "900000000000508004";
-/// Known language refsets with their BCP-47 dialect tags.
-const LANG_REFSET_DIALECTS: &[(&str, &str)] = &[(REFSET_EN_US, "en-US"), (REFSET_EN_GB, "en-GB")];
+/// Known language refsets with their BCP-47 dialect tags, covering the
+/// published national-edition refsets. SCTIDs follow the dialect map shipped
+/// by SNOMED International's Snowstorm server (`search.dialect.config.*`).
+/// Refsets whose tag would add nothing over the description's own RF2
+/// `languageCode` (e.g. the bare-`de` German refset) are intentionally
+/// absent — every refset-preferred synonym already receives a
+/// `preferredForLanguage` designation in its bare language.
+const LANG_REFSET_DIALECTS: &[(&str, &str)] = &[
+    (REFSET_EN_US, "en-US"),
+    (REFSET_EN_GB, "en-GB"),
+    ("554461000005103", "da-DK"),
+    ("32570271000036106", "en-AU"),
+    ("19491000087109", "en-CA"),
+    ("21000220103", "en-IE"),
+    ("271000210107", "en-NZ"),
+    ("5641000179103", "es-UY"),
+    ("71000181105", "et-EE"),
+    ("21000172104", "fr-BE"),
+    ("20581000087109", "fr-CA"),
+    ("10031000315102", "fr-FR"),
+    ("61000202103", "nb-NO"),
+    ("91000202106", "nn-NO"),
+    ("31000172101", "nl-BE"),
+    ("31000146106", "nl-NL"),
+    ("46011000052107", "sv-SE"),
+];
 
 /// FHIR designation-use system for `preferredForLanguage` (matches the
 /// coding the `$expand` displayLanguage swap emits).
@@ -654,8 +680,9 @@ fn parse_language_refsets(
 /// Designations carry every active description (all languages), synonyms
 /// before FSNs and refset-preferred terms first within each group, so
 /// language-keyed first-match lookups resolve to the preferred term.
-/// Synonyms preferred in a known dialect refset additionally get a
-/// dialect-tagged (`en-US` / `en-GB`) `preferredForLanguage` designation.
+/// Every refset-preferred synonym additionally gets a `preferredForLanguage`
+/// designation in its bare RF2 language, plus dialect-tagged copies
+/// (`en-US`, `da-DK`, `fr-CA`, …) for refsets in [`LANG_REFSET_DIALECTS`].
 fn build_concept_terms(
     by_desc_id: HashMap<String, (usize, ParsedDescription)>,
     preferred_in: &HashMap<String, HashSet<String>>,
@@ -724,16 +751,28 @@ fn build_concept_terms(
                 use_code: d.type_id.clone(),
                 value: d.term.clone(),
             });
-            if d.type_id == TYPE_SYNONYM {
-                for (refset_id, dialect) in LANG_REFSET_DIALECTS {
-                    if is_preferred_in(d, refset_id) {
-                        designations.push(OwnedDesignation {
-                            language: (*dialect).to_string(),
-                            use_system: HL7_TERM_MAINT_INFRA,
-                            use_code: "preferredForLanguage".to_string(),
-                            value: d.term.clone(),
-                        });
-                    }
+            if d.type_id == TYPE_SYNONYM && is_preferred_any(d) {
+                // One `preferredForLanguage` per distinct BCP-47 tag: the
+                // known-dialect tags of the refsets this synonym is preferred
+                // in (sorted for determinism), plus the bare RF2
+                // `languageCode` so preference stays queryable for editions
+                // whose refset is not in the dialect table (German, Spanish,
+                // Swiss, …).
+                let mut tags: Vec<&str> = LANG_REFSET_DIALECTS
+                    .iter()
+                    .filter(|(refset_id, _)| is_preferred_in(d, refset_id))
+                    .map(|(_, dialect)| *dialect)
+                    .collect();
+                tags.push(d.language.as_str());
+                tags.sort_unstable();
+                tags.dedup();
+                for tag in tags {
+                    designations.push(OwnedDesignation {
+                        language: tag.to_string(),
+                        use_system: HL7_TERM_MAINT_INFRA,
+                        use_code: "preferredForLanguage".to_string(),
+                        value: d.term.clone(),
+                    });
                 }
             }
         }
@@ -1313,7 +1352,7 @@ BADLINE\r\n";
         assert_eq!(stats.concepts, 2);
         assert_eq!(count_rows(&backend, "concepts"), 2);
         assert_eq!(count_rows(&backend, "concept_hierarchy"), 1);
-        assert_eq!(count_rows(&backend, "concept_designations"), 8);
+        assert_eq!(count_rows(&backend, "concept_designations"), 10);
     }
 
     #[tokio::test]
@@ -1329,8 +1368,11 @@ BADLINE\r\n";
             .await
             .unwrap();
 
-        // 123456001: en×2 + FSN + de + en-US + en-GB = 6; 789012001: en FSN + de FSN = 2.
-        assert_eq!(count_rows(&backend, "concept_designations"), 8);
+        // 123456001: en×2 + FSN + de = 4 descriptions, plus per preferred
+        // synonym a bare-`en` and a dialect preferredForLanguage row
+        // (111005 → en + en-US, 111001 → en + en-GB) = 8;
+        // 789012001: en FSN + de FSN = 2.
+        assert_eq!(count_rows(&backend, "concept_designations"), 10);
 
         // displayLanguage=de resolves the German synonym as the display.
         let resp = backend
@@ -1375,6 +1417,150 @@ BADLINE\r\n";
             .await
             .unwrap();
         assert_eq!(resp.display.as_deref(), Some("Foo disorder"));
+
+        // A region-qualified request falls back to the bare RF2 language
+        // tag (RFC 4647 truncation: de-DE → de) — what a browser's
+        // Accept-Language header typically produces.
+        let resp = backend
+            .lookup(
+                &ctx,
+                LookupRequest {
+                    system: SNOMED_URL.into(),
+                    code: "123456001".into(),
+                    display_language: Some("de-DE".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.display.as_deref(), Some("Foo Erkrankung"));
+    }
+
+    /// A national-edition style archive with no English content at all:
+    /// Danish synonyms preferred via the Danish language refset (which is in
+    /// the dialect table → tagged `da-DK` + `da`) and German synonyms
+    /// preferred via the German refset (not in the table → bare `de` only).
+    #[tokio::test]
+    async fn import_snomed_rf2_national_edition_languages() {
+        use crate::traits::CodeSystemOperations;
+        use crate::types::LookupRequest;
+
+        const NE_CONCEPT_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\tdefinitionStatusId\r\n\
+123456001\t20240101\t1\t900000000000207008\t900000000000074008\r\n";
+        const NE_DESCRIPTION_DA_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcaseSignificanceId\r\n\
+411001\t20240101\t1\t900000000000207008\t123456001\tda\t900000000000013009\tFoo sygdom\t900000000000448009\r\n";
+        const NE_DESCRIPTION_DE_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcaseSignificanceId\r\n\
+411002\t20240101\t1\t900000000000207008\t123456001\tde\t900000000000013009\tFoo Erkrankung\t900000000000448009\r\n";
+        // 554461000005103 = Danish language refset (in LANG_REFSET_DIALECTS),
+        // 722130004 = German language refset (deliberately not in the table).
+        const NE_LANGUAGE_REFSET_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\trefsetId\treferencedComponentId\tacceptabilityId\r\n\
+N1\t20240101\t1\t900000000000207008\t554461000005103\t411001\t900000000000548007\r\n\
+N2\t20240101\t1\t900000000000207008\t722130004\t411002\t900000000000548007\r\n";
+        const NE_RELATIONSHIP_TSV: &str = "\
+id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\ttypeId\tcharacteristicTypeId\tmodifierId\r\n";
+
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+            for (name, content) in [
+                (
+                    "Snapshot/Terminology/sct2_Concept_Snapshot_NE_20240101.txt",
+                    NE_CONCEPT_TSV,
+                ),
+                (
+                    "Snapshot/Terminology/sct2_Description_Snapshot-da_NE_20240101.txt",
+                    NE_DESCRIPTION_DA_TSV,
+                ),
+                (
+                    "Snapshot/Terminology/sct2_Description_Snapshot-de_NE_20240101.txt",
+                    NE_DESCRIPTION_DE_TSV,
+                ),
+                (
+                    "Snapshot/Refset/Language/der2_cRefset_LanguageSnapshot-da_NE_20240101.txt",
+                    NE_LANGUAGE_REFSET_TSV,
+                ),
+                (
+                    "Snapshot/Terminology/sct2_Relationship_Snapshot_NE_20240101.txt",
+                    NE_RELATIONSHIP_TSV,
+                ),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        import_snomed_rf2(&backend, &ctx, tmp.path(), 500, false)
+            .await
+            .unwrap();
+
+        // Danish refset is in the dialect table: a region-qualified request
+        // resolves via the da-DK preferredForLanguage designation.
+        let resp = backend
+            .lookup(
+                &ctx,
+                LookupRequest {
+                    system: SNOMED_URL.into(),
+                    code: "123456001".into(),
+                    display_language: Some("da-DK".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.display.as_deref(), Some("Foo sygdom"));
+        assert!(resp.designations.iter().any(|d| {
+            d.language.as_deref() == Some("da-DK")
+                && d.use_code.as_deref() == Some("preferredForLanguage")
+        }));
+        assert!(
+            resp.designations
+                .iter()
+                .any(|d| d.language.as_deref() == Some("da"))
+        );
+
+        // German refset is not in the dialect table: preference is still
+        // recorded under the bare RF2 language, and a region-qualified
+        // request reaches it via RFC 4647 truncation (de-DE → de).
+        let resp = backend
+            .lookup(
+                &ctx,
+                LookupRequest {
+                    system: SNOMED_URL.into(),
+                    code: "123456001".into(),
+                    display_language: Some("de-DE".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.display.as_deref(), Some("Foo Erkrankung"));
+        assert!(resp.designations.iter().any(|d| {
+            d.language.as_deref() == Some("de")
+                && d.use_code.as_deref() == Some("preferredForLanguage")
+        }));
+
+        // No English anywhere: the display falls back to a preferred
+        // synonym in a non-English language instead of coming up empty.
+        let resp = backend
+            .lookup(
+                &ctx,
+                LookupRequest {
+                    system: SNOMED_URL.into(),
+                    code: "123456001".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(resp.display.is_some());
     }
 
     #[tokio::test]

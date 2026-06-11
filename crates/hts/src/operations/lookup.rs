@@ -647,6 +647,40 @@ mod tests {
         assert_eq!(display_param["valueString"], "Alpha Bêta Charlie");
     }
 
+    /// A realistic browser header carries a region-qualified primary tag
+    /// (`fr-FR`); the stored designation is tagged bare `fr`. RFC 4647
+    /// truncation must bridge the two.
+    #[tokio::test]
+    async fn lookup_accept_language_regional_tag_falls_back_to_base_language() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "system", "valueUri": "http://example.org/cs"},
+                {"name": "code", "valueCode": "ABC"}
+            ]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/CodeSystem/$lookup")
+                    .header("content-type", "application/json")
+                    .header("accept-language", "fr-FR,fr;q=0.9,en;q=0.8")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
+        assert_eq!(display_param["valueString"], "Alpha Bêta Charlie");
+    }
+
     #[tokio::test]
     async fn lookup_explicit_display_language_wins_over_accept_language_header() {
         let app = make_app();

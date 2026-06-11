@@ -660,19 +660,25 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         .unwrap_or_default();
 
     // Find the "preferred" display in any of the requested languages, if any.
-    // Returns the first designation whose language equals one of the requested
-    // languages (case-insensitive, exact match — IG fixtures don't exercise
-    // language-tag fallback like `de-CH` → `de`).
+    // Matching is BCP-47-aware (RFC 4647 Lookup, see [`crate::language`]):
+    // an exact tag wins, then a stored dialect of a requested tag
+    // (`de` → `de-CH`), then truncations of a requested tag (`de-DE` → `de`);
+    // ties keep the earliest designation.
     let preferred_for_lang: Option<&(String, Option<String>)> = if requested_langs.is_empty() {
         None
     } else {
-        displays_for_lang.iter().find(|(_, lang_opt)| {
-            lang_opt.as_deref().is_some_and(|l| {
+        displays_for_lang
+            .iter()
+            .filter_map(|entry| {
+                let stored = entry.1.as_deref()?;
                 requested_langs
                     .iter()
-                    .any(|req| l.eq_ignore_ascii_case(req))
+                    .filter_map(|req| crate::language::lang_match_rank(req, stored))
+                    .min()
+                    .map(|rank| (rank, entry))
             })
-        })
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, entry)| entry)
     };
 
     // Surface the language-preferred display on the response (overriding the

@@ -320,9 +320,11 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // URL-wide via `concept_designations`).
             if let Some(lang) = req.display_language.as_deref() {
                 if req.version.is_none()
-                    && !all_designations
-                        .iter()
-                        .any(|d| d.language.as_deref() == Some(lang))
+                    && !all_designations.iter().any(|d| {
+                        d.language
+                            .as_deref()
+                            .is_some_and(|l| crate::language::lang_matches(lang, l))
+                    })
                 {
                     all_designations.extend(fetch_designations_cross_version(
                         &conn,
@@ -336,13 +338,17 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let all_designations = all_designations;
 
             // 10.2: When displayLanguage is set and a matching designation
-            // exists, prefer its value as the concept display.
+            // exists, prefer its value as the concept display. Matching is
+            // BCP-47-aware (RFC 4647 Lookup): an exact tag wins, then a
+            // stored dialect of the requested tag (`de` → `de-CH`), then
+            // truncations of the requested tag (`de-DE` → `de`).
             let display = if let Some(lang) = req.display_language.as_deref() {
-                all_designations
-                    .iter()
-                    .find(|d| d.language.as_deref() == Some(lang))
-                    .map(|d| d.value.clone())
-                    .or(display)
+                crate::language::best_lang_match_index(
+                    lang,
+                    all_designations.iter().map(|d| d.language.as_deref()),
+                )
+                .map(|idx| all_designations[idx].value.clone())
+                .or(display)
             } else {
                 display
             };
@@ -351,7 +357,11 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let designations = if let Some(lang) = req.display_language.as_deref() {
                 all_designations
                     .into_iter()
-                    .filter(|d| d.language.as_deref() == Some(lang))
+                    .filter(|d| {
+                        d.language
+                            .as_deref()
+                            .is_some_and(|l| crate::language::lang_matches(lang, l))
+                    })
                     .collect()
             } else {
                 all_designations
@@ -2007,7 +2017,8 @@ fn fetch_designations(
     .collect()
 }
 
-/// Designations for `code` in `lang` from stored versions of the canonical
+/// Designations for `code` matching `lang` (BCP-47-aware, see
+/// [`crate::language::lang_matches`]) from stored versions of the canonical
 /// `url` *other than* `exclude_system_id`, taken from the newest such version
 /// that has any (insertion order within that version is preserved so
 /// preferred terms stay first).
@@ -2024,38 +2035,42 @@ fn fetch_designations_cross_version(
              FROM concept_designations cd \
              JOIN concepts c ON c.id = cd.concept_id \
              JOIN code_systems s ON s.id = c.system_id \
-             WHERE s.url = ?1 AND c.code = ?2 AND s.id <> ?3 AND cd.language = ?4 \
+             WHERE s.url = ?1 AND c.code = ?2 AND s.id <> ?3 \
              ORDER BY COALESCE(s.version, '') DESC, cd.id",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     let rows: Vec<(DesignationValue, String)> = stmt
-        .query_map(
-            rusqlite::params![url, code, exclude_system_id, lang],
-            |row| {
-                Ok((
-                    DesignationValue {
-                        language: row.get(0)?,
-                        use_system: row.get(1)?,
-                        use_code: row.get(2)?,
-                        value: row.get(3)?,
-                        source: None,
-                    },
-                    row.get::<_, String>(4)?,
-                ))
-            },
-        )
+        .query_map(rusqlite::params![url, code, exclude_system_id], |row| {
+            Ok((
+                DesignationValue {
+                    language: row.get(0)?,
+                    use_system: row.get(1)?,
+                    use_code: row.get(2)?,
+                    value: row.get(3)?,
+                    source: None,
+                },
+                row.get::<_, String>(4)?,
+            ))
+        })
         .map_err(|e| HtsError::StorageError(e.to_string()))?
         .collect::<Result<_, _>>()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let newest = match rows.first() {
+    // Language matching happens here rather than in SQL so the RFC 4647
+    // fallback rules (`de-DE` → `de`, `de` → `de-CH`) apply.
+    let lang_ok = |d: &DesignationValue| {
+        d.language
+            .as_deref()
+            .is_some_and(|l| crate::language::lang_matches(lang, l))
+    };
+    let newest = match rows.iter().find(|(d, _)| lang_ok(d)) {
         Some((_, v)) => v.clone(),
         None => return Ok(Vec::new()),
     };
     Ok(rows
         .into_iter()
-        .take_while(|(_, v)| *v == newest)
+        .filter(|(d, v)| *v == newest && lang_ok(d))
         .map(|(d, _)| d)
         .collect())
 }

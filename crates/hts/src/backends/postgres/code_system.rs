@@ -156,9 +156,11 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // `concept_designations`).
         if let Some(lang) = req.display_language.as_deref() {
             if req.version.is_none()
-                && !all_designations
-                    .iter()
-                    .any(|d| d.language.as_deref() == Some(lang))
+                && !all_designations.iter().any(|d| {
+                    d.language
+                        .as_deref()
+                        .is_some_and(|l| crate::language::lang_matches(lang, l))
+                })
             {
                 all_designations.extend(
                     fetch_designations_cross_version(
@@ -174,12 +176,16 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         }
         let all_designations = all_designations;
 
+        // Matching is BCP-47-aware (RFC 4647 Lookup): an exact tag wins,
+        // then a stored dialect of the requested tag (`de` → `de-CH`), then
+        // truncations of the requested tag (`de-DE` → `de`).
         let display = if let Some(lang) = req.display_language.as_deref() {
-            all_designations
-                .iter()
-                .find(|d| d.language.as_deref() == Some(lang))
-                .map(|d| d.value.clone())
-                .or(display)
+            crate::language::best_lang_match_index(
+                lang,
+                all_designations.iter().map(|d| d.language.as_deref()),
+            )
+            .map(|idx| all_designations[idx].value.clone())
+            .or(display)
         } else {
             display
         };
@@ -187,7 +193,11 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         let designations = if let Some(lang) = req.display_language.as_deref() {
             all_designations
                 .into_iter()
-                .filter(|d| d.language.as_deref() == Some(lang))
+                .filter(|d| {
+                    d.language
+                        .as_deref()
+                        .is_some_and(|l| crate::language::lang_matches(lang, l))
+                })
                 .collect()
         } else {
             all_designations
@@ -1626,7 +1636,8 @@ async fn fetch_designations(
         .collect())
 }
 
-/// Designations for `code` in `lang` from stored versions of the canonical
+/// Designations for `code` matching `lang` (BCP-47-aware, see
+/// [`crate::language::lang_matches`]) from stored versions of the canonical
 /// `url` *other than* `exclude_system_id`, taken from the newest such version
 /// that has any (insertion order within that version is preserved so
 /// preferred terms stay first).
@@ -1643,20 +1654,26 @@ async fn fetch_designations_cross_version(
              FROM concept_designations cd
              JOIN concepts c ON c.id = cd.concept_id
              JOIN code_systems s ON s.id = c.system_id
-             WHERE s.url = $1 AND c.code = $2 AND s.id <> $3 AND cd.language = $4
+             WHERE s.url = $1 AND c.code = $2 AND s.id <> $3
              ORDER BY COALESCE(s.version, '') DESC, cd.id",
-            &[&url, &code, &exclude_system_id, &lang],
+            &[&url, &code, &exclude_system_id],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
-    let newest: String = match rows.first() {
+    // Language matching happens here rather than in SQL so the RFC 4647
+    // fallback rules (`de-DE` → `de`, `de` → `de-CH`) apply.
+    let lang_ok = |row: &tokio_postgres::Row| {
+        row.get::<_, Option<String>>(0)
+            .is_some_and(|l| crate::language::lang_matches(lang, &l))
+    };
+    let newest: String = match rows.iter().find(|r| lang_ok(r)) {
         Some(row) => row.get(4),
         None => return Ok(Vec::new()),
     };
     Ok(rows
         .into_iter()
-        .take_while(|row| row.get::<_, String>(4) == newest)
+        .filter(|row| row.get::<_, String>(4) == newest && lang_ok(row))
         .map(|row| DesignationValue {
             language: row.get(0),
             use_system: row.get(1),
