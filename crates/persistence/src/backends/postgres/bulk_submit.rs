@@ -779,7 +779,7 @@ impl BulkSubmitProvider for PostgresBackend {
         let results: Vec<BulkEntryResult> = rows
             .iter()
             .map(|row| {
-                let line_number: i64 = row.get(0);
+                let line_number: i32 = row.get(0);
                 let resource_type: String = row.get(1);
                 let resource_id: Option<String> = row.get(2);
                 let created: Option<bool> = row.get(3);
@@ -973,7 +973,7 @@ impl PostgresBackend {
                     &submission_id.submitter.as_str(),
                     &submission_id.submission_id.as_str(),
                     &manifest_id,
-                    &(result.line_number as i64),
+                    &(result.line_number as i32),
                     &result.resource_type.as_str(),
                     &result.resource_id,
                     &result.created,
@@ -1477,8 +1477,8 @@ impl SubmitWorkerStorage for PostgresBackend {
                  WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6
                    AND manifest_id = $7 AND worker_id = $8 AND fencing_token = $9",
                 &[
-                    &(processed_entries as i64),
-                    &(failed_entries as i64),
+                    &(processed_entries as i32),
+                    &(failed_entries as i32),
                     &(last_processed_line as i64),
                     &lease.tenant.tenant_id().as_str(),
                     &lease.submission_id.submitter,
