@@ -768,6 +768,16 @@ curl -X POST http://localhost:8090/CodeSystem/\$lookup \
   -d '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"http://snomed.info/sct"},{"name":"code","valueCode":"22298006"}]}'
 ```
 
+Multiple editions of the same code system (e.g. the SNOMED International
+release plus a national edition) coexist as separate versions keyed on
+`(url, version)`; unversioned requests resolve to the highest version.
+When the requested `displayLanguage` has no designation in that version,
+`$lookup` falls back to the newest *other* stored version that carries the
+language (`$expand` and `$validate-code` match designations across versions
+of the canonical URL by design) — so a German term from a national edition
+is still found when a newer international release is the default. Pinning
+`version` disables the fallback.
+
 ---
 
 ### LOINC
