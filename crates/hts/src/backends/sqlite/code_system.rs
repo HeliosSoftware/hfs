@@ -308,7 +308,32 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 out
             };
 
-            let all_designations = fetch_designations(&conn, concept_id)?;
+            let mut all_designations = fetch_designations(&conn, concept_id)?;
+
+            // Cross-version designation fallback: when the caller pinned no
+            // version and the resolved (newest) version has no designation in
+            // the requested language, pull matching designations from the
+            // newest *other* stored version of the same canonical URL. This
+            // covers e.g. a national SNOMED edition whose translations would
+            // otherwise be shadowed by a newer international release
+            // ($expand and $validate-code already match designations
+            // URL-wide via `concept_designations`).
+            if let Some(lang) = req.display_language.as_deref() {
+                if req.version.is_none()
+                    && !all_designations
+                        .iter()
+                        .any(|d| d.language.as_deref() == Some(lang))
+                {
+                    all_designations.extend(fetch_designations_cross_version(
+                        &conn,
+                        &req.system,
+                        &req.code,
+                        &system_id,
+                        lang,
+                    )?);
+                }
+            }
+            let all_designations = all_designations;
 
             // 10.2: When displayLanguage is set and a matching designation
             // exists, prefer its value as the concept display.
@@ -1982,6 +2007,59 @@ fn fetch_designations(
     .collect()
 }
 
+/// Designations for `code` in `lang` from stored versions of the canonical
+/// `url` *other than* `exclude_system_id`, taken from the newest such version
+/// that has any (insertion order within that version is preserved so
+/// preferred terms stay first).
+fn fetch_designations_cross_version(
+    conn: &rusqlite::Connection,
+    url: &str,
+    code: &str,
+    exclude_system_id: &str,
+    lang: &str,
+) -> Result<Vec<DesignationValue>, HtsError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT cd.language, cd.use_system, cd.use_code, cd.value, COALESCE(s.version, '') \
+             FROM concept_designations cd \
+             JOIN concepts c ON c.id = cd.concept_id \
+             JOIN code_systems s ON s.id = c.system_id \
+             WHERE s.url = ?1 AND c.code = ?2 AND s.id <> ?3 AND cd.language = ?4 \
+             ORDER BY COALESCE(s.version, '') DESC, cd.id",
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let rows: Vec<(DesignationValue, String)> = stmt
+        .query_map(
+            rusqlite::params![url, code, exclude_system_id, lang],
+            |row| {
+                Ok((
+                    DesignationValue {
+                        language: row.get(0)?,
+                        use_system: row.get(1)?,
+                        use_code: row.get(2)?,
+                        value: row.get(3)?,
+                        source: None,
+                    },
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    let newest = match rows.first() {
+        Some((_, v)) => v.clone(),
+        None => return Ok(Vec::new()),
+    };
+    Ok(rows
+        .into_iter()
+        .take_while(|(_, v)| *v == newest)
+        .map(|(d, _)| d)
+        .collect())
+}
+
 /// Build a minimal synthetic FHIR resource JSON when `resource_json` is absent.
 ///
 /// Used as a fallback for resources that pre-date the `resource_json` column.
@@ -2571,6 +2649,108 @@ mod tests {
                     (100, 'de', NULL, NULL, 'Begriff auf Deutsch');",
         )
         .unwrap();
+    }
+
+    /// Three coexisting versions of one canonical URL: the newest (20260601)
+    /// has only English content; the two older ones carry German designations.
+    fn seed_multiversion(b: &SqliteTerminologyBackend) {
+        let conn = b.pool().get().unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_systems
+                 (id, url, version, name, status, content, created_at, updated_at)
+             VALUES ('cs-v2', 'http://example.org/cs-mv', '20260601', 'MV CS',
+                     'active', 'complete', '2024-01-01', '2024-01-01'),
+                    ('cs-v1', 'http://example.org/cs-mv', '20260515', 'MV CS',
+                     'active', 'complete', '2024-01-01', '2024-01-01'),
+                    ('cs-v0', 'http://example.org/cs-mv', '20240101', 'MV CS',
+                     'active', 'complete', '2024-01-01', '2024-01-01');
+
+             INSERT INTO concepts (id, system_id, code, display)
+             VALUES (200, 'cs-v2', 'C1', 'Color (newest)'),
+                    (201, 'cs-v1', 'C1', 'Color (edition)'),
+                    (202, 'cs-v0', 'C1', 'Color (oldest)');
+
+             INSERT INTO concept_designations (concept_id, language, use_system, use_code, value)
+             VALUES (200, 'en', NULL, NULL, 'Hue'),
+                    (201, 'de', NULL, NULL, 'Farbe'),
+                    (201, 'de', NULL, NULL, 'Färbung'),
+                    (202, 'de', NULL, NULL, 'Alte Farbe');",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lookup_display_language_falls_back_to_newest_other_version() {
+        let b = backend();
+        seed_multiversion(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-mv".into(),
+                    code: "C1".into(),
+                    display_language: Some("de".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // German comes from 20260515 (the newest version that has it) —
+        // both its designations in insertion order, nothing from 20240101.
+        assert_eq!(resp.display.as_deref(), Some("Farbe"));
+        assert_eq!(resp.version.as_deref(), Some("20260601"));
+        assert_eq!(resp.designations.len(), 2);
+        assert_eq!(resp.designations[0].value, "Farbe");
+        assert_eq!(resp.designations[1].value, "Färbung");
+    }
+
+    #[tokio::test]
+    async fn lookup_pinned_version_does_not_fall_back() {
+        let b = backend();
+        seed_multiversion(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-mv".into(),
+                    code: "C1".into(),
+                    version: Some("20260601".into()),
+                    display_language: Some("de".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Explicit version pin is respected strictly: no German available.
+        assert_eq!(resp.display.as_deref(), Some("Color (newest)"));
+        assert!(resp.designations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lookup_no_fallback_when_resolved_version_has_language() {
+        let b = backend();
+        seed_multiversion(&b);
+
+        let resp = b
+            .lookup(
+                &ctx(),
+                LookupRequest {
+                    system: "http://example.org/cs-mv".into(),
+                    code: "C1".into(),
+                    display_language: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // English exists in the resolved newest version — served from there.
+        assert_eq!(resp.display.as_deref(), Some("Hue"));
+        assert_eq!(resp.designations.len(), 1);
     }
 
     #[tokio::test]
