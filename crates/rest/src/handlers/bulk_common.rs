@@ -99,3 +99,117 @@ pub(crate) fn pairs_from_parameters(body: &serde_json::Value) -> Vec<(String, St
     }
     pairs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_query_pairs_none_and_repeated() {
+        assert!(parse_query_pairs(None).is_empty());
+        let pairs = parse_query_pairs(Some("_type=Patient&_type=Observation&_since=2020"));
+        assert_eq!(
+            pairs,
+            vec![
+                ("_type".to_string(), "Patient".to_string()),
+                ("_type".to_string(), "Observation".to_string()),
+                ("_since".to_string(), "2020".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collect_multi_splits_and_trims() {
+        let pairs = vec![
+            ("_type".to_string(), "Patient, Observation".to_string()),
+            ("_type".to_string(), "Condition".to_string()),
+            ("other".to_string(), "ignored".to_string()),
+        ];
+        assert_eq!(
+            collect_multi(&pairs, "_type"),
+            vec!["Patient", "Observation", "Condition"]
+        );
+    }
+
+    #[test]
+    fn test_collect_multi_drops_empty_segments() {
+        let pairs = vec![("_type".to_string(), "Patient,,Observation".to_string())];
+        assert_eq!(
+            collect_multi(&pairs, "_type"),
+            vec!["Patient", "Observation"]
+        );
+    }
+
+    #[test]
+    fn test_first_value() {
+        let pairs = vec![
+            ("a".to_string(), "1".to_string()),
+            ("a".to_string(), "2".to_string()),
+        ];
+        assert_eq!(first_value(&pairs, "a"), Some("1".to_string()));
+        assert_eq!(first_value(&pairs, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_instant_valid_and_invalid() {
+        assert!(parse_instant("2021-01-01T00:00:00Z").is_ok());
+        let err = parse_instant("not-a-date").unwrap_err();
+        assert!(matches!(err, RestError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn test_prefer_handling() {
+        let mut headers = HeaderMap::new();
+        headers.insert("prefer", "respond-async, handling=STRICT".parse().unwrap());
+        assert_eq!(prefer_handling(&headers), Some("strict".to_string()));
+
+        let empty = HeaderMap::new();
+        assert_eq!(prefer_handling(&empty), None);
+    }
+
+    #[test]
+    fn test_has_respond_async() {
+        let mut headers = HeaderMap::new();
+        headers.insert("prefer", "respond-async".parse().unwrap());
+        assert!(has_respond_async(&headers));
+
+        let mut other = HeaderMap::new();
+        other.insert("prefer", "handling=lenient".parse().unwrap());
+        assert!(!has_respond_async(&other));
+
+        assert!(!has_respond_async(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn test_pairs_from_parameters_scalar_and_reference() {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_type", "valueString": "Patient"},
+                {"name": "manifest", "valueUrl": "http://example.com/m.json"},
+                {"name": "_since", "valueInstant": "2021-01-01T00:00:00Z"},
+                {"name": "group", "valueReference": {"reference": "Group/123"}},
+                {"name": "no-value"},
+            ]
+        });
+        let pairs = pairs_from_parameters(&body);
+        assert_eq!(first_value(&pairs, "_type"), Some("Patient".to_string()));
+        assert_eq!(
+            first_value(&pairs, "manifest"),
+            Some("http://example.com/m.json".to_string())
+        );
+        assert_eq!(
+            first_value(&pairs, "_since"),
+            Some("2021-01-01T00:00:00Z".to_string())
+        );
+        assert_eq!(first_value(&pairs, "group"), Some("Group/123".to_string()));
+        assert_eq!(first_value(&pairs, "no-value"), None);
+    }
+
+    #[test]
+    fn test_pairs_from_parameters_empty() {
+        assert!(pairs_from_parameters(&json!({})).is_empty());
+    }
+}
