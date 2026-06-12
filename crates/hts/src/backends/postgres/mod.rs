@@ -322,11 +322,19 @@ impl BundleImportBackend for PostgresTerminologyBackend {
     /// contained resources into the PostgreSQL normalized tables.
     async fn import_bundle(
         &self,
-        _ctx: &TenantContext,
+        ctx: &TenantContext,
         data: &[u8],
     ) -> Result<ImportStats, HtsError> {
         let parsed = bundle_parser::parse_bundle(data)?;
+        self.import_parsed(ctx, parsed).await
+    }
 
+    /// Write an already-parsed bundle, skipping the JSON parse step.
+    async fn import_parsed(
+        &self,
+        _ctx: &TenantContext,
+        parsed: bundle_parser::ParsedBundle,
+    ) -> Result<ImportStats, HtsError> {
         let mut client = self
             .pool
             .get()
