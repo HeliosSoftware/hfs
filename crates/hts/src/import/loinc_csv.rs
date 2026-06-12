@@ -15,7 +15,9 @@
 //! `de-DE`). The English `display` is left untouched. Because both the `hts
 //! import` CLI and the server bootstrap funnel LOINC ZIPs through
 //! [`import_loinc_csv`], language variants are picked up automatically by both
-//! paths — no extra flag or file is required.
+//! paths — no extra flag or file is required. The imported language set can
+//! optionally be restricted via [`LanguageFilter`] (`HTS_IMPORT_LANGUAGES` /
+//! `--languages`); excluded variant files are skipped without being parsed.
 //!
 //! # ⚠️  LICENSE REQUIRED
 //!

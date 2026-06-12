@@ -15,6 +15,11 @@
 //! (`en-US`, `da-DK`, `fr-CA`, …) — so `displayLanguage` /
 //! `Accept-Language` requests resolve to the right term in any language.
 //!
+//! The imported language set can be restricted via [`LanguageFilter`]
+//! (`HTS_IMPORT_LANGUAGES` / `--languages`); excluded per-language
+//! Description and Language-refset files are skipped without being parsed,
+//! and English is always retained.
+//!
 //! # ⚠️  LICENSE REQUIRED
 //!
 //! Real SNOMED CT data requires a license from SNOMED International.
