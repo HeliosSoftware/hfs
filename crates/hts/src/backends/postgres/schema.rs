@@ -65,7 +65,12 @@ CREATE TABLE IF NOT EXISTS concepts (
     definition TEXT,
     UNIQUE (system_id, code)
 );
-CREATE INDEX IF NOT EXISTS idx_concepts_system_code ON concepts(system_id, code);
+-- The UNIQUE (system_id, code) constraint already creates a backing index on
+-- exactly those columns, so the old explicit idx_concepts_system_code was a
+-- redundant duplicate that doubled index maintenance on every concept insert.
+-- Drop it on startup (idempotent); the constraint index serves all the same
+-- lookups.
+DROP INDEX IF EXISTS idx_concepts_system_code;
 CREATE INDEX IF NOT EXISTS idx_concepts_display_trgm ON concepts USING gin(display gin_trgm_ops);
 
 -- ── Hierarchy (pre-materialized parent-child links) ───────────────────────────
@@ -103,6 +108,13 @@ CREATE TABLE IF NOT EXISTS concept_designations (
     use_code   TEXT,
     value      TEXT NOT NULL
 );
+-- Index on concept_id is essential: Postgres does not auto-index foreign keys,
+-- so without it each per-concept designation read and the delete-before-reinsert
+-- that every import performs is a sequential scan, making a bulk import of a
+-- designation-heavy source (SNOMED CT, LOINC) O(n²). (concept_properties has the
+-- equivalent idx_props_concept.)
+CREATE INDEX IF NOT EXISTS idx_designations_concept
+    ON concept_designations(concept_id);
 
 -- ── Value Sets ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS value_sets (
@@ -205,15 +217,24 @@ CREATE INDEX IF NOT EXISTS idx_closure_descendant
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
 -- file name with the SHA-256 of the file's contents. On every startup the
--- bootstrap sync hashes each file in the directory and imports only those whose
--- hash is absent or differs from the stored value — so newly added files and
--- updated terminology releases are picked up without re-parsing unchanged files.
+-- bootstrap sync stats each file in the directory and skips re-importing those
+-- whose (size_bytes, mtime_unix) match the recorded values, falling back to a
+-- full content hash only when the cheap stat disagrees — so unchanged files
+-- (including multi-GB SNOMED/LOINC archives) are recognized without re-reading
+-- their contents, while newly added files and updated terminology releases are
+-- still picked up. `languages` records the BCP-47 filter that was applied so a
+-- changed HTS_IMPORT_LANGUAGES re-triggers import of affected files.
 CREATE TABLE IF NOT EXISTS bootstrap_imports (
     path          TEXT PRIMARY KEY,
     content_hash  TEXT NOT NULL,
     size_bytes    BIGINT NOT NULL,
+    mtime_unix    BIGINT,
+    languages     TEXT NOT NULL DEFAULT '',
     imported_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Bring pre-existing ledgers up to the current shape (idempotent).
+ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS mtime_unix BIGINT;
+ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS languages TEXT NOT NULL DEFAULT '';
 ";
 
 /// Apply the HTS PostgreSQL schema to the given client connection.

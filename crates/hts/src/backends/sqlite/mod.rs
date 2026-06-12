@@ -202,6 +202,22 @@ impl SqliteTerminologyBackend {
     /// Returns [`HtsError::StorageError`] if the pool cannot be created or the
     /// schema migration fails.
     pub fn new(db_path: &str) -> Result<Self, HtsError> {
+        Self::new_inner(db_path, true)
+    }
+
+    /// Like [`Self::new`] but defers the expensive `concepts_fts` prebuild and
+    /// in-memory index pre-warm.
+    ///
+    /// The server startup path uses this so that bootstrap re-imports run
+    /// *before* the FTS index is materialized: building FTS in `new` would
+    /// (a) pay the 10–25 s prebuild on data that bootstrap is about to change,
+    /// and (b) leave the index stale for any re-imported system. Callers MUST
+    /// invoke [`Self::finalize_after_bootstrap`] before serving requests.
+    pub fn new_without_fts_prebuild(db_path: &str) -> Result<Self, HtsError> {
+        Self::new_inner(db_path, false)
+    }
+
+    fn new_inner(db_path: &str, prebuild_fts: bool) -> Result<Self, HtsError> {
         // Apply per-connection pragmas on every new connection from the pool.
         // journal_mode is file-level (WAL persists); the rest are per-connection.
         // `synchronous=NORMAL` is crash-safe under WAL (the journal mode set
@@ -286,47 +302,59 @@ impl SqliteTerminologyBackend {
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
+            schema::migrate_bootstrap_imports_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to apply bootstrap_imports column migration: {e}"
+                ))
+            })?;
 
-            // Clear the concept FTS index on every startup — it is always rebuilt
-            // synchronously by prebuild_concepts_fts below, so stale rows from a
-            // previous run must be removed first.
-            // The implicit_expansion_cache is intentionally kept across restarts:
-            // populate_implicit_cache runs inside a BEGIN EXCLUSIVE transaction, so
-            // SQLite rolls back any partial write on crash — the entries are always
-            // fully committed or fully absent.  Persisting the cache means repeated
-            // server restarts (e.g. benchmark reruns) start warm rather than cold.
-            // Cache entries are invalidated per-code-system when new data is imported
-            // (see fhir_bundle::write_code_system).
-            let _ = conn.execute_batch(
-                "DELETE FROM concepts_fts;
-                 DELETE FROM concepts_fts_built;
-                 DELETE FROM concepts_word_fts;",
-            );
+            // FTS prebuild + index pre-warm. Skipped when `prebuild_fts` is
+            // false (server startup path): bootstrap re-imports run first and
+            // [`Self::finalize_after_bootstrap`] performs these steps once on
+            // the final data. The implicit_expansion_cache is intentionally kept
+            // across restarts: populate_implicit_cache runs inside a BEGIN
+            // EXCLUSIVE transaction, so SQLite rolls back any partial write on
+            // crash — the entries are always fully committed or fully absent.
+            // Persisting the cache means repeated server restarts (e.g. benchmark
+            // reruns) start warm rather than cold. Cache entries are invalidated
+            // per-code-system when new data is imported (see
+            // fhir_bundle::write_code_system).
+            if prebuild_fts {
+                // Clear the concept FTS index — it is always rebuilt
+                // synchronously by prebuild_concepts_fts below, so stale rows
+                // from a previous run must be removed first.
+                let _ = conn.execute_batch(
+                    "DELETE FROM concepts_fts;
+                     DELETE FROM concepts_fts_built;
+                     DELETE FROM concepts_word_fts;",
+                );
 
-            // Update query-planner statistics for large tables.
-            let _ = conn.execute_batch(
-                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
-                 ANALYZE concept_properties; ANALYZE concept_designations; \
-                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
-            );
+                // Update query-planner statistics for large tables.
+                let _ = conn.execute_batch(
+                    "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                     ANALYZE concept_properties; ANALYZE concept_designations; \
+                     ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+                );
 
-            // Pre-populate the concepts_fts trigram index for every code system
-            // so that text-filtered $expand requests always use the fast FTS path.
-            // This runs synchronously before the server accepts requests; for large
-            // systems (SNOMED 638K, LOINC 181K) it can take 10–25 s total.
-            value_set::prebuild_concepts_fts(&conn);
+                // Pre-populate the concepts_fts trigram index for every code
+                // system so that text-filtered $expand requests always use the
+                // fast FTS path. This runs synchronously before the server
+                // accepts requests; for large systems (SNOMED 638K, LOINC 181K)
+                // it can take 10–25 s total.
+                value_set::prebuild_concepts_fts(&conn);
 
-            // Pre-warm the in-memory concept index from any implicit-expansion
-            // entries that are already persisted in implicit_expansion_cache.
-            // On a warm restart (e.g. repeated benchmark runs) this lets the
-            // async hot path in expand() fire immediately without waiting for a
-            // background build thread.  No-op on first run (empty cache).
-            value_set::prebuild_implicit_index(&conn, &implicit_index);
+                // Pre-warm the in-memory concept index from any implicit-expansion
+                // entries that are already persisted in implicit_expansion_cache.
+                // On a warm restart (e.g. repeated benchmark runs) this lets the
+                // async hot path in expand() fire immediately without waiting for
+                // a background build thread.  No-op on first run (empty cache).
+                value_set::prebuild_implicit_index(&conn, &implicit_index);
 
-            // Pre-warm the inline-compose in-memory index from any persisted
-            // "inline-compose:*" entries.  Eliminates spawn_blocking contention
-            // for repeated inline ValueSet $expand calls (e.g. EX06 benchmark).
-            value_set::prebuild_inline_compose_index(&conn, &inline_compose_index);
+                // Pre-warm the inline-compose in-memory index from any persisted
+                // "inline-compose:*" entries.  Eliminates spawn_blocking contention
+                // for repeated inline ValueSet $expand calls (e.g. EX06 benchmark).
+                value_set::prebuild_inline_compose_index(&conn, &inline_compose_index);
+            }
         }
 
         info!(db_path, "SQLite terminology backend initialized");
@@ -351,6 +379,56 @@ impl SqliteTerminologyBackend {
             cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Perform the post-bootstrap preparation that [`Self::new`] would normally
+    /// do inline, but on the final post-import data.
+    ///
+    /// Intended to be called once after [`Self::new_without_fts_prebuild`] and
+    /// the bootstrap directory sync, before the server begins accepting
+    /// requests. It:
+    ///
+    /// 1. Rebuilds any concept closures that bootstrap re-imports invalidated.
+    ///    `migrate_concept_closure` only touches systems that have hierarchy
+    ///    edges but no closure rows, so unchanged systems cost nothing while a
+    ///    re-imported SNOMED/LOINC system is rebuilt.
+    /// 2. Clears and rebuilds the `concepts_fts` index on the final data and
+    ///    refreshes the in-memory implicit/inline-compose indexes and planner
+    ///    statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtsError::StorageError`] if a pooled connection cannot be
+    /// acquired or the closure rebuild fails. FTS/index pre-warm failures are
+    /// non-fatal (logged via the underlying helpers) and do not error.
+    pub fn finalize_after_bootstrap(&self) -> Result<(), HtsError> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| HtsError::StorageError(format!("Failed to acquire connection: {e}")))?;
+
+        // Rebuild closures wiped by bootstrap re-import (idempotent — only
+        // systems missing closure rows are recomputed).
+        schema::migrate_concept_closure(&conn).map_err(|e| {
+            HtsError::StorageError(format!("Failed to rebuild concept closure: {e}"))
+        })?;
+
+        // Rebuild FTS + planner stats on the final data. Mirrors the block in
+        // `new_inner` that is skipped under `new_without_fts_prebuild`.
+        let _ = conn.execute_batch(
+            "DELETE FROM concepts_fts;
+             DELETE FROM concepts_fts_built;
+             DELETE FROM concepts_word_fts;",
+        );
+        let _ = conn.execute_batch(
+            "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+             ANALYZE concept_properties; ANALYZE concept_designations; \
+             ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+        );
+        value_set::prebuild_concepts_fts(&conn);
+        value_set::prebuild_implicit_index(&conn, &self.implicit_index);
+        value_set::prebuild_inline_compose_index(&conn, &self.inline_compose_index);
+        Ok(())
     }
 
     /// Open an **in-memory** SQLite database (useful for tests).
@@ -634,6 +712,32 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         }
 
         result
+    }
+
+    async fn code_system_has_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<bool, HtsError> {
+        let pool = self.pool.clone();
+        let url = url.to_string();
+        tokio::task::spawn_blocking(move || -> Result<bool, HtsError> {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM concepts c
+                     JOIN code_systems s ON c.system_id = s.id
+                     WHERE s.url = ?1
+                 )",
+                rusqlite::params![url],
+                |r| r.get(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
 }
 

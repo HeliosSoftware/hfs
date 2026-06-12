@@ -51,10 +51,19 @@ use crate::error::HtsError;
 /// every language present in the source archive is imported, which is the
 /// historical behavior.
 ///
-/// Matching is BCP-47-aware in both directions via
-/// [`crate::language::lang_matches`]: a configured `de` admits stored `de-DE`,
-/// and a configured `de-DE` admits the bare `de` that SNOMED RF2
-/// `languageCode` columns carry.
+/// Matching is BCP-47-aware via [`crate::language::lang_match_rank`], which
+/// ranks a stored tag against a configured tag in the preference order
+/// "`es-ES`, then `esES`, then `es`/`es*`". Two selection modes are built on it:
+///
+/// * [`allows`](Self::allows) — a per-tag predicate (any rank matches). Used by
+///   importers whose stored designation languages are bare ISO codes (SNOMED
+///   RF2 `languageCode`), where there are no regional siblings to disambiguate.
+/// * [`resolve_retained`](Self::resolve_retained) — *best-tier* selection over a
+///   known set of candidate tags: for each configured tag it keeps only the
+///   candidates sharing the best (lowest) rank. So a configured `es-ES` keeps
+///   `es-ES` when present (excluding `es-AR`/`es-MX`), but a configured `es`
+///   keeps every `es-*`. Used by the LOINC importer, whose linguistic-variant
+///   files are region-qualified and enumerable up front.
 ///
 /// The filter only governs *translations* (SNOMED descriptions per language,
 /// LOINC linguistic variants); the English content that drives concept
@@ -92,6 +101,49 @@ impl LanguageFilter {
                 .tags
                 .iter()
                 .any(|t| crate::language::lang_matches(t, language))
+    }
+
+    /// Best-tier selection over a known set of candidate language tags.
+    ///
+    /// For each configured tag, finds the best (lowest) match rank achievable
+    /// among `available` and keeps every candidate sharing that rank; the
+    /// retained set is the union across all configured tags. The allow-all
+    /// filter keeps every candidate.
+    ///
+    /// This is what makes a configured `es-ES` keep only `es-ES` when it is
+    /// present (its tier-0 exact match outranks the tier-2 siblings `es-AR` /
+    /// `es-MX`), while a configured `es` — which can only ever reach tier 2 —
+    /// keeps every `es-*` variant. Returned tags preserve the casing of the
+    /// `available` inputs so callers can test membership against the same
+    /// strings they passed in.
+    pub fn resolve_retained<I, S>(&self, available: I) -> std::collections::HashSet<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let available: Vec<String> = available
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+        if self.allows_all() {
+            return available.into_iter().collect();
+        }
+        let mut keep = std::collections::HashSet::new();
+        for tag in &self.tags {
+            let Some(best) = available
+                .iter()
+                .filter_map(|a| crate::language::lang_match_rank(tag, a))
+                .min()
+            else {
+                continue;
+            };
+            for a in &available {
+                if crate::language::lang_match_rank(tag, a) == Some(best) {
+                    keep.insert(a.clone());
+                }
+            }
+        }
+        keep
     }
 
     /// Canonical form of the configured tag list (sorted, lowercased,
@@ -199,6 +251,23 @@ pub trait BundleImportBackend: Send + Sync {
         parsed: bundle_parser::ParsedBundle,
     ) -> Result<ImportStats, HtsError>;
 
+    /// `true` when the code system at `url` already has at least one concept
+    /// stored. Chunked importers call this **once** before a bulk load to decide
+    /// whether it is a fresh first-time import (no prior concepts) — in which
+    /// case they set [`ParsedBundle::fresh_load`] to skip the pointless
+    /// delete-before-reinsert on every concept of every batch.
+    ///
+    /// The default returns `true` (conservative: assume data may exist, so
+    /// deletes are not skipped), keeping any backend that does not override it
+    /// correct, if slightly slower.
+    async fn code_system_has_concepts(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+    ) -> Result<bool, HtsError> {
+        Ok(true)
+    }
+
     /// Remove all HTS normalized rows for the resource identified by `resource_url`.
     ///
     /// Called by the CRUD DELETE handler after the persistence soft-delete so
@@ -254,5 +323,59 @@ mod tests {
     fn canonical_spec_is_sorted_lowercased_deduped() {
         let f = LanguageFilter::parse("FR-fr, de , fr-FR,de");
         assert_eq!(f.canonical_spec(), "de,fr-fr");
+    }
+
+    fn sorted(set: std::collections::HashSet<String>) -> Vec<String> {
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn resolve_retained_picks_best_tier_per_tag() {
+        // The motivating LOINC case: filter `de,es-ES` against the regional
+        // linguistic-variant files. `es-ES` is an exact (tier-0) match, so its
+        // siblings es-AR/es-MX are excluded; `de` can only reach tier 2, so it
+        // keeps every German regional variant.
+        let f = LanguageFilter::parse("de,es-ES");
+        let available = ["de-AT", "de-DE", "es-AR", "es-ES", "es-MX"];
+        assert_eq!(
+            sorted(f.resolve_retained(available)),
+            vec!["de-AT", "de-DE", "es-ES"]
+        );
+    }
+
+    #[test]
+    fn resolve_retained_bare_tag_keeps_all_regionals() {
+        // A bare `es` only ever reaches tier 2, so every es-* sibling ties and
+        // is kept — "es or es*".
+        let f = LanguageFilter::parse("es");
+        let available = ["es-AR", "es-ES", "es-MX"];
+        assert_eq!(
+            sorted(f.resolve_retained(available)),
+            vec!["es-AR", "es-ES", "es-MX"]
+        );
+    }
+
+    #[test]
+    fn resolve_retained_falls_back_to_bare_then_siblings() {
+        // No exact es-ES present: the best tier reachable is 2, shared by the
+        // bare `es` and the regional siblings, so all of them are kept.
+        let f = LanguageFilter::parse("es-ES");
+        let available = ["es", "es-AR", "es-MX"];
+        assert_eq!(
+            sorted(f.resolve_retained(available)),
+            vec!["es", "es-AR", "es-MX"]
+        );
+    }
+
+    #[test]
+    fn resolve_retained_allow_all_keeps_everything() {
+        let f = LanguageFilter::parse("");
+        let available = ["de-DE", "es-MX"];
+        assert_eq!(
+            sorted(f.resolve_retained(available)),
+            vec!["de-DE", "es-MX"]
+        );
     }
 }

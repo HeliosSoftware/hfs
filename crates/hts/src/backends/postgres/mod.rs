@@ -380,7 +380,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         stats.errors.extend(parsed.parse_errors.iter().cloned());
 
         for cs in &parsed.code_systems {
-            if let Err(e) = write_code_system(&tx, cs, &mut stats).await {
+            if let Err(e) = write_code_system(&tx, cs, &mut stats, parsed.fresh_load).await {
                 stats
                     .errors
                     .push(format!("CodeSystem '{}' import failed: {e}", cs.url));
@@ -449,6 +449,30 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         self.clear_response_caches();
 
         Ok(stats)
+    }
+
+    async fn code_system_has_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<bool, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM concepts c
+                     JOIN code_systems s ON c.system_id = s.id
+                     WHERE s.url = $1
+                 )",
+                &[&url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.get(0))
     }
 
     /// Delete all HTS normalized rows for the resource identified by `resource_url`.
@@ -524,6 +548,11 @@ async fn write_code_system(
     client: &impl GenericClient,
     cs: &ParsedCodeSystem,
     stats: &mut ImportStats,
+    // When `true` the caller guarantees this code system had no concepts before
+    // the import session, so the per-concept delete-before-reinsert of
+    // properties/designations is skipped (fast path for first-time bulk loads).
+    // See [`crate::import::bundle_parser::ParsedBundle::fresh_load`].
+    skip_child_delete: bool,
 ) -> Result<(), HtsError> {
     let resource_json = Some(cs.resource_json.clone());
     let now = utc_now();
@@ -656,6 +685,31 @@ async fn write_code_system(
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
             insert_hierarchy(client, &system_id, parent, &concept.code).await?;
+        }
+
+        // Replace any prior child rows for this concept so a re-import fully
+        // supersedes the previous set rather than duplicating rows or leaving
+        // filtered-out languages behind (the concept row itself is upserted, so
+        // its id is stable). A concept that now yields zero designations after a
+        // narrower language filter must still lose its old ones. Stub
+        // "content=not-present" imports carry an empty concepts array, so this
+        // loop never runs for them. Skipped on a fresh load (nothing to
+        // delete). Mirrors import/fhir_bundle.rs (SQLite).
+        if !skip_child_delete {
+            client
+                .execute(
+                    "DELETE FROM concept_properties WHERE concept_id = $1",
+                    &[&concept_id],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            client
+                .execute(
+                    "DELETE FROM concept_designations WHERE concept_id = $1",
+                    &[&concept_id],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
         }
 
         for prop in &concept.properties {

@@ -302,6 +302,17 @@ pub async fn import_snomed_rf2(
         content: "complete",
     };
 
+    // Probe once before loading: a SNOMED edition is overwhelmingly the largest
+    // designation source, so skipping the per-concept delete-before-reinsert on
+    // a fresh load is the biggest single import win. Probe by canonical URL —
+    // when no concepts exist yet this is a first-time load and every concept is
+    // brand-new. A re-import (or a second edition sharing the URL) keeps the
+    // safe replacement path. Probe failure falls back to the safe path.
+    let fresh_load = !backend
+        .code_system_has_concepts(ctx, SNOMED_URL)
+        .await
+        .unwrap_or(true);
+
     // Seed empty CodeSystem.
     let seed = build_parsed_code_system(&meta, &[]);
     let seed_stats = backend.import_parsed(ctx, seed).await?;
@@ -382,7 +393,8 @@ pub async fn import_snomed_rf2(
             })
             .collect();
 
-        let parsed = build_parsed_code_system(&meta, &builder);
+        let mut parsed = build_parsed_code_system(&meta, &builder);
+        parsed.fresh_load = fresh_load;
         let chunk_stats = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
