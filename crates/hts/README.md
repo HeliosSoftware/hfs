@@ -273,6 +273,10 @@ Options:
       --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
       --log-level <LOG_LEVEL>      Log level [env: HTS_LOG_LEVEL=] [default: info]
       --batch-size <N>             Resources per import batch [default: 500]
+      --languages <TAGS>           Comma-separated BCP-47 tags restricting imported
+                                   translation languages (SNOMED RF2, LOINC); English
+                                   is always retained [env: HTS_IMPORT_LANGUAGES=]
+                                   [default: all languages]
       --dry-run                    Parse only - no database writes
       --verbose                    Emit per-batch progress to stderr
   -h, --help                       Print help
@@ -768,7 +772,14 @@ national-edition language refsets. `$lookup`, `$expand`, and
 `$validate-code` resolve these via the `displayLanguage` parameter or the
 `Accept-Language` HTTP header. Language matching is BCP-47-aware (RFC 4647):
 a request for `de-DE` (what a browser typically sends) finds designations
-tagged `de`, and a request for `fr` accepts `fr-CA`:
+tagged `de`, and a request for `fr` accepts `fr-CA`.
+
+To import only a subset of the available languages (cutting designation
+volume and import time), pass `--languages` (or set `HTS_IMPORT_LANGUAGES`
+for the server bootstrap), e.g. `--languages de,fr-FR`. Excluded
+per-language Description and Language-refset files are skipped without
+being parsed; English is always retained because display selection depends
+on it:
 
 ```bash
 curl -X POST http://localhost:8090/CodeSystem/\$lookup \
