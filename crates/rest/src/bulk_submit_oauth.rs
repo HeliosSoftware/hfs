@@ -143,3 +143,45 @@ impl FileTokenProvider for JwtClientCredentialsTokenProvider {
         Some(token)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A throwaway EC P-384 (secp384r1) PKCS#8 private key, generated solely for
+    // these tests — not used anywhere else.
+    const TEST_ES384_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDDL2uAdbDMvTFQ/r+Tz\n\
+45fPr+tTiZPaq7mKcF2g1fmOCRMSdkSMLaRBzWbIwOE8GxOhZANiAASjv7NSBHxr\n\
+k5K6g75uWMf/NsVu7ay2lO8vuu9EC12UBjDQ+297+9I7+IlSzRmoWKUT0fVrOeoB\n\
+gMMPIjEueYREkCGj6cILnLaP5hAey+Q7JjRgVO6Xqf0u2uCO6yn8UTU=\n\
+-----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn test_new_rejects_unsupported_alg() {
+        assert!(JwtClientCredentialsTokenProvider::new("cid", TEST_ES384_PEM, "HS256").is_none());
+    }
+
+    #[test]
+    fn test_new_rejects_malformed_es384_key() {
+        assert!(JwtClientCredentialsTokenProvider::new("cid", "not-a-pem", "ES384").is_none());
+    }
+
+    #[test]
+    fn test_new_rejects_malformed_rs384_key() {
+        assert!(JwtClientCredentialsTokenProvider::new("cid", "not-a-pem", "RS384").is_none());
+    }
+
+    #[test]
+    fn test_new_accepts_es384_key_and_mints_assertion() {
+        let provider = JwtClientCredentialsTokenProvider::new("my-client", TEST_ES384_PEM, "ES384")
+            .expect("valid ES384 key");
+        assert_eq!(provider.signing_alg, Algorithm::ES384);
+
+        // The signed client assertion is a well-formed 3-segment compact JWS.
+        let assertion = provider
+            .client_assertion("https://idp.example.com/token")
+            .expect("assertion minted");
+        assert_eq!(assertion.split('.').count(), 3);
+    }
+}
