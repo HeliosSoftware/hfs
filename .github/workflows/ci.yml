@@ -257,7 +257,22 @@ jobs:
         #   - RUSTSEC-2026-0119 fires when encoding outbound messages with
         #     many compressible records; mongodb only encodes single-question
         #     resolver queries.
-        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+        #
+        # The pyo3 advisories below only affect `pysof`, which is excluded from
+        # the default workspace build and shipped separately as a Python wheel.
+        # The fix (pyo3 >= 0.29) is blocked upstream: pysof depends on
+        # `pythonize`, whose latest release (0.28) only supports pyo3 0.28.
+        # Neither advisory path is reachable in pysof:
+        #   - RUSTSEC-2026-0176 affects `nth`/`nth_back` on PyList/PyTuple
+        #     iterators; pysof never calls those methods.
+        #   - RUSTSEC-2026-0177 affects `PyCFunction::new_closure`; pysof never
+        #     creates closures. Remove once pythonize ships a pyo3 0.29 build.
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0118
+          --ignore RUSTSEC-2026-0119
+          --ignore RUSTSEC-2026-0176
+          --ignore RUSTSEC-2026-0177
  
   coverage:
     name: Code Coverage
