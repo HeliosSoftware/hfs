@@ -34,7 +34,7 @@ repository = "https://github.com/HeliosSoftware/hfs"
 rust-version = "1.90"
 
 [workspace.dependencies]
-serde = { version = "=1.0.220", features = ["derive"] }
-serde_json = "=1.0.143"
+serde = { version = "=1.0.224", features = ["derive"] }
+serde_json = "=1.0.144"
 helios-fhir = { path = "crates/fhir" }
 chrono = { version = "0.4", features = ["serde"] }
