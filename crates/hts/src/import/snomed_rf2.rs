@@ -31,7 +31,7 @@ use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
 use crate::import::LanguageFilter;
 use crate::import::bundle_builder::{
-    BuilderConcept, BuilderDesignation, BuilderProperty, CodeSystemMeta, build_code_system_bundle,
+    BuilderConcept, BuilderDesignation, BuilderProperty, CodeSystemMeta, build_parsed_code_system,
 };
 
 // ── SNOMED CT constants ───────────────────────────────────────────────────────
@@ -298,8 +298,8 @@ pub async fn import_snomed_rf2(
     };
 
     // Seed empty CodeSystem.
-    let seed = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed = build_parsed_code_system(&meta, &[]);
+    let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -377,8 +377,8 @@ pub async fn import_snomed_rf2(
             })
             .collect();
 
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk_stats = backend.import_bundle(ctx, &bytes).await?;
+        let parsed = build_parsed_code_system(&meta, &builder);
+        let chunk_stats = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
 

@@ -34,7 +34,7 @@ use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
 use crate::import::LanguageFilter;
 use crate::import::bundle_builder::{
-    BuilderConcept, BuilderDesignation, CodeSystemMeta, build_code_system_bundle,
+    BuilderConcept, BuilderDesignation, CodeSystemMeta, build_parsed_code_system,
 };
 
 // ── LOINC constants ───────────────────────────────────────────────────────────
@@ -308,8 +308,8 @@ pub async fn import_loinc_csv(
     };
 
     // Seed: empty CodeSystem to upsert metadata.
-    let seed_bytes = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+    let seed = build_parsed_code_system(&meta, &[]);
+    let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -350,8 +350,8 @@ pub async fn import_loinc_csv(
             })
             .collect();
 
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk_stats = backend.import_bundle(ctx, &bytes).await?;
+        let parsed = build_parsed_code_system(&meta, &builder);
+        let chunk_stats = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
 

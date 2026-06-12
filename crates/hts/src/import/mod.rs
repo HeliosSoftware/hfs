@@ -186,6 +186,19 @@ pub trait BundleImportBackend: Send + Sync {
         data: &[u8],
     ) -> Result<ImportStats, HtsError>;
 
+    /// Import an already-parsed bundle, skipping the JSON parse step.
+    ///
+    /// Filesystem importers that batch large code systems (SNOMED RF2, LOINC)
+    /// construct [`bundle_parser::ParsedBundle`] values directly via
+    /// `bundle_builder::build_parsed_code_system` and feed them here, avoiding
+    /// a serialise→reparse round-trip per batch. Semantics are identical to
+    /// [`Self::import_bundle`] after parsing.
+    async fn import_parsed(
+        &self,
+        ctx: &TenantContext,
+        parsed: bundle_parser::ParsedBundle,
+    ) -> Result<ImportStats, HtsError>;
+
     /// Remove all HTS normalized rows for the resource identified by `resource_url`.
     ///
     /// Called by the CRUD DELETE handler after the persistence soft-delete so

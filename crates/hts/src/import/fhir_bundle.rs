@@ -33,6 +33,18 @@ pub(crate) fn import_bundle_sync(
     data: &[u8],
 ) -> Result<ImportStats, HtsError> {
     let parsed = bundle_parser::parse_bundle(data)?;
+    import_parsed_sync(pool, &parsed)
+}
+
+/// Insert an already-parsed bundle into SQLite. Shared by
+/// [`import_bundle_sync`] and the direct
+/// [`BundleImportBackend::import_parsed`](crate::import::BundleImportBackend::import_parsed)
+/// path used by the chunked filesystem importers.
+#[cfg(feature = "sqlite")]
+pub(crate) fn import_parsed_sync(
+    pool: &Pool<SqliteConnectionManager>,
+    parsed: &ParsedBundle,
+) -> Result<ImportStats, HtsError> {
     let mut conn = pool
         .get()
         .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
@@ -83,7 +95,7 @@ pub(crate) fn import_bundle_sync(
     let tx = conn
         .transaction()
         .map_err(|e| HtsError::StorageError(format!("Begin transaction: {e}")))?;
-    write_parsed_bundle(&tx, &parsed, &mut stats)?;
+    write_parsed_bundle(&tx, parsed, &mut stats)?;
     tx.commit()
         .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
 

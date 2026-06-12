@@ -15,6 +15,10 @@
 
 use serde_json::{Value, json};
 
+use crate::import::bundle_parser::{
+    ParsedBundle, ParsedCodeSystem, ParsedConcept, ParsedDesignation, ParsedProperty,
+};
+
 /// Metadata for a single CodeSystem emitted by an importer.
 #[derive(Debug, Clone)]
 pub(crate) struct CodeSystemMeta<'a> {
@@ -57,6 +61,97 @@ pub(crate) struct BuilderDesignation<'a> {
     pub use_system: Option<&'a str>,
     pub use_code: Option<&'a str>,
     pub value: &'a str,
+}
+
+/// Build a [`ParsedBundle`] containing one CodeSystem directly from builder
+/// structs, skipping the JSON serialise→reparse round-trip of
+/// [`build_code_system_bundle`] + `bundle_parser::parse_bundle`.  Used by the
+/// chunked bulk importers (SNOMED RF2, LOINC) together with
+/// [`BundleImportBackend::import_parsed`](super::BundleImportBackend::import_parsed),
+/// where re-encoding millions of designations per run is measurable overhead.
+///
+/// Semantics mirror the JSON round-trip exactly, with one deliberate
+/// exception: `resource_json` carries the *metadata-only* CodeSystem resource
+/// (no `concept` array) — the same shape the seed bundle of a chunked import
+/// stores — instead of whichever concept chunk happened to be written last.
+pub(crate) fn build_parsed_code_system(
+    meta: &CodeSystemMeta<'_>,
+    concepts: &[BuilderConcept<'_>],
+) -> ParsedBundle {
+    let parsed_concepts = concepts
+        .iter()
+        .map(|c| {
+            // The JSON path encodes `parent_code` as a
+            // `{code:"parent", valueCode}` property which the parser turns
+            // into both a property row and a hierarchy edge — replicate both.
+            let mut properties: Vec<ParsedProperty> = Vec::new();
+            if let Some(parent) = c.parent_code {
+                properties.push(parsed_property("parent", "valueCode", parent));
+            }
+            properties.extend(
+                c.extra_properties
+                    .iter()
+                    .map(|p| parsed_property(p.code, p.value_key, p.value)),
+            );
+
+            let designations = c
+                .designations
+                .iter()
+                .map(|d| ParsedDesignation {
+                    language: d.language.map(str::to_owned),
+                    use_system: d.use_system.map(str::to_owned),
+                    use_code: d.use_code.map(str::to_owned),
+                    value: d.value.to_owned(),
+                })
+                .collect();
+
+            ParsedConcept {
+                code: c.code.to_owned(),
+                display: c.display.map(str::to_owned),
+                definition: c.definition.map(str::to_owned),
+                properties,
+                designations,
+                parent_code: c.parent_code.map(str::to_owned),
+            }
+        })
+        .collect();
+
+    ParsedBundle {
+        code_systems: vec![ParsedCodeSystem {
+            id: meta.id.to_owned(),
+            url: meta.url.to_owned(),
+            version: meta.version.map(str::to_owned),
+            name: meta.name.map(str::to_owned),
+            title: meta.title.map(str::to_owned),
+            status: meta.status.to_owned(),
+            content: meta.content.to_owned(),
+            concepts: parsed_concepts,
+            resource_json: build_code_system_resource(meta, &[]),
+        }],
+        ..Default::default()
+    }
+}
+
+/// Convert a builder property to its parsed form, mirroring
+/// `bundle_parser::parse_property` (FHIR `value[x]` key → value type, and
+/// `parent`/`valueCode` properties marked as hierarchy edges).
+fn parsed_property(code: &str, value_key: &str, value: &str) -> ParsedProperty {
+    let value_type = match value_key {
+        "valueCode" => "code",
+        "valueBoolean" => "boolean",
+        "valueInteger" => "integer",
+        "valueDecimal" => "decimal",
+        "valueDateTime" => "dateTime",
+        _ => "string",
+    };
+    let is_parent_edge = code == "parent" && value_type == "code";
+    ParsedProperty {
+        code: code.to_owned(),
+        value_type: value_type.to_owned(),
+        value: value.to_owned(),
+        is_parent_edge,
+        parent_code_value: is_parent_edge.then(|| value.to_owned()),
+    }
 }
 
 /// Build a single-entry FHIR Bundle containing a CodeSystem resource with the

@@ -557,6 +557,35 @@ fn code_system_version_matches(actual: &str, pattern_segments: &[&str]) -> bool 
 
 // ── BundleImportBackend ────────────────────────────────────────────────────────
 
+impl SqliteTerminologyBackend {
+    /// Evict all in-memory indexes so the next expand re-reads fresh data.
+    ///
+    /// Per-instance CS metadata caches: highest stored version and existence
+    /// flags both flip when a new CS row is imported.  Flushed alongside the
+    /// global `cs_language_cache` invalidation that the sync writer already
+    /// triggers.
+    fn evict_import_caches(&self) {
+        if let Ok(mut guard) = self.implicit_index.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.inline_compose_index.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.property_result_cache.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.plain_fts_cache.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.cs_version_for_url_cache.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.cs_exists_cache.write() {
+            guard.clear();
+        }
+    }
+}
+
 #[async_trait]
 impl BundleImportBackend for SqliteTerminologyBackend {
     /// Parse a FHIR Bundle from raw JSON bytes and insert all contained
@@ -572,12 +601,6 @@ impl BundleImportBackend for SqliteTerminologyBackend {
     ) -> Result<ImportStats, HtsError> {
         let pool = self.pool.clone();
         let data_vec = data.to_vec();
-        let implicit_index = self.implicit_index.clone();
-        let inline_compose_index = self.inline_compose_index.clone();
-        let property_result_cache = self.property_result_cache.clone();
-        let plain_fts_cache = self.plain_fts_cache.clone();
-        let cs_version_for_url_cache = self.cs_version_for_url_cache.clone();
-        let cs_exists_cache = self.cs_exists_cache.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             crate::import::fhir_bundle::import_bundle_sync(&pool, &data_vec)
@@ -585,30 +608,29 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
 
-        // Evict all in-memory indexes so the next expand re-reads fresh data.
         if result.is_ok() {
-            if let Ok(mut guard) = implicit_index.write() {
-                guard.clear();
-            }
-            if let Ok(mut guard) = inline_compose_index.write() {
-                guard.clear();
-            }
-            if let Ok(mut guard) = property_result_cache.write() {
-                guard.clear();
-            }
-            if let Ok(mut guard) = plain_fts_cache.write() {
-                guard.clear();
-            }
-            // Per-instance CS metadata caches: highest stored version and
-            // existence flags both flip when a new CS row is imported.  Flush
-            // alongside the global `cs_language_cache` invalidation that the
-            // sync writer already triggers.
-            if let Ok(mut guard) = cs_version_for_url_cache.write() {
-                guard.clear();
-            }
-            if let Ok(mut guard) = cs_exists_cache.write() {
-                guard.clear();
-            }
+            self.evict_import_caches();
+        }
+
+        result
+    }
+
+    /// Insert an already-parsed bundle, skipping the JSON parse step.
+    async fn import_parsed(
+        &self,
+        _ctx: &TenantContext,
+        parsed: crate::import::bundle_parser::ParsedBundle,
+    ) -> Result<ImportStats, HtsError> {
+        let pool = self.pool.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            crate::import::fhir_bundle::import_parsed_sync(&pool, &parsed)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
+
+        if result.is_ok() {
+            self.evict_import_caches();
         }
 
         result
