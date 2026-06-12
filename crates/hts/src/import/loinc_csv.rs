@@ -32,6 +32,7 @@ use zip::ZipArchive;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::LanguageFilter;
 use crate::import::bundle_builder::{
     BuilderConcept, BuilderDesignation, CodeSystemMeta, build_code_system_bundle,
 };
@@ -88,17 +89,23 @@ struct LoincParseResult {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Import a LOINC distribution ZIP through the given backend.
+///
+/// `languages` restricts which linguistic-variant translations are ingested
+/// as designations (see [`LanguageFilter`]); excluded variant files are never
+/// parsed. The English main-table content is unaffected.
 pub async fn import_loinc_csv(
     backend: &dyn BundleImportBackend,
     ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
+    languages: &LanguageFilter,
 ) -> Result<ImportStats, HtsError> {
     const FORMAT: &str = "loinc";
     let batch_size = batch_size.max(1);
 
     let path_owned = path.to_path_buf();
+    let languages = languages.clone();
     let parsed = tokio::task::spawn_blocking(move || -> Result<LoincParseResult, HtsError> {
         let paths = find_loinc_paths(&path_owned)?;
         let loinc_table_path = &paths.loinc_table;
@@ -164,6 +171,14 @@ pub async fn import_loinc_csv(
                 ));
                 continue;
             };
+            if !languages.allows(&language) {
+                tracing::info!(
+                    file = %filename,
+                    language = %language,
+                    "skipping LOINC linguistic variant excluded by language filter"
+                );
+                continue;
+            }
             let mut zip = open_zip(&path_owned)?;
             let entry = match zip.by_name(variant_path) {
                 Ok(e) => e,
@@ -937,9 +952,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         let conn = backend.pool().get().unwrap();
         let definition: Option<String> = conn
@@ -958,9 +980,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        let stats = import_loinc_csv(&backend, &ctx, zip_file.path(), 500, true)
-            .await
-            .expect("dry-run should succeed");
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            true,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("dry-run should succeed");
 
         assert_eq!(stats.code_systems, 1);
         assert!(stats.concepts > 0);
@@ -975,9 +1004,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        let stats = import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .expect("live import should succeed");
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("live import should succeed");
 
         assert_eq!(stats.code_systems, 1);
         // 3 LOINC codes + 3 LP codes = 6 total concepts
@@ -994,12 +1030,26 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 6);
@@ -1012,9 +1062,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        let stats = import_loinc_csv(&backend, &ctx, zip_file.path(), 2, false)
-            .await
-            .unwrap();
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            2,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.concepts, 6);
         assert_eq!(count_rows(&backend, "concepts"), 6);
     }
@@ -1030,6 +1087,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             Path::new("/nonexistent/loinc.zip"),
             500,
             false,
+            &LanguageFilter::default(),
         )
         .await;
         assert!(result.is_err());
@@ -1067,9 +1125,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             zip.finish().unwrap();
         }
 
-        let stats = import_loinc_csv(&backend, &ctx, tmp.path(), 500, false)
-            .await
-            .expect("should pick LoincTable/Loinc.csv, not the accessory file");
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            tmp.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("should pick LoincTable/Loinc.csv, not the accessory file");
         assert_eq!(stats.concepts, 6);
         assert_eq!(count_rows(&backend, "concepts"), 6);
     }
@@ -1188,9 +1253,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip_with_variants();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .expect("import with linguistic variants should succeed");
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("import with linguistic variants should succeed");
 
         // 2 French + 1 German translation = 3 designation rows.
         assert_eq!(count_rows(&backend, "concept_designations"), 3);
@@ -1220,14 +1292,63 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
     }
 
     #[tokio::test]
+    async fn import_loinc_csv_language_filter_skips_excluded_variants() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_loinc_zip_with_variants();
+
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::parse("fr"),
+        )
+        .await
+        .expect("import with language filter should succeed");
+
+        // Only the 2 French translations survive; the German variant file is
+        // skipped without being parsed.
+        assert_eq!(count_rows(&backend, "concept_designations"), 2);
+
+        let conn = backend.pool().get().unwrap();
+        let de_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_designations WHERE language = 'de-DE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(de_count, 0);
+
+        // The English display is unaffected by the filter.
+        let display: String = conn
+            .query_row(
+                "SELECT display FROM concepts WHERE code = '2160-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(display, "Creatinine [Mass/volume] in Serum or Plasma");
+    }
+
+    #[tokio::test]
     async fn import_loinc_csv_dry_run_counts_designations() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip_with_variants();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, true)
-            .await
-            .expect("dry-run should succeed");
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            true,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("dry-run should succeed");
 
         // Dry-run writes nothing.
         assert_eq!(count_rows(&backend, "concept_designations"), 0);
@@ -1240,9 +1361,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(count_rows(&backend, "concept_designations"), 0);
     }
 
@@ -1269,9 +1397,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             zip.finish().unwrap();
         }
 
-        let stats = import_loinc_csv(&backend, &ctx, tmp.path(), 500, true)
-            .await
-            .unwrap();
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            tmp.path(),
+            500,
+            true,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(stats.concepts > 0, "got 0 concepts");
         assert!(

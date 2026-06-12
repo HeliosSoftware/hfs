@@ -103,6 +103,15 @@ pub struct HtsConfig {
     /// at 500 for memory-constrained ad-hoc runs).
     #[arg(long, env = "HTS_BOOTSTRAP_BATCH_SIZE", default_value = "5000")]
     pub bootstrap_batch_size: usize,
+
+    /// Comma-separated BCP-47 language tags to import from multilingual
+    /// terminology distributions (SNOMED CT RF2 descriptions, LOINC
+    /// linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware
+    /// (`de` admits `de-DE` and vice versa) and English is always retained.
+    /// Empty (the default) imports every language present in the source.
+    /// Changing this re-triggers bootstrap imports of affected files.
+    #[arg(long, env = "HTS_IMPORT_LANGUAGES", default_value = "")]
+    pub import_languages: String,
 }
 
 impl HtsConfig {
@@ -126,6 +135,7 @@ impl Default for HtsConfig {
             max_expansion_size: 10_000,
             bootstrap_dir: String::new(),
             bootstrap_batch_size: 5000,
+            import_languages: String::new(),
         }
     }
 }
@@ -382,6 +392,14 @@ pub struct ImportArgs {
     /// Number of resources per import batch (controls peak memory usage)
     #[arg(long, default_value = "500")]
     pub batch_size: usize,
+
+    /// Comma-separated BCP-47 language tags to import from multilingual
+    /// distributions (SNOMED CT RF2 descriptions, LOINC linguistic
+    /// variants), e.g. `de,fr-FR`. Matching is BCP-47-aware (`de` admits
+    /// `de-DE` and vice versa) and English is always retained. Empty (the
+    /// default) imports every language present in the source.
+    #[arg(long, env = "HTS_IMPORT_LANGUAGES", default_value = "")]
+    pub languages: String,
 
     /// Parse and count resources without writing anything to the database
     #[arg(long)]

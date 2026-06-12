@@ -44,6 +44,64 @@ use helios_persistence::tenant::TenantContext;
 
 use crate::error::HtsError;
 
+/// Restricts which translation languages multilingual importers ingest.
+///
+/// Built from a comma-separated list of BCP-47 tags (`HTS_IMPORT_LANGUAGES`
+/// env var / `--languages` CLI flag). An empty list means *no restriction* —
+/// every language present in the source archive is imported, which is the
+/// historical behavior.
+///
+/// Matching is BCP-47-aware in both directions via
+/// [`crate::language::lang_matches`]: a configured `de` admits stored `de-DE`,
+/// and a configured `de-DE` admits the bare `de` that SNOMED RF2
+/// `languageCode` columns carry.
+///
+/// The filter only governs *translations* (SNOMED descriptions per language,
+/// LOINC linguistic variants); the English content that drives concept
+/// displays is never filtered out.
+#[derive(Debug, Clone, Default)]
+pub struct LanguageFilter {
+    /// Normalized (trimmed, lowercased) BCP-47 tags. Empty = allow all.
+    tags: Vec<String>,
+}
+
+impl LanguageFilter {
+    /// Parse a comma-separated tag list. Whitespace around tags is ignored;
+    /// empty segments are dropped. An empty or all-whitespace `spec` yields
+    /// the allow-all filter.
+    pub fn parse(spec: &str) -> Self {
+        let mut tags: Vec<String> = spec
+            .split(',')
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        tags.sort();
+        tags.dedup();
+        Self { tags }
+    }
+
+    /// `true` when no restriction is configured (every language imported).
+    pub fn allows_all(&self) -> bool {
+        self.tags.is_empty()
+    }
+
+    /// `true` when designations in `language` should be imported.
+    pub fn allows(&self, language: &str) -> bool {
+        self.allows_all()
+            || self
+                .tags
+                .iter()
+                .any(|t| crate::language::lang_matches(t, language))
+    }
+
+    /// Canonical form of the configured tag list (sorted, lowercased,
+    /// comma-joined). Folded into the bootstrap ledger signature so changing
+    /// the language set re-triggers imports on the next startup.
+    pub fn canonical_spec(&self) -> String {
+        self.tags.join(",")
+    }
+}
+
 /// Statistics returned from a single import operation.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportStats {
@@ -143,5 +201,45 @@ pub trait BundleImportBackend: Send + Sync {
         _resource_url: &str,
     ) -> Result<(), HtsError> {
         Ok(())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::LanguageFilter;
+
+    #[test]
+    fn empty_spec_allows_everything() {
+        for spec in ["", "  ", ",", " , "] {
+            let f = LanguageFilter::parse(spec);
+            assert!(f.allows_all(), "spec {spec:?} must be allow-all");
+            assert!(f.allows("de"));
+            assert!(f.allows("zh-Hans-CN"));
+            assert_eq!(f.canonical_spec(), "");
+        }
+    }
+
+    #[test]
+    fn filter_matches_bcp47_in_both_directions() {
+        let f = LanguageFilter::parse("de, fr-FR");
+        assert!(!f.allows_all());
+        // Configured bare tag admits regional variants.
+        assert!(f.allows("de"));
+        assert!(f.allows("de-DE"));
+        // Configured regional tag admits the bare RF2 language code.
+        assert!(f.allows("fr"));
+        assert!(f.allows("fr-FR"));
+        // Unrelated languages are rejected; prefix without a subtag
+        // boundary must not match.
+        assert!(!f.allows("da"));
+        assert!(!f.allows("den"));
+    }
+
+    #[test]
+    fn canonical_spec_is_sorted_lowercased_deduped() {
+        let f = LanguageFilter::parse("FR-fr, de , fr-FR,de");
+        assert_eq!(f.canonical_spec(), "de,fr-fr");
     }
 }
