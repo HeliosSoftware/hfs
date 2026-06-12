@@ -83,6 +83,9 @@ fn test_postgres_expected_capabilities() {
         BackendCapability::CursorPagination,
         BackendCapability::Transactions,
         BackendCapability::OptimisticLocking,
+        BackendCapability::BulkExport,
+        BackendCapability::BulkSubmitIngest,
+        BackendCapability::BulkSubmitRestWorker,
         BackendCapability::Include,
         BackendCapability::Revinclude,
         BackendCapability::SharedSchema,
@@ -1831,6 +1834,9 @@ mod postgres_integration {
         assert!(backend.supports(BackendCapability::InstanceHistory));
         assert!(backend.supports(BackendCapability::BasicSearch));
         assert!(backend.supports(BackendCapability::Transactions));
+        assert!(backend.supports(BackendCapability::BulkExport));
+        assert!(backend.supports(BackendCapability::BulkSubmitIngest));
+        assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
         assert!(backend.supports(BackendCapability::Include));
         assert!(backend.supports(BackendCapability::Revinclude));
     }
