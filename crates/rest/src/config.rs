@@ -1468,6 +1468,166 @@ mod tests {
         assert!(errs.iter().any(|e| e.contains("SINCE_NEWLY_ADDED")));
     }
 
+    // ── BulkSubmitConfig::validate ────────────────────────────────
+
+    #[test]
+    fn test_bulk_submit_config_default_is_valid() {
+        assert!(BulkSubmitConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_invalid_output_backend() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "gcs".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("OUTPUT_BACKEND")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_s3_output_requires_bucket() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "s3".to_string(),
+            s3_bucket: None,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("S3_BUCKET")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_s3_output_with_bucket_ok() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "s3".to_string(),
+            s3_bucket: Some("my-bucket".to_string()),
+            ..BulkSubmitConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_invalid_requires_access_token() {
+        let cfg = BulkSubmitConfig {
+            requires_access_token: "maybe".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("REQUIRES_ACCESS_TOKEN")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_local_fs_requires_access_token_false_invalid() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "local-fs".to_string(),
+            requires_access_token: "false".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("local-fs")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_invalid_signing_alg() {
+        let cfg = BulkSubmitConfig {
+            signing_alg: "HS256".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("SIGNING_ALG")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_rs384_signing_alg_ok() {
+        let cfg = BulkSubmitConfig {
+            signing_alg: "RS384".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_worker_concurrency() {
+        let cfg = BulkSubmitConfig {
+            worker_concurrency: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("WORKER_CONCURRENCY")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_max_concurrent_per_tenant() {
+        let cfg = BulkSubmitConfig {
+            max_concurrent_per_tenant: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("MAX_CONCURRENT_PER_TENANT")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_batch_size() {
+        let cfg = BulkSubmitConfig {
+            batch_size: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("BATCH_SIZE")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_heartbeat_interval() {
+        let cfg = BulkSubmitConfig {
+            heartbeat_interval_secs: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("HEARTBEAT_INTERVAL")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_lease_must_exceed_heartbeat() {
+        let cfg = BulkSubmitConfig {
+            lease_duration_secs: 10,
+            heartbeat_interval_secs: 20,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("LEASE_DURATION")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_cleanup_interval() {
+        let cfg = BulkSubmitConfig {
+            cleanup_interval_secs: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("CLEANUP_INTERVAL")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_collects_multiple_errors() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "bogus".to_string(),
+            signing_alg: "bogus".to_string(),
+            worker_concurrency: 0,
+            batch_size: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.len() >= 4);
+    }
+
+    #[test]
+    fn test_server_config_validate_propagates_bulk_submit_errors() {
+        let mut config = ServerConfig::default();
+        config.bulk_submit.signing_alg = "nope".to_string();
+        let errs = config.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("SIGNING_ALG")));
+    }
+
     // ── display for StorageBackendMode ────────────────────────────
 
     #[test]
