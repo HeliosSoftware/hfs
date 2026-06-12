@@ -750,6 +750,40 @@ hts import ./SnomedCT_InternationalRF2_PRODUCTION_20250901T120000Z.zip --format 
 
 For large imports, add `--batch-size 200 --verbose` to monitor progress.
 
+Descriptions in **all languages** present in the archive (including the
+per-language Description files shipped by national extensions, e.g.
+`sct2_Description_Snapshot-de_*.txt`) are imported as FHIR
+`concept.designation` entries tagged with the RF2 language code and a `use`
+Coding carrying the SNOMED description type (FSN / synonym). Language
+reference sets — every one in the archive, not just the English ones — are
+used to pick the preferred synonym for the concept `display` (US English
+first, then GB English) and to add `preferredForLanguage` designations for
+each refset-preferred synonym: one tagged with its bare RF2 language code,
+plus a BCP-47 dialect-tagged copy (`en-US`, `en-GB`, `da-DK`, `fr-CA`,
+`nl-BE`, `sv-SE`, …) when the refset is one of the published
+national-edition language refsets. `$lookup`, `$expand`, and
+`$validate-code` resolve these via the `displayLanguage` parameter or the
+`Accept-Language` HTTP header. Language matching is BCP-47-aware (RFC 4647):
+a request for `de-DE` (what a browser typically sends) finds designations
+tagged `de`, and a request for `fr` accepts `fr-CA`:
+
+```bash
+curl -X POST http://localhost:8090/CodeSystem/\$lookup \
+  -H "Content-Type: application/fhir+json" \
+  -H "Accept-Language: de" \
+  -d '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"http://snomed.info/sct"},{"name":"code","valueCode":"22298006"}]}'
+```
+
+Multiple editions of the same code system (e.g. the SNOMED International
+release plus a national edition) coexist as separate versions keyed on
+`(url, version)`; unversioned requests resolve to the highest version.
+When the requested `displayLanguage` has no designation in that version,
+`$lookup` falls back to the newest *other* stored version that carries the
+language (`$expand` and `$validate-code` match designations across versions
+of the canonical URL by design) — so a German term from a national edition
+is still found when a newer international release is the default. Pinning
+`version` disables the fallback.
+
 ---
 
 ### LOINC

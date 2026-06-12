@@ -1062,26 +1062,18 @@ fn apply_display_language<'a, B: TerminologyBackend>(
         }
         // (system, code) → (designation language tag, designation value).
         // Match using BCP 47 / RFC 4647 Lookup: prefer an exact match, then
-        // accept any designation whose tag starts with the requested tag plus
-        // a `-` subtag separator (so `de` matches `de-CH` but not `den`).
+        // a designation whose tag extends the requested tag with a `-`
+        // subtag (so `de` matches `de-CH` but not `den`), then the same two
+        // rules against truncations of the requested tag (`de-DE` → `de`).
         let mut match_map: HashMap<(String, String), (Option<String>, String)> = HashMap::new();
         for (system, codes) in &by_system {
             if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
                 for (code, list) in ds {
-                    let exact = list
-                        .iter()
-                        .find(|d| d.language.as_deref() == Some(language));
-                    let chosen = exact.cloned().or_else(|| {
-                        list.into_iter().find(|d| {
-                            d.language.as_deref().is_some_and(|lang| {
-                                let prefix = format!("{language}-");
-                                lang.eq_ignore_ascii_case(language)
-                                    || lang
-                                        .to_ascii_lowercase()
-                                        .starts_with(&prefix.to_ascii_lowercase())
-                            })
-                        })
-                    });
+                    let chosen = crate::language::best_lang_match_index(
+                        language,
+                        list.iter().map(|d| d.language.as_deref()),
+                    )
+                    .and_then(|idx| list.into_iter().nth(idx));
                     if let Some(d) = chosen {
                         match_map.insert(((*system).to_string(), code), (d.language, d.value));
                     }
