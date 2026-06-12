@@ -4,7 +4,7 @@ name: Inferno Bulk Submit Data
 #
 # As of this writing the official `inferno-framework/bulk-data-test-kit` ships
 # only EXPORT suites (v1.0.1 / v2.0.0 / v2.0.0_client); there is no published
-# bulk-submit/import conformance suite for the Argo25 `$bulk-submit` operation.
+# bulk-submit conformance suite for the Argo25 `$bulk-submit` operation.
 # This workflow mirrors the structure of `inferno-bulk-data.yml` (build HFS with
 # R4,postgres,s3; bring up Postgres + MinIO + Keycloak with a `system/bulk-submit`
 # client scope; create a session; run the suite groups; collect results) so that
