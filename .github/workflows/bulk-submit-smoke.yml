@@ -28,8 +28,9 @@ jobs:
         run: |
           FHIR_VERSIONS='["R4","R4B","R5"]'
           # Keep this backend/output matrix aligned with bulk-export-smoke.yml.
-          # Bulk submit is currently wired for SQLite/PostgreSQL primary stores
-          # and their Elasticsearch composites. MongoDB and S3 primary stores are
+          # Bulk submit REST worker support is currently wired for SQLite/PostgreSQL
+          # primary stores and their Elasticsearch composites. S3 has only
+          # BulkSubmitIngest provider support, so MongoDB and S3 primary stores are
           # kept in the matrix to assert the endpoint-unavailable contract.
           ROWS='[
             {"backend":"sqlite","output":"local","expectation":"full"},
