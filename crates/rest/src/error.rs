@@ -716,4 +716,130 @@ mod tests {
         assert_eq!(outcome["resourceType"], "OperationOutcome");
         assert_eq!(outcome["issue"].as_array().unwrap().len(), 2);
     }
+
+    // ── Display for the bulk-submit error variants ────────────────
+
+    #[test]
+    fn test_conflict_display() {
+        let err = RestError::Conflict {
+            message: "duplicate submission".to_string(),
+        };
+        assert_eq!(err.to_string(), "Conflict: duplicate submission");
+    }
+
+    #[test]
+    fn test_too_many_requests_display() {
+        let err = RestError::TooManyRequests {
+            message: "submission in progress".to_string(),
+        };
+        assert_eq!(err.to_string(), "Too many requests: submission in progress");
+    }
+
+    // ── into_response() status codes ──────────────────────────────
+
+    #[test]
+    fn test_conflict_into_response_status() {
+        let resp = RestError::Conflict {
+            message: "x".to_string(),
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_too_many_requests_into_response_status() {
+        let resp = RestError::TooManyRequests {
+            message: "x".to_string(),
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ── StorageError::BulkSubmit → RestError mapping ──────────────
+
+    fn status_of(err: StorageError) -> StatusCode {
+        RestError::from(err).into_response().status()
+    }
+
+    #[test]
+    fn test_bulk_submit_submission_not_found_maps_to_404() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
+            submitter: "acme".to_string(),
+            submission_id: "s1".to_string(),
+        });
+        assert_eq!(status_of(err), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_bulk_submit_manifest_not_found_maps_to_404() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::ManifestNotFound {
+            submission_id: "s1".to_string(),
+            manifest_id: "m1".to_string(),
+        });
+        assert_eq!(status_of(err), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_bulk_submit_conflict_variants_map_to_409() {
+        use helios_persistence::error::BulkSubmitError;
+        let cases = vec![
+            StorageError::BulkSubmit(BulkSubmitError::DuplicateSubmission {
+                submitter: "acme".to_string(),
+                submission_id: "s1".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::AlreadyComplete {
+                submission_id: "s1".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::InvalidState {
+                submission_id: "s1".to_string(),
+                expected: "in-progress".to_string(),
+                actual: "complete".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::Aborted {
+                submission_id: "s1".to_string(),
+                reason: "cancelled".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::ManifestReplacementError {
+                manifest_url: "http://x".to_string(),
+                reason: "in-flight".to_string(),
+            }),
+        ];
+        for err in cases {
+            assert_eq!(status_of(err), StatusCode::CONFLICT);
+        }
+    }
+
+    #[test]
+    fn test_bulk_submit_processing_variants_map_to_422() {
+        use helios_persistence::error::BulkSubmitError;
+        let cases = vec![
+            StorageError::BulkSubmit(BulkSubmitError::ParseError {
+                line: 3,
+                message: "bad json".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::InvalidResource {
+                line: 7,
+                message: "missing resourceType".to_string(),
+            }),
+            StorageError::BulkSubmit(BulkSubmitError::MaxErrorsExceeded {
+                submission_id: "s1".to_string(),
+                max_errors: 10,
+            }),
+        ];
+        for err in cases {
+            assert_eq!(status_of(err), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    #[test]
+    fn test_bulk_submit_rollback_failed_maps_to_500() {
+        use helios_persistence::error::BulkSubmitError;
+        let err = StorageError::BulkSubmit(BulkSubmitError::RollbackFailed {
+            submission_id: "s1".to_string(),
+            message: "db down".to_string(),
+        });
+        assert_eq!(status_of(err), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
