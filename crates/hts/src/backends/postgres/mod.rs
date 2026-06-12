@@ -340,19 +340,25 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // because rebuilding per chunk is O(n²) — the SNOMED full closure
         // is built once via the end-of-CLI `migrate_concept_closure_pg` call.
         // Mirrors the SQLite import_bundle pattern.
+        // Probed with EXISTS rather than COUNT(*): the answer only
+        // distinguishes empty from non-empty, and a COUNT over an
+        // ever-growing concept set would make each batch of a chunked bulk
+        // load scan all previously imported rows.
         let mut systems_needing_closure: Vec<String> = Vec::new();
         for cs in &parsed.code_systems {
             let row = client
                 .query_opt(
-                    "SELECT COUNT(*) FROM concepts c
-                     JOIN code_systems s ON c.system_id = s.id
-                     WHERE s.url = $1",
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concepts c
+                         JOIN code_systems s ON c.system_id = s.id
+                         WHERE s.url = $1
+                     )",
                     &[&cs.url],
                 )
                 .await
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            let count: i64 = row.map(|r| r.get(0)).unwrap_or(0);
-            if count == 0 {
+            let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
+            if !has_concepts {
                 systems_needing_closure.push(cs.url.clone());
             }
         }

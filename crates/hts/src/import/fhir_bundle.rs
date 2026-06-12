@@ -48,23 +48,29 @@ pub(crate) fn import_bundle_sync(
     // SNOMED CT (~640K concepts, ~1 280 batches = hours). Skipping per-batch
     // rebuilds is safe: write_code_system deletes the stale closure, and
     // migrate_concept_closure at server startup rebuilds it exactly once.
+    // Probed with EXISTS rather than COUNT(*): the answer only distinguishes
+    // empty from non-empty, and a COUNT over an ever-growing concept set would
+    // make each batch of a chunked bulk load (SNOMED RF2, LOINC) scan all
+    // previously imported rows.
     let systems_needing_closure: Vec<String> = parsed
         .code_systems
         .iter()
         .filter_map(|cs| {
-            let count: i64 = conn
+            let has_concepts: bool = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM concepts c
-                     JOIN code_systems s ON c.system_id = s.id
-                     WHERE s.url = ?1",
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concepts c
+                         JOIN code_systems s ON c.system_id = s.id
+                         WHERE s.url = ?1
+                     )",
                     rusqlite::params![cs.url],
                     |r| r.get(0),
                 )
-                .unwrap_or(0);
-            if count == 0 {
-                Some(cs.url.clone())
-            } else {
+                .unwrap_or(false);
+            if has_concepts {
                 None
+            } else {
+                Some(cs.url.clone())
             }
         })
         .collect();
