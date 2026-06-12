@@ -372,6 +372,8 @@ Options:
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
 | `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
+| `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
+| `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
 
 Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
 `zstd`) are decompressed transparently; unsupported encodings are rejected

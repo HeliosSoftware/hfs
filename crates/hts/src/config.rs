@@ -94,6 +94,15 @@ pub struct HtsConfig {
     /// boots a populated server automatically. Leave empty to disable.
     #[arg(long, env = "HTS_BOOTSTRAP_DIR", default_value = "")]
     pub bootstrap_dir: String,
+
+    /// Number of concepts per import batch during bootstrap sync. Each batch
+    /// is one database transaction plus fixed per-batch bookkeeping (metadata
+    /// upsert, cache invalidation), so larger batches amortize that overhead
+    /// for big terminologies (SNOMED CT, LOINC) at the cost of peak memory.
+    /// Mirrors the `--batch-size` flag of `hts import` (whose default stays
+    /// at 500 for memory-constrained ad-hoc runs).
+    #[arg(long, env = "HTS_BOOTSTRAP_BATCH_SIZE", default_value = "5000")]
+    pub bootstrap_batch_size: usize,
 }
 
 impl HtsConfig {
@@ -116,6 +125,7 @@ impl Default for HtsConfig {
             max_body_size: 10 * 1024 * 1024, // 10MB
             max_expansion_size: 10_000,
             bootstrap_dir: String::new(),
+            bootstrap_batch_size: 5000,
         }
     }
 }

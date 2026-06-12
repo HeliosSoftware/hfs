@@ -72,7 +72,7 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     let backend = SqliteTerminologyBackend::new(&config.database_url)?;
     let hts_pool = backend.pool().clone();
 
-    bootstrap_sync_sqlite(&backend, &config.bootstrap_dir).await?;
+    bootstrap_sync_sqlite(&backend, &config.bootstrap_dir, config.bootstrap_batch_size).await?;
 
     let resource_store = SqliteBackend::open(&config.database_url)
         .map_err(|e| anyhow::anyhow!("Failed to open resource store: {e}"))?;
@@ -121,7 +121,7 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
 
-    bootstrap_sync_postgres(&backend, &config.bootstrap_dir).await?;
+    bootstrap_sync_postgres(&backend, &config.bootstrap_dir, config.bootstrap_batch_size).await?;
 
     let resource_store = PostgresBackend::from_connection_string(&config.database_url)
         .await
@@ -167,24 +167,26 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 async fn bootstrap_sync_sqlite(
     backend: &SqliteTerminologyBackend,
     bootstrap_dir: &str,
+    batch_size: usize,
 ) -> anyhow::Result<()> {
     let Some(dir) = resolve_bootstrap_dir(bootstrap_dir) else {
         return Ok(());
     };
     let tracker = BootstrapTracker::Sqlite(backend);
-    bootstrap_sync(&tracker, backend, &dir).await
+    bootstrap_sync(&tracker, backend, &dir, batch_size).await
 }
 
 #[cfg(feature = "postgres")]
 async fn bootstrap_sync_postgres(
     backend: &PostgresTerminologyBackend,
     bootstrap_dir: &str,
+    batch_size: usize,
 ) -> anyhow::Result<()> {
     let Some(dir) = resolve_bootstrap_dir(bootstrap_dir) else {
         return Ok(());
     };
     let tracker = BootstrapTracker::Postgres(backend);
-    bootstrap_sync(&tracker, backend, &dir).await
+    bootstrap_sync(&tracker, backend, &dir, batch_size).await
 }
 
 /// Backend-agnostic bootstrap sync: import the directory, gating each file on
@@ -194,11 +196,12 @@ async fn bootstrap_sync(
     tracker: &BootstrapTracker<'_>,
     backend: &dyn BundleImportBackend,
     dir: &std::path::Path,
+    batch_size: usize,
 ) -> anyhow::Result<()> {
-    info!(bootstrap_dir = %dir.display(), "bootstrap: syncing terminology directory");
+    info!(bootstrap_dir = %dir.display(), batch_size, "bootstrap: syncing terminology directory");
     let ctx = TenantContext::system();
     let (stats, imported, skipped) =
-        import_directory_files(backend, &ctx, dir, 500, false, Some(tracker))
+        import_directory_files(backend, &ctx, dir, batch_size, false, Some(tracker))
             .await
             .map_err(|e| anyhow::anyhow!("bootstrap import failed: {e}"))?;
     info!(
