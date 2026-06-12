@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use helios_hts::config::{Cli, Command, HtsConfig, ImportArgs, ImportFormat, detect_format};
-use helios_hts::import::{BundleImportBackend, ImportResult, ImportStats};
+use helios_hts::import::{BundleImportBackend, ImportResult, ImportStats, LanguageFilter};
 use helios_persistence::tenant::TenantContext;
 use tracing::info;
 
@@ -72,7 +72,7 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
     let backend = SqliteTerminologyBackend::new(&config.database_url)?;
     let hts_pool = backend.pool().clone();
 
-    bootstrap_sync_sqlite(&backend, &config.bootstrap_dir, config.bootstrap_batch_size).await?;
+    bootstrap_sync_sqlite(&backend, &config).await?;
 
     let resource_store = SqliteBackend::open(&config.database_url)
         .map_err(|e| anyhow::anyhow!("Failed to open resource store: {e}"))?;
@@ -121,7 +121,7 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 
     let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
 
-    bootstrap_sync_postgres(&backend, &config.bootstrap_dir, config.bootstrap_batch_size).await?;
+    bootstrap_sync_postgres(&backend, &config).await?;
 
     let resource_store = PostgresBackend::from_connection_string(&config.database_url)
         .await
@@ -166,27 +166,25 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
 #[cfg(feature = "sqlite")]
 async fn bootstrap_sync_sqlite(
     backend: &SqliteTerminologyBackend,
-    bootstrap_dir: &str,
-    batch_size: usize,
+    config: &HtsConfig,
 ) -> anyhow::Result<()> {
-    let Some(dir) = resolve_bootstrap_dir(bootstrap_dir) else {
+    let Some(dir) = resolve_bootstrap_dir(&config.bootstrap_dir) else {
         return Ok(());
     };
     let tracker = BootstrapTracker::Sqlite(backend);
-    bootstrap_sync(&tracker, backend, &dir, batch_size).await
+    bootstrap_sync(&tracker, backend, &dir, config).await
 }
 
 #[cfg(feature = "postgres")]
 async fn bootstrap_sync_postgres(
     backend: &PostgresTerminologyBackend,
-    bootstrap_dir: &str,
-    batch_size: usize,
+    config: &HtsConfig,
 ) -> anyhow::Result<()> {
-    let Some(dir) = resolve_bootstrap_dir(bootstrap_dir) else {
+    let Some(dir) = resolve_bootstrap_dir(&config.bootstrap_dir) else {
         return Ok(());
     };
     let tracker = BootstrapTracker::Postgres(backend);
-    bootstrap_sync(&tracker, backend, &dir, batch_size).await
+    bootstrap_sync(&tracker, backend, &dir, config).await
 }
 
 /// Backend-agnostic bootstrap sync: import the directory, gating each file on
@@ -196,14 +194,28 @@ async fn bootstrap_sync(
     tracker: &BootstrapTracker<'_>,
     backend: &dyn BundleImportBackend,
     dir: &std::path::Path,
-    batch_size: usize,
+    config: &HtsConfig,
 ) -> anyhow::Result<()> {
-    info!(bootstrap_dir = %dir.display(), batch_size, "bootstrap: syncing terminology directory");
+    let batch_size = config.bootstrap_batch_size;
+    let languages = LanguageFilter::parse(&config.import_languages);
+    info!(
+        bootstrap_dir = %dir.display(),
+        batch_size,
+        import_languages = %languages.canonical_spec(),
+        "bootstrap: syncing terminology directory"
+    );
     let ctx = TenantContext::system();
-    let (stats, imported, skipped) =
-        import_directory_files(backend, &ctx, dir, batch_size, false, Some(tracker))
-            .await
-            .map_err(|e| anyhow::anyhow!("bootstrap import failed: {e}"))?;
+    let (stats, imported, skipped) = import_directory_files(
+        backend,
+        &ctx,
+        dir,
+        batch_size,
+        false,
+        &languages,
+        Some(tracker),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("bootstrap import failed: {e}"))?;
     info!(
         imported_files = imported,
         skipped_files = skipped,
@@ -532,8 +544,10 @@ async fn run_import_for_path(
 ) -> Result<(ImportStats, String), helios_hts::error::HtsError> {
     use helios_hts::error::HtsError;
 
+    let languages = LanguageFilter::parse(&args.languages);
+
     if args.path.is_dir() && !rxnorm_dir {
-        return import_directory(backend, ctx, args).await;
+        return import_directory(backend, ctx, args, &languages).await;
     }
 
     let format = match args.format {
@@ -557,6 +571,7 @@ async fn run_import_for_path(
         &args.path,
         args.batch_size,
         args.dry_run,
+        &languages,
     )
     .await?;
     Ok((stats, format.to_string()))
@@ -570,6 +585,7 @@ async fn import_directory(
     backend: &dyn BundleImportBackend,
     ctx: &TenantContext,
     args: &ImportArgs,
+    languages: &LanguageFilter,
 ) -> Result<(ImportStats, String), helios_hts::error::HtsError> {
     let (stats, imported_count, skipped_count) = import_directory_files(
         backend,
@@ -577,6 +593,7 @@ async fn import_directory(
         &args.path,
         args.batch_size,
         args.dry_run,
+        languages,
         None,
     )
     .await?;
@@ -600,6 +617,7 @@ async fn import_directory_files(
     dir: &std::path::Path,
     batch_size: usize,
     dry_run: bool,
+    languages: &LanguageFilter,
     tracker: Option<&BootstrapTracker<'_>>,
 ) -> Result<(ImportStats, usize, usize), helios_hts::error::HtsError> {
     use helios_hts::error::HtsError;
@@ -665,7 +683,20 @@ async fn import_directory_files(
         // we log it and fall through to import the file unconditionally.
         let mut pending_signature: Option<(String, i64)> = None;
         if let Some(tracker) = tracker {
-            match compute_signature(entry) {
+            // For language-sensitive formats the configured language set is
+            // folded into the ledger signature, so changing
+            // HTS_IMPORT_LANGUAGES re-triggers the import of affected files
+            // on the next startup even though their content is unchanged.
+            // The allow-all default leaves the signature untouched, keeping
+            // existing ledgers valid.
+            let lang_sensitive = matches!(format, ImportFormat::SnomedRf2 | ImportFormat::Loinc);
+            let signature = compute_signature(entry).map(|(mut hash, size)| {
+                if lang_sensitive && !languages.allows_all() {
+                    hash = format!("{hash};languages={}", languages.canonical_spec());
+                }
+                (hash, size)
+            });
+            match signature {
                 Ok((hash, size)) => match tracker.imported_hash(fname).await {
                     Ok(Some(prev)) if prev == hash => {
                         eprintln!(
@@ -694,7 +725,7 @@ async fn import_directory_files(
             "[import] file {}/{total} ({format}): {fname}{suffix}",
             idx + 1
         );
-        match dispatch_import(format, backend, ctx, entry, batch_size, dry_run).await {
+        match dispatch_import(format, backend, ctx, entry, batch_size, dry_run, languages).await {
             Ok(file_stats) => {
                 stats.merge(file_stats);
                 imported_count += 1;
@@ -733,6 +764,7 @@ async fn dispatch_import(
     path: &std::path::Path,
     batch_size: usize,
     dry_run: bool,
+    languages: &LanguageFilter,
 ) -> Result<ImportStats, helios_hts::error::HtsError> {
     use helios_hts::import::{
         dicom::import_dicom, hl7_v2_tables::import_hl7_v2_tables, icd9_cm::import_icd9_cm,
@@ -744,8 +776,12 @@ async fn dispatch_import(
 
     match format {
         ImportFormat::Hl7Npm => import_tgz(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::SnomedRf2 => import_snomed_rf2(backend, ctx, path, batch_size, dry_run).await,
-        ImportFormat::Loinc => import_loinc_csv(backend, ctx, path, batch_size, dry_run).await,
+        ImportFormat::SnomedRf2 => {
+            import_snomed_rf2(backend, ctx, path, batch_size, dry_run, languages).await
+        }
+        ImportFormat::Loinc => {
+            import_loinc_csv(backend, ctx, path, batch_size, dry_run, languages).await
+        }
         ImportFormat::Icd10Cm => import_icd10_cm(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Icd9Cm => import_icd9_cm(backend, ctx, path, batch_size, dry_run).await,
         ImportFormat::Rxnorm => import_rxnorm_rrf(backend, ctx, path, batch_size, dry_run).await,
@@ -880,35 +916,63 @@ mod tests {
         write_bundle(boot.path(), "cs.json", "http://example.org/cs", "1.0.0");
 
         // First run: imports the file.
-        let (stats, imported, skipped) =
-            import_directory_files(&backend, &ctx, boot.path(), 500, false, Some(&tracker))
-                .await
-                .unwrap();
+        let (stats, imported, skipped) = import_directory_files(
+            &backend,
+            &ctx,
+            boot.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
         assert_eq!((imported, skipped), (1, 0));
         assert_eq!(stats.code_systems, 1);
 
         // Second run, file unchanged: skipped, nothing imported.
-        let (stats, imported, skipped) =
-            import_directory_files(&backend, &ctx, boot.path(), 500, false, Some(&tracker))
-                .await
-                .unwrap();
+        let (stats, imported, skipped) = import_directory_files(
+            &backend,
+            &ctx,
+            boot.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
         assert_eq!((imported, skipped), (0, 1));
         assert_eq!(stats.code_systems, 0);
 
         // Bump the version: content changes, so the file is re-imported.
         write_bundle(boot.path(), "cs.json", "http://example.org/cs", "2.0.0");
-        let (_stats, imported, skipped) =
-            import_directory_files(&backend, &ctx, boot.path(), 500, false, Some(&tracker))
-                .await
-                .unwrap();
+        let (_stats, imported, skipped) = import_directory_files(
+            &backend,
+            &ctx,
+            boot.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
         assert_eq!((imported, skipped), (1, 0));
 
         // Add a brand-new file: only it is imported; cs.json stays skipped.
         write_bundle(boot.path(), "cs2.json", "http://example.org/cs2", "1.0.0");
-        let (_stats, imported, skipped) =
-            import_directory_files(&backend, &ctx, boot.path(), 500, false, Some(&tracker))
-                .await
-                .unwrap();
+        let (_stats, imported, skipped) = import_directory_files(
+            &backend,
+            &ctx,
+            boot.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
         assert_eq!((imported, skipped), (1, 1));
     }
 
@@ -923,10 +987,17 @@ mod tests {
         write_bundle(boot.path(), "cs.json", "http://example.org/cs", "1.0.0");
 
         for _ in 0..2 {
-            let (_stats, imported, skipped) =
-                import_directory_files(&backend, &ctx, boot.path(), 500, false, None)
-                    .await
-                    .unwrap();
+            let (_stats, imported, skipped) = import_directory_files(
+                &backend,
+                &ctx,
+                boot.path(),
+                500,
+                false,
+                &LanguageFilter::default(),
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!((imported, skipped), (1, 0));
         }
     }
