@@ -51,6 +51,26 @@ pub(crate) struct TenantLocation {
 }
 
 impl S3Backend {
+    /// Returns the backend-level capability declarations for S3.
+    ///
+    /// Kept independent of client construction so reporting/tests do not need
+    /// AWS SDK initialization.
+    pub fn declared_capabilities() -> Vec<BackendCapability> {
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::Versioning,
+            BackendCapability::InstanceHistory,
+            BackendCapability::TypeHistory,
+            BackendCapability::SystemHistory,
+            BackendCapability::OptimisticLocking,
+            BackendCapability::CursorPagination,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::SharedSchema,
+            BackendCapability::DatabasePerTenant,
+        ]
+    }
+
     /// Creates a new S3 backend using AWS standard credential provider chain.
     pub fn new(config: S3BackendConfig) -> StorageResult<Self> {
         Self::from_env(config)
@@ -233,36 +253,11 @@ impl Backend for S3Backend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        matches!(
-            capability,
-            BackendCapability::Crud
-                | BackendCapability::Versioning
-                | BackendCapability::InstanceHistory
-                | BackendCapability::TypeHistory
-                | BackendCapability::SystemHistory
-                | BackendCapability::OptimisticLocking
-                | BackendCapability::CursorPagination
-                | BackendCapability::BulkExport
-                | BackendCapability::BulkImport
-                | BackendCapability::SharedSchema
-                | BackendCapability::DatabasePerTenant
-        )
+        Self::declared_capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::Versioning,
-            BackendCapability::InstanceHistory,
-            BackendCapability::TypeHistory,
-            BackendCapability::SystemHistory,
-            BackendCapability::OptimisticLocking,
-            BackendCapability::CursorPagination,
-            BackendCapability::BulkExport,
-            BackendCapability::BulkImport,
-            BackendCapability::SharedSchema,
-            BackendCapability::DatabasePerTenant,
-        ]
+        Self::declared_capabilities()
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {
