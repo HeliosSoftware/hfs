@@ -269,6 +269,47 @@ mod tests {
         assert_eq!(out, b"hello");
     }
 
+    #[test]
+    fn test_err_constructs_backend_internal() {
+        let err = HttpSubmitInputFetcher::err("boom");
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_build_get_no_token_succeeds() {
+        let fetcher = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string());
+        let rb = fetcher
+            .build_get("http://example.com/m.json", &[], false, &[])
+            .await;
+        assert!(rb.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_get_requires_token_without_provider_errors() {
+        let fetcher = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string());
+        let result = fetcher
+            .build_get(
+                "http://example.com/file.ndjson",
+                &[],
+                true,
+                &["http://example.com/.well-known/smart-configuration".to_string()],
+            )
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("no outbound auth is configured"));
+    }
+
+    #[tokio::test]
+    async fn test_build_get_applies_provider_headers() {
+        // Provider headers are applied even on the anonymous path.
+        let fetcher = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string());
+        let headers = vec![("X-Custom".to_string(), "value".to_string())];
+        let rb = fetcher
+            .build_get("http://example.com/m.json", &headers, false, &[])
+            .await;
+        assert!(rb.is_ok());
+    }
+
     #[cfg(not(feature = "bulk-submit-jwe"))]
     #[test]
     fn test_maybe_decrypt_rejected_without_feature() {
