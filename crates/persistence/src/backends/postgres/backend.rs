@@ -540,6 +540,9 @@ impl Backend for PostgresBackend {
                 | BackendCapability::Transactions
                 | BackendCapability::OptimisticLocking
                 | BackendCapability::PessimisticLocking
+                | BackendCapability::BulkExport
+                | BackendCapability::BulkSubmitIngest
+                | BackendCapability::BulkSubmitRestWorker
                 | BackendCapability::Include
                 | BackendCapability::Revinclude
                 | BackendCapability::SharedSchema
@@ -565,6 +568,9 @@ impl Backend for PostgresBackend {
             BackendCapability::Transactions,
             BackendCapability::OptimisticLocking,
             BackendCapability::PessimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
             BackendCapability::Include,
             BackendCapability::Revinclude,
             BackendCapability::SharedSchema,
