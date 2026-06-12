@@ -378,7 +378,7 @@ Options:
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
 | `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
 | `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
-| `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |
+| `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and *best-tier*: a specific `es-ES` imports only `es-ES` (not the siblings `es-AR`/`es-MX`), while a bare `es` imports every `es-*`. English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |
 
 Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
 `zstd`) are decompressed transparently; unsupported encodings are rejected
@@ -770,16 +770,23 @@ plus a BCP-47 dialect-tagged copy (`en-US`, `en-GB`, `da-DK`, `fr-CA`,
 `nl-BE`, `sv-SE`, …) when the refset is one of the published
 national-edition language refsets. `$lookup`, `$expand`, and
 `$validate-code` resolve these via the `displayLanguage` parameter or the
-`Accept-Language` HTTP header. Language matching is BCP-47-aware (RFC 4647):
-a request for `de-DE` (what a browser typically sends) finds designations
-tagged `de`, and a request for `fr` accepts `fr-CA`.
+`Accept-Language` HTTP header. Language matching is BCP-47-aware: a tag is
+ranked against stored designations in the preference order **exact
+(`es-ES`) → separator-insensitive (`esES`) → same primary language (`es`, or
+any regional sibling such as `es-AR`/`es-MX`, all equal-preference)**. So a
+request for `de-DE` (what a browser typically sends) finds designations
+tagged `de`, and a request for `fr` accepts `fr-CA`; when an exact `es-ES`
+designation exists it is preferred over `es`/`es-MX`.
 
 To import only a subset of the available languages (cutting designation
 volume and import time), pass `--languages` (or set `HTS_IMPORT_LANGUAGES`
-for the server bootstrap), e.g. `--languages de,fr-FR`. Excluded
-per-language Description and Language-refset files are skipped without
-being parsed; English is always retained because display selection depends
-on it:
+for the server bootstrap), e.g. `--languages de,fr-FR`. Selection follows the
+same precedence on a **best-tier** basis: for each requested tag only the
+best-ranked available languages are kept. A specific `es-ES` therefore imports
+**only** `es-ES` (excluding `es-AR`/`es-MX`), while a bare `es` — which can only
+reach the primary-language tier — imports every `es-*` variant. Excluded
+per-language Description and Language-refset files are skipped without being
+parsed; English is always retained because display selection depends on it:
 
 ```bash
 curl -X POST http://localhost:8090/CodeSystem/\$lookup \

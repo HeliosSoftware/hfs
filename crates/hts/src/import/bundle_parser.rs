@@ -34,6 +34,16 @@ pub struct ParsedBundle {
     /// Non-fatal parse errors.  Resources with errors are skipped; the rest
     /// of the bundle continues to be imported.
     pub parse_errors: Vec<String>,
+    /// Optimization hint: when `true`, every code system in this bundle is
+    /// known to have had **no concepts** in the database before this import
+    /// session began, so the per-concept delete-before-reinsert of
+    /// properties/designations is pointless and can be skipped. Set by the
+    /// chunked filesystem importers (SNOMED RF2, LOINC) after a single
+    /// pre-import probe; it stays `true` across every batch of a fresh load.
+    /// Defaults to `false` (always replace), which is always correct — the flag
+    /// is purely a fast-path for first-time bulk loads. Importers MUST leave it
+    /// `false` whenever the target may already contain concepts (re-import).
+    pub fresh_load: bool,
 }
 
 /// A single FHIR CodeSystem resource extracted from a Bundle entry.

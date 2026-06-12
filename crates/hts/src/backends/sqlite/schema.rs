@@ -53,7 +53,11 @@ CREATE TABLE IF NOT EXISTS concepts (
     definition  TEXT,
     UNIQUE(system_id, code)
 );
-CREATE INDEX IF NOT EXISTS idx_concepts_system_code ON concepts(system_id, code);
+-- The UNIQUE(system_id, code) constraint already creates an automatic index on
+-- exactly those columns, so the old explicit idx_concepts_system_code was a
+-- redundant duplicate that doubled index maintenance on every concept insert.
+-- Drop it on startup (idempotent); the autoindex serves all the same lookups.
+DROP INDEX IF EXISTS idx_concepts_system_code;
 
 -- ── Hierarchy (pre-materialized parent-child links) ───────────────────────────
 CREATE TABLE IF NOT EXISTS concept_hierarchy (
@@ -88,6 +92,14 @@ CREATE TABLE IF NOT EXISTS concept_designations (
     use_code    TEXT,
     value       TEXT NOT NULL
 );
+-- Index on concept_id is essential: it is the sole access path for both the
+-- per-concept designation reads ($lookup/$expand/$validate-code) and the
+-- delete-before-reinsert that every import performs. Without it each
+-- `WHERE concept_id = ?` is a full table scan, making a bulk import of a
+-- designation-heavy source (SNOMED CT, LOINC) O(n²) — the dominant import
+-- cost. (concept_properties already has an equivalent leading-column index.)
+CREATE INDEX IF NOT EXISTS idx_concept_designations_concept
+    ON concept_designations(concept_id);
 
 CREATE INDEX IF NOT EXISTS idx_code_systems_created_at ON code_systems(created_at);
 -- Covering index for metadata-only list queries (summary=true / _count without resource_json).
@@ -242,13 +254,19 @@ CREATE INDEX IF NOT EXISTS idx_closure_descendant
 -- ── Bootstrap import ledger ───────────────────────────────────────────────────
 -- Records which files in HTS_BOOTSTRAP_DIR have already been imported, keyed on
 -- file name with the SHA-256 of the file's contents. On every startup the
--- bootstrap sync hashes each file in the directory and imports only those whose
--- hash is absent or differs from the stored value — so newly added files and
--- updated terminology releases are picked up without re-parsing unchanged files.
+-- bootstrap sync stats each file in the directory and skips re-importing those
+-- whose (size_bytes, mtime_unix) match the recorded values, falling back to a
+-- full content hash only when the cheap stat disagrees — so unchanged files
+-- (including multi-GB SNOMED/LOINC archives) are recognized without re-reading
+-- their contents, while newly added files and updated terminology releases are
+-- still picked up. `languages` records the BCP-47 filter that was applied so a
+-- changed HTS_IMPORT_LANGUAGES re-triggers import of affected files.
 CREATE TABLE IF NOT EXISTS bootstrap_imports (
     path          TEXT PRIMARY KEY,
     content_hash  TEXT NOT NULL,
     size_bytes    INTEGER NOT NULL,
+    mtime_unix    INTEGER,
+    languages     TEXT NOT NULL DEFAULT '',
     imported_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ";
@@ -463,6 +481,29 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
              ON value_sets(created_at, id, url, version, name, title, status);",
     )?;
 
+    Ok(())
+}
+
+/// Add the `mtime_unix` and `languages` columns to an existing
+/// `bootstrap_imports` ledger.
+///
+/// Older databases created the ledger with only `(path, content_hash,
+/// size_bytes, imported_at)`. The size+mtime skip fast-path needs `mtime_unix`,
+/// and the language-filter gate needs `languages` stored separately from the
+/// content hash. Uses `ALTER TABLE … ADD COLUMN`, ignoring "duplicate column
+/// name" so it is safe to run on every startup.
+pub fn migrate_bootstrap_imports_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let migrations = [
+        "ALTER TABLE bootstrap_imports ADD COLUMN mtime_unix INTEGER",
+        "ALTER TABLE bootstrap_imports ADD COLUMN languages TEXT NOT NULL DEFAULT ''",
+    ];
+    for sql in &migrations {
+        match conn.execute_batch(sql) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 

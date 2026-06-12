@@ -69,10 +69,20 @@ async fn run_server(config: HtsConfig) -> anyhow::Result<()> {
 
     use helios_persistence::backends::sqlite::SqliteBackend;
 
-    let backend = SqliteTerminologyBackend::new(&config.database_url)?;
+    // Defer the FTS prebuild until after bootstrap so the index is built once
+    // on the final post-import data rather than on stale data the bootstrap
+    // sync is about to change.
+    let backend = SqliteTerminologyBackend::new_without_fts_prebuild(&config.database_url)?;
     let hts_pool = backend.pool().clone();
 
     bootstrap_sync_sqlite(&backend, &config).await?;
+
+    // Rebuild closures invalidated by bootstrap re-import and materialize the
+    // FTS index on the final data, matching the post-import steps the CLI
+    // `hts import` path performs. Runs before the server accepts requests.
+    backend
+        .finalize_after_bootstrap()
+        .map_err(|e| anyhow::anyhow!("post-bootstrap finalization failed: {e}"))?;
 
     let resource_store = SqliteBackend::open(&config.database_url)
         .map_err(|e| anyhow::anyhow!("Failed to open resource store: {e}"))?;
@@ -122,6 +132,16 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
 
     bootstrap_sync_postgres(&backend, &config).await?;
+
+    // Rebuild any concept closures invalidated by bootstrap re-import, matching
+    // the post-import step the CLI `hts import` path performs. Without this a
+    // bootstrapped server can come up with chunked SNOMED/LOINC closure data
+    // wiped during import and never rebuilt. Idempotent — only systems missing
+    // closure rows are recomputed.
+    backend
+        .rebuild_missing_closures()
+        .await
+        .map_err(|e| anyhow::anyhow!("post-bootstrap closure rebuild failed: {e}"))?;
 
     let resource_store = PostgresBackend::from_connection_string(&config.database_url)
         .await
@@ -258,62 +278,100 @@ enum BootstrapTracker<'a> {
     Postgres(&'a PostgresTerminologyBackend),
 }
 
+/// A previously-recorded bootstrap ledger row.
+///
+/// `mtime_unix` is `None` for rows written by an older HTS that predates the
+/// column, forcing a content-hash comparison on first boot after upgrade.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+struct LedgerRecord {
+    content_hash: String,
+    size_bytes: i64,
+    mtime_unix: Option<i64>,
+    languages: String,
+}
+
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 impl BootstrapTracker<'_> {
-    /// The content hash previously recorded for `path` (file name), if any.
-    async fn imported_hash(&self, path: &str) -> anyhow::Result<Option<String>> {
+    /// The full ledger row previously recorded for `path` (file name), if any.
+    async fn imported_record(&self, path: &str) -> anyhow::Result<Option<LedgerRecord>> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::Sqlite(backend) => {
                 use rusqlite::OptionalExtension;
                 let pool = backend.pool().clone();
                 let key = path.to_string();
-                let hash =
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+                let rec =
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<LedgerRecord>> {
                         let conn = pool.get()?;
-                        let h = conn
+                        let r = conn
                             .query_row(
-                                "SELECT content_hash FROM bootstrap_imports WHERE path = ?1",
+                                "SELECT content_hash, size_bytes, mtime_unix, languages \
+                                 FROM bootstrap_imports WHERE path = ?1",
                                 [&key],
-                                |r| r.get::<_, String>(0),
+                                |r| {
+                                    Ok(LedgerRecord {
+                                        content_hash: r.get(0)?,
+                                        size_bytes: r.get(1)?,
+                                        mtime_unix: r.get(2)?,
+                                        languages: r.get(3)?,
+                                    })
+                                },
                             )
                             .optional()?;
-                        Ok(h)
+                        Ok(r)
                     })
                     .await??;
-                Ok(hash)
+                Ok(rec)
             }
             #[cfg(feature = "postgres")]
             Self::Postgres(backend) => {
                 let client = backend.pool().get().await?;
                 let row = client
                     .query_opt(
-                        "SELECT content_hash FROM bootstrap_imports WHERE path = $1",
+                        "SELECT content_hash, size_bytes, mtime_unix, languages \
+                         FROM bootstrap_imports WHERE path = $1",
                         &[&path],
                     )
                     .await?;
-                Ok(row.map(|r| r.get::<_, String>(0)))
+                Ok(row.map(|r| LedgerRecord {
+                    content_hash: r.get(0),
+                    size_bytes: r.get(1),
+                    mtime_unix: r.get(2),
+                    languages: r.get(3),
+                }))
             }
         }
     }
 
-    /// Record (insert or update) the content hash and size for `path`.
-    async fn record(&self, path: &str, hash: &str, size: i64) -> anyhow::Result<()> {
+    /// Record (insert or update) the content hash, size, mtime and applied
+    /// language filter for `path`.
+    async fn record(
+        &self,
+        path: &str,
+        hash: &str,
+        size: i64,
+        mtime_unix: Option<i64>,
+        languages: &str,
+    ) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::Sqlite(backend) => {
                 let pool = backend.pool().clone();
-                let (key, hash) = (path.to_string(), hash.to_string());
+                let (key, hash, languages) =
+                    (path.to_string(), hash.to_string(), languages.to_string());
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     let conn = pool.get()?;
                     conn.execute(
-                        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) \
-                         VALUES (?1, ?2, ?3) \
+                        "INSERT INTO bootstrap_imports \
+                             (path, content_hash, size_bytes, mtime_unix, languages) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) \
                          ON CONFLICT(path) DO UPDATE SET \
                              content_hash = excluded.content_hash, \
                              size_bytes   = excluded.size_bytes, \
+                             mtime_unix   = excluded.mtime_unix, \
+                             languages    = excluded.languages, \
                              imported_at  = datetime('now')",
-                        rusqlite::params![key, hash, size],
+                        rusqlite::params![key, hash, size, mtime_unix, languages],
                     )?;
                     Ok(())
                 })
@@ -325,19 +383,47 @@ impl BootstrapTracker<'_> {
                 let client = backend.pool().get().await?;
                 client
                     .execute(
-                        "INSERT INTO bootstrap_imports (path, content_hash, size_bytes) \
-                         VALUES ($1, $2, $3) \
+                        "INSERT INTO bootstrap_imports \
+                             (path, content_hash, size_bytes, mtime_unix, languages) \
+                         VALUES ($1, $2, $3, $4, $5) \
                          ON CONFLICT (path) DO UPDATE SET \
                              content_hash = EXCLUDED.content_hash, \
                              size_bytes   = EXCLUDED.size_bytes, \
+                             mtime_unix   = EXCLUDED.mtime_unix, \
+                             languages    = EXCLUDED.languages, \
                              imported_at  = now()",
-                        &[&path, &hash, &size],
+                        &[&path, &hash, &size, &mtime_unix, &languages],
                     )
                     .await?;
                 Ok(())
             }
         }
     }
+}
+
+/// Cheaply stat a regular file for its `(size, mtime as unix nanoseconds)`
+/// without reading its contents. Returns `None` for anything that is not a
+/// regular file (e.g. an RxNorm RRF directory) or when the metadata/mtime is
+/// unavailable, in which case callers fall back to the full content-hash
+/// comparison.
+///
+/// Nanosecond precision (not seconds) is used so that a same-size content
+/// rewrite is reliably detected on filesystems with sub-second mtime
+/// granularity (ext4, tmpfs, APFS, NTFS) — a seconds-resolution mtime could
+/// collide for two writes in the same wall-clock second.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn cheap_file_stat(path: &std::path::Path) -> Option<(i64, i64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    Some((meta.len() as i64, mtime))
 }
 
 /// Compute a `(SHA-256 hex, size in bytes)` signature for a bootstrap entry.
@@ -681,42 +767,95 @@ async fn import_directory_files(
         // content; otherwise remember the signature to record after a
         // successful import. A hashing or ledger-lookup error is non-fatal —
         // we log it and fall through to import the file unconditionally.
-        let mut pending_signature: Option<(String, i64)> = None;
+        //
+        // Skip decision, cheapest-first:
+        //   1. stat the file (no read) — if size + mtime + applied language
+        //      filter all match the ledger, the file is unchanged → skip without
+        //      ever reading it. This is what keeps restarts fast for multi-GB
+        //      SNOMED/LOINC archives.
+        //   2. only when the cheap stat disagrees (or the ledger predates the
+        //      mtime column) fall back to a full content hash, so a file whose
+        //      mtime was merely touched is still recognized as unchanged.
+        let mut pending_signature: Option<(String, i64, Option<i64>, String)> = None;
         if let Some(tracker) = tracker {
-            // For language-sensitive formats the configured language set is
-            // folded into the ledger signature, so changing
-            // HTS_IMPORT_LANGUAGES re-triggers the import of affected files
-            // on the next startup even though their content is unchanged.
-            // The allow-all default leaves the signature untouched, keeping
-            // existing ledgers valid.
+            // The language filter applied to this file, stored separately from
+            // the content hash so the cheap fast-path can detect a changed
+            // HTS_IMPORT_LANGUAGES without re-hashing. Empty = no filtering
+            // (non-language-sensitive format, or the allow-all default).
             let lang_sensitive = matches!(format, ImportFormat::SnomedRf2 | ImportFormat::Loinc);
-            let signature = compute_signature(entry).map(|(mut hash, size)| {
-                if lang_sensitive && !languages.allows_all() {
-                    hash = format!("{hash};languages={}", languages.canonical_spec());
-                }
-                (hash, size)
-            });
-            match signature {
-                Ok((hash, size)) => match tracker.imported_hash(fname).await {
-                    Ok(Some(prev)) if prev == hash => {
+            let applied_langs = if lang_sensitive && !languages.allows_all() {
+                languages.canonical_spec()
+            } else {
+                String::new()
+            };
+            // Directories (RxNorm RRF) return None and fall through to the
+            // metadata-based compute_signature, which is already cheap for them.
+            let stat = cheap_file_stat(entry);
+
+            match tracker.imported_record(fname).await {
+                Ok(Some(rec)) => {
+                    let fast_match = matches!((stat, rec.mtime_unix), (Some((sz, mt)), Some(rmt))
+                        if sz == rec.size_bytes && mt == rmt)
+                        && rec.languages == applied_langs;
+                    if fast_match {
                         eprintln!(
-                            "[skip] {}/{total} {fname}{suffix}: unchanged since last bootstrap",
+                            "[skip] {}/{total} {fname}{suffix}: unchanged since last bootstrap (size+mtime)",
                             idx + 1
                         );
                         skipped_count += 1;
                         continue;
                     }
-                    Ok(_) => pending_signature = Some((hash, size)),
+                    // Stat disagreed (or legacy row without mtime): hash to see
+                    // whether the contents actually changed.
+                    match compute_signature(entry) {
+                        Ok((hash, size)) => {
+                            let mtime = stat.map(|(_, m)| m);
+                            if hash == rec.content_hash && rec.languages == applied_langs {
+                                // Content identical — only the mtime was touched.
+                                // Refresh the ledger so the next boot fast-paths,
+                                // then skip.
+                                if !dry_run
+                                    && let Err(e) = tracker
+                                        .record(fname, &hash, size, mtime, &applied_langs)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        file = fname,
+                                        error = %e,
+                                        "failed to refresh bootstrap ledger mtime"
+                                    );
+                                }
+                                eprintln!(
+                                    "[skip] {}/{total} {fname}{suffix}: unchanged since last bootstrap (content hash)",
+                                    idx + 1
+                                );
+                                skipped_count += 1;
+                                continue;
+                            }
+                            pending_signature = Some((hash, size, mtime, applied_langs));
+                        }
+                        Err(e) => tracing::warn!(
+                            file = fname,
+                            error = %e,
+                            "could not hash bootstrap file; importing unconditionally"
+                        ),
+                    }
+                }
+                Ok(None) => match compute_signature(entry) {
+                    Ok((hash, size)) => {
+                        let mtime = stat.map(|(_, m)| m);
+                        pending_signature = Some((hash, size, mtime, applied_langs));
+                    }
                     Err(e) => tracing::warn!(
                         file = fname,
                         error = %e,
-                        "bootstrap ledger lookup failed; importing unconditionally"
+                        "could not hash bootstrap file; importing unconditionally"
                     ),
                 },
                 Err(e) => tracing::warn!(
                     file = fname,
                     error = %e,
-                    "could not hash bootstrap file; importing unconditionally"
+                    "bootstrap ledger lookup failed; importing unconditionally"
                 ),
             }
         }
@@ -729,9 +868,10 @@ async fn import_directory_files(
             Ok(file_stats) => {
                 stats.merge(file_stats);
                 imported_count += 1;
-                if let (Some(tracker), Some((hash, size))) = (tracker, pending_signature.as_ref())
+                if let (Some(tracker), Some((hash, size, mtime, langs))) =
+                    (tracker, pending_signature.as_ref())
                     && !dry_run
-                    && let Err(e) = tracker.record(fname, hash, *size).await
+                    && let Err(e) = tracker.record(fname, hash, *size, *mtime, langs).await
                 {
                     tracing::warn!(
                         file = fname,
@@ -882,7 +1022,24 @@ mod tests {
                 }
             }]
         });
-        std::fs::write(dir.join(name), serde_json::to_vec(&bundle).unwrap()).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+
+        // Stamp a deterministic mtime keyed on (name, version) so the bootstrap
+        // size+mtime fast-path reliably sees a content change as a change,
+        // independent of the host filesystem's mtime granularity (some
+        // platforms, e.g. the CI/WSL temp dirs, resolve mtime to whole
+        // seconds, which would otherwise collide for two same-size rewrites in
+        // the same wall-clock second). A real terminology release replaces the
+        // file and so always lands a fresh mtime — this mirrors that.
+        let key: u64 = name.bytes().chain(version.bytes()).map(u64::from).sum();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + key);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
     }
 
     #[test]

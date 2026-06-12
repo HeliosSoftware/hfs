@@ -159,21 +159,33 @@ pub async fn import_loinc_csv(
             None => HashMap::new(),
         };
 
-        // code → (language → translated display). Last writer wins per language.
-        let mut translations: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // First pass: resolve every linguistic-variant file's language tag so
+        // the language filter can make a *best-tier* decision over the whole
+        // candidate set (e.g. keep `es-ES` and drop `es-AR`/`es-MX`), rather
+        // than admitting every tag that loosely matches.
+        let mut variant_langs: Vec<(&String, String, String)> = Vec::new();
         for variant_path in &paths.lv_variants {
             let filename = variant_path
                 .rsplit('/')
                 .next()
                 .unwrap_or(variant_path)
                 .to_string();
-            let Some(language) = derive_language_tag(&filename, &lv_index) else {
-                parse_errors.push(format!(
+            match derive_language_tag(&filename, &lv_index) {
+                Some(language) => variant_langs.push((variant_path, filename, language)),
+                None => parse_errors.push(format!(
                     "Cannot determine language for linguistic-variant file '{filename}' — skipped"
-                ));
-                continue;
-            };
-            if !languages.allows(&language) {
+                )),
+            }
+        }
+        // Best-tier retained set across all candidate languages. English
+        // designations are always kept (consistent with SNOMED), independent of
+        // the filter.
+        let retained = languages.resolve_retained(variant_langs.iter().map(|(_, _, l)| l.as_str()));
+
+        // code → (language → translated display). Last writer wins per language.
+        let mut translations: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for (variant_path, filename, language) in &variant_langs {
+            if !crate::language::lang_matches("en", language) && !retained.contains(language) {
                 tracing::info!(
                     file = %filename,
                     language = %language,
@@ -182,14 +194,14 @@ pub async fn import_loinc_csv(
                 continue;
             }
             let mut zip = open_zip(&path_owned)?;
-            let entry = match zip.by_name(variant_path) {
+            let entry = match zip.by_name(variant_path.as_str()) {
                 Ok(e) => e,
                 Err(e) => {
                     parse_errors.push(format!("Cannot open {variant_path}: {e} — skipped"));
                     continue;
                 }
             };
-            let rows = parse_linguistic_variant(entry, &filename, &mut parse_errors)?;
+            let rows = parse_linguistic_variant(entry, filename, &mut parse_errors)?;
             for (code, value) in rows {
                 translations
                     .entry(code)
@@ -309,6 +321,16 @@ pub async fn import_loinc_csv(
         content: "complete",
     };
 
+    // Probe once before loading: if the system has no concepts yet, every
+    // concept in every batch is brand-new, so the per-concept
+    // delete-before-reinsert can be skipped across the whole load. On a
+    // re-import (system already populated) we leave it off so replacement
+    // semantics still apply. Probe failure falls back to the safe path.
+    let fresh_load = !backend
+        .code_system_has_concepts(ctx, LOINC_URL)
+        .await
+        .unwrap_or(true);
+
     // Seed: empty CodeSystem to upsert metadata.
     let seed = build_parsed_code_system(&meta, &[]);
     let seed_stats = backend.import_parsed(ctx, seed).await?;
@@ -352,7 +374,8 @@ pub async fn import_loinc_csv(
             })
             .collect();
 
-        let parsed = build_parsed_code_system(&meta, &builder);
+        let mut parsed = build_parsed_code_system(&meta, &builder);
+        parsed.fresh_load = fresh_load;
         let chunk_stats = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
@@ -894,6 +917,53 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         tmp
     }
 
+    /// Build a ZIP carrying the regional variant set from the user-reported
+    /// case: de-AT, de-DE, es-AR, es-ES, es-MX. The numeric ids (15/91/92/93)
+    /// are absent from `LV_INDEX_CSV` so `derive_language_tag` resolves those
+    /// tags from the filename letters (id 8 maps to de-DE via the index).
+    fn make_test_loinc_zip_with_regional_variants() -> NamedTempFile {
+        let tmp = NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+
+            zip.start_file("LoincTable/Loinc.csv", opts).unwrap();
+            zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
+            zip.start_file(
+                "AccessoryFiles/MultiAxialHierarchy/MultiAxialHierarchy.csv",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(HIERARCHY_CSV.as_bytes()).unwrap();
+            zip.start_file(
+                "AccessoryFiles/LinguisticVariants/LinguisticVariants.csv",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(LV_INDEX_CSV.as_bytes()).unwrap();
+
+            // German variants (LONG_COMMON_NAME-style, 1 row each): de-AT, de-DE.
+            for fname in ["deAT15LinguisticVariant.csv", "deDE8LinguisticVariant.csv"] {
+                zip.start_file(format!("AccessoryFiles/LinguisticVariants/{fname}"), opts)
+                    .unwrap();
+                zip.write_all(LV_DE_CSV.as_bytes()).unwrap();
+            }
+            // Spanish variants (axes-synthesized, 2 rows each): es-AR, es-ES, es-MX.
+            for fname in [
+                "esAR92LinguisticVariant.csv",
+                "esES91LinguisticVariant.csv",
+                "esMX93LinguisticVariant.csv",
+            ] {
+                zip.start_file(format!("AccessoryFiles/LinguisticVariants/{fname}"), opts)
+                    .unwrap();
+                zip.write_all(LV_ES_AXES_CSV.as_bytes()).unwrap();
+            }
+
+            zip.finish().unwrap();
+        }
+        tmp
+    }
+
     fn count_rows(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
         let conn = backend.pool().get().unwrap();
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -1333,6 +1403,94 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             )
             .unwrap();
         assert_eq!(display, "Creatinine [Mass/volume] in Serum or Plasma");
+    }
+
+    #[tokio::test]
+    async fn import_loinc_best_tier_excludes_regional_siblings() {
+        // The user-reported case: filter `de,es-ES` against de-AT, de-DE,
+        // es-AR, es-ES, es-MX. `es-ES` is an exact match, so es-AR/es-MX are
+        // dropped; `de` only reaches the regional-sibling tier, so both German
+        // variants are kept.
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_loinc_zip_with_regional_variants();
+
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::parse("de,es-ES"),
+        )
+        .await
+        .expect("import with language filter should succeed");
+
+        let conn = backend.pool().get().unwrap();
+        let count = |lang: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM concept_designations WHERE language = ?1",
+                [lang],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("de-AT"), 1, "de-AT kept (de* sibling tier)");
+        assert_eq!(count("de-DE"), 1, "de-DE kept (de* sibling tier)");
+        assert_eq!(count("es-ES"), 2, "es-ES kept (exact match)");
+        assert_eq!(count("es-AR"), 0, "es-AR dropped (es-ES exact outranks)");
+        assert_eq!(count("es-MX"), 0, "es-MX dropped (es-ES exact outranks)");
+        // 2 German + 2 Spanish designations, nothing else.
+        assert_eq!(count_rows(&backend, "concept_designations"), 4);
+    }
+
+    #[tokio::test]
+    async fn loinc_fresh_load_skip_then_narrowed_reimport_replaces() {
+        // First import is a fresh load (system empty → fresh_load path skips the
+        // delete-before-reinsert). Both French and German designations land.
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_loinc_zip_with_variants();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_rows(&backend, "concept_designations"), 3); // fr×2 + de×1
+
+        // Re-import with a narrower filter. The system now has concepts, so the
+        // probe must flip fresh_load OFF and the per-concept replacement must
+        // run — dropping the German designation. This is the interaction that
+        // would silently leave stale rows if the skip path were taken on a
+        // re-import.
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::parse("fr"),
+        )
+        .await
+        .unwrap();
+        let conn = backend.pool().get().unwrap();
+        let de: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_designations WHERE language = 'de-DE'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            de, 0,
+            "stale German designations must be removed on re-import"
+        );
+        assert_eq!(count_rows(&backend, "concept_designations"), 2); // fr×2 only
     }
 
     #[tokio::test]
