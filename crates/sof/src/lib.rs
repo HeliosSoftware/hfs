@@ -180,9 +180,25 @@
 //! - `R5`: FHIR 5.0.0 support
 //! - `R6`: FHIR 6.0.0 support
 
+pub mod compartment;
+pub mod constants;
 pub mod data_source;
+pub mod fhir_format;
+pub mod params;
 pub mod parquet_schema;
+pub mod sqlquery;
 pub mod traits;
+
+pub use compartment::{resolve_group_members_to_patient_refs, resource_in_patient_compartment};
+pub use constants::{ConstantValue, parse_constant_from_json};
+pub use params::{
+    ExtractedRunParams, body_has_view_definition, extract_run_params_from_json, split_csv_refs,
+};
+pub use sqlquery::{
+    BoundParam, ColumnFhirType, DependsOnView, InMemorySqlEngine, LibraryParameter, QueryResult,
+    SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableSchema, bind_supplied_params,
+    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library,
+};
 
 use chrono::{DateTime, Utc};
 use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
@@ -561,6 +577,13 @@ pub enum SofError {
     /// This error occurs when converting data to Parquet format fails.
     #[error("Parquet conversion error: {0}")]
     ParquetConversionError(String),
+
+    /// A `patient` / `group` reference supplied to `$viewdefinition-run` does
+    /// not resolve against the supplied resources. Per the SoF v2 spec, this
+    /// is a `400 Bad Request` (mapped to OperationOutcome `not-found` /
+    /// `invalid`), not a silent empty-result.
+    #[error("Referenced resource not found: {0}")]
+    ReferencedResourceNotFound(String),
 }
 
 /// Supported output content types for ViewDefinition transformations.
@@ -624,7 +647,9 @@ impl ContentType {
     /// - `"application/json"` → [`ContentType::Json`]
     /// - `"application/ndjson"` → [`ContentType::NdJson`]
     /// - `"application/x-ndjson"` → [`ContentType::NdJson`]
-    /// - `"application/parquet"` → [`ContentType::Parquet`]
+    /// - `"application/vnd.apache.parquet"` → [`ContentType::Parquet`] (spec native media type)
+    /// - `"application/octet-stream"` → [`ContentType::Parquet`] (spec Accept-table value)
+    /// - `"application/parquet"` → [`ContentType::Parquet`] (permissive alias)
     ///
     /// # Arguments
     ///
@@ -682,8 +707,28 @@ impl ContentType {
             "text/csv" | "text/csv;header=true" => Ok(ContentType::CsvWithHeader),
             "application/json" => Ok(ContentType::Json),
             "application/ndjson" | "application/x-ndjson" => Ok(ContentType::NdJson),
-            "application/parquet" => Ok(ContentType::Parquet),
+            // `application/vnd.apache.parquet` is the format's native media
+            // type per the spec's Common Operation Behavior table;
+            // `application/octet-stream` is the spec Accept-table value
+            // (audit item #8) and `application/parquet` is kept as a
+            // permissive alias for backwards-compat with clients that
+            // still send it.
+            "application/vnd.apache.parquet"
+            | "application/octet-stream"
+            | "application/parquet" => Ok(ContentType::Parquet),
             _ => Err(SofError::UnsupportedContentType(s.to_string())),
+        }
+    }
+
+    /// The format's native media type per the SoF v2 spec's Common Operation
+    /// Behavior output-format table. This is the `Content-Type` served for
+    /// the raw-payload (default) representation.
+    pub fn mime_type(&self) -> &'static str {
+        match self {
+            ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
+            ContentType::Json => "application/json",
+            ContentType::NdJson => "application/x-ndjson",
+            ContentType::Parquet => "application/vnd.apache.parquet",
         }
     }
 }
@@ -939,6 +984,283 @@ pub fn run_view_definition(
     content_type: ContentType,
 ) -> Result<Vec<u8>, SofError> {
     run_view_definition_with_options(view_definition, bundle, content_type, RunOptions::default())
+}
+
+/// Parses a JSON value into a [`SofViewDefinition`] using the newest enabled
+/// FHIR version.
+///
+/// Use [`parse_view_definition_for_version`] to pick a specific version (for
+/// example when matching the FHIR version of an inline `Bundle` parameter).
+pub fn parse_view_definition(json: serde_json::Value) -> Result<SofViewDefinition, SofError> {
+    parse_view_definition_for_version(json, get_newest_enabled_fhir_version())
+}
+
+/// Parses a JSON value into a [`SofViewDefinition`] using the specified FHIR
+/// version.
+pub fn parse_view_definition_for_version(
+    json: serde_json::Value,
+    version: helios_fhir::FhirVersion,
+) -> Result<SofViewDefinition, SofError> {
+    match version {
+        #[cfg(feature = "R4")]
+        helios_fhir::FhirVersion::R4 => {
+            let view_def: helios_fhir::r4::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Invalid R4 ViewDefinition: {}", e))
+                })?;
+            Ok(SofViewDefinition::R4(view_def))
+        }
+        #[cfg(feature = "R4B")]
+        helios_fhir::FhirVersion::R4B => {
+            let view_def: helios_fhir::r4b::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Invalid R4B ViewDefinition: {}", e))
+                })?;
+            Ok(SofViewDefinition::R4B(view_def))
+        }
+        #[cfg(feature = "R5")]
+        helios_fhir::FhirVersion::R5 => {
+            let view_def: helios_fhir::r5::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Invalid R5 ViewDefinition: {}", e))
+                })?;
+            Ok(SofViewDefinition::R5(view_def))
+        }
+        #[cfg(feature = "R6")]
+        helios_fhir::FhirVersion::R6 => {
+            let view_def: helios_fhir::r6::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Invalid R6 ViewDefinition: {}", e))
+                })?;
+            Ok(SofViewDefinition::R6(view_def))
+        }
+    }
+}
+
+/// Wraps a list of raw FHIR resources in a `collection` Bundle of the newest
+/// enabled FHIR version.
+pub fn create_bundle_from_resources(
+    resources: Vec<serde_json::Value>,
+) -> Result<SofBundle, SofError> {
+    create_bundle_from_resources_for_version(resources, get_newest_enabled_fhir_version())
+}
+
+/// Wraps a list of raw FHIR resources in a `collection` Bundle of the
+/// specified FHIR version.
+pub fn create_bundle_from_resources_for_version(
+    resources: Vec<serde_json::Value>,
+    version: helios_fhir::FhirVersion,
+) -> Result<SofBundle, SofError> {
+    let bundle_json = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "collection",
+        "entry": resources.into_iter().map(|resource| {
+            serde_json::json!({ "resource": resource })
+        }).collect::<Vec<_>>()
+    });
+
+    match version {
+        #[cfg(feature = "R4")]
+        helios_fhir::FhirVersion::R4 => {
+            let bundle: helios_fhir::r4::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Failed to create R4 Bundle: {}", e))
+                })?;
+            Ok(SofBundle::R4(bundle))
+        }
+        #[cfg(feature = "R4B")]
+        helios_fhir::FhirVersion::R4B => {
+            let bundle: helios_fhir::r4b::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Failed to create R4B Bundle: {}", e))
+                })?;
+            Ok(SofBundle::R4B(bundle))
+        }
+        #[cfg(feature = "R5")]
+        helios_fhir::FhirVersion::R5 => {
+            let bundle: helios_fhir::r5::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Failed to create R5 Bundle: {}", e))
+                })?;
+            Ok(SofBundle::R5(bundle))
+        }
+        #[cfg(feature = "R6")]
+        helios_fhir::FhirVersion::R6 => {
+            let bundle: helios_fhir::r6::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    SofError::InvalidViewDefinition(format!("Failed to create R6 Bundle: {}", e))
+                })?;
+            Ok(SofBundle::R6(bundle))
+        }
+    }
+}
+
+/// Filters raw FHIR resource JSON by patient and/or group references using
+/// the FHIR `CompartmentDefinition-patient` spec data.
+///
+/// Per the SQL-on-FHIR v2 `$viewdefinition-run` spec, `patient` is `0..1`
+/// and `group` is `0..*`; both arguments accept slices and multiple values
+/// are unioned. `group_refs` are resolved against any `Group` resources
+/// found in `resources` (the `member.entity` Patient references contribute
+/// to the effective patient-compartment set).
+///
+/// The compartment scan uses
+/// `helios_fhir::compartment_expressions::{r4,r4b,r5,r6}::get_compartment_param_expressions`
+/// — a compile-time join of `CompartmentDefinition-patient.json` against
+/// `search-parameters.json` — to enumerate the spec-defined `(name,
+/// FHIRPath-expression)` pairs that link a resource type to the `Patient`
+/// compartment. Each expression is evaluated against the resource and the
+/// resulting `Reference`(s) are matched against the requested patient set.
+/// This replaces the prior hand-rolled `(subject|patient)` allowlist
+/// (audit item #3) without any runtime data-file dependency.
+///
+/// **Absent-target handling (SoF v2 spec):** any `patient` / `group` reference
+/// that does not resolve against the supplied resources is a hard error,
+/// returned as [`SofError::ReferencedResourceNotFound`]. Callers surface this
+/// as `400 Bad Request` + an `OperationOutcome` per the spec's error table.
+/// Previously this path emitted a `Warning: 199` HTTP header and continued
+/// with a (possibly empty) result; the warning-header behavior was
+/// removed to align with the spec.
+pub fn filter_resources_by_patient_and_group(
+    resources: Vec<serde_json::Value>,
+    patient_refs: &[String],
+    group_refs: &[String],
+    fhir_version: FhirVersion,
+) -> Result<Vec<serde_json::Value>, SofError> {
+    use std::collections::HashSet;
+
+    if patient_refs.is_empty() && group_refs.is_empty() {
+        return Ok(resources);
+    }
+
+    // Absent-target detection: any `patient` / `group` reference that
+    // isn't represented by a resource in the supplied bundle is a hard
+    // error per the SoF v2 spec error table.
+    let mut absent: Vec<String> = Vec::new();
+    for r in patient_refs {
+        let canonical = if r.starts_with("Patient/") {
+            r.clone()
+        } else {
+            format!("Patient/{}", r)
+        };
+        let id = canonical
+            .strip_prefix("Patient/")
+            .and_then(|s| s.split('/').next());
+        let found = id
+            .map(|id| {
+                resources.iter().any(|res| {
+                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Patient")
+                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
+                })
+            })
+            .unwrap_or(false);
+        if !found {
+            absent.push(canonical);
+        }
+    }
+    for g in group_refs {
+        let canonical = if g.starts_with("Group/") {
+            g.clone()
+        } else {
+            format!("Group/{}", g)
+        };
+        let id = canonical
+            .strip_prefix("Group/")
+            .and_then(|s| s.split('/').next());
+        let found = id
+            .map(|id| {
+                resources.iter().any(|res| {
+                    res.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+                        && res.get("id").and_then(|v| v.as_str()) == Some(id)
+                })
+            })
+            .unwrap_or(false);
+        if !found {
+            absent.push(canonical);
+        }
+    }
+    if !absent.is_empty() {
+        return Err(SofError::ReferencedResourceNotFound(format!(
+            "{} not found in supplied resources",
+            absent.join(", ")
+        )));
+    }
+
+    // Build the effective patient-compartment set: explicit patient refs +
+    // patient refs resolved from supplied groups. Both forms are
+    // canonicalised to `Patient/{id}` so downstream comparisons don't
+    // double-handle the prefix.
+    let mut targets: HashSet<String> = patient_refs
+        .iter()
+        .map(|r| {
+            if r.starts_with("Patient/") {
+                r.clone()
+            } else {
+                format!("Patient/{}", r)
+            }
+        })
+        .collect();
+
+    if !group_refs.is_empty() {
+        targets.extend(compartment::resolve_group_members_to_patient_refs(
+            group_refs, &resources,
+        ));
+    }
+
+    // No effective patient targets (e.g. supplied Group resolved to zero
+    // Patient members). The targets themselves are present (they got past
+    // the absent-target check above), so this is an empty-but-valid result.
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut filtered = Vec::with_capacity(resources.len());
+    for resource in resources.into_iter() {
+        // Group resources are first-class compartment members when their
+        // `Group/{id}` was requested directly (i.e. not via member
+        // resolution). Skip the FHIRPath scan for Group itself.
+        if resource.get("resourceType").and_then(|v| v.as_str()) == Some("Group")
+            && resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| {
+                    group_refs
+                        .iter()
+                        .any(|g| g == &format!("Group/{}", id) || g == id)
+                })
+                .unwrap_or(false)
+        {
+            filtered.push(resource);
+            continue;
+        }
+
+        if compartment::resource_in_patient_compartment(&resource, &targets, fhir_version)? {
+            filtered.push(resource);
+        }
+    }
+
+    Ok(filtered)
+}
+
+/// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,
+/// returning only resources whose `lastUpdated` is strictly after `since`.
+/// Resources without `meta.lastUpdated` are excluded.
+pub fn filter_resources_by_since(
+    resources: Vec<serde_json::Value>,
+    since: DateTime<Utc>,
+) -> Result<Vec<serde_json::Value>, SofError> {
+    Ok(resources
+        .into_iter()
+        .filter(|resource| {
+            resource
+                .get("meta")
+                .and_then(|m| m.get("lastUpdated"))
+                .and_then(|lu| lu.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc) > since)
+                .unwrap_or(false)
+        })
+        .collect())
 }
 
 /// Configuration options for Parquet file generation.
@@ -1795,6 +2117,17 @@ pub fn iter_ndjson_chunks<R: BufRead>(
 ///
 /// This is used internally for streaming/chunked processing where we have
 /// raw JSON that needs to be converted to typed resources for FHIRPath evaluation.
+/// Crate-internal entry point for the compartment filter to convert raw
+/// JSON to a typed `FhirResource` (matching the version the caller already
+/// negotiated). Wraps the private [`parse_json_to_fhir_resource`] without
+/// exposing it as a public stable API.
+pub(crate) fn parse_json_to_fhir_resource_pub(
+    json: serde_json::Value,
+    version: FhirVersion,
+) -> Result<helios_fhir::FhirResource, SofError> {
+    parse_json_to_fhir_resource(json, version)
+}
+
 fn parse_json_to_fhir_resource(
     json: serde_json::Value,
     version: FhirVersion,
@@ -1949,7 +2282,7 @@ fn extract_view_definition_constants<VD: ViewDefinitionTrait>(
 }
 
 // Generic version-agnostic ViewDefinition processing
-fn process_view_definition_generic<VD, B>(
+pub(crate) fn process_view_definition_generic<VD, B>(
     view_definition: VD,
     bundle: B,
 ) -> Result<ProcessedResult, SofError>
@@ -2992,6 +3325,24 @@ where
                     }
                 }
 
+                // Apply unionAll branches in the child's context
+                if let Some(union_selects) = select.union_all() {
+                    let mut union_combinations = Vec::new();
+                    for combo in &child_combinations {
+                        for union_select in union_selects {
+                            let select_combinations = expand_select_combinations(
+                                &child_context,
+                                union_select,
+                                std::slice::from_ref(combo),
+                                all_columns,
+                                variables,
+                            )?;
+                            union_combinations.extend(select_combinations);
+                        }
+                    }
+                    child_combinations = union_combinations;
+                }
+
                 // Add the processed combinations to our results
                 // (these may have been filtered by forEach, which is correct)
                 all_combinations.extend(child_combinations);
@@ -3162,7 +3513,13 @@ fn apply_pagination_to_result(
     Ok(result)
 }
 
-fn format_output(
+/// Renders a [`ProcessedResult`] to bytes in the requested [`ContentType`].
+///
+/// Dispatches to [`format_csv`], [`format_json`], [`format_ndjson`], or
+/// [`format_parquet`] based on `content_type`. Callers outside this crate
+/// (REST handlers, pysof, sof-server) use this entry point so output shape is
+/// consistent across consumers.
+pub fn format_output(
     result: ProcessedResult,
     content_type: ContentType,
     parquet_options: Option<&ParquetOptions>,
@@ -3177,7 +3534,42 @@ fn format_output(
     }
 }
 
-fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, SofError> {
+/// Builds a [`ProcessedResult`] from a stream of flat JSON-object rows.
+///
+/// Used by callers that receive rows as `serde_json::Value` (e.g. the REST
+/// SoF runner streams) and want to feed them through the shared output
+/// formatters. Column order is taken from the first row's key order;
+/// subsequent rows fill in missing keys as `None`.
+pub fn rows_to_processed_result(rows: Vec<serde_json::Value>) -> ProcessedResult {
+    let columns: Vec<String> = match rows.first() {
+        Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    let processed_rows = rows
+        .iter()
+        .map(|row| {
+            let values = columns
+                .iter()
+                .map(|col| match row {
+                    serde_json::Value::Object(map) => map.get(col).cloned(),
+                    _ => None,
+                })
+                .collect();
+            ProcessedRow { values }
+        })
+        .collect();
+    ProcessedResult {
+        columns,
+        rows: processed_rows,
+    }
+}
+
+/// Encodes a [`ProcessedResult`] as CSV bytes via the `csv` crate (RFC 4180).
+///
+/// String values are emitted raw; non-string values are JSON-serialised. The
+/// underlying writer handles quoting for fields containing `,`, `"`, or
+/// newlines, so callers do not need to escape.
+pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, SofError> {
     let mut wtr = csv::Writer::from_writer(vec![]);
 
     if include_header {
@@ -3208,7 +3600,9 @@ fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, 
         .map_err(|e| SofError::CsvWriterError(e.to_string()))
 }
 
-fn format_json(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
+/// Encodes a [`ProcessedResult`] as a pretty-printed JSON array of row
+/// objects. Missing column values are emitted as `null`.
+pub fn format_json(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     let mut output = Vec::new();
 
     for row in result.rows {
@@ -3228,7 +3622,9 @@ fn format_json(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     Ok(serde_json::to_vec_pretty(&output)?)
 }
 
-fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
+/// Encodes a [`ProcessedResult`] as newline-delimited JSON. One row per
+/// line; missing column values are emitted as `null`.
+pub fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     let mut output = Vec::new();
 
     for row in result.rows {
@@ -3250,7 +3646,14 @@ fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     Ok(output)
 }
 
-fn format_parquet(
+/// Encodes a [`ProcessedResult`] as a single Parquet file in memory.
+///
+/// Schema is inferred from `result.columns` and the row values; type mapping
+/// follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
+/// integer→INT32, decimal→FLOAT64, dateTime/date→UTF8). Use
+/// [`format_parquet_multi_file`] when the output needs to be split across
+/// files by size.
+pub fn format_parquet(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {

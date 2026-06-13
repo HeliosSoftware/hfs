@@ -42,10 +42,31 @@ fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
 
+/// Extracts the `value[x]` payload from a FHIRPath Patch `Parameters.part`
+/// entry whose `name` is `"value"`. Returns the value of the first key
+/// matching `value[A-Z]…` (e.g. `valueString`, `valueQuantity`,
+/// `valueReference`), so every FHIR polymorphic variant is accepted rather
+/// than only the handful the patch handler used to special-case.
+fn extract_part_value(part: &Value) -> Option<Value> {
+    part.as_object()?.iter().find_map(|(k, v)| {
+        let suffix = k.strip_prefix("value")?;
+        suffix
+            .chars()
+            .next()?
+            .is_ascii_uppercase()
+            .then(|| v.clone())
+    })
+}
+
 #[async_trait]
 impl ResourceStorage for PostgresBackend {
     fn backend_name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
+        use crate::sof::postgres::PgInDbRunner;
+        Some(std::sync::Arc::new(PgInDbRunner::new(self.pool())))
     }
 
     async fn create(
@@ -2176,13 +2197,7 @@ impl PostgresBackend {
                             .map(|s| s.to_string());
                     }
                     Some("value") => {
-                        op_value = part
-                            .get("valueString")
-                            .or_else(|| part.get("valueBoolean"))
-                            .or_else(|| part.get("valueInteger"))
-                            .or_else(|| part.get("valueDecimal"))
-                            .or_else(|| part.get("valueCode"))
-                            .cloned();
+                        op_value = extract_part_value(part);
                     }
                     _ => {}
                 }

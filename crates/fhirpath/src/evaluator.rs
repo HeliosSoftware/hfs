@@ -4739,7 +4739,7 @@ fn call_function(
                     }
                     Ok(EvaluationResult::string(string_items.join(separator)))
                 }
-                EvaluationResult::Empty => Ok(EvaluationResult::string(String::new())), // {}.join(sep) -> ""
+                EvaluationResult::Empty => Ok(EvaluationResult::Empty), // {}.join(sep) -> {} per FHIRPath spec
                 EvaluationResult::String(s, _, _) => Ok(EvaluationResult::string(s.clone())), // Single string -> same string
                 _ => Err(EvaluationError::TypeError(
                     "join requires string items or a collection of strings".to_string(),
@@ -9023,59 +9023,28 @@ fn could_be_typed_polymorphic_field(
     obj: &HashMap<String, EvaluationResult>,
     context: &EvaluationContext,
 ) -> bool {
-    // Extract potential base name
     let base_name = extract_potential_polymorphic_base(field_name);
-
-    // If we couldn't extract a base name, it's not a typed polymorphic field
     if base_name == field_name {
         return false;
     }
 
-    // For strict mode checking, we need to determine if this is a polymorphic field
-    // by examining the object structure and metadata
-
-    // First, check if we have metadata about choice elements
-    // Look for the resourceType to get metadata
-    if let Some(EvaluationResult::String(_resource_type, _, _)) = obj.get("resourceType") {
-        // Try to get metadata for this resource type
-        // Since we can't directly access the metadata here, we need to use a different approach
-
-        // Check if the base name follows common polymorphic patterns
-        // Common polymorphic fields in FHIR include: value[x], effective[x], onset[x], etc.
-        // In strict mode, we want to be conservative and check if this could be polymorphic
-
-        // Look for evidence that this is a polymorphic field:
-        // 1. The field name has a camelCase pattern with type suffix
-        // 2. There might be other fields with the same base name
-        // 3. The base name is commonly known as polymorphic
-
-        // Check if there are other fields with the same base name
-        let has_other_variants = obj.keys().any(|key| {
-            key != field_name
-                && key.starts_with(&base_name)
-                && key.len() > base_name.len()
-                && key
-                    .chars()
-                    .nth(base_name.len())
-                    .is_some_and(|c| c.is_uppercase())
-        });
-
-        // If we find other variants, it's definitely polymorphic
-        if has_other_variants {
-            return true;
-        }
-
-        // Even without other variants present, check if this looks like a typed polymorphic field
-        // by examining if the suffix is a valid FHIR type using our type checking infrastructure
-        let suffix = &field_name[base_name.len()..];
-
-        // Use the new function to check if the suffix is a valid FHIR type
-        if crate::resource_type::is_valid_fhir_type_suffix(suffix, &context.fhir_version) {
-            return true;
-        }
+    // We need a parent FHIR type to answer authoritatively. If the object
+    // carries `resourceType`, use it; otherwise fall through to the
+    // suffix-validity heuristic so deeply-nested objects still get a useful
+    // answer (the original behavior was to silently return false for those
+    // — that's strictly worse than checking the suffix).
+    if let Some(EvaluationResult::String(resource_type, _, _)) = obj.get("resourceType")
+        && helios_fhir::get_field_type(context.fhir_version, resource_type, field_name).is_some()
+    {
+        return true;
     }
 
-    false
+    // Suffix-validity fallback: if the camelCase split yields a known FHIR
+    // type code as the suffix, treat the field as a typed polymorphic
+    // variant. This covers extension fields and any parent types that the
+    // FIELD_TYPES table doesn't reach from `resourceType` alone.
+    let suffix = &field_name[base_name.len()..];
+    crate::resource_type::is_valid_fhir_type_suffix(suffix, &context.fhir_version)
 }
 
 /// Extracts the potential base name from what might be a typed polymorphic field

@@ -152,6 +152,17 @@ impl SqliteBackend {
         } else {
             SqliteConnectionManager::file(path.as_ref())
         };
+        // Per-connection initialiser: register the in-DB SOF runner's helper
+        // UDFs (`fhir_last_segment`) so SQL emitted by the FHIRPath compiler
+        // can call them directly without dialect-specific shimming.
+        let manager = manager.with_init(|conn| {
+            crate::sof::sqlite_udfs::register(conn).map_err(|e| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(format!("failed to register SOF SQLite UDFs: {e}")),
+                )
+            })
+        });
 
         let pool = Pool::builder()
             .max_size(config.max_connections)
@@ -367,6 +378,11 @@ impl SqliteBackend {
         }
 
         Ok(count)
+    }
+
+    /// Returns a clone of the connection pool (cheap — pool is `Arc`-backed internally).
+    pub(crate) fn pool(&self) -> Pool<SqliteConnectionManager> {
+        self.pool.clone()
     }
 
     /// Get a connection from the pool.

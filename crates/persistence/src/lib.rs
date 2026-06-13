@@ -147,6 +147,7 @@ pub mod composite;
 pub mod core;
 pub mod error;
 pub mod search;
+pub mod sof;
 pub mod strategy;
 pub mod tenant;
 pub mod types;

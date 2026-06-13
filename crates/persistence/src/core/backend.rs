@@ -106,6 +106,10 @@ pub enum BackendCapability {
     SchemaPerTenant,
     /// Database-per-tenant multitenancy.
     DatabasePerTenant,
+    /// Backend can compile ViewDefinitions to SQL and run them in-DB (no in-process FHIRPath eval).
+    InDbSofRunner,
+    /// Backend supports raw SQL queries via `$sql-query-run` (Postgres, SQLite only).
+    RawSqlQuery,
 }
 
 impl std::fmt::Display for BackendCapability {
@@ -137,6 +141,8 @@ impl std::fmt::Display for BackendCapability {
             BackendCapability::SharedSchema => "shared-schema",
             BackendCapability::SchemaPerTenant => "schema-per-tenant",
             BackendCapability::DatabasePerTenant => "database-per-tenant",
+            BackendCapability::InDbSofRunner => "indb-sof-runner",
+            BackendCapability::RawSqlQuery => "raw-sql-query",
         };
         write!(f, "{}", name)
     }

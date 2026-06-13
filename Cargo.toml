@@ -2,6 +2,10 @@
 members = [
 	"crates/*",
 ]
+exclude = [
+	# crates/hts contains planning docs but no Cargo.toml yet (HTS feature branch)
+	"crates/hts",
+]
 # Build all Rust crates by default, but skip pysof unless explicitly requested.
 # This keeps `cargo build` working on machines without Python while still
 # making `crates/pysof` an actual workspace member for maturin.
@@ -34,7 +38,7 @@ repository = "https://github.com/HeliosSoftware/hfs"
 rust-version = "1.90"
 
 [workspace.dependencies]
-serde = { version = "=1.0.220", features = ["derive"] }
-serde_json = "=1.0.143"
+serde = { version = "=1.0.221", features = ["derive"] }
+serde_json = "=1.0.144"
 helios-fhir = { path = "crates/fhir" }
 chrono = { version = "0.4", features = ["serde"] }
