@@ -585,6 +585,48 @@ curl -X POST http://localhost:8090/CodeSystem/\$validate-code \
   }'
 ```
 
+#### Display validation
+
+When a `display` is supplied it is validated against the concept's display
+**and its designations**, honouring `displayLanguage` with the same
+BCP-47-aware matching used by `$lookup` (see [SNOMED CT](#snomed-ct) above). A
+designation counts as a valid display when it has no `use` (the default
+display), carries the FHIR `display` use, or is a terminology-native
+description type — notably SNOMED CT synonyms/FSNs, whose designation
+`use.system` is `http://snomed.info/sct`. So a request with
+`displayLanguage=de` and the matching German SNOMED term validates `true` and
+echoes that term back as `display`. Designations whose `use` marks them as an
+alternative-purpose label (e.g. the FHIR designation-usage `consumer-name`)
+are not treated as displays.
+
+By default a display that matches none of these is an `error` and flips
+`result` to `false` (FHIR `invalid-display`). The `lenient-display-validation`
+boolean parameter downgrades that mismatch to a `warning` while keeping
+`result=true`:
+
+```bash
+curl -X POST http://localhost:8090/CodeSystem/\$validate-code \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [
+      {"name": "url",     "valueUri":    "http://loinc.org"},
+      {"name": "code",    "valueCode":   "718-7"},
+      {"name": "display", "valueString": "not the right display"},
+      {"name": "lenient-display-validation", "valueBoolean": true}
+    ]
+  }'
+```
+
+> **Provenance.** `lenient-display-validation` is defined in **FHIR R6**
+> (ballot) on
+> [`ValueSet/$validate-code`](https://build.fhir.org/valueset-operation-validate-code.html);
+> it is absent from the R4 and R5 operation definitions. HTS accepts it on
+> both `CodeSystem/$validate-code` and `ValueSet/$validate-code` regardless of
+> the resources' FHIR version — an opt-in superset of the published
+> definitions. The default (parameter absent or `false`) is the spec-mandated
+> behaviour across all versions: an invalid display fails validation.
+
 ### Expand a ValueSet
 
 ```bash
