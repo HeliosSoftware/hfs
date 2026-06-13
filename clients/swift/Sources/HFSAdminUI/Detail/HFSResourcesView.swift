@@ -6,10 +6,16 @@ struct HFSResourcesView: View {
 
     @State private var selectedType: String?
     @State private var typeFilter = ""
+    @State private var parameters: [ResourceSearchParameter] = []
     @State private var items: [ResourceListItem] = []
+    @State private var total: Int?
+    @State private var nextURL: URL?
     @State private var isLoading = false
+    @State private var isLoadingMore = false
     @State private var errorMessage: String?
     @State private var selectedItem: ResourceListItem?
+
+    private let pageSize = 20
 
     var body: some View {
         Group {
@@ -39,9 +45,8 @@ struct HFSResourcesView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .task(id: selectedType) {
-            if let type = selectedType {
-                await load(type: type)
-            }
+            parameters = []
+            await runSearch()
         }
     }
 
@@ -79,6 +84,8 @@ struct HFSResourcesView: View {
             VStack(spacing: 0) {
                 resultsHeader(type: type)
                 Divider()
+                parametersEditor
+                Divider()
                 resultsContent(type: type)
             }
         } else {
@@ -95,7 +102,7 @@ struct HFSResourcesView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(type)
                     .font(.headline)
-                Text("\(items.count) loaded")
+                Text(countSummary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -103,11 +110,59 @@ struct HFSResourcesView: View {
             Spacer()
 
             Button {
-                Task { await load(type: type) }
+                Task { await runSearch() }
             } label: {
                 Label("Reload", systemImage: "arrow.clockwise")
             }
             .disabled(isLoading)
+        }
+        .padding(12)
+    }
+
+    private var countSummary: String {
+        if let total {
+            return "\(items.count) loaded of \(total)"
+        }
+        return "\(items.count) loaded"
+    }
+
+    private var parametersEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach($parameters) { $parameter in
+                HStack(spacing: 8) {
+                    TextField("parameter", text: $parameter.name)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 170)
+                    TextField("value", text: $parameter.value)
+                        .textFieldStyle(.roundedBorder)
+                    Button {
+                        parameters.removeAll { $0.id == parameter.id }
+                    } label: {
+                        Image(systemName: "minus.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                Button {
+                    parameters.append(ResourceSearchParameter())
+                } label: {
+                    Label("Add Parameter", systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+
+                Spacer()
+
+                Button {
+                    Task { await runSearch() }
+                } label: {
+                    Label("Search", systemImage: "magnifyingglass")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isLoading)
+            }
         }
         .padding(12)
     }
@@ -123,18 +178,44 @@ struct HFSResourcesView: View {
             } description: {
                 Text(errorMessage)
             } actions: {
-                Button("Retry") { Task { await load(type: type) } }
+                Button("Retry") { Task { await runSearch() } }
             }
         } else if items.isEmpty {
             ContentUnavailableView {
                 Label("No \(type) Resources", systemImage: "tray")
             } description: {
-                Text("The server returned no resources of this type.")
+                Text("No resources match the current search.")
             }
         } else {
-            List(selection: $selectedItem) {
-                ForEach(items) { item in
-                    resourceRow(item).tag(item)
+            VStack(spacing: 0) {
+                List(selection: $selectedItem) {
+                    ForEach(items) { item in
+                        resourceRow(item).tag(item)
+                    }
+                }
+
+                if nextURL != nil {
+                    Divider()
+                    HStack(spacing: 8) {
+                        Button {
+                            Task { await loadMore() }
+                        } label: {
+                            HStack(spacing: 6) {
+                                if isLoadingMore {
+                                    ProgressView().controlSize(.small)
+                                }
+                                Text(isLoadingMore ? "Loading…" : "Load \(pageSize) more")
+                            }
+                        }
+                        .disabled(isLoadingMore)
+
+                        Spacer()
+
+                        Text("\(items.count) loaded")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
                 }
             }
         }
@@ -186,17 +267,49 @@ struct HFSResourcesView: View {
 
     // MARK: - Loading
 
-    private func load(type: String) async {
-        guard let operations = model.resourceOperations() else { return }
+    private func runSearch() async {
+        guard let type = selectedType, let operations = model.resourceOperations() else { return }
         isLoading = true
         errorMessage = nil
         selectedItem = nil
+        items = []
+        total = nil
+        nextURL = nil
         defer { isLoading = false }
 
         do {
-            items = try await operations.search(resourceType: type, count: 20)
+            let page = try await operations.search(
+                resourceType: type,
+                parameters: parameters,
+                count: pageSize
+            )
+            items = page.items
+            total = page.total
+            nextURL = page.nextURL
         } catch {
-            items = []
+            errorMessage = HFSAppModel.describe(error)
+        }
+    }
+
+    private func loadMore() async {
+        guard
+            let url = nextURL,
+            let type = selectedType,
+            let operations = model.resourceOperations(),
+            !isLoadingMore
+        else { return }
+
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+
+        do {
+            let page = try await operations.searchPage(url: url, fallbackType: type)
+            items.append(contentsOf: page.items)
+            nextURL = page.nextURL
+            if let pageTotal = page.total {
+                total = pageTotal
+            }
+        } catch {
             errorMessage = HFSAppModel.describe(error)
         }
     }
