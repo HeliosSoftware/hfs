@@ -44,6 +44,49 @@ pub(crate) type BoolMap = HashMap<String, bool>;
 pub(crate) type LookupResponseMap = HashMap<String, Arc<LookupResponse>>;
 pub(crate) type ValidateCodeResponseMap = HashMap<String, Arc<ValidateCodeResponse>>;
 
+/// Insert `(key, value)` into a bounded cache, evicting one existing entry when
+/// the map is already at `max` capacity.
+///
+/// The response and concept-flag caches are read under a shared (`read`) lock
+/// on the `$lookup` / `$validate-code` hot paths, so we deliberately do **not**
+/// track per-entry recency: true LRU would require taking a write lock on every
+/// read to bump a recency counter, serializing the very lookups the cache
+/// exists to speed up. Instead, when the map is full we evict a single
+/// arbitrary entry (std `HashMap` iteration order is randomized per process, so
+/// this is effectively random replacement) and admit the new key.
+///
+/// This replaces the previous "insert only while `len < max`" policy, which
+/// *froze* each cache once it filled: the first `max` distinct keys held their
+/// slots permanently and every later key missed forever, making the cache
+/// useless for any working set larger than `max` (e.g. diverse-code `$lookup`
+/// traffic against a 600 K-concept SNOMED system). Random replacement keeps the
+/// same memory ceiling while letting hot keys re-enter the cache.
+pub(crate) fn bounded_cache_insert<K, V, S>(
+    map: &mut HashMap<K, V, S>,
+    key: K,
+    value: V,
+    max: usize,
+) where
+    K: std::hash::Hash + Eq + Clone,
+    S: std::hash::BuildHasher,
+{
+    if max == 0 {
+        return;
+    }
+    // Only evict when inserting a genuinely new key would exceed the bound;
+    // overwriting an existing key does not grow the map.
+    if map.len() >= max && !map.contains_key(&key) {
+        // Clone one key to end the immutable borrow before removing. The keys
+        // here are small (`String` / `(String, String)`) and this only runs on
+        // a cache miss, so the clone is negligible next to the SQLite work that
+        // produced `value`.
+        if let Some(evict) = map.keys().next().cloned() {
+            map.remove(&evict);
+        }
+    }
+    map.insert(key, value);
+}
+
 /// Shared in-memory index for text-filtered implicit ValueSet expansions.
 ///
 /// Keyed by the implicit ValueSet URL.  Values are the combined entry list
@@ -786,6 +829,44 @@ mod tests {
     #[test]
     fn supports_subsumption_is_true() {
         assert!(backend().supports_subsumption());
+    }
+
+    #[test]
+    fn bounded_cache_insert_evicts_instead_of_freezing() {
+        // The pre-fix policy froze the cache once full: keys beyond `max` were
+        // never admitted. With eviction, the map stays at `max` but always
+        // admits the newest key (the regression we are guarding against).
+        let mut map: HashMap<i32, i32> = HashMap::new();
+        let max = 3;
+        for i in 0..100 {
+            bounded_cache_insert(&mut map, i, i * 10, max);
+            assert!(map.len() <= max, "cache must never exceed its bound");
+            // The just-inserted key is always present (random replacement only
+            // evicts a *different*, pre-existing entry to make room).
+            assert_eq!(map.get(&i), Some(&(i * 10)), "newest key must be admitted");
+        }
+        assert_eq!(map.len(), max, "a saturated cache stays at its bound");
+    }
+
+    #[test]
+    fn bounded_cache_insert_overwrite_does_not_evict() {
+        // Re-inserting an existing key updates in place without evicting, so a
+        // full cache of distinct keys is preserved on a refresh.
+        let mut map: HashMap<&str, i32> = HashMap::new();
+        let max = 2;
+        bounded_cache_insert(&mut map, "a", 1, max);
+        bounded_cache_insert(&mut map, "b", 2, max);
+        bounded_cache_insert(&mut map, "a", 99, max); // overwrite, not grow
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("a"), Some(&99));
+        assert_eq!(map.get("b"), Some(&2));
+    }
+
+    #[test]
+    fn bounded_cache_insert_zero_max_is_noop() {
+        let mut map: HashMap<i32, i32> = HashMap::new();
+        bounded_cache_insert(&mut map, 1, 1, 0);
+        assert!(map.is_empty(), "max=0 must never store anything");
     }
 
     #[test]
