@@ -1975,9 +1975,12 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             if let Some(k) = cache_key_owned {
                 let arc = std::sync::Arc::new(response.clone());
                 if let Ok(mut w) = validate_cache.write() {
-                    if w.len() < super::code_system::validate_code_response_cache_max() {
-                        w.insert(k, arc);
-                    }
+                    super::bounded_cache_insert(
+                        &mut *w,
+                        k,
+                        arc,
+                        super::code_system::validate_code_response_cache_max(),
+                    );
                 }
             }
             Ok(response)
@@ -6151,9 +6154,12 @@ fn is_concept_abstract(
     let result = conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok();
 
     if let Ok(mut w) = cache.write() {
-        if w.len() < super::code_system::concept_flag_cache_max() {
-            w.insert((system_url.to_string(), code.to_string()), result);
-        }
+        super::bounded_cache_insert(
+            &mut *w,
+            (system_url.to_string(), code.to_string()),
+            result,
+            super::code_system::concept_flag_cache_max(),
+        );
     }
     result
 }
@@ -6947,9 +6953,12 @@ fn is_concept_inactive(
     let result = conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok();
 
     if let Ok(mut w) = cache.write() {
-        if w.len() < super::code_system::concept_flag_cache_max() {
-            w.insert((system_url.to_string(), code.to_string()), result);
-        }
+        super::bounded_cache_insert(
+            &mut *w,
+            (system_url.to_string(), code.to_string()),
+            result,
+            super::code_system::concept_flag_cache_max(),
+        );
     }
     result
 }

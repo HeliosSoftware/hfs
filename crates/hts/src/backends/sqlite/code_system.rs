@@ -384,9 +384,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             if let Some(k) = cache_key_owned {
                 let arc = std::sync::Arc::new(response.clone());
                 if let Ok(mut w) = lookup_cache.write() {
-                    if w.len() < lookup_response_cache_max() {
-                        w.insert(k, arc);
-                    }
+                    super::bounded_cache_insert(&mut *w, k, arc, lookup_response_cache_max());
                 }
             }
             Ok(response)

@@ -414,6 +414,12 @@ concept_map_mappings  - source→target code mappings with equivalence
 
 The `value_set_expansions` table acts as a write-through cache: the first `$expand` call for a given ValueSet computes and stores the expansion; subsequent calls read from the cache directly. The cache is invalidated automatically when a CodeSystem or ValueSet is updated via PUT or DELETE.
 
+#### Indexing and caching
+
+Per-concept reads on the hot operation paths (`$lookup`, `$validate-code`, `$expand`) are served by dedicated indexes rather than table scans. Concept resolution uses the `UNIQUE(system_id, code)` index on `concepts` (so a separate explicit index on the same columns would be redundant), while properties and designations are keyed by `concept_id` — `concept_properties(concept_id, …)` and `concept_designations(concept_id)`. The transitive `concept_closure` table makes `$subsumes` and `is-a` filters O(1) index seeks instead of recursive traversals.
+
+On top of the SQL layer, the SQLite backend keeps small bounded in-memory caches of assembled `$lookup` / `$validate-code` responses and per-concept status flags, keyed on the full request. When a cache reaches its bound it evicts an existing entry (random replacement) and admits the new one, so a working set larger than the bound — e.g. diverse-code `$lookup` traffic against a 600 K-concept SNOMED system — keeps hot codes cached rather than freezing the cache at capacity and locking out every later code. Reads take a shared lock and never block each other; recency is deliberately not tracked, since bumping it on every read would require an exclusive lock and serialize lookups. Caches are flushed when the underlying data changes (import, PUT, DELETE).
+
 ### PostgreSQL
 
 PostgreSQL backend support is planned for a future release. The schema, query patterns, and persistence trait surface have been designed with multi-backend portability in mind, and the integration is being staged behind feature work tracked separately. Until it lands, all production deployments should use the SQLite backend documented above.
