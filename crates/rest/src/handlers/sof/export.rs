@@ -12,10 +12,10 @@
 //! | `/export/{job-id}/status` | DELETE | Cancel job |
 //! | `/export/{job-id}/{filename}` | GET | Download output file |
 //!
-//! Both operations share the status/cancel/download flow and the output
-//! format set (`ndjson` default, `csv`, `json`, `parquet`, `fhir` — the
-//! latter producing newline-delimited `Parameters` files served as
-//! `application/fhir+ndjson`).
+//! Both operations share the status/cancel/download flow and the export
+//! output format set (`ndjson` default, `csv`, `json`, `parquet`). The `fhir`
+//! format is intentionally not offered here: per the spec's Common Operation
+//! Behavior it applies to the synchronous run operations only.
 //!
 //! ## Submit response (202)
 //!
@@ -31,7 +31,7 @@
 //!
 //! - `202 Accepted` + `X-Progress: running` while the job is running
 //! - `200 OK` with the completion manifest `Parameters` resource in the body
-//!   when complete (per the FHIR Asynchronous Interaction Request Pattern —
+//!   when complete (per the FHIR Asynchronous Bulk Data Request Pattern —
 //!   there is no `303 See Other` redirect and no separate result URL)
 //! - `500 Internal Server Error` + `OperationOutcome` if the job failed
 //! - `404 Not Found` if the job ID is unknown or was cancelled
@@ -75,13 +75,15 @@ const ALLOWED_BODY_PARAMS: &[&str] = &[
     "source",
 ];
 
-/// Output formats this server can serialize. The spec binds `_format` to
-/// the extensible `OutputFormatCodes` value set; we reject anything outside
-/// this list with 400 per the spec's "reject unsupported parameters" rule
-/// rather than silently downgrading the output to NDJSON. `fhir` exports
-/// each output as a file of newline-delimited `Parameters` resources
-/// (`application/fhir+ndjson`) per the spec's Common Operation Behavior.
-const SUPPORTED_FORMATS: &[&str] = &["ndjson", "csv", "json", "parquet", "fhir"];
+/// Output formats this server can serialize. The spec binds the export
+/// `_format` to the extensible `ExportOutputFormatCodes` value set
+/// (`csv`, `ndjson`, `parquet`, `json`); we reject anything outside this list
+/// with 400 per the spec's "reject unsupported parameters" rule rather than
+/// silently downgrading the output to NDJSON. `fhir` is deliberately absent:
+/// per the spec's Common Operation Behavior it applies to the synchronous run
+/// operations only, since a newline-delimited `Parameters` file has no
+/// established media type or consumer.
+const SUPPORTED_FORMATS: &[&str] = &["ndjson", "csv", "json", "parquet"];
 
 /// Query parameters for `$viewdefinition-export`.
 ///
@@ -92,7 +94,8 @@ const SUPPORTED_FORMATS: &[&str] = &["ndjson", "csv", "json", "parquet", "fhir"]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportQueryParams {
-    /// Output format: `ndjson` (default), `csv`, `json`, or `parquet`.
+    /// Output format: `ndjson` (default), `csv`, `json`, or `parquet`
+    /// (`ExportOutputFormatCodes`; `fhir` is a run-operation-only format).
     #[serde(rename = "_format")]
     pub format: Option<String>,
 
@@ -1291,15 +1294,10 @@ where
             .into_response()),
         Some(data) => {
             // Determine Content-Type from extension (G3: include Parquet).
-            // `.fhir.ndjson` (newline-delimited Parameters resources from
-            // `_format=fhir`) must be checked before the plain ndjson
-            // fallthrough.
             let content_type = if filename.ends_with(".csv") {
                 "text/csv; charset=utf-8"
             } else if filename.ends_with(".parquet") {
                 "application/vnd.apache.parquet"
-            } else if filename.ends_with(".fhir.ndjson") {
-                "application/fhir+ndjson"
             } else if filename.ends_with(".json") {
                 // `_format=json` shards hold a single JSON array of rows.
                 "application/json"

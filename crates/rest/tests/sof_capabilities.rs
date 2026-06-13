@@ -194,6 +194,24 @@ mod sof_capability_tests {
             strength, "extensible",
             "binding strength must be `extensible` per spec"
         );
+
+        // Per spec PR #365, the export operations bind to a separate
+        // ExportOutputFormatCodes value set (no `fhir`). The capability
+        // response declares this second binding alongside the run binding.
+        let has_export_binding = params
+            .iter()
+            .filter(|p| p["name"] == "formatBinding")
+            .filter_map(|b| b["part"].as_array())
+            .flat_map(|parts| parts.iter())
+            .filter(|p| p["name"] == "valueSet")
+            .any(|p| {
+                p["valueUri"].as_str()
+                    == Some("https://sql-on-fhir.org/ig/ValueSet/ExportOutputFormatCodes")
+            });
+        assert!(
+            has_export_binding,
+            "capability must declare the ExportOutputFormatCodes binding for the export operations"
+        );
     }
 
     // =========================================================================

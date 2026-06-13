@@ -1824,17 +1824,18 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 31. `_format=fhir` on $viewdefinition-export: each output file holds
-    //     newline-delimited Parameters resources, served as
-    //     application/fhir+ndjson (spec PR #365 Common Operation Behavior).
+    // 31. `_format=fhir` is rejected on $viewdefinition-export with 400. Per
+    //     spec PR #365 (commit 8c21fc4), `fhir` applies to the synchronous run
+    //     operations only; the export `_format` binds to ExportOutputFormatCodes
+    //     (csv, ndjson, parquet, json), since a newline-delimited Parameters
+    //     file has no established media type or consumer.
     // =========================================================================
 
     #[tokio::test]
-    async fn test_export_fhir_format() {
+    async fn test_export_fhir_format_rejected() {
         let (server, backend) = create_test_server_with_export().await;
         seed_patients(&backend).await;
 
-        // Typed columns so the Parameters parts carry the right value[x].
         let view = json!({
             "resourceType": "ViewDefinition",
             "resource": "Patient",
@@ -1855,73 +1856,21 @@ mod sof_export_tests {
             .await;
         assert_eq!(
             submit_resp.status_code(),
-            StatusCode::ACCEPTED,
-            "{}",
+            StatusCode::BAD_REQUEST,
+            "fhir is a run-operation-only format; export must reject it: {}",
             submit_resp.text()
         );
-        let location = submit_resp
-            .headers()
-            .get("content-location")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
-        let params = manifest["parameter"].as_array().unwrap();
-        // Manifest echoes the requested format.
-        let fmt = params
-            .iter()
-            .find(|p| p["name"].as_str() == Some("_format"))
-            .and_then(|p| p["valueCode"].as_str());
-        assert_eq!(fmt, Some("fhir"));
-
-        let file_url = params
-            .iter()
-            .filter(|p| p["name"].as_str() == Some("output"))
-            .flat_map(|p| p["part"].as_array().unwrap().iter())
-            .find(|part| part["name"].as_str() == Some("location"))
-            .and_then(|part| part["valueUri"].as_str())
-            .expect("manifest must carry a download location")
-            .to_string();
+        let body: Value = submit_resp.json();
+        assert_eq!(body["resourceType"], json!("OperationOutcome"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
         assert!(
-            file_url.ends_with(".fhir.ndjson"),
-            "fhir export files use the .fhir.ndjson extension: {file_url}"
+            diag.contains("fhir") && diag.contains("parquet"),
+            "diagnostics should report the unsupported value and the supported set: {diag}"
         );
-
-        let path = file_url.strip_prefix("http://localhost").unwrap();
-        let download = server
-            .get(path)
-            .add_header(X_TENANT_ID, "test-tenant")
-            .await;
-        assert_eq!(download.status_code(), StatusCode::OK);
-        let ct = download
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert_eq!(
-            ct, "application/fhir+ndjson",
-            "fhir export files are served as application/fhir+ndjson"
+        assert!(
+            !diag.contains("supported: ndjson, csv, json, parquet, fhir"),
+            "the supported-format list must no longer advertise fhir: {diag}"
         );
-
-        let body = download.text();
-        let lines: Vec<Value> = body
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("each line must be valid JSON"))
-            .collect();
-        assert_eq!(lines.len(), 2, "one Parameters per row: {body}");
-        for line in &lines {
-            assert_eq!(line["resourceType"], json!("Parameters"));
-            let parts = line["parameter"].as_array().unwrap();
-            assert!(
-                parts
-                    .iter()
-                    .any(|p| p["name"] == json!("family") && p["valueString"].is_string()),
-                "row must carry a typed family parameter: {line}"
-            );
-        }
     }
 
     // =========================================================================
@@ -2065,7 +2014,9 @@ mod sof_export_tests {
     }
 
     #[tokio::test]
-    async fn test_sqlquery_export_fhir_format() {
+    async fn test_sqlquery_export_fhir_format_rejected() {
+        // Per spec PR #365 (commit 8c21fc4), `fhir` is a run-operation-only
+        // format; $sqlquery-export must reject it with 400.
         let (server, backend) = create_test_server_with_export().await;
         seed_patients(&backend).await;
         let vd_ref = seed_patient_flat_view(&backend).await;
@@ -2085,70 +2036,17 @@ mod sof_export_tests {
             .await;
         assert_eq!(
             submit_resp.status_code(),
-            StatusCode::ACCEPTED,
-            "{}",
+            StatusCode::BAD_REQUEST,
+            "fhir is a run-operation-only format; $sqlquery-export must reject it: {}",
             submit_resp.text()
         );
-        let location = submit_resp
-            .headers()
-            .get("content-location")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        let manifest = poll_to_manifest(&server, &location, "test-tenant").await;
-        let params = manifest["parameter"].as_array().unwrap();
-        // No `name` part supplied → falls back to Library.name.
-        let out_name = params
-            .iter()
-            .filter(|p| p["name"].as_str() == Some("output"))
-            .flat_map(|p| p["part"].as_array().unwrap().iter())
-            .find(|p| p["name"].as_str() == Some("name"))
-            .and_then(|p| p["valueString"].as_str());
-        assert_eq!(out_name, Some("PatientFamilies"));
-
-        let file_url = params
-            .iter()
-            .filter(|p| p["name"].as_str() == Some("output"))
-            .flat_map(|p| p["part"].as_array().unwrap().iter())
-            .find(|p| p["name"].as_str() == Some("location"))
-            .and_then(|p| p["valueUri"].as_str())
-            .unwrap()
-            .to_string();
-        assert!(file_url.ends_with(".fhir.ndjson"), "{file_url}");
-
-        let path = file_url.strip_prefix("http://localhost").unwrap();
-        let download = server
-            .get(path)
-            .add_header(X_TENANT_ID, "test-tenant")
-            .await;
-        assert_eq!(download.status_code(), StatusCode::OK);
-        let ct = download
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert_eq!(ct, "application/fhir+ndjson");
-
-        let lines: Vec<Value> = download
-            .text()
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        assert_eq!(lines.len(), 2);
-        for line in &lines {
-            assert_eq!(line["resourceType"], json!("Parameters"));
-            let parts = line["parameter"].as_array().unwrap();
-            // `active` came from a boolean-typed VD column → valueBoolean.
-            assert!(
-                parts
-                    .iter()
-                    .any(|p| p["name"] == json!("active") && p["valueBoolean"] == json!(true)),
-                "active must be a typed boolean parameter: {line}"
-            );
-        }
+        let out: Value = submit_resp.json();
+        assert_eq!(out["resourceType"], json!("OperationOutcome"));
+        let diag = out["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("fhir") && diag.contains("parquet"),
+            "diagnostics should report the unsupported value and the supported set: {diag}"
+        );
     }
 
     #[tokio::test]

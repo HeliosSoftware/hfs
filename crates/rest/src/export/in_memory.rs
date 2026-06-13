@@ -11,7 +11,6 @@
 //!   the (pre-validated) SQL is executed, and the result rows are sharded
 //!   into output files.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -224,16 +223,12 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
 // Job execution
 // ============================================================================
 
-/// File extension (without leading dot) for an output format. `fhir` export
-/// files carry newline-delimited `Parameters` resources
-/// (`application/fhir+ndjson`), distinguished from plain ndjson by the
-/// compound `.fhir.ndjson` extension.
+/// File extension (without leading dot) for an output format.
 fn ext_for(format: &str) -> &'static str {
     match format {
         "csv" => "csv",
         "parquet" => "parquet",
         "json" => "json",
-        "fhir" => "fhir.ndjson",
         _ => "ndjson",
     }
 }
@@ -325,7 +320,7 @@ async fn run_views_job<Sink: ExportSink>(
             let shard_slice = &rows[range];
             let row_count = shard_slice.len();
 
-            let data = format_rows(shard_slice, &format, task.header, &named.view)
+            let data = format_rows(shard_slice, &format, task.header)
                 .map_err(|e| format!("view '{}': {e}", named.name))?;
 
             // Shard files are numbered by a running index across the whole
@@ -406,9 +401,8 @@ async fn run_sqlquery_job<Sink: ExportSink>(
 
 /// Materializes a query's table sources and executes its SQL, enforcing the
 /// same row caps and timeout as the synchronous `$sqlquery-run` operation.
-/// Output column types are refined from the table sources' ViewDefinition
-/// schemas (mirroring the run handler) so `_format=fhir` exports carry the
-/// right `value[x]` choices.
+/// The export operations emit flat formats only (csv/ndjson/parquet/json), so
+/// the result's JSON cell values feed `format_output` directly.
 async fn execute_sql_query(
     runner: &Arc<dyn SofRunner>,
     task: &ExportTask,
@@ -461,7 +455,7 @@ async fn execute_sql_query(
         tokio::task::spawn_blocking(move || engine.execute_select(&sql, &bindings, max_rows)).await;
     watchdog.abort();
 
-    let mut result = match exec_result {
+    let result = match exec_result {
         Ok(Ok(r)) => r,
         Ok(Err(e)) if e.to_string().contains("interrupted") => {
             return Err(ExportError::Runner(format!(
@@ -476,22 +470,6 @@ async fn execute_sql_query(
         }
     };
 
-    // Refine output column types: when a result column name matches a column
-    // materialized from a table source, prefer the VD-declared FHIR type.
-    let mut name_to_type: HashMap<String, helios_sof::sqlquery::ColumnFhirType> = HashMap::new();
-    for schema in &schemas {
-        for col in &schema.columns {
-            name_to_type
-                .entry(col.name.clone())
-                .or_insert_with(|| col.fhir_type.clone());
-        }
-    }
-    for (i, col) in result.columns.iter().enumerate() {
-        if let Some(t) = name_to_type.get(col) {
-            result.column_types[i] = t.clone();
-        }
-    }
-
     Ok(result)
 }
 
@@ -500,26 +478,23 @@ async fn execute_sql_query(
 // ============================================================================
 
 /// Serializes a shard of view-output rows (column → value JSON objects).
-/// `view_json` supplies the declared column types for `_format=fhir`.
 fn format_rows(
     rows: &[serde_json::Value],
     format: &str,
     include_csv_header: bool,
-    view_json: &serde_json::Value,
 ) -> Result<Vec<u8>, ExportError> {
     match format {
         "csv" => format_csv(rows, include_csv_header),
         "parquet" => format_parquet(rows),
         "json" => format_json_array(rows),
-        "fhir" => helios_sof::fhir_format::format_view_fhir_ndjson(rows, view_json)
-            .map_err(|e| ExportError::Serialization(e.to_string())),
         _ => format_ndjson(rows),
     }
 }
 
-/// Serializes a shard of SQL query result rows. The flat formats go through
-/// `helios_sof::format_output` (matching the `$sqlquery-run` bytes); `fhir`
-/// emits newline-delimited typed `Parameters` resources.
+/// Serializes a shard of SQL query result rows through
+/// `helios_sof::format_output` (matching the `$sqlquery-run` bytes). The
+/// export operations support flat formats only; `fhir` is a run-operation
+/// format and is rejected at kick-off.
 fn format_query_rows(
     result: &QueryResult,
     range: std::ops::Range<usize>,
@@ -527,39 +502,29 @@ fn format_query_rows(
     include_csv_header: bool,
 ) -> Result<Vec<u8>, ExportError> {
     let rows = &result.rows[range];
-    match format {
-        "fhir" => helios_sof::sqlquery::format_fhir_ndjson_rows(
-            &result.columns,
-            &result.column_types,
-            rows,
-        )
-        .map_err(|e| ExportError::Serialization(e.to_string())),
-        _ => {
-            let ct = match format {
-                "csv" => {
-                    if include_csv_header {
-                        helios_sof::ContentType::CsvWithHeader
-                    } else {
-                        helios_sof::ContentType::Csv
-                    }
-                }
-                "json" => helios_sof::ContentType::Json,
-                "parquet" => helios_sof::ContentType::Parquet,
-                _ => helios_sof::ContentType::NdJson,
-            };
-            // Build a ProcessedResult directly so columns keep their SQL
-            // order (mirrors the `$sqlquery-run` handler).
-            let processed = helios_sof::ProcessedResult {
-                columns: result.columns.clone(),
-                rows: rows
-                    .iter()
-                    .map(|r| helios_sof::ProcessedRow { values: r.clone() })
-                    .collect(),
-            };
-            helios_sof::format_output(processed, ct, None)
-                .map_err(|e| ExportError::Serialization(e.to_string()))
+    let ct = match format {
+        "csv" => {
+            if include_csv_header {
+                helios_sof::ContentType::CsvWithHeader
+            } else {
+                helios_sof::ContentType::Csv
+            }
         }
-    }
+        "json" => helios_sof::ContentType::Json,
+        "parquet" => helios_sof::ContentType::Parquet,
+        _ => helios_sof::ContentType::NdJson,
+    };
+    // Build a ProcessedResult directly so columns keep their SQL order
+    // (mirrors the `$sqlquery-run` handler).
+    let processed = helios_sof::ProcessedResult {
+        columns: result.columns.clone(),
+        rows: rows
+            .iter()
+            .map(|r| helios_sof::ProcessedRow { values: r.clone() })
+            .collect(),
+    };
+    helios_sof::format_output(processed, ct, None)
+        .map_err(|e| ExportError::Serialization(e.to_string()))
 }
 
 /// Serialises rows as a single JSON array (`_format=json`).

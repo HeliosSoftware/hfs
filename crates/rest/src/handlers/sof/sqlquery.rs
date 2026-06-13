@@ -15,14 +15,16 @@
 //!
 //! ## Output shape for flat formats
 //!
-//! The spec declares the operation's `return` parameter as `Binary | Parameters`
-//! (1..1). By default, flat formats (csv/json/ndjson/parquet) are returned as
-//! raw payload bytes with the format's `Content-Type` — matching `$viewdefinition-run`
-//! and every other SoF reference implementation. Callers that want a strictly
-//! spec-shaped response can ask for the `Binary` wrapper by setting
-//! `Accept: application/fhir+json`; in that case the bytes are base64-encoded
-//! into `Binary.data` and the response is a FHIR `Binary` resource.
-//! `_format=fhir` always returns a `Parameters` resource as specified.
+//! The spec declares the operation's `return` parameter as `Binary` (1..1):
+//! a raw binary stream in the format's native media type, *not* a serialized
+//! `Binary` resource envelope (spec PR #365, commit `86c178b`; same shape as
+//! `$viewdefinition-run`). When `_format=fhir` is requested the response is a
+//! `Parameters` resource instead — the documented exception to the `Binary`
+//! return. By default, flat formats (csv/json/ndjson/parquet) are returned as
+//! raw payload bytes with the format's `Content-Type`. Callers that want the
+//! serialized `Binary` envelope (base64 `data`) can request it by setting
+//! `Accept: application/fhir+json` on a *flat* `_format`; this envelope axis
+//! does not apply to `_format=fhir`, which always returns `Parameters`.
 //!
 //! ## Type fidelity under `_format=fhir`
 //!

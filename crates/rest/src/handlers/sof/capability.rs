@@ -87,8 +87,12 @@ where
         bool_param("supportsAbsoluteReference", true),
     ];
 
-    // Supported output formats (G2: includes parquet; fhir is supported by
-    // both $viewdefinition-run and $sqlquery-run).
+    // Supported output formats (G2: includes parquet). `fhir` is offered by
+    // the synchronous run operations only ($viewdefinition-run,
+    // $sqlquery-run); per spec PR #365 the export operations bind `_format`
+    // to ExportOutputFormatCodes (csv/ndjson/parquet/json) and reject `fhir`.
+    // The capability operation's `supportedFormat` is a single flat list, so
+    // `fhir` appears here because the server genuinely supports it.
     for fmt in ["ndjson", "json", "csv", "parquet", "fhir"] {
         params.push(json!({
             "name": "supportedFormat",
@@ -96,12 +100,12 @@ where
         }));
     }
 
-    // Audit item #13: explicit declaration of the spec's
-    // OutputFormatCodes value-set binding (extensible). The codes
-    // accepted above (ndjson/json/csv/parquet/fhir) are exactly the
-    // canonical CodeSystem codes; this entry lets audit tools
-    // discover the binding without having to follow the
-    // CapabilityStatement → OperationDefinition link.
+    // Audit item #13: explicit declaration of the spec's value-set bindings
+    // (extensible). The run operations bind `_format` to OutputFormatCodes
+    // (which includes `fhir`); the export operations bind to
+    // ExportOutputFormatCodes (csv/ndjson/parquet/json, no `fhir`) per spec
+    // PR #365. These entries let audit tools discover the bindings without
+    // following the CapabilityStatement → OperationDefinition link.
     params.push(json!({
         "name": "formatBinding",
         "part": [
@@ -109,7 +113,19 @@ where
                 "name": "valueSet",
                 "valueUri": "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes"
             },
-            {"name": "strength", "valueCode": "extensible"}
+            {"name": "strength", "valueCode": "extensible"},
+            {"name": "operationScope", "valueString": "run"}
+        ]
+    }));
+    params.push(json!({
+        "name": "formatBinding",
+        "part": [
+            {
+                "name": "valueSet",
+                "valueUri": "https://sql-on-fhir.org/ig/ValueSet/ExportOutputFormatCodes"
+            },
+            {"name": "strength", "valueCode": "extensible"},
+            {"name": "operationScope", "valueString": "export"}
         ]
     }));
 

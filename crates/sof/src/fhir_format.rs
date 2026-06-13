@@ -26,10 +26,6 @@ use crate::{ProcessedResult, SofError};
 /// Native media type of the `fhir` output format.
 pub const FHIR_JSON_MIME: &str = "application/fhir+json";
 
-/// Media type of `_format=fhir` export files: newline-delimited FHIR
-/// `Parameters` resources, one per result row.
-pub const FHIR_NDJSON_MIME: &str = "application/fhir+ndjson";
-
 /// The FHIR XML media type — recognised only to reject it explicitly.
 pub const FHIR_XML_MIME: &str = "application/fhir+xml";
 
@@ -134,66 +130,6 @@ pub fn format_view_fhir_parameters(
         json!({ "resourceType": "Parameters", "parameter": row_params })
     };
     serde_json::to_vec(&body).map_err(SofError::SerializationError)
-}
-
-/// Renders view-run output rows (column → value JSON objects, as produced by
-/// a `SofRunner` row stream) as newline-delimited FHIR `Parameters`
-/// resources — the export-side shape of `_format=fhir` per the SoF v2 spec's
-/// Common Operation Behavior (media type [`FHIR_NDJSON_MIME`]).
-///
-/// One `Parameters` resource per line, one line per result row; each row's
-/// non-NULL columns become top-level `parameter` entries carrying the
-/// appropriate `value[x]`, driven by the ViewDefinition's declared
-/// `column.type` (default `string`). Collection (array) cells repeat the
-/// parameter once per element. A row with no non-NULL columns emits a bare
-/// `{"resourceType":"Parameters"}` line.
-pub fn format_view_fhir_ndjson(rows: &[Value], view_json: &Value) -> Result<Vec<u8>, SofError> {
-    let schema = TableSchema::from_view_definition(view_json);
-    let type_for = |name: &str| -> ColumnFhirType {
-        schema
-            .columns
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| c.fhir_type.clone())
-            .unwrap_or_else(|| ColumnFhirType::String("string".into()))
-    };
-
-    let mut out = Vec::new();
-    for row in rows {
-        let Some(obj) = row.as_object() else {
-            return Err(SofError::InvalidViewDefinition(
-                "view output row is not a JSON object; cannot render as FHIR Parameters"
-                    .to_string(),
-            ));
-        };
-        let mut parts: Vec<Value> = Vec::with_capacity(obj.len());
-        for (name, value) in obj {
-            if value.is_null() {
-                continue; // NULL → omit
-            }
-            let ty = type_for(name);
-            match value {
-                Value::Array(items) => {
-                    for item in items {
-                        if item.is_null() {
-                            continue;
-                        }
-                        parts.push(part_or_sof_error(name, item, &ty)?);
-                    }
-                }
-                other => parts.push(part_or_sof_error(name, other, &ty)?),
-            }
-        }
-        let resource = if parts.is_empty() {
-            json!({ "resourceType": "Parameters" })
-        } else {
-            json!({ "resourceType": "Parameters", "parameter": parts })
-        };
-        let line = serde_json::to_vec(&resource).map_err(SofError::SerializationError)?;
-        out.extend_from_slice(&line);
-        out.push(b'\n');
-    }
-    Ok(out)
 }
 
 fn part_or_sof_error(name: &str, value: &Value, ty: &ColumnFhirType) -> Result<Value, SofError> {
@@ -323,51 +259,6 @@ mod tests {
             "application/fhir+xml, application/fhir+json"
         )));
         assert!(!accept_requires_unsupported_fhir_xml(Some("text/csv")));
-    }
-
-    #[test]
-    fn view_fhir_ndjson_one_parameters_per_row() {
-        let rows = vec![
-            json!({"id": "p1", "active": true, "given": ["John", "Quincy"]}),
-            json!({"id": "p2", "active": null}),
-        ];
-        let v = view(json!([
-            {"name": "id", "path": "id", "type": "id"},
-            {"name": "active", "path": "active", "type": "boolean"},
-            {"name": "given", "path": "name.given", "type": "string", "collection": true}
-        ]));
-        let bytes = format_view_fhir_ndjson(&rows, &v).unwrap();
-        let lines: Vec<Value> = String::from_utf8(bytes)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        assert_eq!(lines.len(), 2);
-        for line in &lines {
-            assert_eq!(line["resourceType"], json!("Parameters"));
-        }
-        let p1 = lines[0]["parameter"].as_array().unwrap();
-        assert!(
-            p1.iter()
-                .any(|p| p["name"] == json!("id") && p["valueId"] == json!("p1"))
-        );
-        assert!(
-            p1.iter()
-                .any(|p| p["name"] == json!("active") && p["valueBoolean"] == json!(true))
-        );
-        // collection column repeats the parameter per element
-        assert_eq!(p1.iter().filter(|p| p["name"] == json!("given")).count(), 2);
-        // NULL column omitted on row 2
-        let p2 = lines[1]["parameter"].as_array().unwrap();
-        assert_eq!(p2.len(), 1);
-        assert_eq!(p2[0]["name"], json!("id"));
-    }
-
-    #[test]
-    fn view_fhir_ndjson_empty_rows_yield_empty_output() {
-        let v = view(json!([{"name": "id", "path": "id", "type": "id"}]));
-        let bytes = format_view_fhir_ndjson(&[], &v).unwrap();
-        assert!(bytes.is_empty());
     }
 
     #[test]

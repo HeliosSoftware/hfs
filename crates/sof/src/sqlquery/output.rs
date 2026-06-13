@@ -135,50 +135,6 @@ fn coerce_instant(v: &Value) -> Value {
     }
 }
 
-/// Renders query-result rows as newline-delimited FHIR `Parameters`
-/// resources — the export-side shape of `_format=fhir` per the SoF v2 spec's
-/// Common Operation Behavior (media type `application/fhir+ndjson`).
-///
-/// One `Parameters` resource per line, one line per result row; each row's
-/// non-NULL columns become top-level `parameter` entries carrying the
-/// appropriate `value[X]` (the same part shape as a single synchronous `row`
-/// parameter's part list). NULL columns are omitted; a row with no non-NULL
-/// columns emits a bare `{"resourceType":"Parameters"}` line.
-pub fn format_fhir_ndjson_rows(
-    columns: &[String],
-    column_types: &[ColumnFhirType],
-    rows: &[Vec<Option<Value>>],
-) -> Result<Vec<u8>, SqlQueryError> {
-    let mut out = Vec::new();
-    for row in rows {
-        let mut parts: Vec<Value> = Vec::with_capacity(row.len());
-        for (i, cell) in row.iter().enumerate() {
-            let Some(value) = cell else {
-                continue; // NULL → omit
-            };
-            if value.is_null() {
-                continue;
-            }
-            let col_name = &columns[i];
-            let col_type = column_types
-                .get(i)
-                .cloned()
-                .unwrap_or(ColumnFhirType::String("string".into()));
-            parts.push(value_to_fhir_part(col_name, value, &col_type)?);
-        }
-        let resource = if parts.is_empty() {
-            json!({ "resourceType": "Parameters" })
-        } else {
-            json!({ "resourceType": "Parameters", "parameter": parts })
-        };
-        let line = serde_json::to_vec(&resource)
-            .map_err(|e| SqlQueryError::MalformedLibrary(e.to_string()))?;
-        out.extend_from_slice(&line);
-        out.push(b'\n');
-    }
-    Ok(out)
-}
-
 fn value_x_key_for(code: &str) -> &'static str {
     match code {
         "code" => "valueCode",
