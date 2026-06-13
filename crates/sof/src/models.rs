@@ -227,29 +227,51 @@ pub fn validate_query_params(
     })
 }
 
-/// Parse content type from Accept header and query parameters
+/// Parse content type from Accept header and query parameters.
+///
+/// Spec precedence (SoF v2 PR #353): `_format` (query or body) > `Accept`
+/// header. `_format` is `0..1` and defaults to `ndjson`. When `_format` is
+/// missing and `Accept` is absent or maps to no known format (e.g. `*/*`,
+/// `application/fhir+json`), this returns `ContentType::NdJson` rather than
+/// erroring — clients can omit both and get a usable default.
+///
+/// When `_format` IS supplied, its value is honored verbatim; an unsupported
+/// value surfaces as `UnsupportedContentType` (→ 400) so client typos still
+/// fail loudly.
 pub fn parse_content_type(
     accept_header: Option<&str>,
     format_param: Option<&str>,
     header_param: Option<bool>,
 ) -> Result<ContentType, helios_sof::SofError> {
-    // Query parameter takes precedence over Accept header
-    let content_type_str = format_param.or(accept_header).unwrap_or("application/json");
-
-    // Handle CSV header parameter
-    let content_type_str = if content_type_str == "text/csv" {
-        match header_param {
-            Some(false) => "text/csv;header=false",
-            Some(true) | None => "text/csv;header=true", // Default to true if not specified
+    let apply_csv_header = |s: &str| -> String {
+        if s == "text/csv" {
+            match header_param {
+                Some(false) => "text/csv;header=false".to_string(),
+                _ => "text/csv;header=true".to_string(),
+            }
+        } else {
+            s.to_string()
         }
-    } else {
-        content_type_str
     };
 
-    ContentType::from_string(content_type_str)
+    if let Some(fmt) = format_param {
+        return ContentType::from_string(&apply_csv_header(fmt));
+    }
+    if let Some(accept) = accept_header {
+        if let Ok(ct) = ContentType::from_string(&apply_csv_header(accept)) {
+            return Ok(ct);
+        }
+    }
+    Ok(ContentType::NdJson)
 }
 
-/// Result type for parameter extraction
+/// Result type for parameter extraction.
+///
+/// `patient` and `group` are `Vec<String>` to match the SoF v2 spec
+/// (`patient` is `0..1`, `group` is `0..*`) and the shared permissive
+/// extractor in [`helios_sof::params`]. The strict path used to keep
+/// only `Option<String>` here, which silently dropped earlier entries
+/// when callers supplied multiple `group` references.
 #[derive(Debug, Default)]
 pub struct ExtractedParameters {
     pub view_definition: Option<serde_json::Value>,
@@ -257,8 +279,8 @@ pub struct ExtractedParameters {
     pub format: Option<String>,
     pub header: Option<bool>,
     pub view_reference: Option<String>,
-    pub patient: Option<String>,
-    pub group: Option<String>,
+    pub patient: Vec<String>,
+    pub group: Vec<String>,
     pub source: Option<String>,
     pub limit: Option<u32>,
     pub since: Option<String>,
@@ -341,32 +363,34 @@ fn process_parameter(
             }
         }
         "patient" => {
-            // Check for valueReference first
+            // Spec: patient is 0..1, but the strict extractor accumulates
+            // for parity with the shared permissive extractor and to keep
+            // the cardinality faithful when callers repeat the entry.
             if let Some(value_ref) = param_json.get("valueReference") {
                 if let Some(reference) = value_ref.get("reference") {
                     if let Some(ref_str) = reference.as_str() {
-                        result.patient = Some(ref_str.to_string());
+                        result.patient.push(ref_str.to_string());
                     }
                 }
             } else if let Some(value_str) = param_json.get("valueString") {
                 if let Some(ref_str) = value_str.as_str() {
-                    result.patient = Some(ref_str.to_string());
+                    result.patient.push(ref_str.to_string());
                 }
             } else if has_any_value_field(&param_json) {
                 return Err("patient parameter must use valueReference or valueString".to_string());
             }
         }
         "group" => {
-            // Check for valueReference first
+            // Spec: group is 0..*. Accumulate every entry.
             if let Some(value_ref) = param_json.get("valueReference") {
                 if let Some(reference) = value_ref.get("reference") {
                     if let Some(ref_str) = reference.as_str() {
-                        result.group = Some(ref_str.to_string());
+                        result.group.push(ref_str.to_string());
                     }
                 }
             } else if let Some(value_str) = param_json.get("valueString") {
                 if let Some(ref_str) = value_str.as_str() {
-                    result.group = Some(ref_str.to_string());
+                    result.group.push(ref_str.to_string());
                 }
             } else if has_any_value_field(&param_json) {
                 return Err("group parameter must use valueReference or valueString".to_string());
@@ -575,7 +599,19 @@ fn process_parameter(
     Ok(())
 }
 
-/// Extract all parameters from a Parameters resource in a version-independent way
+/// Extract all parameters from a Parameters resource in a version-independent way.
+///
+/// Walks the typed FHIR `Parameters` resource and pulls each operation
+/// parameter into [`ExtractedParameters`]. Validation is interleaved with
+/// extraction here (e.g. `_limit` upper bound, RFC 3339 `_since`, `compression`
+/// allowed values, `header` boolean shape) — see [`process_parameter`].
+///
+/// **Relation to [`crate::params::extract_run_params_from_json`]**: the
+/// shared extractor in `helios-sof::params` performs the same field walk
+/// permissively (no validation). The REST handler uses it directly; this
+/// function keeps the stricter validation path for the standalone sof-server.
+/// A future refactor may fold the two together by lifting validation into a
+/// separate `validate_run_params` pass over the shared output.
 pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParameters, String> {
     let mut result = ExtractedParameters::default();
 
@@ -623,154 +659,17 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
     Ok(result)
 }
 
-/// Apply filtering to output data based on validated parameters
-///
-/// This function applies post-processing filters like pagination to the
-/// transformed output data. It handles different output formats appropriately.
-///
-/// # Arguments
-/// * `output_data` - Raw output bytes from ViewDefinition execution
-/// * `params` - Validated query parameters containing filtering options
-///
-/// # Returns
-/// * `Ok(Vec<u8>)` - Filtered output data
-/// * `Err(String)` - Error message if filtering fails
-///
-/// # Supported Filters
-/// * Count limiting - Applied using `_limit` parameter
-/// * Format-aware - Handles CSV headers correctly during pagination
-///
-/// # Note
-/// The `_since` parameter is validated but not applied here as it requires
-/// filtering at the resource level before transformation.
-pub fn apply_result_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    // Apply pagination and count limiting
-    // Note: _since filtering is applied at the resource level before ViewDefinition transformation
-
-    match params.format {
-        ContentType::Json | ContentType::NdJson => apply_json_filtering(output_data, params),
-        ContentType::Csv | ContentType::CsvWithHeader => apply_csv_filtering(output_data, params),
-        ContentType::Parquet => {
-            // Parquet filtering is not implemented in this scope
-            Ok(output_data)
-        }
-    }
-}
-
-/// Apply filtering to JSON/NDJSON output
-fn apply_json_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    let output_str =
-        String::from_utf8(output_data).map_err(|e| format!("Invalid UTF-8 in output: {}", e))?;
-
-    if params.limit.is_none() {
-        return Ok(output_str.into_bytes());
-    }
-
-    match params.format {
-        ContentType::Json => {
-            // Parse as JSON array and apply pagination
-            let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str)
-                .map_err(|e| format!("Invalid JSON output: {}", e))?;
-
-            apply_pagination_to_records(&mut records, params);
-
-            let filtered_json = serde_json::to_string(&records)
-                .map_err(|e| format!("Failed to serialize filtered JSON: {}", e))?;
-            Ok(filtered_json.into_bytes())
-        }
-        ContentType::NdJson => {
-            // Parse as NDJSON and apply pagination
-            let mut records = Vec::new();
-            for line in output_str.lines() {
-                if !line.trim().is_empty() {
-                    let record: serde_json::Value = serde_json::from_str(line)
-                        .map_err(|e| format!("Invalid NDJSON line: {}", e))?;
-                    records.push(record);
-                }
-            }
-
-            apply_pagination_to_records(&mut records, params);
-
-            let filtered_ndjson = records
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to serialize filtered NDJSON: {}", e))?
-                .join("\n");
-            Ok(filtered_ndjson.into_bytes())
-        }
-        _ => Ok(output_str.into_bytes()),
-    }
-}
-
-/// Apply filtering to CSV output
-fn apply_csv_filtering(
-    output_data: Vec<u8>,
-    params: &ValidatedRunParams,
-) -> Result<Vec<u8>, String> {
-    let output_str = String::from_utf8(output_data)
-        .map_err(|e| format!("Invalid UTF-8 in CSV output: {}", e))?;
-
-    if params.limit.is_none() {
-        return Ok(output_str.into_bytes());
-    }
-
-    let lines: Vec<&str> = output_str.lines().collect();
-    if lines.is_empty() {
-        return Ok(output_str.into_bytes());
-    }
-
-    // Check if we have headers based on the format
-    let has_header = matches!(params.format, ContentType::CsvWithHeader);
-    let header_offset = if has_header { 1 } else { 0 };
-
-    if lines.len() <= header_offset {
-        return Ok(output_str.into_bytes());
-    }
-
-    // Split into header and data lines
-    let (header_lines, data_lines) = if has_header {
-        (lines[0..1].to_vec(), lines[1..].to_vec())
-    } else {
-        (Vec::new(), lines)
-    };
-
-    // Apply pagination to data lines
-    let mut data_lines = data_lines;
-    apply_pagination_to_lines(&mut data_lines, params);
-
-    // Reconstruct CSV
-    let mut result_lines = header_lines;
-    result_lines.extend(data_lines);
-    let result = result_lines.join("\n");
-
-    // Add final newline if original had one
-    if output_str.ends_with('\n') && !result.ends_with('\n') {
-        Ok(format!("{}\n", result).into_bytes())
-    } else {
-        Ok(result.into_bytes())
-    }
-}
-
-/// Apply limit limiting to a vector of JSON records
-fn apply_pagination_to_records(records: &mut Vec<serde_json::Value>, params: &ValidatedRunParams) {
-    if let Some(limit) = params.limit {
-        records.truncate(limit);
-    }
-}
-
-/// Apply limit limiting to a vector of string lines
-fn apply_pagination_to_lines(lines: &mut Vec<&str>, params: &ValidatedRunParams) {
-    if let Some(limit) = params.limit {
-        lines.truncate(limit);
-    }
-}
+// Audit item #16: the previous `apply_result_filtering` /
+// `apply_json_filtering` / `apply_csv_filtering` /
+// `apply_pagination_to_records` / `apply_pagination_to_lines` helpers
+// re-parsed and re-truncated serialized output bytes even though
+// `helios_sof::run_view_definition_with_options` already applies
+// `_limit` at the structured-row level (via
+// `apply_pagination_to_result`) before serialization. The serialized-
+// byte pass was inefficient (re-parsed/re-serialized JSON every time),
+// CSV-fragile (line-splits assumed no embedded newlines in quoted
+// fields), and produced identical output to the row-level pass in
+// every case. All of it was removed.
 
 #[cfg(test)]
 mod tests {
@@ -885,57 +784,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_apply_csv_filtering() {
-        let csv_data = "id,name\n1,John\n2,Jane\n3,Bob\n4,Alice\n"
-            .as_bytes()
-            .to_vec();
-        let params = ValidatedRunParams {
-            format: ContentType::CsvWithHeader,
-            limit: Some(2),
-            since: None,
-            view_reference: None,
-            patient: None,
-            group: None,
-            source: None,
-            parquet_options: None,
-        };
-
-        let result = apply_csv_filtering(csv_data, &params).unwrap();
-        let result_str = String::from_utf8(result).unwrap();
-
-        assert!(result_str.contains("id,name"));
-        assert!(result_str.contains("1,John"));
-        assert!(result_str.contains("2,Jane"));
-        assert!(!result_str.contains("3,Bob"));
-        assert!(!result_str.contains("4,Alice"));
-    }
-
-    #[test]
-    fn test_apply_json_filtering() {
-        let json_data =
-            r#"[{"id":"1","name":"John"},{"id":"2","name":"Jane"},{"id":"3","name":"Bob"}]"#
-                .as_bytes()
-                .to_vec();
-        let params = ValidatedRunParams {
-            format: ContentType::Json,
-            limit: Some(2),
-            since: None,
-            view_reference: None,
-            patient: None,
-            group: None,
-            source: None,
-            parquet_options: None,
-        };
-
-        let result = apply_json_filtering(json_data, &params).unwrap();
-        let result_str = String::from_utf8(result).unwrap();
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result_str).unwrap();
-
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0]["id"], "1");
-        assert_eq!(parsed[1]["id"], "2");
-    }
+    // Audit item #16: `test_apply_csv_filtering` and
+    // `test_apply_json_filtering` were removed alongside the dead
+    // `apply_csv_filtering` / `apply_json_filtering` helpers. End-to-end
+    // `_limit` behavior is exercised by `test_run_view_definition_limit`
+    // (and equivalents) via the HTTP layer + the structured-row pass
+    // inside `helios_sof::run_view_definition_with_options`.
 
     #[test]
     fn test_extract_viewreference_parameter() {
@@ -980,7 +834,7 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
-            assert_eq!(extracted.patient, Some("Patient/456".to_string()));
+            assert_eq!(extracted.patient, vec!["Patient/456".to_string()]);
         }
     }
 
@@ -1000,7 +854,37 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
-            assert_eq!(extracted.group, Some("Group/my-group".to_string()));
+            assert_eq!(extracted.group, vec!["Group/my-group".to_string()]);
+        }
+    }
+
+    #[test]
+    fn test_extract_multiple_group_parameters_accumulate() {
+        // Spec: group is 0..*. Strict extractor must accumulate every entry
+        // (previously dropped to last-wins via Option<String>).
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "group", "valueReference": {"reference": "Group/a"}},
+                {"name": "group", "valueReference": {"reference": "Group/b"}},
+                {"name": "group", "valueString": "Group/c"}
+            ]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+
+            assert_eq!(
+                extracted.group,
+                vec![
+                    "Group/a".to_string(),
+                    "Group/b".to_string(),
+                    "Group/c".to_string(),
+                ]
+            );
         }
     }
 
@@ -1061,7 +945,7 @@ mod tests {
             let extracted = extract_all_parameters(run_params).unwrap();
 
             assert!(extracted.view_definition.is_some());
-            assert_eq!(extracted.patient, Some("Patient/123".to_string()));
+            assert_eq!(extracted.patient, vec!["Patient/123".to_string()]);
             assert_eq!(extracted.format, Some("csv".to_string()));
             assert_eq!(extracted.header, Some(false));
         }

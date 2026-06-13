@@ -19,6 +19,11 @@
 //! | UnsupportedResourceType | 400 | not-supported |
 //! | AccessDenied | 403 | forbidden |
 //! | BackendError | 500 | exception |
+//!
+//! [`RestError::NotSupported`] (400 + `not-supported`) is reserved for
+//! spec-defined parameters/features that the server explicitly refuses;
+//! [`RestError::NotImplemented`] (501 + `not-supported`) signals work that
+//! has not yet been wired up.
 
 use axum::{
     Json,
@@ -137,6 +142,17 @@ pub enum RestError {
         feature: String,
     },
 
+    /// Parameter or feature is recognised but explicitly not supported by
+    /// this server configuration (HTTP 400 + `not-supported`). Use this for
+    /// spec-defined parameters that we reject by design (e.g. the SoF
+    /// `source` parameter on a storage-backed server), as opposed to
+    /// [`RestError::NotImplemented`] which signals a feature that is not
+    /// yet wired up.
+    NotSupported {
+        /// Description of the unsupported feature/parameter.
+        feature: String,
+    },
+
     /// Internal server error (HTTP 500).
     InternalError {
         /// Error message.
@@ -217,6 +233,9 @@ impl fmt::Display for RestError {
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
+            }
+            RestError::NotSupported { feature } => {
+                write!(f, "Not supported: {}", feature)
             }
             RestError::InternalError { message } => {
                 write!(f, "Internal error: {}", message)
@@ -316,6 +335,9 @@ impl IntoResponse for RestError {
                 "not-supported",
                 format!("Feature '{}' is not implemented", feature),
             ),
+            RestError::NotSupported { feature } => {
+                (StatusCode::BAD_REQUEST, "not-supported", feature.clone())
+            }
             RestError::InternalError { message } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "exception",

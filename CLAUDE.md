@@ -227,8 +227,8 @@ All three HTTP servers (`hfs`, `sof-server`, `hts`) accept request bodies sent
 with `Content-Encoding: gzip` (also `deflate`, `br`, `zstd`); unsupported
 encodings are rejected with `415`. Responses are compressed when the client
 sends `Accept-Encoding` (with `Content-Encoding` and `Vary: Accept-Encoding`
-set). SOF never re-compresses `application/parquet` / `application/zip`
-output. Body-size limits (`HFS_MAX_BODY_SIZE`, `SOF_MAX_BODY_SIZE`,
+set). SOF never re-compresses parquet (`application/vnd.apache.parquet`,
+legacy `application/parquet`) / `application/zip` output. Body-size limits (`HFS_MAX_BODY_SIZE`, `SOF_MAX_BODY_SIZE`,
 `HTS_MAX_BODY_SIZE`) are enforced on the *decompressed* body, so highly
 compressed payloads cannot bypass them.
 

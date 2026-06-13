@@ -259,30 +259,14 @@ fn infer_member_type(
     Some(inferred)
 }
 
-/// Dispatches a field-type lookup to the per-version generated table in `helios-fhir`.
+/// Thin alias for [`helios_fhir::get_field_type`] — kept so this module's
+/// existing call sites read the same as before the wrapper was consolidated.
 fn lookup_field_type(
     version: FhirVersion,
     parent_type: &str,
     field_name: &str,
 ) -> Option<(&'static str, bool)> {
-    match version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => helios_fhir::r4::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => helios_fhir::r4b::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => helios_fhir::r5::get_field_type(parent_type, field_name),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => helios_fhir::r6::get_field_type(parent_type, field_name),
-        // The `FhirVersion` enum's variants are gated on `helios-fhir`'s own
-        // feature flags, which can disagree with this crate's feature flags
-        // when an upstream consumer enables a version on `helios-fhir`
-        // directly without enabling the same version on `helios-fhirpath`.
-        // In that case we have no field-type table for the variant — fall back
-        // to "no info" rather than failing to compile.
-        #[allow(unreachable_patterns)]
-        _ => None,
-    }
+    helios_fhir::get_field_type(version, parent_type, field_name)
 }
 
 /// Returns true if the given FHIR type code corresponds to a FHIRPath system primitive.

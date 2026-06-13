@@ -213,7 +213,11 @@ async fn test_run_view_definition_ndjson_output() {
 
     assert_eq!(response.status_code(), StatusCode::OK);
     let content_type = response.header("content-type");
-    assert_eq!(content_type.to_str().unwrap(), "application/ndjson");
+    // Production NDJSON content-type is `application/x-ndjson` (matches
+    // HFS REST; aligned in the audit #8 sweep). `application/ndjson`
+    // remains a permissive INPUT alias for back-compat, but the OUTPUT
+    // is always the dashed form.
+    assert_eq!(content_type.to_str().unwrap(), "application/x-ndjson");
 
     let ndjson_text = response.text();
     let lines: Vec<&str> = ndjson_text.trim().lines().collect();
@@ -270,6 +274,45 @@ async fn test_run_view_definition_error_no_view() {
     assert_eq!(json["resourceType"], "OperationOutcome");
 }
 
+/// A bare `ViewDefinition` body (no `Parameters` wrapper) is a valid shortcut
+/// shape: callers piping a stored ViewDefinition straight to the server
+/// shouldn't have to build a Parameters envelope. Other operation parameters
+/// must come from the query string in this shape.
+#[tokio::test]
+async fn test_run_view_definition_bare_body() {
+    let server = common::test_server().await;
+
+    let bare_view = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [
+                {"name": "id", "path": "id"},
+                {"name": "gender", "path": "gender"}
+            ]
+        }]
+    });
+
+    // No `Parameters` wrapper, no `resource` entries. The view runs
+    // against zero input resources — what matters is that the body
+    // shape (`resourceType=ViewDefinition`, not `Parameters`) is
+    // accepted instead of being rejected with `400 Bad Request +
+    // "Request body must be a Parameters resource"`.
+    let response = server
+        .post("/ViewDefinition/$viewdefinition-run")
+        .add_query_param("_format", "application/json")
+        .json(&bare_view)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "bare ViewDefinition body must be accepted: {:?}",
+        response.text()
+    );
+}
+
 #[tokio::test]
 async fn test_run_view_definition_unsupported_format() {
     let server = common::test_server().await;
@@ -293,7 +336,8 @@ async fn test_run_view_definition_unsupported_format() {
         .json(&request_body)
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    // Spec: unsupported `_format` → 400 Bad Request + OperationOutcome.
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
 
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");
@@ -842,5 +886,295 @@ async fn test_since_parameter_wrong_value_type() {
             .as_str()
             .unwrap()
             .contains("_since parameter must use valueInstant or valueDateTime")
+    );
+}
+
+/// Audit item #6: `POST /$viewdefinition-run` (system-level) routes to the
+/// same handler as the type-level alias `POST /ViewDefinition/$viewdefinition-run`.
+#[tokio::test]
+async fn test_system_level_route_runs_view_definition() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": "ndjson"},
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "p1"}
+            }
+        ]
+    });
+
+    // System-level URL — no /ViewDefinition prefix.
+    let response = server
+        .post("/$viewdefinition-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "system-level POST /$viewdefinition-run must succeed; body: {}",
+        response.text()
+    );
+    let text = response.text();
+    assert!(
+        text.contains("\"id\":\"p1\""),
+        "response must contain the seeded Patient id: {text}"
+    );
+}
+
+/// Audit item #7: instance-level URLs are rejected with a clear 400
+/// explaining the stateless limitation, not a 404 or 501.
+#[tokio::test]
+async fn test_instance_level_returns_400_with_stateless_explanation() {
+    let server = common::test_server().await;
+
+    let response = server
+        .post("/ViewDefinition/some-id/$viewdefinition-run")
+        .add_header("Content-Type", "application/json")
+        .json(&json!({"resourceType": "Parameters"}))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::BAD_REQUEST,
+        "instance-level POST must return 400, not 404/501"
+    );
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    let details = json["issue"][0]["details"]["text"]
+        .as_str()
+        .expect("error must have text details");
+    assert!(
+        details.contains("Instance-level") && details.contains("stateless"),
+        "error message must explain stateless limitation: {details}"
+    );
+    assert!(
+        details.contains("viewResource"),
+        "error message must point at the supported alternative: {details}"
+    );
+}
+
+/// Parquet output uses its native media type
+/// `application/vnd.apache.parquet` per the SoF v2 Common Operation
+/// Behavior table, plus `Content-Disposition: attachment;
+/// filename="output.parquet"` so downloads land with the right extension.
+/// `application/octet-stream` / `application/parquet` remain accepted as
+/// request-side aliases.
+#[tokio::test]
+async fn test_parquet_response_uses_native_parquet_content_type() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": "application/octet-stream"},
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {"resourceType": "Patient", "id": "p1"}
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$viewdefinition-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "parquet request must succeed; body: {}",
+        response.text()
+    );
+    let ct = response
+        .header("content-type")
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    assert_eq!(
+        ct, "application/vnd.apache.parquet",
+        "parquet response must use its native media type per spec, got {ct}"
+    );
+    let cd = response
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        cd.contains("filename=") && cd.contains(".parquet"),
+        "parquet response must include Content-Disposition naming a .parquet file, got '{cd}'"
+    );
+    // PAR1 magic bytes confirm we actually got parquet bytes.
+    let bytes = response.as_bytes();
+    assert!(
+        bytes.starts_with(b"PAR1"),
+        "response body must be a Parquet file (PAR1 magic), got first 8 bytes: {:?}",
+        &bytes[..bytes.len().min(8)]
+    );
+}
+
+/// Audit item #9: an invalid ViewDefinition body (well-formed Parameters
+/// wrapper, but the inner ViewDefinition has a type mismatch serde can't
+/// parse) must surface as `422 Unprocessable Entity`, not `400 Bad Request`.
+#[tokio::test]
+async fn test_invalid_view_definition_returns_422() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_format", "valueCode": "ndjson"},
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    // Type mismatch: select must be an array of Select objects,
+                    // not a string. Serde rejects deserialization.
+                    "select": "not-an-array"
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$viewdefinition-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid ViewDefinition must be 422 (audit #9), got {} with body: {}",
+        response.status_code(),
+        response.text()
+    );
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+}
+
+/// Audit item #11: sof-server publishes the spec-defined
+/// `GET /$sql-on-fhir-capabilities` endpoint with truthful capability
+/// flags (no reference resolution, no export, no $sqlquery-run; all
+/// four `$viewdefinition-run` output formats listed).
+#[tokio::test]
+async fn test_sof_capabilities_endpoint() {
+    let server = common::test_server().await;
+
+    let response = server.get("/$sql-on-fhir-capabilities").await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let content_type = response.header("content-type");
+    assert_eq!(content_type.to_str().unwrap(), "application/fhir+json");
+
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "Parameters");
+
+    let params = json["parameter"].as_array().expect("parameter array");
+
+    // Helper to extract a single boolean by name.
+    let bool_for = |name: &str| -> bool {
+        params
+            .iter()
+            .find(|p| p["name"] == name)
+            .and_then(|p| p["valueBoolean"].as_bool())
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+
+    assert!(
+        bool_for("supportsViewDefinitionRun"),
+        "$viewdefinition-run must be supported"
+    );
+    assert!(
+        !bool_for("supportsViewDefinitionExport"),
+        "stateless sof-server doesn't support $export"
+    );
+    assert!(
+        !bool_for("supportsSqlQueryRun"),
+        "sof-server doesn't expose $sqlquery-run"
+    );
+    assert!(
+        !bool_for("supportsInDbRunner"),
+        "sof-server uses the in-process FHIRPath runner only"
+    );
+    assert!(
+        !bool_for("supportsRelativeReference"),
+        "sof-server has no resource store"
+    );
+    assert!(
+        !bool_for("supportsCanonicalReference"),
+        "sof-server has no resource store"
+    );
+    assert!(
+        !bool_for("supportsAbsoluteReference"),
+        "sof-server has no resource store"
+    );
+
+    // All four $viewdefinition-run output formats must be advertised.
+    let formats: Vec<&str> = params
+        .iter()
+        .filter(|p| p["name"] == "supportedFormat")
+        .filter_map(|p| p["valueCode"].as_str())
+        .collect();
+    for required in ["ndjson", "json", "csv", "parquet"] {
+        assert!(
+            formats.contains(&required),
+            "supportedFormat must include {required}: {formats:?}"
+        );
+    }
+
+    // Audit item #13: the response must declare the spec's
+    // OutputFormatCodes value-set binding so audit tools can find
+    // it without dereferencing the OperationDefinition.
+    let binding = params
+        .iter()
+        .find(|p| p["name"] == "formatBinding")
+        .expect("formatBinding parameter must be present");
+    let binding_parts = binding["part"]
+        .as_array()
+        .expect("formatBinding must have part[]");
+    let value_set = binding_parts
+        .iter()
+        .find(|p| p["name"] == "valueSet")
+        .and_then(|p| p["valueUri"].as_str())
+        .expect("formatBinding.valueSet must be a uri");
+    assert_eq!(
+        value_set, "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes",
+        "binding must reference the spec's OutputFormatCodes value set"
+    );
+    let strength = binding_parts
+        .iter()
+        .find(|p| p["name"] == "strength")
+        .and_then(|p| p["valueCode"].as_str())
+        .expect("formatBinding.strength must be a code");
+    assert_eq!(
+        strength, "extensible",
+        "binding strength must match the spec's `extensible` declaration"
     );
 }
