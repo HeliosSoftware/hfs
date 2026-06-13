@@ -6211,6 +6211,53 @@ mod tests {
         assert!(has_message, "message expected for display mismatch");
     }
 
+    /// `lenient-display-validation=true` downgrades a display mismatch from an
+    /// error (result=false) to a warning with result=true, per the FHIR spec.
+    #[tokio::test]
+    async fn lenient_display_validation_downgrades_mismatch_to_warning() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/cs"},
+                {"name": "code", "valueCode": "ABC"},
+                {"name": "display", "valueString": "Wrong Display"},
+                {"name": "lenient-display-validation", "valueBoolean": true}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result_param["valueBoolean"], true,
+            "lenient-display-validation keeps result=true on a display mismatch: {json}"
+        );
+
+        // The mismatch must still be surfaced, but as a `warning`.
+        let issues = params
+            .iter()
+            .find(|p| p["name"] == "issues")
+            .expect("issues OperationOutcome expected for a display mismatch");
+        let issue_list = issues["resource"]["issue"].as_array().unwrap();
+        let display_issue = issue_list
+            .iter()
+            .find(|i| {
+                i["details"]["coding"]
+                    .as_array()
+                    .map(|cs| cs.iter().any(|c| c["code"] == "invalid-display"))
+                    .unwrap_or(false)
+            })
+            .expect("invalid-display issue expected");
+        assert_eq!(
+            display_issue["severity"], "warning",
+            "display mismatch must be a warning under lenient validation: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn missing_url_returns_400() {
         let app = make_app();
