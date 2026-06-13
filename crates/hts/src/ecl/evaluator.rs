@@ -7,8 +7,8 @@
 //! Gated on `feature = "sqlite"` because every helper uses `rusqlite`
 //! types directly. A future Postgres-backed evaluator will live alongside
 //! this module and consume the same `EclExpr` AST from `super::parser`.
-//! (The `sqlite` gate is applied at the `pub mod evaluator;` declaration in
-//! `super::mod`, so no inner `#![cfg]` is needed here.)
+//! (The module is declared `#[cfg(feature = "sqlite")]` in `mod.rs`, so no
+//! redundant inner `#![cfg]` is needed here.)
 //!
 //! # Strategy
 //!

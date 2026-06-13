@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 
 use crate::search::fold_text;
 use crate::types::{
-    SearchModifier, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
-    strip_reference_version,
+    CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, SearchValue, strip_reference_version,
 };
 
 /// Returns the implicit precision of a decimal search value from its string form
@@ -247,6 +247,15 @@ impl PostgresQueryBuilder {
             }
         }
 
+        // Compartment membership: match resources that reference the compartment
+        // through ANY of the membership params (OR), per the CompartmentDefinition.
+        if let Some(comp) = &query.compartment {
+            // Last condition appended, so no need to advance `current_offset`.
+            if let Some(condition) = Self::build_compartment_condition(comp, current_offset) {
+                conditions.push(condition);
+            }
+        }
+
         if conditions.is_empty() {
             return None;
         }
@@ -258,6 +267,122 @@ impl PostgresQueryBuilder {
         }
 
         Some(combined)
+    }
+
+    /// Builds the compartment-membership subquery: matches resources that
+    /// reference `comp.reference` via ANY of `comp.params` (logical OR), mirroring
+    /// the SQLite backend. Returns `None` when there are no params or reference.
+    fn build_compartment_condition(
+        comp: &CompartmentMembership,
+        param_offset: usize,
+    ) -> Option<SqlFragment> {
+        if comp.params.is_empty() || comp.reference.is_empty() {
+            return None;
+        }
+
+        // Membership params come from the bundled FHIR CompartmentDefinitions
+        // (trusted); escape single quotes defensively before inlining.
+        let in_list = comp
+            .params
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let base = strip_reference_version(&comp.reference).to_string();
+        let p1 = param_offset + 1;
+        let p2 = param_offset + 2;
+
+        Some(SqlFragment::with_params(
+            format!(
+                "id IN (SELECT resource_id FROM search_index \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name IN ({in_list}) \
+                 AND (value_reference = ${p1} OR value_reference LIKE ${p2} || '/_history/%'))"
+            ),
+            vec![SqlParam::text(&base), SqlParam::text(&base)],
+        ))
+    }
+
+    /// Builds the `_contained` match subquery (mirrors the SQLite backend's
+    /// `build_contained`).
+    ///
+    /// Returns SQL selecting `(resource_type, resource_id, contained_local_id)`
+    /// from `search_index` for contained resources (`is_contained = TRUE`) of the
+    /// searched type (`contained_type = $2`) matching every standard parameter,
+    /// keyed on the contained entity `(resource_id, contained_local_id)` via
+    /// `GROUP BY ... HAVING COUNT(DISTINCT param_name) >= n`. Value predicates are
+    /// the bare column conditions shared with composite-component matching.
+    ///
+    /// Param layout: `$1` = tenant, `$2` = contained type, then value params.
+    /// Returns `None` when no standard parameter contributes a condition
+    /// (special `_`-params and composites are not applied to contained matching).
+    pub fn build_contained(query: &SearchQuery) -> Option<SqlFragment> {
+        let mut branches: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
+        let mut distinct_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // $1 = tenant, $2 = contained_type are bound by the caller.
+        let mut offset = 2;
+
+        for param in &query.parameters {
+            if param.name.starts_with('_')
+                || matches!(
+                    param.param_type,
+                    SearchParamType::Composite | SearchParamType::Special
+                )
+            {
+                continue;
+            }
+
+            let mut or_parts: Vec<String> = Vec::new();
+            for value in &param.values {
+                let predicate = match param.param_type {
+                    SearchParamType::Token
+                    | SearchParamType::String
+                    | SearchParamType::Number
+                    | SearchParamType::Quantity
+                    | SearchParamType::Date => {
+                        Self::build_composite_component(value, param.param_type, offset)
+                    }
+                    SearchParamType::Reference => Some((
+                        format!("value_reference = ${}", offset + 1),
+                        vec![SqlParam::text(strip_reference_version(&value.value))],
+                    )),
+                    SearchParamType::Uri => Some((
+                        format!("value_uri = ${}", offset + 1),
+                        vec![SqlParam::text(&value.value)],
+                    )),
+                    SearchParamType::Composite | SearchParamType::Special => None,
+                };
+                if let Some((sql, ps)) = predicate {
+                    offset += ps.len();
+                    or_parts.push(sql);
+                    params.extend(ps);
+                }
+            }
+            if or_parts.is_empty() {
+                continue;
+            }
+            branches.push(format!(
+                "(param_name = '{}' AND ({}))",
+                param.name,
+                or_parts.join(" OR ")
+            ));
+            distinct_names.insert(param.name.clone());
+        }
+
+        if branches.is_empty() {
+            return None;
+        }
+        let sql = format!(
+            "SELECT resource_type, resource_id, contained_local_id FROM search_index \
+             WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 AND ({}) \
+             GROUP BY resource_type, resource_id, contained_local_id \
+             HAVING COUNT(DISTINCT param_name) >= {}",
+            branches.join(" OR "),
+            distinct_names.len()
+        );
+        Some(SqlFragment::with_params(sql, params))
     }
 
     /// Builds an `ORDER BY` clause from the query's `_sort` directives.

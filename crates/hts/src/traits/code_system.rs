@@ -114,6 +114,29 @@ pub trait CodeSystemOperations: Send + Sync {
         Ok(None)
     }
 
+    /// Return `true` when the CodeSystem at `url` (optionally pinned to
+    /// `version`) declares `hierarchyMeaning = "is-a"` AND actually carries
+    /// parent/child edges.
+    ///
+    /// Drives `$expand`'s default-nesting decision: when a request omits both
+    /// `excludeNested` and `hierarchical`, the FHIR default is a tree-shaped
+    /// expansion mirroring the CodeSystem's is-a hierarchy (tx.fhir.org
+    /// behaviour, pinned by the IG `version/vs-expand-versionless` fixture).
+    /// We only auto-nest for genuine is-a hierarchies; code systems whose
+    /// nesting means something else (`grouped-by`, `part-of`, or an absent
+    /// `hierarchyMeaning`) stay flat. Returns `Ok(false)` for unknown systems.
+    /// The default implementation returns `Ok(false)` so backends that don't
+    /// model hierarchy degrade to flat expansions.
+    async fn code_system_is_hierarchical(
+        &self,
+        ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<bool, HtsError> {
+        let _ = (ctx, url, version);
+        Ok(false)
+    }
+
     /// Batch-fetch designations for a list of concept codes in the given
     /// CodeSystem URL. Returns a map from code → list of designations. Codes
     /// with no designations may be omitted from the result. Used by `$expand`

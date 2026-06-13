@@ -224,12 +224,14 @@ pub enum ManifestStatus {
     Completed,
     /// Manifest processing failed.
     Failed,
+    /// Manifest was superseded by a later submission via `replacesManifestUrl`.
+    Replaced,
 }
 
 impl ManifestStatus {
     /// Returns true if the manifest is in a terminal state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        matches!(self, Self::Completed | Self::Failed | Self::Replaced)
     }
 }
 
@@ -240,6 +242,7 @@ impl std::fmt::Display for ManifestStatus {
             Self::Processing => write!(f, "processing"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
+            Self::Replaced => write!(f, "replaced"),
         }
     }
 }
@@ -253,6 +256,7 @@ impl std::str::FromStr for ManifestStatus {
             "processing" => Ok(Self::Processing),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
+            "replaced" => Ok(Self::Replaced),
             _ => Err(format!("unknown manifest status: {}", s)),
         }
     }

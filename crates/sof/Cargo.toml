@@ -38,7 +38,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 axum = { version = "0.8", features = ["json", "query"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "compression-full", "decompression-full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 http = "1.0"
@@ -57,9 +57,13 @@ zip = "2.2"
 futures = "0.3"
 tokio-stream = "0.1"
 bytes = "1.5"
+rusqlite = { version = "0.33", features = ["bundled", "serde_json"] }
+sqlparser = "0.54"
+base64 = "0.22"
 
 [dev-dependencies]
 axum-test = "18.0"
+flate2 = "1"
 tempfile = "3.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 

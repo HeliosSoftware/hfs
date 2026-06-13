@@ -1,0 +1,72 @@
+name: Inferno Bulk Submit Data
+
+# SCAFFOLD — inert until an upstream Inferno Bulk Data **Submit** test kit exists.
+#
+# As of this writing the official `inferno-framework/bulk-data-test-kit` ships
+# only EXPORT suites (v1.0.1 / v2.0.0 / v2.0.0_client); there is no published
+# bulk-submit conformance suite for the Argo25 `$bulk-submit` operation.
+# This workflow mirrors the structure of `inferno-bulk-data.yml` (build HFS with
+# R4,postgres,s3; bring up Postgres + MinIO + Keycloak with a `system/bulk-submit`
+# client scope; create a session; run the suite groups; collect results) so that
+# wiring it to a real kit is a one-line change once one is available.
+#
+# Until then this job only validates that HFS builds with bulk-submit support and
+# that the (configurable) kit reference is reachable; it does NOT assert
+# conformance. DO NOT hard-code a guessed suite id — read it from the kit source
+# (`lib/.../*_test_suite.rb`) exactly as the export workflow does.
+#
+# Usage: GitHub Actions → "Inferno Bulk Submit Data" → Run workflow, supplying the
+# kit repository + ref once a submit kit is published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kit_repo:
+        description: "Inferno bulk-submit test-kit repository (owner/name)"
+        required: false
+        default: ""
+      kit_ref:
+        description: "test-kit ref (branch / tag)"
+        required: false
+        default: "main"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+
+jobs:
+  build:
+    name: Build HFS with Bulk Submit support
+    runs-on: [self-hosted, Linux]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Configure LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          {
+            echo '[target.x86_64-unknown-linux-gnu]'
+            echo 'linker = "clang"'
+            echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]'
+          } >> ~/.cargo/config.toml
+      - name: Build HFS (bulk-submit-capable)
+        run: cargo build -p helios-hfs --no-default-features --features R4,postgres,s3
+
+  kit-guard:
+    name: Verify a submit test kit was supplied
+    needs: build
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Check kit_repo input
+        run: |
+          if [ -z "${{ github.event.inputs.kit_repo }}" ]; then
+            echo "::notice::No Inferno bulk-submit kit supplied. This workflow is a"
+            echo "::notice::scaffold; provide kit_repo once an upstream submit suite exists."
+            echo "Scaffold OK — HFS builds with bulk-submit support."
+            exit 0
+          fi
+          echo "Kit supplied: ${{ github.event.inputs.kit_repo }}@${{ github.event.inputs.kit_ref }}"
+          echo "::warning::Submit-kit wiring is not yet implemented; mirror inferno-bulk-data.yml."

@@ -15,8 +15,8 @@ use helios_fhir::FhirVersion;
 use rusqlite::params;
 
 use crate::core::{
-    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, RevincludeProvider,
-    SearchProvider, SearchResult,
+    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -76,6 +76,12 @@ impl SearchProvider for SqliteBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // `_contained` search uses a dedicated path (different index columns and
+        // heterogeneous result types); standard search handles `_contained=false`.
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+
         // Populate Bundle.total only when the client asked for it
         // (`_total=accurate|estimate`). Computed up-front, before acquiring the
         // (non-Send) connection, so it is not held across this await.
@@ -111,7 +117,7 @@ impl SearchProvider for SqliteBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        let search_filter = if !query.parameters.is_empty() {
+        let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
             let builder =
                 QueryBuilder::new(tenant_id, resource_type).with_param_offset(param_offset);
             let fragment = builder.build(query);
@@ -327,6 +333,7 @@ impl SearchProvider for SqliteBackend {
             resources: page,
             included: Vec::new(),
             total,
+            scores: Default::default(),
         })
     }
 
@@ -339,10 +346,11 @@ impl SearchProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
-        // Build the search filter if there are search parameters
+        // Build the search filter if there are search parameters or a compartment.
         let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query
             .parameters
             .is_empty()
+            || query.compartment.is_some()
         {
             let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
             let fragment = builder.build(query);
@@ -390,6 +398,10 @@ impl SearchProvider for SqliteBackend {
         &self,
     ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
         self.search_registry()
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
     }
 }
 
@@ -502,6 +514,7 @@ impl MultiTypeSearchProvider for SqliteBackend {
             resources: Page::new(resources, page_info),
             included: Vec::new(),
             total: None,
+            scores: Default::default(),
         })
     }
 }
@@ -839,6 +852,169 @@ impl ChainedSearchProvider for SqliteBackend {
         }
 
         Ok(ids)
+    }
+}
+
+/// Finds the `contained[]` entry with the given local `id` in a container's
+/// content.
+fn extract_contained_resource(
+    content: &serde_json::Value,
+    local_id: &str,
+) -> Option<serde_json::Value> {
+    content
+        .get("contained")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(local_id))
+        .cloned()
+}
+
+/// Builds a `StoredResource` for a contained resource, inheriting the
+/// container's version/tenant/timestamps. Used for `_containedType=contained`.
+fn build_contained_stored(
+    container: &StoredResource,
+    contained_type: &str,
+    local_id: &str,
+    content: serde_json::Value,
+) -> StoredResource {
+    StoredResource::from_storage(
+        contained_type.to_string(),
+        local_id.to_string(),
+        container.version_id().to_string(),
+        container.tenant_id().clone(),
+        content,
+        container.created_at(),
+        container.last_modified(),
+        None,
+        container.fhir_version(),
+    )
+}
+
+// Contained (`_contained`) search.
+impl SqliteBackend {
+    /// Executes a `_contained=true|both` search.
+    ///
+    /// Matches contained resources of `query.resource_type` via the
+    /// `is_contained` index rows, then returns either the container resources
+    /// (`_containedType=container`, default) or the contained resources
+    /// themselves (`_containedType=contained`). For `_contained=both`, top-level
+    /// matches (run through the standard path) are merged in first.
+    ///
+    /// Paginated by `_offset`/`_count` as a single window (no keyset cursor);
+    /// contained result sets are expected to be small.
+    async fn search_contained(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        use crate::types::{ContainedMode, ContainedReturn};
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let contained_type = query.resource_type.as_str();
+
+        // 1. Resolve contained matches → (container_type, container_id, local_id).
+        let builder = QueryBuilder::new(tenant_id, contained_type);
+        let matches: Vec<(String, String, Option<String>)> = match builder.build_contained(query) {
+            Some(fragment) => {
+                let conn = self.get_connection()?;
+                let mut stmt = conn.prepare(&fragment.sql).map_err(|e| {
+                    internal_error(format!("Failed to prepare contained query: {e}"))
+                })?;
+                let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                    Box::new(tenant_id.to_string()),
+                    Box::new(contained_type.to_string()),
+                ];
+                for param in &fragment.params {
+                    match param {
+                        SqlParam::String(s) => all_params.push(Box::new(s.clone())),
+                        SqlParam::Integer(i) => all_params.push(Box::new(*i)),
+                        SqlParam::Float(f) => all_params.push(Box::new(*f)),
+                        SqlParam::Null => all_params.push(Box::new(Option::<String>::None)),
+                    }
+                }
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                stmt.query_map(refs.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| internal_error(format!("Failed to execute contained query: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| internal_error(format!("Failed to read contained row: {e}")))?
+            }
+            None => Vec::new(),
+        };
+
+        // 2. Materialize result items (container or contained), de-duplicated.
+        let mut items: Vec<StoredResource> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        match query.contained_return {
+            ContainedReturn::Container => {
+                for (ctype, cid, _) in &matches {
+                    if !seen.insert(format!("{ctype}/{cid}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, ctype, cid).await? {
+                        items.push(container);
+                    }
+                }
+            }
+            ContainedReturn::Contained => {
+                for (ctype, cid, local) in &matches {
+                    let Some(local_id) = local else { continue };
+                    if !seen.insert(format!("{ctype}/{cid}#{local_id}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, ctype, cid).await? {
+                        if let Some(c) = extract_contained_resource(container.content(), local_id) {
+                            items.push(build_contained_stored(
+                                &container,
+                                contained_type,
+                                local_id,
+                                c,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. For `both`, merge top-level matches ahead of contained ones.
+        if query.contained == ContainedMode::Both {
+            let mut top_query = query.clone();
+            top_query.contained = ContainedMode::Off;
+            top_query.contained_return = ContainedReturn::Container;
+            let top = self.search(tenant, &top_query).await?;
+            let mut merged = top.resources.items;
+            let top_urls: HashSet<String> = merged.iter().map(|r| r.url()).collect();
+            for item in items {
+                if !top_urls.contains(&item.url()) {
+                    merged.push(item);
+                }
+            }
+            items = merged;
+        }
+
+        // 4. Apply the offset/count window.
+        let count = query.count.unwrap_or(100) as usize;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let total_matches = items.len() as u64;
+        let windowed: Vec<StoredResource> = items.into_iter().skip(offset).take(count).collect();
+
+        let total = if query.wants_total() {
+            Some(total_matches)
+        } else {
+            None
+        };
+        let page = Page::new(windowed, PageInfo::end());
+        let mut result = SearchResult::new(page);
+        if let Some(t) = total {
+            result = result.with_total(t);
+        }
+        Ok(result)
     }
 }
 
@@ -2447,5 +2623,145 @@ mod tests {
             "Combined patient + type search should find exactly doc1"
         );
         assert_eq!(result.resources.items[0].id(), "doc1");
+    }
+
+    // ---- _contained / _containedType search ----
+
+    use crate::types::{ContainedMode, ContainedReturn, SearchParamType, SearchValue};
+
+    /// Seeds an Observation containing a Patient named "Smith", plus a top-level
+    /// Patient also named "Smith".
+    async fn seed_contained(backend: &SqliteBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs1",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                    "subject": { "reference": "#p1" },
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "p1",
+                        "name": [{ "family": "Smith", "given": ["Contained"] }],
+                        "gender": "male"
+                    }]
+                }),
+                helios_fhir::FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "top1", "name": [{ "family": "Smith" }] }),
+                helios_fhir::FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn name_query(mode: ContainedMode, ret: ContainedReturn) -> SearchQuery {
+        let mut q = SearchQuery::new("Patient");
+        q.contained = mode;
+        q.contained_return = ret;
+        q.parameters.push(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Smith")],
+            chain: vec![],
+            components: vec![],
+        });
+        q
+    }
+
+    #[tokio::test]
+    async fn contained_off_excludes_contained_resources() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        // Default (_contained=off): only the top-level Patient matches.
+        let result = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::Off, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(urls, vec!["Patient/top1"]);
+    }
+
+    #[tokio::test]
+    async fn contained_on_returns_container_by_default() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::On, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(urls, vec!["Observation/obs1"], "container is returned");
+    }
+
+    #[tokio::test]
+    async fn contained_on_contained_type_returns_contained_resource() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::On, ContainedReturn::Contained),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.resources.items.len(), 1);
+        let r = &result.resources.items[0];
+        assert_eq!(r.resource_type(), "Patient");
+        assert_eq!(r.id(), "p1");
+        assert_eq!(r.content()["name"][0]["given"][0], "Contained");
+    }
+
+    #[tokio::test]
+    async fn contained_both_merges_top_level_and_container() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &name_query(ContainedMode::Both, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let mut urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        urls.sort();
+        assert_eq!(urls, vec!["Observation/obs1", "Patient/top1"]);
+    }
+
+    #[tokio::test]
+    async fn contained_respects_param_so_no_false_match() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_contained(&backend, &tenant).await;
+
+        // No contained Patient named "Jones" → no container match.
+        let mut q = name_query(ContainedMode::On, ContainedReturn::Container);
+        q.parameters[0].values = vec![SearchValue::eq("Jones")];
+        let result = backend.search(&tenant, &q).await.unwrap();
+        assert!(result.resources.items.is_empty());
     }
 }

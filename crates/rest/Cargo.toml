@@ -14,11 +14,11 @@ categories = ["web-programming", "database"]
 [features]
 default = ["R4", "sqlite"]
 
-# FHIR version features (pass through to helios-fhir, helios-persistence, helios-audit, helios-serde, helios-subscriptions)
-R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-audit/R4", "helios-serde?/R4", "helios-subscriptions?/R4"]
-R4B = ["helios-fhir/R4B", "helios-persistence/R4B", "helios-audit/R4B", "helios-serde?/R4B", "helios-subscriptions?/R4B"]
-R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-audit/R5", "helios-serde?/R5", "helios-subscriptions?/R5"]
-R6 = ["helios-fhir/R6", "helios-persistence/R6", "helios-audit/R6", "helios-serde?/R6", "helios-subscriptions?/R6"]
+# FHIR version features (pass through to helios-fhir, helios-persistence, helios-audit, helios-serde, helios-sof, helios-subscriptions)
+R4 = ["helios-fhir/R4", "helios-persistence/R4", "helios-audit/R4", "helios-serde?/R4", "helios-sof/R4", "helios-subscriptions?/R4"]
+R4B = ["helios-fhir/R4B", "helios-persistence/R4B", "helios-audit/R4B", "helios-serde?/R4B", "helios-sof/R4B", "helios-subscriptions?/R4B"]
+R5 = ["helios-fhir/R5", "helios-persistence/R5", "helios-audit/R5", "helios-serde?/R5", "helios-sof/R5", "helios-subscriptions?/R5"]
+R6 = ["helios-fhir/R6", "helios-persistence/R6", "helios-audit/R6", "helios-serde?/R6", "helios-sof/R6", "helios-subscriptions?/R6"]
 
 # Serialization format features
 xml = ["helios-fhir/xml", "dep:helios-serde", "helios-serde?/xml"]
@@ -28,7 +28,7 @@ sqlite = ["helios-persistence/sqlite"]
 postgres = ["helios-persistence/postgres"]
 mongodb = ["helios-persistence/mongodb"]
 elasticsearch = ["helios-persistence/elasticsearch"]
-s3 = ["helios-persistence/s3"]
+s3 = ["helios-persistence/s3", "dep:aws-sdk-s3", "dep:aws-config"]
 
 # Auth feature (pass through to helios-auth)
 redis = ["helios-auth/redis"]
@@ -36,11 +36,17 @@ redis = ["helios-auth/redis"]
 # Subscriptions
 subscriptions = ["dep:helios-subscriptions"]
 
+# Bulk-submit JWE file decryption (`fileEncryptionKey`). Enables decrypting
+# `dir` + A128GCM/A256GCM compact-JWE files; without it, encrypted submissions
+# record a `not-supported` manifest-level error (documented non-conformance).
+bulk-submit-jwe = ["dep:aes-gcm"]
+
 [dependencies]
 # Core dependencies
 helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
 helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false }
 helios-serde = { path = "../serde", version = "0.1.47", optional = true, default-features = false }
+helios-sof = { path = "../sof", version = "0.1.47", default-features = false }
 helios-auth = { path = "../auth", version = "0.1.47" }
 helios-audit = { path = "../audit", version = "0.1.47", default-features = false }
 helios-subscriptions = { path = "../subscriptions", version = "0.1.47", optional = true, default-features = false }
@@ -52,13 +58,14 @@ async-trait = "0.1"
 # Web framework
 axum = { version = "0.8", features = ["json", "query", "matched-path", "ws"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "compression-full", "decompression-full"] }
 http = "1.0"
 mime = "0.3"
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+serde_urlencoded = "0.7"
 
 # Error handling
 thiserror = "2"
@@ -78,13 +85,35 @@ chrono.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2.5"
 json-patch = "3"
+futures = "0.3"
+dashmap = "6"
+
+# SQL-query-run: DDL validation
+sqlparser = "0.54"
+
+# Base64 (used to wrap $sqlquery-run flat output as Binary.data when the caller
+# asks for application/fhir+json)
+base64 = "0.22"
+
+# S3 export sink (optional — only when s3 feature is enabled)
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
 
 # HTTP client for terminology server integration (HTS)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+
+# JWT signing for the bulk-submit outbound SMART Backend Services client.
+jsonwebtoken = "9"
+
+# Pure-Rust AES-GCM for optional bulk-submit JWE file decryption (no OpenSSL).
+aes-gcm = { version = "0.10", optional = true }
 
 [dev-dependencies]
 # HTTP testing
 axum-test = "18.0"
+
+# gzip test payloads for HTTP compression tests
+flate2 = "1"
 
 # Temp files
 tempfile = "3"
@@ -96,8 +125,17 @@ tokio-test = "0.4"
 # JSON path for test assertions
 jsonpath-rust = "0.7"
 
+# base64url decoding for OAuth assertion inspection in tests
+base64 = "0.22"
+
 # Regex for pattern matching in tests
 regex = "1"
+
+# Postgres conformance test (gated via #[ignore] + PG_CONFORMANCE env var).
+# Brings up a PostgreSQL container locally — same versions used by
+# `helios-persistence`'s integration tests for binary-version parity.
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 [package.metadata.docs.rs]
 features = ["R4", "sqlite"]

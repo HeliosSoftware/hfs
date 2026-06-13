@@ -20,8 +20,12 @@ use axum::{
     response::Response,
 };
 use helios_fhir::FhirVersion;
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::search::SearchParameterRegistry;
+use helios_persistence::types::SearchParamType;
 use tracing::debug;
+
+use super::sof::capability::build_sof_capabilities;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
@@ -65,7 +69,7 @@ pub async fn capabilities_handler<S>(
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     // Determine which version to describe (from Accept header or default)
     let fhir_version = version
@@ -121,16 +125,24 @@ fn build_capability_statement<S>(
     base_url: &str,
 ) -> serde_json::Value
 where
-    S: ResourceStorage,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     let backend_name = state.storage().backend_name();
 
     // Get resource types for the requested FHIR version
     let resource_types = get_resource_type_names_for_version(version);
 
+    // Advertise each resource type's real search parameters from the loaded
+    // SearchParameter registry (not just the seven common params). The read
+    // guard is held only across this synchronous build (no await).
+    // `_contained` / `_containedType` are only advertised when the backend can
+    // evaluate contained search (others reject them with 501).
+    let supports_contained = state.storage().supports_contained_search();
+
+    let registry = state.storage().search_param_registry().read();
     let resources: Vec<serde_json::Value> = resource_types
         .iter()
-        .map(|rt| build_resource_capability(rt))
+        .map(|rt| build_resource_capability(rt, &registry, supports_contained))
         .collect();
 
     #[allow(unused_mut)]
@@ -141,10 +153,32 @@ where
         formats.push("application/fhir+xml");
     }
 
-    let mut operations = vec![serde_json::json!({
-        "name": "versions",
-        "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
-    })];
+    // Standard operations, extended with SOF operations
+    let mut operations = build_rest_operations(state);
+
+    // Optional SOF extension block on the rest[0] element
+    let sof_extension = build_sof_rest_extension(state);
+
+    let mut rest_entry = serde_json::json!({
+        "mode": "server",
+        "documentation": "Helios FHIR RESTful API",
+        "security": {
+            "cors": state.config().enable_cors,
+            "description": "This server supports CORS for cross-origin requests"
+        },
+        "resource": resources,
+        "interaction": [
+            { "code": "transaction" },
+            { "code": "batch" },
+            { "code": "history-system" },
+            { "code": "search-system" }
+        ]
+    });
+
+    // Inject the SOF extension array when present
+    if let Some(ext) = sof_extension {
+        rest_entry["extension"] = ext;
+    }
 
     let mut statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
@@ -157,21 +191,7 @@ where
             "description": format!("Helios FHIR Server ({})", backend_name),
             "url": base_url
         },
-        "rest": [{
-            "mode": "server",
-            "documentation": "Helios FHIR RESTful API",
-            "security": {
-                "cors": state.config().enable_cors,
-                "description": "This server supports CORS for cross-origin requests"
-            },
-            "resource": resources,
-            "interaction": [
-                { "code": "transaction" },
-                { "code": "batch" },
-                { "code": "history-system" },
-                { "code": "search-system" }
-            ],
-        }]
+        "rest": [rest_entry]
     });
 
     // Advertise Bulk Data Export operations when enabled.
@@ -192,12 +212,94 @@ where
             serde_json::json!(["http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"]);
     }
 
+    // Advertise Bulk Data Submit operations when enabled.
+    if state.bulk_submit_config().enabled {
+        operations.push(serde_json::json!({
+            "name": "bulk-submit",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/bulk-submit"
+        }));
+        operations.push(serde_json::json!({
+            "name": "bulk-submit-status",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/bulk-submit-status"
+        }));
+    }
+
     statement["rest"][0]["operation"] = serde_json::Value::Array(operations);
     statement
 }
 
+/// Builds the `rest[0].operation` list, including SOF operations.
+///
+/// `viewdefinition-run` and `sqlquery-run` are always declared when SOF is enabled.
+/// `viewdefinition-export` and `sqlquery-export` are declared only when an
+/// export controller is wired.
+fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
+    state: &AppState<S>,
+) -> Vec<serde_json::Value> {
+    let mut ops = vec![
+        serde_json::json!({
+            "name": "validate",
+            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"
+        }),
+        serde_json::json!({
+            "name": "versions",
+            "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
+        }),
+        serde_json::json!({
+            "name": "viewdefinition-run",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run"
+        }),
+        serde_json::json!({
+            "name": "sqlquery-run",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-run"
+        }),
+    ];
+
+    if state.export_controller().is_some() {
+        ops.push(serde_json::json!({
+            "name": "viewdefinition-export",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-export"
+        }));
+        ops.push(serde_json::json!({
+            "name": "sqlquery-export",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-export"
+        }));
+    }
+
+    ops
+}
+
+/// Builds the `extension` array on `rest[0]` advertising SOF-specific flags.
+fn build_sof_rest_extension<S: ResourceStorage + Send + Sync + 'static>(
+    state: &AppState<S>,
+) -> Option<serde_json::Value> {
+    let caps = build_sof_capabilities(state);
+    // Inline the SOF Parameters as a contained extension value so consumers
+    // that understand the SOF spec can discover the flags without an extra request.
+    Some(serde_json::json!([
+        {
+            "url": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-sof-capabilities.html",
+            "valueReference": {
+                "reference": "/$sql-on-fhir-capabilities",
+                "display": "SQL-on-FHIR Capabilities"
+            }
+        },
+        {
+            "url": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-sof-capabilities-inline.html",
+            "valueAttachment": {
+                "contentType": "application/json",
+                "data": serde_json::to_string(&caps).unwrap_or_default()
+            }
+        }
+    ]))
+}
+
 /// Builds the capability entry for a resource type.
-fn build_resource_capability(resource_type: &str) -> serde_json::Value {
+fn build_resource_capability(
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+    supports_contained: bool,
+) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "type": resource_type,
         "profile": format!("http://hl7.org/fhir/StructureDefinition/{}", resource_type),
@@ -221,7 +323,7 @@ fn build_resource_capability(resource_type: &str) -> serde_json::Value {
         "conditionalDelete": "single",
         "searchInclude": ["*"],
         "searchRevInclude": ["*"],
-        "searchParam": build_common_search_params()
+        "searchParam": build_search_params(resource_type, registry, supports_contained)
     });
     // Bulk Data Access IG: per-resource `$export` operation entries on Patient
     // and Group, in addition to the system-level `$export` advertised at
@@ -244,9 +346,61 @@ fn build_resource_capability(resource_type: &str) -> serde_json::Value {
     entry
 }
 
+/// Builds the full `searchParam` list for a resource type: the seven common
+/// params plus the resource-specific params from the loaded SearchParameter
+/// registry. Control/common params (those starting with `_`) and duplicates are
+/// skipped.
+fn build_search_params(
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+    supports_contained: bool,
+) -> Vec<serde_json::Value> {
+    let mut params = build_common_search_params(supports_contained);
+    let mut seen: std::collections::HashSet<String> = params
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect();
+
+    for def in registry.get_active_params(resource_type) {
+        if def.code.starts_with('_') || !seen.insert(def.code.clone()) {
+            continue;
+        }
+        let mut param = serde_json::json!({
+            "name": def.code,
+            "type": fhir_search_param_type(def.param_type),
+            "definition": def.url,
+        });
+        if let Some(doc) = &def.description {
+            param["documentation"] = serde_json::Value::String(doc.clone());
+        }
+        params.push(param);
+    }
+    params
+}
+
+/// Maps an internal search-parameter type to its FHIR CapabilityStatement
+/// `searchParam.type` code.
+fn fhir_search_param_type(t: SearchParamType) -> &'static str {
+    match t {
+        SearchParamType::Number => "number",
+        SearchParamType::Date => "date",
+        SearchParamType::String => "string",
+        SearchParamType::Token => "token",
+        SearchParamType::Reference => "reference",
+        SearchParamType::Composite => "composite",
+        SearchParamType::Quantity => "quantity",
+        SearchParamType::Uri => "uri",
+        SearchParamType::Special => "special",
+    }
+}
+
 /// Builds common search parameters supported by all resources.
-fn build_common_search_params() -> Vec<serde_json::Value> {
-    vec![
+///
+/// `_contained` / `_containedType` are only included when `supports_contained`
+/// is set (the backend can evaluate contained search). `_list` is always
+/// advertised (resolved application-side on every backend).
+fn build_common_search_params(supports_contained: bool) -> Vec<serde_json::Value> {
+    let mut params = vec![
         serde_json::json!({
             "name": "_id",
             "type": "token",
@@ -274,13 +428,63 @@ fn build_common_search_params() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "_text",
-            "type": "string",
+            "type": "special",
             "documentation": "Search on the narrative of the resource"
         }),
         serde_json::json!({
             "name": "_content",
-            "type": "string",
+            "type": "special",
             "documentation": "Search on the entire content of the resource"
         }),
-    ]
+        serde_json::json!({
+            "name": "_list",
+            "type": "special",
+            "documentation": "Resources referenced by the given List resource"
+        }),
+    ];
+
+    if supports_contained {
+        params.push(serde_json::json!({
+            "name": "_contained",
+            "type": "token",
+            "documentation": "Whether to search contained resources (false|true|both)"
+        }));
+        params.push(serde_json::json!({
+            "name": "_containedType",
+            "type": "token",
+            "documentation": "Return the container or the contained resource (container|contained)"
+        }));
+    }
+
+    params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn param_names(params: &[serde_json::Value]) -> Vec<String> {
+        params
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn common_params_always_advertise_list() {
+        let names = param_names(&build_common_search_params(false));
+        assert!(names.contains(&"_list".to_string()));
+        assert!(names.contains(&"_text".to_string()));
+    }
+
+    #[test]
+    fn contained_params_gated_on_capability() {
+        let without = param_names(&build_common_search_params(false));
+        assert!(!without.contains(&"_contained".to_string()));
+        assert!(!without.contains(&"_containedType".to_string()));
+
+        let with = param_names(&build_common_search_params(true));
+        assert!(with.contains(&"_contained".to_string()));
+        assert!(with.contains(&"_containedType".to_string()));
+    }
 }

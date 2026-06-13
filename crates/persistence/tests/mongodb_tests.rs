@@ -1259,6 +1259,109 @@ async fn mongodb_integration_history_delete_trial_use_not_supported() {
 }
 
 #[tokio::test]
+async fn mongodb_integration_contained_search() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+
+    let Some(backend) = create_backend_with_full_registry("contained_search").await else {
+        eprintln!("Skipping mongodb_integration_contained_search (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained");
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs1",
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                "subject": { "reference": "#p1" },
+                "contained": [{
+                    "resourceType": "Patient",
+                    "id": "p1",
+                    "name": [{ "family": "Smith", "given": ["Contained"] }],
+                    "gender": "male"
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "top1", "name": [{ "family": "Smith" }] }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let name_query = |mode: ContainedMode, ret: ContainedReturn| {
+        let mut q = SearchQuery::new("Patient");
+        q.contained = mode;
+        q.contained_return = ret;
+        q.parameters.push(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Smith")],
+            chain: vec![],
+            components: vec![],
+        });
+        q
+    };
+
+    // Default (_contained=off): only the top-level Patient.
+    let off = backend
+        .search(
+            &tenant,
+            &name_query(ContainedMode::Off, ContainedReturn::Container),
+        )
+        .await
+        .unwrap();
+    let off_urls: Vec<String> = off.resources.items.iter().map(|r| r.url()).collect();
+    assert_eq!(off_urls, vec!["Patient/top1"]);
+
+    // _contained=true: the container is returned.
+    let on = backend
+        .search(
+            &tenant,
+            &name_query(ContainedMode::On, ContainedReturn::Container),
+        )
+        .await
+        .unwrap();
+    let on_urls: Vec<String> = on.resources.items.iter().map(|r| r.url()).collect();
+    assert_eq!(on_urls, vec!["Observation/obs1"]);
+
+    // _containedType=contained: the contained Patient itself.
+    let contained = backend
+        .search(
+            &tenant,
+            &name_query(ContainedMode::On, ContainedReturn::Contained),
+        )
+        .await
+        .unwrap();
+    assert_eq!(contained.resources.items.len(), 1);
+    assert_eq!(contained.resources.items[0].resource_type(), "Patient");
+    assert_eq!(contained.resources.items[0].id(), "p1");
+
+    // _contained=both: top-level + container.
+    let both = backend
+        .search(
+            &tenant,
+            &name_query(ContainedMode::Both, ContainedReturn::Container),
+        )
+        .await
+        .unwrap();
+    let mut both_urls: Vec<String> = both.resources.items.iter().map(|r| r.url()).collect();
+    both_urls.sort();
+    assert_eq!(both_urls, vec!["Observation/obs1", "Patient/top1"]);
+}
+
+#[tokio::test]
 async fn mongodb_integration_search_quantity() {
     let Some(backend) = create_backend_with_full_registry("search_quantity").await else {
         eprintln!("Skipping mongodb_integration_search_quantity (set HFS_TEST_MONGODB_URL)");
@@ -1332,6 +1435,100 @@ async fn mongodb_integration_search_quantity() {
         .await
         .unwrap();
     assert!(result.resources.items.is_empty(), "wrong unit → no hit");
+}
+
+#[tokio::test]
+async fn mongodb_integration_compartment_search() {
+    // Compartment membership: a resource joins the Patient compartment if it
+    // references the patient via ANY of the membership params (`subject` OR
+    // `performer`). Resources for another patient must be excluded.
+    use helios_persistence::types::CompartmentMembership;
+
+    let Some(backend) = create_backend_with_full_registry("compartment_search").await else {
+        eprintln!("Skipping mongodb_integration_compartment_search (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let tenant = create_tenant("tenant-compartment");
+
+    // In the compartment via `subject`.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-subject",
+                "status": "final",
+                "code": {"text": "hr"},
+                "subject": {"reference": "Patient/p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // In the compartment via the NON-first param `performer` only.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-performer",
+                "status": "final",
+                "code": {"text": "hr"},
+                "subject": {"reference": "Patient/p2"},
+                "performer": [{"reference": "Patient/p1"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Not in the compartment (references another patient).
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-other",
+                "status": "final",
+                "code": {"text": "hr"},
+                "subject": {"reference": "Patient/p2"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut query = SearchQuery::new("Observation");
+    query.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string(), "performer".to_string()],
+        reference: "Patient/p1".to_string(),
+    });
+
+    let result = backend.search(&tenant, &query).await.unwrap();
+    let ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+
+    assert!(
+        ids.contains(&"obs-subject".to_string()),
+        "compartment must include the resource linked via `subject`"
+    );
+    assert!(
+        ids.contains(&"obs-performer".to_string()),
+        "compartment must include the resource linked via `performer`"
+    );
+    assert!(
+        !ids.contains(&"obs-other".to_string()),
+        "compartment must exclude resources of another patient"
+    );
 }
 
 #[tokio::test]

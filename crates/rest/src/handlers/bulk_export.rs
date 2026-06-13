@@ -51,69 +51,11 @@ fn bad_request(msg: impl Into<String>) -> RestError {
     }
 }
 
-use crate::extractors::query_pairs::{collect_multi, first_value, parse_query_pairs};
-
-/// Parses a FHIR `instant` into a UTC datetime.
-fn parse_instant(s: &str) -> Result<chrono::DateTime<Utc>, RestError> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| bad_request(format!("invalid instant '{s}': {e}")))
-}
-
-/// Reads the `Prefer: handling=` directive (`strict` / `lenient`).
-fn prefer_handling(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("prefer")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|p| {
-            p.split(',')
-                .map(|s| s.trim())
-                .find_map(|s| s.strip_prefix("handling="))
-                .map(|s| s.to_ascii_lowercase())
-        })
-}
-
-/// Returns true if `Prefer: respond-async` is present.
-fn has_respond_async(headers: &HeaderMap) -> bool {
-    headers
-        .get("prefer")
-        .and_then(|v| v.to_str().ok())
-        .map(|p| {
-            p.split(',')
-                .any(|s| s.trim().eq_ignore_ascii_case("respond-async"))
-        })
-        .unwrap_or(false)
-}
-
-/// Builds the parameter pairs from a POST `Parameters` resource body.
-fn pairs_from_parameters(body: &serde_json::Value) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-    if let Some(arr) = body.get("parameter").and_then(|p| p.as_array()) {
-        for p in arr {
-            let Some(name) = p.get("name").and_then(|n| n.as_str()) else {
-                continue;
-            };
-            // Accept valueString / valueUri / valueInstant / valueCode etc.
-            let value = p
-                .get("valueString")
-                .or_else(|| p.get("valueUri"))
-                .or_else(|| p.get("valueInstant"))
-                .or_else(|| p.get("valueCode"))
-                .or_else(|| p.get("valueDateTime"))
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    // patient reference: { name: "patient", valueReference: { reference } }
-                    p.get("valueReference")
-                        .and_then(|r| r.get("reference"))
-                        .and_then(|r| r.as_str())
-                });
-            if let Some(v) = value {
-                pairs.push((name.to_string(), v.to_string()));
-            }
-        }
-    }
-    pairs
-}
+// Shared `Prefer` / `Parameters` parsing helpers live in `bulk_common`.
+use super::bulk_common::{
+    collect_multi, first_value, has_respond_async, pairs_from_parameters, parse_instant,
+    parse_query_pairs, prefer_handling,
+};
 
 /// Shared kick-off logic for all three export levels.
 #[allow(clippy::too_many_arguments)]

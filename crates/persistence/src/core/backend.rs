@@ -98,14 +98,20 @@ pub enum BackendCapability {
     Sorting,
     /// Bulk export operations.
     BulkExport,
-    /// Bulk import operations.
-    BulkImport,
+    /// Synchronous Bulk Data Submit ingestion (`BulkSubmitProvider`).
+    BulkSubmitIngest,
+    /// Full `$bulk-submit` REST worker/job-store support.
+    BulkSubmitRestWorker,
     /// Shared schema multitenancy.
     SharedSchema,
     /// Schema-per-tenant multitenancy.
     SchemaPerTenant,
     /// Database-per-tenant multitenancy.
     DatabasePerTenant,
+    /// Backend can compile ViewDefinitions to SQL and run them in-DB (no in-process FHIRPath eval).
+    InDbSofRunner,
+    /// Backend supports raw SQL queries via `$sql-query-run` (Postgres, SQLite only).
+    RawSqlQuery,
 }
 
 impl std::fmt::Display for BackendCapability {
@@ -133,10 +139,13 @@ impl std::fmt::Display for BackendCapability {
             BackendCapability::OffsetPagination => "offset-pagination",
             BackendCapability::Sorting => "sorting",
             BackendCapability::BulkExport => "bulk-export",
-            BackendCapability::BulkImport => "bulk-import",
+            BackendCapability::BulkSubmitIngest => "bulk-submit-ingest",
+            BackendCapability::BulkSubmitRestWorker => "bulk-submit-rest-worker",
             BackendCapability::SharedSchema => "shared-schema",
             BackendCapability::SchemaPerTenant => "schema-per-tenant",
             BackendCapability::DatabasePerTenant => "database-per-tenant",
+            BackendCapability::InDbSofRunner => "indb-sof-runner",
+            BackendCapability::RawSqlQuery => "raw-sql-query",
         };
         write!(f, "{}", name)
     }
@@ -299,6 +308,14 @@ mod tests {
         assert_eq!(
             BackendCapability::FullTextSearch.to_string(),
             "full-text-search"
+        );
+        assert_eq!(
+            BackendCapability::BulkSubmitIngest.to_string(),
+            "bulk-submit-ingest"
+        );
+        assert_eq!(
+            BackendCapability::BulkSubmitRestWorker.to_string(),
+            "bulk-submit-rest-worker"
         );
     }
 

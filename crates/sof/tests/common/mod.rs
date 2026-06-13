@@ -29,13 +29,21 @@ fn create_test_app() -> Router {
 
     Router::new()
         .route("/metadata", get(capability_statement_handler))
+        .route("/$sql-on-fhir-capabilities", get(sof_capabilities_handler))
+        // System-level alias (audit item #6).
+        .route(
+            "/$viewdefinition-run",
+            post(run_view_definition_handler).get(run_view_definition_get_handler),
+        )
         .route(
             "/ViewDefinition/$viewdefinition-run",
             post(run_view_definition_handler).get(run_view_definition_get_handler),
         )
+        // Instance-level: rejected with 400 because sof-server is
+        // stateless (audit item #7). Both GET and POST land here.
         .route(
             "/ViewDefinition/{id}/$viewdefinition-run",
-            get(run_view_definition_by_id_handler),
+            get(run_view_definition_by_id_handler).post(run_view_definition_by_id_handler),
         )
         .route("/health", get(health_check))
         .layer(CorsLayer::permissive())
@@ -46,6 +54,11 @@ async fn capability_statement_handler() -> axum::response::Response {
     // This is a simplified version for testing
     // In production, this would use the actual handler from helios_sof::server::handlers
 
+    // Stub mirroring the production CapabilityStatement structure (audit
+    // items #6, #7, #11). Real production wiring lives in
+    // `crates/sof/src/handlers.rs::create_capability_statement` and is
+    // exercised by the in-handler unit test there; this stub only needs to
+    // be shape-compatible for the integration smoke tests.
     let capability_statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
         "id": "sof-server",
@@ -64,7 +77,14 @@ async fn capability_statement_handler() -> axum::response::Response {
             "url": "http://localhost:8080"
         },
         "fhirVersion": "4.0.1",
-        "format": ["json", "xml"],
+        "format": [
+            "application/json",
+            "application/x-ndjson",
+            "text/csv",
+            "application/vnd.apache.parquet",
+            "application/octet-stream",
+            "application/fhir+json"
+        ],
         "rest": [{
             "mode": "server",
             "resource": [{
@@ -78,7 +98,7 @@ async fn capability_statement_handler() -> axum::response::Response {
             "operation": [{
                 "name": "viewdefinition-run",
                 "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run",
-                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, and NDJSON output formats."
+                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, NDJSON, and Parquet output. Invoked at the system level (POST /$viewdefinition-run) or type level (POST /ViewDefinition/$viewdefinition-run); the ViewDefinition must be supplied inline in the request body via 'viewResource' (no resource store, so 'viewReference' and instance-level URLs are not supported)."
             }]
         }]
     });
@@ -87,6 +107,44 @@ async fn capability_statement_handler() -> axum::response::Response {
         axum::http::StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/fhir+json")],
         Json(capability_statement),
+    )
+        .into_response()
+}
+
+/// Stub for the `GET /$sql-on-fhir-capabilities` endpoint (audit item
+/// #11). Mirrors the shape sof-server's production handler emits so
+/// integration tests can exercise the same client-facing response.
+async fn sof_capabilities_handler() -> axum::response::Response {
+    let caps = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "supportsViewDefinitionRun", "valueBoolean": true},
+            {"name": "supportsViewDefinitionExport", "valueBoolean": false},
+            {"name": "supportsSqlQueryRun", "valueBoolean": false},
+            {"name": "supportsInDbRunner", "valueBoolean": false},
+            {"name": "supportsRelativeReference", "valueBoolean": false},
+            {"name": "supportsCanonicalReference", "valueBoolean": false},
+            {"name": "supportsAbsoluteReference", "valueBoolean": false},
+            {"name": "supportedFormat", "valueCode": "ndjson"},
+            {"name": "supportedFormat", "valueCode": "json"},
+            {"name": "supportedFormat", "valueCode": "csv"},
+            {"name": "supportedFormat", "valueCode": "parquet"},
+            {
+                "name": "formatBinding",
+                "part": [
+                    {
+                        "name": "valueSet",
+                        "valueUri": "https://sql-on-fhir.org/ig/ValueSet/OutputFormatCodes"
+                    },
+                    {"name": "strength", "valueCode": "extensible"}
+                ]
+            }
+        ]
+    });
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/fhir+json")],
+        Json(caps),
     )
         .into_response()
 }
@@ -106,8 +164,12 @@ async fn run_view_definition_handler(
         return error_response(axum::http::StatusCode::BAD_REQUEST, &e);
     }
 
-    // Basic parameter parsing
-    if body["resourceType"] != "Parameters" {
+    // sof-server accepts two body shapes:
+    //   - A FHIR `Parameters` resource (full form), or
+    //   - A bare `ViewDefinition` resource (shortcut — equivalent to a
+    //     Parameters body with a single `viewResource` entry).
+    let is_bare_view_definition = body["resourceType"] == "ViewDefinition";
+    if !is_bare_view_definition && body["resourceType"] != "Parameters" {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
             "Request body must be a Parameters resource",
@@ -122,7 +184,10 @@ async fn run_view_definition_handler(
     let mut patient_filter = None;
     let mut count_from_body = None;
 
-    if let Some(parameters) = body["parameter"].as_array() {
+    if is_bare_view_definition {
+        // Body itself is the ViewDefinition; no resources, no operation params.
+        view_def_json = body.as_object().cloned();
+    } else if let Some(parameters) = body["parameter"].as_array() {
         for param in parameters {
             match param["name"].as_str() {
                 Some("viewResource") => {
@@ -378,38 +443,30 @@ async fn run_view_definition_handler(
         }
     };
 
-    // Check if header parameter is being used with non-CSV format
-    if header_param.is_some() && format_from_body.is_none() {
-        // We have a header parameter but need to check if format is CSV
-        let test_format = format.or(accept).unwrap_or("application/json");
-        if test_format != "text/csv" {
-            return error_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Header parameter only applies to CSV format",
-            );
-        }
-    }
+    // Per spec: "Applies only when csv output is requested" — so the
+    // `header` parameter is silently ignored for non-CSV formats rather
+    // than producing 400. This stub used to mirror an older
+    // (overly-strict) production behavior; aligned to the new lenient
+    // rule per audit item #14.
 
+    // Per spec (operations-common, Output Formats): an unsupported
+    // `_format` value → 400 Bad Request + OperationOutcome (mirrors the
+    // production mapping of SofError::UnsupportedContentType).
     let content_type = match parse_content_type(accept, format, header_param) {
         Ok(ct) => ct,
-        Err(e) => match e {
-            helios_sof::SofError::UnsupportedContentType(_) => {
-                return error_response(
-                    axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    &e.to_string(),
-                );
-            }
-            _ => return error_response(axum::http::StatusCode::BAD_REQUEST, &e.to_string()),
-        },
+        Err(e) => return error_response(axum::http::StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
     // Create ViewDefinition and Bundle
+    // Per SoF v2 spec: invalid ViewDefinition → 422 Unprocessable Entity
+    // (audit item #9). Production code does the same mapping; the test
+    // stub mirrors so integration tests see the right status.
     let view_definition =
         match serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_def_json) {
             Ok(vd) => SofViewDefinition::R4(vd),
             Err(e) => {
                 return error_response(
-                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                     &format!("Invalid ViewDefinition: {}", e),
                 );
             }
@@ -448,19 +505,33 @@ async fn run_view_definition_handler(
                 );
             };
 
-            let mime_type = match content_type {
-                ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
-                ContentType::Json => "application/json",
-                ContentType::NdJson => "application/ndjson",
-                ContentType::Parquet => "application/parquet",
-            };
+            // Per SoF v2 spec: each format's native media type (parquet is
+            // `application/vnd.apache.parquet`). Production code does the
+            // same; mirroring here so integration tests exercise the right
+            // headers.
+            let mime_type = content_type.mime_type();
 
-            (
-                axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, mime_type)],
-                output,
-            )
-                .into_response()
+            if matches!(content_type, ContentType::Parquet) {
+                (
+                    axum::http::StatusCode::OK,
+                    [
+                        (axum::http::header::CONTENT_TYPE, mime_type),
+                        (
+                            axum::http::header::CONTENT_DISPOSITION,
+                            "attachment; filename=\"output.parquet\"",
+                        ),
+                    ],
+                    output,
+                )
+                    .into_response()
+            } else {
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, mime_type)],
+                    output,
+                )
+                    .into_response()
+            }
         }
         Err(e) => error_response(axum::http::StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
     }
@@ -551,16 +622,18 @@ async fn run_view_definition_get_handler(
 }
 
 async fn run_view_definition_by_id_handler(
-    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Path(_id): axum::extract::Path<String>,
     _query: axum::extract::Query<std::collections::HashMap<String, String>>,
     _headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    // Audit item #7: stateless server rejects instance-level URLs with
+    // 400 (not 404 or 501) and points at the supported alternative.
     error_response(
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        &format!(
-            "ViewDefinition lookup by ID '{}' is not implemented. Use POST /ViewDefinition/$viewdefinition-run with the ViewDefinition in the request body.",
-            id
-        ),
+        axum::http::StatusCode::BAD_REQUEST,
+        "Instance-level $viewdefinition-run (/ViewDefinition/{id}/$viewdefinition-run) is not \
+         supported by this stateless server — there is no resource store to look up a stored \
+         ViewDefinition by id. Use POST /ViewDefinition/$viewdefinition-run with a 'viewResource' \
+         parameter (or a bare ViewDefinition body) instead.",
     )
 }
 

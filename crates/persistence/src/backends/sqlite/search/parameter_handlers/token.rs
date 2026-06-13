@@ -62,14 +62,6 @@ impl TokenHandler {
             return Self::build_text_advanced_sql(&value.value, param_offset);
         }
 
-        // Handle :code-only modifier
-        if matches!(modifier, Some(SearchModifier::CodeOnly)) {
-            return SqlFragment::with_params(
-                format!("value_token_code = ?{}", param_num),
-                vec![SqlParam::string(&value.value)],
-            );
-        }
-
         // Handle :of-type modifier (for identifier searches)
         if matches!(modifier, Some(SearchModifier::OfType)) {
             return Self::build_of_type_sql(&value.value, param_offset);

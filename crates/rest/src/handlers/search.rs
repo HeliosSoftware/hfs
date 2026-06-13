@@ -17,7 +17,7 @@ use helios_persistence::core::{
     IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
     resolve_includes_iterative,
 };
-use helios_persistence::types::SearchBundle;
+use helios_persistence::types::{SearchBundle, SearchParamType};
 use tracing::{debug, warn};
 
 use helios_fhir::FhirVersion;
@@ -159,6 +159,22 @@ async fn execute_search<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    // Reject known-but-unimplemented control parameters instead of silently
+    // ignoring them (which returns an unfiltered, misleading `200`). `_query`
+    // (named queries) is not implemented by any backend. (`_list` is implemented
+    // via list resolution; `_score` as an output/`_sort` concept; `_contained` /
+    // `_containedType` are parsed below and gated per backend capability.)
+    const UNSUPPORTED_PARAMS: [&str; 1] = ["_query"];
+    if let Some((key, _)) = pairs
+        .iter()
+        .find(|(k, _)| UNSUPPORTED_PARAMS.contains(&k.as_str()))
+    {
+        return Err(RestError::InvalidParameter {
+            param: key.clone(),
+            message: format!("search parameter '{key}' is not supported by this server"),
+        });
+    }
+
     // `:not-in` requires negated value-set filtering, which no backend
     // implements. Reject it explicitly (501) regardless of whether a terminology
     // server is configured, rather than silently ignoring it (which would return
@@ -176,6 +192,37 @@ where
     let pairs = if let Some(ts_url) = state.terminology_server_url() {
         expand_terminology_params(pairs, ts_url).await?
     } else {
+        // No terminology server configured: token `:in` / `:above` / `:below`
+        // cannot be satisfied. Reject them with `501` rather than silently
+        // falling through to literal matching (which returns misleading results).
+        // `:in` is token-only, so it always needs terminology; `:above`/`:below`
+        // also apply to reference/uri, which resolve locally — only reject those
+        // when the parameter is a token. See assessment item A2c.
+        {
+            let registry = state.storage().search_param_registry().read();
+            for (key, _) in &pairs {
+                let Some((base, modifier)) = key.split_once(':') else {
+                    continue;
+                };
+                let needs_terminology = match modifier {
+                    "in" => true,
+                    "above" | "below" => registry
+                        .get_param(resource_type, base)
+                        .or_else(|| registry.get_param("Resource", base))
+                        .map(|p| p.param_type == SearchParamType::Token)
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if needs_terminology {
+                    return Err(RestError::NotImplemented {
+                        feature: format!(
+                            "search modifier ':{modifier}' on token parameter '{base}' requires a \
+                             configured terminology server (set HFS_TERMINOLOGY_SERVER)"
+                        ),
+                    });
+                }
+            }
+        }
         pairs
     };
 
@@ -200,8 +247,46 @@ where
                 });
             }
         }
-        build_search_query(resource_type, &search_params, &registry)?
+        let built = build_search_query(resource_type, &search_params, &registry)?;
+        // Under strict handling, reject a `_sort` on a field the server cannot
+        // actually sort by (it would otherwise silently fall back to `id`). Only
+        // `_id`, `_lastUpdated`, and registered indexed typed params sort
+        // reliably; composite/special/unknown fields do not. See item A4a.
+        if strict {
+            for s in &built.sort {
+                let sortable = s.parameter == "_id"
+                    || s.parameter == "_lastUpdated"
+                    // `_score` ranks by relevance on full-text backends
+                    // (Elasticsearch); other backends fall back to default order.
+                    || s.parameter == "_score"
+                    || matches!(
+                        s.param_type,
+                        Some(t) if t != SearchParamType::Composite && t != SearchParamType::Special
+                    );
+                if !sortable {
+                    return Err(RestError::InvalidParameter {
+                        param: format!("_sort={}", s.parameter),
+                        message: format!(
+                            "cannot sort by '{}' (unsupported sort field) under Prefer: handling=strict",
+                            s.parameter
+                        ),
+                    });
+                }
+            }
+        }
+        built
     };
+
+    // `_contained=true|both` requires contained-resource indexing. Gate it on the
+    // backend's capability so unsupported backends return a clear 501 rather than
+    // silently ignoring the parameter and returning an unfiltered result.
+    if query.contained != helios_persistence::types::ContainedMode::Off
+        && !state.storage().supports_contained_search()
+    {
+        return Err(RestError::NotImplemented {
+            feature: "'_contained' search is not supported by this storage backend".to_string(),
+        });
+    }
 
     // Clamp page size to the configured default/maximum.
     let count = query
@@ -210,6 +295,30 @@ where
         .unwrap_or(state.default_page_size())
         .min(state.max_page_size());
     query.count = Some(count as u32);
+
+    // Resolve `_list` into an `_id` filter via application-side List lookup, so
+    // any backend's `search()` can execute it. Functional list values (the
+    // `$current-*` pseudo-lists) require patient-compartment clinical logic that
+    // no backend implements; reject them explicitly rather than silently
+    // returning an unfiltered result.
+    if let Some(functional) = query.list.iter().find(|v| v.starts_with('$')) {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "functional list '{functional}' is not supported; \
+                 use '_list=[List id]' with a stored List resource"
+            ),
+        });
+    }
+    let query = if helios_persistence::search::query_has_list(&query) {
+        helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "List (_list) resolution failed");
+                RestError::from(e)
+            })?
+    } else {
+        query
+    };
 
     // Resolve chained / reverse-chained (`_has`) parameters into an `_id` filter
     // via application-side joins, so any backend's `search()` can execute them.
@@ -437,13 +546,19 @@ fn bundle_to_json_with_subsetting(
                 entry["resource"] = subsetted;
             }
             if let Some(ref search) = e.search {
-                entry["search"] = serde_json::json!({
+                let mut search_json = serde_json::json!({
                     "mode": match search.mode {
                         helios_persistence::types::SearchEntryMode::Match => "match",
                         helios_persistence::types::SearchEntryMode::Include => "include",
                         helios_persistence::types::SearchEntryMode::Outcome => "outcome",
                     }
                 });
+                // Relevance score (Bundle.entry.search.score), when the backend
+                // computed one.
+                if let Some(score) = search.score {
+                    search_json["score"] = serde_json::json!(score);
+                }
+                entry["search"] = search_json;
             }
             entry
         }).collect::<Vec<_>>()
@@ -850,5 +965,36 @@ mod tests {
             as_map(&result).get("url:below"),
             Some(&"http://example.org/fhir/ValueSet/x".to_string())
         );
+    }
+
+    #[test]
+    fn test_bundle_json_emits_search_score() {
+        use helios_persistence::types::{BundleEntry, SearchBundle};
+
+        let bundle = SearchBundle::new().with_entry(
+            BundleEntry::match_entry(
+                "http://example.com/fhir/Patient/1",
+                serde_json::json!({"resourceType": "Patient", "id": "1"}),
+            )
+            .with_score(Some(0.42)),
+        );
+
+        let json = bundle_to_json_with_subsetting(bundle, None, None, FhirVersion::R4);
+        let search = &json["entry"][0]["search"];
+        assert_eq!(search["mode"], "match");
+        assert_eq!(search["score"], serde_json::json!(0.42));
+    }
+
+    #[test]
+    fn test_bundle_json_omits_absent_search_score() {
+        use helios_persistence::types::{BundleEntry, SearchBundle};
+
+        let bundle = SearchBundle::new().with_entry(BundleEntry::match_entry(
+            "http://example.com/fhir/Patient/1",
+            serde_json::json!({"resourceType": "Patient", "id": "1"}),
+        ));
+
+        let json = bundle_to_json_with_subsetting(bundle, None, None, FhirVersion::R4);
+        assert!(json["entry"][0]["search"].get("score").is_none());
     }
 }

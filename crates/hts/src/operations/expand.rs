@@ -589,6 +589,45 @@ fn parse_display_language(raw: &str) -> Option<DisplayLangSpec> {
     })
 }
 
+/// Inspect an inline `valueSet` compose for the "pure full-system" shape that
+/// qualifies for default hierarchical expansion (see the default-nesting block
+/// in [`process_expand_inner`]): at least one `compose.include`, every include
+/// a bare `{system[, version]}` with no `filter` / `concept` / `valueSet`, and
+/// no `compose.exclude`. Returns the included `(system, version)` pairs, or
+/// `None` when the compose has any other shape (filtered, enumerated,
+/// nested-valueSet, or carries excludes) — those keep the flat default.
+fn pure_full_system_includes(value_set: Option<&Value>) -> Option<Vec<(String, Option<String>)>> {
+    let compose = value_set?.get("compose")?;
+    // Any exclude clause disqualifies — excludes make the surviving set a
+    // curated list rather than a faithful slice of the CS hierarchy.
+    if compose
+        .get("exclude")
+        .and_then(|e| e.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return None;
+    }
+    let includes = compose.get("include")?.as_array()?;
+    if includes.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(includes.len());
+    for inc in includes {
+        let obj = inc.as_object()?;
+        if obj.contains_key("filter") || obj.contains_key("concept") || obj.contains_key("valueSet")
+        {
+            return None;
+        }
+        let system = obj.get("system").and_then(|v| v.as_str())?;
+        let version = obj
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        out.push((system.to_string(), version));
+    }
+    Some(out)
+}
+
 /// The HL7 `hl7TermMaintInfra` system + code identifying a designation as
 /// the "preferred for language" entry. Used when the displayLanguage swap
 /// rotates the CodeSystem's original-language display into the designation
@@ -1062,26 +1101,18 @@ fn apply_display_language<'a, B: TerminologyBackend>(
         }
         // (system, code) → (designation language tag, designation value).
         // Match using BCP 47 / RFC 4647 Lookup: prefer an exact match, then
-        // accept any designation whose tag starts with the requested tag plus
-        // a `-` subtag separator (so `de` matches `de-CH` but not `den`).
+        // a designation whose tag extends the requested tag with a `-`
+        // subtag (so `de` matches `de-CH` but not `den`), then the same two
+        // rules against truncations of the requested tag (`de-DE` → `de`).
         let mut match_map: HashMap<(String, String), (Option<String>, String)> = HashMap::new();
         for (system, codes) in &by_system {
             if let Ok(ds) = backend.concept_designations(ctx, system, codes).await {
                 for (code, list) in ds {
-                    let exact = list
-                        .iter()
-                        .find(|d| d.language.as_deref() == Some(language));
-                    let chosen = exact.cloned().or_else(|| {
-                        list.into_iter().find(|d| {
-                            d.language.as_deref().is_some_and(|lang| {
-                                let prefix = format!("{language}-");
-                                lang.eq_ignore_ascii_case(language)
-                                    || lang
-                                        .to_ascii_lowercase()
-                                        .starts_with(&prefix.to_ascii_lowercase())
-                            })
-                        })
-                    });
+                    let chosen = crate::language::best_lang_match_index(
+                        language,
+                        list.iter().map(|d| d.language.as_deref()),
+                    )
+                    .and_then(|idx| list.into_iter().nth(idx));
                     if let Some(d) = chosen {
                         match_map.insert(((*system).to_string(), code), (d.language, d.value));
                     }
@@ -1132,13 +1163,24 @@ fn apply_display_language<'a, B: TerminologyBackend>(
                         .iter()
                         .any(|d| d.language == cs_lang && d.value == orig);
                     if !already {
-                        c.designations.push(ExpansionContainsDesignation {
-                            language: cs_lang.clone(),
-                            use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
-                            use_code: Some("preferredForLanguage".to_string()),
-                            value: orig,
-                            extensions: vec![],
-                        });
+                        // Insert at the FRONT: the rotated entry represents the
+                        // CodeSystem's primary `display`, which the IG
+                        // `language/expand-xform-*` fixtures list ahead of any
+                        // explicit designation. The HL7 validator sorts
+                        // designations by language (stable) before comparing, so
+                        // when an explicit designation shares the CS language
+                        // (e.g. en-multi `code2aII`) the preferredForLanguage
+                        // entry must precede it to match `designation[0]`.
+                        c.designations.insert(
+                            0,
+                            ExpansionContainsDesignation {
+                                language: cs_lang.clone(),
+                                use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
+                                use_code: Some("preferredForLanguage".to_string()),
+                                value: orig,
+                                extensions: vec![],
+                            },
+                        );
                     }
                 }
             } else if spec.hard_fallback {
@@ -1153,13 +1195,20 @@ fn apply_display_language<'a, B: TerminologyBackend>(
                             .iter()
                             .any(|d| d.language == cs_lang && d.value == orig);
                         if !already {
-                            c.designations.push(ExpansionContainsDesignation {
-                                language: cs_lang.clone(),
-                                use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
-                                use_code: Some("preferredForLanguage".to_string()),
-                                value: orig,
-                                extensions: vec![],
-                            });
+                            // Front-insert for the same reason as the swap branch
+                            // above: the primary-display rotation must precede any
+                            // explicit same-language designation (en-multi
+                            // `code2aII`) under the validator's language-sort.
+                            c.designations.insert(
+                                0,
+                                ExpansionContainsDesignation {
+                                    language: cs_lang.clone(),
+                                    use_system: Some(HL7_TERM_MAINT_INFRA_SYSTEM.to_string()),
+                                    use_code: Some("preferredForLanguage".to_string()),
+                                    value: orig,
+                                    extensions: vec![],
+                                },
+                            );
                         }
                     }
                 }
@@ -1469,7 +1518,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // either signal as a request for tree mode.
     let hierarchical_param = find_str_param(&params, "hierarchical").map(|s| s == "true");
     let exclude_nested = find_str_param(&params, "excludeNested").map(|s| s == "true");
-    let hierarchical = match (hierarchical_param, exclude_nested) {
+    let mut hierarchical = match (hierarchical_param, exclude_nested) {
         (Some(true), _) => Some(true),
         (_, Some(false)) => Some(true),
         (other, _) => other,
@@ -1478,6 +1527,39 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // enumerated expansions flat when only excludeNested=false was the
     // trigger (per the IG enum-* fixtures).
     let hierarchical_explicit = hierarchical_param == Some(true);
+
+    // Default-nesting: when the caller specified neither `hierarchical` nor
+    // `excludeNested`, the FHIR default is a hierarchical expansion that mirrors
+    // the CodeSystem's own is-a hierarchy (tx.fhir.org behaviour; pinned by the
+    // IG `version/vs-expand-versionless` fixture). Enable tree mode only for a
+    // "pure full-system" inline compose — every include a bare `{system}`, no
+    // filter/concept/valueSet, no excludes — where every included CodeSystem is
+    // a genuine is-a hierarchy. Filtered, enumerated, multi-source, or
+    // non-is-a composes stay flat, matching the ~100 other IG expand fixtures
+    // that omit `excludeNested` and expect a flat list. Only inline `valueSet`
+    // composes are inspected; URL-resolved ValueSets keep the flat default.
+    if hierarchical_param.is_none() && exclude_nested.is_none() {
+        if let Some(systems) = pure_full_system_includes(value_set.as_ref()) {
+            let ctx = TenantContext::system();
+            let mut all_isa = !systems.is_empty();
+            for (sys, ver) in &systems {
+                match state
+                    .backend()
+                    .code_system_is_hierarchical(&ctx, sys, ver.as_deref())
+                    .await
+                {
+                    Ok(true) => {}
+                    _ => {
+                        all_isa = false;
+                        break;
+                    }
+                }
+            }
+            if all_isa {
+                hierarchical = Some(true);
+            }
+        }
+    }
 
     // ── Resolve supplements (request `useSupplement` params) ────────────────
     // Walk every `useSupplement` and confirm a matching `content=supplement`

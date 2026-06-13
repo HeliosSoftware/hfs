@@ -63,6 +63,20 @@ impl ExtractedValue {
     }
 }
 
+/// Search values extracted from one `contained[]` entry of a container resource.
+#[derive(Debug, Clone)]
+pub struct ContainedExtraction {
+    /// The contained resource's `resourceType`.
+    pub contained_type: String,
+    /// The contained resource's local `id` (used for `Container/cid#localid`).
+    pub local_id: String,
+    /// The contained resource's JSON (the `contained[]` entry itself). Backends
+    /// that store content inline (Elasticsearch) index this directly.
+    pub content: Value,
+    /// The search values extracted from the contained resource.
+    pub values: Vec<ExtractedValue>,
+}
+
 /// Extracts searchable values from FHIR resources using FHIRPath.
 pub struct SearchParameterExtractor {
     registry: Arc<RwLock<SearchParameterRegistry>>,
@@ -145,6 +159,46 @@ impl SearchParameterExtractor {
         }
 
         Ok(results)
+    }
+
+    /// Extracts searchable values from a container resource's `contained[]`
+    /// entries, for `_contained` search.
+    ///
+    /// Each contained resource is treated as a standalone resource of its own
+    /// `resourceType` and run through the normal [`Self::extract`] path. Contained
+    /// resources without a `resourceType` or `id` are skipped — an `id` is
+    /// required so the match can be addressed (`Container/cid#localid`) and the
+    /// container can return the specific contained resource.
+    pub fn extract_contained(&self, container: &Value) -> Vec<ContainedExtraction> {
+        let Some(entries) = container.get("contained").and_then(|c| c.as_array()) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for entry in entries {
+            let (Some(contained_type), Some(local_id)) = (
+                entry.get("resourceType").and_then(|v| v.as_str()),
+                entry.get("id").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            match self.extract(entry, contained_type) {
+                Ok(values) if !values.is_empty() => out.push(ContainedExtraction {
+                    contained_type: contained_type.to_string(),
+                    local_id: local_id.to_string(),
+                    content: entry.clone(),
+                    values,
+                }),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "Failed to extract contained {}/{}: {}",
+                    contained_type,
+                    local_id,
+                    e
+                ),
+            }
+        }
+        out
     }
 
     /// Extracts values for a specific parameter from a resource.

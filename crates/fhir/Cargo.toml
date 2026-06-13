@@ -31,6 +31,10 @@ time = "0.3"
 chrono = { workspace = true }
 # Re-add serde-with-arbitrary-precision, keep macros
 rust_decimal = { version = "1.0", features = ["serde-with-arbitrary-precision", "macros"] }
+# SearchParameter registry/loader (moved from helios-persistence so helios-sof
+# can do compartment-aware filtering without a circular dep).
+regex = "1"
+tracing = "0.1"
 
 [dev-dependencies]
 rust_decimal_macros = "1.0"

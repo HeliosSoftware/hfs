@@ -83,6 +83,9 @@ fn test_postgres_expected_capabilities() {
         BackendCapability::CursorPagination,
         BackendCapability::Transactions,
         BackendCapability::OptimisticLocking,
+        BackendCapability::BulkExport,
+        BackendCapability::BulkSubmitIngest,
+        BackendCapability::BulkSubmitRestWorker,
         BackendCapability::Include,
         BackendCapability::Revinclude,
         BackendCapability::SharedSchema,
@@ -1831,6 +1834,9 @@ mod postgres_integration {
         assert!(backend.supports(BackendCapability::InstanceHistory));
         assert!(backend.supports(BackendCapability::BasicSearch));
         assert!(backend.supports(BackendCapability::Transactions));
+        assert!(backend.supports(BackendCapability::BulkExport));
+        assert!(backend.supports(BackendCapability::BulkSubmitIngest));
+        assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
         assert!(backend.supports(BackendCapability::Include));
         assert!(backend.supports(BackendCapability::Revinclude));
     }
@@ -3670,5 +3676,150 @@ mod postgres_integration {
             .unwrap();
         // Only completed/error/cancelled jobs can expire — these are accepted.
         assert!(expired_now.is_empty());
+    }
+
+    // ========================================================================
+    // _contained / _containedType search
+    // ========================================================================
+
+    async fn seed_contained(backend: &PostgresBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "obs1",
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "1234-5" }] },
+                    "subject": { "reference": "#p1" },
+                    "contained": [{
+                        "resourceType": "Patient",
+                        "id": "p1",
+                        "name": [{ "family": "Smith", "given": ["Contained"] }],
+                        "gender": "male"
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "top1", "name": [{ "family": "Smith" }] }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn contained_name_query(
+        mode: helios_persistence::types::ContainedMode,
+        ret: helios_persistence::types::ContainedReturn,
+    ) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+        let mut q = SearchQuery::new("Patient");
+        q.contained = mode;
+        q.contained_return = ret;
+        q.parameters.push(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Smith")],
+            chain: vec![],
+            components: vec![],
+        });
+        q
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_contained_off_excludes_contained() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{ContainedMode, ContainedReturn};
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &contained_name_query(ContainedMode::Off, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(urls, vec!["Patient/top1"]);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_contained_returns_container() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{ContainedMode, ContainedReturn};
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &contained_name_query(ContainedMode::On, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        assert_eq!(urls, vec!["Observation/obs1"]);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_contained_type_contained_returns_contained() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{ContainedMode, ContainedReturn};
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &contained_name_query(ContainedMode::On, ContainedReturn::Contained),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.resources.items.len(), 1);
+        let r = &result.resources.items[0];
+        assert_eq!(r.resource_type(), "Patient");
+        assert_eq!(r.id(), "p1");
+        assert_eq!(r.content()["name"][0]["given"][0], "Contained");
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_contained_both_merges() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{ContainedMode, ContainedReturn};
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+        seed_contained(&backend, &tenant).await;
+
+        let result = backend
+            .search(
+                &tenant,
+                &contained_name_query(ContainedMode::Both, ContainedReturn::Container),
+            )
+            .await
+            .unwrap();
+        let mut urls: Vec<String> = result.resources.items.iter().map(|r| r.url()).collect();
+        urls.sort();
+        assert_eq!(urls, vec!["Observation/obs1", "Patient/top1"]);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_supports_contained_search() {
+        use helios_persistence::core::SearchProvider;
+        let backend = create_backend().await;
+        assert!(backend.supports_contained_search());
     }
 }

@@ -8,10 +8,6 @@ crates/sof/output.csv
 package-lock.json
 .prettierrc
 off
-.claude
-AGENTS.md
-.claude/
-
 # Build script download markers
 .download_marker
 
@@ -22,4 +18,3 @@ AGENTS.md
 
 # Test artifacts
 /test-artifacts
-

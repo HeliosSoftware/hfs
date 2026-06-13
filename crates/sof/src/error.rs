@@ -19,11 +19,23 @@ pub enum ServerError {
     /// Invalid request parameters or body
     BadRequest(String),
 
+    /// A reference supplied in a request (e.g. `patient` / `group` on
+    /// `$viewdefinition-run`) does not resolve. Surfaces as `400 Bad Request`
+    /// + `OperationOutcome.issue.code = not-found`, per the SoF v2 spec's
+    /// error table.
+    ReferencedResourceNotFound(String),
+
     /// Requested resource not found
     NotFound(String),
 
     /// Unsupported media type or format
     UnsupportedMediaType(String),
+
+    /// The representation requested via `Accept` cannot be produced
+    /// (e.g. the `application/fhir+xml` `Binary` envelope form). Surfaces
+    /// as `406 Not Acceptable` + `OperationOutcome` per the SoF v2 spec's
+    /// content-negotiation rules.
+    NotAcceptable(String),
 
     /// Internal processing error from SOF engine
     ProcessingError(SofError),
@@ -42,8 +54,12 @@ impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ServerError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
+            ServerError::ReferencedResourceNotFound(msg) => {
+                write!(f, "Referenced resource not found: {}", msg)
+            }
             ServerError::NotFound(msg) => write!(f, "Not found: {}", msg),
             ServerError::UnsupportedMediaType(msg) => write!(f, "Unsupported media type: {}", msg),
+            ServerError::NotAcceptable(msg) => write!(f, "Not acceptable: {}", msg),
             ServerError::ProcessingError(err) => write!(f, "Processing error: {}", err),
             ServerError::JsonError(err) => write!(f, "JSON error: {}", err),
             ServerError::InternalError(msg) => write!(f, "Internal server error: {}", msg),
@@ -57,12 +73,17 @@ impl std::error::Error for ServerError {}
 impl From<SofError> for ServerError {
     fn from(err: SofError) -> Self {
         match &err {
-            SofError::UnsupportedContentType(_) => {
-                ServerError::UnsupportedMediaType(err.to_string())
-            }
+            // Spec (operations-common, Output Formats): an unsupported
+            // `_format` value SHALL be rejected with 400 Bad Request +
+            // OperationOutcome — 415 is reserved for transport-level
+            // Content-Type/Content-Encoding problems.
+            SofError::UnsupportedContentType(_) => ServerError::BadRequest(err.to_string()),
             SofError::InvalidSource(_)
             | SofError::SourceNotFound(_)
             | SofError::UnsupportedSourceProtocol(_) => ServerError::BadRequest(err.to_string()),
+            SofError::ReferencedResourceNotFound(_) => {
+                ServerError::ReferencedResourceNotFound(err.to_string())
+            }
             SofError::SourceFetchError(_)
             | SofError::SourceReadError(_)
             | SofError::InvalidSourceContent(_) => ServerError::ProcessingError(err),
@@ -81,12 +102,18 @@ impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let (status, error_code, details) = match &self {
             ServerError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "invalid", msg.clone()),
+            ServerError::ReferencedResourceNotFound(msg) => {
+                (StatusCode::BAD_REQUEST, "not-found", msg.clone())
+            }
             ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, "not-found", msg.clone()),
             ServerError::UnsupportedMediaType(msg) => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "not-supported",
                 msg.clone(),
             ),
+            ServerError::NotAcceptable(msg) => {
+                (StatusCode::NOT_ACCEPTABLE, "not-supported", msg.clone())
+            }
             ServerError::ProcessingError(err) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "processing",

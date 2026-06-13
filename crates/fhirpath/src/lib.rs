@@ -353,18 +353,7 @@ pub fn evaluate_expression(
     expression: &str,
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, String> {
-    use chumsky::Parser;
-
-    // Parse the expression
-    let parsed = parser::parser()
-        .parse(expression)
-        .into_result()
-        .map_err(|e| {
-            format!(
-                "Failed to parse FHIRPath expression '{}': {:?}",
-                expression, e
-            )
-        })?;
+    let parsed = parse_expression(expression)?;
 
     // Evaluate the parsed expression
     evaluator::evaluate(&parsed, context, None).map_err(|e| {
@@ -373,4 +362,23 @@ pub fn evaluate_expression(
             expression, e
         )
     })
+}
+
+/// Parse a FHIRPath expression source string into a typed [`parser::Expression`] AST.
+///
+/// Provides a chumsky-free entry point for consumers that need the AST
+/// (e.g. compiling FHIRPath to SQL) without taking a dependency on the
+/// parser-combinator crate.
+pub fn parse_expression(expression: &str) -> Result<parser::Expression, String> {
+    use chumsky::Parser;
+
+    parser::parser()
+        .parse(expression)
+        .into_result()
+        .map_err(|e| {
+            format!(
+                "Failed to parse FHIRPath expression '{}': {:?}",
+                expression, e
+            )
+        })
 }

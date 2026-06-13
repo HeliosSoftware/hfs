@@ -137,6 +137,9 @@
 
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
+// The Elasticsearch index mapping is built with a single large `json!` literal;
+// the added `_contained` fields push it past the default macro recursion limit.
+#![recursion_limit = "256"]
 
 pub mod advisor;
 pub mod backends;
@@ -144,6 +147,7 @@ pub mod composite;
 pub mod core;
 pub mod error;
 pub mod search;
+pub mod sof;
 pub mod strategy;
 pub mod tenant;
 pub mod types;
