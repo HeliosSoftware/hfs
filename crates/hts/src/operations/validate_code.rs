@@ -605,18 +605,29 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     // Collect (display_value, language_tag_opt) pairs for every valid display:
     // the default display tagged with the CS language, plus every designation
     // that has a language attached.
-    // A designation only counts as a "valid display" alternative when it
-    // either has no `use.code` (default = display) or carries the FHIR-standard
-    // `display` use. Designations with a non-display use (e.g.
-    // `olde-english`, `consumer-name`) are alternative-purpose terms, not
-    // displays — including them in the "Valid display is …" message
-    // misrepresents what counts as a correct display, and the IG
-    // `batch/batch-validate-bad` fixture expects them excluded.
-    fn is_display_alternative(use_code: Option<&str>) -> bool {
+    // A designation only counts as a "valid display" alternative when it is
+    // genuinely a display term rather than an alternative-purpose label:
+    //   - no `use.code` (default = display), or the FHIR-standard `display` use;
+    //   - a terminology-native description type, identified by its `use.system`
+    //     (e.g. SNOMED CT synonyms/FSNs carry `use.system = http://snomed.info/sct`
+    //     with a description-type concept id like `900000000000013009` as the
+    //     code — these ARE the display terms, and `$lookup` surfaces them, so
+    //     `$validate-code` must too, otherwise a German SNOMED display can never
+    //     be resolved or accepted).
+    // Designations whose use comes from the FHIR designation-usage code system
+    // with a non-`display` code (e.g. `olde-english`, `consumer-name`) are
+    // alternative-purpose terms, not displays — including them in the
+    // "Valid display is …" message misrepresents what counts as a correct
+    // display, and the IG `batch/batch-validate-bad` fixture expects them
+    // excluded.
+    const SNOMED_SYSTEM: &str = "http://snomed.info/sct";
+    fn is_display_alternative(use_system: Option<&str>, use_code: Option<&str>) -> bool {
         match use_code {
             None => true,
             Some(c) if c.eq_ignore_ascii_case("display") => true,
-            _ => false,
+            // Terminology-native description types (e.g. all SNOMED CT
+            // description types) are legitimate display terms.
+            Some(_) => use_system.is_some_and(|s| s.eq_ignore_ascii_case(SNOMED_SYSTEM)),
         }
     }
 
@@ -625,13 +636,15 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         displays_for_lang.push((d.to_string(), cs_language.clone()));
     }
     for desig in &designations {
-        if !desig.value.is_empty() && is_display_alternative(desig.use_code.as_deref()) {
+        if !desig.value.is_empty()
+            && is_display_alternative(desig.use_system.as_deref(), desig.use_code.as_deref())
+        {
             displays_for_lang.push((desig.value.clone(), desig.language.clone()));
         }
     }
     for desig in &supplement_designations {
         if !desig.value.is_empty()
-            && is_display_alternative(desig.use_code.as_deref())
+            && is_display_alternative(desig.use_system.as_deref(), desig.use_code.as_deref())
             && !displays_for_lang
                 .iter()
                 .any(|(v, _)| v.eq_ignore_ascii_case(&desig.value))
@@ -6007,6 +6020,91 @@ mod tests {
         let params = json["parameter"].as_array().unwrap();
         let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
         assert_eq!(display_param["valueString"], "Alpha Beta Charlie");
+    }
+
+    /// Regression: a SNOMED-style German designation whose `use.system` is the
+    /// SNOMED CT system and whose `use.code` is a description-type concept id
+    /// (here `900000000000013009`, the synonym type) must be recognised as a
+    /// valid display. With `displayLanguage=de` the response `display` must be
+    /// the German term and validating that German display must return
+    /// `result=true` — matching `$lookup`. Previously the `is_display_alternative`
+    /// filter only accepted `use.code` of `None`/`display`, so the SNOMED-typed
+    /// designation was dropped and the English default was returned instead.
+    fn make_snomed_like_app() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at, resource_json)
+                 VALUES ('cs1', 'http://snomed.info/sct', '1.0', 'SNOMED CT',
+                         'active', 'complete', '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"url\":\"http://snomed.info/sct\",\"version\":\"1.0\",\"status\":\"active\",\"content\":\"complete\",\"language\":\"en\"}');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (1, 'cs1', '22298006', 'Myocardial infarction (disorder)');
+
+                 INSERT INTO concept_designations (concept_id, language, use_system, use_code, value)
+                 VALUES (1, 'de', 'http://snomed.info/sct', '900000000000013009', 'Myokardinfarkt');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/CodeSystem/$validate-code",
+                post(validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn snomed_german_designation_resolves_display() {
+        let app = make_snomed_like_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "displayLanguage", "valueCode": "de"}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result_param["valueBoolean"], true);
+
+        let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
+        assert_eq!(display_param["valueString"], "Myokardinfarkt");
+    }
+
+    #[tokio::test]
+    async fn snomed_german_display_validates_true() {
+        let app = make_snomed_like_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "display", "valueString": "Myokardinfarkt"},
+                {"name": "displayLanguage", "valueCode": "de"}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result_param["valueBoolean"], true,
+            "supplying the correct German SNOMED display must validate true: {json}"
+        );
     }
 
     #[tokio::test]
