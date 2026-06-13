@@ -144,14 +144,48 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             out
         };
 
-        let all_designations = fetch_designations(&client, concept_id).await?;
+        let mut all_designations = fetch_designations(&client, concept_id).await?;
 
+        // Cross-version designation fallback: when the caller pinned no
+        // version and the resolved (newest) version has no designation in the
+        // requested language, pull matching designations from the newest
+        // *other* stored version of the same canonical URL. This covers e.g.
+        // a national SNOMED edition whose translations would otherwise be
+        // shadowed by a newer international release ($expand and
+        // $validate-code already match designations URL-wide via
+        // `concept_designations`).
+        if let Some(lang) = req.display_language.as_deref() {
+            if req.version.is_none()
+                && !all_designations.iter().any(|d| {
+                    d.language
+                        .as_deref()
+                        .is_some_and(|l| crate::language::lang_matches(lang, l))
+                })
+            {
+                all_designations.extend(
+                    fetch_designations_cross_version(
+                        &client,
+                        &req.system,
+                        &req.code,
+                        &system_id,
+                        lang,
+                    )
+                    .await?,
+                );
+            }
+        }
+        let all_designations = all_designations;
+
+        // Matching is BCP-47-aware (RFC 4647 Lookup): an exact tag wins,
+        // then a stored dialect of the requested tag (`de` → `de-CH`), then
+        // truncations of the requested tag (`de-DE` → `de`).
         let display = if let Some(lang) = req.display_language.as_deref() {
-            all_designations
-                .iter()
-                .find(|d| d.language.as_deref() == Some(lang))
-                .map(|d| d.value.clone())
-                .or(display)
+            crate::language::best_lang_match_index(
+                lang,
+                all_designations.iter().map(|d| d.language.as_deref()),
+            )
+            .map(|idx| all_designations[idx].value.clone())
+            .or(display)
         } else {
             display
         };
@@ -159,7 +193,11 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         let designations = if let Some(lang) = req.display_language.as_deref() {
             all_designations
                 .into_iter()
-                .filter(|d| d.language.as_deref() == Some(lang))
+                .filter(|d| {
+                    d.language
+                        .as_deref()
+                        .is_some_and(|l| crate::language::lang_matches(lang, l))
+                })
                 .collect()
         } else {
             all_designations
@@ -1588,6 +1626,54 @@ async fn fetch_designations(
 
     Ok(rows
         .into_iter()
+        .map(|row| DesignationValue {
+            language: row.get(0),
+            use_system: row.get(1),
+            use_code: row.get(2),
+            value: row.get(3),
+            source: None,
+        })
+        .collect())
+}
+
+/// Designations for `code` matching `lang` (BCP-47-aware, see
+/// [`crate::language::lang_matches`]) from stored versions of the canonical
+/// `url` *other than* `exclude_system_id`, taken from the newest such version
+/// that has any (insertion order within that version is preserved so
+/// preferred terms stay first).
+async fn fetch_designations_cross_version(
+    client: &tokio_postgres::Client,
+    url: &str,
+    code: &str,
+    exclude_system_id: &str,
+    lang: &str,
+) -> Result<Vec<DesignationValue>, HtsError> {
+    let rows = client
+        .query(
+            "SELECT cd.language, cd.use_system, cd.use_code, cd.value, COALESCE(s.version, '')
+             FROM concept_designations cd
+             JOIN concepts c ON c.id = cd.concept_id
+             JOIN code_systems s ON s.id = c.system_id
+             WHERE s.url = $1 AND c.code = $2 AND s.id <> $3
+             ORDER BY COALESCE(s.version, '') DESC, cd.id",
+            &[&url, &code, &exclude_system_id],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    // Language matching happens here rather than in SQL so the RFC 4647
+    // fallback rules (`de-DE` → `de`, `de` → `de-CH`) apply.
+    let lang_ok = |row: &tokio_postgres::Row| {
+        row.get::<_, Option<String>>(0)
+            .is_some_and(|l| crate::language::lang_matches(lang, &l))
+    };
+    let newest: String = match rows.iter().find(|r| lang_ok(r)) {
+        Some(row) => row.get(4),
+        None => return Ok(Vec::new()),
+    };
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.get::<_, String>(4) == newest && lang_ok(row))
         .map(|row| DesignationValue {
             language: row.get(0),
             use_system: row.get(1),

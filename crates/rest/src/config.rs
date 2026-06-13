@@ -560,6 +560,70 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
+    /// Enable SQL-on-FHIR operations ($viewdefinition-run, $viewdefinition-export).
+    /// When enabled, the configured storage backend MUST provide an in-DB
+    /// SOF runner (sqlite or postgres) — there is no in-process fallback.
+    #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
+    pub sof_enabled: bool,
+
+    /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
+    #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
+    pub export_sink: String,
+
+    /// Root directory for filesystem export sink.
+    #[arg(long, env = "HFS_EXPORT_DIR", default_value = "./exports")]
+    pub export_dir: String,
+
+    /// S3 bucket name for S3 export sink.
+    #[arg(long, env = "HFS_EXPORT_S3_BUCKET")]
+    pub export_s3_bucket: Option<String>,
+
+    /// S3 region for S3 export sink (defaults to AWS credential-chain region).
+    #[arg(long, env = "HFS_EXPORT_S3_REGION")]
+    pub export_s3_region: Option<String>,
+
+    /// Pre-signed URL TTL (seconds) for S3 export sink.
+    ///
+    /// Defaults to 24 hours: the SQL-on-FHIR spec requires `output.location`
+    /// download URLs to remain valid for at least 24 hours after export
+    /// completion (matching the `Expires` header on the completion poll).
+    #[arg(long, env = "HFS_EXPORT_PRESIGN_TTL_SECS", default_value = "86400")]
+    pub export_presign_ttl_secs: u64,
+
+    /// Maximum concurrent export jobs.
+    #[arg(long, env = "HFS_EXPORT_MAX_CONCURRENCY", default_value = "4")]
+    pub export_max_concurrency: usize,
+
+    /// Target rows per output shard for `$viewdefinition-export`.
+    /// Large result sets are split into multiple files of this size.
+    #[arg(long, env = "HFS_EXPORT_SHARD_ROWS", default_value = "500000")]
+    pub export_shard_rows: usize,
+
+    /// Export job controller backend: "memory" (default, in-process).
+    /// Future values: "kafka", "sqs".
+    #[arg(long, env = "HFS_EXPORT_CONTROLLER", default_value = "memory")]
+    pub export_controller: String,
+
+    /// Maximum rows returned by `$sqlquery-run`.
+    #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
+    pub sof_sqlquery_max_rows: usize,
+
+    /// Maximum rows materialized per depends-on ViewDefinition by `$sqlquery-run`.
+    #[arg(
+        long,
+        env = "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+        default_value = "1000000"
+    )]
+    pub sof_sqlquery_max_source_rows_per_vd: usize,
+
+    /// Maximum number of depends-on ViewDefinitions a single SQLQuery Library may declare.
+    #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
+    pub sof_sqlquery_max_vds: usize,
+
+    /// Hard timeout (seconds) for `$sqlquery-run` queries.
+    #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
+    pub sof_sqlquery_timeout_secs: u64,
+
     /// URL of the Helios Terminology Server (HTS) for terminology operations.
     ///
     /// When set, HFS delegates the following operations to the HTS:
@@ -617,6 +681,19 @@ impl Default for ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            sof_enabled: true,
+            export_sink: "fs".to_string(),
+            export_dir: "./exports".to_string(),
+            export_s3_bucket: None,
+            export_s3_region: None,
+            export_presign_ttl_secs: 86_400,
+            export_max_concurrency: 4,
+            export_shard_rows: 500_000,
+            export_controller: "memory".to_string(),
+            sof_sqlquery_max_rows: 100_000,
+            sof_sqlquery_max_source_rows_per_vd: 1_000_000,
+            sof_sqlquery_max_vds: 16,
+            sof_sqlquery_timeout_secs: 30,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
@@ -715,6 +792,19 @@ impl ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            sof_enabled: true,
+            export_sink: "fs".to_string(),
+            export_dir: "./exports".to_string(),
+            export_s3_bucket: None,
+            export_s3_region: None,
+            export_presign_ttl_secs: 86_400,
+            export_max_concurrency: 4,
+            export_shard_rows: 500_000,
+            export_controller: "memory".to_string(),
+            sof_sqlquery_max_rows: 100_000,
+            sof_sqlquery_max_source_rows_per_vd: 1_000_000,
+            sof_sqlquery_max_vds: 16,
+            sof_sqlquery_timeout_secs: 30,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),

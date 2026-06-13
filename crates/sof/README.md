@@ -360,7 +360,8 @@ The server can be configured using either command-line arguments or environment 
 Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
 `zstd`) are decompressed transparently; unsupported encodings are rejected
 with `415`. Responses are compressed when the client sends `Accept-Encoding`,
-except `application/parquet` and `application/zip` output, which is already
+except parquet (`application/vnd.apache.parquet`, legacy
+`application/parquet`) and `application/zip` output, which is already
 compressed and returned as-is.
 
 ##### Environment Variables
@@ -593,7 +594,7 @@ Parameter table:
 
 | Name | Type | Use | Scope | Min | Max | Documentation |
 |------|------|-----|-------|-----|-----|---------------|
-| _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/parquet` |
+| _format | code | in | type, instance | 0 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/vnd.apache.parquet` (aliases: `application/parquet`, `application/octet-stream`), `application/fhir+json` (`fhir`). Defaults to `application/x-ndjson` when neither `_format` nor a usable `Accept` header is supplied. |
 | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
 | maxFileSize | integer | in | type, instance | 0 | 1 | Maximum Parquet file size in MB (10-10000). When exceeded, generates multiple files in a ZIP archive. |
 | rowGroupSize | integer | in | type, instance | 0 | 1 | Parquet row group size in MB (64-1024, default: 256) |
@@ -612,11 +613,12 @@ Parameter table:
 
 All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as POST query parameters:
 
-- **_format**: Output format (required if not in Accept header)
-  - `application/json` - JSON array output (default)
+- **_format**: Output format (optional; defaults to `application/x-ndjson` per SoF v2)
+  - `application/json` - JSON array output
   - `text/csv` - CSV output
   - `application/ndjson` - Newline-delimited JSON
-  - `application/parquet` - Parquet file 
+  - `application/vnd.apache.parquet` - Parquet file (aliases: `application/parquet`, `application/octet-stream`)
+  - `fhir` / `application/fhir+json` - FHIR Parameters resource with one `row` per result row
 - **header**: Control CSV headers (only applies to CSV format)
   - `true` - Include headers (default for CSV)
   - `false` - Exclude headers
@@ -663,8 +665,9 @@ The server automatically sets appropriate response headers based on the output f
   - `application/json` for JSON output
   - `text/csv` for CSV output
   - `application/ndjson` for NDJSON output
-  - `application/parquet` for single Parquet file
+  - `application/vnd.apache.parquet` for single Parquet file
   - `application/zip` for multiple Parquet files
+  - `application/fhir+json` for `_format=fhir` output and `Binary`-envelope responses
 
 **Streaming Response Headers (for large files):**
 - `Transfer-Encoding: chunked` - Automatically set for files > 10MB
@@ -1002,7 +1005,7 @@ curl -X POST "http://localhost:8080/ViewDefinition/$viewdefinition-run?_format=a
   - Enables processing of gigabyte-scale datasets without memory constraints
   - Response headers for streaming:
     - `Transfer-Encoding: chunked` - Automatically set by the server for streaming responses
-    - `Content-Type: application/parquet` or `application/zip` - Based on single or multi-file output
+    - `Content-Type: application/vnd.apache.parquet` or `application/zip` - Based on single or multi-file output
     - `Content-Disposition: attachment; filename="data.parquet"` or `filename="data.zip"` - For convenient file downloads
   - Chunked responses use 64KB chunks for optimal network efficiency
 

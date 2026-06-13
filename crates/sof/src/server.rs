@@ -29,7 +29,7 @@
 //! POST /ViewDefinition/$viewdefinition-run
 //!   Body: Parameters resource containing ViewDefinition and data
 //!   Query Parameters (except viewReference, viewResource, patient, group, resource):
-//!     _format: Output format - application/json, application/ndjson, text/csv, application/parquet
+//!     _format: Output format - application/json, application/x-ndjson, text/csv, application/octet-stream (parquet)
 //!     header: CSV header control - true (default), false (only applies to CSV format)
 //!     source: Data source (type: string) - Not yet supported
 //!     _limit: Limits the number of results (1-10000)
@@ -118,7 +118,7 @@ use tracing::{info, warn};
 mod error;
 mod handlers;
 mod models;
-mod streaming;
+mod parquet_zip;
 
 /// Server configuration options
 #[derive(Debug, Clone)]
@@ -326,14 +326,52 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
     // would only burn CPU for no size win.
     let compress_predicate = SizeAbove::new(32)
         .and(NotForContentType::const_new("application/parquet"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apache.parquet",
+        ))
         .and(NotForContentType::const_new("application/zip"));
 
     let mut app = Router::new()
         // FHIR endpoints
         .route("/metadata", get(handlers::capability_statement))
+        // SQL-on-FHIR capabilities (audit item #11): the spec-defined
+        // `GET /$sql-on-fhir-capabilities` endpoint returning a Parameters
+        // resource that enumerates which SoF features this server supports.
+        // sof-server is stateless so most of the reference-resolution
+        // capabilities are false; the truthful capability block lets
+        // clients negotiate without trial-and-error.
+        .route(
+            "/$sql-on-fhir-capabilities",
+            get(handlers::sof_capabilities),
+        )
+        // Per spec, GET is permitted for simple invocations (no
+        // viewResource/resource body). sof-server is stateless and rejects
+        // viewReference, so GET will normally surface a 400/501 — but the
+        // route exists so clients can negotiate the method correctly.
+        //
+        // The SoF v2 OperationDefinition lists three valid endpoints:
+        //   - [base]/$viewdefinition-run                            (system-level)
+        //   - [base]/CanonicalResource/$viewdefinition-run          (type-level)
+        //   - [base]/CanonicalResource/[id]/$viewdefinition-run     (instance-level)
+        //
+        // sof-server is stateless, so instance-level (which infers the
+        // ViewDefinition from a stored {id}) is rejected with a clear 400
+        // by `instance_level_not_supported`. The system- and type-level
+        // endpoints both route to the same handler — they differ only in
+        // URL shape (the type-level path is `CanonicalResource =
+        // ViewDefinition`).
+        .route(
+            "/$viewdefinition-run",
+            post(handlers::run_view_definition_handler).get(handlers::run_view_definition_handler),
+        )
         .route(
             "/ViewDefinition/$viewdefinition-run",
-            post(handlers::run_view_definition_handler),
+            post(handlers::run_view_definition_handler).get(handlers::run_view_definition_handler),
+        )
+        .route(
+            "/ViewDefinition/{id}/$viewdefinition-run",
+            post(handlers::instance_level_not_supported)
+                .get(handlers::instance_level_not_supported),
         )
         // Health check endpoint
         .route("/health", get(handlers::health_check))
@@ -480,6 +518,38 @@ mod tests {
         let json: serde_json::Value = response.json();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "sof-server");
+    }
+
+    // ── Unsupported `_format` ─────────────────────────────────────────────
+
+    /// Spec (operations-common, Output Formats): an unsupported `_format`
+    /// value SHALL be rejected with 400 Bad Request + OperationOutcome —
+    /// for the body parameter as well as the query parameter. (The stub
+    /// suite in `tests/` used to entrench 415 for the body path.)
+    #[tokio::test]
+    async fn test_unsupported_body_format_returns_400() {
+        let server = TestServer::new(create_app()).unwrap();
+
+        let mut body = run_request_body();
+        body["parameter"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "_format", "valueCode": "text/plain"}));
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .json(&body)
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "unsupported body _format must be 400, got {}: {}",
+            response.status_code(),
+            response.text()
+        );
+        let json: serde_json::Value = response.json();
+        assert_eq!(json["resourceType"], "OperationOutcome");
     }
 
     // ── HTTP compression ──────────────────────────────────────────────────
@@ -675,7 +745,7 @@ mod tests {
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(
             response.headers().get("content-type").unwrap(),
-            "application/parquet"
+            "application/vnd.apache.parquet"
         );
         // Parquet is already compressed — the gzip layer must skip it.
         assert!(response.headers().get("content-encoding").is_none());
@@ -710,5 +780,125 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // =========================================================================
+    // SoF v2 Common Operation Behavior (spec PR #365): `fhir` output format,
+    // Binary-envelope representation, and FHIR-XML rejection.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_fhir_format_returns_parameters() {
+        let server = TestServer::new(create_app()).unwrap();
+        let mut body = run_request_body();
+        body["parameter"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"name": "_format", "valueCode": "fhir"}),
+        );
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .json(&body)
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/fhir+json"
+        );
+        let v: serde_json::Value = response.json();
+        assert_eq!(v["resourceType"], "Parameters");
+        let rows = v["parameter"].as_array().expect("parameter array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "row");
+        let parts = rows[0]["part"].as_array().expect("row parts");
+        assert!(
+            parts
+                .iter()
+                .any(|p| p["name"] == "gender" && p["valueString"] == "male"),
+            "row must carry the gender part: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_fhir_json_without_format_selects_fhir() {
+        let server = TestServer::new(create_app()).unwrap();
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("accept", "application/fhir+json")
+            .json(&run_request_body())
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let v: serde_json::Value = response.json();
+        assert_eq!(
+            v["resourceType"], "Parameters",
+            "Accept: application/fhir+json must select the fhir format: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_accept_fhir_json_with_csv_format_returns_binary_envelope() {
+        use base64::Engine as _;
+        let server = TestServer::new(create_app()).unwrap();
+        let mut body = run_request_body();
+        body["parameter"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"name": "_format", "valueCode": "csv"}),
+        );
+
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("accept", "application/fhir+json")
+            .json(&body)
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/fhir+json"
+        );
+        let v: serde_json::Value = response.json();
+        assert_eq!(v["resourceType"], "Binary");
+        assert_eq!(v["contentType"], "text/csv");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(v["data"].as_str().expect("Binary.data"))
+            .expect("Binary.data must be base64");
+        let csv = String::from_utf8(decoded).expect("decoded csv is utf8");
+        assert!(csv.contains("male"), "decoded csv: {csv}");
+    }
+
+    #[tokio::test]
+    async fn test_accept_fhir_xml_returns_406() {
+        let server = TestServer::new(create_app()).unwrap();
+        let response = server
+            .post("/ViewDefinition/$viewdefinition-run")
+            .add_header("accept", "application/fhir+xml")
+            .json(&run_request_body())
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::NOT_ACCEPTABLE,
+            "{}",
+            response.text()
+        );
+        let v: serde_json::Value = response.json();
+        assert_eq!(v["resourceType"], "OperationOutcome");
     }
 }

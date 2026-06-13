@@ -249,15 +249,33 @@ jobs:
       - name: Run security audit
         # Vulnerability-class advisories cannot be ignored via audit.toml
         # (cargo-audit only honors that for warning-class entries), so they
-        # are listed here. Remove once mongodb releases a build with
-        # hickory >= 0.26.1 (tracked: mongodb/mongo-rust-driver#1682).
-        # Neither path is reachable in our build:
+        # are listed here.
+        #
+        # mongodb (via hickory-resolver → hickory-proto 0.25.2). Remove once
+        # mongodb releases a build with hickory >= 0.26.1
+        # (tracked: mongodb/mongo-rust-driver#1682). Neither path is reachable:
         #   - RUSTSEC-2026-0118 requires the dnssec-ring/dnssec-aws-lc-rs
         #     hickory features, which we don't enable.
         #   - RUSTSEC-2026-0119 fires when encoding outbound messages with
         #     many compressible records; mongodb only encodes single-question
         #     resolver queries.
-        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+        #
+        # rustls-webpki 0.101.7 (via rustls 0.21.x ← aws-smithy-http-client
+        # 1.1.10). The 0.101.x line is no longer patched; AWS SDK pins it.
+        # None of the three are reachable through the AWS SDK path:
+        #   - RUSTSEC-2026-0098 (URI name constraints): rustls-webpki has no
+        #     API for asserting URI names.
+        #   - RUSTSEC-2026-0099 (wildcard name constraints): requires a
+        #     misissued certificate with name constraints; AWS endpoints
+        #     don't use name-constrained intermediates.
+        #   - RUSTSEC-2026-0104 (CRL panic): the AWS SDK doesn't parse CRLs.
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2026-0118
+          --ignore RUSTSEC-2026-0119
+          --ignore RUSTSEC-2026-0098
+          --ignore RUSTSEC-2026-0099
+          --ignore RUSTSEC-2026-0104
  
   coverage:
     name: Code Coverage

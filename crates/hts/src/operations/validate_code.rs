@@ -660,19 +660,25 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         .unwrap_or_default();
 
     // Find the "preferred" display in any of the requested languages, if any.
-    // Returns the first designation whose language equals one of the requested
-    // languages (case-insensitive, exact match — IG fixtures don't exercise
-    // language-tag fallback like `de-CH` → `de`).
+    // Matching is BCP-47-aware (RFC 4647 Lookup, see [`crate::language`]):
+    // an exact tag wins, then a stored dialect of a requested tag
+    // (`de` → `de-CH`), then truncations of a requested tag (`de-DE` → `de`);
+    // ties keep the earliest designation.
     let preferred_for_lang: Option<&(String, Option<String>)> = if requested_langs.is_empty() {
         None
     } else {
-        displays_for_lang.iter().find(|(_, lang_opt)| {
-            lang_opt.as_deref().is_some_and(|l| {
+        displays_for_lang
+            .iter()
+            .filter_map(|entry| {
+                let stored = entry.1.as_deref()?;
                 requested_langs
                     .iter()
-                    .any(|req| l.eq_ignore_ascii_case(req))
+                    .filter_map(|req| crate::language::lang_match_rank(req, stored))
+                    .min()
+                    .map(|rank| (rank, entry))
             })
-        })
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, entry)| entry)
     };
 
     // Surface the language-preferred display on the response (overriding the
@@ -2465,7 +2471,8 @@ pub async fn get_validate_code_handler<B: TerminologyBackend>(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
-    let params = query_params_to_fhir_params(pairs);
+    let mut params = query_params_to_fhir_params(pairs);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     match process_validate_code(&state, params).await {
         Ok(v) => Ok(fhir_respond(v, format)),
         Err(e) => match invalid_display_language_response(&e) {
@@ -5822,7 +5829,8 @@ pub async fn get_vs_validate_code_handler<B: TerminologyBackend>(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_format(raw.as_deref(), accept);
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
-    let params = query_params_to_fhir_params(pairs);
+    let mut params = query_params_to_fhir_params(pairs);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     match process_vs_validate_code(&state, params).await {
         Ok(v) => Ok(fhir_respond(v, format)),
         Err(e) => {
@@ -5868,8 +5876,10 @@ pub async fn vs_validate_by_id_post<B: TerminologyBackend>(
     let raw_params = body
         .and_then(|Json(v)| extract_parameter_array(&v).ok())
         .unwrap_or_default();
+    let mut params = inject_url(raw_params, url);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, inject_url(raw_params, url)).await?,
+        process_vs_validate_code(&state, params).await?,
         format,
     ))
 }
@@ -5890,8 +5900,10 @@ pub async fn get_vs_validate_by_id<B: TerminologyBackend>(
 
     let pairs = parse_query_string(raw.as_deref().unwrap_or(""));
     let params = query_params_to_fhir_params(pairs);
+    let mut params = inject_url(params, url);
+    crate::operations::expand::inject_accept_language(&headers, &mut params);
     Ok(fhir_respond(
-        process_vs_validate_code(&state, inject_url(params, url)).await?,
+        process_vs_validate_code(&state, params).await?,
         format,
     ))
 }

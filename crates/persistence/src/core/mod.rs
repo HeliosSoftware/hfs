@@ -97,6 +97,7 @@ pub mod bulk_submit;
 pub mod capabilities;
 pub mod history;
 pub mod search;
+pub mod sof_runner;
 pub mod storage;
 pub mod transaction;
 pub mod versioned;
@@ -136,6 +137,7 @@ pub use search::{
     RevincludeProvider, SearchProvider, SearchResult, TerminologySearchProvider,
     TextSearchProvider, resolve_includes_iterative,
 };
+pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, PatchFormat, PurgableStorage, ResourceStorage,
