@@ -1,0 +1,6 @@
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
