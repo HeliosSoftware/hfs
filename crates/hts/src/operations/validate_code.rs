@@ -554,6 +554,7 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     display_language: Option<&str>,
     expected_display: Option<&str>,
     supplements: &[SupplementInfo],
+    lenient_display_validation: bool,
     resp: &mut ValidateCodeResponse,
 ) {
     // CodeSystem.language is the language of the primary `display` field.
@@ -858,15 +859,17 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
             )
         };
 
-        // Honour `lenient-display-validation`: if the original
-        // backend-emitted issue was a warning, preserve that severity (and
-        // keep result=true).  Otherwise this is a hard mismatch error.
-        let severity = prior_invalid_display_severity
-            .as_deref()
-            .filter(|s| *s == "warning")
-            .map(str::to_string)
-            .unwrap_or_else(|| "error".to_string());
-        let lenient = severity == "warning";
+        // Honour `lenient-display-validation`: the mismatch is a warning (and
+        // `result` stays true) when the caller passed the flag, OR when the
+        // backend already softened its own issue to a warning. The flag must
+        // be consulted directly here because this language-aware pass can
+        // surface a mismatch the backend never saw — e.g. the caller's display
+        // matches the concept's default display but not the requested
+        // `displayLanguage` designation, so the backend accepted it and emitted
+        // no issue for us to inherit a severity from.
+        let lenient = lenient_display_validation
+            || prior_invalid_display_severity.as_deref() == Some("warning");
+        let severity = if lenient { "warning" } else { "error" }.to_string();
         resp.issues.push(ValidationIssue {
             severity,
             fhir_code: "invalid".into(),
@@ -1138,6 +1141,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     display_language: Option<&str>,
     expected_display: Option<&str>,
     supplements: &[SupplementInfo],
+    lenient_display_validation: bool,
 ) -> Value {
     // For inactive concepts whose underlying status is more specific than
     // "inactive" (e.g. `retired`, `deprecated`, `withdrawn`), the IG
@@ -1439,6 +1443,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             display_language,
             expected_display,
             supplements,
+            lenient_display_validation,
             &mut resp,
         )
         .await;
@@ -2207,6 +2212,16 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
     // forms (code / coding / codeableConcept) can pass it to the post-build
     // language-aware display validator.
     let display_language: Option<String> = find_str_param(&params, "displayLanguage");
+    // `lenient-display-validation` (R6): downgrade a display mismatch to a
+    // warning with result=true. Captured once so all three input forms pass it
+    // to the language-aware validator, which can surface a mismatch the backend
+    // never saw (display matches the default but not the `displayLanguage`
+    // designation).
+    let lenient_display_validation: bool = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
     // Reject malformed BCP-47 `displayLanguage` early — IG
     // `display/validation-wrong-de-en-bad` and the language2 group expect a
     // 4xx OperationOutcome with `code=processing` and the
@@ -2291,6 +2306,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
             display_language.as_deref(),
             display.as_deref(),
             &supplements,
+            lenient_display_validation,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -2365,6 +2381,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
             display_language.as_deref(),
             display.as_deref(),
             &supplements,
+            lenient_display_validation,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -2428,6 +2445,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
                     display_language.as_deref(),
                     None,
                     &[],
+                    lenient_display_validation,
                 )
                 .await);
             }
@@ -3499,6 +3517,14 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
 ) -> Result<Value, HtsError> {
     let ctx = TenantContext::system();
 
+    // `lenient-display-validation` (R6): downgrade a display mismatch to a
+    // warning with result=true (see `process_validate_code_inner`).
+    let lenient_display_validation: bool = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+
     // Extract the input coding/code (priority: coding → code). For the
     // `coding` form, an empty `system` (Coding without a system field)
     // collapses to None per FHIR spec semantics.
@@ -3670,6 +3696,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
             find_str_param(&params, "displayLanguage").as_deref(),
             in_display.as_deref(),
             &[],
+            lenient_display_validation,
         )
         .await;
         return Ok(value);
@@ -3794,6 +3821,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
         find_str_param(&params, "displayLanguage").as_deref(),
         in_display.as_deref(),
         &[],
+        lenient_display_validation,
     )
     .await;
     Ok(value)
@@ -4562,6 +4590,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             display_language.as_deref(),
             display.as_deref(),
             &supplements,
+            lenient_display.unwrap_or(false),
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -4902,6 +4931,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             display_language.as_deref(),
             display.as_deref(),
             &supplements,
+            lenient_display.unwrap_or(false),
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -5329,6 +5359,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     display_language.as_deref(),
                     coding_display.as_deref(),
                     &supplements,
+                    lenient_display.unwrap_or(false),
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -5392,6 +5423,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     display_language.as_deref(),
                     coding_display.as_deref(),
                     &supplements,
+                    lenient_display.unwrap_or(false),
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -5454,6 +5486,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     display_language.as_deref(),
                     coding_display.as_deref(),
                     &supplements,
+                    lenient_display.unwrap_or(false),
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -6080,6 +6113,83 @@ mod tests {
 
         let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
         assert_eq!(display_param["valueString"], "Myokardinfarkt");
+    }
+
+    /// `lenient-display-validation` must also apply when the mismatch is
+    /// surfaced by the language-aware layer rather than the backend: here the
+    /// supplied display is the concept's English default (which the backend
+    /// accepts), but `displayLanguage=de` makes the German designation the only
+    /// valid display, so the operations layer flags a mismatch the backend
+    /// never emitted. With the flag set this must still be a `warning` with
+    /// `result=true`, not an error.
+    #[tokio::test]
+    async fn lenient_applies_to_display_language_mismatch() {
+        let app = make_snomed_like_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "display", "valueString": "Myocardial infarction (disorder)"},
+                {"name": "displayLanguage", "valueCode": "de"},
+                {"name": "lenient-display-validation", "valueBoolean": true}
+            ]
+        });
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result["valueBoolean"], true,
+            "lenient-display-validation must keep result=true even when the \
+             displayLanguage layer surfaces the mismatch: {json}"
+        );
+
+        let issues = params
+            .iter()
+            .find(|p| p["name"] == "issues")
+            .expect("issues OperationOutcome expected");
+        let display_issue = issues["resource"]["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| {
+                i["details"]["coding"]
+                    .as_array()
+                    .map(|cs| cs.iter().any(|c| c["code"] == "invalid-display"))
+                    .unwrap_or(false)
+            })
+            .expect("invalid-display issue expected");
+        assert_eq!(
+            display_issue["severity"], "warning",
+            "display-language mismatch must be a warning under lenient validation: {json}"
+        );
+    }
+
+    /// Counterpart guard: without the flag, the same display-language mismatch
+    /// remains a hard `error` with `result=false` (the spec default).
+    #[tokio::test]
+    async fn display_language_mismatch_without_lenient_is_error() {
+        let app = make_snomed_like_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "display", "valueString": "Myocardial infarction (disorder)"},
+                {"name": "displayLanguage", "valueCode": "de"}
+            ]
+        });
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result["valueBoolean"], false,
+            "without lenient-display-validation the mismatch must fail: {json}"
+        );
     }
 
     #[tokio::test]
