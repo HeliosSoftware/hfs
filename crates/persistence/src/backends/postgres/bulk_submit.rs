@@ -1,21 +1,28 @@
 //! Bulk submit implementation for PostgreSQL backend.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
+use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use uuid::Uuid;
 
 use crate::core::ResourceStorage;
+use crate::core::bulk_export::ExportJobId;
+use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
     StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
     SubmissionManifest, SubmissionStatus, SubmissionSummary,
 };
+use crate::core::bulk_submit_worker::{
+    ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
+    SubmitFileRow, SubmitWorkerStorage,
+};
 use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
-use crate::tenant::TenantContext;
+use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::PostgresBackend;
 
@@ -25,6 +32,26 @@ fn internal_error(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+/// Builds a `LeaseError::LeaseLost` for a submit manifest.
+fn lease_lost(lease: &ManifestLease) -> LeaseError {
+    LeaseError::LeaseLost {
+        job_id: ExportJobId::from_string(format!("{}/{}", lease.submission_id, lease.manifest_id)),
+    }
+}
+
+/// Derives the ingest FHIR version from a stored `outputFormat` MIME string.
+fn fhir_version_from_output_format(output_format: Option<&str>) -> FhirVersion {
+    output_format
+        .and_then(|fmt| {
+            fmt.split(';').find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix("fhirVersion=")
+                    .and_then(FhirVersion::from_mime_param)
+            })
+        })
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -513,9 +540,9 @@ impl BulkSubmitProvider for PostgresBackend {
         let replaces_manifest_url: Option<String> = row.get(1);
         let status_str: String = row.get(2);
         let added_at: chrono::DateTime<Utc> = row.get(3);
-        let total: i64 = row.get(4);
-        let processed: i64 = row.get(5);
-        let failed: i64 = row.get(6);
+        let total: i32 = row.get(4);
+        let processed: i32 = row.get(5);
+        let failed: i32 = row.get(6);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -674,9 +701,9 @@ impl BulkSubmitProvider for PostgresBackend {
                     failed_entries = failed_entries + $3
                  WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6 AND manifest_id = $7",
                 &[
-                    &(results.len() as i64),
-                    &(results.iter().filter(|r| r.is_success()).count() as i64),
-                    &(error_count as i64),
+                    &(results.len() as i32),
+                    &(results.iter().filter(|r| r.is_success()).count() as i32),
+                    &(error_count as i32),
                     &tenant_id,
                     &submission_id.submitter.as_str(),
                     &submission_id.submission_id.as_str(),
@@ -752,7 +779,7 @@ impl BulkSubmitProvider for PostgresBackend {
         let results: Vec<BulkEntryResult> = rows
             .iter()
             .map(|row| {
-                let line_number: i64 = row.get(0);
+                let line_number: i32 = row.get(0);
                 let resource_type: String = row.get(1);
                 let resource_id: Option<String> = row.get(2);
                 let created: Option<bool> = row.get(3);
@@ -946,7 +973,7 @@ impl PostgresBackend {
                     &submission_id.submitter.as_str(),
                     &submission_id.submission_id.as_str(),
                     &manifest_id,
-                    &(result.line_number as i64),
+                    &(result.line_number as i32),
                     &result.resource_type.as_str(),
                     &result.resource_id,
                     &result.created,
@@ -1212,5 +1239,693 @@ impl BulkSubmitRollbackProvider for PostgresBackend {
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl SubmitClaimStrategy for PostgresBackend {
+    async fn claim_next_manifest(
+        &self,
+        worker_id: &WorkerId,
+        lease_duration: StdDuration,
+    ) -> StorageResult<Option<ManifestLease>> {
+        let mut client = self.get_client().await?;
+        let now = Utc::now();
+        let lease_expiry = now
+            + chrono::Duration::from_std(lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin claim txn: {}", e)))?;
+
+        let rows = txn
+            .query(
+                "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token
+                 FROM bulk_manifests m
+                 JOIN bulk_submissions s
+                   ON s.tenant_id = m.tenant_id AND s.submitter = m.submitter
+                      AND s.submission_id = m.submission_id
+                 WHERE m.manifest_url IS NOT NULL
+                   AND s.status = 'in-progress'
+                   AND (m.status = 'pending'
+                        OR (m.status = 'processing'
+                            AND (m.lease_expiry IS NULL OR m.lease_expiry < $1)))
+                 ORDER BY m.added_at
+                 LIMIT 1
+                 FOR UPDATE OF m SKIP LOCKED",
+                &[&now],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to select claimable manifest: {}", e)))?;
+
+        let Some(row) = rows.first() else {
+            txn.commit()
+                .await
+                .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
+            return Ok(None);
+        };
+        let tenant_id: String = row.get(0);
+        let submitter: String = row.get(1);
+        let submission_id: String = row.get(2);
+        let manifest_id: String = row.get(3);
+        let fencing_token: i64 = row.get(4);
+        let new_token = fencing_token + 1;
+
+        txn.execute(
+            "UPDATE bulk_manifests
+             SET status = 'processing', worker_id = $1, lease_expiry = $2, fencing_token = $3
+             WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6 AND manifest_id = $7",
+            &[
+                &worker_id.as_str(),
+                &lease_expiry,
+                &new_token,
+                &tenant_id,
+                &submitter,
+                &submission_id,
+                &manifest_id,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to claim manifest: {}", e)))?;
+
+        txn.commit()
+            .await
+            .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
+
+        Ok(Some(ManifestLease {
+            tenant: TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
+            submission_id: SubmissionId::new(submitter, submission_id),
+            manifest_id,
+            worker_id: worker_id.clone(),
+            lease_expiry,
+            fencing_token: new_token as u64,
+        }))
+    }
+
+    async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let now = Utc::now();
+        let new_expiry = now + chrono::Duration::seconds(60);
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests SET lease_expiry = $1
+                 WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4
+                   AND manifest_id = $5 AND worker_id = $6 AND fencing_token = $7",
+                &[
+                    &new_expiry,
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("heartbeat failed: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(new_expiry)
+        }
+    }
+
+    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE bulk_manifests
+                 SET status = 'pending', worker_id = NULL, lease_expiry = NULL
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6
+                   AND status = 'processing'",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SubmitWorkerStorage for PostgresBackend {
+    async fn get_manifest_for_worker(
+        &self,
+        lease: &ManifestLease,
+    ) -> Result<ManifestWorkerView, LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let rows = client
+            .query(
+                "SELECT manifest_url, fhir_base_url, output_format, file_request_headers,
+                        oauth_metadata_urls, file_encryption_key, last_processed_line
+                 FROM bulk_manifests
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("load manifest: {e}"))))?;
+        let row = rows.first().ok_or_else(|| lease_lost(lease))?;
+
+        let manifest_url: Option<String> = row.get(0);
+        let fhir_base_url: Option<String> = row.get(1);
+        let output_format: Option<String> = row.get(2);
+        let headers_json: Option<String> = row.get(3);
+        let oauth_json: Option<String> = row.get(4);
+        let encryption_json: Option<String> = row.get(5);
+        let last_processed_line: i64 = row.get(6);
+
+        let file_request_headers: Vec<(String, String)> = headers_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let oauth_metadata_urls: Vec<String> = oauth_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let file_encryption_key: Option<Value> = encryption_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let fhir_version = fhir_version_from_output_format(output_format.as_deref());
+
+        Ok(ManifestWorkerView {
+            manifest_id: lease.manifest_id.clone(),
+            manifest_url,
+            fhir_base_url,
+            output_format,
+            file_request_headers,
+            oauth_metadata_urls,
+            file_encryption_key,
+            last_processed_line: last_processed_line.max(0) as u64,
+            fhir_version,
+        })
+    }
+
+    async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests SET status = 'processing'
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("mark processing: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn update_manifest_progress(
+        &self,
+        lease: &ManifestLease,
+        processed_entries: u64,
+        failed_entries: u64,
+        last_processed_line: u64,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests
+                 SET processed_entries = $1, failed_entries = $2, last_processed_line = $3
+                 WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6
+                   AND manifest_id = $7 AND worker_id = $8 AND fencing_token = $9",
+                &[
+                    &(processed_entries as i32),
+                    &(failed_entries as i32),
+                    &(last_processed_line as i64),
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update progress: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn record_submit_file(
+        &self,
+        lease: &ManifestLease,
+        file: &SubmitFileRecord,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        // Fence: only record if we still hold the lease.
+        let holds = client
+            .query(
+                "SELECT 1 FROM bulk_manifests
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("fence check: {e}"))))?;
+        if holds.is_empty() {
+            return Err(lease_lost(lease));
+        }
+
+        let count_severity = file
+            .count_severity
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok());
+        client
+            .execute(
+                "INSERT INTO bulk_submit_files
+                 (tenant_id, submitter, submission_id, manifest_url, file_type, resource_type,
+                  part_index, fencing_token, file_path, line_count, byte_count, count_severity,
+                  created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &file.manifest_url,
+                    &file.file_type,
+                    &file.resource_type,
+                    &(file.part_index as i32),
+                    &(lease.fencing_token as i64),
+                    &file.file_path,
+                    &(file.line_count as i64),
+                    &(file.byte_count as i64),
+                    &count_severity,
+                    &Utc::now(),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("record submit file: {e}"))))?;
+        Ok(())
+    }
+
+    async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests SET status = 'completed', worker_id = NULL, lease_expiry = NULL
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("finish manifest: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn fail_manifest(
+        &self,
+        lease: &ManifestLease,
+        _error_message: &str,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests SET status = 'failed', worker_id = NULL, lease_expiry = NULL
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("fail manifest: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn set_manifest_fetch_params(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        manifest_id: &str,
+        fhir_base_url: Option<&str>,
+        output_format: Option<&str>,
+        file_request_headers: &[(String, String)],
+        oauth_metadata_urls: &[String],
+        file_encryption_key: Option<&Value>,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        let fhir_base_url = fhir_base_url.map(|s| s.to_string());
+        let output_format = output_format.map(|s| s.to_string());
+        let headers_json = serde_json::to_string(file_request_headers).ok();
+        let oauth_json = serde_json::to_string(oauth_metadata_urls).ok();
+        let encryption_json = file_encryption_key.and_then(|v| serde_json::to_string(v).ok());
+        client
+            .execute(
+                "UPDATE bulk_manifests
+                 SET fhir_base_url = $1, output_format = $2, file_request_headers = $3,
+                     oauth_metadata_urls = $4, file_encryption_key = $5
+                 WHERE tenant_id = $6 AND submitter = $7 AND submission_id = $8 AND manifest_id = $9",
+                &[
+                    &fhir_base_url,
+                    &output_format,
+                    &headers_json,
+                    &oauth_json,
+                    &encryption_json,
+                    &tenant.tenant_id().as_str(),
+                    &id.submitter,
+                    &id.submission_id,
+                    &manifest_id,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("set manifest fetch params: {e}")))?;
+        Ok(())
+    }
+
+    async fn replace_manifest_by_url(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        manifest_url: &str,
+    ) -> StorageResult<Vec<String>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT manifest_id FROM bulk_manifests
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_url = $4 AND status != 'replaced'",
+                &[&tenant_id, &id.submitter, &id.submission_id, &manifest_url],
+            )
+            .await
+            .map_err(|e| internal_error(format!("replace lookup: {e}")))?;
+        let ids: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+        client
+            .execute(
+                "UPDATE bulk_manifests SET status = 'replaced'
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_url = $4",
+                &[&tenant_id, &id.submitter, &id.submission_id, &manifest_url],
+            )
+            .await
+            .map_err(|e| internal_error(format!("mark replaced: {e}")))?;
+        Ok(ids)
+    }
+
+    async fn set_submission_kickoff_meta(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        owner_subject: Option<&str>,
+        request_url: &str,
+        requires_access_token: bool,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        let owner = owner_subject.map(|s| s.to_string());
+        client
+            .execute(
+                "UPDATE bulk_submissions
+                 SET owner_subject = $1, request_url = $2, requires_access_token = $3
+                 WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6",
+                &[
+                    &owner,
+                    &request_url,
+                    &requires_access_token,
+                    &tenant.tenant_id().as_str(),
+                    &id.submitter,
+                    &id.submission_id,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("set kickoff meta: {e}")))?;
+        Ok(())
+    }
+
+    async fn ensure_poll_token(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<String> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT poll_token FROM bulk_submissions
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[&tenant_id, &id.submitter, &id.submission_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("read poll token: {e}")))?;
+        if let Some(row) = rows.first() {
+            let existing: Option<String> = row.get(0);
+            if let Some(token) = existing {
+                return Ok(token);
+            }
+        }
+        let token = Uuid::new_v4().to_string();
+        client
+            .execute(
+                "UPDATE bulk_submissions SET poll_token = $1
+                 WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4",
+                &[&token, &tenant_id, &id.submitter, &id.submission_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("set poll token: {e}")))?;
+        Ok(token)
+    }
+
+    async fn list_expired_submissions(
+        &self,
+        now: DateTime<Utc>,
+        ttl: StdDuration,
+        limit: u32,
+    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+        let client = self.get_client().await?;
+        let cutoff = now
+            - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86400));
+        let rows = client
+            .query(
+                "SELECT tenant_id, submitter, submission_id FROM bulk_submissions
+                 WHERE updated_at < $1 ORDER BY updated_at LIMIT $2",
+                &[&cutoff, &(limit as i64)],
+            )
+            .await
+            .map_err(|e| internal_error(format!("list expired: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let tenant_id: String = r.get(0);
+                let submitter: String = r.get(1);
+                let submission_id: String = r.get(2);
+                (
+                    TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
+                    SubmissionId::new(submitter, submission_id),
+                )
+            })
+            .collect())
+    }
+
+    async fn resolve_poll_token(&self, token: &str) -> StorageResult<Option<PollTokenTarget>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT tenant_id, submitter, submission_id, owner_subject
+                 FROM bulk_submissions WHERE poll_token = $1",
+                &[&token],
+            )
+            .await
+            .map_err(|e| internal_error(format!("resolve poll token: {e}")))?;
+        Ok(rows.first().map(|row| {
+            let tenant_id: String = row.get(0);
+            let submitter: String = row.get(1);
+            let submission_id: String = row.get(2);
+            let owner_subject: Option<String> = row.get(3);
+            PollTokenTarget {
+                tenant: TenantContext::new(
+                    TenantId::new(tenant_id),
+                    TenantPermissions::full_access(),
+                ),
+                submission_id: SubmissionId::new(submitter, submission_id),
+                owner_subject,
+            }
+        }))
+    }
+
+    async fn clear_poll_token(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "UPDATE bulk_submissions SET poll_token = NULL
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &id.submitter,
+                    &id.submission_id,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("clear poll token: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_submit_files(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Vec<SubmitFileRow>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT manifest_url, file_type, resource_type, part_index, fencing_token,
+                        file_path, line_count, byte_count, count_severity
+                 FROM bulk_submit_files
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                 ORDER BY id",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &id.submitter,
+                    &id.submission_id,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("list submit files: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let count_severity: Option<String> = row.get(8);
+                SubmitFileRow {
+                    manifest_url: row.get(0),
+                    file_type: row.get(1),
+                    resource_type: row.get(2),
+                    part_index: row.get::<_, i32>(3) as u32,
+                    fencing_token: row.get::<_, i64>(4) as u64,
+                    file_path: row.get(5),
+                    line_count: row.get::<_, i64>(6) as u64,
+                    byte_count: row.get::<_, i64>(7) as u64,
+                    count_severity: count_severity
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok()),
+                }
+            })
+            .collect())
+    }
+
+    async fn delete_submission_artifacts(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<()> {
+        let client = self.get_client().await?;
+        client
+            .execute(
+                "DELETE FROM bulk_submit_files
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[
+                    &tenant.tenant_id().as_str(),
+                    &id.submitter,
+                    &id.submission_id,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("delete artifacts: {e}")))?;
+        Ok(())
+    }
+
+    async fn count_active_submissions(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_submissions
+                 WHERE tenant_id = $1 AND status = 'in-progress'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .map_err(|e| internal_error(format!("count active submissions: {e}")))?;
+        let count: i64 = row.get(0);
+        Ok(count.max(0) as u64)
+    }
+
+    async fn ensure_transaction_time(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<DateTime<Utc>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT transaction_time FROM bulk_submissions
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[&tenant_id, &id.submitter, &id.submission_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("read transaction_time: {e}")))?;
+        if let Some(row) = rows.first() {
+            let existing: Option<DateTime<Utc>> = row.get(0);
+            if let Some(dt) = existing {
+                return Ok(dt);
+            }
+        }
+        let now = Utc::now();
+        client
+            .execute(
+                "UPDATE bulk_submissions SET transaction_time = $1
+                 WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4",
+                &[&now, &tenant_id, &id.submitter, &id.submission_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("set transaction_time: {e}")))?;
+        Ok(now)
     }
 }

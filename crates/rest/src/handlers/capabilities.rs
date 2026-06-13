@@ -212,6 +212,18 @@ where
             serde_json::json!(["http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"]);
     }
 
+    // Advertise Bulk Data Submit operations when enabled.
+    if state.bulk_submit_config().enabled {
+        operations.push(serde_json::json!({
+            "name": "bulk-submit",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/bulk-submit"
+        }));
+        operations.push(serde_json::json!({
+            "name": "bulk-submit-status",
+            "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/bulk-submit-status"
+        }));
+    }
+
     statement["rest"][0]["operation"] = serde_json::Value::Array(operations);
     statement
 }

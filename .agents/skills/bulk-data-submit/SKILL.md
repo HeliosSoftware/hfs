@@ -60,7 +60,7 @@ At least one of `submissionStatus` or `manifestUrl` must be populated.
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | `ES384` or `RS384` |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens; never `system/bulk-submit` |
 
-Job state reuses the same backend as the FHIR resources. SQLite shares `./data/hfs.db`; PostgreSQL shares `HFS_DATABASE_URL`. Bulk submit is available on `sqlite`, `postgres`, and their `-elasticsearch` composites. Other backends return `501`.
+Job state reuses the same backend as the FHIR resources. SQLite shares `./data/hfs.db`; PostgreSQL shares `HFS_DATABASE_URL`. Bulk submit is available on `sqlite`, `postgres`, and their `-elasticsearch` composites. Other backends return `501`. The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubmitProvider` ingestion engine) and `BulkSubmitRestWorker` (full `$bulk-submit` REST worker/job-store): SQLite and Postgres advertise both, while S3 advertises only `BulkSubmitIngest` and never owns REST-worker job state.
 
 ## Behavior Notes
 

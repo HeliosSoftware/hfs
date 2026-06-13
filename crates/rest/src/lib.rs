@@ -147,6 +147,8 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 pub mod bulk_export_auth;
+pub mod bulk_submit_fetcher;
+pub mod bulk_submit_oauth;
 pub mod config;
 pub mod error;
 pub mod export;
@@ -286,6 +288,19 @@ pub struct BulkExportBundle {
     pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
 }
 
+/// The bulk-submit job store, input fetcher, output store, and download
+/// authorizer, wired into [`AppState`] by [`create_app_with_auth_and_bulk_export`].
+pub struct BulkSubmitBundle {
+    /// Job-state store (claim + worker storage + ingestion engine + lifecycle).
+    pub jobs: Arc<dyn helios_persistence::core::BulkSubmitJobStore>,
+    /// Remote input fetcher (manifest + NDJSON retrieval).
+    pub fetcher: Arc<dyn helios_persistence::core::SubmitInputFetcher>,
+    /// Output store for status-manifest artifacts.
+    pub output: Arc<dyn helios_persistence::core::ExportOutputStore>,
+    /// Download authorizer (reuses the export file-auth trait).
+    pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
+}
+
 /// Creates the Axum application with custom configuration and optional authentication.
 ///
 /// When `auth_state` is `Some`, authentication and authorization middleware
@@ -324,6 +339,7 @@ where
         auth_state,
         audit_state,
         None,
+        None,
     )
 }
 
@@ -361,6 +377,48 @@ where
         auth_state,
         audit_state,
         Some(bulk_export),
+        None,
+    )
+}
+
+/// Like [`create_app_with_auth`], but wires **either or both** of the bulk-export
+/// and bulk-submit subsystems. Either bundle may be `None` independently, so bulk
+/// submit can be enabled with bulk export disabled (and vice versa).
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_and_bulk<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
     )
 }
 
@@ -373,6 +431,7 @@ fn build_app<S>(
     auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
     audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
     bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
 ) -> Router
 where
     S: ResourceStorage
@@ -527,6 +586,12 @@ where
     // Wire the bulk-export subsystem if provided.
     let state = match bulk_export {
         Some(b) => state.with_bulk_export(b.jobs, b.output, b.file_auth),
+        None => state,
+    };
+
+    // Wire the bulk-submit subsystem if provided.
+    let state = match bulk_submit {
+        Some(b) => state.with_bulk_submit(b.jobs, b.fetcher, b.output, b.file_auth),
         None => state,
     };
 

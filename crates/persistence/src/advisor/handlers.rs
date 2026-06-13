@@ -400,6 +400,9 @@ impl BackendInfo {
                     "History",
                     "VersionRead",
                     "Transaction",
+                    "BulkExport",
+                    "BulkSubmitIngest",
+                    "BulkSubmitRestWorker",
                 ]
                 .into_iter()
                 .map(String::from)
@@ -440,6 +443,9 @@ impl BackendInfo {
                     "ConditionalCreate",
                     "ConditionalUpdate",
                     "ConditionalDelete",
+                    "BulkExport",
+                    "BulkSubmitIngest",
+                    "BulkSubmitRestWorker",
                 ]
                 .into_iter()
                 .map(String::from)
@@ -522,10 +528,16 @@ impl BackendInfo {
                 name: "Amazon S3 / Object Storage".to_string(),
                 description: "Object storage, ideal for archival and large data volumes"
                     .to_string(),
-                default_capabilities: vec!["Create", "Read", "Delete"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
+                default_capabilities: vec![
+                    "Create",
+                    "Read",
+                    "Delete",
+                    "BulkExport",
+                    "BulkSubmitIngest",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
                 recommended_roles: vec!["Archive"].into_iter().map(String::from).collect(),
                 strengths: vec![
                     "Very low storage cost",
@@ -886,7 +898,8 @@ fn parse_backend_role(s: &str) -> Result<BackendRole, String> {
 }
 
 fn parse_capability(s: &str) -> Result<BackendCapability, String> {
-    match s.to_lowercase().as_str() {
+    let normalized = s.to_lowercase().replace(['-', '_', ' '], "");
+    match normalized.as_str() {
         "crud" | "create" | "read" | "update" | "delete" => Ok(BackendCapability::Crud),
         "basicsearch" | "search" => Ok(BackendCapability::BasicSearch),
         "versioning" | "versionread" => Ok(BackendCapability::Versioning),
@@ -907,7 +920,8 @@ fn parse_capability(s: &str) -> Result<BackendCapability, String> {
         "offsetpagination" => Ok(BackendCapability::OffsetPagination),
         "sorting" => Ok(BackendCapability::Sorting),
         "bulkexport" => Ok(BackendCapability::BulkExport),
-        "bulkimport" => Ok(BackendCapability::BulkImport),
+        "bulksubmitingest" | "bulkimport" => Ok(BackendCapability::BulkSubmitIngest),
+        "bulksubmitrestworker" => Ok(BackendCapability::BulkSubmitRestWorker),
         "optimisticlocking" => Ok(BackendCapability::OptimisticLocking),
         _ => Err(format!("Unknown capability: {}", s)),
     }
@@ -930,6 +944,22 @@ mod tests {
         assert!(result.is_ok());
         let info = result.unwrap();
         assert_eq!(info.kind, "Sqlite");
+    }
+
+    #[test]
+    fn test_parse_bulk_submit_capabilities() {
+        assert_eq!(
+            parse_capability("bulk-submit-ingest").unwrap(),
+            BackendCapability::BulkSubmitIngest
+        );
+        assert_eq!(
+            parse_capability("BulkSubmitRestWorker").unwrap(),
+            BackendCapability::BulkSubmitRestWorker
+        );
+        assert_eq!(
+            parse_capability("bulkimport").unwrap(),
+            BackendCapability::BulkSubmitIngest
+        );
     }
 
     #[test]

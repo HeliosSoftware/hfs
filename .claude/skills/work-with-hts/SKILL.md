@@ -112,6 +112,8 @@ cargo run --bin hts -- import ./package.tgz \
 
 LOINC language translations under `AccessoryFiles/LinguisticVariants/`, such as `frFR28LinguisticVariant.csv`, are imported automatically as FHIR `concept.designation` entries tagged with BCP-47 language values such as `fr-FR` and `de-DE`.
 
+SNOMED CT descriptions in all languages — including per-language Description files from national extensions — are imported as `concept.designation` entries tagged with the RF2 language code. Every language refset marks its preferred synonyms with `preferredForLanguage` designations (a bare language tag plus a dialect tag like `en-US`/`da-DK`/`fr-CA` for published national refsets), and `en-US`→`en-GB` preference picks the display. Select language via the `displayLanguage` parameter or the `Accept-Language` header on `$lookup` / `$expand` / `$validate-code`; matching is BCP-47-aware (`de-DE` finds `de`, `fr` accepts `fr-CA`).
+
 ## Format Auto-detection
 
 | Extension or pattern | Detected format |

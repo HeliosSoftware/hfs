@@ -36,6 +36,11 @@ redis = ["helios-auth/redis"]
 # Subscriptions
 subscriptions = ["dep:helios-subscriptions"]
 
+# Bulk-submit JWE file decryption (`fileEncryptionKey`). Enables decrypting
+# `dir` + A128GCM/A256GCM compact-JWE files; without it, encrypted submissions
+# record a `not-supported` manifest-level error (documented non-conformance).
+bulk-submit-jwe = ["dep:aes-gcm"]
+
 [dependencies]
 # Core dependencies
 helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
@@ -95,7 +100,13 @@ aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
 
 # HTTP client for terminology server integration (HTS)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+
+# JWT signing for the bulk-submit outbound SMART Backend Services client.
+jsonwebtoken = "9"
+
+# Pure-Rust AES-GCM for optional bulk-submit JWE file decryption (no OpenSSL).
+aes-gcm = { version = "0.10", optional = true }
 
 [dev-dependencies]
 # HTTP testing
@@ -113,6 +124,9 @@ tokio-test = "0.4"
 
 # JSON path for test assertions
 jsonpath-rust = "0.7"
+
+# base64url decoding for OAuth assertion inspection in tests
+base64 = "0.22"
 
 # Regex for pattern matching in tests
 regex = "1"

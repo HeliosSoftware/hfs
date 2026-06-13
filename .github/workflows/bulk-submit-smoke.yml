@@ -15,10 +15,49 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  HFS_S3_SUBMIT_BUCKET: ${{ secrets.HFS_S3_SUBMIT_BUCKET || vars.HFS_S3_SUBMIT_BUCKET || secrets.HFS_S3_EXPORT_BUCKET || vars.HFS_S3_EXPORT_BUCKET }}
 
 jobs:
+  matrix-setup:
+    name: Generate matrix
+    runs-on: [self-hosted, Linux]
+    outputs:
+      smoke-matrix: ${{ steps.gen.outputs.smoke-matrix }}
+    steps:
+      - id: gen
+        run: |
+          FHIR_VERSIONS='["R4","R4B","R5"]'
+          # Keep this backend/output matrix aligned with bulk-export-smoke.yml.
+          # Bulk submit REST worker support is currently wired for SQLite/PostgreSQL
+          # primary stores and their Elasticsearch composites. S3 has only
+          # BulkSubmitIngest provider support, so MongoDB and S3 primary stores are
+          # kept in the matrix to assert the endpoint-unavailable contract.
+          ROWS='[
+            {"backend":"sqlite","output":"local","expectation":"full"},
+            {"backend":"sqlite","output":"s3","expectation":"full"},
+            {"backend":"postgres","output":"local","expectation":"full"},
+            {"backend":"postgres","output":"s3","expectation":"full"},
+            {"backend":"sqlite-elasticsearch","output":"local","expectation":"full"},
+            {"backend":"sqlite-elasticsearch","output":"s3","expectation":"full"},
+            {"backend":"postgres-elasticsearch","output":"local","expectation":"full"},
+            {"backend":"postgres-elasticsearch","output":"s3","expectation":"full"},
+            {"backend":"mongodb","output":"local","expectation":"endpoint-unavailable"},
+            {"backend":"mongodb","output":"s3","expectation":"endpoint-unavailable"},
+            {"backend":"mongodb-elasticsearch","output":"local","expectation":"endpoint-unavailable"},
+            {"backend":"mongodb-elasticsearch","output":"s3","expectation":"endpoint-unavailable"},
+            {"backend":"s3-elasticsearch","output":"local","expectation":"endpoint-unavailable"},
+            {"backend":"s3","output":"none","expectation":"endpoint-unavailable"}
+          ]'
+
+          MATRIX=$(jq -c --argjson versions "$FHIR_VERSIONS" \
+            '[.[] as $row | $versions[] as $version | $row + {fhir_version: $version}]' \
+            <<<"$ROWS")
+          echo "smoke-matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Smoke matrix: $(jq 'length' <<<"$MATRIX") jobs"
+
   build:
     name: Build HFS with Bulk Submit support
+    needs: matrix-setup
     runs-on: [self-hosted, Linux]
     steps:
       - uses: actions/checkout@v5
@@ -35,7 +74,9 @@ jobs:
             echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]'
           } >> ~/.cargo/config.toml
       - name: Build HFS
-        run: cargo build -p helios-hfs --no-default-features --features R4,postgres
+        run: |
+          cargo build -p helios-hfs --no-default-features \
+            --features R4,R4B,R5,sqlite,elasticsearch,postgres,mongodb,s3
       - uses: actions/upload-artifact@v7
         with:
           name: hfs-bulk-submit-smoke-binary
@@ -43,14 +84,20 @@ jobs:
           retention-days: 1
 
   smoke:
-    name: Bulk Submit round trip (${{ matrix.backend }})
-    needs: build
+    name: Smoke (${{ matrix.fhir_version }} / ${{ matrix.backend }} / ${{ matrix.output }})
+    needs: [matrix-setup, build]
     runs-on: [self-hosted, Linux]
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        backend: [sqlite, postgres]
+        include: ${{ fromJSON(needs.matrix-setup.outputs.smoke-matrix) }}
+    env:
+      RESULTS_DIR: bulk-submit-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/${{ matrix.output }}
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v8
@@ -59,37 +106,175 @@ jobs:
           path: target/debug
       - run: chmod +x target/debug/hfs
 
-      - name: Resolve runner IP
-        run: echo "RUNNER_IP=$(hostname -I | awk '{print $1}')" >> "$GITHUB_ENV"
-
-      - name: Start PostgreSQL (postgres backend only)
-        if: matrix.backend == 'postgres'
+      - name: Determine runner and Docker host IP
         run: |
-          PG="pg-bulk-submit-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$PG" 2>/dev/null || true
-          docker run -d --name "$PG" -p 0:5432 \
-            -e POSTGRES_USER=helios -e POSTGRES_PASSWORD=helios -e POSTGRES_DB=helios \
-            postgres:16
-          echo "PG_CONTAINER=$PG" >> "$GITHUB_ENV"
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Start Elasticsearch
+        if: contains(matrix.backend, 'elasticsearch')
+        run: |
+          ES_CONTAINER="es-bulk-submit-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
+          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+            elasticsearch:8.15.0
+          echo "ES_CONTAINER=$ES_CONTAINER" >> "$GITHUB_ENV"
+
           for i in {1..30}; do
-            if docker exec "$PG" pg_isready -U helios >/dev/null 2>&1; then
-              echo "PG_PORT=$(docker port "$PG" 5432 | head -1 | sed 's/.*://')" >> "$GITHUB_ENV"
-              break
+            ES_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$ES_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" >/dev/null 2>&1; then
+              echo "ES_PORT=$ES_PORT" >> "$GITHUB_ENV"
+              echo "Elasticsearch is ready on port $ES_PORT"
+              exit 0
             fi
+            echo "Attempt $i/30: Elasticsearch not ready yet..."
             sleep 2
           done
 
+          docker logs "$ES_CONTAINER"
+          exit 1
+
+      - name: Start PostgreSQL
+        if: contains(matrix.backend, 'postgres')
+        run: |
+          PG_CONTAINER="pg-bulk-submit-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+          echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios >/dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+                echo "PG_URL=postgresql://helios:helios@$DOCKER_HOST_IP:$PG_PORT/helios" >> "$GITHUB_ENV"
+                echo "PostgreSQL is ready on port $PG_PORT"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Start MongoDB replica set
+        if: contains(matrix.backend, 'mongodb')
+        run: |
+          MONGO_CONTAINER="mongo-bulk-submit-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
+          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+          echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$MONGO_PORT" ]; then
+              if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]})' >/dev/null 2>&1 || true; then
+                if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'db.hello().isWritablePrimary' | grep -q true; then
+                  echo "MONGO_PORT=$MONGO_PORT" >> "$GITHUB_ENV"
+                  echo "MongoDB replica set is ready on port $MONGO_PORT"
+                  exit 0
+                fi
+              fi
+            fi
+            echo "Attempt $i/30: MongoDB not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$MONGO_CONTAINER"
+          exit 1
+
+      - name: Start MinIO
+        if: startsWith(matrix.backend, 's3')
+        run: |
+          MINIO_CONTAINER="minio-bulk-submit-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
+          docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MINIO_CONTAINER" -p 0:9000 -p 0:9001 \
+            -e MINIO_ROOT_USER=hfs-minio \
+            -e MINIO_ROOT_PASSWORD=hfs-minio-secret \
+            minio/minio:latest server /data --console-address ":9001"
+          echo "MINIO_CONTAINER=$MINIO_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            MINIO_PORT=$(docker port "$MINIO_CONTAINER" 9000 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$MINIO_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$MINIO_PORT/minio/health/live" >/dev/null 2>&1; then
+              echo "MINIO_PORT=$MINIO_PORT" >> "$GITHUB_ENV"
+              docker run --rm --network "container:$MINIO_CONTAINER" \
+                --entrypoint /bin/sh \
+                minio/mc:latest \
+                -c 'mc alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret && mc mb -p local/hfs-primary || true'
+              echo "MinIO is ready on port $MINIO_PORT"
+              exit 0
+            fi
+            echo "Attempt $i/30: MinIO not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$MINIO_CONTAINER"
+          exit 1
+
+      - name: Validate S3 submit bucket configuration
+        if: matrix.output == 's3'
+        run: |
+          if [ -z "${HFS_S3_SUBMIT_BUCKET:-}" ]; then
+            echo "::error::output=s3 requires HFS_S3_SUBMIT_BUCKET or HFS_S3_EXPORT_BUCKET to be configured"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        if: matrix.output == 's3'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        if: matrix.output == 's3'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> "$GITHUB_PATH"
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Verify S3 submit bucket access
+        if: matrix.output == 's3'
+        run: |
+          aws s3api head-bucket --bucket "$HFS_S3_SUBMIT_BUCKET"
+
       - name: Stage Data-Provider manifest + NDJSON
         run: |
-          mkdir -p provider
-          PROVIDER_PORT=18791
+          PROVIDER_DIR="$(pwd)/$RESULTS_DIR/provider"
+          mkdir -p "$PROVIDER_DIR"
+          PROVIDER_PORT=$((19100 + ${{ strategy['job-index'] }}))
           echo "PROVIDER_PORT=$PROVIDER_PORT" >> "$GITHUB_ENV"
           BASE="http://$RUNNER_IP:$PROVIDER_PORT"
-          cat > provider/patients.ndjson <<'EOF'
+          cat > "$PROVIDER_DIR/patients.ndjson" <<'EOF'
           {"resourceType":"Patient","id":"submit-smoke-1","name":[{"family":"Submit","given":["Alpha"]}],"gender":"female"}
           {"resourceType":"Patient","id":"submit-smoke-2","name":[{"family":"Submit","given":["Beta"]}],"gender":"male"}
           EOF
-          cat > provider/manifest.json <<EOF
+          cat > "$PROVIDER_DIR/manifest.json" <<EOF
           {
             "transactionTime": "2024-01-01T00:00:00Z",
             "request": "$BASE/manifest.json",
@@ -101,92 +286,290 @@ jobs:
             "deleted": []
           }
           EOF
-          ( cd provider && nohup python3 -m http.server "$PROVIDER_PORT" --bind 0.0.0.0 >/tmp/provider.log 2>&1 & echo $! > /tmp/provider.pid )
+          ( cd "$PROVIDER_DIR" && nohup python3 -m http.server "$PROVIDER_PORT" --bind 0.0.0.0 > "$PROVIDER_DIR/provider.log" 2>&1 & echo $! > /tmp/provider-bulk-submit-${{ strategy['job-index'] }}.pid )
+          echo "PROVIDER_PID=$(cat /tmp/provider-bulk-submit-${{ strategy['job-index'] }}.pid)" >> "$GITHUB_ENV"
+          echo "PROVIDER_LOG=$PROVIDER_DIR/provider.log" >> "$GITHUB_ENV"
           sleep 2
           curl -sf "$BASE/manifest.json" >/dev/null
 
       - name: Start HFS
         run: |
-          PORT=18790
-          echo "HFS_PORT=$PORT" >> "$GITHUB_ENV"
-          COMMON="HFS_BASE_URL=http://$RUNNER_IP:$PORT HFS_BULK_SUBMIT_ENABLED=true HFS_BULK_SUBMIT_BATCH_SIZE=100"
-          if [ "${{ matrix.backend }}" = "postgres" ]; then
-            export HFS_STORAGE_BACKEND=postgres
-            export HFS_DATABASE_URL="postgresql://helios:helios@$RUNNER_IP:$PG_PORT/helios"
-          else
-            export HFS_STORAGE_BACKEND=sqlite
-            export HFS_DATABASE_URL="$RUNNER_IP-ignored"
-            rm -f ./data/hfs.db
-          fi
-          env $COMMON ./target/debug/hfs --port "$PORT" --host 0.0.0.0 >/tmp/hfs.log 2>&1 &
-          echo $! > /tmp/hfs.pid
-          for i in {1..30}; do
-            if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then echo "HFS ready"; break; fi
+          mkdir -p "$RESULTS_DIR"
+          HFS_PORT=$((18790 + ${{ strategy['job-index'] }}))
+          HFS_LOG="$RESULTS_DIR/hfs.log"
+          HFS_DEFAULT_TENANT="bulk-submit-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy['job-index'] }}"
+          echo "HFS_PORT=$HFS_PORT" >> "$GITHUB_ENV"
+          echo "HFS_LOG=$HFS_LOG" >> "$GITHUB_ENV"
+          echo "HFS_DEFAULT_TENANT=$HFS_DEFAULT_TENANT" >> "$GITHUB_ENV"
+
+          COMMON_ENV=(
+            HFS_BASE_URL="http://localhost:$HFS_PORT"
+            HFS_DEFAULT_FHIR_VERSION="${{ matrix.fhir_version }}"
+            HFS_DEFAULT_TENANT="$HFS_DEFAULT_TENANT"
+            HFS_BULK_EXPORT_ENABLED=false
+            HFS_BULK_SUBMIT_BATCH_SIZE=100
+            HFS_BULK_SUBMIT_FILE_URL_TTL=3600
+            HFS_BULK_SUBMIT_OUTPUT_TTL=3600
+          )
+
+          BULK_ENV=()
+          case "${{ matrix.output }}" in
+            local)
+              BULK_ENV=(
+                HFS_BULK_SUBMIT_ENABLED=true
+                HFS_BULK_SUBMIT_OUTPUT_BACKEND=local-fs
+                HFS_BULK_SUBMIT_OUTPUT_DIR="$RESULTS_DIR/submit-output"
+                HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN=auto
+              )
+              ;;
+            s3)
+              BULK_ENV=(
+                HFS_BULK_SUBMIT_ENABLED=true
+                HFS_BULK_SUBMIT_OUTPUT_BACKEND=s3
+                HFS_BULK_SUBMIT_S3_BUCKET="$HFS_S3_SUBMIT_BUCKET"
+                HFS_BULK_SUBMIT_S3_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+                HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN=false
+              )
+              ;;
+            none)
+              BULK_ENV=(
+                HFS_BULK_SUBMIT_ENABLED=false
+              )
+              ;;
+            *)
+              echo "Unknown output: ${{ matrix.output }}"
+              exit 1
+              ;;
+          esac
+
+          case "${{ matrix.backend }}" in
+            sqlite)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=sqlite \
+                ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            sqlite-elasticsearch)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=sqlite-elasticsearch \
+                HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+                ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            postgres)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=postgres \
+                HFS_DATABASE_URL="$PG_URL" \
+                HFS_PG_HOST="$DOCKER_HOST_IP" \
+                HFS_PG_PORT="$PG_PORT" \
+                HFS_PG_DBNAME=helios \
+                HFS_PG_USER=helios \
+                HFS_PG_PASSWORD=helios \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            postgres-elasticsearch)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=postgres-elasticsearch \
+                HFS_DATABASE_URL="$PG_URL" \
+                HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            mongodb)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=mongodb \
+                HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+                HFS_MONGODB_DATABASE="helios_bulk_submit_smoke_${{ github.run_id }}_${{ github.run_attempt }}_${{ strategy['job-index'] }}" \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            mongodb-elasticsearch)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                HFS_STORAGE_BACKEND=mongodb-elasticsearch \
+                HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+                HFS_MONGODB_DATABASE="helios_bulk_submit_smoke_${{ github.run_id }}_${{ github.run_attempt }}_${{ strategy['job-index'] }}" \
+                HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            s3)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                AWS_ACCESS_KEY_ID=hfs-minio \
+                AWS_SECRET_ACCESS_KEY=hfs-minio-secret \
+                AWS_REGION=us-east-1 \
+                HFS_STORAGE_BACKEND=s3 \
+                HFS_S3_BUCKET=hfs-primary \
+                HFS_S3_ENDPOINT="http://$DOCKER_HOST_IP:$MINIO_PORT" \
+                HFS_S3_FORCE_PATH_STYLE=true \
+                HFS_S3_PREFIX="ci/bulk-submit-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ strategy['job-index'] }}/" \
+                HFS_S3_VALIDATE_BUCKETS=false \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+            s3-elasticsearch)
+              env "${COMMON_ENV[@]}" "${BULK_ENV[@]}" \
+                AWS_ACCESS_KEY_ID=hfs-minio \
+                AWS_SECRET_ACCESS_KEY=hfs-minio-secret \
+                AWS_REGION=us-east-1 \
+                HFS_STORAGE_BACKEND=s3-elasticsearch \
+                HFS_S3_BUCKET=hfs-primary \
+                HFS_S3_ENDPOINT="http://$DOCKER_HOST_IP:$MINIO_PORT" \
+                HFS_S3_FORCE_PATH_STYLE=true \
+                HFS_S3_PREFIX="ci/bulk-submit-smoke/${{ github.run_id }}/${{ github.run_attempt }}/${{ strategy['job-index'] }}/" \
+                HFS_S3_VALIDATE_BUCKETS=false \
+                HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+                ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+              ;;
+          esac
+
+          echo $! > /tmp/hfs-bulk-submit-${{ strategy['job-index'] }}.pid
+          echo "HFS_PID=$(cat /tmp/hfs-bulk-submit-${{ strategy['job-index'] }}.pid)" >> "$GITHUB_ENV"
+
+      - name: Wait for HFS to be ready
+        run: |
+          for i in {1..45}; do
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "HFS process exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT/health" >/dev/null 2>&1; then
+              echo "HFS is ready"
+              exit 0
+            fi
+            echo "Attempt $i/45: HFS not ready yet..."
             sleep 2
           done
 
+          tail -100 "$HFS_LOG"
+          exit 1
+
       - name: Kick off $bulk-submit
         run: |
-          BASE="http://127.0.0.1:$HFS_PORT"
+          BASE="http://localhost:$HFS_PORT"
           PROVIDER="http://$RUNNER_IP:$PROVIDER_PORT"
-          cat > submit.json <<EOF
+          cat > "$RESULTS_DIR/submit.json" <<EOF
           {
             "resourceType": "Parameters",
             "parameter": [
               { "name": "submitter", "valueIdentifier": { "system": "http://example.org", "value": "smoke" } },
-              { "name": "submissionId", "valueString": "smoke-1" },
+              { "name": "submissionId", "valueString": "smoke-${{ strategy['job-index'] }}" },
               { "name": "manifestUrl", "valueUrl": "$PROVIDER/manifest.json" },
               { "name": "fhirBaseUrl", "valueUrl": "$PROVIDER/fhir" },
               { "name": "submissionStatus", "valueCoding": { "system": "http://hl7.org/fhir/event-status", "code": "completed" } }
             ]
           }
           EOF
-          code=$(curl -sS -o submit-resp.json -w "%{http_code}" -X POST "$BASE/\$bulk-submit" \
-            -H "Content-Type: application/fhir+json" --data-binary @submit.json)
-          echo "kickoff HTTP $code"; cat submit-resp.json
-          [ "$code" = "200" ]
+          code=$(curl -sS -o "$RESULTS_DIR/submit-resp.json" -w "%{http_code}" -X POST "$BASE/\$bulk-submit" \
+            -H "Content-Type: application/fhir+json" --data-binary @"$RESULTS_DIR/submit.json")
+          echo "kickoff HTTP $code"
+          cat "$RESULTS_DIR/submit-resp.json"
+          if [ "${{ matrix.expectation }}" = "endpoint-unavailable" ]; then
+            [ "$code" = "501" ]
+          else
+            [ "$code" = "200" ]
+          fi
 
       - name: Poll status to completion
+        if: matrix.expectation == 'full'
         run: |
-          BASE="http://127.0.0.1:$HFS_PORT"
-          cat > status.json <<'EOF'
+          BASE="http://localhost:$HFS_PORT"
+          cat > "$RESULTS_DIR/status.json" <<EOF
           { "resourceType": "Parameters", "parameter": [
             { "name": "submitter", "valueIdentifier": { "system": "http://example.org", "value": "smoke" } },
-            { "name": "submissionId", "valueString": "smoke-1" } ] }
+            { "name": "submissionId", "valueString": "smoke-${{ strategy['job-index'] }}" } ] }
           EOF
           LOC=$(curl -sS -D - -o /dev/null -X POST "$BASE/\$bulk-submit-status" \
-            -H "Content-Type: application/fhir+json" --data-binary @status.json \
+            -H "Content-Type: application/fhir+json" --data-binary @"$RESULTS_DIR/status.json" \
             | tr -d '\r' | awk -F': ' 'tolower($1)=="content-location"{print $2}')
           echo "poll URL: $LOC"
           [ -n "$LOC" ]
-          # Rewrite host to localhost for in-runner polling.
-          LOC_LOCAL=$(echo "$LOC" | sed "s#http://$RUNNER_IP:$HFS_PORT#http://127.0.0.1:$HFS_PORT#")
           for i in {1..30}; do
-            code=$(curl -sS -o manifest.json -w "%{http_code}" "$LOC_LOCAL")
+            code=$(curl -sS -o "$RESULTS_DIR/manifest.json" -w "%{http_code}" "$LOC")
             echo "poll $i: HTTP $code"
-            if [ "$code" = "200" ]; then cat manifest.json; break; fi
+            if [ "$code" = "200" ]; then cat "$RESULTS_DIR/manifest.json"; break; fi
             sleep 2
           done
           [ "$code" = "200" ]
 
       - name: Assert resources were ingested
+        if: matrix.expectation == 'full'
         run: |
-          BASE="http://127.0.0.1:$HFS_PORT"
+          BASE="http://localhost:$HFS_PORT"
           for id in submit-smoke-1 submit-smoke-2; do
             code=$(curl -sS -o /dev/null -w "%{http_code}" "$BASE/Patient/$id")
-            echo "GET Patient/$id → $code"
+            echo "GET Patient/$id -> $code"
             [ "$code" = "200" ]
           done
+
+      - name: Stop HFS gracefully
+        if: always()
+        run: |
+          if [ -n "${HFS_PID:-}" ] && kill -0 "$HFS_PID" 2>/dev/null; then
+            kill -INT "$HFS_PID" 2>/dev/null || true
+            for _ in {1..50}; do
+              if kill -0 "$HFS_PID" 2>/dev/null; then
+                sleep 0.2
+              else
+                break
+              fi
+            done
+            kill -9 "$HFS_PID" 2>/dev/null || true
+          fi
+          rm -f /tmp/hfs-bulk-submit-${{ strategy['job-index'] }}.pid
+
+      - name: Stop provider
+        if: always()
+        run: |
+          if [ -n "${PROVIDER_PID:-}" ] && kill -0 "$PROVIDER_PID" 2>/dev/null; then
+            kill "$PROVIDER_PID" 2>/dev/null || true
+          fi
+          rm -f /tmp/provider-bulk-submit-${{ strategy['job-index'] }}.pid
+
+      - name: Cleanup S3 submit output
+        if: always() && matrix.output == 's3'
+        run: |
+          if [ -n "${HFS_S3_SUBMIT_BUCKET:-}" ] && [ -n "${HFS_DEFAULT_TENANT:-}" ]; then
+            aws s3 rm "s3://$HFS_S3_SUBMIT_BUCKET/$HFS_DEFAULT_TENANT/submit/" --recursive || true
+          fi
+
+      - name: Collect backend container logs
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR/backend-logs"
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker logs "$ES_CONTAINER" > "$RESULTS_DIR/backend-logs/elasticsearch.log" 2>&1 || true
+          fi
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker logs "$PG_CONTAINER" > "$RESULTS_DIR/backend-logs/postgres.log" 2>&1 || true
+          fi
+          if [ -n "${MONGO_CONTAINER:-}" ]; then
+            docker logs "$MONGO_CONTAINER" > "$RESULTS_DIR/backend-logs/mongodb.log" 2>&1 || true
+          fi
+          if [ -n "${MINIO_CONTAINER:-}" ]; then
+            docker logs "$MINIO_CONTAINER" > "$RESULTS_DIR/backend-logs/minio.log" 2>&1 || true
+          fi
 
       - name: Dump logs on failure
         if: failure()
         run: |
-          echo "=== HFS log ==="; tail -100 /tmp/hfs.log || true
-          echo "=== provider log ==="; tail -50 /tmp/provider.log || true
+          echo "=== HFS log ==="; tail -100 "$HFS_LOG" || true
+          echo "=== provider log ==="; tail -50 "$PROVIDER_LOG" || true
 
-      - name: Cleanup
+      - name: Upload bulk submit smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bulk-submit-smoke-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bulk-submit-smoke-results/${{ matrix.fhir_version }}/${{ matrix.backend }}/${{ matrix.output }}/
+          retention-days: 30
+
+      - name: Cleanup containers
         if: always()
         run: |
-          [ -f /tmp/hfs.pid ] && kill "$(cat /tmp/hfs.pid)" 2>/dev/null || true
-          [ -f /tmp/provider.pid ] && kill "$(cat /tmp/provider.pid)" 2>/dev/null || true
-          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${MONGO_CONTAINER:-}" ]; then
+            docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${MINIO_CONTAINER:-}" ]; then
+            docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
+          fi

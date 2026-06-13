@@ -514,6 +514,9 @@ impl Backend for SqliteBackend {
                 | BackendCapability::OffsetPagination
                 | BackendCapability::Transactions
                 | BackendCapability::OptimisticLocking
+                | BackendCapability::BulkExport
+                | BackendCapability::BulkSubmitIngest
+                | BackendCapability::BulkSubmitRestWorker
                 | BackendCapability::Include
                 | BackendCapability::Revinclude
                 | BackendCapability::SharedSchema
@@ -534,6 +537,9 @@ impl Backend for SqliteBackend {
             BackendCapability::OffsetPagination,
             BackendCapability::Transactions,
             BackendCapability::OptimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
             BackendCapability::Include,
             BackendCapability::Revinclude,
             BackendCapability::SharedSchema,
@@ -768,6 +774,9 @@ mod tests {
         assert!(backend.supports(BackendCapability::Crud));
         assert!(backend.supports(BackendCapability::BasicSearch));
         assert!(backend.supports(BackendCapability::Transactions));
+        assert!(backend.supports(BackendCapability::BulkExport));
+        assert!(backend.supports(BackendCapability::BulkSubmitIngest));
+        assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
         assert!(!backend.supports(BackendCapability::FullTextSearch));
     }
 
