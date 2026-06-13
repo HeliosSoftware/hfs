@@ -49,8 +49,9 @@ Connection flow:
 3. **Overview** shows facts parsed from the CapabilityStatement (resource-type
    count, FHIR version, tenant); **Refresh** re-fetches `/metadata`.
 4. **Resources** lists the server's resource types, searches a selected type
-   (`GET /[type]?_count=20`), and shows each resource's JSON in a system
-   `.inspector` panel.
+   (`GET /[type]?_count=20` plus any editable search parameters), pages through
+   results by following the Bundle `next` link, and shows each resource's JSON in
+   a system `.inspector` panel.
 
 ## UI Layout Structure
 
@@ -83,7 +84,7 @@ Liquid Glass automatically where supported.
 |--------|-------|
 | Settings | ✅ Live — connect/disconnect, validation, status feedback |
 | Overview | ✅ Live — capability tiles from `/metadata`, refresh |
-| Resources | ✅ Live — type list, first-page search, JSON inspector |
+| Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector |
 | Search | ⏳ Scaffold placeholder |
 | Bulk Jobs | ⏳ Scaffold placeholder |
 | Audit | ⏳ Scaffold placeholder |
@@ -100,18 +101,19 @@ Done:
 2. ✅ `HFSAppModel` state layer + functional Settings (connect/disconnect).
 3. ✅ Overview wired to the live CapabilityStatement.
 4. ✅ Resources browser: type list → search → JSON detail (`.inspector`).
+5. ✅ Resource search **pagination** (follows the Bundle `next` link) and
+   editable **search parameters**.
 
 Coming next:
 
-5. ⏭️ Resource search **pagination** (Bundle `next` link) and **search
-   parameters**, shared with a dedicated Search screen.
-6. ⏭️ Resource **create / update / delete** (read-write; the "New Resource"
+6. ⏭️ A dedicated Search screen reusing the parameter/pagination plumbing.
+7. ⏭️ Resource **create / update / delete** (read-write; the "New Resource"
    toolbar action is currently a placeholder).
-7. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
-8. ⏭️ **Auth** (`HFSAuth`): static bearer token, then SMART-on-FHIR discovery
+8. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
+9. ⏭️ **Auth** (`HFSAuth`): static bearer token, then SMART-on-FHIR discovery
    (currently `NoAccessTokenProvider`).
-9. ⏭️ Settings persistence (`@AppStorage`/`UserDefaults`).
-10. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
+10. ⏭️ Settings persistence (`@AppStorage`/`UserDefaults`).
+11. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
 
 ## Building
 
