@@ -92,6 +92,7 @@ Use those skills instead of expanding this always-loaded file:
 - `/bulk-data-export` - FHIR Bulk Data Access `$export` jobs, manifests, output storage, and behavior notes.
 - `/bulk-data-submit` - FHIR Bulk Data Submit `$bulk-submit` ingestion, status, OAuth, JWE, and worker settings.
 - `/docker-and-release` - Docker image builds and release workflow.
+- `/run-swift-client` - Swift admin client (`clients/swift`): `hfs-admin` macOS app, `swift build`/`test`, `.app` packaging, connecting to a local server, and SwiftUI conventions.
 
 ## Environment Setup
 
