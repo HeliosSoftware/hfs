@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
+use helios_persistence::core::sof_runner::SofRunner;
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, ExportOutputStore, ResourceStorage, SubmitInputFetcher,
 };
 
 use crate::bulk_export_auth::ExportFileAuth;
 use crate::config::{BulkExportConfig, BulkSubmitConfig, ServerConfig};
+use crate::export::ExportJobController;
 use crate::middleware::auth::AuthMiddlewareState;
 
 /// Shared application state for the REST API.
@@ -48,6 +50,12 @@ pub struct AppState<S> {
 
     /// Auth middleware state (present only when auth is enabled).
     auth: Option<Arc<AuthMiddlewareState>>,
+
+    /// SQL-on-FHIR runner (in-DB or in-process fallback).
+    sof_runner: Option<Arc<dyn SofRunner>>,
+
+    /// Export job controller (present when export is enabled).
+    export_controller: Option<Arc<dyn ExportJobController>>,
 
     /// Optional audit sink for handler-level per-entry audit emission.
     audit_sink: Option<Arc<dyn AuditSink>>,
@@ -95,6 +103,8 @@ impl<S> Clone for AppState<S> {
             config: Arc::clone(&self.config),
             auth_config: Arc::clone(&self.auth_config),
             auth: self.auth.clone(),
+            sof_runner: self.sof_runner.clone(),
+            export_controller: self.export_controller.clone(),
             audit_sink: self.audit_sink.clone(),
             audit_source_observer: self.audit_source_observer.clone(),
             #[cfg(feature = "subscriptions")]
@@ -127,6 +137,8 @@ impl<S: ResourceStorage> AppState<S> {
             config: Arc::new(config),
             auth_config: Arc::new(AuthConfig::default()),
             auth: None,
+            sof_runner: None,
+            export_controller: None,
             audit_sink: None,
             audit_source_observer: "Device/hfs".to_string(),
             #[cfg(feature = "subscriptions")]
@@ -169,6 +181,8 @@ impl<S: ResourceStorage> AppState<S> {
             config: Arc::new(config),
             auth_config: Arc::new(auth_config),
             auth: auth_state,
+            sof_runner: None,
+            export_controller: None,
             audit_sink,
             audit_source_observer: audit_source_observer.into(),
             #[cfg(feature = "subscriptions")]
@@ -183,6 +197,33 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_file_auth: None,
             bulk_submit_config,
         }
+    }
+
+    /// Sets the SQL-on-FHIR runner for this application state.
+    ///
+    /// Typically called at startup after creating the state, once the runner has been
+    /// selected (in-DB for capable backends, in-process for all others).
+    pub fn with_sof_runner(mut self, runner: Arc<dyn SofRunner>) -> Self {
+        self.sof_runner = Some(runner);
+        self
+    }
+
+    /// Returns the SQL-on-FHIR runner, if one has been configured. The
+    /// `$viewdefinition-run` handler returns `501 Not Implemented` when this
+    /// is `None` — there is no in-process fallback.
+    pub fn sof_runner(&self) -> Option<&Arc<dyn SofRunner>> {
+        self.sof_runner.as_ref()
+    }
+
+    /// Sets the export job controller on this application state.
+    pub fn with_export_controller(mut self, controller: Arc<dyn ExportJobController>) -> Self {
+        self.export_controller = Some(controller);
+        self
+    }
+
+    /// Returns the export job controller, if one has been configured.
+    pub fn export_controller(&self) -> Option<&Arc<dyn ExportJobController>> {
+        self.export_controller.as_ref()
     }
 
     /// Wires the bulk-export job store, output store, and file authorizer.

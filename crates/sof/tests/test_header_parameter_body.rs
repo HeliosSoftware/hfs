@@ -181,8 +181,13 @@ async fn test_header_parameter_overrides_query() {
     assert!(lines[0].contains("test-3"));
 }
 
+/// Audit item #14: the `header` parameter "applies only when csv output
+/// is requested" per spec. When supplied alongside a non-CSV format
+/// (here: default JSON), it MUST be silently ignored, not rejected.
+/// This test was previously asserting the old (overly-strict) 400
+/// behavior; updated to the spec-aligned lenient behavior.
 #[tokio::test]
-async fn test_header_parameter_without_format() {
+async fn test_header_parameter_without_format_is_ignored_on_non_csv() {
     let server = common::test_server().await;
 
     let request_body = json!({
@@ -215,23 +220,23 @@ async fn test_header_parameter_without_format() {
         ]
     });
 
-    // No format specified, should default to JSON
+    // No `_format` specified → defaults to JSON. The body's `header`
+    // parameter should be ignored (not error).
     let response = server
         .post("/ViewDefinition/$viewdefinition-run")
         .json(&request_body)
         .await;
 
-    // header parameter only applies to CSV, should get error with JSON format
-    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-
-    let json: serde_json::Value = response.json();
-    assert_eq!(json["resourceType"], "OperationOutcome");
-    assert!(
-        json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Header parameter only applies to CSV format")
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "header on non-CSV must be ignored, not rejected; got {} body: {}",
+        response.status_code(),
+        response.text()
     );
+    // Response should be JSON (header parameter quietly ignored).
+    let content_type = response.header("content-type");
+    assert_eq!(content_type.to_str().unwrap(), "application/json");
 }
 
 #[tokio::test]

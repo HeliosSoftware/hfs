@@ -151,6 +151,7 @@ pub mod bulk_submit_fetcher;
 pub mod bulk_submit_oauth;
 pub mod config;
 pub mod error;
+pub mod export;
 pub mod extractors;
 pub mod fhir_types;
 pub mod handlers;
@@ -178,6 +179,7 @@ use helios_persistence::core::{
 use tower::ServiceBuilder;
 use tower_http::{
     compression::CompressionLayer,
+    compression::predicate::{NotForContentType, Predicate, SizeAbove},
     cors::{Any, CorsLayer},
     decompression::RequestDecompressionLayer,
     timeout::TimeoutLayer,
@@ -456,6 +458,9 @@ where
         info!("Authentication is ENABLED");
     }
 
+    // Storage arrives pre-wrapped in an Arc so we can share it with the SofRunner.
+    let storage_arc = storage;
+
     let (app_audit_sink, app_audit_source_observer) = audit_state
         .as_ref()
         .map(|audit| {
@@ -472,14 +477,111 @@ where
     let outbound_auth_provider = auth_config.outbound_provider();
 
     // Create application state
-    let state = AppState::with_auth_and_audit(
-        storage,
+    let mut state = AppState::with_auth_and_audit(
+        Arc::clone(&storage_arc),
         config.clone(),
         auth_config,
         auth_state.clone(),
         app_audit_sink,
         app_audit_source_observer,
     );
+
+    // Wire SQL-on-FHIR runner and export controller. The SOF runtime path is
+    // in-DB SQL only — backends without a SOF runner can't serve
+    // `$viewdefinition-run` and the handler returns 501 if SOF is enabled
+    // without one.
+    if config.sof_enabled {
+        let Some(runner) = storage_arc.sof_runner() else {
+            // Hard config error — surfaced as a startup panic so misconfiguration
+            // doesn't silently disable a feature the operator asked for.
+            panic!(
+                "HFS_SOF_ENABLED=true but storage backend '{}' does not provide an in-DB SOF \
+                 runner; either disable SOF or use a backend that supports it (sqlite, postgres)",
+                storage_arc.backend_name()
+            );
+        };
+        info!(
+            runner = runner.runner_name(),
+            fhir_version = ?config.default_fhir_version,
+            "Using in-DB SofRunner"
+        );
+
+        // Keep a clone for the export controller before moving runner into state.
+        let runner_for_export = Arc::clone(&runner);
+        state = state.with_sof_runner(runner);
+
+        // Wire the export job controller.
+        use crate::export::{ExportJobController, FilesystemSink, InMemoryController};
+        let controller: Arc<dyn ExportJobController> = {
+            let max_concurrency = Some(config.export_max_concurrency);
+            let shard_rows = Some(config.export_shard_rows);
+
+            #[cfg(feature = "s3")]
+            if config.export_sink.to_lowercase() == "s3" {
+                use crate::export::S3Sink;
+                let bucket = config
+                    .export_s3_bucket
+                    .clone()
+                    .unwrap_or_else(|| "hfs-exports".to_string());
+                let region = config.export_s3_region.clone();
+                let ttl = config.export_presign_ttl_secs;
+
+                info!(bucket = %bucket, "Export controller: InMemory + S3Sink");
+
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(S3Sink::from_config(
+                        bucket.clone(),
+                        region,
+                        String::new(),
+                        ttl,
+                    ))
+                }) {
+                    Ok(sink) => Arc::new(InMemoryController::with_shard_rows(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                    )),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            dir = %config.export_dir,
+                            "S3 export sink init failed — falling back to FilesystemSink"
+                        );
+                        let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                        Arc::new(InMemoryController::with_shard_rows(
+                            runner_for_export,
+                            sink,
+                            max_concurrency,
+                            shard_rows,
+                        ))
+                    }
+                }
+            } else {
+                info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
+                let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                Arc::new(InMemoryController::with_shard_rows(
+                    runner_for_export,
+                    sink,
+                    max_concurrency,
+                    shard_rows,
+                ))
+            }
+
+            #[cfg(not(feature = "s3"))]
+            {
+                info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
+                let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                Arc::new(InMemoryController::with_shard_rows(
+                    runner_for_export,
+                    sink,
+                    max_concurrency,
+                    shard_rows,
+                ))
+            }
+        };
+        state = state.with_export_controller(controller);
+    }
 
     // Wire the bulk-export subsystem if provided.
     let state = match bulk_export {
@@ -593,9 +695,22 @@ where
     // *decompressed* bytes — a small highly-compressed payload cannot bypass
     // `HFS_MAX_BODY_SIZE`. Kept inside the CORS layer so 415/413 error
     // responses still carry CORS headers for browser clients.
+    //
+    // Never re-compress Parquet or ZIP output (SoF run/export responses) —
+    // both are already compressed, so HTTP-level compression would only burn
+    // CPU for no size win. Both parquet media-type identifiers are excluded:
+    // `application/vnd.apache.parquet` (the spec's native media type) and
+    // the legacy `application/parquet` alias, matching sof-server's
+    // predicate.
+    let compress_predicate = SizeAbove::new(32)
+        .and(NotForContentType::const_new("application/parquet"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apache.parquet",
+        ))
+        .and(NotForContentType::const_new("application/zip"));
     let router = router
         .layer(RequestDecompressionLayer::new())
-        .layer(CompressionLayer::new());
+        .layer(CompressionLayer::new().compress_when(compress_predicate));
 
     // Add CORS if enabled
     let router = if config.enable_cors {

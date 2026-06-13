@@ -25,6 +25,8 @@ use helios_persistence::search::SearchParameterRegistry;
 use helios_persistence::types::SearchParamType;
 use tracing::debug;
 
+use super::sof::capability::build_sof_capabilities;
+
 use crate::error::{RestError, RestResult};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::get_resource_type_names_for_version;
@@ -67,7 +69,7 @@ pub async fn capabilities_handler<S>(
     req_headers: HeaderMap,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + SearchProvider + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     // Determine which version to describe (from Accept header or default)
     let fhir_version = version
@@ -123,7 +125,7 @@ fn build_capability_statement<S>(
     base_url: &str,
 ) -> serde_json::Value
 where
-    S: ResourceStorage + SearchProvider,
+    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     let backend_name = state.storage().backend_name();
 
@@ -151,10 +153,32 @@ where
         formats.push("application/fhir+xml");
     }
 
-    let mut operations = vec![serde_json::json!({
-        "name": "versions",
-        "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
-    })];
+    // Standard operations, extended with SOF operations
+    let mut operations = build_rest_operations(state);
+
+    // Optional SOF extension block on the rest[0] element
+    let sof_extension = build_sof_rest_extension(state);
+
+    let mut rest_entry = serde_json::json!({
+        "mode": "server",
+        "documentation": "Helios FHIR RESTful API",
+        "security": {
+            "cors": state.config().enable_cors,
+            "description": "This server supports CORS for cross-origin requests"
+        },
+        "resource": resources,
+        "interaction": [
+            { "code": "transaction" },
+            { "code": "batch" },
+            { "code": "history-system" },
+            { "code": "search-system" }
+        ]
+    });
+
+    // Inject the SOF extension array when present
+    if let Some(ext) = sof_extension {
+        rest_entry["extension"] = ext;
+    }
 
     let mut statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
@@ -167,21 +191,7 @@ where
             "description": format!("Helios FHIR Server ({})", backend_name),
             "url": base_url
         },
-        "rest": [{
-            "mode": "server",
-            "documentation": "Helios FHIR RESTful API",
-            "security": {
-                "cors": state.config().enable_cors,
-                "description": "This server supports CORS for cross-origin requests"
-            },
-            "resource": resources,
-            "interaction": [
-                { "code": "transaction" },
-                { "code": "batch" },
-                { "code": "history-system" },
-                { "code": "search-system" }
-            ],
-        }]
+        "rest": [rest_entry]
     });
 
     // Advertise Bulk Data Export operations when enabled.
@@ -216,6 +226,72 @@ where
 
     statement["rest"][0]["operation"] = serde_json::Value::Array(operations);
     statement
+}
+
+/// Builds the `rest[0].operation` list, including SOF operations.
+///
+/// `viewdefinition-run` and `sqlquery-run` are always declared when SOF is enabled.
+/// `viewdefinition-export` and `sqlquery-export` are declared only when an
+/// export controller is wired.
+fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
+    state: &AppState<S>,
+) -> Vec<serde_json::Value> {
+    let mut ops = vec![
+        serde_json::json!({
+            "name": "validate",
+            "definition": "http://hl7.org/fhir/OperationDefinition/Resource-validate"
+        }),
+        serde_json::json!({
+            "name": "versions",
+            "definition": "http://hl7.org/fhir/OperationDefinition/CapabilityStatement-versions"
+        }),
+        serde_json::json!({
+            "name": "viewdefinition-run",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-run"
+        }),
+        serde_json::json!({
+            "name": "sqlquery-run",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-run"
+        }),
+    ];
+
+    if state.export_controller().is_some() {
+        ops.push(serde_json::json!({
+            "name": "viewdefinition-export",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$viewdefinition-export"
+        }));
+        ops.push(serde_json::json!({
+            "name": "sqlquery-export",
+            "definition": "http://sql-on-fhir.org/OperationDefinition/$sqlquery-export"
+        }));
+    }
+
+    ops
+}
+
+/// Builds the `extension` array on `rest[0]` advertising SOF-specific flags.
+fn build_sof_rest_extension<S: ResourceStorage + Send + Sync + 'static>(
+    state: &AppState<S>,
+) -> Option<serde_json::Value> {
+    let caps = build_sof_capabilities(state);
+    // Inline the SOF Parameters as a contained extension value so consumers
+    // that understand the SOF spec can discover the flags without an extra request.
+    Some(serde_json::json!([
+        {
+            "url": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-sof-capabilities.html",
+            "valueReference": {
+                "reference": "/$sql-on-fhir-capabilities",
+                "display": "SQL-on-FHIR Capabilities"
+            }
+        },
+        {
+            "url": "https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/StructureDefinition-sof-capabilities-inline.html",
+            "valueAttachment": {
+                "contentType": "application/json",
+                "data": serde_json::to_string(&caps).unwrap_or_default()
+            }
+        }
+    ]))
 }
 
 /// Builds the capability entry for a resource type.
