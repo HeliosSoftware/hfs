@@ -531,8 +531,9 @@ async fn lookup_concept_status<B: TerminologyBackend>(
 /// default-language display:
 ///
 ///   "There are no valid display names found for the code <system>#<code>
-///    for language(s) 'L'. The display is 'Y' which is the default language
-///    display"  (info severity, `NO_VALID_DISPLAY_FOUND_NONE_FOR_LANG_OK`)
+///    for language(s) 'L'. The display is 'Y' which is a valid display for the
+///    default language"  (info severity, `NO_VALID_DISPLAY_FOUND_NONE_FOR_LANG_OK`,
+///    where 'Y' is the supplied display)
 ///
 /// or, when no display in the requested language exists AND the supplied
 /// display doesn't match either:
@@ -767,9 +768,15 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         // that the CS doesn't have a designation in, emit the
         // `NO_VALID_DISPLAY_FOUND_NONE_FOR_LANG_OK` info-level notice.
         if !has_display_in_lang && cs_language.is_some() {
-            let default = default_display.as_deref().unwrap_or("");
+            // Echo the *supplied* display (it validated as a valid display in
+            // the default language — either the primary `display` or an
+            // alternate designation), not our chosen default. The IG
+            // `validation/simple-code-good-language-none` fixture supplies the
+            // alternate designation "Alternate Display 2aII" and expects it
+            // quoted back, and uses the wording "a valid display for the
+            // default language" regardless of primary-vs-alternate.
             let text = format!(
-                "There are no valid display names found for the code {system_url}#{code} for language(s) '{lang_tail}'. The display is '{default}' which is the default language display"
+                "There are no valid display names found for the code {system_url}#{code} for language(s) '{lang_tail}'. The display is '{expected}' which is a valid display for the default language"
             );
             resp.issues.push(ValidationIssue {
                 severity: "information".into(),

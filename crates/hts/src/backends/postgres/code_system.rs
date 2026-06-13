@@ -769,6 +769,35 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
+    async fn code_system_is_hierarchical(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<bool, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        // Mirror the SQLite implementation: hierarchyMeaning='is-a' AND at least
+        // one materialised parent/child edge. `$2 IS NULL` lets an unpinned
+        // request match any version of the URL.
+        let row = client
+            .query_opt(
+                "SELECT 1 FROM code_systems s \
+                 JOIN concept_hierarchy h ON h.system_id = s.id \
+                 WHERE s.url = $1 \
+                   AND ($2::text IS NULL OR s.version = $2) \
+                   AND s.resource_json->>'hierarchyMeaning' = 'is-a' \
+                 LIMIT 1",
+                &[&url, &version],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.is_some())
+    }
+
     async fn concept_designations(
         &self,
         _ctx: &TenantContext,

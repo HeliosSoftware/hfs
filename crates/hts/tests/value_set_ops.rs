@@ -77,6 +77,97 @@ async fn expand_with_count_limits_results() {
     assert_eq!(contains.len(), 1, "expected exactly 1 code with count=1");
 }
 
+// ── Default hierarchical expansion (is-a CodeSystems) ──────────────────────────
+
+/// A CodeSystem declaring `hierarchyMeaning = "is-a"` with a real parent/child
+/// tree. Used to exercise the default-nesting behaviour pinned by the IG
+/// `version/vs-expand-versionless` fixture.
+#[cfg(feature = "sqlite")]
+const ISA_HIERARCHY_BUNDLE: &str = r#"{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    { "resource": {
+        "resourceType": "CodeSystem",
+        "id": "isa-cs",
+        "url": "http://hts.test/isa",
+        "version": "1.0",
+        "status": "active",
+        "content": "complete",
+        "hierarchyMeaning": "is-a",
+        "concept": [
+          { "code": "parent", "display": "Parent",
+            "concept": [
+              { "code": "child1", "display": "Child 1" },
+              { "code": "child2", "display": "Child 2" }
+            ]
+          },
+          { "code": "sibling", "display": "Sibling" }
+        ]
+    }}
+  ]
+}"#;
+
+/// When the request omits both `excludeNested` and `hierarchical` and the inline
+/// ValueSet wholly includes an is-a CodeSystem, the expansion nests children
+/// under their parent (FHIR default; IG `version/vs-expand-versionless`).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_codesystem_nests_by_default() {
+    let app = TestApp::new();
+    app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
+
+    let req = r#"{"resourceType":"Parameters","parameter":[
+      {"name":"valueSet","resource":{"resourceType":"ValueSet","url":"http://hts.test/vs/isa-all","status":"active","compose":{"include":[{"system":"http://hts.test/isa"}]}}}
+    ]}"#;
+    let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    let top_codes: Vec<&str> = top.iter().filter_map(|c| c["code"].as_str()).collect();
+    assert_eq!(
+        top_codes,
+        vec!["parent", "sibling"],
+        "expected only top-level codes at root, got {body}"
+    );
+    assert_eq!(body["expansion"]["total"], 4, "total counts all 4 concepts");
+
+    let parent = top.iter().find(|c| c["code"] == "parent").unwrap();
+    let children: Vec<&str> = parent["contains"]
+        .as_array()
+        .expect("parent should nest its children")
+        .iter()
+        .filter_map(|c| c["code"].as_str())
+        .collect();
+    assert_eq!(children, vec!["child1", "child2"]);
+}
+
+/// `excludeNested=true` keeps the same is-a CodeSystem expansion FLAT.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_codesystem_flat_with_exclude_nested() {
+    let app = TestApp::new();
+    app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
+
+    let req = r#"{"resourceType":"Parameters","parameter":[
+      {"name":"excludeNested","valueBoolean":true},
+      {"name":"valueSet","resource":{"resourceType":"ValueSet","url":"http://hts.test/vs/isa-all","status":"active","compose":{"include":[{"system":"http://hts.test/isa"}]}}}
+    ]}"#;
+    let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    assert_eq!(
+        top.len(),
+        4,
+        "flat list should hold all 4 codes, got {body}"
+    );
+    assert!(
+        top.iter().all(|c| c.get("contains").is_none()),
+        "excludeNested=true must not nest: {body}"
+    );
+}
+
 // ── $validate-code (ValueSet) ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]

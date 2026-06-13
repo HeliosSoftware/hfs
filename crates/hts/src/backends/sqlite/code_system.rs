@@ -796,6 +796,42 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
         Ok(lang)
     }
 
+    async fn code_system_is_hierarchical(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+        version: Option<&str>,
+    ) -> Result<bool, HtsError> {
+        let pool = self.pool().clone();
+        let url_owned = url.to_string();
+        let version_owned = version.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> Result<bool, HtsError> {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            // A genuine is-a hierarchy: hierarchyMeaning='is-a' AND at least one
+            // materialised parent/child edge. `concept_hierarchy.system_id`
+            // joins to the synthetic `code_systems.id`. When a version is pinned
+            // we match it; otherwise any version of the URL qualifies.
+            let found: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM code_systems s \
+                     JOIN concept_hierarchy h ON h.system_id = s.id \
+                     WHERE s.url = ?1 \
+                       AND (?2 IS NULL OR s.version = ?2) \
+                       AND json_extract(s.resource_json, '$.hierarchyMeaning') = 'is-a' \
+                     LIMIT 1",
+                    rusqlite::params![url_owned, version_owned],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            Ok(found.is_some())
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
+    }
+
     async fn concept_designations(
         &self,
         _ctx: &TenantContext,
