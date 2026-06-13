@@ -50,6 +50,15 @@ public actor HFSClient {
             throw HFSClientError.invalidBaseURL
         }
 
+        return try await makeRequest(url: url, method: method, body: body)
+    }
+
+    /// Builds a request for an absolute URL, e.g. a Bundle `next` page link.
+    public func makeRequest(
+        url: URL,
+        method: String = "GET",
+        body: Data? = nil
+    ) async throws -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.httpBody = body
