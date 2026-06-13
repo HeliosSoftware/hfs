@@ -23,31 +23,69 @@ final class HFSOperationsTests: XCTestCase {
             ]}
             """.utf8
         )
-        let client = HFSClient(
-            configuration: HFSClientConfiguration(baseURL: try XCTUnwrap(URL(string: "http://localhost:8080"))),
-            transport: StubTransport(statusCode: 200, data: bundle)
-        )
-        let operations = HFSResourceOperations(client: client)
+        let operations = try makeOperations(returning: bundle)
 
-        let items = try await operations.search(resourceType: "Patient", count: 20)
+        let page = try await operations.search(resourceType: "Patient", count: 20)
 
-        XCTAssertEqual(items.count, 2)
-        XCTAssertEqual(items.map(\.fhirID).sorted(), ["123", "456"])
-        XCTAssertEqual(Set(items.map(\.resourceType)), ["Patient"])
-        XCTAssertTrue(items[0].prettyJSON.contains("\"id\""))
+        XCTAssertEqual(page.items.count, 2)
+        XCTAssertEqual(page.items.map(\.fhirID).sorted(), ["123", "456"])
+        XCTAssertEqual(Set(page.items.map(\.resourceType)), ["Patient"])
+        XCTAssertTrue(page.items[0].prettyJSON.contains("\"id\""))
+        XCTAssertNil(page.nextURL)
     }
 
     func testSearchReturnsEmptyForBundleWithoutEntries() async throws {
         let bundle = Data(#"{"resourceType":"Bundle","type":"searchset"}"#.utf8)
+        let operations = try makeOperations(returning: bundle)
+
+        let page = try await operations.search(resourceType: "Observation")
+
+        XCTAssertTrue(page.items.isEmpty)
+        XCTAssertNil(page.total)
+        XCTAssertNil(page.nextURL)
+    }
+
+    func testSearchParsesTotalAndNextLink() async throws {
+        let bundle = Data(
+            """
+            {"resourceType":"Bundle","type":"searchset","total":42,
+             "link":[
+               {"relation":"self","url":"http://localhost:8080/Patient?_count=20"},
+               {"relation":"next","url":"http://localhost:8080/Patient?_count=20&_offset=20"}
+             ],
+             "entry":[{"resource":{"resourceType":"Patient","id":"1"}}]}
+            """.utf8
+        )
+        let operations = try makeOperations(returning: bundle)
+
+        let page = try await operations.search(resourceType: "Patient")
+
+        XCTAssertEqual(page.total, 42)
+        XCTAssertEqual(page.items.count, 1)
+        XCTAssertEqual(
+            page.nextURL,
+            URL(string: "http://localhost:8080/Patient?_count=20&_offset=20")
+        )
+    }
+
+    func testSearchPageFollowsNextURL() async throws {
+        let bundle = Data(
+            #"{"resourceType":"Bundle","type":"searchset","entry":[{"resource":{"resourceType":"Patient","id":"21"}}]}"#.utf8
+        )
+        let operations = try makeOperations(returning: bundle)
+        let next = try XCTUnwrap(URL(string: "http://localhost:8080/Patient?_count=20&_offset=20"))
+
+        let page = try await operations.searchPage(url: next, fallbackType: "Patient")
+
+        XCTAssertEqual(page.items.map(\.fhirID), ["21"])
+    }
+
+    private func makeOperations(returning data: Data) throws -> HFSResourceOperations {
         let client = HFSClient(
             configuration: HFSClientConfiguration(baseURL: try XCTUnwrap(URL(string: "http://localhost:8080"))),
-            transport: StubTransport(statusCode: 200, data: bundle)
+            transport: StubTransport(statusCode: 200, data: data)
         )
-        let operations = HFSResourceOperations(client: client)
-
-        let items = try await operations.search(resourceType: "Observation")
-
-        XCTAssertTrue(items.isEmpty)
+        return HFSResourceOperations(client: client)
     }
 }
 
