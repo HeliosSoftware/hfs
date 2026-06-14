@@ -3,13 +3,14 @@ import SwiftUI
 struct HFSDetailContent: View {
     @Environment(HFSAppModel.self) private var model
     var destination: HFSAdminDestination
+    @Binding var newResourceRequested: Bool
 
     var body: some View {
         switch destination {
         case .settings:
             HFSSettingsView()
         case .resources:
-            HFSResourcesView()
+            HFSResourcesView(newResourceRequested: $newResourceRequested)
         default:
             scaffold
         }
