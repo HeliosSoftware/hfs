@@ -7,9 +7,11 @@
 # implementation (git diff + test evidence) and blocks the stop until the
 # implementation is complete, correct, and accurately summarized.
 #
-# Fail-closed: if Codex cannot run, the stop is blocked (up to the retry cap).
-# Set CODEX_PLAN_GATE_DISABLE=1 to skip the gate entirely (escape hatch).
-# CODEX_PLAN_GATE_MAX_BLOCKS caps consecutive blocks to avoid infinite loops.
+# Fail-closed: if neither Codex nor the safe Claude fallback can run, the stop
+# is blocked (up to the retry cap). Set CODEX_PLAN_GATE_DISABLE=1 to skip the
+# gate entirely (escape hatch). CODEX_PLAN_GATE_MAX_BLOCKS caps consecutive
+# blocks to avoid infinite loops. Set CODEX_PLAN_GATE_CLAUDE_FALLBACK=0 to
+# require Codex.
 #
 set -euo pipefail
 
@@ -19,6 +21,11 @@ codex_bin="${CODEX_BIN:-$(command -v codex || true)}"
 if [[ -z "$codex_bin" && -x "$HOME/.local/bin/codex" ]]; then
   codex_bin="$HOME/.local/bin/codex"
 fi
+claude_bin="${CLAUDE_BIN:-$(command -v claude || true)}"
+if [[ -z "$claude_bin" && -x "$HOME/.local/bin/claude" ]]; then
+  claude_bin="$HOME/.local/bin/claude"
+fi
+claude_fallback_enabled="${CODEX_PLAN_GATE_CLAUDE_FALLBACK:-1}"
 debug_dir="$project_dir/.claude/debug"
 state_root="$project_dir/.claude/state/codex-plan-gate"
 schema="${CODEX_FINAL_REVIEW_SCHEMA:-$script_dir/../schemas/codex-final-review.schema.json}"
@@ -192,12 +199,6 @@ if [[ "$current_blocks" -ge "$max_blocks" ]]; then
   exit 0
 fi
 
-if [[ -z "$codex_bin" || ! -x "$codex_bin" ]]; then
-  next_blocks=$((current_blocks + 1))
-  printf '%s\n' "$next_blocks" > "$block_count_file"
-  block_stop "Codex final verifier could not run because no executable Codex binary was found (CODEX_BIN='${CODEX_BIN:-}'). Fix verifier availability or set CODEX_PLAN_GATE_DISABLE=1, then provide a final summary."
-fi
-
 if [[ ! -f "$schema" ]]; then
   next_blocks=$((current_blocks + 1))
   printf '%s\n' "$next_blocks" > "$block_count_file"
@@ -208,44 +209,64 @@ prompt_file="$session_dir/final-review-prompt.md"
 review_file="$session_dir/final-review.json"
 codex_stdout="$session_dir/final-codex.stdout"
 codex_stderr="$session_dir/final-codex.stderr"
+claude_stdout="$session_dir/final-claude.stdout"
+claude_stderr="$session_dir/final-claude.stderr"
+reviewer_engine="codex"
+codex_available=1
 
-codex_help="$("$codex_bin" --help 2>&1 || true)"
-codex_exec_help="$("$codex_bin" exec --help 2>&1 || true)"
+if [[ -z "$codex_bin" || ! -x "$codex_bin" ]]; then
+  codex_available=0
+  if [[ "$claude_fallback_enabled" != "0" && -n "$claude_bin" && -x "$claude_bin" ]]; then
+    reviewer_engine="claude"
+    gate_log_event "final-review" "fallback" "reason=codex-unavailable" "fallback=claude"
+    gate_log_line "$gate_main_log" "codex unavailable; falling back to claude safe-mode verifier"
+  else
+    next_blocks=$((current_blocks + 1))
+    printf '%s\n' "$next_blocks" > "$block_count_file"
+    block_stop "Codex final verifier could not run because no executable Codex binary was found (CODEX_BIN='${CODEX_BIN:-}'), and the safe Claude fallback is unavailable or disabled (CLAUDE_BIN='${CLAUDE_BIN:-}', CODEX_PLAN_GATE_CLAUDE_FALLBACK=$claude_fallback_enabled). Fix verifier availability or set CODEX_PLAN_GATE_DISABLE=1, then provide a final summary."
+  fi
+fi
+
 codex_args=()
 search_enabled=0
 
-if printf '%s\n' "$codex_help" | grep -q -- '--ask-for-approval'; then
-  codex_args+=(--ask-for-approval never)
+if [[ "$codex_available" == "1" ]]; then
+  codex_help="$("$codex_bin" --help 2>&1 || true)"
+  codex_exec_help="$("$codex_bin" exec --help 2>&1 || true)"
+
+  if printf '%s\n' "$codex_help" | grep -q -- '--ask-for-approval'; then
+    codex_args+=(--ask-for-approval never)
+  fi
+
+  if printf '%s\n' "$codex_help" | grep -q -- '--search'; then
+    codex_args+=(--search)
+    search_enabled=1
+  fi
+
+  codex_args+=(exec -C "$project_dir")
+
+  if printf '%s\n' "$codex_exec_help" | grep -q -- '--sandbox'; then
+    codex_args+=(--sandbox read-only)
+  fi
+
+  if printf '%s\n' "$codex_exec_help" | grep -q -- '--ephemeral'; then
+    codex_args+=(--ephemeral)
+  fi
+
+  if ! printf '%s\n' "$codex_exec_help" | grep -q -- '--output-schema'; then
+    next_blocks=$((current_blocks + 1))
+    printf '%s\n' "$next_blocks" > "$block_count_file"
+    block_stop "Codex final verifier requires codex exec --output-schema, but this Codex CLI does not advertise it. Update Codex or set CODEX_BIN to a compatible binary, then provide a final summary."
+  fi
+
+  if ! printf '%s\n' "$codex_exec_help" | grep -q -- '--output-last-message'; then
+    next_blocks=$((current_blocks + 1))
+    printf '%s\n' "$next_blocks" > "$block_count_file"
+    block_stop "Codex final verifier requires codex exec --output-last-message/-o, but this Codex CLI does not advertise it. Update Codex or set CODEX_BIN to a compatible binary, then provide a final summary."
+  fi
+
+  codex_args+=(--output-schema "$schema" -o "$review_file" -)
 fi
-
-if printf '%s\n' "$codex_help" | grep -q -- '--search'; then
-  codex_args+=(--search)
-  search_enabled=1
-fi
-
-codex_args+=(exec -C "$project_dir")
-
-if printf '%s\n' "$codex_exec_help" | grep -q -- '--sandbox'; then
-  codex_args+=(--sandbox read-only)
-fi
-
-if printf '%s\n' "$codex_exec_help" | grep -q -- '--ephemeral'; then
-  codex_args+=(--ephemeral)
-fi
-
-if ! printf '%s\n' "$codex_exec_help" | grep -q -- '--output-schema'; then
-  next_blocks=$((current_blocks + 1))
-  printf '%s\n' "$next_blocks" > "$block_count_file"
-  block_stop "Codex final verifier requires codex exec --output-schema, but this Codex CLI does not advertise it. Update Codex or set CODEX_BIN to a compatible binary, then provide a final summary."
-fi
-
-if ! printf '%s\n' "$codex_exec_help" | grep -q -- '--output-last-message'; then
-  next_blocks=$((current_blocks + 1))
-  printf '%s\n' "$next_blocks" > "$block_count_file"
-  block_stop "Codex final verifier requires codex exec --output-last-message/-o, but this Codex CLI does not advertise it. Update Codex or set CODEX_BIN to a compatible binary, then provide a final summary."
-fi
-
-codex_args+=(--output-schema "$schema" -o "$review_file" -)
 
 transcript_tail="$(
   TRANSCRIPT_PATH="$transcript_path" python3 <<'PY'
@@ -445,15 +466,46 @@ EOF
 
 gate_codex_t0="$(date +%s)"
 codex_rc=0
-"$codex_bin" "${codex_args[@]}" < "$prompt_file" > "$codex_stdout" 2> "$codex_stderr" || codex_rc=$?
+if [[ "$reviewer_engine" == "claude" ]]; then
+  # claude --print does not write the bare schema object to stdout the way
+  # codex -o does. With --output-format json it emits a result envelope whose
+  # schema-conforming verdict lives under .structured_output; extract that into
+  # review_file so the downstream validator sees the same shape codex produces.
+  CLAUDE_CODE_SAFE_MODE=1 "$claude_bin" \
+    --safe-mode \
+    --print \
+    --output-format json \
+    --permission-mode dontAsk \
+    --allowedTools Read,Grep,Glob \
+    --add-dir "$project_dir" \
+    --json-schema "$(cat "$schema")" \
+    < "$prompt_file" > "$claude_stdout" 2> "$claude_stderr" || codex_rc=$?
+  if [[ "$codex_rc" -eq 0 ]]; then
+    python3 - "$claude_stdout" "$review_file" <<'PY' || codex_rc=$?
+import json
+import sys
+from pathlib import Path
+
+env = json.loads(Path(sys.argv[1]).read_text())
+verdict = env.get("structured_output")
+if verdict is None:
+    raise SystemExit(1)
+Path(sys.argv[2]).write_text(json.dumps(verdict))
+PY
+  fi
+else
+  "$codex_bin" "${codex_args[@]}" < "$prompt_file" > "$codex_stdout" 2> "$codex_stderr" || codex_rc=$?
+fi
 gate_codex_s=$(( $(date +%s) - gate_codex_t0 ))
 gate_snapshot_attempt "$attempt_counter"
-gate_log_line "$gate_main_log" "codex_invoked attempt=$GATE_ATTEMPT rc=$codex_rc duration_s=$gate_codex_s"
+gate_log_line "$gate_main_log" "verifier_invoked engine=$reviewer_engine attempt=$GATE_ATTEMPT rc=$codex_rc duration_s=$gate_codex_s"
 
 if [[ "$codex_rc" -ne 0 ]]; then
   next_blocks=$((current_blocks + 1))
   printf '%s\n' "$next_blocks" > "$block_count_file"
-  reason="Codex final verifier failed closed. Fix verifier execution or address any implementation gaps, then provide a final summary. stderr: $(tail -n 20 "$codex_stderr" | tr '\n' ' ')"
+  verifier_stderr="$codex_stderr"
+  [[ "$reviewer_engine" == "claude" ]] && verifier_stderr="$claude_stderr"
+  reason="${reviewer_engine} final verifier failed closed. Fix verifier execution or address any implementation gaps, then provide a final summary. stderr: $(tail -n 20 "$verifier_stderr" | tr '\n' ' ')"
   gate_log_line "$gate_main_log" "$reason"
   block_stop "$reason"
 fi
@@ -556,7 +608,7 @@ PY
 then
   next_blocks=$((current_blocks + 1))
   printf '%s\n' "$next_blocks" > "$block_count_file"
-  block_stop "Codex final verifier returned invalid JSON. Continue by fixing verifier output or implementation evidence, then provide a final summary."
+  block_stop "${reviewer_engine} final verifier returned invalid JSON. Continue by fixing verifier output or implementation evidence, then provide a final summary."
 fi
 
 # Verdict is structurally valid from here; capture workflow_type for event logging.
