@@ -50,7 +50,7 @@ fn fhir_version_from_output_format(output_format: Option<&str>) -> FhirVersion {
                     .and_then(FhirVersion::from_mime_param)
             })
         })
-        .unwrap_or_default()
+        .unwrap_or_else(FhirVersion::default_enabled)
 }
 
 fn internal_error(message: String) -> StorageError {

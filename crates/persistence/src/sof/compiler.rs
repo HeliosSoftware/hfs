@@ -59,9 +59,13 @@ fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
 /// Compiles a raw ViewDefinition JSON value into a [`CompiledQuery`] for SQLite.
 ///
 /// Shorthand for `compile_view_definition_dialect(view_json, SqlDialect::Sqlite,
-/// FhirVersion::default())`.
+/// FhirVersion::default_enabled())`.
 pub fn compile_view_definition(view_json: &Value) -> Result<CompiledQuery, SofError> {
-    compile_view_definition_dialect(view_json, SqlDialect::Sqlite, FhirVersion::default())
+    compile_view_definition_dialect(
+        view_json,
+        SqlDialect::Sqlite,
+        FhirVersion::default_enabled(),
+    )
 }
 
 /// Compiles a raw ViewDefinition JSON value into a [`CompiledQuery`] for the given dialect.

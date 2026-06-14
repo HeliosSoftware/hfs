@@ -118,7 +118,7 @@ mod inner {
 
         // 1. Persist raw FHIR JSON (version_id = "1", ETag = W/"1").
         let stored = store
-            .create(&ctx, resource_type, body, FhirVersion::default())
+            .create(&ctx, resource_type, body, FhirVersion::default_enabled())
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
 

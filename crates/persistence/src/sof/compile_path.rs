@@ -92,7 +92,7 @@ impl CompileEnv {
             column_type_hint: None,
             next_where_alias: 0,
             resource_type: String::new(),
-            fhir_version: FhirVersion::default(),
+            fhir_version: FhirVersion::default_enabled(),
         }
     }
 
