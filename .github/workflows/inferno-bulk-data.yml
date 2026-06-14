@@ -81,7 +81,7 @@ jobs:
       - name: Checkout bulk-data-test-kit
         uses: actions/checkout@v5
         with:
-          repository: inferno-framework/bulk-data-test-kit
+          repository: HeliosSoftware/bulk-data-test-kit
           ref: ${{ github.event.inputs.kit_ref }}
           path: inferno-kit
 
