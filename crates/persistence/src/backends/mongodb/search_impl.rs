@@ -331,6 +331,13 @@ impl SearchProvider for MongoBackend {
     fn supports_contained_search(&self) -> bool {
         true
     }
+
+    fn modifiers_for_param_type(
+        &self,
+        param_type: crate::types::SearchParamType,
+    ) -> Vec<&'static str> {
+        Self::modifiers_for_type(param_type)
+    }
 }
 
 #[async_trait]
