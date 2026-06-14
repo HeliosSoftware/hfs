@@ -11,7 +11,7 @@
 
 use helios_hts::backends::PostgresTerminologyBackend;
 use helios_hts::error::HtsError;
-use helios_hts::import::BundleImportBackend;
+use helios_hts::import::{BundleImportBackend, LanguageFilter};
 use helios_hts::traits::{
     CodeSystemOperations, ConceptMapOperations, TerminologyMetadata, ValueSetOperations,
 };
@@ -2052,9 +2052,16 @@ LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
         zip.finish().unwrap();
     }
 
-    let stats = import_loinc_csv(&backend, &ctx(), tmp.path(), 500, false)
-        .await
-        .unwrap();
+    let stats = import_loinc_csv(
+        &backend,
+        &ctx(),
+        tmp.path(),
+        500,
+        false,
+        &LanguageFilter::default(),
+    )
+    .await
+    .unwrap();
 
     // 3 LOINC codes + 3 LP category nodes = 6 concepts.
     assert_eq!(stats.concepts, 6);

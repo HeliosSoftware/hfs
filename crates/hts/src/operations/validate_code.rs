@@ -554,6 +554,7 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     display_language: Option<&str>,
     expected_display: Option<&str>,
     supplements: &[SupplementInfo],
+    lenient_display_validation: bool,
     resp: &mut ValidateCodeResponse,
 ) {
     // CodeSystem.language is the language of the primary `display` field.
@@ -605,18 +606,29 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
     // Collect (display_value, language_tag_opt) pairs for every valid display:
     // the default display tagged with the CS language, plus every designation
     // that has a language attached.
-    // A designation only counts as a "valid display" alternative when it
-    // either has no `use.code` (default = display) or carries the FHIR-standard
-    // `display` use. Designations with a non-display use (e.g.
-    // `olde-english`, `consumer-name`) are alternative-purpose terms, not
-    // displays — including them in the "Valid display is …" message
-    // misrepresents what counts as a correct display, and the IG
-    // `batch/batch-validate-bad` fixture expects them excluded.
-    fn is_display_alternative(use_code: Option<&str>) -> bool {
+    // A designation only counts as a "valid display" alternative when it is
+    // genuinely a display term rather than an alternative-purpose label:
+    //   - no `use.code` (default = display), or the FHIR-standard `display` use;
+    //   - a terminology-native description type, identified by its `use.system`
+    //     (e.g. SNOMED CT synonyms/FSNs carry `use.system = http://snomed.info/sct`
+    //     with a description-type concept id like `900000000000013009` as the
+    //     code — these ARE the display terms, and `$lookup` surfaces them, so
+    //     `$validate-code` must too, otherwise a German SNOMED display can never
+    //     be resolved or accepted).
+    // Designations whose use comes from the FHIR designation-usage code system
+    // with a non-`display` code (e.g. `olde-english`, `consumer-name`) are
+    // alternative-purpose terms, not displays — including them in the
+    // "Valid display is …" message misrepresents what counts as a correct
+    // display, and the IG `batch/batch-validate-bad` fixture expects them
+    // excluded.
+    const SNOMED_SYSTEM: &str = "http://snomed.info/sct";
+    fn is_display_alternative(use_system: Option<&str>, use_code: Option<&str>) -> bool {
         match use_code {
             None => true,
             Some(c) if c.eq_ignore_ascii_case("display") => true,
-            _ => false,
+            // Terminology-native description types (e.g. all SNOMED CT
+            // description types) are legitimate display terms.
+            Some(_) => use_system.is_some_and(|s| s.eq_ignore_ascii_case(SNOMED_SYSTEM)),
         }
     }
 
@@ -625,13 +637,15 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         displays_for_lang.push((d.to_string(), cs_language.clone()));
     }
     for desig in &designations {
-        if !desig.value.is_empty() && is_display_alternative(desig.use_code.as_deref()) {
+        if !desig.value.is_empty()
+            && is_display_alternative(desig.use_system.as_deref(), desig.use_code.as_deref())
+        {
             displays_for_lang.push((desig.value.clone(), desig.language.clone()));
         }
     }
     for desig in &supplement_designations {
         if !desig.value.is_empty()
-            && is_display_alternative(desig.use_code.as_deref())
+            && is_display_alternative(desig.use_system.as_deref(), desig.use_code.as_deref())
             && !displays_for_lang
                 .iter()
                 .any(|(v, _)| v.eq_ignore_ascii_case(&desig.value))
@@ -713,17 +727,41 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         return;
     }
 
-    // Decide whether the supplied display is valid.
-    //   - If a requested displayLanguage is set AND a designation in that
-    //     language exists, the only valid display is that designation.
+    // Decide whether the supplied display is valid. The accepted set mirrors
+    // exactly the choices advertised by `format_valid_displays`:
+    //   - If a requested displayLanguage is set AND the code has designation(s)
+    //     in that language, the display is valid when it matches ANY of those
+    //     language designations — not only the single language-preferred term.
+    //     A concept routinely has several valid synonyms per language (e.g.
+    //     SNOMED `22298006` accepts both "Myokardinfarkt" and "Herzinfarkt"
+    //     for `de`), and every one of them is listed as a valid choice in the
+    //     mismatch message, so every one of them must validate.
     //   - Otherwise (no displayLanguage, or the requested language has no
     //     designation), any (default | designation) value is accepted.
-    let display_matches: bool = if let Some((value, _)) = preferred_for_lang {
-        value.eq_ignore_ascii_case(expected)
-    } else {
-        displays_for_lang
-            .iter()
-            .any(|(v, _)| v.eq_ignore_ascii_case(expected))
+    let display_matches: bool = {
+        let in_lang: Vec<&(String, Option<String>)> = if requested_langs.is_empty() {
+            Vec::new()
+        } else {
+            displays_for_lang
+                .iter()
+                .filter(|(_, l)| {
+                    l.as_deref().is_some_and(|stored| {
+                        requested_langs
+                            .iter()
+                            .any(|req| stored.eq_ignore_ascii_case(req))
+                    })
+                })
+                .collect()
+        };
+        if in_lang.is_empty() {
+            displays_for_lang
+                .iter()
+                .any(|(v, _)| v.eq_ignore_ascii_case(expected))
+        } else {
+            in_lang
+                .iter()
+                .any(|(v, _)| v.eq_ignore_ascii_case(expected))
+        }
     };
 
     // Determine whether the CS has any display in any of the requested
@@ -845,15 +883,17 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
             )
         };
 
-        // Honour `lenient-display-validation`: if the original
-        // backend-emitted issue was a warning, preserve that severity (and
-        // keep result=true).  Otherwise this is a hard mismatch error.
-        let severity = prior_invalid_display_severity
-            .as_deref()
-            .filter(|s| *s == "warning")
-            .map(str::to_string)
-            .unwrap_or_else(|| "error".to_string());
-        let lenient = severity == "warning";
+        // Honour `lenient-display-validation`: the mismatch is a warning (and
+        // `result` stays true) when the caller passed the flag, OR when the
+        // backend already softened its own issue to a warning. The flag must
+        // be consulted directly here because this language-aware pass can
+        // surface a mismatch the backend never saw — e.g. the caller's display
+        // matches the concept's default display but not the requested
+        // `displayLanguage` designation, so the backend accepted it and emitted
+        // no issue for us to inherit a severity from.
+        let lenient = lenient_display_validation
+            || prior_invalid_display_severity.as_deref() == Some("warning");
+        let severity = if lenient { "warning" } else { "error" }.to_string();
         resp.issues.push(ValidationIssue {
             severity,
             fhir_code: "invalid".into(),
@@ -1125,6 +1165,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     display_language: Option<&str>,
     expected_display: Option<&str>,
     supplements: &[SupplementInfo],
+    lenient_display_validation: bool,
 ) -> Value {
     // For inactive concepts whose underlying status is more specific than
     // "inactive" (e.g. `retired`, `deprecated`, `withdrawn`), the IG
@@ -1426,6 +1467,7 @@ async fn build_validate_response_async<B: TerminologyBackend>(
             display_language,
             expected_display,
             supplements,
+            lenient_display_validation,
             &mut resp,
         )
         .await;
@@ -2194,6 +2236,16 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
     // forms (code / coding / codeableConcept) can pass it to the post-build
     // language-aware display validator.
     let display_language: Option<String> = find_str_param(&params, "displayLanguage");
+    // `lenient-display-validation` (R6): downgrade a display mismatch to a
+    // warning with result=true. Captured once so all three input forms pass it
+    // to the language-aware validator, which can surface a mismatch the backend
+    // never saw (display matches the default but not the `displayLanguage`
+    // designation).
+    let lenient_display_validation: bool = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
     // Reject malformed BCP-47 `displayLanguage` early — IG
     // `display/validation-wrong-de-en-bad` and the language2 group expect a
     // 4xx OperationOutcome with `code=processing` and the
@@ -2278,6 +2330,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
             display_language.as_deref(),
             display.as_deref(),
             &supplements,
+            lenient_display_validation,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -2352,6 +2405,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
             display_language.as_deref(),
             display.as_deref(),
             &supplements,
+            lenient_display_validation,
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -2415,6 +2469,7 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
                     display_language.as_deref(),
                     None,
                     &[],
+                    lenient_display_validation,
                 )
                 .await);
             }
@@ -3486,6 +3541,14 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
 ) -> Result<Value, HtsError> {
     let ctx = TenantContext::system();
 
+    // `lenient-display-validation` (R6): downgrade a display mismatch to a
+    // warning with result=true (see `process_validate_code_inner`).
+    let lenient_display_validation: bool = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
+        .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+
     // Extract the input coding/code (priority: coding → code). For the
     // `coding` form, an empty `system` (Coding without a system field)
     // collapses to None per FHIR spec semantics.
@@ -3657,6 +3720,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
             find_str_param(&params, "displayLanguage").as_deref(),
             in_display.as_deref(),
             &[],
+            lenient_display_validation,
         )
         .await;
         return Ok(value);
@@ -3781,6 +3845,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
         find_str_param(&params, "displayLanguage").as_deref(),
         in_display.as_deref(),
         &[],
+        lenient_display_validation,
     )
     .await;
     Ok(value)
@@ -4549,6 +4614,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             display_language.as_deref(),
             display.as_deref(),
             &supplements,
+            lenient_display.unwrap_or(false),
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -4889,6 +4955,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             display_language.as_deref(),
             display.as_deref(),
             &supplements,
+            lenient_display.unwrap_or(false),
         )
         .await;
         append_used_supplements(&mut value, &supplements);
@@ -5316,6 +5383,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     display_language.as_deref(),
                     coding_display.as_deref(),
                     &supplements,
+                    lenient_display.unwrap_or(false),
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -5379,6 +5447,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     display_language.as_deref(),
                     coding_display.as_deref(),
                     &supplements,
+                    lenient_display.unwrap_or(false),
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -5441,6 +5510,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     display_language.as_deref(),
                     coding_display.as_deref(),
                     &supplements,
+                    lenient_display.unwrap_or(false),
                 )
                 .await;
                 append_used_supplements(&mut value, &supplements);
@@ -6009,6 +6079,251 @@ mod tests {
         assert_eq!(display_param["valueString"], "Alpha Beta Charlie");
     }
 
+    /// Regression: a SNOMED-style German designation whose `use.system` is the
+    /// SNOMED CT system and whose `use.code` is a description-type concept id
+    /// (here `900000000000013009`, the synonym type) must be recognised as a
+    /// valid display. With `displayLanguage=de` the response `display` must be
+    /// the German term and validating that German display must return
+    /// `result=true` — matching `$lookup`. Previously the `is_display_alternative`
+    /// filter only accepted `use.code` of `None`/`display`, so the SNOMED-typed
+    /// designation was dropped and the English default was returned instead.
+    fn make_snomed_like_app() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at, resource_json)
+                 VALUES ('cs1', 'http://snomed.info/sct', '1.0', 'SNOMED CT',
+                         'active', 'complete', '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"url\":\"http://snomed.info/sct\",\"version\":\"1.0\",\"status\":\"active\",\"content\":\"complete\",\"language\":\"en\"}');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (1, 'cs1', '22298006', 'Myocardial infarction (disorder)');
+
+                 INSERT INTO concept_designations (concept_id, language, use_system, use_code, value)
+                 VALUES (1, 'de', 'http://snomed.info/sct', '900000000000013009', 'Myokardinfarkt');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/CodeSystem/$validate-code",
+                post(validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn snomed_german_designation_resolves_display() {
+        let app = make_snomed_like_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "displayLanguage", "valueCode": "de"}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result_param["valueBoolean"], true);
+
+        let display_param = params.iter().find(|p| p["name"] == "display").unwrap();
+        assert_eq!(display_param["valueString"], "Myokardinfarkt");
+    }
+
+    /// `lenient-display-validation` must also apply when the mismatch is
+    /// surfaced by the language-aware layer rather than the backend: here the
+    /// supplied display is the concept's English default (which the backend
+    /// accepts), but `displayLanguage=de` makes the German designation the only
+    /// valid display, so the operations layer flags a mismatch the backend
+    /// never emitted. With the flag set this must still be a `warning` with
+    /// `result=true`, not an error.
+    #[tokio::test]
+    async fn lenient_applies_to_display_language_mismatch() {
+        let app = make_snomed_like_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "display", "valueString": "Myocardial infarction (disorder)"},
+                {"name": "displayLanguage", "valueCode": "de"},
+                {"name": "lenient-display-validation", "valueBoolean": true}
+            ]
+        });
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result["valueBoolean"], true,
+            "lenient-display-validation must keep result=true even when the \
+             displayLanguage layer surfaces the mismatch: {json}"
+        );
+
+        let issues = params
+            .iter()
+            .find(|p| p["name"] == "issues")
+            .expect("issues OperationOutcome expected");
+        let display_issue = issues["resource"]["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| {
+                i["details"]["coding"]
+                    .as_array()
+                    .map(|cs| cs.iter().any(|c| c["code"] == "invalid-display"))
+                    .unwrap_or(false)
+            })
+            .expect("invalid-display issue expected");
+        assert_eq!(
+            display_issue["severity"], "warning",
+            "display-language mismatch must be a warning under lenient validation: {json}"
+        );
+    }
+
+    /// Counterpart guard: without the flag, the same display-language mismatch
+    /// remains a hard `error` with `result=false` (the spec default).
+    #[tokio::test]
+    async fn display_language_mismatch_without_lenient_is_error() {
+        let app = make_snomed_like_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "display", "valueString": "Myocardial infarction (disorder)"},
+                {"name": "displayLanguage", "valueCode": "de"}
+            ]
+        });
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result["valueBoolean"], false,
+            "without lenient-display-validation the mismatch must fail: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snomed_german_display_validates_true() {
+        let app = make_snomed_like_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "display", "valueString": "Myokardinfarkt"},
+                {"name": "displayLanguage", "valueCode": "de"}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result_param["valueBoolean"], true,
+            "supplying the correct German SNOMED display must validate true: {json}"
+        );
+    }
+
+    /// A concept with several designations in the *same* language: one
+    /// language-preferred term plus additional synonyms. Mirrors a real SNOMED
+    /// concept, e.g. `22298006` has the German synonyms "Myokardinfarkt"
+    /// (preferred) and "Herzinfarkt".
+    fn make_snomed_multi_de_app() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at, resource_json)
+                 VALUES ('cs1', 'http://snomed.info/sct', '1.0', 'SNOMED CT',
+                         'active', 'complete', '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"url\":\"http://snomed.info/sct\",\"version\":\"1.0\",\"status\":\"active\",\"content\":\"complete\",\"language\":\"en\"}');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (1, 'cs1', '22298006', 'Myocardial infarction (disorder)');
+
+                 INSERT INTO concept_designations (concept_id, language, use_system, use_code, value)
+                 VALUES (1, 'de', 'http://snomed.info/sct', '900000000000013009', 'Myokardinfarkt'),
+                        (1, 'de', 'http://snomed.info/sct', '900000000000013009', 'Herzinfarkt');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/CodeSystem/$validate-code",
+                post(validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    /// Regression: a *non-preferred* designation in the requested language must
+    /// validate as a correct display. Previously only the single
+    /// language-preferred designation ("Myokardinfarkt") was accepted, so the
+    /// equally-valid synonym "Herzinfarkt" — which the mismatch message itself
+    /// advertised as one of the valid choices — was wrongly reported as a
+    /// "Wrong Display Name" with `result=false`. It must now return
+    /// `result=true` with no `invalid-display` issue.
+    #[tokio::test]
+    async fn snomed_nonpreferred_german_synonym_validates_true() {
+        let app = make_snomed_multi_de_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "display", "valueString": "Herzinfarkt"},
+                {"name": "displayLanguage", "valueCode": "de"}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result_param["valueBoolean"], true,
+            "a valid non-preferred German synonym must validate true: {json}"
+        );
+
+        let has_invalid_display = params
+            .iter()
+            .find(|p| p["name"] == "issues")
+            .and_then(|p| p["resource"]["issue"].as_array())
+            .map(|issues| {
+                issues.iter().any(|i| {
+                    i["details"]["coding"]
+                        .as_array()
+                        .map(|cs| cs.iter().any(|c| c["code"] == "invalid-display"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            !has_invalid_display,
+            "a valid synonym must not produce an invalid-display issue: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn system_param_rejected_with_400() {
         // FHIR spec requires `url`; sending `system` is not accepted.
@@ -6111,6 +6426,53 @@ mod tests {
 
         let has_message = params.iter().any(|p| p["name"] == "message");
         assert!(has_message, "message expected for display mismatch");
+    }
+
+    /// `lenient-display-validation=true` downgrades a display mismatch from an
+    /// error (result=false) to a warning with result=true, per the FHIR spec.
+    #[tokio::test]
+    async fn lenient_display_validation_downgrades_mismatch_to_warning() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/cs"},
+                {"name": "code", "valueCode": "ABC"},
+                {"name": "display", "valueString": "Wrong Display"},
+                {"name": "lenient-display-validation", "valueBoolean": true}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result_param["valueBoolean"], true,
+            "lenient-display-validation keeps result=true on a display mismatch: {json}"
+        );
+
+        // The mismatch must still be surfaced, but as a `warning`.
+        let issues = params
+            .iter()
+            .find(|p| p["name"] == "issues")
+            .expect("issues OperationOutcome expected for a display mismatch");
+        let issue_list = issues["resource"]["issue"].as_array().unwrap();
+        let display_issue = issue_list
+            .iter()
+            .find(|i| {
+                i["details"]["coding"]
+                    .as_array()
+                    .map(|cs| cs.iter().any(|c| c["code"] == "invalid-display"))
+                    .unwrap_or(false)
+            })
+            .expect("invalid-display issue expected");
+        assert_eq!(
+            display_issue["severity"], "warning",
+            "display mismatch must be a warning under lenient validation: {json}"
+        );
     }
 
     #[tokio::test]

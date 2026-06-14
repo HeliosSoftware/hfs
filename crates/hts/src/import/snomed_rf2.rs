@@ -15,6 +15,11 @@
 //! (`en-US`, `da-DK`, `fr-CA`, …) — so `displayLanguage` /
 //! `Accept-Language` requests resolve to the right term in any language.
 //!
+//! The imported language set can be restricted via [`LanguageFilter`]
+//! (`HTS_IMPORT_LANGUAGES` / `--languages`); excluded per-language
+//! Description and Language-refset files are skipped without being parsed,
+//! and English is always retained.
+//!
 //! # ⚠️  LICENSE REQUIRED
 //!
 //! Real SNOMED CT data requires a license from SNOMED International.
@@ -29,8 +34,9 @@ use zip::ZipArchive;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::LanguageFilter;
 use crate::import::bundle_builder::{
-    BuilderConcept, BuilderDesignation, BuilderProperty, CodeSystemMeta, build_code_system_bundle,
+    BuilderConcept, BuilderDesignation, BuilderProperty, CodeSystemMeta, build_parsed_code_system,
 };
 
 // ── SNOMED CT constants ───────────────────────────────────────────────────────
@@ -139,20 +145,27 @@ struct SnomedParseResult {
 }
 
 /// Import a SNOMED CT RF2 distribution ZIP through the given backend.
+///
+/// `languages` restricts which description languages are ingested as
+/// designations (see [`LanguageFilter`]). English descriptions are always
+/// retained because concept display selection and the `en-US`/`en-GB`
+/// preference chain depend on them.
 pub async fn import_snomed_rf2(
     backend: &dyn BundleImportBackend,
     ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
+    languages: &LanguageFilter,
 ) -> Result<ImportStats, HtsError> {
     const FORMAT: &str = "snomed-rf2";
     let batch_size = batch_size.max(1);
 
     let path_owned = path.to_path_buf();
+    let languages = languages.clone();
     let parsed = tokio::task::spawn_blocking(move || -> Result<SnomedParseResult, HtsError> {
         let (concept_path, desc_paths, rel_path, assoc_refset_paths, lang_refset_paths) =
-            find_rf2_paths(&path_owned)?;
+            find_rf2_paths(&path_owned, &languages)?;
 
         tracing::info!(
             concept_file = %concept_path,
@@ -184,6 +197,7 @@ pub async fn import_snomed_rf2(
                 parse_descriptions(
                     BufReader::new(entry),
                     &active_concepts,
+                    &languages,
                     &mut next_order,
                     &mut by_desc_id,
                     &mut parse_errors,
@@ -288,9 +302,20 @@ pub async fn import_snomed_rf2(
         content: "complete",
     };
 
+    // Probe once before loading: a SNOMED edition is overwhelmingly the largest
+    // designation source, so skipping the per-concept delete-before-reinsert on
+    // a fresh load is the biggest single import win. Probe by canonical URL —
+    // when no concepts exist yet this is a first-time load and every concept is
+    // brand-new. A re-import (or a second edition sharing the URL) keeps the
+    // safe replacement path. Probe failure falls back to the safe path.
+    let fresh_load = !backend
+        .code_system_has_concepts(ctx, SNOMED_URL)
+        .await
+        .unwrap_or(true);
+
     // Seed empty CodeSystem.
-    let seed = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle(ctx, &seed).await?;
+    let seed = build_parsed_code_system(&meta, &[]);
+    let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -368,8 +393,9 @@ pub async fn import_snomed_rf2(
             })
             .collect();
 
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk_stats = backend.import_bundle(ctx, &bytes).await?;
+        let mut parsed = build_parsed_code_system(&meta, &builder);
+        parsed.fresh_load = fresh_load;
+        let chunk_stats = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
 
@@ -448,9 +474,60 @@ fn pick_single(paths: Vec<String>) -> Option<String> {
     paths.into_iter().next()
 }
 
+/// `true` when descriptions in RF2 language `tag` should be imported under
+/// `filter`. English always passes — display selection and the
+/// `en-US`/`en-GB` preference chain depend on the English descriptions and
+/// language refsets.
+fn language_retained(filter: &LanguageFilter, tag: &str) -> bool {
+    crate::language::lang_matches("en", tag) || filter.allows(tag)
+}
+
+/// Extract the language tag from an RF2 Description / Language-refset file
+/// name, e.g. `sct2_Description_Snapshot-en_INT_20240101.txt` → `en`,
+/// `der2_cRefset_LanguageSnapshot-da_DK1000005_20240331.txt` → `da`.
+/// Returns `None` when the name carries no recognizable tag (such files are
+/// kept and filtered row-by-row instead).
+fn rf2_filename_language(path: &str) -> Option<String> {
+    let fname = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    for marker in ["snapshot-", "full-", "delta-"] {
+        if let Some(pos) = fname.find(marker) {
+            let tag: String = fname[pos + marker.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+                .collect();
+            if !tag.is_empty() {
+                return Some(tag);
+            }
+        }
+    }
+    None
+}
+
+/// Drop files whose filename language tag is excluded by `filter`. Files
+/// without a recognizable tag are kept (their rows are filtered during
+/// parsing instead).
+fn retain_languages(paths: Vec<String>, filter: &LanguageFilter) -> Vec<String> {
+    if filter.allows_all() {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .filter(|p| {
+            let keep = rf2_filename_language(p)
+                .map(|tag| language_retained(filter, &tag))
+                .unwrap_or(true);
+            if !keep {
+                tracing::info!(file = %p, "skipping RF2 file excluded by language filter");
+            }
+            keep
+        })
+        .collect()
+}
+
 #[allow(clippy::type_complexity)]
 fn find_rf2_paths(
     path: &Path,
+    languages: &LanguageFilter,
 ) -> Result<(String, Vec<String>, String, Vec<String>, Vec<String>), HtsError> {
     let mut zip = open_zip(path)?;
 
@@ -489,10 +566,11 @@ fn find_rf2_paths(
     }
 
     // National editions ship one Description file per language; sort for a
-    // deterministic read order across platforms.
-    let mut desc_paths = prefer_snapshot(desc_paths);
+    // deterministic read order across platforms. Files in languages excluded
+    // by the import filter are dropped here so they are never parsed.
+    let mut desc_paths = retain_languages(prefer_snapshot(desc_paths), languages);
     desc_paths.sort();
-    let mut lang_refset_paths = prefer_snapshot(lang_refset_paths);
+    let mut lang_refset_paths = retain_languages(prefer_snapshot(lang_refset_paths), languages);
     lang_refset_paths.sort();
     let mut assoc_refset_paths = prefer_snapshot(assoc_refset_paths);
     assoc_refset_paths.sort();
@@ -566,6 +644,7 @@ fn parse_active_concepts(reader: impl BufRead, errors: &mut Vec<String>) -> Hash
 fn parse_descriptions(
     reader: impl BufRead,
     active_concepts: &HashSet<String>,
+    languages: &LanguageFilter,
     next_order: &mut usize,
     by_desc_id: &mut HashMap<String, (usize, ParsedDescription)>,
     errors: &mut Vec<String>,
@@ -601,6 +680,12 @@ fn parse_descriptions(
             continue;
         }
         if !active_concepts.contains(concept_id) || term.is_empty() {
+            continue;
+        }
+        // Row-level language gate for mixed-language Description files
+        // (file-level filtering already dropped per-language files whose
+        // name carries an excluded tag).
+        if !language_retained(languages, language) {
             continue;
         }
 
@@ -1097,6 +1182,7 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
         parse_descriptions(
             DESCRIPTION_TSV.as_bytes(),
             &active,
+            &LanguageFilter::default(),
             &mut next_order,
             &mut by_desc_id,
             &mut errors,
@@ -1104,6 +1190,7 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
         parse_descriptions(
             DESCRIPTION_DE_TSV.as_bytes(),
             &active,
+            &LanguageFilter::default(),
             &mut next_order,
             &mut by_desc_id,
             &mut errors,
@@ -1164,6 +1251,7 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
         parse_descriptions(
             DESCRIPTION_TSV.as_bytes(),
             &active,
+            &LanguageFilter::default(),
             &mut next_order,
             &mut by_desc_id,
             &mut errors,
@@ -1250,6 +1338,7 @@ id\teffectiveTime\tactive\tmoduleId\tconceptId\tlanguageCode\ttypeId\tterm\tcase
         parse_descriptions(
             full_tsv.as_bytes(),
             &active,
+            &LanguageFilter::default(),
             &mut next_order,
             &mut by_desc_id,
             &mut errors,
@@ -1306,9 +1395,16 @@ BADLINE\r\n";
         let ctx = TenantContext::system();
         let zip_file = make_test_rf2_zip();
 
-        let stats = import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, true)
-            .await
-            .expect("dry-run should succeed");
+        let stats = import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            true,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("dry-run should succeed");
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 2);
@@ -1324,9 +1420,16 @@ BADLINE\r\n";
         let ctx = TenantContext::system();
         let zip_file = make_test_rf2_zip();
 
-        let stats = import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .expect("live import should succeed");
+        let stats = import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("live import should succeed");
 
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.concepts, 2);
@@ -1342,9 +1445,16 @@ BADLINE\r\n";
         let ctx = TenantContext::system();
         let zip_file = make_full_and_snapshot_rf2_zip();
 
-        let stats = import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .expect("import should succeed");
+        let stats = import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("import should succeed");
 
         // Identical to the snapshot-only archive: the Full files' poison rows
         // (extra concept 555555001, stale description, duplicate edge) must
@@ -1364,9 +1474,16 @@ BADLINE\r\n";
         let ctx = TenantContext::system();
         let zip_file = make_test_rf2_zip();
 
-        import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
+        import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         // 123456001: en×2 + FSN + de = 4 descriptions, plus per preferred
         // synonym a bare-`en` and a dialect preferredForLanguage row
@@ -1436,6 +1553,106 @@ BADLINE\r\n";
         assert_eq!(resp.display.as_deref(), Some("Foo Erkrankung"));
     }
 
+    /// `--languages en` drops the German per-language Description file while
+    /// leaving all English content (including `preferredForLanguage` rows)
+    /// intact.
+    #[tokio::test]
+    async fn import_snomed_rf2_language_filter_drops_excluded_languages() {
+        use crate::traits::CodeSystemOperations;
+        use crate::types::LookupRequest;
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_rf2_zip();
+
+        import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::parse("en"),
+        )
+        .await
+        .unwrap();
+
+        // Full import yields 10 designation rows (see
+        // import_snomed_rf2_writes_multilingual_designations); the 2 German
+        // synonyms/FSNs from the per-language Description file are dropped.
+        assert_eq!(count_rows(&backend, "concept_designations"), 8);
+
+        // English lookups behave exactly as without a filter.
+        let resp = backend
+            .lookup(
+                &ctx,
+                LookupRequest {
+                    system: SNOMED_URL.into(),
+                    code: "123456001".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.display.as_deref(), Some("Foo malady"));
+        assert!(
+            resp.designations
+                .iter()
+                .all(|d| d.language.as_deref() != Some("de"))
+        );
+    }
+
+    /// English is always retained even when the filter names only other
+    /// languages — display selection depends on it.
+    #[tokio::test]
+    async fn import_snomed_rf2_language_filter_always_keeps_english() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_rf2_zip();
+
+        import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::parse("de"),
+        )
+        .await
+        .unwrap();
+
+        // en is force-retained alongside the requested de, so the result is
+        // identical to an unfiltered import.
+        assert_eq!(count_rows(&backend, "concept_designations"), 10);
+    }
+
+    #[test]
+    fn rf2_filename_language_extraction() {
+        assert_eq!(
+            rf2_filename_language(
+                "Snapshot/Terminology/sct2_Description_Snapshot-en_INT_20240101.txt"
+            )
+            .as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            rf2_filename_language(
+                "Snapshot/Refset/Language/der2_cRefset_LanguageSnapshot-da_DK1000005_20240331.txt"
+            )
+            .as_deref(),
+            Some("da")
+        );
+        assert_eq!(
+            rf2_filename_language("Full/Terminology/sct2_Description_Full-en-gb_INT_20240101.txt")
+                .as_deref(),
+            Some("en-gb")
+        );
+        // Concept/Relationship files carry no language tag.
+        assert_eq!(
+            rf2_filename_language("Snapshot/Terminology/sct2_Concept_Snapshot_INT_20240101.txt"),
+            None
+        );
+    }
+
     /// A national-edition style archive with no English content at all:
     /// Danish synonyms preferred via the Danish language refset (which is in
     /// the dialect table → tagged `da-DK` + `da`) and German synonyms
@@ -1497,9 +1714,16 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
 
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
         let ctx = TenantContext::system();
-        import_snomed_rf2(&backend, &ctx, tmp.path(), 500, false)
-            .await
-            .unwrap();
+        import_snomed_rf2(
+            &backend,
+            &ctx,
+            tmp.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         // Danish refset is in the dialect table: a region-qualified request
         // resolves via the da-DK preferredForLanguage designation.
@@ -1569,12 +1793,26 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
         let ctx = TenantContext::system();
         let zip_file = make_test_rf2_zip();
 
-        import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
-        import_snomed_rf2(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
+        import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
+        import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 2);
@@ -1587,9 +1825,16 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
         let ctx = TenantContext::system();
         let zip_file = make_test_rf2_zip();
 
-        let stats = import_snomed_rf2(&backend, &ctx, zip_file.path(), 1, false)
-            .await
-            .unwrap();
+        let stats = import_snomed_rf2(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            1,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(stats.concepts, 2);
         assert_eq!(count_rows(&backend, "concepts"), 2);
@@ -1606,6 +1851,7 @@ id\teffectiveTime\tactive\tmoduleId\tsourceId\tdestinationId\trelationshipGroup\
             Path::new("/nonexistent/snomed.zip"),
             500,
             false,
+            &LanguageFilter::default(),
         )
         .await;
         assert!(result.is_err());

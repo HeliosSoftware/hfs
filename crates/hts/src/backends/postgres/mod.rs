@@ -322,11 +322,19 @@ impl BundleImportBackend for PostgresTerminologyBackend {
     /// contained resources into the PostgreSQL normalized tables.
     async fn import_bundle(
         &self,
-        _ctx: &TenantContext,
+        ctx: &TenantContext,
         data: &[u8],
     ) -> Result<ImportStats, HtsError> {
         let parsed = bundle_parser::parse_bundle(data)?;
+        self.import_parsed(ctx, parsed).await
+    }
 
+    /// Write an already-parsed bundle, skipping the JSON parse step.
+    async fn import_parsed(
+        &self,
+        _ctx: &TenantContext,
+        parsed: bundle_parser::ParsedBundle,
+    ) -> Result<ImportStats, HtsError> {
         let mut client = self
             .pool
             .get()
@@ -340,19 +348,25 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // because rebuilding per chunk is O(n²) — the SNOMED full closure
         // is built once via the end-of-CLI `migrate_concept_closure_pg` call.
         // Mirrors the SQLite import_bundle pattern.
+        // Probed with EXISTS rather than COUNT(*): the answer only
+        // distinguishes empty from non-empty, and a COUNT over an
+        // ever-growing concept set would make each batch of a chunked bulk
+        // load scan all previously imported rows.
         let mut systems_needing_closure: Vec<String> = Vec::new();
         for cs in &parsed.code_systems {
             let row = client
                 .query_opt(
-                    "SELECT COUNT(*) FROM concepts c
-                     JOIN code_systems s ON c.system_id = s.id
-                     WHERE s.url = $1",
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concepts c
+                         JOIN code_systems s ON c.system_id = s.id
+                         WHERE s.url = $1
+                     )",
                     &[&cs.url],
                 )
                 .await
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            let count: i64 = row.map(|r| r.get(0)).unwrap_or(0);
-            if count == 0 {
+            let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
+            if !has_concepts {
                 systems_needing_closure.push(cs.url.clone());
             }
         }
@@ -366,7 +380,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         stats.errors.extend(parsed.parse_errors.iter().cloned());
 
         for cs in &parsed.code_systems {
-            if let Err(e) = write_code_system(&tx, cs, &mut stats).await {
+            if let Err(e) = write_code_system(&tx, cs, &mut stats, parsed.fresh_load).await {
                 stats
                     .errors
                     .push(format!("CodeSystem '{}' import failed: {e}", cs.url));
@@ -435,6 +449,30 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         self.clear_response_caches();
 
         Ok(stats)
+    }
+
+    async fn code_system_has_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<bool, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM concepts c
+                     JOIN code_systems s ON c.system_id = s.id
+                     WHERE s.url = $1
+                 )",
+                &[&url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.get(0))
     }
 
     /// Delete all HTS normalized rows for the resource identified by `resource_url`.
@@ -510,6 +548,11 @@ async fn write_code_system(
     client: &impl GenericClient,
     cs: &ParsedCodeSystem,
     stats: &mut ImportStats,
+    // When `true` the caller guarantees this code system had no concepts before
+    // the import session, so the per-concept delete-before-reinsert of
+    // properties/designations is skipped (fast path for first-time bulk loads).
+    // See [`crate::import::bundle_parser::ParsedBundle::fresh_load`].
+    skip_child_delete: bool,
 ) -> Result<(), HtsError> {
     let resource_json = Some(cs.resource_json.clone());
     let now = utc_now();
@@ -642,6 +685,31 @@ async fn write_code_system(
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
             insert_hierarchy(client, &system_id, parent, &concept.code).await?;
+        }
+
+        // Replace any prior child rows for this concept so a re-import fully
+        // supersedes the previous set rather than duplicating rows or leaving
+        // filtered-out languages behind (the concept row itself is upserted, so
+        // its id is stable). A concept that now yields zero designations after a
+        // narrower language filter must still lose its old ones. Stub
+        // "content=not-present" imports carry an empty concepts array, so this
+        // loop never runs for them. Skipped on a fresh load (nothing to
+        // delete). Mirrors import/fhir_bundle.rs (SQLite).
+        if !skip_child_delete {
+            client
+                .execute(
+                    "DELETE FROM concept_properties WHERE concept_id = $1",
+                    &[&concept_id],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            client
+                .execute(
+                    "DELETE FROM concept_designations WHERE concept_id = $1",
+                    &[&concept_id],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
         }
 
         for prop in &concept.properties {

@@ -2,10 +2,6 @@
 members = [
 	"crates/*",
 ]
-exclude = [
-	# crates/hts contains planning docs but no Cargo.toml yet (HTS feature branch)
-	"crates/hts",
-]
 # Build all Rust crates by default, but skip pysof unless explicitly requested.
 # This keeps `cargo build` working on machines without Python while still
 # making `crates/pysof` an actual workspace member for maturin.

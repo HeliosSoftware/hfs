@@ -384,9 +384,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             if let Some(k) = cache_key_owned {
                 let arc = std::sync::Arc::new(response.clone());
                 if let Ok(mut w) = lookup_cache.write() {
-                    if w.len() < lookup_response_cache_max() {
-                        w.insert(k, arc);
-                    }
+                    super::bounded_cache_insert(&mut *w, k, arc, lookup_response_cache_max());
                 }
             }
             Ok(response)
@@ -553,7 +551,11 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             };
 
             // Optionally validate the caller's expected display.
-            // Per FHIR spec, a display mismatch causes result=false (with a message).
+            // Per FHIR spec, a display mismatch causes result=false (with a
+            // message). When the caller passes `lenient-display-validation=true`
+            // the mismatch is downgraded to a `warning` and `result` stays true,
+            // matching the Postgres CodeSystem and SQLite ValueSet paths.
+            let lenient = req.lenient_display_validation == Some(true);
             let mut issues: Vec<crate::types::ValidationIssue> = Vec::new();
             let message = req.display.as_ref().and_then(|expected| {
                 let actual = display.as_deref().unwrap_or("");
@@ -563,7 +565,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                         expected, actual
                     );
                     issues.push(crate::types::ValidationIssue {
-                        severity: "error".into(),
+                        severity: if lenient { "warning" } else { "error" }.into(),
                         fhir_code: "invalid".into(),
                         tx_code: "invalid-display".into(),
                         text: text.clone(),
@@ -580,7 +582,7 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             });
 
             Ok(ValidateCodeResponse {
-                result: message.is_none(),
+                result: message.is_none() || lenient,
                 message,
                 display,
                 system: None,
