@@ -84,14 +84,35 @@ mod sof_export_tests {
         })
     }
 
-    /// Polls the status URL until the job completes (200 OK with the
-    /// manifest in the poll body — no 303 redirect). Times out after ~2s.
+    /// Polls the status URL until the job finishes. Per the FHIR Asynchronous
+    /// Interaction Request Pattern, completion is signalled by a `303 See Other`
+    /// redirect to a separate result URL; this helper follows that redirect and
+    /// returns the manifest `Parameters` fetched (with `200 OK`) from the result
+    /// URL. Times out after ~2s.
     async fn poll_to_manifest(server: &TestServer, status_url: &str, tenant: &str) -> Value {
         for _ in 0..40 {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             let poll = server.get(status_url).add_header(X_TENANT_ID, tenant).await;
             match poll.status_code() {
-                StatusCode::OK => return poll.json::<Value>(),
+                StatusCode::SEE_OTHER => {
+                    let result_url = poll
+                        .headers()
+                        .get(axum::http::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .expect("303 completion response missing Location header")
+                        .to_string();
+                    let result = server
+                        .get(&result_url)
+                        .add_header(X_TENANT_ID, tenant)
+                        .await;
+                    assert_eq!(
+                        result.status_code(),
+                        StatusCode::OK,
+                        "result fetch failed: {}",
+                        result.text()
+                    );
+                    return result.json::<Value>();
+                }
                 StatusCode::ACCEPTED => continue,
                 other => panic!("unexpected poll status {other}: {}", poll.text()),
             }
@@ -136,7 +157,7 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 2. Poll → eventually 200 + manifest
+    // 2. Poll → eventually 303 See Other → result URL → 200 + manifest
     // =========================================================================
 
     #[tokio::test]
@@ -177,10 +198,112 @@ mod sof_export_tests {
         );
     }
 
+    /// The completing status poll signals completion with `303 See Other` and an
+    /// empty body, carrying the separate result URL in the `Location` header
+    /// (FHIR Asynchronous Interaction Request Pattern). The status URL itself
+    /// never returns the manifest with `200 OK`. Fetching the result URL returns
+    /// `200 OK` with the manifest `Parameters` resource.
+    #[tokio::test]
+    async fn test_export_completion_redirects_to_result() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let submit_resp = server
+            .post("/ViewDefinition/$viewdefinition-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let status_url = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Poll until the job finishes; completion is a 303, never a 200.
+        let mut result_url = None;
+        for _ in 0..40 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let poll = server
+                .get(&status_url)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            match poll.status_code() {
+                StatusCode::ACCEPTED => continue,
+                StatusCode::SEE_OTHER => {
+                    // Empty body, Location points to the result endpoint.
+                    assert!(
+                        poll.text().is_empty(),
+                        "completion poll must have an empty body, got: {}",
+                        poll.text()
+                    );
+                    let loc = poll
+                        .headers()
+                        .get(axum::http::header::LOCATION)
+                        .expect("303 missing Location header")
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    assert!(
+                        loc.contains("/export/") && loc.ends_with("/result"),
+                        "unexpected result URL: {loc}"
+                    );
+                    result_url = Some(loc);
+                    break;
+                }
+                other => panic!("unexpected poll status {other}: {}", poll.text()),
+            }
+        }
+        let result_url = result_url.expect("export did not complete within 2s");
+
+        // The result URL serves the manifest with 200 OK.
+        let result = server
+            .get(&result_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(result.status_code(), StatusCode::OK, "{}", result.text());
+        let manifest: Value = result.json();
+        assert_eq!(manifest["resourceType"].as_str(), Some("Parameters"));
+        // The result and download URLs are valid for ≥24h → Expires header.
+        assert!(
+            result.headers().contains_key(axum::http::header::EXPIRES),
+            "result response missing Expires header"
+        );
+
+        // The result is stable: a second fetch returns the same manifest.
+        let again = server
+            .get(&result_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(again.status_code(), StatusCode::OK);
+        assert_eq!(again.json::<Value>(), manifest);
+    }
+
+    /// Fetching the result URL for a job that does not exist (or is not yet
+    /// finished) returns `404 Not Found` — the result is only available once the
+    /// status poll has redirected to it.
+    #[tokio::test]
+    async fn test_export_result_unknown_job_returns_404() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let resp = server
+            .get("/export/00000000-0000-0000-0000-000000000000/result")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND, "{}", resp.text());
+        assert_eq!(
+            resp.json::<Value>()["resourceType"].as_str(),
+            Some("OperationOutcome")
+        );
+    }
+
     /// `Accept: application/fhir+xml` (without fhir+json) on a status poll is
     /// not supported → `406 Not Acceptable` + OperationOutcome, same as the
-    /// run operations. The poll's `Accept` header governs the manifest
-    /// representation per Common Operation Behavior — Asynchronous Delivery.
+    /// run operations. The poll's `Accept` header governs that poll's
+    /// (interim/error) response per Common Operation Behavior — Asynchronous
+    /// Delivery.
     #[tokio::test]
     async fn test_export_status_poll_accept_fhir_xml_returns_406() {
         let (server, backend) = create_test_server_with_export().await;
@@ -937,8 +1060,8 @@ mod sof_export_tests {
             .unwrap()
             .to_string();
 
-        // Poll repeatedly; capture either the in-progress (202) or completed (200)
-        // shape and assert each body shape conforms to the spec.
+        // Poll repeatedly; capture either the in-progress (202) or completed
+        // (303 → result) shape and assert each body shape conforms to the spec.
         for _ in 0..40 {
             let poll = server
                 .get(&location)
@@ -980,9 +1103,22 @@ mod sof_export_tests {
                     });
                     assert!(n <= 99, "running percent must be <= 99, got {n}");
                 }
-                StatusCode::OK => {
-                    // Completed — the manifest rides in the poll body.
-                    let body: Value = poll.json();
+                StatusCode::SEE_OTHER => {
+                    // Completed — the poll redirects to the result URL, which
+                    // carries the manifest. The redirect body is empty.
+                    assert!(poll.text().is_empty(), "completion 303 must be empty");
+                    let result_url = poll
+                        .headers()
+                        .get(axum::http::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .expect("303 missing Location header")
+                        .to_string();
+                    let result = server
+                        .get(&result_url)
+                        .add_header(X_TENANT_ID, "test-tenant")
+                        .await;
+                    assert_eq!(result.status_code(), StatusCode::OK, "{}", result.text());
+                    let body: Value = result.json();
                     assert_eq!(body["resourceType"].as_str(), Some("Parameters"));
                     let params = body["parameter"].as_array().unwrap();
                     let status = params
@@ -1067,9 +1203,10 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 17. Failed jobs: the status poll itself returns 500 + OperationOutcome
-    //     (spec: no 303 redirect, no separate result URL).
-    //     Uses a test-only controller that always reports `Failed`.
+    // 17. Failed jobs: the status poll redirects with `303 See Other` to the
+    //     result URL, which returns 500 + OperationOutcome (FHIR Asynchronous
+    //     Interaction Request Pattern). Uses a test-only controller that always
+    //     reports `Failed`.
     // =========================================================================
 
     struct FailingController {
@@ -1105,7 +1242,7 @@ mod sof_export_tests {
     }
 
     #[tokio::test]
-    async fn test_export_failed_status_poll_returns_500_operation_outcome() {
+    async fn test_export_failed_status_poll_redirects_to_500_result() {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -1125,10 +1262,10 @@ mod sof_export_tests {
         let app = helios_rest::routing::fhir_routes::create_routes(state);
         let server = TestServer::new(app).expect("failed to create test server");
 
-        // Spec (Common Operation Behavior — Asynchronous Delivery): a failed
-        // job surfaces directly on the status poll as the relevant error
-        // status code with an OperationOutcome body. There is no 303 redirect.
-        // Poll twice to confirm the terminal failure response is stable.
+        // FHIR Asynchronous Interaction Request Pattern: a finished job — even a
+        // failed one — is signalled by `303 See Other` to the result URL with an
+        // empty body; the status endpoint never carries the outcome. Poll twice
+        // to confirm the terminal redirect is stable.
         for _ in 0..2 {
             let poll = server
                 .get("/export/fail-1/status")
@@ -1136,12 +1273,37 @@ mod sof_export_tests {
                 .await;
             assert_eq!(
                 poll.status_code(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed status poll should 500, got: {} {}",
+                StatusCode::SEE_OTHER,
+                "failed job should redirect to the result URL, got: {} {}",
                 poll.status_code(),
                 poll.text()
             );
-            let body: Value = poll.json();
+            assert!(poll.text().is_empty(), "303 body must be empty");
+            let result_url = poll
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .expect("303 missing Location header")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                result_url.ends_with("/result"),
+                "unexpected result URL: {result_url}"
+            );
+
+            // The result URL surfaces the failure as 500 + OperationOutcome.
+            let result = server
+                .get(&result_url)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            assert_eq!(
+                result.status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed result should 500, got: {} {}",
+                result.status_code(),
+                result.text()
+            );
+            let body: Value = result.json();
             assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
             assert!(
                 body["issue"][0]["diagnostics"]
@@ -1190,7 +1352,7 @@ mod sof_export_tests {
     }
 
     // =========================================================================
-    // 19. Completion (200 OK) poll carries an `Expires` header (IMF-fixdate).
+    // 19. The result response (200 OK) carries an `Expires` header (IMF-fixdate).
     // =========================================================================
 
     #[tokio::test]
@@ -1213,18 +1375,32 @@ mod sof_export_tests {
             .unwrap()
             .to_string();
 
-        // Poll until the completing 200 OK so we can read its response
-        // headers — the manifest (and Expires) ride on the status poll.
-        let result = loop {
-            let poll = server
-                .get(&location)
-                .add_header(X_TENANT_ID, "test-tenant")
-                .await;
-            if poll.status_code() == StatusCode::OK {
-                break poll;
+        // Poll until the completing 303, then fetch the result URL — the
+        // manifest (and its Expires header) ride on the result response.
+        let result = {
+            let mut result_url = None;
+            for _ in 0..100 {
+                let poll = server
+                    .get(&location)
+                    .add_header(X_TENANT_ID, "test-tenant")
+                    .await;
+                if poll.status_code() == StatusCode::SEE_OTHER {
+                    result_url = poll
+                        .headers()
+                        .get(axum::http::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            let result_url = result_url.expect("export did not complete");
+            server
+                .get(&result_url)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await
         };
+        assert_eq!(result.status_code(), StatusCode::OK, "{}", result.text());
         let expires = result
             .headers()
             .get("expires")
@@ -1737,7 +1913,7 @@ mod sof_export_tests {
     // =========================================================================
     // 30. Cancel after completion is a no-op: the cancel call returns 202
     //     (the job exists) but does not overwrite the `Completed` state, so
-    //     the status URL keeps serving the manifest.
+    //     the status URL keeps redirecting to the result manifest.
     // =========================================================================
 
     #[tokio::test]
@@ -1786,19 +1962,9 @@ mod sof_export_tests {
             cancel.text()
         );
 
-        // Status URL must still serve the Completed manifest with 200.
-        let result_after = server
-            .get(&status_url)
-            .add_header(X_TENANT_ID, "test-tenant")
-            .await;
-        assert_eq!(
-            result_after.status_code(),
-            StatusCode::OK,
-            "completed job should still 200 after spurious cancel: {} {}",
-            result_after.status_code(),
-            result_after.text()
-        );
-        let manifest_after: Value = result_after.json();
+        // The completed job must still redirect to its result, which serves the
+        // manifest — the spurious cancel must not have reset the state.
+        let manifest_after = poll_to_manifest(&server, &status_url, "test-tenant").await;
         let status_after = manifest_after["parameter"]
             .as_array()
             .unwrap()
