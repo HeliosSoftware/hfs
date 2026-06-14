@@ -727,17 +727,41 @@ async fn apply_language_display_validation<B: TerminologyBackend>(
         return;
     }
 
-    // Decide whether the supplied display is valid.
-    //   - If a requested displayLanguage is set AND a designation in that
-    //     language exists, the only valid display is that designation.
+    // Decide whether the supplied display is valid. The accepted set mirrors
+    // exactly the choices advertised by `format_valid_displays`:
+    //   - If a requested displayLanguage is set AND the code has designation(s)
+    //     in that language, the display is valid when it matches ANY of those
+    //     language designations — not only the single language-preferred term.
+    //     A concept routinely has several valid synonyms per language (e.g.
+    //     SNOMED `22298006` accepts both "Myokardinfarkt" and "Herzinfarkt"
+    //     for `de`), and every one of them is listed as a valid choice in the
+    //     mismatch message, so every one of them must validate.
     //   - Otherwise (no displayLanguage, or the requested language has no
     //     designation), any (default | designation) value is accepted.
-    let display_matches: bool = if let Some((value, _)) = preferred_for_lang {
-        value.eq_ignore_ascii_case(expected)
-    } else {
-        displays_for_lang
-            .iter()
-            .any(|(v, _)| v.eq_ignore_ascii_case(expected))
+    let display_matches: bool = {
+        let in_lang: Vec<&(String, Option<String>)> = if requested_langs.is_empty() {
+            Vec::new()
+        } else {
+            displays_for_lang
+                .iter()
+                .filter(|(_, l)| {
+                    l.as_deref().is_some_and(|stored| {
+                        requested_langs
+                            .iter()
+                            .any(|req| stored.eq_ignore_ascii_case(req))
+                    })
+                })
+                .collect()
+        };
+        if in_lang.is_empty() {
+            displays_for_lang
+                .iter()
+                .any(|(v, _)| v.eq_ignore_ascii_case(expected))
+        } else {
+            in_lang
+                .iter()
+                .any(|(v, _)| v.eq_ignore_ascii_case(expected))
+        }
     };
 
     // Determine whether the CS has any display in any of the requested
@@ -6214,6 +6238,89 @@ mod tests {
         assert_eq!(
             result_param["valueBoolean"], true,
             "supplying the correct German SNOMED display must validate true: {json}"
+        );
+    }
+
+    /// A concept with several designations in the *same* language: one
+    /// language-preferred term plus additional synonyms. Mirrors a real SNOMED
+    /// concept, e.g. `22298006` has the German synonyms "Myokardinfarkt"
+    /// (preferred) and "Herzinfarkt".
+    fn make_snomed_multi_de_app() -> Router {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at, resource_json)
+                 VALUES ('cs1', 'http://snomed.info/sct', '1.0', 'SNOMED CT',
+                         'active', 'complete', '2024-01-01', '2024-01-01',
+                         '{\"resourceType\":\"CodeSystem\",\"url\":\"http://snomed.info/sct\",\"version\":\"1.0\",\"status\":\"active\",\"content\":\"complete\",\"language\":\"en\"}');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (1, 'cs1', '22298006', 'Myocardial infarction (disorder)');
+
+                 INSERT INTO concept_designations (concept_id, language, use_system, use_code, value)
+                 VALUES (1, 'de', 'http://snomed.info/sct', '900000000000013009', 'Myokardinfarkt'),
+                        (1, 'de', 'http://snomed.info/sct', '900000000000013009', 'Herzinfarkt');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        Router::new()
+            .route(
+                "/CodeSystem/$validate-code",
+                post(validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state)
+    }
+
+    /// Regression: a *non-preferred* designation in the requested language must
+    /// validate as a correct display. Previously only the single
+    /// language-preferred designation ("Myokardinfarkt") was accepted, so the
+    /// equally-valid synonym "Herzinfarkt" — which the mismatch message itself
+    /// advertised as one of the valid choices — was wrongly reported as a
+    /// "Wrong Display Name" with `result=false`. It must now return
+    /// `result=true` with no `invalid-display` issue.
+    #[tokio::test]
+    async fn snomed_nonpreferred_german_synonym_validates_true() {
+        let app = make_snomed_multi_de_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "22298006"},
+                {"name": "display", "valueString": "Herzinfarkt"},
+                {"name": "displayLanguage", "valueCode": "de"}
+            ]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result_param = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(
+            result_param["valueBoolean"], true,
+            "a valid non-preferred German synonym must validate true: {json}"
+        );
+
+        let has_invalid_display = params
+            .iter()
+            .find(|p| p["name"] == "issues")
+            .and_then(|p| p["resource"]["issue"].as_array())
+            .map(|issues| {
+                issues.iter().any(|i| {
+                    i["details"]["coding"]
+                        .as_array()
+                        .map(|cs| cs.iter().any(|c| c["code"] == "invalid-display"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            !has_invalid_display,
+            "a valid synonym must not produce an invalid-display issue: {json}"
         );
     }
 
