@@ -83,6 +83,37 @@ public struct HFSResourceOperations: Sendable {
         return try Self.parsePage(data, fallbackType: fallbackType)
     }
 
+    /// Creates a new resource of the given type (POST /[type]).
+    public func create(resourceType: String, json: Data) async throws -> ResourceListItem {
+        let request = try await client.makeRequest(
+            pathComponents: [resourceType],
+            method: "POST",
+            body: json
+        )
+        let data = try await client.send(request)
+        return Self.parseResource(data, fallbackType: resourceType, requestBody: json)
+    }
+
+    /// Replaces an existing resource (PUT /[type]/[id]).
+    public func update(resourceType: String, id: String, json: Data) async throws -> ResourceListItem {
+        let request = try await client.makeRequest(
+            pathComponents: [resourceType, id],
+            method: "PUT",
+            body: json
+        )
+        let data = try await client.send(request)
+        return Self.parseResource(data, fallbackType: resourceType, requestBody: json)
+    }
+
+    /// Deletes a resource (DELETE /[type]/[id]).
+    public func delete(resourceType: String, id: String) async throws {
+        let request = try await client.makeRequest(
+            pathComponents: [resourceType, id],
+            method: "DELETE"
+        )
+        _ = try await client.send(request)
+    }
+
     static func parsePage(_ data: Data, fallbackType: String) throws -> ResourcePage {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw HFSClientError.decoding("Expected a Bundle object.")
@@ -102,19 +133,50 @@ public struct HFSResourceOperations: Sendable {
         let entries = root["entry"] as? [[String: Any]] ?? []
         return entries.compactMap { entry -> ResourceListItem? in
             guard let resource = entry["resource"] as? [String: Any] else { return nil }
-            let fhirID = resource["id"] as? String ?? "(no id)"
-            let type = resource["resourceType"] as? String ?? fallbackType
-            guard
-                let json = try? JSONSerialization.data(
-                    withJSONObject: resource,
-                    options: [.prettyPrinted, .sortedKeys]
-                )
-            else { return nil }
-            return ResourceListItem(
-                fhirID: fhirID,
-                resourceType: type,
-                prettyJSON: String(decoding: json, as: UTF8.self)
-            )
+            return makeItem(from: resource, fallbackType: fallbackType)
         }
+    }
+
+    /// Parses a single resource response (create/update), falling back to the
+    /// request body when the server returns no body (e.g. a 204 on update).
+    static func parseResource(
+        _ data: Data,
+        fallbackType: String,
+        requestBody: Data? = nil
+    ) -> ResourceListItem {
+        if
+            let resource = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let item = makeItem(from: resource, fallbackType: fallbackType)
+        {
+            return item
+        }
+        if
+            let requestBody,
+            let resource = (try? JSONSerialization.jsonObject(with: requestBody)) as? [String: Any],
+            let item = makeItem(from: resource, fallbackType: fallbackType)
+        {
+            return item
+        }
+        return ResourceListItem(
+            fhirID: "(unknown)",
+            resourceType: fallbackType,
+            prettyJSON: String(decoding: data, as: UTF8.self)
+        )
+    }
+
+    private static func makeItem(from resource: [String: Any], fallbackType: String) -> ResourceListItem? {
+        let fhirID = resource["id"] as? String ?? "(no id)"
+        let type = resource["resourceType"] as? String ?? fallbackType
+        guard
+            let json = try? JSONSerialization.data(
+                withJSONObject: resource,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+        else { return nil }
+        return ResourceListItem(
+            fhirID: fhirID,
+            resourceType: type,
+            prettyJSON: String(decoding: json, as: UTF8.self)
+        )
     }
 }
