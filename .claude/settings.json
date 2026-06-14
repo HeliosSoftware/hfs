@@ -36,16 +36,6 @@
             "timeout": 5
           }
         ]
-      },
-      {
-        "matcher": "ExitPlanMode",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/codex-verify-plan.sh",
-            "timeout": 120
-          }
-        ]
       }
     ],
     "PostToolUse": [
@@ -82,17 +72,7 @@
             "timeout": 5
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/codex-final-plan-review.sh",
-            "timeout": 120
-          }
-        ]
       }
     ]
   }
 }
-
