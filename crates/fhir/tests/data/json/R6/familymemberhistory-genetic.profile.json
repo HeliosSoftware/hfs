@@ -26,7 +26,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.5.1229"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "FamilyMemberHistoryForGeneticsAnalysis",
   "title": "Family member history for genetics analysis",
   "status": "draft",
@@ -44,7 +44,7 @@
     }
   ],
   "description": "Adds additional information to a family member history supporting both the capture of mother/father relationships as well as additional observations necessary to enable genetics-based risk analysis for patients",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "workflow",
@@ -76,7 +76,7 @@
     "extension": [
       {
         "url": "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-        "valueString": "6.0.0-ballot3"
+        "valueString": "6.0.0-ballot4"
       }
     ],
     "element": [
@@ -143,13 +143,6 @@
             "severity": "error",
             "human": "Can have age[x] or born[x], but not both",
             "expression": "age.empty() or born.empty()",
-            "source": "http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory"
-          },
-          {
-            "key": "fhs-2",
-            "severity": "error",
-            "human": "Can only have estimatedAge if age[x] is present",
-            "expression": "age.exists() or estimatedAge.empty()",
             "source": "http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory"
           },
           {
@@ -311,7 +304,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -712,7 +705,7 @@
           ],
           "strength": "required",
           "description": "A code that identifies the status of the family history record.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1056,9 +1049,9 @@
       {
         "id": "FamilyMemberHistory.sex",
         "path": "FamilyMemberHistory.sex",
-        "short": "male | female | other | unknown",
-        "definition": "The birth sex of the family member.",
-        "comment": "This element should ideally reflect whether the individual is genetically male or female.  However, as reported information based on the knowledge of the patient or reporting friend/relative, there may be situations where the reported sex might not be totally accurate.  E.g. \u0027Aunt Sue\u0027 might be XY rather than XX.  Questions soliciting this information should be phrased to encourage capture of genetic sex where known.  However, systems performing analysis should also allow for the possibility of imprecision with this element.",
+        "short": "female-typical | male-typical | specified | unknown",
+        "definition": "A context-specific sex value for the family member which can inform clinical decision making in relation to treatment of the patient. This element SHALL NOT be used to reflect the family member\u0027s gender identity.",
+        "comment": "This element should ideally reflect the family member\u0027s sex characteristics. However, as reported information based on the knowledge of the patient or reporting friend/relative, there may be situations where the reported sex might not be totally accurate. E.g. \u0027Aunt Sue\u0027 might be XY rather than XX. Questions soliciting this information should be phrased to encourage capture of genetic sex where known. However, systems performing analysis should also allow for the possibility of imprecision with this element.",
         "requirements": "Not all relationship codes imply sex and the relative\u0027s sex can be relevant for risk assessments.",
         "min": 0,
         "max": "1",
@@ -1091,9 +1084,9 @@
               "valueString": "Sex"
             }
           ],
-          "strength": "extensible",
-          "description": "Codes describing the sex assigned at birth as documented on the birth registration.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/administrative-gender"
+          "strength": "preferred",
+          "description": "Codes describing the sex values appropriate in this context",
+          "valueSet": "http://terminology.hl7.org/ValueSet/sex-parameter-for-clinical-use"
         }
       },
       {
@@ -1147,7 +1140,6 @@
         "path": "FamilyMemberHistory.age[x]",
         "short": "(approximate) age",
         "definition": "The age of the relative at the time the family member history is recorded.",
-        "comment": "use estimatedAge to indicate whether the age is actual or not.",
         "requirements": "While age can be calculated from date of birth, sometimes recording age directly is more natural for clinicians.",
         "min": 0,
         "max": "1",
@@ -1168,7 +1160,6 @@
           }
         ],
         "condition": [
-          "fhs-2",
           "fhs-1",
           "fhs-3"
         ],
@@ -1190,42 +1181,6 @@
             "map": "participation[typeCode\u003dSBJ].act[classCode\u003dOBS,moodCode\u003dEVN, code\u003d\"age\"].value"
           }
         ]
-      },
-      {
-        "id": "FamilyMemberHistory.estimatedAge",
-        "path": "FamilyMemberHistory.estimatedAge",
-        "short": "Age is estimated?",
-        "definition": "If true, indicates that the age value specified is an estimated value.",
-        "comment": "This element is labeled as a modifier because the fact that age is estimated can/should change the results of any algorithm that calculates based on the specified age.",
-        "requirements": "Clinicians often prefer to specify an estimaged age rather than an age range.",
-        "min": 0,
-        "max": "1",
-        "base": {
-          "path": "FamilyMemberHistory.estimatedAge",
-          "min": 0,
-          "max": "1"
-        },
-        "type": [
-          {
-            "code": "boolean"
-          }
-        ],
-        "meaningWhenMissing": "It is unknown whether the age is an estimate or not",
-        "condition": [
-          "fhs-2"
-        ],
-        "constraint": [
-          {
-            "key": "ele-1",
-            "severity": "error",
-            "human": "All FHIR elements must have a @value or children",
-            "expression": "hasValue() or (children().count() \u003e id.count())",
-            "source": "http://hl7.org/fhir/StructureDefinition/Element"
-          }
-        ],
-        "mustSupport": false,
-        "isModifier": false,
-        "isSummary": true
       },
       {
         "id": "FamilyMemberHistory.deceased[x]",

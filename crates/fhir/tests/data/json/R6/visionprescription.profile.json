@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "VisionPrescription",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/VisionPrescription",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "VisionPrescription",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-06-13T17:13:29+00:00",
   "publisher": "HL7 International / Orders and Observations",
   "contact": [
     {
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "workflow",
@@ -303,7 +303,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -653,7 +653,7 @@
           ],
           "strength": "required",
           "description": "A code specifying the state of the resource instance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -709,7 +709,7 @@
           ],
           "strength": "required",
           "description": "The priority of the request.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1209,7 +1209,7 @@
           ],
           "strength": "required",
           "description": "A coded concept listing the eye codes.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/vision-eye-codes|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/vision-eye-codes|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1565,7 +1565,7 @@
           ],
           "strength": "required",
           "description": "A coded concept listing the base codes.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/vision-base-codes|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/vision-base-codes|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2017,7 +2017,7 @@
           ],
           "strength": "required",
           "description": "A code specifying the state of the resource instance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2059,7 +2059,7 @@
           ],
           "strength": "required",
           "description": "The priority of the request.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2326,7 +2326,7 @@
           ],
           "strength": "required",
           "description": "A coded concept listing the eye codes.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/vision-eye-codes|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/vision-eye-codes|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2477,7 +2477,7 @@
           ],
           "strength": "required",
           "description": "A coded concept listing the base codes.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/vision-base-codes|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/vision-base-codes|6.0.0-ballot4"
         },
         "mapping": [
           {

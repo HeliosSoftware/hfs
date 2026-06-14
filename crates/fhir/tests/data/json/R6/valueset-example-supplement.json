@@ -3,7 +3,7 @@
   "id": "example-supplement",
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp class\u003d\"res-header-id\"\u003e\n        \u003cb\u003eGenerated Narrative: ValueSet example-supplement\u003c/b\u003e\n      \u003c/p\u003e\n      \u003ca name\u003d\"example-supplement\"\u003e \u003c/a\u003e\n      \u003ca name\u003d\"hcexample-supplement\"\u003e \u003c/a\u003e\n      \u003cp\u003eThis ValueSet requires the Code system Supplement \n        \u003ca href\u003d\"codesystem-example-supplement.html\"\u003eCholesterol Code Legacy Status\u003c/a\u003e.\n      \u003c/p\u003e\n      \u003cul\u003e\n        \u003cli\u003eInclude codes from\n          \u003ca href\u003d\"codesystem-example.html\"\u003e\n            \u003ccode\u003ehttp://hl7.org/fhir/CodeSystem/example\u003c/code\u003e\n          \u003c/a\u003e\n          \u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to the version provided in this specification\"\u003e version \u0026#x1F4E6;6.0.0-ballot3\u003c/span\u003e where legacy  \u003d true\n        \u003c/li\u003e\n      \u003c/ul\u003e\n    \u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp class\u003d\"res-header-id\"\u003e\n        \u003cb\u003eGenerated Narrative: ValueSet example-supplement\u003c/b\u003e\n      \u003c/p\u003e\n      \u003ca name\u003d\"example-supplement\"\u003e \u003c/a\u003e\n      \u003ca name\u003d\"hcexample-supplement\"\u003e \u003c/a\u003e\n      \u003cp\u003eThis ValueSet requires the Code system Supplement \n        \u003ca href\u003d\"codesystem-example-supplement.html\"\u003eCholesterol Code Legacy Status\u003c/a\u003e.\n      \u003c/p\u003e\n      \u003cul\u003e\n        \u003cli\u003eInclude codes from\n          \u003ca href\u003d\"codesystem-example.html\"\u003e\n            \u003ccode\u003ehttp://hl7.org/fhir/CodeSystem/example\u003c/code\u003e\n          \u003c/a\u003e\n          \u003cspan title\u003d\"Version is not explicitly stated, which means it is fixed to the version provided in this specification\"\u003e version \u0026#x1F4E6;6.0.0-ballot4\u003c/span\u003e where legacy  \u003d true\n        \u003c/li\u003e\n      \u003c/ul\u003e\n    \u003c/div\u003e"
   },
   "extension": [
     {
@@ -16,7 +16,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/ValueSet/example-supplement",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "ACMECholCodesPlasmaSupplemented",
   "title": "ACME Codes for Cholesterol: Plasma only (Supplemented)",
   "status": "draft",

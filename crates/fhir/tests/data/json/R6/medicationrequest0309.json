@@ -43,50 +43,6 @@
     "reference": "Practitioner/f007",
     "display": "Patrick Pump"
   },
-  "dosageInstruction": {
-    "simple": {
-      "text": "1000 mg/m2 orally twice daily from days 1-14 of cycle",
-      "timing": {
-        "repeat": {
-          "boundsPeriod": {
-            "start": "2016-01-22",
-            "end": "2016-02-04"
-          },
-          "frequency": 1,
-          "period": 2,
-          "periodUnit": "d"
-        }
-      },
-      "route": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "26643006",
-            "display": "Oral Route"
-          }
-        ]
-      },
-      "doseAndRate": [
-        {
-          "type": {
-            "coding": [
-              {
-                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                "code": "ordered",
-                "display": "Ordered"
-              }
-            ]
-          },
-          "doseQuantity": {
-            "value": 1000,
-            "unit": "mg/m2",
-            "system": "http://unitsofmeasure.org",
-            "code": "mg/m2"
-          }
-        }
-      ]
-    }
-  },
   "meta": {
     "tag": [
       {

@@ -19,14 +19,7 @@
   <location>
     <reference value="Location/1/_history/1"/>
   </location>
-  <authorization>
-    <concept>
-      <coding>
-        <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
-        <code value="TREAT"/>
-      </coding>
-    </concept>
-  </authorization>
+  <authorization/>
   <activity>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/iso-21089-lifecycle"/>

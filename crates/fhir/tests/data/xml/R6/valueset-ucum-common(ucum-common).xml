@@ -20,7 +20,7 @@
           <a href="http://unitsofmeasure.org">
             <code>http://unitsofmeasure.org</code>
           </a>
-          <span title="Version is not explicity stated. No matching Code System found"> version Not Stated (use latest from terminology server)</span>
+          <span title="Version is not explicitly stated. No matching Code System found"> version Not Stated (use latest from terminology server)</span>
           <table class="none">
             <tr>
               <td style="white-space:nowrap">
@@ -3438,7 +3438,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.3.3144"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="CommonUCUMUnits"/>
   <title value="Common UCUM units"/>
   <status value="draft"/>

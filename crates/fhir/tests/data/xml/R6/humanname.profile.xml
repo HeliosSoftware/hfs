@@ -208,11 +208,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/HumanName"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="HumanName"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-06-13T17:13:29+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -235,7 +235,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Need to be able to record names, along with notes about their use."/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>
@@ -391,7 +391,7 @@
         </extension>
         <strength value="required"/>
         <description value="The use of a human name."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/name-use|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/name-use|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -410,7 +410,7 @@
       <path value="HumanName.text"/>
       <short value="Text representation of the full name"/>
       <definition value="Specifies the entire name as it should be displayed e.g. on an application UI. This may be provided instead of or as well as the specific parts."/>
-      <comment value="Can provide both a text representation and parts. Applications updating a name SHALL ensure that when both text and parts are present,  no content is included in the text that isn't found in a part."/>
+      <comment value="Can provide both a text representation and parts. Applications updating a name SHALL ensure that when both text and parts are present,  no content is included in the text that is not found in a part."/>
       <requirements value="A renderable, unencoded form."/>
       <min value="0"/>
       <max value="1"/>
@@ -670,7 +670,7 @@
         </extension>
         <strength value="required"/>
         <description value="The use of a human name."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/name-use|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/name-use|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -689,7 +689,7 @@
       <path value="HumanName.text"/>
       <short value="Text representation of the full name"/>
       <definition value="Specifies the entire name as it should be displayed e.g. on an application UI. This may be provided instead of or as well as the specific parts."/>
-      <comment value="Can provide both a text representation and parts. Applications updating a name SHALL ensure that when both text and parts are present,  no content is included in the text that isn't found in a part."/>
+      <comment value="Can provide both a text representation and parts. Applications updating a name SHALL ensure that when both text and parts are present,  no content is included in the text that is not found in a part."/>
       <requirements value="A renderable, unencoded form."/>
       <min value="0"/>
       <max value="1"/>
