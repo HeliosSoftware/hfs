@@ -33,34 +33,7 @@
     <reference value="Practitioner/f007"/>
     <display value="Patrick Pump"/>
   </requester>
-  <dosageInstruction>
-    <simple>
-      <text value="Apply to affected areas four times daily on Monday of each week"/>
-      <timing>
-        <repeat>
-          <frequency value="4"/>
-          <period value="1"/>
-          <periodUnit value="d"/>
-          <dayOfWeek value="mon"/>
-        </repeat>
-      </timing>
-      <doseAndRate>
-        <type>
-          <coding>
-            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-            <code value="ordered"/>
-            <display value="Ordered"/>
-          </coding>
-        </type>
-        <doseQuantity>
-          <value value="1"/>
-          <unit value="ea"/>
-          <system value="http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm"/>
-          <code value="OINT"/>
-        </doseQuantity>
-      </doseAndRate>
-    </simple>
-  </dosageInstruction>
+  <dosageInstruction/>
   <dispenseRequest>
     <validityPeriod>
       <start value="2015-01-15"/>

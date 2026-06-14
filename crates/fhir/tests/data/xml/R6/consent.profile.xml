@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Consent"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -46,6 +46,8 @@
             <a href="domainresource.html">DomainResource</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">A healthcare consumer's  or third party's choices to permit or deny recipients or roles to perform actions for specific purposes and periods of time
+            <br/>
+            <span style="font-style: italic" title="consent-1">+ Rule: If provision exists, decision must also be provided</span>
             <br/>
             <br/>Elements defined in Ancestors: 
             <a href="resource.html#Resource" title="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes.">id</a>, 
@@ -442,7 +444,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPQfAOvGUf7ztuvPMf/78/fkl/Pbg+u8Rvjqteu2Pf3zxPz36Pz0z+vTmPzurPvuw/npofbjquvNefHVduuyN+uuMu3Oafbgjfnqvf/3zv/3xevPi+vRjP/20/bmsP///wD/ACH5BAEKAB8ALAAAAAAQABAAAAVl4CeOZGme5qCqqDg8jyVJaz1876DsmAQAgqDgltspMEhMJoMZ4iy6I1AooFCIv+wKybziALVAoAEjYLwDgGIpJhMslgxaLR4/3rMAWoBp32V5exg8Shl1ckRUQVaMVkQ2kCstKCEAOw==" alt="." style="background-color: white; background-color: inherit" title="Element" class="hierarchy"/> 
-            <span title="Consent.verification : Whether a treatment instruction (e.g. artificial respiration: yes or no) was verified with the patient, his/her family or another authorized person.">verification</span>
+            <span title="Consent.verification : Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized person.">verification</span>
             <a name="Consent.verification"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -452,7 +454,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="types.html#BackBoneElement">BackboneElement</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Consent Verified by patient or family
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Consent verified by patient (or another authorized person)
             <br/>
             <br/>
           </td>
@@ -495,7 +497,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Business case of verification
             <br/>Binding: 
-            <a href="valueset-consent-verification.html">Consent Vefication Codes</a> (
+            <a href="valueset-consent-verification.html">Consent Verification Codes</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -594,7 +596,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzME+lXFigAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+3OsRUAIAjEUOL+O8cJABttJM11/x1qZAGqRBEVcNIqdWj1efDqQbb3HwwwwEfABmQUHSPM9dtDAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPQfAOvGUf7ztuvPMf/78/fkl/Pbg+u8Rvjqteu2Pf3zxPz36Pz0z+vTmPzurPvuw/npofbjquvNefHVduuyN+uuMu3Oafbgjfnqvf/3zv/3xevPi+vRjP/20/bmsP///wD/ACH5BAEKAB8ALAAAAAAQABAAAAVl4CeOZGme5qCqqDg8jyVJaz1876DsmAQAgqDgltspMEhMJoMZ4iy6I1AooFCIv+wKybziALVAoAEjYLwDgGIpJhMslgxaLR4/3rMAWoBp32V5exg8Shl1ckRUQVaMVkQ2kCstKCEAOw==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Element" class="hierarchy"/> 
-            <span title="Consent.provision : An exception to the base policy of this consent. An exception can be an addition or removal of access permissions.">provision</span>
+            <span title="Consent.provision : Constraints and exceptions to the base policy that can add or remove some access permissions under specific conditions.">provision</span>
             <a name="Consent.provision"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -604,7 +606,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="types.html#BackBoneElement">BackboneElement</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Constraints to the base Consent.policyRule/Consent.policy
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Constraints to the base Consent.policyBasis/Consent.policyText
             <br/>
             <br/>
           </td>
@@ -616,7 +618,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIZgEiYEgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAIElEQVQ4y2P8//8/AyWAiYFCMGrAqAGjBowaMGoAAgAALL0DKYQ0DPIAAAAASUVORK5CYII=" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="Consent.provision.period : Timeframe for this provision.">period</span>
+            <span title="Consent.provision.period : Time frame for this provision.">period</span>
             <a name="Consent.provision.period"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -626,7 +628,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#Period">Period</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Timeframe for this provision
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Time frame for this provision
             <br/>
           </td>
         </tr>
@@ -770,7 +772,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Context of activities covered by this provision
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-v3-PurposeOfUse.html">PurposeOfUse</a> (
+            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-PurposeOfUse.html">PurposeOfUse</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -795,7 +797,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">e.g. Resource Type, Profile, CDA, etc
             <br/>Binding: 
-            <a href="valueset-consent-content-class.html">Consent Content Class</a> (
+            <a href="valueset-doc-typecodes.html">FHIR Document Type Codes</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -968,7 +970,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIZgEiYEgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAIElEQVQ4y2P8//8/AyWAiYFCMGrAqAGjBowaMGoAAgAALL0DKYQ0DPIAAAAASUVORK5CYII=" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzME+lXFigAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+3OsRUAIAjEUOL+O8cJABttJM11/x1qZAGqRBEVcNIqdWj1efDqQbb3HwwwwEfABmQUHSPM9dtDAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABGdBTUEAAK/INwWK6QAAABl0RVh0U29mdHdhcmUAQWRvYmUgSW1hZ2VSZWFkeXHJZTwAAAKjSURBVDjLrZLdT1JhHMfd6q6L7voT3NrEuQq6aTircWFQ04u4MetCZ4UXGY2J1UoMdCoWxMZWDWtrrqHgylZ54RbkZtkiJ5aAku8MXXqQl3PgAOfb8xwq5LrOzmfnd34vn+d5tqcMQNm/UPZfBMHXx2ZWvI386odLe7jIL7w5EQ68qjhEOFjCmMj+v4LQmCwtCHkSCuSlFOIst4X1KU1mbUqT/kPki57bmL6xEnx55HxRMCqNCTkO6fUBpH5YkFoeBLsyAiHLEFcSQi5B2C38Z3eAPJ8JjcrmigKnLJ7nd8mwDcnFh4h/68T29FVsfW4F4zeCmb0LZqYDO191hOtkZ5sIuY8lioJhKZ9lo2DmbNjx9WDTowW7+YmsGv+9Ov3GijsgxwsNy7iiYOg4L54/nyawQC4lDubYANIRG7g1I9glHVILl5EMNCCXnEfouXSP4JksI+RY5OIfkWXGwf8cQSb6hAz2gV2+BXaxFangBSS/n0PCfxq5xAxCg3sFj2TpPB8Hvz2G3dWneOvqhLnPCIfDgd5uPebfNyAyrUR/t1bMmft7MdR1NiuXyw8UBDYpJ/AMkhsOPLa2wmKxIBqNIhwOw+Px4EG/Hvb7GoSCc2JucnJS7FEqlb2FizRwNMLHFmPvXnQJN/U6+Px+3LvdApVKiebmZlitVuj1ejFWqc7AZNCJEq1WGxMFAVPFtUCPZKhDXZUyGu6IAr+pklOclGNiYgI+nw9erxculws0N2uqjFOBwWDgSu61RCK50tLSwlBBfX39eE1NDa9QKFBXVydCY5qjNSqgvSWCw+RRqVTzZrOZcTqd2263G3a7HW1tbWhvbxdjmqM12kN7SwTl5eX7qqurq2pra5eampqSGo2GI2TUanUj4RSJ4zRHa7SH9v4C8Nrl+GFh7LoAAAAASUVORK5CYII=" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Reference to another Element" class="hierarchy"/> 
-            <span title="Consent.provision.provision : Provisions which provide exceptions to the base provision or subprovisions.">provision</span>
+            <span title="Consent.provision.provision : Nested provisions adding further constraints and exceptions to the parent provision.">provision</span>
             <a name="Consent.provision.provision"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -976,7 +978,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">see 
             <a href="#Consent.provision" title="Consent.provision">provision</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Nested Exception Provisions
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Nested provisions to further constraint the parent provision
             <br/>
             <br/>
           </td>
@@ -997,7 +999,7 @@
     <valueCode value="normative"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
-    <valueCode value="cbcc"/>
+    <valueCode value="sec"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
     <valueInteger value="2"/>
@@ -1006,12 +1008,12 @@
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Consent"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Consent"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
-  <publisher value="HL7 International / Community Based Collaborative Care"/>
+  <date value="2026-06-13T17:13:29+00:00"/>
+  <publisher value="HL7 International / Security"/>
   <contact>
     <telecom>
       <system value="url"/>
@@ -1021,7 +1023,7 @@
   <contact>
     <telecom>
       <system value="url"/>
-      <value value="http://www.hl7.org/Special/committees/cbcc"/>
+      <value value="http://www.hl7.org/Special/committees/secure"/>
     </telecom>
   </contact>
   <description value="A record of a healthcare consumer’s  choices  or choices made on their behalf by a third party, which permits or denies identified recipient(s) or recipient role(s) to perform one or more actions within a given policy context, for specific purposes and periods of time."/>
@@ -1032,7 +1034,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -1071,6 +1073,13 @@
         <min value="0"/>
         <max value="*"/>
       </base>
+      <constraint>
+        <key value="consent-1"/>
+        <severity value="error"/>
+        <human value="If provision exists, decision must also be provided"/>
+        <expression value="provision.exists() implies decision.exists()"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/Consent"/>
+      </constraint>
       <constraint>
         <key value="dom-2"/>
         <severity value="error"/>
@@ -1241,7 +1250,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1449,7 +1458,7 @@
         </extension>
         <strength value="required"/>
         <description value="Indicates the state of the consent."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/consent-state-codes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/consent-state-codes|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -2040,8 +2049,8 @@
     </element>
     <element id="Consent.verification">
       <path value="Consent.verification"/>
-      <short value="Consent Verified by patient or family"/>
-      <definition value="Whether a treatment instruction (e.g. artificial respiration: yes or no) was verified with the patient, his/her family or another authorized person."/>
+      <short value="Consent verified by patient (or another authorized person)"/>
+      <definition value="Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized person."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2327,7 +2336,7 @@
         </extension>
         <strength value="required"/>
         <description value="Sets the base decision for Consent to be either permit or deny, with provisions assumed to be a negation of the previous level."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/consent-provision-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/consent-provision-type|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Consent.provision">
@@ -2335,8 +2344,8 @@
         <valueString value="provision"/>
       </extension>
       <path value="Consent.provision"/>
-      <short value="Constraints to the base Consent.policyRule/Consent.policy"/>
-      <definition value="An exception to the base policy of this consent. An exception can be an addition or removal of access permissions."/>
+      <short value="Constraints to the base Consent.policyBasis/Consent.policyText"/>
+      <definition value="Constraints and exceptions to the base policy that can add or remove some access permissions under specific conditions."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2452,8 +2461,8 @@
     </element>
     <element id="Consent.provision.period">
       <path value="Consent.provision.period"/>
-      <short value="Timeframe for this provision"/>
-      <definition value="Timeframe for this provision."/>
+      <short value="Time frame for this provision"/>
+      <definition value="Time frame for this provision."/>
       <comment value="This is the bound effective time of the consent and should be in the base provision in the Consent resource."/>
       <min value="0"/>
       <max value="1"/>
@@ -2807,7 +2816,7 @@
         </extension>
         <strength value="preferred"/>
         <description value="The document type a consent provision covers."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/consent-content-class"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/doc-typecodes"/>
       </binding>
     </element>
     <element id="Consent.provision.resourceType">
@@ -3057,7 +3066,7 @@
         </extension>
         <strength value="required"/>
         <description value="How a resource reference is interpreted when testing consent restrictions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/consent-data-meaning|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/consent-data-meaning|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Consent.provision.data.reference">
@@ -3114,8 +3123,8 @@
     </element>
     <element id="Consent.provision.provision">
       <path value="Consent.provision.provision"/>
-      <short value="Nested Exception Provisions"/>
-      <definition value="Provisions which provide exceptions to the base provision or subprovisions."/>
+      <short value="Nested provisions to further constraint the parent provision"/>
+      <definition value="Nested provisions adding further constraints and exceptions to the parent provision."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -3144,6 +3153,13 @@
       <comment value="Broadly, there are 3 key areas of consent for patients: Consent around sharing information (aka Privacy Consent Directive - Authorization to Collect, Use, or Disclose information), consent for specific treatment, or kinds of treatment and consent for research participation and data sharing."/>
       <min value="0"/>
       <max value="*"/>
+      <constraint>
+        <key value="consent-1"/>
+        <severity value="error"/>
+        <human value="If provision exists, decision must also be provided"/>
+        <expression value="provision.exists() implies decision.exists()"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/Consent"/>
+      </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <mapping>
@@ -3205,7 +3221,7 @@
         </extension>
         <strength value="required"/>
         <description value="Indicates the state of the consent."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/consent-state-codes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/consent-state-codes|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -3524,8 +3540,8 @@
     </element>
     <element id="Consent.verification">
       <path value="Consent.verification"/>
-      <short value="Consent Verified by patient or family"/>
-      <definition value="Whether a treatment instruction (e.g. artificial respiration: yes or no) was verified with the patient, his/her family or another authorized person."/>
+      <short value="Consent verified by patient (or another authorized person)"/>
+      <definition value="Whether the consent instructions/rules (e.g. artificial respiration: yes or no) have been verified with the patient, his/her family, or another authorized person."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -3635,7 +3651,7 @@
         </extension>
         <strength value="required"/>
         <description value="Sets the base decision for Consent to be either permit or deny, with provisions assumed to be a negation of the previous level."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/consent-provision-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/consent-provision-type|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Consent.provision">
@@ -3643,8 +3659,8 @@
         <valueString value="provision"/>
       </extension>
       <path value="Consent.provision"/>
-      <short value="Constraints to the base Consent.policyRule/Consent.policy"/>
-      <definition value="An exception to the base policy of this consent. An exception can be an addition or removal of access permissions."/>
+      <short value="Constraints to the base Consent.policyBasis/Consent.policyText"/>
+      <definition value="Constraints and exceptions to the base policy that can add or remove some access permissions under specific conditions."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -3656,8 +3672,8 @@
     </element>
     <element id="Consent.provision.period">
       <path value="Consent.provision.period"/>
-      <short value="Timeframe for this provision"/>
-      <definition value="Timeframe for this provision."/>
+      <short value="Time frame for this provision"/>
+      <definition value="Time frame for this provision."/>
       <comment value="This is the bound effective time of the consent and should be in the base provision in the Consent resource."/>
       <min value="0"/>
       <max value="1"/>
@@ -3823,7 +3839,7 @@
         </extension>
         <strength value="preferred"/>
         <description value="The document type a consent provision covers."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/consent-content-class"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/doc-typecodes"/>
       </binding>
     </element>
     <element id="Consent.provision.resourceType">
@@ -3921,7 +3937,7 @@
         </extension>
         <strength value="required"/>
         <description value="How a resource reference is interpreted when testing consent restrictions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/consent-data-meaning|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/consent-data-meaning|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="Consent.provision.data.reference">
@@ -3954,8 +3970,8 @@
     </element>
     <element id="Consent.provision.provision">
       <path value="Consent.provision.provision"/>
-      <short value="Nested Exception Provisions"/>
-      <definition value="Provisions which provide exceptions to the base provision or subprovisions."/>
+      <short value="Nested provisions to further constraint the parent provision"/>
+      <definition value="Nested provisions adding further constraints and exceptions to the parent provision."/>
       <min value="0"/>
       <max value="*"/>
       <contentReference value="#Consent.provision"/>

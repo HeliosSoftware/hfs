@@ -30,7 +30,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.5.1318"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "ProvenanceRelevantHistory",
   "title": "Provenance  Relevant  History",
   "status": "active",
@@ -48,7 +48,7 @@
     }
   ],
   "description": "This profile is provided for guidance purposes only.  There is no expectation that implementers must adhere to this profile.  It is included in the specification to help implementers understand how they might use Provenance to satisfy the typical needs envisioned by the \u0027relevantHistory\u0027 elements found in various Event and Request resources.\r\n\r\nThis profile identifies the data elements most likely to be relevant to implementers who are using Provenance to convey the `relevant history` of a resource, as discussed in the [request pattern](request.html#history).  For the purposes of this profile, mustSupport should be interpreted as \u0027SHOULD be considered for population and SHOULD be understood by consumers.\u0027  Implementers are not obligated to handle all of these element and are not prohibited from also making use of additional data elements",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "workflow",
@@ -85,7 +85,7 @@
     "extension": [
       {
         "url": "http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version",
-        "valueString": "6.0.0-ballot3"
+        "valueString": "6.0.0-ballot4"
       }
     ],
     "element": [
@@ -305,7 +305,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -730,7 +730,6 @@
         "path": "Provenance.authorization",
         "short": "Authorization (purposeOfUse) related to the event",
         "definition": "The authorization (e.g., PurposeOfUse) that was used during the event being recorded.",
-        "comment": "Plain text reasons can be sent in the \"text\" component with no codings.  Domains MAY wish to define a constrained terminology.  The authorization for the resource\u0027s existence of the resource itself will be maintained on the resource, not here.",
         "requirements": "Record of any relevant security context, not restricted to purposeOfUse valueSet. May include security compartments, refrain, obligation, or other security tags.",
         "alias": [
           "PurposeOfEvent"
@@ -744,7 +743,7 @@
         },
         "type": [
           {
-            "code": "CodeableReference"
+            "code": "CodeableConcept"
           }
         ],
         "constraint": [
@@ -756,7 +755,7 @@
             "source": "http://hl7.org/fhir/StructureDefinition/Element"
           }
         ],
-        "mustSupport": true,
+        "mustSupport": false,
         "isModifier": false,
         "isSummary": false,
         "binding": {
@@ -794,6 +793,7 @@
         "path": "Provenance.why",
         "short": "Why was the event performed?",
         "definition": "Describes why the event recorded in this provenenace occurred in textual form.",
+        "comment": "Plain/Markdown text reasons the action occurred.",
         "alias": [
           "reason"
         ],
@@ -818,7 +818,7 @@
             "source": "http://hl7.org/fhir/StructureDefinition/Element"
           }
         ],
-        "mustSupport": false,
+        "mustSupport": true,
         "isModifier": false,
         "isSummary": false,
         "mapping": [
@@ -2106,7 +2106,7 @@
       {
         "id": "Provenance.entity.role",
         "path": "Provenance.entity.role",
-        "short": "revision | quotation | source | instantiates | removal",
+        "short": "revision | quotation | source | instantiates | removal | other",
         "definition": "How the entity was used during the activity.",
         "min": 1,
         "max": "1",
@@ -2142,7 +2142,7 @@
           ],
           "strength": "required",
           "description": "How an entity was used in an activity.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -2313,9 +2313,9 @@
         "mustSupport": true
       },
       {
-        "id": "Provenance.authorization",
-        "path": "Provenance.authorization",
-        "comment": "Plain text reasons can be sent in the \"text\" component with no codings.  Domains MAY wish to define a constrained terminology.  The authorization for the resource\u0027s existence of the resource itself will be maintained on the resource, not here.",
+        "id": "Provenance.why",
+        "path": "Provenance.why",
+        "comment": "Plain/Markdown text reasons the action occurred.",
         "mustSupport": true
       },
       {

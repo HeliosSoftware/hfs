@@ -45,7 +45,7 @@
             <code>http://terminology.hl7.org/CodeSystem/v3-ActMood</code>
           </td>
           <td style="white-space:nowrap">  
-            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActMood.html#v3-ActMood-CRT">CRT</a>
+            <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActMood.html#v3-ActMood-CRT">CRT</a>
           </td>
           <td>criterion</td>
           <td>inactive</td>
@@ -72,7 +72,7 @@
             <code>http://terminology.hl7.org/CodeSystem/v3-ActMood</code>
           </td>
           <td style="white-space:nowrap">  
-            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActMood.html#v3-ActMood-EXPEC">EXPEC</a>
+            <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActMood.html#v3-ActMood-EXPEC">EXPEC</a>
           </td>
           <td>expectation</td>
           <td/>
@@ -97,7 +97,7 @@
             <code>http://terminology.hl7.org/CodeSystem/v3-ActMood</code>
           </td>
           <td style="white-space:nowrap">    
-            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActMood.html#v3-ActMood-GOL">GOL</a>
+            <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActMood.html#v3-ActMood-GOL">GOL</a>
           </td>
           <td>goal</td>
           <td/>
@@ -124,7 +124,7 @@
             <code>http://terminology.hl7.org/CodeSystem/v3-ActMood</code>
           </td>
           <td style="white-space:nowrap">    
-            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActMood.html#v3-ActMood-RSK">RSK</a>
+            <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActMood.html#v3-ActMood-RSK">RSK</a>
           </td>
           <td>risk</td>
           <td/>
@@ -147,7 +147,7 @@
             <code>http://terminology.hl7.org/CodeSystem/v3-ActMood</code>
           </td>
           <td style="white-space:nowrap">  
-            <a href="http://terminology.hl7.org/7.0.0/CodeSystem-v3-ActMood.html#v3-ActMood-OPT">OPT</a>
+            <a href="http://terminology.hl7.org/7.1.0/CodeSystem-v3-ActMood.html#v3-ActMood-OPT">OPT</a>
           </td>
           <td>option</td>
           <td/>
@@ -171,7 +171,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.3.3146"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="ExampleInactive"/>
   <title value="Example with inactive codes"/>
   <status value="draft"/>

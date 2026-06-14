@@ -45,9 +45,5 @@
       </coding>
     </concept>
   </reason>
-  <dosageInstruction>
-    <simple>
-      <text value="Take one tablet daily as directed"/>
-    </simple>
-  </dosageInstruction>
+  <dosageInstruction/>
 </MedicationRequest>

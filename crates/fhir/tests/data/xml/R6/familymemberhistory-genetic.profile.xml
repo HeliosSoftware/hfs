@@ -20,7 +20,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.5.1229"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="FamilyMemberHistoryForGeneticsAnalysis"/>
   <title value="Family member history for genetics analysis"/>
   <status value="draft"/>
@@ -34,7 +34,7 @@
     </telecom>
   </contact>
   <description value="Adds additional information to a family member history supporting both the capture of mother/father relationships as well as additional observations necessary to enable genetics-based risk analysis for patients"/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -62,7 +62,7 @@
   <derivation value="constraint"/>
   <snapshot>
     <extension url="http://hl7.org/fhir/tools/StructureDefinition/snapshot-base-version">
-      <valueString value="6.0.0-ballot3"/>
+      <valueString value="6.0.0-ballot4"/>
     </extension>
     <element id="FamilyMemberHistory">
       <path value="FamilyMemberHistory"/>
@@ -121,13 +121,6 @@
         <severity value="error"/>
         <human value="Can have age[x] or born[x], but not both"/>
         <expression value="age.empty() or born.empty()"/>
-        <source value="http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory"/>
-      </constraint>
-      <constraint>
-        <key value="fhs-2"/>
-        <severity value="error"/>
-        <human value="Can only have estimatedAge if age[x] is present"/>
-        <expression value="age.exists() or estimatedAge.empty()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory"/>
       </constraint>
       <constraint>
@@ -262,7 +255,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -585,7 +578,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code that identifies the status of the family history record."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -863,9 +856,9 @@
     </element>
     <element id="FamilyMemberHistory.sex">
       <path value="FamilyMemberHistory.sex"/>
-      <short value="male | female | other | unknown"/>
-      <definition value="The birth sex of the family member."/>
-      <comment value="This element should ideally reflect whether the individual is genetically male or female.  However, as reported information based on the knowledge of the patient or reporting friend/relative, there may be situations where the reported sex might not be totally accurate.  E.g. 'Aunt Sue' might be XY rather than XX.  Questions soliciting this information should be phrased to encourage capture of genetic sex where known.  However, systems performing analysis should also allow for the possibility of imprecision with this element."/>
+      <short value="female-typical | male-typical | specified | unknown"/>
+      <definition value="A context-specific sex value for the family member which can inform clinical decision making in relation to treatment of the patient. This element SHALL NOT be used to reflect the family member's gender identity."/>
+      <comment value="This element should ideally reflect the family member's sex characteristics. However, as reported information based on the knowledge of the patient or reporting friend/relative, there may be situations where the reported sex might not be totally accurate. E.g. 'Aunt Sue' might be XY rather than XX. Questions soliciting this information should be phrased to encourage capture of genetic sex where known. However, systems performing analysis should also allow for the possibility of imprecision with this element."/>
       <requirements value="Not all relationship codes imply sex and the relative's sex can be relevant for risk assessments."/>
       <min value="0"/>
       <max value="1"/>
@@ -891,9 +884,9 @@
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
           <valueString value="Sex"/>
         </extension>
-        <strength value="extensible"/>
-        <description value="Codes describing the sex assigned at birth as documented on the birth registration."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/administrative-gender"/>
+        <strength value="preferred"/>
+        <description value="Codes describing the sex values appropriate in this context"/>
+        <valueSet value="http://terminology.hl7.org/ValueSet/sex-parameter-for-clinical-use"/>
       </binding>
     </element>
     <element id="FamilyMemberHistory.born[x]">
@@ -937,7 +930,6 @@
       <path value="FamilyMemberHistory.age[x]"/>
       <short value="(approximate) age"/>
       <definition value="The age of the relative at the time the family member history is recorded."/>
-      <comment value="use estimatedAge to indicate whether the age is actual or not."/>
       <requirements value="While age can be calculated from date of birth, sometimes recording age directly is more natural for clinicians."/>
       <min value="0"/>
       <max value="1"/>
@@ -955,7 +947,6 @@
       <type>
         <code value="string"/>
       </type>
-      <condition value="fhs-2"/>
       <condition value="fhs-1"/>
       <condition value="fhs-3"/>
       <constraint>
@@ -972,35 +963,6 @@
         <identity value="rim"/>
         <map value="participation[typeCode=SBJ].act[classCode=OBS,moodCode=EVN, code=&quot;age&quot;].value"/>
       </mapping>
-    </element>
-    <element id="FamilyMemberHistory.estimatedAge">
-      <path value="FamilyMemberHistory.estimatedAge"/>
-      <short value="Age is estimated?"/>
-      <definition value="If true, indicates that the age value specified is an estimated value."/>
-      <comment value="This element is labeled as a modifier because the fact that age is estimated can/should change the results of any algorithm that calculates based on the specified age."/>
-      <requirements value="Clinicians often prefer to specify an estimaged age rather than an age range."/>
-      <min value="0"/>
-      <max value="1"/>
-      <base>
-        <path value="FamilyMemberHistory.estimatedAge"/>
-        <min value="0"/>
-        <max value="1"/>
-      </base>
-      <type>
-        <code value="boolean"/>
-      </type>
-      <meaningWhenMissing value="It is unknown whether the age is an estimate or not"/>
-      <condition value="fhs-2"/>
-      <constraint>
-        <key value="ele-1"/>
-        <severity value="error"/>
-        <human value="All FHIR elements must have a @value or children"/>
-        <expression value="hasValue() or (children().count() &gt; id.count())"/>
-        <source value="http://hl7.org/fhir/StructureDefinition/Element"/>
-      </constraint>
-      <mustSupport value="false"/>
-      <isModifier value="false"/>
-      <isSummary value="true"/>
     </element>
     <element id="FamilyMemberHistory.deceased[x]">
       <path value="FamilyMemberHistory.deceased[x]"/>

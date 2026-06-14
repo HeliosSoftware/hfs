@@ -33,6 +33,21 @@
           <td>
             <b>Target Code</b>
           </td>
+          <td>
+            <b>segment-map</b>
+          </td>
+          <td>
+            <b>references</b>
+          </td>
+          <td>
+            <b>antlr</b>
+          </td>
+          <td>
+            <b>fhirpath</b>
+          </td>
+          <td>
+            <b>narrative</b>
+          </td>
         </tr>
         <tr>
           <td>ADT_A04.MSH (Message Header)</td>
@@ -40,6 +55,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Bundle</td>
+          <td>MSH[Bundle]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.MSH (Message Header)</td>
@@ -47,6 +67,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>MessageHeader[1]</td>
+          <td>MSH[MessageHeader]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.MSH (Message Header)</td>
@@ -54,6 +79,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Provenance[1]</td>
+          <td>MSH[Provenance]</td>
+          <td>Provenance.target=Bundle; Provenance.target=MessageHeader[MSH]</td>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.SFT (Software Segment)</td>
@@ -61,6 +91,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>MessageHeader[1]</td>
+          <td>SFT[MessageHeader]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.EVN (Event Type)</td>
@@ -68,6 +103,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Provenance[3]</td>
+          <td>EVN[Provenance]</td>
+          <td>Provenance.target=Bundle; Provenance.target=MessageHeader[MSH]</td>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.PID (Patient Identification)</td>
@@ -75,6 +115,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
+          <td>PID[Patient]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.PD1 (Additional Demographics)</td>
@@ -82,6 +127,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
+          <td>PD1[Patient]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04:follow:PID.ARV (Access Restrictions)</td>
@@ -89,6 +139,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
+          <td>ARV[Patient]</td>
+          <td>Resource=Patient[1]</td>
+          <td>IF ARV-1 IN ("PID", "PD1") AND ARV-3 NOT VALUED</td>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04:follow:PID.ROL (Role)</td>
@@ -96,6 +151,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
+          <td>ROL[Patient-PractitionerRole]</td>
+          <td/>
+          <td>IF ROL-3.1 EQUALS "PP" AND ROL-3.3 EQUALS "HL70443"</td>
+          <td>(element("3.1")="PP")and(element("3.3")="HL70443")</td>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04:follow:PID.ROL (Role)</td>
@@ -103,6 +163,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>RelatedPerson[1]</td>
+          <td>ROL[RelatedPerson]</td>
+          <td>RelatedPerson[1].patient.reference=Patient[1].id</td>
+          <td>IF ROL-3.1 NOT EQUALS  "PP" OR ROL-3.3 NOT EQUALS "HL70443"</td>
+          <td>(element("3.1")!="PP")or(element("3.3")!="HL70443")</td>
+          <td>While most likely all other HL70443 values go to RelatedPerson, the implementation needs to determine whether that is fully accurate.</td>
         </tr>
         <tr>
           <td>ADT_A04.NEXT_OF_KIN.NK1 (Next of Kin / Associated Parties)</td>
@@ -110,6 +175,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>RelatedPerson[2]</td>
+          <td>NK1[RelatedPerson]</td>
+          <td>RelatedPerson[2].patient.reference=Patient[1].id</td>
+          <td/>
+          <td/>
+          <td>The FHIR location will depend on the nature of the data being exchanged and how the systems use next of kin data</td>
         </tr>
         <tr>
           <td>ADT_A04.NEXT_OF_KIN.NK1 (Next of Kin / Associated Parties)</td>
@@ -117,6 +187,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
+          <td>NK1[Patient]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td>The FHIR location will depend on the nature of the data being exchanged and how the systems use next of kin data</td>
         </tr>
         <tr>
           <td>ADT_A04.PV1 (Patient Visit)</td>
@@ -124,6 +199,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
+          <td>PV1[Encounter]</td>
+          <td>Encounter[1].subject.reference=Patient[1].id</td>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.PV1 (Patient Visit)</td>
@@ -131,6 +211,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Patient[1]</td>
+          <td>PV1[Patient]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.PV2 (Patient Visit - Additional Info.)</td>
@@ -138,6 +223,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
+          <td>PV2[Encounter]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04:follow:PV1.ARV (Access Restrictions)</td>
@@ -145,6 +235,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
+          <td>ARV[Encounter]</td>
+          <td>Resource=Encounter[1]</td>
+          <td>IF ARV-1 IN ("PV1", "PV2") AND ARV-3 NOT VALUED</td>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.ROL (Role)</td>
@@ -152,6 +247,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
+          <td>ROL[Encounter-PractitionerRole]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.OBSERVATIONADT_A04.OBX (Observation/Result)</td>
@@ -159,6 +259,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Observation</td>
+          <td>OBX[Observation]</td>
+          <td>Observation.subject.reference=Patient[1].id</td>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.OBSERVATIONADT_A04.OBX (Observation/Result)</td>
@@ -166,6 +271,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Observation</td>
+          <td>OBX[Observation-Component]</td>
+          <td>Observation.subject.reference=Patient[1].id</td>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.AL1 (Allergy Information)</td>
@@ -173,6 +283,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>AllergyIntolerance</td>
+          <td>AL1[AllergyIntolerance]</td>
+          <td>AllergyIntolerance.patient.reference=Patient[1].id</td>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.DG1 (Diagnosis Information)</td>
@@ -180,6 +295,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Condition</td>
+          <td>DG1[Condition]</td>
+          <td>Condition.subject.reference=Patient[1].id</td>
+          <td/>
+          <td/>
+          <td>If in context of the patient</td>
         </tr>
         <tr>
           <td>ADT_A04.DG1 (Diagnosis Information)</td>
@@ -187,6 +307,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
+          <td>DG1[Encounter]</td>
+          <td>Encounter[1].diagnosis.reference=Condition[1].id</td>
+          <td>IF DG1-6 EQUALS "admitting"</td>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.DG1 (Diagnosis Information)</td>
@@ -194,6 +319,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Encounter[1]</td>
+          <td>DG1[Encounter]</td>
+          <td>Encounter[1].diagnosis.reference=Condition[1].id</td>
+          <td/>
+          <td/>
+          <td>If in context of an encounter</td>
         </tr>
         <tr>
           <td>ADT_A04.DG1 (Diagnosis Information)</td>
@@ -201,6 +331,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>EpisodeOfCare[1]</td>
+          <td>DG1[EpisodeOfCare]</td>
+          <td>EpisodeOfCare.diagnosis.reference=Condition[1].id</td>
+          <td/>
+          <td/>
+          <td>If in context of an episode of care</td>
         </tr>
         <tr>
           <td>ADT_A04.PROCEDUREADT_A04.PR1 (Procedures)</td>
@@ -208,6 +343,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Procedure</td>
+          <td>PR1[Procedure]</td>
+          <td>Procedure.subject.reference=Patient[1].id</td>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.INSURANCEADT_A04.IN1 (Insurance)</td>
@@ -215,6 +355,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Coverage[1]</td>
+          <td>IN1[Coverage]</td>
+          <td>Coverage.subscriber.reference=Patient[1].id</td>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.INSURANCEADT_A04.IN2 (Insurance Additional Info.)</td>
@@ -222,6 +367,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Coverage[1]</td>
+          <td>IN2[Coverage]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
         <tr>
           <td>ADT_A04.INSURANCEADT_A04.IN3 (Insurance Additional Info - Cert.)</td>
@@ -229,6 +379,11 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>Coverage[1]</td>
+          <td>IN3[Coverage]</td>
+          <td/>
+          <td/>
+          <td/>
+          <td/>
         </tr>
       </table>
     </div>
@@ -241,7 +396,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.14.2"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="MessageADT_A04toBundle"/>
   <title value="MessageADT_ A04to Bundle"/>
   <status value="active"/>

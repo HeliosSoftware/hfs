@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Substance"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -236,11 +236,11 @@
     <valueCode value="business"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Substance"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Substance"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-06-13T17:13:29+00:00"/>
   <publisher value="HL7 International / Biomedical Research and Regulation"/>
   <contact>
     <telecom>
@@ -262,7 +262,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="w5"/>
     <uri value="http://hl7.org/fhir/fivews"/>
@@ -461,7 +461,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -663,7 +663,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code to indicate if the substance is actively used."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/substance-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/substance-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -914,7 +914,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code to indicate if the substance is actively used."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/substance-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/substance-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="w5"/>

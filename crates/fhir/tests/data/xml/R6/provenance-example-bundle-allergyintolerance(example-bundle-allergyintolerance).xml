@@ -23,7 +23,7 @@
           <lastUpdated value="2019-07-09T15:26:23.217+00:00"/>
         </meta>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: AllergyIntolerance 79613</b></p><a name="79613"> </a><a name="hc79613"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px">version: 1; Last updated: 2019-07-09T15:26:23.217Z</p></div><p><b>clinicalStatus</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical active}">Active</span></p><p><b>verificationStatus</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/allergyintolerance-verification confirmed}">Confirmed</span></p><p><b>category</b>: Medication</p><p><b>criticality</b>: High Risk</p><p><b>code</b>: <span title="Codes:{http://snomed.info/sct 762952008}">Peanuts</span></p><p><b>patient</b>: <a href="patient-example.html">Jim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --&gt; (ongoing)))</a></p><p><b>onset</b>: 2017-06-09</p><blockquote><p><b>reaction</b></p><h3>Manifestations</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Concept</b></td></tr><tr><td style="display: none">*</td><td><span title="Codes:{http://snomed.info/sct 247472004}">Hives</span></td></tr></table><p><b>onset</b>: 2017-06-09</p></blockquote></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: AllergyIntolerance 79613</b></p><a name="79613"> </a><a name="hc79613"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px">version: 1; Last updated: 2019-07-09T15:26:23.217Z</p></div><p><b>clinicalStatus</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical active}">Active</span></p><p><b>verificationStatus</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/allergyintolerance-verification confirmed}">Confirmed</span></p><p><b>category</b>: </p><p><b>criticality</b>: High Risk</p><p><b>code</b>: <span title="Codes:{http://snomed.info/sct 762952008}">Peanuts</span></p><p><b>patient</b>: <a href="patient-example.html">Jim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --&gt; (ongoing)))</a></p><p><b>onset</b>: 2017-06-09</p><blockquote><p><b>reaction</b></p><h3>Manifestations</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Concept</b></td></tr><tr><td style="display: none">*</td><td><span title="Codes:{http://snomed.info/sct 247472004}">Hives</span></td></tr></table><p><b>onset</b>: 2017-06-09</p></blockquote></div>
         </text>
         <clinicalStatus>
           <coding>
@@ -39,7 +39,7 @@
             <display value="Confirmed"/>
           </coding>
         </verificationStatus>
-        <category value="medication"/>
+        <category/>
         <criticality value="high"/>
         <code>
           <coding>

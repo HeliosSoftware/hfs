@@ -1,6 +1,7 @@
 {
   "resourceType": "NutritionProduct",
   "id": "example",
+  "status": "active",
   "code": {
     "coding": [
       {
@@ -10,7 +11,6 @@
       }
     ]
   },
-  "status": "active",
   "category": [
     {
       "coding": [

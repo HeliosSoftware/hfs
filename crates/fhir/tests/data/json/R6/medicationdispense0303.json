@@ -83,59 +83,6 @@
     "code": "d"
   },
   "whenPrepared": "2016-04-15T07:14:00+05:00",
-  "dosageInstruction": {
-    "simple": {
-      "text": "one to two tablets every 4-6 hours as needed for rib pain",
-      "additionalInstruction": [
-        {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "418914006",
-              "display": "Warning. May cause drowsiness. If affected do not drive or operate machinery. Avoid alcoholic drink (qualifier value)"
-            }
-          ]
-        }
-      ],
-      "timing": {
-        "repeat": {
-          "frequency": 1,
-          "period": 4,
-          "periodMax": 6,
-          "periodUnit": "h"
-        }
-      },
-      "asNeededFor": [
-        {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "297217002",
-              "display": "Rib Pain (finding)"
-            }
-          ]
-        }
-      ],
-      "route": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "26643006",
-            "display": "Oral Route"
-          }
-        ]
-      },
-      "method": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "421521009",
-            "display": "Swallow - dosing instruction imperative (qualifier value)"
-          }
-        ]
-      }
-    }
-  },
   "meta": {
     "tag": [
       {

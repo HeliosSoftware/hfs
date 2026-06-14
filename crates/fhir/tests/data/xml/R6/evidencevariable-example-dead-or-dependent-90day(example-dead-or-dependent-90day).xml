@@ -40,21 +40,6 @@
         </valueCodeableConcept>
         <exclude value="false"/>
         <description value="dead at 90 days"/>
-        <timing>
-          <contextCode>
-            <coding>
-              <system value="http://hl7.org/fhir/evidence-variable-event"/>
-              <code value="study-start"/>
-              <display value="Study Start"/>
-            </coding>
-          </contextCode>
-          <offsetDuration>
-            <value value="90"/>
-            <unit value="days"/>
-            <system value="http://unitsofmeasure.org"/>
-            <code value="d"/>
-          </offsetDuration>
-        </timing>
       </characteristic>
       <characteristic>
         <code>
@@ -73,21 +58,6 @@
         </valueCodeableConcept>
         <exclude value="false"/>
         <description value="functionally dependent at 90 days"/>
-        <timing>
-          <contextCode>
-            <coding>
-              <system value="http://hl7.org/fhir/evidence-variable-event"/>
-              <code value="study-start"/>
-              <display value="Study Start"/>
-            </coding>
-          </contextCode>
-          <offsetDuration>
-            <value value="90"/>
-            <unit value="days"/>
-            <system value="http://unitsofmeasure.org"/>
-            <code value="d"/>
-          </offsetDuration>
-        </timing>
       </characteristic>
     </Group>
   </contained>

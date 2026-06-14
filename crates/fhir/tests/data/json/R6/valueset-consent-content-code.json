@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "consent-content-code",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
   },
   "text": {
     "status": "generated",
@@ -11,7 +11,7 @@
   "extension": [
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
-      "valueCode": "cbcc"
+      "valueCode": "security"
     },
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
@@ -34,12 +34,12 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.3.746"
     }
   ],
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "ConsentContentCodes",
   "title": "Consent Content Codes",
   "status": "active",
   "experimental": false,
-  "publisher": "CBCC",
+  "publisher": "HL7 International / Security",
   "contact": [
     {
       "telecom": [

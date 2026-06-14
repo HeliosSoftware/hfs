@@ -53,6 +53,7 @@
     }
   ],
   "dosageInstruction": {
+    "renderedInstruction": "Rapid daily-dose escalation, until tolerated, from 3 mg/d, then 10 mg/d, to 30 mg IV over 120 min, 3 times per week on alternate days for up to 12 weeks.",
     "step": [
       {
         "component": [

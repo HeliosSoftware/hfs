@@ -321,51 +321,7 @@
               "text": "Management of Asthma"
             }
           }
-        ],
-        "dosageInstruction": {
-          "simple": {
-            "additionalInstruction": [
-              {
-                "text": "Take with Food"
-              }
-            ],
-            "timing": {
-              "repeat": {
-                "frequency": 2,
-                "period": 1,
-                "periodUnit": "d"
-              }
-            },
-            "route": {
-              "coding": [
-                {
-                  "system": "http://snomed.info/sct",
-                  "code": "394899003",
-                  "display": "oral administration of treatment"
-                }
-              ]
-            },
-            "doseAndRate": [
-              {
-                "type": {
-                  "coding": [
-                    {
-                      "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                      "code": "ordered",
-                      "display": "Ordered"
-                    }
-                  ]
-                },
-                "doseQuantity": {
-                  "value": 1,
-                  "unit": "tablet",
-                  "system": "http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm",
-                  "code": "TAB"
-                }
-              }
-            ]
-          }
-        }
+        ]
       }
     },
     {

@@ -110,6 +110,13 @@
           <td>abandoned</td>
         </tr>
         <tr>
+          <td>unknown</td>
+          <td>
+            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+          </td>
+          <td>unknown</td>
+        </tr>
+        <tr>
           <td>ready</td>
           <td>
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
@@ -120,7 +127,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-task-status"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="TaskStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Task Status&quot;"/>
   <status value="draft"/>
@@ -224,6 +231,13 @@
       <code value="cancelled"/>
       <target>
         <code value="abandoned"/>
+        <relationship value="equivalent"/>
+      </target>
+    </element>
+    <element>
+      <code value="unknown"/>
+      <target>
+        <code value="unknown"/>
         <relationship value="equivalent"/>
       </target>
     </element>
