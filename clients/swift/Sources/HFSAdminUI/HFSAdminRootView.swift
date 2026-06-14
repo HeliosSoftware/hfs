@@ -11,6 +11,7 @@ public struct HFSAdminRootView: View {
     @State private var selection: HFSAdminDestination = .overview
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var pendingAction: HFSAdminDestination?
+    @State private var newResourceRequested = false
 
     public init() {}
 
@@ -20,7 +21,7 @@ public struct HFSAdminRootView: View {
                 .navigationTitle("HFS Admin")
                 .navigationSplitViewColumnWidth(min: 260, ideal: 280, max: 320)
         } detail: {
-            HFSDetailContent(destination: selection)
+            HFSDetailContent(destination: selection, newResourceRequested: $newResourceRequested)
                 .navigationTitle(selection.title)
                 .toolbar {
                     ToolbarItemGroup(placement: .primaryAction) {
@@ -71,6 +72,12 @@ public struct HFSAdminRootView: View {
             Task { await model.connect() }
         case .overview:
             Task { await model.refreshOverview() }
+        case .resources:
+            if model.isConnected {
+                newResourceRequested = true
+            } else {
+                pendingAction = selection
+            }
         default:
             pendingAction = selection
         }
