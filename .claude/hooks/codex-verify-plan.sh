@@ -7,8 +7,9 @@
 # schemas/codex-plan-review.schema.json and either allows the exit (pass) or
 # denies it with concrete required changes (fail).
 #
-# Fail-closed: if Codex cannot run, the plan is denied. Set
-# CODEX_PLAN_GATE_DISABLE=1 to skip the gate entirely (escape hatch).
+# Fail-closed: if neither Codex nor the safe Claude fallback can run, the plan
+# is denied. Set CODEX_PLAN_GATE_DISABLE=1 to skip the gate entirely (escape
+# hatch). Set CODEX_PLAN_GATE_CLAUDE_FALLBACK=0 to require Codex.
 #
 set -euo pipefail
 
@@ -18,6 +19,11 @@ codex_bin="${CODEX_BIN:-$(command -v codex || true)}"
 if [[ -z "$codex_bin" && -x "$HOME/.local/bin/codex" ]]; then
   codex_bin="$HOME/.local/bin/codex"
 fi
+claude_bin="${CLAUDE_BIN:-$(command -v claude || true)}"
+if [[ -z "$claude_bin" && -x "$HOME/.local/bin/claude" ]]; then
+  claude_bin="$HOME/.local/bin/claude"
+fi
+claude_fallback_enabled="${CODEX_PLAN_GATE_CLAUDE_FALLBACK:-1}"
 debug_dir="$project_dir/.claude/debug"
 state_root="$project_dir/.claude/state/codex-plan-gate"
 schema="${CODEX_PLAN_REVIEW_SCHEMA:-$script_dir/../schemas/codex-plan-review.schema.json}"
@@ -97,10 +103,6 @@ gate_prune_sessions "$state_root"
 gate_log_line "$gate_main_log" "session=$session_id transcript=$transcript_path"
 printf '%s\n' "$payload" > "$session_dir/plan-hook-input.json"
 
-if [[ -z "$codex_bin" || ! -x "$codex_bin" ]]; then
-  deny "Codex plan verifier could not run because no executable Codex binary was found (CODEX_BIN='${CODEX_BIN:-}'). Install Codex, set CODEX_BIN, or set CODEX_PLAN_GATE_DISABLE=1 to bypass the gate."
-fi
-
 if [[ ! -f "$schema" ]]; then
   deny "Codex plan verifier schema is missing: $schema"
 fi
@@ -109,40 +111,58 @@ prompt_file="$session_dir/plan-review-prompt.md"
 review_file="$session_dir/plan-review.json"
 codex_stdout="$session_dir/plan-codex.stdout"
 codex_stderr="$session_dir/plan-codex.stderr"
+claude_stdout="$session_dir/plan-claude.stdout"
+claude_stderr="$session_dir/plan-claude.stderr"
+reviewer_engine="codex"
+codex_available=1
 
-codex_help="$("$codex_bin" --help 2>&1 || true)"
-codex_exec_help="$("$codex_bin" exec --help 2>&1 || true)"
+if [[ -z "$codex_bin" || ! -x "$codex_bin" ]]; then
+  codex_available=0
+  if [[ "$claude_fallback_enabled" != "0" && -n "$claude_bin" && -x "$claude_bin" ]]; then
+    reviewer_engine="claude"
+    gate_log_event "plan-gate" "fallback" "reason=codex-unavailable" "fallback=claude"
+    gate_log_line "$gate_main_log" "codex unavailable; falling back to claude safe-mode verifier"
+  else
+    deny "Codex plan verifier could not run because no executable Codex binary was found (CODEX_BIN='${CODEX_BIN:-}'), and the safe Claude fallback is unavailable or disabled (CLAUDE_BIN='${CLAUDE_BIN:-}', CODEX_PLAN_GATE_CLAUDE_FALLBACK=$claude_fallback_enabled). Install Codex, set CODEX_BIN, install Claude, or set CODEX_PLAN_GATE_DISABLE=1 to bypass the gate."
+  fi
+fi
+
 codex_args=()
 search_enabled=0
 
-if printf '%s\n' "$codex_help" | grep -q -- '--ask-for-approval'; then
-  codex_args+=(--ask-for-approval never)
+if [[ "$codex_available" == "1" ]]; then
+  codex_help="$("$codex_bin" --help 2>&1 || true)"
+  codex_exec_help="$("$codex_bin" exec --help 2>&1 || true)"
+
+  if printf '%s\n' "$codex_help" | grep -q -- '--ask-for-approval'; then
+    codex_args+=(--ask-for-approval never)
+  fi
+
+  if printf '%s\n' "$codex_help" | grep -q -- '--search'; then
+    codex_args+=(--search)
+    search_enabled=1
+  fi
+
+  codex_args+=(exec -C "$project_dir")
+
+  if printf '%s\n' "$codex_exec_help" | grep -q -- '--sandbox'; then
+    codex_args+=(--sandbox read-only)
+  fi
+
+  if printf '%s\n' "$codex_exec_help" | grep -q -- '--ephemeral'; then
+    codex_args+=(--ephemeral)
+  fi
+
+  if ! printf '%s\n' "$codex_exec_help" | grep -q -- '--output-schema'; then
+    deny "Codex plan verifier requires codex exec --output-schema, but this Codex CLI does not advertise it. Update Codex or set CODEX_BIN to a compatible binary."
+  fi
+
+  if ! printf '%s\n' "$codex_exec_help" | grep -q -- '--output-last-message'; then
+    deny "Codex plan verifier requires codex exec --output-last-message/-o, but this Codex CLI does not advertise it. Update Codex or set CODEX_BIN to a compatible binary."
+  fi
+
+  codex_args+=(--output-schema "$schema" -o "$review_file" -)
 fi
-
-if printf '%s\n' "$codex_help" | grep -q -- '--search'; then
-  codex_args+=(--search)
-  search_enabled=1
-fi
-
-codex_args+=(exec -C "$project_dir")
-
-if printf '%s\n' "$codex_exec_help" | grep -q -- '--sandbox'; then
-  codex_args+=(--sandbox read-only)
-fi
-
-if printf '%s\n' "$codex_exec_help" | grep -q -- '--ephemeral'; then
-  codex_args+=(--ephemeral)
-fi
-
-if ! printf '%s\n' "$codex_exec_help" | grep -q -- '--output-schema'; then
-  deny "Codex plan verifier requires codex exec --output-schema, but this Codex CLI does not advertise it. Update Codex or set CODEX_BIN to a compatible binary."
-fi
-
-if ! printf '%s\n' "$codex_exec_help" | grep -q -- '--output-last-message'; then
-  deny "Codex plan verifier requires codex exec --output-last-message/-o, but this Codex CLI does not advertise it. Update Codex or set CODEX_BIN to a compatible binary."
-fi
-
-codex_args+=(--output-schema "$schema" -o "$review_file" -)
 
 transcript_tail="$(
   TRANSCRIPT_PATH="$transcript_path" python3 <<'PY'
@@ -163,13 +183,27 @@ print(tail[-200000:])
 PY
 )"
 
-# Resolve and read the exact plan file Claude is submitting, so Codex reviews
-# the final plan verbatim rather than reconstructing it from the transcript.
-# Preference: the last .claude/plans/*.md path referenced in the transcript;
-# fall back to the most-recently-modified plan file; fall back to the plan
-# carried inline on tool_input.plan.
-plan_file="$(
-  TRANSCRIPT_PATH="$transcript_path" python3 <<'PY'
+# Resolve and read the exact plan Claude is submitting, so Codex reviews the
+# final plan verbatim. Preference order, most authoritative first:
+#   1. tool_input.plan - the plan literally being submitted through this
+#      ExitPlanMode call. This is the source of truth and must win.
+#   2. The last .claude/plans/*.md path referenced in this session's transcript.
+#   3. The most-recently-modified plan file in ~/.claude/plans.
+# Fallbacks 2 and 3 read a shared, cross-session directory, so they can resolve
+# to an unrelated plan (another project/session). Only consult them when the
+# submitted call carries no inline plan.
+plan_from_input="$(json_get tool_input.plan)"
+
+plan_text=""
+plan_source=""
+if [[ "$plan_from_input" =~ [^[:space:]] ]]; then
+  plan_text="$plan_from_input"
+  plan_source="ExitPlanMode tool_input.plan"
+fi
+
+if ! [[ "$plan_text" =~ [^[:space:]] ]]; then
+  plan_file="$(
+    TRANSCRIPT_PATH="$transcript_path" python3 <<'PY'
 import os
 import re
 from pathlib import Path
@@ -184,26 +218,19 @@ if tp:
             candidate = matches[-1]
 print(candidate)
 PY
-)"
+  )"
 
-if [[ -z "$plan_file" || ! -f "$plan_file" ]]; then
-  plans_dir="$HOME/.claude/plans"
-  if [[ -d "$plans_dir" ]]; then
-    plan_file="$(ls -1t "$plans_dir"/*.md 2>/dev/null | head -1 || true)"
+  if [[ -z "$plan_file" || ! -f "$plan_file" ]]; then
+    plans_dir="$HOME/.claude/plans"
+    if [[ -d "$plans_dir" ]]; then
+      plan_file="$(ls -1t "$plans_dir"/*.md 2>/dev/null | head -1 || true)"
+    fi
   fi
-fi
 
-plan_from_input="$(json_get tool_input.plan)"
-
-plan_text=""
-plan_source=""
-if [[ -n "$plan_file" && -f "$plan_file" ]]; then
-  plan_text="$(cat "$plan_file")"
-  plan_source="plan file: $plan_file"
-fi
-if ! [[ "$plan_text" =~ [^[:space:]] ]] && [[ -n "$plan_from_input" ]]; then
-  plan_text="$plan_from_input"
-  plan_source="ExitPlanMode tool_input.plan"
+  if [[ -n "$plan_file" && -f "$plan_file" ]]; then
+    plan_text="$(cat "$plan_file")"
+    plan_source="plan file (fallback): $plan_file"
+  fi
 fi
 gate_log_line "$gate_main_log" "plan_source=${plan_source:-none}"
 
@@ -298,13 +325,44 @@ EOF
 
 gate_codex_t0="$(date +%s)"
 codex_rc=0
-"$codex_bin" "${codex_args[@]}" < "$prompt_file" > "$codex_stdout" 2> "$codex_stderr" || codex_rc=$?
+if [[ "$reviewer_engine" == "claude" ]]; then
+  # claude --print does not write the bare schema object to stdout the way
+  # codex -o does. With --output-format json it emits a result envelope whose
+  # schema-conforming verdict lives under .structured_output; extract that into
+  # review_file so the downstream validator sees the same shape codex produces.
+  CLAUDE_CODE_SAFE_MODE=1 "$claude_bin" \
+    --safe-mode \
+    --print \
+    --output-format json \
+    --permission-mode dontAsk \
+    --allowedTools Read,Grep,Glob \
+    --add-dir "$project_dir" \
+    --json-schema "$(cat "$schema")" \
+    < "$prompt_file" > "$claude_stdout" 2> "$claude_stderr" || codex_rc=$?
+  if [[ "$codex_rc" -eq 0 ]]; then
+    python3 - "$claude_stdout" "$review_file" <<'PY' || codex_rc=$?
+import json
+import sys
+from pathlib import Path
+
+env = json.loads(Path(sys.argv[1]).read_text())
+verdict = env.get("structured_output")
+if verdict is None:
+    raise SystemExit(1)
+Path(sys.argv[2]).write_text(json.dumps(verdict))
+PY
+  fi
+else
+  "$codex_bin" "${codex_args[@]}" < "$prompt_file" > "$codex_stdout" 2> "$codex_stderr" || codex_rc=$?
+fi
 gate_codex_s=$(( $(date +%s) - gate_codex_t0 ))
 gate_snapshot_attempt "$attempt_counter"
-gate_log_line "$gate_main_log" "codex_invoked attempt=$GATE_ATTEMPT rc=$codex_rc duration_s=$gate_codex_s"
+gate_log_line "$gate_main_log" "verifier_invoked engine=$reviewer_engine attempt=$GATE_ATTEMPT rc=$codex_rc duration_s=$gate_codex_s"
 
 if [[ "$codex_rc" -ne 0 ]]; then
-  reason="Codex rejected or failed during plan verification. Revise the plan only after addressing verifier execution errors. stderr: $(tail -n 20 "$codex_stderr" | tr '\n' ' ')"
+  verifier_stderr="$codex_stderr"
+  [[ "$reviewer_engine" == "claude" ]] && verifier_stderr="$claude_stderr"
+  reason="${reviewer_engine} rejected or failed during plan verification. Revise the plan only after addressing verifier execution errors. stderr: $(tail -n 20 "$verifier_stderr" | tr '\n' ' ')"
   gate_log_line "$gate_main_log" "$reason"
   deny "$reason"
 fi
@@ -412,7 +470,7 @@ except Exception:
     raise SystemExit(1)
 PY
 then
-  deny "Codex plan verifier returned invalid JSON or an invalid pass without accepted_plan_markdown. Revise the plan and try again."
+  deny "${reviewer_engine} plan verifier returned invalid JSON or an invalid pass without accepted_plan_markdown. Revise the plan and try again."
 fi
 
 # Verdict is structurally valid from here; capture workflow_type for event logging.
