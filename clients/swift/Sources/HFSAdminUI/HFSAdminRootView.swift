@@ -46,6 +46,11 @@ public struct HFSAdminRootView: View {
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 1240, minHeight: 760)
         .environment(model)
+        .task {
+            if model.autoConnect, model.connectionState == .disconnected {
+                await model.connect()
+            }
+        }
         .alert(
             pendingAction?.primaryActionTitle ?? "",
             isPresented: Binding(
