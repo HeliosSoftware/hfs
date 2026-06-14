@@ -426,10 +426,18 @@ where
             get(handlers::sof::get_export_status_handler::<S>)
                 .delete(handlers::sof::cancel_export_handler::<S>),
         )
+        // Export result: GET /export/{job-id}/result
+        // Per the FHIR Asynchronous Interaction Request Pattern, the completing
+        // status poll returns `303 See Other` pointing here. This endpoint
+        // serves the manifest `Parameters` (200 OK) on success, or the relevant
+        // error status code with an `OperationOutcome` on failure. The static
+        // `result` segment takes priority over the `{filename}` download route
+        // below (matchit 0.8).
+        .route(
+            "/export/{job_id}/result",
+            get(handlers::sof::get_export_result_handler::<S>),
+        )
         // Export download: GET /export/{job-id}/{filename}
-        // (The completion manifest is served by the status endpoint with
-        // 200 OK per the spec's async pattern — there is no separate
-        // /result route.)
         .route(
             "/export/{job_id}/{filename}",
             get(handlers::sof::download_export_file_handler::<S>),

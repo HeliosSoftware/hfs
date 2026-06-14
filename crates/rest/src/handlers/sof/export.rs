@@ -29,12 +29,20 @@
 //!
 //! ## Poll response
 //!
+//! Per the FHIR Asynchronous Interaction Request Pattern, the status URL only
+//! reports polling machinery; the job's outcome is served from a separate
+//! result URL (`GET /export/{job-id}/result`):
+//!
 //! - `202 Accepted` + `X-Progress: running` while the job is running
-//! - `200 OK` with the completion manifest `Parameters` resource in the body
-//!   when complete (per the FHIR Asynchronous Bulk Data Request Pattern —
-//!   there is no `303 See Other` redirect and no separate result URL)
-//! - `500 Internal Server Error` + `OperationOutcome` if the job failed
+//! - `303 See Other` with a `Location` header carrying the result URL and an
+//!   empty body once the job has finished — whether it succeeded or failed
 //! - `404 Not Found` if the job ID is unknown or was cancelled
+//!
+//! ## Result response (`GET /export/{job-id}/result`)
+//!
+//! - `200 OK` with the completion manifest `Parameters` resource on success
+//! - `500 Internal Server Error` + `OperationOutcome` if the job failed
+//! - `404 Not Found` if the job is unknown, cancelled, or not yet finished
 
 use axum::{
     extract::{Path, State},
@@ -1028,9 +1036,10 @@ where
     S: ResourceStorage + Send + Sync + 'static,
 {
     // Spec Common Operation Behavior — Asynchronous Delivery: the `Accept`
-    // header on each poll governs that poll's response, including the
-    // completion manifest. The FHIR XML representation is not supported →
-    // 406, same as the run operations.
+    // header on each poll governs that poll's response (interim `202 Accepted`
+    // bodies and error responses). The FHIR XML representation is not supported
+    // → 406, same as the run operations. The completing poll itself is a
+    // `303 See Other` with an empty body, so its representation is unaffected.
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     if accept_requires_unsupported_fhir_xml(accept) {
         return Err(RestError::NotAcceptable {
@@ -1100,56 +1109,23 @@ where
                 .into_response())
         }
 
-        // Spec (Common Operation Behavior — Asynchronous Delivery): the
-        // status poll itself carries the terminal response. Failure returns
-        // the relevant error status code with an OperationOutcome body;
-        // polling-transport errors and operation failures are distinguished
-        // by the status code on the poll response itself.
-        Some(JobStatus::Failed { message, .. }) => Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({
-                "resourceType": "OperationOutcome",
-                "issue": [{
-                    "severity": "error",
-                    "code": "processing",
-                    "diagnostics": format!("Export job '{job_id}' failed: {message}")
-                }]
-            })),
-        )
-            .into_response()),
-
-        // Completion is `200 OK` with the manifest in the status-poll body —
-        // no `303 See Other` redirect and no separate result resource.
-        Some(JobStatus::Completed {
-            files,
-            submitted_at,
-            completed_at,
-            format,
-            client_tracking_id,
-        }) => {
-            // Spec: the completed status URL and download URLs SHALL be valid
-            // for at least 24 hours and MAY carry an `Expires` header. Format
-            // is IMF-fixdate per RFC 7231.
-            let expires_at = completed_at + chrono::Duration::hours(24);
-            let expires_str = expires_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        // Spec (Common Operation Behavior — Asynchronous Delivery, FHIR
+        // Asynchronous Interaction Request Pattern): once the job has finished
+        // — whether it succeeded or failed — the status poll returns
+        // `303 See Other` with a `Location` header carrying the result URL and
+        // an empty body. The status endpoint reflects polling machinery only;
+        // it never communicates the job's outcome. The outcome (manifest on
+        // success, OperationOutcome on failure) is served from the result URL.
+        Some(JobStatus::Failed { .. }) | Some(JobStatus::Completed { .. }) => {
+            let result_url = format!(
+                "{base}/export/{job_id}/result",
+                base = state.base_url().trim_end_matches('/'),
+            );
             let mut headers = HeaderMap::new();
-            if let Ok(v) = HeaderValue::from_str(&expires_str) {
-                headers.insert(header::EXPIRES, v);
+            if let Ok(v) = HeaderValue::from_str(&result_url) {
+                headers.insert(header::LOCATION, v);
             }
-            Ok((
-                StatusCode::OK,
-                headers,
-                axum::Json(build_completion_manifest(
-                    state.base_url(),
-                    &job_id,
-                    &files,
-                    submitted_at,
-                    completed_at,
-                    &format,
-                    client_tracking_id.as_deref(),
-                )),
-            )
-                .into_response())
+            Ok((StatusCode::SEE_OTHER, headers).into_response())
         }
     }
 }
@@ -1216,6 +1192,112 @@ fn build_completion_manifest(
         "resourceType": "Parameters",
         "parameter": params
     })
+}
+
+// ============================================================================
+// Result: GET /export/{job-id}/result
+// ============================================================================
+
+/// Serve the result of a finished export job.
+///
+/// Per the FHIR Asynchronous Interaction Request Pattern, the completing status
+/// poll redirects here with `303 See Other`. A successful export returns
+/// `200 OK` with the manifest `Parameters` resource; a failed export returns the
+/// relevant error status code (e.g. `500 Internal Server Error`) with an
+/// `OperationOutcome`. The result and its download URLs remain valid for at
+/// least 24 hours, so repeated fetches return the same outcome within that
+/// window. A job that is unknown, cancelled, or still in progress has no result
+/// to serve and returns `404 Not Found`.
+pub async fn get_export_result_handler<S>(
+    State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, RestError>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    // The result `GET`'s `Accept` header governs the manifest representation.
+    // FHIR XML is not supported → 406, same as the run operations.
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    if accept_requires_unsupported_fhir_xml(accept) {
+        return Err(RestError::NotAcceptable {
+            message: "the application/fhir+xml representation is not supported; \
+                      use application/fhir+json"
+                .to_string(),
+        });
+    }
+
+    let controller = match state.export_controller() {
+        Some(c) => c,
+        None => {
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, "export not configured").into_response());
+        }
+    };
+
+    match controller.get_status(tenant.tenant_id(), &job_id) {
+        // Unknown, cancelled, or still running → no result available. The
+        // result URL is only handed out (via the status poll's 303) once the
+        // job has finished, so reaching here otherwise means there is nothing
+        // to serve.
+        None | Some(JobStatus::Cancelled) | Some(JobStatus::Running { .. }) => Ok((
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{"severity": "error", "code": "not-found",
+                    "diagnostics": format!("No result available for export job '{job_id}'")}]
+            })),
+        )
+            .into_response()),
+
+        // Failed export → the relevant error status code with an
+        // OperationOutcome body explaining the failure.
+        Some(JobStatus::Failed { message, .. }) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "processing",
+                    "diagnostics": format!("Export job '{job_id}' failed: {message}")
+                }]
+            })),
+        )
+            .into_response()),
+
+        // Successful export → `200 OK` with the manifest `Parameters` resource.
+        Some(JobStatus::Completed {
+            files,
+            submitted_at,
+            completed_at,
+            format,
+            client_tracking_id,
+        }) => {
+            // Spec: the result URL and download URLs SHALL be valid for at least
+            // 24 hours and MAY carry an `Expires` header. Format is IMF-fixdate
+            // per RFC 7231.
+            let expires_at = completed_at + chrono::Duration::hours(24);
+            let expires_str = expires_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let mut headers = HeaderMap::new();
+            if let Ok(v) = HeaderValue::from_str(&expires_str) {
+                headers.insert(header::EXPIRES, v);
+            }
+            Ok((
+                StatusCode::OK,
+                headers,
+                axum::Json(build_completion_manifest(
+                    state.base_url(),
+                    &job_id,
+                    &files,
+                    submitted_at,
+                    completed_at,
+                    &format,
+                    client_tracking_id.as_deref(),
+                )),
+            )
+                .into_response())
+        }
+    }
 }
 
 // ============================================================================
