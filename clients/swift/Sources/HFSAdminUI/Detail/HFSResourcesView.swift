@@ -16,9 +16,26 @@ struct HFSResourcesView: View {
     @State private var errorMessage: String?
     @State private var selectedItem: ResourceListItem?
     @State private var loadGeneration = 0
+    @State private var editorMode: EditorMode?
+    @State private var deleteCandidate: ResourceListItem?
+
+    /// Set by the toolbar "New Resource" action in the root view.
+    @Binding var newResourceRequested: Bool
 
     private let pageSize = 20
     private let spinnerDelay = Duration.milliseconds(300)
+
+    private enum EditorMode: Identifiable {
+        case create(type: String)
+        case edit(item: ResourceListItem)
+
+        var id: String {
+            switch self {
+            case .create(let type): "create-\(type)"
+            case .edit(let item): "edit-\(item.id)"
+            }
+        }
+    }
 
     var body: some View {
         if model.isConnected {
@@ -46,6 +63,52 @@ struct HFSResourcesView: View {
         .task(id: selectedType) {
             parameters = []
             await runSearch()
+        }
+        .onChange(of: newResourceRequested) { _, requested in
+            guard requested else { return }
+            editorMode = .create(type: selectedType ?? "Patient")
+            newResourceRequested = false
+        }
+        .sheet(item: $editorMode) { mode in
+            editorSheet(for: mode)
+        }
+        .confirmationDialog(
+            deleteCandidate.map { "Delete \($0.resourceType)/\($0.fhirID)?" } ?? "Delete resource?",
+            isPresented: Binding(
+                get: { deleteCandidate != nil },
+                set: { if !$0 { deleteCandidate = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: deleteCandidate
+        ) { item in
+            Button("Delete", role: .destructive) {
+                Task { await performDelete(item) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("This permanently deletes the resource on the server.")
+        }
+    }
+
+    @ViewBuilder
+    private func editorSheet(for mode: EditorMode) -> some View {
+        switch mode {
+        case .create(let type):
+            HFSResourceEditorView(
+                title: "New \(type)",
+                saveButtonTitle: "Create",
+                initialJSON: "{\n  \"resourceType\" : \"\(type)\"\n}"
+            ) { data in
+                await performCreate(data)
+            }
+        case .edit(let item):
+            HFSResourceEditorView(
+                title: "Edit \(item.resourceType)/\(item.fhirID)",
+                saveButtonTitle: "Save",
+                initialJSON: item.prettyJSON
+            ) { data in
+                await performUpdate(item, data)
+            }
         }
     }
 
@@ -272,6 +335,25 @@ struct HFSResourcesView: View {
             Spacer()
 
             Button {
+                editorMode = .edit(item: item)
+            } label: {
+                Label("Edit", systemImage: "pencil")
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .help("Edit this resource")
+
+            Button(role: .destructive) {
+                deleteCandidate = item
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .foregroundStyle(.red)
+            .help("Delete this resource")
+
+            Button {
                 selectedItem = nil
             } label: {
                 Label("Close", systemImage: "xmark.circle.fill")
@@ -283,6 +365,63 @@ struct HFSResourcesView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal)
         .padding(.vertical, 10)
+    }
+
+    // MARK: - Create / update / delete
+
+    /// Returns an error message to show in the editor, or `nil` on success.
+    private func performCreate(_ data: Data) async -> String? {
+        guard let operations = model.resourceOperations() else { return "Not connected to a server." }
+        guard
+            let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let type = (object["resourceType"] as? String), !type.isEmpty
+        else {
+            return "JSON must include a non-empty \"resourceType\"."
+        }
+
+        do {
+            let created = try await operations.create(resourceType: type, json: data)
+            if type == selectedType {
+                await runSearch()
+                selectedItem = items.first { $0.fhirID == created.fhirID }
+            } else {
+                // Switch to the created resource's type; .task reloads the list.
+                selectedType = type
+            }
+            return nil
+        } catch {
+            return HFSAppModel.describe(error)
+        }
+    }
+
+    /// Returns an error message to show in the editor, or `nil` on success.
+    private func performUpdate(_ item: ResourceListItem, _ data: Data) async -> String? {
+        guard let operations = model.resourceOperations() else { return "Not connected to a server." }
+
+        do {
+            let updated = try await operations.update(
+                resourceType: item.resourceType,
+                id: item.fhirID,
+                json: data
+            )
+            await runSearch()
+            selectedItem = items.first { $0.fhirID == updated.fhirID }
+            return nil
+        } catch {
+            return HFSAppModel.describe(error)
+        }
+    }
+
+    private func performDelete(_ item: ResourceListItem) async {
+        guard let operations = model.resourceOperations() else { return }
+
+        do {
+            try await operations.delete(resourceType: item.resourceType, id: item.fhirID)
+            selectedItem = nil
+            await runSearch()
+        } catch {
+            errorMessage = HFSAppModel.describe(error)
+        }
     }
 
     // MARK: - Loading
