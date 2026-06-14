@@ -84,7 +84,7 @@ Liquid Glass automatically where supported.
 |--------|-------|
 | Settings | ✅ Live — connect/disconnect, validation, status feedback, persisted settings + connect-on-launch |
 | Overview | ✅ Live — capability tiles from `/metadata`, refresh |
-| Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector |
+| Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector, create/update/delete |
 | Search | ⏳ Scaffold placeholder |
 | Bulk Jobs | ⏳ Scaffold placeholder |
 | Audit | ⏳ Scaffold placeholder |
@@ -105,16 +105,19 @@ Done:
    editable **search parameters**.
 6. ✅ **Settings persistence** (`UserDefaults`): Base URL, Tenant, FHIR version,
    and a "Connect on launch" toggle are saved and restored across relaunches.
+7. ✅ Resource **create / update / delete** (read-write): the "New Resource"
+   toolbar action opens a JSON editor (`HFSCodeEditor`, with macOS smart-quote
+   substitution disabled), and the inspector exposes edit/delete with
+   confirmation.
 
 Coming next:
 
-7. ⏭️ A dedicated Search screen reusing the parameter/pagination plumbing.
-8. ⏭️ Resource **create / update / delete** (read-write; the "New Resource"
-   toolbar action is currently a placeholder).
-9. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
-10. ⏭️ **Auth** (`HFSAuth`): static bearer token, then SMART-on-FHIR discovery
+8. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
+9. ⏭️ **Auth** (`HFSAuth`): static bearer token, then SMART-on-FHIR discovery
    (currently `NoAccessTokenProvider`).
-11. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
+10. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
+11. ⏭️ A dedicated Search screen — only if it adds cross-type search,
+   `_include`/`_revinclude`, or sorting beyond the in-place Resources search.
 
 ## Building
 
