@@ -11,11 +11,14 @@ struct HFSResourcesView: View {
     @State private var total: Int?
     @State private var nextURL: URL?
     @State private var isLoading = false
+    @State private var showSpinner = false
     @State private var isLoadingMore = false
     @State private var errorMessage: String?
     @State private var selectedItem: ResourceListItem?
+    @State private var loadGeneration = 0
 
     private let pageSize = 20
+    private let spinnerDelay = Duration.milliseconds(300)
 
     var body: some View {
         Group {
@@ -42,8 +45,9 @@ struct HFSResourcesView: View {
             Divider()
 
             resultsColumn
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .searchable(text: $typeFilter, prompt: "Filter types")
         .task(id: selectedType) {
             parameters = []
             await runSearch()
@@ -53,22 +57,10 @@ struct HFSResourcesView: View {
     // MARK: - Resource type column
 
     private var typeColumn: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Filter types", text: $typeFilter)
-                    .textFieldStyle(.plain)
-            }
-            .padding(8)
-
-            Divider()
-
-            List(filteredTypes, id: \.self, selection: $selectedType) { type in
-                Text(type)
-            }
-            .listStyle(.sidebar)
+        List(filteredTypes, id: \.self, selection: $selectedType) { type in
+            Text(type)
         }
+        .listStyle(.sidebar)
     }
 
     private var filteredTypes: [String] {
@@ -87,13 +79,16 @@ struct HFSResourcesView: View {
                 parametersEditor
                 Divider()
                 resultsContent(type: type)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         } else {
             ContentUnavailableView {
                 Label("Select a Resource Type", systemImage: "folder")
             } description: {
                 Text("Choose a resource type to load a page of results.")
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -120,6 +115,9 @@ struct HFSResourcesView: View {
     }
 
     private var countSummary: String {
+        if isLoading {
+            return "Loading…"
+        }
         if let total {
             return "\(items.count) loaded of \(total)"
         }
@@ -169,7 +167,7 @@ struct HFSResourcesView: View {
 
     @ViewBuilder
     private func resultsContent(type: String) -> some View {
-        if isLoading {
+        if showSpinner {
             ProgressView("Loading \(type)…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let errorMessage {
@@ -180,6 +178,11 @@ struct HFSResourcesView: View {
             } actions: {
                 Button("Retry") { Task { await runSearch() } }
             }
+        } else if isLoading {
+            // Loading, but not long enough to warrant a spinner yet — stay blank
+            // so fast responses don't flash the spinner or the empty state.
+            Color.clear
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if items.isEmpty {
             ContentUnavailableView {
                 Label("No \(type) Resources", systemImage: "tray")
@@ -268,14 +271,35 @@ struct HFSResourcesView: View {
     // MARK: - Loading
 
     private func runSearch() async {
-        guard let type = selectedType, let operations = model.resourceOperations() else { return }
-        isLoading = true
+        guard let type = selectedType, let operations = model.resourceOperations() else {
+            isLoading = false
+            showSpinner = false
+            items = []
+            total = nil
+            nextURL = nil
+            errorMessage = nil
+            return
+        }
+
+        loadGeneration += 1
+        let generation = loadGeneration
+
         errorMessage = nil
         selectedItem = nil
         items = []
         total = nil
         nextURL = nil
-        defer { isLoading = false }
+        isLoading = true
+        showSpinner = false
+
+        // Reveal the spinner only if this load is still the latest one after a
+        // short delay, so fast responses (and fast failures) never flash it.
+        Task { @MainActor in
+            try? await Task.sleep(for: spinnerDelay)
+            if generation == loadGeneration, isLoading {
+                showSpinner = true
+            }
+        }
 
         do {
             let page = try await operations.search(
@@ -283,12 +307,21 @@ struct HFSResourcesView: View {
                 parameters: parameters,
                 count: pageSize
             )
+            guard generation == loadGeneration else { return }
             items = page.items
             total = page.total
             nextURL = page.nextURL
         } catch {
+            guard generation == loadGeneration else { return }
+            items = []
+            total = nil
+            nextURL = nil
             errorMessage = HFSAppModel.describe(error)
         }
+
+        guard generation == loadGeneration else { return }
+        isLoading = false
+        showSpinner = false
     }
 
     private func loadMore() async {
@@ -299,17 +332,20 @@ struct HFSResourcesView: View {
             !isLoadingMore
         else { return }
 
+        let generation = loadGeneration
         isLoadingMore = true
         defer { isLoadingMore = false }
 
         do {
             let page = try await operations.searchPage(url: url, fallbackType: type)
+            guard generation == loadGeneration else { return }
             items.append(contentsOf: page.items)
             nextURL = page.nextURL
             if let pageTotal = page.total {
                 total = pageTotal
             }
         } catch {
+            guard generation == loadGeneration else { return }
             errorMessage = HFSAppModel.describe(error)
         }
     }
