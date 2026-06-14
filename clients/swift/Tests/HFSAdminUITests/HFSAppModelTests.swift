@@ -15,7 +15,8 @@ final class HFSAppModelTests: XCTestCase {
         )
         let model = HFSAppModel(
             serverURLString: "http://localhost:8080",
-            transport: StubTransport(statusCode: 200, data: json)
+            transport: StubTransport(statusCode: 200, data: json),
+            defaults: Self.ephemeralDefaults()
         )
 
         await model.connect()
@@ -29,7 +30,8 @@ final class HFSAppModelTests: XCTestCase {
     func testConnectFailsOnServerError() async {
         let model = HFSAppModel(
             serverURLString: "http://localhost:8080",
-            transport: StubTransport(statusCode: 503, data: Data())
+            transport: StubTransport(statusCode: 503, data: Data()),
+            defaults: Self.ephemeralDefaults()
         )
 
         await model.connect()
@@ -44,7 +46,8 @@ final class HFSAppModelTests: XCTestCase {
     func testConnectRejectsURLWithoutScheme() async {
         let model = HFSAppModel(
             serverURLString: "localhost:8080",
-            transport: StubTransport(statusCode: 200, data: Data())
+            transport: StubTransport(statusCode: 200, data: Data()),
+            defaults: Self.ephemeralDefaults()
         )
 
         await model.connect()
@@ -58,7 +61,8 @@ final class HFSAppModelTests: XCTestCase {
         let json = Data(#"{"resourceType":"CapabilityStatement"}"#.utf8)
         let model = HFSAppModel(
             serverURLString: "http://localhost:8080",
-            transport: StubTransport(statusCode: 200, data: json)
+            transport: StubTransport(statusCode: 200, data: json),
+            defaults: Self.ephemeralDefaults()
         )
 
         await model.connect()
@@ -82,7 +86,8 @@ final class HFSAppModelTests: XCTestCase {
         )
         let model = HFSAppModel(
             serverURLString: "http://localhost:8080",
-            transport: StubTransport(statusCode: 200, data: json)
+            transport: StubTransport(statusCode: 200, data: json),
+            defaults: Self.ephemeralDefaults()
         )
 
         await model.connect()
@@ -96,7 +101,10 @@ final class HFSAppModelTests: XCTestCase {
     }
 
     func testRefreshOverviewWithoutClientSetsError() async {
-        let model = HFSAppModel(transport: StubTransport(statusCode: 200, data: Data()))
+        let model = HFSAppModel(
+            transport: StubTransport(statusCode: 200, data: Data()),
+            defaults: Self.ephemeralDefaults()
+        )
 
         await model.refreshOverview()
 
@@ -110,7 +118,8 @@ final class HFSAppModelTests: XCTestCase {
         )
         let model = HFSAppModel(
             serverURLString: "http://localhost:8080",
-            transport: StubTransport(statusCode: 200, data: json)
+            transport: StubTransport(statusCode: 200, data: json),
+            defaults: Self.ephemeralDefaults()
         )
 
         await model.connect()
@@ -126,7 +135,8 @@ final class HFSAppModelTests: XCTestCase {
         let json = Data(#"{"resourceType":"CapabilityStatement","rest":[{"resource":[{"type":"Patient"}]}]}"#.utf8)
         let model = HFSAppModel(
             serverURLString: "http://localhost:8080",
-            transport: StubTransport(statusCode: 200, data: json)
+            transport: StubTransport(statusCode: 200, data: json),
+            defaults: Self.ephemeralDefaults()
         )
 
         await model.connect()
@@ -137,11 +147,51 @@ final class HFSAppModelTests: XCTestCase {
     }
 
     func testTenantDisplayFallsBackToDefault() {
-        let model = HFSAppModel(tenantIdentifier: "  ")
+        let model = HFSAppModel(tenantIdentifier: "  ", defaults: Self.ephemeralDefaults())
         XCTAssertEqual(model.tenantDisplay, "default")
 
         model.tenantIdentifier = "acme"
         XCTAssertEqual(model.tenantDisplay, "acme")
+    }
+
+    // MARK: - Settings persistence
+
+    func testSettingsPersistAcrossInstances() {
+        let defaults = Self.ephemeralDefaults()
+
+        let first = HFSAppModel(defaults: defaults)
+        first.serverURLString = "https://fhir.example.com"
+        first.tenantIdentifier = "acme"
+        first.fhirVersion = .r5
+        first.autoConnect = false
+
+        // A fresh model over the same defaults restores the saved values.
+        let second = HFSAppModel(defaults: defaults)
+        XCTAssertEqual(second.serverURLString, "https://fhir.example.com")
+        XCTAssertEqual(second.tenantIdentifier, "acme")
+        XCTAssertEqual(second.fhirVersion, .r5)
+        XCTAssertFalse(second.autoConnect)
+    }
+
+    func testInitDefaultsWhenNothingPersisted() {
+        let model = HFSAppModel(defaults: Self.ephemeralDefaults())
+        XCTAssertEqual(model.serverURLString, "http://localhost:8080")
+        XCTAssertEqual(model.tenantIdentifier, "")
+        XCTAssertEqual(model.fhirVersion, .r4)
+        XCTAssertTrue(model.autoConnect)
+    }
+
+    func testInitDoesNotOverwritePersistedValuesWithProvidedDefaults() {
+        let defaults = Self.ephemeralDefaults()
+        HFSAppModel(defaults: defaults).serverURLString = "https://saved.example.com"
+
+        // Even when a different default URL is supplied, the persisted one wins.
+        let restored = HFSAppModel(serverURLString: "http://other:9000", defaults: defaults)
+        XCTAssertEqual(restored.serverURLString, "https://saved.example.com")
+    }
+
+    private static func ephemeralDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "hfs.tests.\(UUID().uuidString)")!
     }
 }
 
