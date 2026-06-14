@@ -82,7 +82,7 @@ Liquid Glass automatically where supported.
 
 | Screen | State |
 |--------|-------|
-| Settings | ✅ Live — connect/disconnect, validation, status feedback |
+| Settings | ✅ Live — connect/disconnect, validation, status feedback, persisted settings + connect-on-launch |
 | Overview | ✅ Live — capability tiles from `/metadata`, refresh |
 | Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector |
 | Search | ⏳ Scaffold placeholder |
@@ -103,16 +103,17 @@ Done:
 4. ✅ Resources browser: type list → search → JSON detail (`.inspector`).
 5. ✅ Resource search **pagination** (follows the Bundle `next` link) and
    editable **search parameters**.
+6. ✅ **Settings persistence** (`UserDefaults`): Base URL, Tenant, FHIR version,
+   and a "Connect on launch" toggle are saved and restored across relaunches.
 
 Coming next:
 
-6. ⏭️ A dedicated Search screen reusing the parameter/pagination plumbing.
-7. ⏭️ Resource **create / update / delete** (read-write; the "New Resource"
+7. ⏭️ A dedicated Search screen reusing the parameter/pagination plumbing.
+8. ⏭️ Resource **create / update / delete** (read-write; the "New Resource"
    toolbar action is currently a placeholder).
-8. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
-9. ⏭️ **Auth** (`HFSAuth`): static bearer token, then SMART-on-FHIR discovery
+9. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
+10. ⏭️ **Auth** (`HFSAuth`): static bearer token, then SMART-on-FHIR discovery
    (currently `NoAccessTokenProvider`).
-10. ⏭️ Settings persistence (`@AppStorage`/`UserDefaults`).
 11. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
 
 ## Building
