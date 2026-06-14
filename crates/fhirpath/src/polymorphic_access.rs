@@ -172,7 +172,7 @@ fn get_polymorphic_fields(
     // match unrelated fields whose names happen to start with `base_name`.
     let mut consulted_field_types = false;
     if let Some(EvaluationResult::String(resource_type, _, _)) = obj.get("resourceType")
-        && let Some(table) = helios_fhir::field_types(helios_fhir::FhirVersion::default())
+        && let Some(table) = helios_fhir::field_types(helios_fhir::FhirVersion::default_enabled())
     {
         consulted_field_types = true;
         for (parent, field, _ty, _is_collection) in table {
@@ -410,7 +410,7 @@ pub fn is_choice_element(field_name: &str) -> bool {
 /// `effective`, `onset`, …) instead of the always-false fallback that
 /// preceded this.
 fn is_polymorphic_base_in_default_version(name: &str) -> bool {
-    let table: &[(&str, &str, &str, bool)] = match helios_fhir::FhirVersion::default() {
+    let table: &[(&str, &str, &str, bool)] = match helios_fhir::FhirVersion::default_enabled() {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => helios_fhir::r4::FIELD_TYPES,
         #[cfg(feature = "R4B")]
