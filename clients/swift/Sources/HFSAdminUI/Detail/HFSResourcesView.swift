@@ -21,19 +21,14 @@ struct HFSResourcesView: View {
     private let spinnerDelay = Duration.milliseconds(300)
 
     var body: some View {
-        Group {
-            if model.isConnected {
-                browser
-            } else {
-                ContentUnavailableView {
-                    Label("Not Connected", systemImage: "bolt.horizontal.circle")
-                } description: {
-                    Text("Connect to a server in Settings to browse resources.")
-                }
+        if model.isConnected {
+            browser
+        } else {
+            ContentUnavailableView {
+                Label("Not Connected", systemImage: "bolt.horizontal.circle")
+            } description: {
+                Text("Connect to a server in Settings to browse resources.")
             }
-        }
-        .inspector(isPresented: inspectorPresented) {
-            jsonInspector
         }
     }
 
@@ -80,6 +75,12 @@ struct HFSResourcesView: View {
 
                 resultsContent(type: type)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                if let item = selectedItem {
+                    Divider()
+
+                    jsonColumn(item)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         } else {
@@ -235,18 +236,14 @@ struct HFSResourcesView: View {
         }
     }
 
-    // MARK: - JSON inspector
+    // MARK: - JSON detail column
 
-    private var inspectorPresented: Binding<Bool> {
-        Binding(
-            get: { selectedItem != nil },
-            set: { if !$0 { selectedItem = nil } }
-        )
-    }
+    private func jsonColumn(_ item: ResourceListItem) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            inspectorHeader(item)
 
-    @ViewBuilder
-    private var jsonInspector: some View {
-        if let item = selectedItem {
+            Divider()
+
             ScrollView {
                 Text(item.prettyJSON)
                     .font(.system(.caption, design: .monospaced))
@@ -254,15 +251,38 @@ struct HFSResourcesView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
             }
-            .navigationTitle("\(item.resourceType)/\(item.fhirID)")
-            .inspectorColumnWidth(min: 280, ideal: 360, max: 460)
-        } else {
-            ContentUnavailableView(
-                "No Selection",
-                systemImage: "doc.text",
-                description: Text("Select a resource to inspect its JSON.")
-            )
         }
+        .frame(minWidth: 280, idealWidth: 360, maxWidth: 460)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func inspectorHeader(_ item: ResourceListItem) -> some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.resourceType)
+                    .font(.headline)
+                Text(item.fhirID)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer()
+
+            Button {
+                selectedItem = nil
+            } label: {
+                Label("Close", systemImage: "xmark.circle.fill")
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+        .padding(.vertical, 10)
     }
 
     // MARK: - Loading
