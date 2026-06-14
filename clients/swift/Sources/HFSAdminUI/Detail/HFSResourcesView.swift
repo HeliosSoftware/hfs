@@ -73,11 +73,11 @@ struct HFSResourcesView: View {
     @ViewBuilder
     private var resultsColumn: some View {
         if let type = selectedType {
-            VStack(spacing: 0) {
-                resultsHeader(type: type)
+            HStack(spacing: 0) {
+                resourceSearchForm(type: type)
+
                 Divider()
-                parametersEditor
-                Divider()
+
                 resultsContent(type: type)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -92,28 +92,6 @@ struct HFSResourcesView: View {
         }
     }
 
-    private func resultsHeader(type: String) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(type)
-                    .font(.headline)
-                Text(countSummary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            Button {
-                Task { await runSearch() }
-            } label: {
-                Label("Reload", systemImage: "arrow.clockwise")
-            }
-            .disabled(isLoading)
-        }
-        .padding(12)
-    }
-
     private var countSummary: String {
         if isLoading {
             return "Loading…"
@@ -124,45 +102,64 @@ struct HFSResourcesView: View {
         return "\(items.count) loaded"
     }
 
-    private var parametersEditor: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach($parameters) { $parameter in
-                HStack(spacing: 8) {
-                    TextField("parameter", text: $parameter.name)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 170)
-                    TextField("value", text: $parameter.value)
-                        .textFieldStyle(.roundedBorder)
-                    Button {
-                        parameters.removeAll { $0.id == parameter.id }
-                    } label: {
-                        Image(systemName: "minus.circle.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                }
-            }
-
-            HStack {
-                Button {
-                    parameters.append(ResourceSearchParameter())
-                } label: {
-                    Label("Add Parameter", systemImage: "plus")
-                }
-                .buttonStyle(.borderless)
-
-                Spacer()
+    private func resourceSearchForm(type: String) -> some View {
+        Form {
+            Section("Resource") {
+                LabeledContent("Type", value: type)
+                LabeledContent("Loaded", value: countSummary)
 
                 Button {
                     Task { await runSearch() }
                 } label: {
-                    Label("Search", systemImage: "magnifyingglass")
+                    Label("Reload", systemImage: "arrow.clockwise")
                 }
-                .buttonStyle(.borderedProminent)
                 .disabled(isLoading)
             }
+
+            Section("Search Parameters") {
+                if parameters.isEmpty {
+                    Text("No parameters")
+                        .foregroundStyle(.secondary)
+                }
+
+                ForEach($parameters) { $parameter in
+                    HStack(spacing: 8) {
+                        TextField("Parameter", text: $parameter.name)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 170)
+                        TextField("Value", text: $parameter.value)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            parameters.removeAll { $0.id == parameter.id }
+                        } label: {
+                            Label("Remove Parameter", systemImage: "minus.circle.fill")
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+
+                ControlGroup {
+                    Button {
+                        parameters.append(ResourceSearchParameter())
+                    } label: {
+                        Label("Add Parameter", systemImage: "plus")
+                    }
+
+                    Button {
+                        Task { await runSearch() }
+                    } label: {
+                        Label("Search", systemImage: "magnifyingglass")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isLoading)
+                }
+            }
         }
-        .padding(12)
+        .formStyle(.grouped)
+        .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
+        .frame(maxHeight: .infinity)
     }
 
     @ViewBuilder
