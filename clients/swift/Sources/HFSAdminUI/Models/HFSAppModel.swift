@@ -44,9 +44,13 @@ public final class HFSAppModel {
     }
 
     /// Editable connection settings, bound directly to the Settings form.
-    public var serverURLString: String
-    public var tenantIdentifier: String
-    public var fhirVersion: HFSFHIRVersion
+    /// Mutations persist to `UserDefaults` so they survive relaunch.
+    public var serverURLString: String { didSet { persistSettings() } }
+    public var tenantIdentifier: String { didSet { persistSettings() } }
+    public var fhirVersion: HFSFHIRVersion { didSet { persistSettings() } }
+
+    /// When enabled, the app probes the saved server automatically on launch.
+    public var autoConnect: Bool { didSet { persistSettings() } }
 
     /// Live connection state, updated by ``connect()`` / ``disconnect()``.
     public private(set) var connectionState: ConnectionState = .disconnected
@@ -63,17 +67,46 @@ public final class HFSAppModel {
     public private(set) var client: HFSClient?
 
     private let transport: HFSHTTPTransport
+    private let defaults: UserDefaults
+    private var canPersist = false
+
+    private enum DefaultsKey {
+        static let serverURL = "hfs.connection.serverURL"
+        static let tenant = "hfs.connection.tenant"
+        static let fhirVersion = "hfs.connection.fhirVersion"
+        static let autoConnect = "hfs.connection.autoConnect"
+    }
 
     public init(
         serverURLString: String = "http://localhost:8080",
         tenantIdentifier: String = "",
         fhirVersion: HFSFHIRVersion = .r4,
-        transport: HFSHTTPTransport = URLSessionHFSHTTPTransport()
+        autoConnect: Bool = true,
+        transport: HFSHTTPTransport = URLSessionHFSHTTPTransport(),
+        defaults: UserDefaults = .standard
     ) {
-        self.serverURLString = serverURLString
-        self.tenantIdentifier = tenantIdentifier
-        self.fhirVersion = fhirVersion
         self.transport = transport
+        self.defaults = defaults
+
+        // Restore persisted settings, falling back to the provided defaults.
+        self.serverURLString = defaults.string(forKey: DefaultsKey.serverURL) ?? serverURLString
+        self.tenantIdentifier = defaults.string(forKey: DefaultsKey.tenant) ?? tenantIdentifier
+        self.fhirVersion = defaults.string(forKey: DefaultsKey.fhirVersion)
+            .flatMap(HFSFHIRVersion.init(rawValue:)) ?? fhirVersion
+        self.autoConnect = (defaults.object(forKey: DefaultsKey.autoConnect) as? Bool) ?? autoConnect
+
+        // Enable persistence only after the initial load so restoring values
+        // above does not write them straight back.
+        canPersist = true
+    }
+
+    /// Writes the editable connection settings to `UserDefaults`.
+    private func persistSettings() {
+        guard canPersist else { return }
+        defaults.set(serverURLString, forKey: DefaultsKey.serverURL)
+        defaults.set(tenantIdentifier, forKey: DefaultsKey.tenant)
+        defaults.set(fhirVersion.rawValue, forKey: DefaultsKey.fhirVersion)
+        defaults.set(autoConnect, forKey: DefaultsKey.autoConnect)
     }
 
     public var isConnected: Bool {
