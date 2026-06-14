@@ -1,7 +1,15 @@
 name: Inferno US Core Test Suite
 
 on:
-  workflow_dispatch: # Manual trigger only for initial implementation
+  workflow_dispatch: # Manual trigger
+  schedule:
+    # Weekly US Core conformance tracking run — Sunday 08:00 UTC (04:00 ET).
+    # Offset from the daily suites (hts-ig 03:00, hts 05:00) and clear of the
+    # weekday ci-extended 07:00 run, so this long (~2.5h) job has the
+    # self-hosted runners to itself. Runs as a status/early-warning signal —
+    # the suite is not yet consistently green, so treat a weekly red as a
+    # tracking indicator rather than a gate.
+    - cron: "0 8 * * 0"
 
 env:
   CARGO_TERM_COLOR: always
