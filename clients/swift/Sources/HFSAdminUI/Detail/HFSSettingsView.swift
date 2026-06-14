@@ -37,6 +37,12 @@ struct HFSSettingsView: View {
                 }
             }
 
+            Section {
+                Toggle("Connect on launch", isOn: $model.autoConnect)
+            } footer: {
+                Text("Server settings are saved automatically and restored next time.")
+            }
+
             Section("Status") {
                 LabeledContent("Connection") {
                     connectionStatusLabel
