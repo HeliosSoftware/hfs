@@ -538,7 +538,7 @@ impl MongoBackend {
     /// does not implement `:missing`, token `:not`/`:of-type`, reference
     /// `:identifier`, or uri `:above`/`:below`; advertising only what
     /// `search_impl` accepts keeps the CapabilityStatement honest.
-    fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
+    pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text"],
             SearchParamType::Token => vec!["text", "code-text"],

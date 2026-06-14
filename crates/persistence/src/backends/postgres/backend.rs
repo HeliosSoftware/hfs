@@ -752,7 +752,7 @@ impl SearchCapabilityProvider for PostgresBackend {
 
 impl PostgresBackend {
     /// Returns supported modifiers for a parameter type.
-    fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
+    pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             // `not-in` is intentionally omitted: it returns 501 (negated

@@ -997,6 +997,27 @@ impl SearchProvider for CompositeStorage {
             .map(|p| p.supports_contained_search())
             .unwrap_or(false)
     }
+
+    fn modifiers_for_param_type(
+        &self,
+        param_type: crate::types::SearchParamType,
+    ) -> Vec<&'static str> {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.modifiers_for_param_type(param_type);
+            }
+        }
+        self.search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+            .map(|p| p.modifiers_for_param_type(param_type))
+            .unwrap_or_default()
+    }
 }
 
 #[async_trait]
