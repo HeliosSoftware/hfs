@@ -149,7 +149,13 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # Serialized: all matrix jobs share one Inferno instance, which runs a
+      # single test run at a time. Running two jobs in parallel made the second
+      # collide with the first's in-progress run ("Cannot run new test while
+      # another test run is in progress" / SQLite "database is locked"), and the
+      # per-job retry window (~30s) is far shorter than a run (~30min), so the
+      # loser always failed. One at a time avoids the contention entirely.
+      max-parallel: 1
       matrix:
         suite_id:
           [
