@@ -1,15 +1,20 @@
 //! SQL-on-FHIR runner abstraction.
 //!
-//! This module defines the [`SofRunner`] trait, implemented by per-backend
-//! **in-DB runners** that compile a [`ViewDefinition`] to SQL and execute it
-//! directly inside the storage backend, skipping FHIRPath evaluation entirely.
-//! Two implementations exist today: one for SQLite and one for PostgreSQL.
-//! Backends advertise the capability via [`BackendCapability::InDbSofRunner`].
+//! This module defines the [`SofRunner`] trait, implemented per-backend. Two
+//! strategies exist:
 //!
-//! There is no in-process FHIRPath fallback — if the configured backend does
-//! not provide a runner, the `$viewdefinition-run` handler returns
-//! `501 Not Implemented`. Inline `resource:` parameters are materialised into
-//! a transient in-memory SQLite backend so they reuse the same in-DB pipeline.
+//! - **In-DB runners** compile a [`ViewDefinition`] to a native query executed
+//!   inside the storage backend, skipping FHIRPath evaluation entirely: SQLite
+//!   and PostgreSQL compile to SQL, MongoDB compiles to an aggregation pipeline.
+//! - **In-process runners** stream the resources out of a backend that has no
+//!   query engine (S3 object storage, and S3-primary composites) and evaluate
+//!   the view with the `helios-sof` FHIRPath engine
+//!   ([`InProcessSofRunner`](crate::sof::in_process::InProcessSofRunner)).
+//!
+//! If the configured backend provides no runner at all, the
+//! `$viewdefinition-run` handler returns `501 Not Implemented`. Inline
+//! `resource:` parameters are materialised into a transient in-memory SQLite
+//! backend so they reuse the same in-DB pipeline.
 //!
 //! The handler layer streams the result rows directly into the HTTP response.
 

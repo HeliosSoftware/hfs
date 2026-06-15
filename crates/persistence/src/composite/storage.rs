@@ -48,9 +48,9 @@ use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
     IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatchFormat, PatientExportProvider,
-    ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, StorageCapabilities,
-    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
-    VersionedStorage,
+    ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
+    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
@@ -713,6 +713,14 @@ impl CompositeStorage {
 impl ResourceStorage for CompositeStorage {
     fn backend_name(&self) -> &'static str {
         "composite"
+    }
+
+    fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        // SQL-on-FHIR runs as in-DB SQL against the primary store (where all
+        // writes land), so delegate to the primary backend. Composites whose
+        // primary is SOF-capable (e.g. sqlite-elasticsearch) thus expose a
+        // runner; others inherit `None`.
+        self.primary.sof_runner()
     }
 
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
