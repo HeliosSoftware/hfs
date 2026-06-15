@@ -87,7 +87,7 @@ Liquid Glass automatically where supported.
 | Overview | ✅ Live — capability tiles from `/metadata`, refresh |
 | Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector, create/update/delete |
 | Search | ⏳ Scaffold placeholder |
-| Bulk Jobs | ✅ Live — `$export` kick-off (system/patient/group, `_type`/`_since`), auto-polling, manifest `Table`, cancel |
+| Bulk Jobs | ✅ Live — `$export` kick-off (system/patient/group, `_type`/`_since`), background auto-polling, manifest `Table`, output-file download, cancel |
 | Audit | ⛔️ Deferred — HFS records audit events to a write-only sink (reserved `__system__` tenant, not routable), so there is no REST endpoint to read them. Revisit when HFS exposes AuditEvent. |
 | Subscriptions | ✅ Live — list/filter by status, create (JSON editor), inspect (channel/endpoint/topic + JSON), delete |
 
@@ -118,11 +118,12 @@ Done:
    `UserDefaults` — the Keychain is its future home.
 9. ✅ **Bulk Jobs** (`$export`): `HFSBulkDataOperations` implements async
    kick-off (system/patient/group, with `_type`/`_since`), status polling
-   (`202` vs `200` manifest), and cancel. The screen kicks off exports, tracks
-   jobs with a custom `HFSJobStatusBadge`, auto-polls running jobs, and renders
-   the completed manifest in a first-party `Table`. Job state is view-local for
-   now (resets on navigation away); promoting it to `HFSAppModel` is a
-   follow-up.
+   (`202` vs `200` manifest), file download, and cancel. The screen kicks off
+   exports, tracks jobs with a custom `HFSJobStatusBadge`, and renders the
+   completed manifest in a first-party `Table` with per-file download via
+   `.fileExporter`. Job state lives in `HFSAppModel`, so jobs survive navigating
+   away and a background poller keeps running jobs up to date regardless of the
+   visible screen.
 10. ✅ **Subscriptions**: `HFSSubscriptionOperations` searches `Subscription`
     resources (status filter, pagination) and parses channel/endpoint/topic
     version-agnostically (R4 `channel.*`/`criteria`, R5 `channelType`/`endpoint`/
