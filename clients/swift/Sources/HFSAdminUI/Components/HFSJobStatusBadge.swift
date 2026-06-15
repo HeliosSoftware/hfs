@@ -1,10 +1,6 @@
 import SwiftUI
 
-/// A small colored capsule that summarizes a job's lifecycle state.
-///
-/// Custom because SwiftUI has no first-party "status pill"; it is composed from
-/// first-party primitives (`Label`, `Capsule`, `.tint`) so it still adopts the
-/// system palette and Dynamic Type.
+/// An export-job status pill, mapping `BulkExportJob` state onto `HFSStatusBadge`.
 struct HFSJobStatusBadge: View {
     enum Kind {
         case running
@@ -45,26 +41,12 @@ struct HFSJobStatusBadge: View {
     var detail: String?
 
     var body: some View {
-        Label {
-            Text(label)
-                .font(.caption.weight(.medium))
-        } icon: {
-            Image(systemName: kind.systemImage)
-                .symbolRenderingMode(.hierarchical)
-                .imageScale(.small)
-        }
-        .labelStyle(.titleAndIcon)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(kind.tint.opacity(0.15), in: Capsule())
-        .foregroundStyle(kind.tint)
-    }
-
-    private var label: String {
-        if let detail, !detail.isEmpty {
-            return "\(kind.title) · \(detail)"
-        }
-        return kind.title
+        HFSStatusBadge(
+            title: kind.title,
+            systemImage: kind.systemImage,
+            tint: kind.tint,
+            detail: detail
+        )
     }
 }
 

@@ -1,29 +1,13 @@
 import HFSOperations
 import SwiftUI
 
-/// A small colored capsule that conveys a `Subscription.status`.
-///
-/// Custom because SwiftUI has no first-party status pill; it is composed from
-/// first-party primitives (`Label`, `Capsule`, `.tint`) so it still adopts the
-/// system palette and Dynamic Type. Sibling of `HFSJobStatusBadge`.
+/// A subscription status pill, mapping `Subscription.status` onto `HFSStatusBadge`.
 struct HFSSubscriptionStatusBadge: View {
     /// The parsed status, or `nil` when the subscription has an unknown code.
     let status: SubscriptionStatus?
 
     var body: some View {
-        Label {
-            Text(title)
-                .font(.caption.weight(.medium))
-        } icon: {
-            Image(systemName: systemImage)
-                .symbolRenderingMode(.hierarchical)
-                .imageScale(.small)
-        }
-        .labelStyle(.titleAndIcon)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(tint.opacity(0.15), in: Capsule())
-        .foregroundStyle(tint)
+        HFSStatusBadge(title: title, systemImage: systemImage, tint: tint)
     }
 
     private var title: String { status?.label ?? "Unknown" }
