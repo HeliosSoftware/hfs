@@ -34,6 +34,17 @@ public actor HFSClient {
         return data
     }
 
+    /// Like ``send(_:)`` but also returns the `HTTPURLResponse`, for callers that
+    /// need the status code or response headers (e.g. the async `$export`
+    /// kick-off `Content-Location` and the poll's `202` vs `200`).
+    public func sendReturningResponse(
+        _ request: URLRequest
+    ) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await transport.send(request)
+        try validate(response)
+        return (data, response)
+    }
+
     public func makeRequest(
         pathComponents: [String],
         queryItems: [URLQueryItem] = [],
