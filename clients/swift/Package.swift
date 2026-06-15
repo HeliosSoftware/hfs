@@ -63,6 +63,7 @@ let package = Package(
                 "HFSCore",
                 "HFSFHIR",
                 "HFSHTTP",
+                "HFSAuth",
                 "HFSClient",
                 "HFSOperations"
             ]
