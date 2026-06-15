@@ -18,3 +18,6 @@ off
 
 # Test artifacts
 /test-artifacts
+
+# Bulk export output (written by the hfs server at runtime)
+/data/exports/
