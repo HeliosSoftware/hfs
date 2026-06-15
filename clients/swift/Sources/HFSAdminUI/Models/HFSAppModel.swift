@@ -75,6 +75,12 @@ public final class HFSAppModel {
     /// The connected client, available to feature screens once connected.
     public private(set) var client: HFSClient?
 
+    /// Tracked Bulk Data export jobs, owned here so they survive navigating away
+    /// from the Bulk Jobs screen and keep polling while running. Internal: the
+    /// `BulkExportJob` type is internal to this UI module.
+    private(set) var exportJobs: [BulkExportJob] = []
+    private var exportPollTask: Task<Void, Never>?
+
     private let transport: HFSHTTPTransport
     private let defaults: UserDefaults
     private var canPersist = false
@@ -226,6 +232,105 @@ public final class HFSAppModel {
         client.map(HFSSubscriptionOperations.init)
     }
 
+    // MARK: - Bulk export jobs
+
+    /// Kicks off an export, tracks it in ``exportJobs``, and starts polling.
+    /// Returns an error message on failure, or `nil` on success (the new job is
+    /// then `exportJobs.first`).
+    func startExport(
+        level: BulkExportLevel,
+        groupID: String?,
+        types: [String],
+        since: String?
+    ) async -> String? {
+        guard let operations = bulkDataOperations() else { return "Not connected to a server." }
+        do {
+            let kickoff = try await operations.kickOff(
+                level: level,
+                groupID: groupID,
+                types: types,
+                since: since
+            )
+            let job = BulkExportJob(
+                level: level,
+                groupID: groupID,
+                types: types,
+                since: since,
+                statusURL: kickoff.statusURL,
+                startedAt: Date(),
+                state: .running(progress: nil)
+            )
+            exportJobs.insert(job, at: 0)
+            await pollExportJob(job.id)
+            ensureExportPolling()
+            return nil
+        } catch {
+            return Self.describe(error)
+        }
+    }
+
+    /// Polls one running job's status URL and updates its state.
+    func pollExportJob(_ id: BulkExportJob.ID) async {
+        guard
+            let operations = bulkDataOperations(),
+            let job = exportJobs.first(where: { $0.id == id }),
+            job.isRunning
+        else { return }
+
+        do {
+            switch try await operations.status(url: job.statusURL) {
+            case .inProgress(let progress):
+                updateExportState(id, .running(progress: progress))
+            case .complete(let manifest):
+                updateExportState(id, .completed(manifest))
+            }
+        } catch {
+            updateExportState(id, .failed(Self.describe(error)))
+        }
+    }
+
+    /// Polls every running job once.
+    func pollRunningExportJobs() async {
+        for job in exportJobs where job.isRunning {
+            await pollExportJob(job.id)
+        }
+    }
+
+    /// Cancels and deletes a job via its status URL.
+    func cancelExportJob(_ id: BulkExportJob.ID) async {
+        guard
+            let operations = bulkDataOperations(),
+            let job = exportJobs.first(where: { $0.id == id })
+        else { return }
+
+        do {
+            try await operations.cancel(url: job.statusURL)
+            updateExportState(id, .cancelled)
+        } catch {
+            updateExportState(id, .failed(Self.describe(error)))
+        }
+    }
+
+    /// Starts a background poller (if not already running) that refreshes running
+    /// jobs every couple seconds, independent of which screen is visible.
+    private func ensureExportPolling() {
+        guard exportPollTask == nil else { return }
+        exportPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self else { return }
+                if self.exportJobs.contains(where: \.isRunning) {
+                    await self.pollRunningExportJobs()
+                }
+            }
+        }
+    }
+
+    private func updateExportState(_ id: BulkExportJob.ID, _ state: BulkExportJob.State) {
+        guard let index = exportJobs.firstIndex(where: { $0.id == id }) else { return }
+        exportJobs[index].state = state
+    }
+
     /// Re-fetches `/metadata` for the connected server and refreshes the Overview.
     public func refreshOverview() async {
         guard let client else {
@@ -254,6 +359,11 @@ public final class HFSAppModel {
         overviewError = nil
         resourceTypes = []
         connectionState = .disconnected
+
+        // Export jobs belong to a connection; stop polling and drop them.
+        exportPollTask?.cancel()
+        exportPollTask = nil
+        exportJobs = []
     }
 
     private static func parseCapability(
