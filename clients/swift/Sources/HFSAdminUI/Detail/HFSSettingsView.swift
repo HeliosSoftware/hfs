@@ -38,6 +38,26 @@ struct HFSSettingsView: View {
             }
 
             Section {
+                SecureField(
+                    "Bearer Token",
+                    text: $model.accessToken,
+                    prompt: Text("Leave empty for unsecured servers")
+                )
+                #if !os(macOS)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                #endif
+            } header: {
+                Text("Authentication")
+            } footer: {
+                Text(
+                    "Sent as an Authorization: Bearer header. Leave empty to connect "
+                        + "without auth. The token is kept for this session only and is "
+                        + "not saved to disk."
+                )
+            }
+
+            Section {
                 Toggle("Connect on launch", isOn: $model.autoConnect)
             } footer: {
                 Text("Server settings are saved automatically and restored next time.")
@@ -46,6 +66,16 @@ struct HFSSettingsView: View {
             Section("Status") {
                 LabeledContent("Connection") {
                     connectionStatusLabel
+                }
+
+                LabeledContent("Auth") {
+                    if model.hasAccessToken {
+                        Label("Bearer token", systemImage: "lock.fill")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Label("None", systemImage: "lock.open")
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 if let serverName = model.serverName {
