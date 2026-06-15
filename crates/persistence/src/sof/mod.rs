@@ -12,8 +12,12 @@
 //!    `compile_view_definition_dialect`, the entry point used by the runners.
 //!
 //! Backend runners:
-//! - [`sqlite`] — [`SqliteInDbRunner`] implementing [`SofRunner`] for SQLite.
-//! - [`postgres`] — [`PgInDbRunner`] implementing [`SofRunner`] for PostgreSQL.
+//! - [`sqlite`] — `SqliteInDbRunner` (SQL) for SQLite.
+//! - [`postgres`] — `PgInDbRunner` (SQL) for PostgreSQL.
+//! - [`mongodb`] — `MongoInDbRunner` (aggregation pipeline) for MongoDB.
+//! - [`in_process`] — `InProcessSofRunner`, a backend-agnostic runner that
+//!   evaluates the view with the `helios-sof` engine over scanned resources
+//!   (used by S3 / S3-primary composites, which have no query engine).
 //!
 //! Inline `resource:` parameters on `$viewdefinition-run` are handled by the
 //! REST layer via the in-process `helios-sof` FHIRPath evaluator, so this
@@ -24,6 +28,7 @@ pub mod compile_view;
 pub mod compiler;
 pub mod dialect;
 pub mod emit;
+pub mod in_process;
 pub mod ir;
 
 #[cfg(feature = "sqlite")]
@@ -34,6 +39,12 @@ pub mod sqlite_udfs;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+
+#[cfg(feature = "mongodb")]
+pub mod emit_mongo;
+
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 
 use helios_fhir::FhirVersion;
 

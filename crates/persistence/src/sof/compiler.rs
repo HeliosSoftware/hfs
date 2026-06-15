@@ -1,12 +1,14 @@
-//! ViewDefinition → SQL compiler (SQLite and PostgreSQL dialects).
+//! ViewDefinition compiler (SQLite/PostgreSQL SQL and MongoDB pipelines).
 //!
 //! Thin façade over the IR-based pipeline:
 //!
 //! 1. [`build_plan`] walks the ViewDefinition JSON and produces a
 //!    [`PlanNode`](super::ir::PlanNode) tree plus the resolved
-//!    `ViewDefinition.constant[]` values.
-//! 2. [`emit_plan`] lowers the plan to dialect-appropriate SQL via the
-//!    [`Dialect`] trait.
+//!    `ViewDefinition.constant[]` values. The [`CompileTarget`] tunes
+//!    target-specific lowering (e.g. trailing-`[N]` forEach).
+//! 2. The emitter lowers the plan to the target form: [`emit_plan`] for SQL via
+//!    the [`Dialect`] trait, or [`emit_mongo`](super::emit_mongo::emit_mongo)
+//!    for a MongoDB aggregation pipeline.
 //!
 //! Returns [`SofError::Uncompilable`] for FHIRPath constructs the in-DB
 //! pipeline doesn't yet handle (e.g. `where(crit)` chains, the boundary
@@ -32,6 +34,35 @@ pub enum SqlDialect {
     Postgres,
 }
 
+/// Backend a ViewDefinition is being compiled for. Drives target-specific
+/// lowering decisions in [`build_plan`] (e.g. whether trailing-`[N]` forEach
+/// paths may use a correlated subquery) and selects the emitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileTarget {
+    /// SQLite SQL emitter.
+    Sqlite,
+    /// PostgreSQL SQL emitter.
+    Postgres,
+    /// MongoDB aggregation-pipeline emitter.
+    #[cfg(feature = "mongodb")]
+    Mongo,
+}
+
+impl CompileTarget {
+    /// Whether the target can index a flattened collection via a correlated
+    /// subquery in `FROM`. SQL backends can (`ScalarFromChain`); the MongoDB
+    /// emitter instead carries `flat_index` on the unnest and lowers it to
+    /// `$arrayElemAt`, so `build_plan` must NOT produce `ScalarFromChain` nodes
+    /// for it.
+    pub(super) fn supports_correlated_from_subqueries(self) -> bool {
+        match self {
+            CompileTarget::Sqlite | CompileTarget::Postgres => true,
+            #[cfg(feature = "mongodb")]
+            CompileTarget::Mongo => false,
+        }
+    }
+}
+
 /// Output of a successful ViewDefinition compilation.
 #[derive(Debug, Clone)]
 pub struct CompiledQuery {
@@ -45,6 +76,33 @@ pub struct CompiledQuery {
     /// Resolved `ViewDefinition.constant[]` values, in allocation order.
     /// Bound by the runners as `$3..` / `?3..` after `tenant_id` and
     /// `resource_type`.
+    pub constants: Vec<super::ir::LitValue>,
+}
+
+/// Compiled SQL-on-FHIR view, in the form the target backend executes:
+/// parameterised SQL, or a MongoDB aggregation pipeline.
+#[derive(Debug, Clone)]
+pub enum CompiledView {
+    /// SQL text + bind constants for the SQLite / PostgreSQL runners.
+    Sql(CompiledQuery),
+    /// Aggregation pipeline for the MongoDB runner.
+    #[cfg(feature = "mongodb")]
+    Mongo(CompiledPipeline),
+}
+
+/// Output of compiling a ViewDefinition to a MongoDB aggregation pipeline.
+#[cfg(feature = "mongodb")]
+#[derive(Debug, Clone)]
+pub struct CompiledPipeline {
+    /// Aggregation stages, ready to pass to `Collection::aggregate`. The leading
+    /// `$match` already constrains `tenant_id`/`resource_type`/`is_deleted`.
+    pub pipeline: Vec<mongodb::bson::Document>,
+    /// Column names in `select` order (the keys of the final `$project`).
+    pub columns: Vec<String>,
+    /// Resolved `ViewDefinition.constant[]` values, in allocation order.
+    ///
+    /// MongoDB has no out-of-band bind parameters, so the emitter inlines these
+    /// as BSON literals; they are surfaced here for parity/diagnostics only.
     pub constants: Vec<super::ir::LitValue>,
 }
 
@@ -83,14 +141,73 @@ pub fn compile_view_definition_dialect(
     dialect: SqlDialect,
     fhir_version: FhirVersion,
 ) -> Result<CompiledQuery, SofError> {
-    let dial = dialect_for(dialect);
-    let (plan, constants) = build_plan(view_json, dial.as_ref(), fhir_version)?;
-    let emitted = emit_plan(&plan, dial.as_ref())?;
-    Ok(CompiledQuery {
-        sql: emitted.sql,
-        columns: emitted.columns,
-        constants,
-    })
+    let target = match dialect {
+        SqlDialect::Sqlite => CompileTarget::Sqlite,
+        SqlDialect::Postgres => CompileTarget::Postgres,
+    };
+    match compile_view_target(view_json, target, fhir_version)? {
+        CompiledView::Sql(q) => Ok(q),
+        #[cfg(feature = "mongodb")]
+        CompiledView::Mongo(_) => unreachable!("SQL dialect never compiles to a Mongo pipeline"),
+    }
+}
+
+/// Compiles a ViewDefinition for an arbitrary [`CompileTarget`], returning the
+/// target-appropriate [`CompiledView`]. Single funnel through [`build_plan`]
+/// so every target shares the JSON→IR lowering.
+fn compile_view_target(
+    view_json: &Value,
+    target: CompileTarget,
+    fhir_version: FhirVersion,
+) -> Result<CompiledView, SofError> {
+    match target {
+        CompileTarget::Sqlite | CompileTarget::Postgres => {
+            let dialect = if target == CompileTarget::Postgres {
+                SqlDialect::Postgres
+            } else {
+                SqlDialect::Sqlite
+            };
+            let dial = dialect_for(dialect);
+            let (plan, constants) = build_plan(view_json, dial.as_ref(), target, fhir_version)?;
+            let emitted = emit_plan(&plan, dial.as_ref())?;
+            Ok(CompiledView::Sql(CompiledQuery {
+                sql: emitted.sql,
+                columns: emitted.columns,
+                constants,
+            }))
+        }
+        #[cfg(feature = "mongodb")]
+        CompileTarget::Mongo => {
+            // The dialect is unused on the Mongo path (build_plan only consults
+            // it inside the correlated-subquery lowering, which Mongo skips), so
+            // a SQLite dialect serves purely as a never-called placeholder.
+            let dial = dialect_for(SqlDialect::Sqlite);
+            let (plan, constants) = build_plan(view_json, dial.as_ref(), target, fhir_version)?;
+            let emitted = super::emit_mongo::emit_mongo(&plan, &constants)?;
+            Ok(CompiledView::Mongo(CompiledPipeline {
+                pipeline: emitted.pipeline,
+                columns: emitted.columns,
+                constants,
+            }))
+        }
+    }
+}
+
+/// Compiles a raw ViewDefinition JSON value into a MongoDB aggregation pipeline.
+///
+/// # Errors
+///
+/// Returns [`SofError::Uncompilable`] for constructs the Mongo emitter does not
+/// yet support (e.g. `lowBoundary`/`highBoundary`, `repeat:`, collections).
+#[cfg(feature = "mongodb")]
+pub fn compile_view_definition_mongo(
+    view_json: &Value,
+    fhir_version: FhirVersion,
+) -> Result<CompiledPipeline, SofError> {
+    match compile_view_target(view_json, CompileTarget::Mongo, fhir_version)? {
+        CompiledView::Mongo(p) => Ok(p),
+        CompiledView::Sql(_) => unreachable!("Mongo target never compiles to SQL"),
+    }
 }
 
 // ============================================================================
