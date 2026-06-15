@@ -1,4 +1,5 @@
 import Foundation
+import HFSAuth
 import HFSClient
 import HFSCore
 import HFSFHIR
@@ -52,6 +53,14 @@ public final class HFSAppModel {
     /// When enabled, the app probes the saved server automatically on launch.
     public var autoConnect: Bool { didSet { persistSettings() } }
 
+    /// Optional bearer token for secured servers, sent as `Authorization: Bearer`.
+    ///
+    /// Session-only by design: it is **never** written to `UserDefaults`, since a
+    /// plist is not an appropriate store for a secret. A blank/whitespace value
+    /// disables auth entirely (no header), so unsecured local servers are
+    /// unaffected. A future step can promote this to Keychain alongside SMART.
+    public var accessToken: String = ""
+
     /// Live connection state, updated by ``connect()`` / ``disconnect()``.
     public private(set) var connectionState: ConnectionState = .disconnected
 
@@ -82,11 +91,13 @@ public final class HFSAppModel {
         tenantIdentifier: String = "",
         fhirVersion: HFSFHIRVersion = .r4,
         autoConnect: Bool = true,
+        accessToken: String = "",
         transport: HFSHTTPTransport = URLSessionHFSHTTPTransport(),
         defaults: UserDefaults = .standard
     ) {
         self.transport = transport
         self.defaults = defaults
+        self.accessToken = accessToken
 
         // Restore persisted settings, falling back to the provided defaults.
         self.serverURLString = defaults.string(forKey: DefaultsKey.serverURL) ?? serverURLString
@@ -138,6 +149,23 @@ public final class HFSAppModel {
         return trimmed.isEmpty ? "default" : trimmed
     }
 
+    /// Whether a non-empty bearer token is configured for the next connection.
+    public var hasAccessToken: Bool {
+        !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Builds the access-token provider for the current settings.
+    ///
+    /// A blank or whitespace-only token yields ``NoAccessTokenProvider``, which
+    /// sends no `Authorization` header at all — identical to the unauthenticated
+    /// behavior, so unsecured local servers keep working unchanged.
+    func makeTokenProvider() -> any HFSAccessTokenProvider {
+        let trimmed = accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty
+            ? NoAccessTokenProvider()
+            : StaticAccessTokenProvider(token: trimmed)
+    }
+
     /// Validates the configured URL, builds a client, and probes `/metadata`.
     public func connect() async {
         guard !isConnecting else { return }
@@ -162,7 +190,11 @@ public final class HFSAppModel {
             tenant: HFSTenantContext(identifier: trimmedTenant.isEmpty ? nil : trimmedTenant),
             defaultFHIRVersion: fhirVersion
         )
-        let client = HFSClient(configuration: configuration, transport: transport)
+        let client = HFSClient(
+            configuration: configuration,
+            transport: transport,
+            tokenProvider: makeTokenProvider()
+        )
 
         do {
             let capability = try await client.capabilityStatement()
