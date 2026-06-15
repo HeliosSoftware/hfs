@@ -10,6 +10,11 @@ rust-version.workspace = true
 description = "Helios Terminology Server — FHIR Terminology Operations"
 keywords = ["helios-software", "hl7", "fhir", "terminology", "healthcare"]
 categories = ["web-programming"]
+# Bundled terminology archives (~148 MiB: VSAC, PHINVADS, ICD-10-CM, SNOMED,
+# HL7 packages, etc.) are runtime bootstrap/import data, not compile-time
+# inputs. Excluding them keeps the published crate under crates.io's upload
+# limit; operators mount this data at runtime (see config.rs / main.rs).
+exclude = ["terminology-data/**"]
 
 [lib]
 name = "helios_hts"
