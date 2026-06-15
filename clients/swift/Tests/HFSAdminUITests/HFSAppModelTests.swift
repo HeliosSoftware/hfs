@@ -190,6 +190,72 @@ final class HFSAppModelTests: XCTestCase {
         XCTAssertEqual(restored.serverURLString, "https://saved.example.com")
     }
 
+    // MARK: - Authentication
+
+    func testConnectWithoutTokenSendsNoAuthorizationHeader() async {
+        let json = Data(#"{"resourceType":"CapabilityStatement"}"#.utf8)
+        let transport = CapturingTransport(statusCode: 200, data: json)
+        let model = HFSAppModel(
+            serverURLString: "http://localhost:8080",
+            transport: transport,
+            defaults: Self.ephemeralDefaults()
+        )
+
+        await model.connect()
+
+        XCTAssertTrue(model.isConnected)
+        XCTAssertFalse(model.hasAccessToken)
+        XCTAssertNil(transport.lastRequest?.value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testBlankTokenIsTreatedAsNoAuth() async {
+        let json = Data(#"{"resourceType":"CapabilityStatement"}"#.utf8)
+        let transport = CapturingTransport(statusCode: 200, data: json)
+        let model = HFSAppModel(
+            serverURLString: "http://localhost:8080",
+            accessToken: "   ",
+            transport: transport,
+            defaults: Self.ephemeralDefaults()
+        )
+
+        await model.connect()
+
+        XCTAssertFalse(model.hasAccessToken)
+        XCTAssertNil(transport.lastRequest?.value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testConnectWithTokenSendsBearerHeader() async {
+        let json = Data(#"{"resourceType":"CapabilityStatement"}"#.utf8)
+        let transport = CapturingTransport(statusCode: 200, data: json)
+        let model = HFSAppModel(
+            serverURLString: "http://localhost:8080",
+            accessToken: "secret-token",
+            transport: transport,
+            defaults: Self.ephemeralDefaults()
+        )
+
+        await model.connect()
+
+        XCTAssertTrue(model.isConnected)
+        XCTAssertTrue(model.hasAccessToken)
+        XCTAssertEqual(
+            transport.lastRequest?.value(forHTTPHeaderField: "Authorization"),
+            "Bearer secret-token"
+        )
+    }
+
+    func testAccessTokenIsNotPersisted() {
+        let defaults = Self.ephemeralDefaults()
+
+        let first = HFSAppModel(defaults: defaults)
+        first.accessToken = "secret-token"
+
+        // A bearer token is session-only and must never be restored from disk.
+        let second = HFSAppModel(defaults: defaults)
+        XCTAssertEqual(second.accessToken, "")
+        XCTAssertFalse(second.hasAccessToken)
+    }
+
     private static func ephemeralDefaults() -> UserDefaults {
         UserDefaults(suiteName: "hfs.tests.\(UUID().uuidString)")!
     }
@@ -200,6 +266,31 @@ private struct StubTransport: HFSHTTPTransport {
     let data: Data
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let url = request.url ?? URL(string: "http://localhost")!
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: statusCode,
+            httpVersion: nil,
+            headerFields: nil
+        )!
+        return (data, response)
+    }
+}
+
+/// A transport that records the most recent request so tests can assert on the
+/// headers the client produced (e.g. `Authorization`).
+private final class CapturingTransport: HFSHTTPTransport, @unchecked Sendable {
+    let statusCode: Int
+    let data: Data
+    private(set) var lastRequest: URLRequest?
+
+    init(statusCode: Int, data: Data) {
+        self.statusCode = statusCode
+        self.data = data
+    }
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        lastRequest = request
         let url = request.url ?? URL(string: "http://localhost")!
         let response = HTTPURLResponse(
             url: url,
