@@ -117,7 +117,11 @@ use std::sync::Arc;
 /// ```
 pub struct EvaluationContext {
     /// The FHIR resources being evaluated (available for context access)
-    pub resources: Vec<FhirResource>,
+    /// Shared via `Arc` so resources survive context cloning (`FhirResource` is
+    /// not `Clone`, but `Arc` clones cheaply by ref-count). This lets lambda
+    /// scopes (`where()`, `select()`, …), which run in child contexts, still see
+    /// the root resources for `%context`, `%resource`, and `resolve()`.
+    pub resources: Arc<Vec<FhirResource>>,
 
     /// The FHIR version being used for type checking and resource validation
     pub fhir_version: FhirVersion,
@@ -167,9 +171,9 @@ pub struct EvaluationContext {
 impl Clone for EvaluationContext {
     fn clone(&self) -> Self {
         EvaluationContext {
-            // Resources cannot be cloned, so child contexts start with empty resources
-            // This is a limitation but doesn't affect typical usage patterns
-            resources: Vec::new(),
+            // Resources are shared via Arc, so clones (and the child/parent chain)
+            // keep visibility of the root resources.
+            resources: self.resources.clone(),
             fhir_version: self.fhir_version,
             variables: self.variables.clone(),
             this: self.this.clone(),
@@ -233,7 +237,7 @@ impl EvaluationContext {
         let this = resources.first().map(convert_resource_to_result);
 
         Self {
-            resources,
+            resources: Arc::new(resources),
             fhir_version,
             variables: HashMap::new(),
             this,
@@ -266,7 +270,7 @@ impl EvaluationContext {
         let this = resources.first().map(convert_resource_to_result);
 
         Self {
-            resources,
+            resources: Arc::new(resources),
             fhir_version,
             variables: HashMap::new(),
             this,
@@ -296,7 +300,7 @@ impl EvaluationContext {
     /// A new empty `EvaluationContext` instance
     pub fn new_empty(fhir_version: FhirVersion) -> Self {
         Self {
-            resources: Vec::new(),
+            resources: Arc::new(Vec::new()),
             fhir_version,
             variables: HashMap::new(),
             this: None,
@@ -409,7 +413,14 @@ impl EvaluationContext {
     ///
     /// * `resource` - The FHIR resource to add to the context
     pub fn add_resource(&mut self, resource: FhirResource) {
-        self.resources.push(resource);
+        // Resources are shared via Arc and FhirResource is not Clone, so we can't
+        // copy-on-write. Require sole ownership — true for all call sites, which
+        // add resources at setup time before any context cloning occurs.
+        Arc::get_mut(&mut self.resources)
+            .expect(
+                "add_resource requires sole ownership of the resources Arc (call before cloning)",
+            )
+            .push(resource);
     }
 
     /// Sets a variable in the context to a string value
@@ -506,14 +517,12 @@ impl EvaluationContext {
     ///
     /// A new `EvaluationContext` with this context as its parent
     pub fn create_child_context(&self) -> EvaluationContext {
-        // Resources are not cloned in parent context to avoid Clone requirement
-        // Child context will maintain its own reference to resources
-        // This is a limitation of the current architecture but doesn't affect
-        // functionality since resources are typically only accessed from the
-        // active context, not parent contexts
+        // Resources are shared via Arc so the child (used for lambda bodies like
+        // where()/select()) still sees the root resources — needed for %context,
+        // %resource, and resolve() inside lambdas.
 
         EvaluationContext {
-            resources: Vec::new(), // Child starts with empty resources
+            resources: self.resources.clone(), // Cheap Arc clone — shares root resources
             fhir_version: self.fhir_version,
             variables: HashMap::new(), // Start with empty variables in child
             this: self.this.clone(),
@@ -1547,8 +1556,11 @@ fn evaluate_term(
             // Handle variables (%var, %context) next and return
             if let Invocation::Member(name) = invocation {
                 if let Some(var_name) = name.strip_prefix('%') {
-                    if var_name == "context" {
-                        // Return %context value
+                    if var_name == "context" || var_name == "resource" || var_name == "rootResource"
+                    {
+                        // Return %context / %resource / %rootResource value. In this
+                        // engine all three resolve to the resource(s) in scope: the
+                        // root resource being evaluated.
                         // Correctly wrap the entire conditional result in Ok()
                         return Ok(if context.resources.is_empty() {
                             EvaluationResult::Empty
@@ -1663,8 +1675,9 @@ fn evaluate_term(
         Term::Literal(literal) => Ok(evaluate_literal(literal)), // Wrap in Ok
         Term::ExternalConstant(name) => {
             // Look up external constant in the context
-            // Special handling for %context
-            if name == "context" {
+            // Special handling for %context / %resource / %rootResource — all
+            // resolve to the resource(s) currently in scope.
+            if name == "context" || name == "resource" || name == "rootResource" {
                 Ok(if context.resources.is_empty() {
                     EvaluationResult::Empty
                 } else if context.resources.len() == 1 {
@@ -1853,7 +1866,15 @@ fn evaluate_invocation_with_context(
                     };
 
                     // Check if trying to override system variables
-                    let system_vars = ["%context", "%ucum", "%sct", "%loinc", "%vs"];
+                    let system_vars = [
+                        "%context",
+                        "%resource",
+                        "%rootResource",
+                        "%ucum",
+                        "%sct",
+                        "%loinc",
+                        "%vs",
+                    ];
                     if system_vars.contains(&var_name.as_str()) {
                         return Err(EvaluationError::SemanticError(format!(
                             "Cannot override system variable '{}'",
@@ -2534,7 +2555,15 @@ fn evaluate_invocation(
                     };
 
                     // Check if trying to override system variables
-                    let system_vars = ["%context", "%ucum", "%sct", "%loinc", "%vs"];
+                    let system_vars = [
+                        "%context",
+                        "%resource",
+                        "%rootResource",
+                        "%ucum",
+                        "%sct",
+                        "%loinc",
+                        "%vs",
+                    ];
                     if system_vars.contains(&var_name.as_str()) {
                         return Err(EvaluationError::SemanticError(format!(
                             "Cannot override system variable '{}'",
@@ -6286,6 +6315,16 @@ fn call_function(
             // Delegate to the reference key functions module
             crate::reference_key_functions::get_reference_key_function(invocation_base, args)
         }
+        "resolve" => {
+            // Dereference a Reference (or reference string) to the resource it points
+            // to, searching resources in scope (context + contained).
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'resolve' expects 0 arguments".to_string(),
+                ));
+            }
+            crate::resolve_function::resolve_function(invocation_base, context)
+        }
         "hasValue" => {
             // hasValue() returns true if the element is a primitive with an actual value
             // Returns false if element is empty or is a primitive with extensions but no value
@@ -6529,6 +6568,7 @@ fn call_function(
                 "highBoundary",
                 "getResourceKey",
                 "getReferenceKey",
+                "resolve",
                 "sum",
                 "min",
                 "max",

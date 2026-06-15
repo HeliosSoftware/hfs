@@ -287,6 +287,7 @@ mod polymorphic_access;
 mod reference_key_functions;
 mod repeat_all_function;
 mod repeat_function;
+mod resolve_function;
 mod resource_type;
 mod set_operations;
 mod subset_functions;
