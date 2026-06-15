@@ -165,6 +165,12 @@ public struct HFSBulkDataOperations: Sendable {
         _ = try await client.send(request)
     }
 
+    /// Downloads the raw bytes of a manifest output file (NDJSON).
+    public func downloadFile(url: URL) async throws -> Data {
+        let request = try await client.makeRequest(url: url)
+        return try await client.send(request)
+    }
+
     static func parseManifest(_ data: Data) throws -> BulkExportManifest {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw HFSClientError.decoding("Expected an export manifest object.")
