@@ -87,7 +87,7 @@ Liquid Glass automatically where supported.
 | Overview | ✅ Live — capability tiles from `/metadata`, refresh |
 | Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector, create/update/delete |
 | Search | ⏳ Scaffold placeholder |
-| Bulk Jobs | ⏳ Scaffold placeholder |
+| Bulk Jobs | ✅ Live — `$export` kick-off (system/patient/group, `_type`/`_since`), auto-polling, manifest `Table`, cancel |
 | Audit | ⏳ Scaffold placeholder |
 | Subscriptions | ⏳ Scaffold placeholder |
 
@@ -116,14 +116,21 @@ Done:
    `NoAccessTokenProvider` (no `Authorization` header at all), so unsecured
    servers are unchanged. The token is deliberately **not** persisted to
    `UserDefaults` — the Keychain is its future home.
+9. ✅ **Bulk Jobs** (`$export`): `HFSBulkDataOperations` implements async
+   kick-off (system/patient/group, with `_type`/`_since`), status polling
+   (`202` vs `200` manifest), and cancel. The screen kicks off exports, tracks
+   jobs with a custom `HFSJobStatusBadge`, auto-polls running jobs, and renders
+   the completed manifest in a first-party `Table`. Job state is view-local for
+   now (resets on navigation away); promoting it to `HFSAppModel` is a
+   follow-up.
 
 Coming next:
 
-9. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
-10. ⏭️ **SMART-on-FHIR** discovery, building on the existing token-provider
+10. ⏭️ Remaining operations screens: Audit, Subscriptions.
+11. ⏭️ **SMART-on-FHIR** discovery, building on the existing token-provider
    abstraction (currently static bearer tokens only).
-11. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
-12. ⏭️ A dedicated Search screen — only if it adds cross-type search,
+12. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
+13. ⏭️ A dedicated Search screen — only if it adds cross-type search,
    `_include`/`_revinclude`, or sorting beyond the in-place Resources search.
 
 ## Building
