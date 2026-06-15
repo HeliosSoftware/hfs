@@ -151,6 +151,62 @@ final class HFSOperationsTests: XCTestCase {
         }
     }
 
+    func testSearchBuildsIncludeRevincludeAndSort() async throws {
+        let transport = RecordingTransport(statusCode: 200, data: Data(#"{"resourceType":"Bundle"}"#.utf8))
+        let operations = try makeOperations(transport: transport)
+
+        _ = try await operations.search(
+            resourceType: "Observation",
+            parameters: [ResourceSearchParameter(name: "status", value: "final")],
+            includes: ["Observation:patient", " Observation:encounter "],
+            revIncludes: ["DiagnosticReport:result"],
+            sort: "-date"
+        )
+
+        let components = try XCTUnwrap(
+            transport.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }
+        )
+        let items = components.queryItems ?? []
+        XCTAssertEqual(items.first { $0.name == "status" }?.value, "final")
+        XCTAssertEqual(items.filter { $0.name == "_include" }.map(\.value), ["Observation:patient", "Observation:encounter"])
+        XCTAssertEqual(items.first { $0.name == "_revinclude" }?.value, "DiagnosticReport:result")
+        XCTAssertEqual(items.first { $0.name == "_sort" }?.value, "-date")
+    }
+
+    func testSearchTagsIncludedEntries() async throws {
+        let bundle = Data(
+            """
+            {"resourceType":"Bundle","type":"searchset","total":1,
+             "entry":[
+               {"search":{"mode":"match"},"resource":{"resourceType":"Observation","id":"o1"}},
+               {"search":{"mode":"include"},"resource":{"resourceType":"Patient","id":"p1"}}
+             ]}
+            """.utf8
+        )
+        let operations = try makeOperations(returning: bundle)
+
+        let page = try await operations.search(resourceType: "Observation")
+
+        XCTAssertEqual(page.items.count, 2)
+        XCTAssertEqual(page.items.first { $0.resourceType == "Observation" }?.mode, .match)
+        XCTAssertEqual(page.items.first { $0.resourceType == "Patient" }?.mode, .include)
+    }
+
+    func testCreatedItemDefaultsToMatchMode() async throws {
+        let transport = RecordingTransport(
+            statusCode: 201,
+            data: Data(#"{"resourceType":"Patient","id":"new"}"#.utf8)
+        )
+        let operations = try makeOperations(transport: transport)
+
+        let item = try await operations.create(
+            resourceType: "Patient",
+            json: Data(#"{"resourceType":"Patient"}"#.utf8)
+        )
+
+        XCTAssertEqual(item.mode, .match)
+    }
+
     private func makeOperations(returning data: Data) throws -> HFSResourceOperations {
         try makeOperations(transport: StubTransport(statusCode: 200, data: data))
     }
