@@ -256,6 +256,54 @@ final class HFSAppModelTests: XCTestCase {
         XCTAssertFalse(second.hasAccessToken)
     }
 
+    // MARK: - Bulk export jobs
+
+    func testStartExportTracksJobAndCompletesFromManifest() async {
+        let model = HFSAppModel(
+            serverURLString: "http://localhost:8080",
+            transport: ExportFlowTransport(),
+            defaults: Self.ephemeralDefaults()
+        )
+        await model.connect()
+        XCTAssertTrue(model.isConnected)
+
+        let error = await model.startExport(level: .system, groupID: nil, types: [], since: nil)
+
+        XCTAssertNil(error)
+        XCTAssertEqual(model.exportJobs.count, 1)
+        guard case .completed(let manifest) = model.exportJobs.first?.state else {
+            return XCTFail("Expected the job to complete from the manifest")
+        }
+        XCTAssertEqual(manifest.output.count, 1)
+        XCTAssertEqual(manifest.output.first?.type, "Patient")
+    }
+
+    func testStartExportWithoutConnectionReturnsError() async {
+        let model = HFSAppModel(
+            transport: StubTransport(statusCode: 200, data: Data()),
+            defaults: Self.ephemeralDefaults()
+        )
+
+        let error = await model.startExport(level: .system, groupID: nil, types: [], since: nil)
+
+        XCTAssertNotNil(error)
+        XCTAssertTrue(model.exportJobs.isEmpty)
+    }
+
+    func testDisconnectClearsExportJobs() async {
+        let model = HFSAppModel(
+            serverURLString: "http://localhost:8080",
+            transport: ExportFlowTransport(),
+            defaults: Self.ephemeralDefaults()
+        )
+        await model.connect()
+        _ = await model.startExport(level: .system, groupID: nil, types: [], since: nil)
+        XCTAssertEqual(model.exportJobs.count, 1)
+
+        model.disconnect()
+        XCTAssertTrue(model.exportJobs.isEmpty)
+    }
+
     private static func ephemeralDefaults() -> UserDefaults {
         UserDefaults(suiteName: "hfs.tests.\(UUID().uuidString)")!
     }
@@ -272,6 +320,46 @@ private struct StubTransport: HFSHTTPTransport {
             statusCode: statusCode,
             httpVersion: nil,
             headerFields: nil
+        )!
+        return (data, response)
+    }
+}
+
+/// Simulates the async `$export` flow by routing on the request path: a
+/// CapabilityStatement for `/metadata`, a `202` + `Content-Location` for the
+/// kick-off, and a `200` manifest for the status poll.
+private struct ExportFlowTransport: HFSHTTPTransport {
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let url = request.url ?? URL(string: "http://localhost:8080")!
+        let path = url.path
+
+        let statusCode: Int
+        let data: Data
+        var headers: [String: String] = [:]
+
+        if path.hasSuffix("$export") {
+            statusCode = 202
+            data = Data()
+            headers["Content-Location"] = "http://localhost:8080/export-status/job-1"
+        } else if path.contains("export-status") {
+            statusCode = 200
+            data = Data(
+                """
+                {"transactionTime":"2024-01-01T00:00:00Z","request":"http://localhost:8080/$export",
+                 "requiresAccessToken":false,
+                 "output":[{"type":"Patient","url":"http://localhost:8080/export-file/job-1/Patient-1","count":3}]}
+                """.utf8
+            )
+        } else {
+            statusCode = 200
+            data = Data(#"{"resourceType":"CapabilityStatement"}"#.utf8)
+        }
+
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: statusCode,
+            httpVersion: nil,
+            headerFields: headers
         )!
         return (data, response)
     }
