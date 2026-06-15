@@ -3,17 +3,42 @@ import HFSClient
 import HFSCore
 import HFSFHIR
 
+/// How a Bundle entry was matched, from `entry.search.mode`. `match` is the
+/// primary result set; `include` entries are pulled in by `_include`/`_revinclude`.
+public enum SearchEntryMode: String, Sendable, Hashable {
+    case match
+    case include
+    case outcome
+    case other
+
+    init(raw: String?) {
+        switch raw {
+        case "match": self = .match
+        case "include": self = .include
+        case "outcome": self = .outcome
+        default: self = .other
+        }
+    }
+}
+
 /// One resource parsed from a search Bundle, ready for list display.
 public struct ResourceListItem: Identifiable, Sendable, Hashable {
     public let id: UUID
     public let fhirID: String
     public let resourceType: String
+    public let mode: SearchEntryMode
     public let prettyJSON: String
 
-    public init(fhirID: String, resourceType: String, prettyJSON: String) {
+    public init(
+        fhirID: String,
+        resourceType: String,
+        mode: SearchEntryMode = .match,
+        prettyJSON: String
+    ) {
         self.id = UUID()
         self.fhirID = fhirID
         self.resourceType = resourceType
+        self.mode = mode
         self.prettyJSON = prettyJSON
     }
 }
@@ -57,10 +82,17 @@ public struct HFSResourceOperations: Sendable {
         return FHIRResource(id: id, resourceType: resourceType, rawJSON: data)
     }
 
-    /// Searches a resource type with optional parameters and returns the first page.
+    /// Searches a resource type and returns the first page.
+    ///
+    /// Beyond plain parameters, supports `_include`/`_revinclude` (to pull in
+    /// referenced/referencing resources, tagged `.include` in the results) and
+    /// `_sort`.
     public func search(
         resourceType: String,
         parameters: [ResourceSearchParameter] = [],
+        includes: [String] = [],
+        revIncludes: [String] = [],
+        sort: String = "",
         count: Int = 20
     ) async throws -> ResourcePage {
         var queryItems = [URLQueryItem(name: "_count", value: String(count))]
@@ -69,6 +101,16 @@ public struct HFSResourceOperations: Sendable {
             let value = parameter.value.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty, !value.isEmpty else { continue }
             queryItems.append(URLQueryItem(name: name, value: value))
+        }
+        for include in Self.cleaned(includes) {
+            queryItems.append(URLQueryItem(name: "_include", value: include))
+        }
+        for revInclude in Self.cleaned(revIncludes) {
+            queryItems.append(URLQueryItem(name: "_revinclude", value: revInclude))
+        }
+        let trimmedSort = sort.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSort.isEmpty {
+            queryItems.append(URLQueryItem(name: "_sort", value: trimmedSort))
         }
 
         let request = try await client.makeRequest(pathComponents: [resourceType], queryItems: queryItems)
@@ -133,8 +175,15 @@ public struct HFSResourceOperations: Sendable {
         let entries = root["entry"] as? [[String: Any]] ?? []
         return entries.compactMap { entry -> ResourceListItem? in
             guard let resource = entry["resource"] as? [String: Any] else { return nil }
-            return makeItem(from: resource, fallbackType: fallbackType)
+            let mode = SearchEntryMode(raw: (entry["search"] as? [String: Any])?["mode"] as? String)
+            return makeItem(from: resource, fallbackType: fallbackType, mode: mode)
         }
+    }
+
+    private static func cleaned(_ values: [String]) -> [String] {
+        values
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
     /// Parses a single resource response (create/update), falling back to the
@@ -164,7 +213,11 @@ public struct HFSResourceOperations: Sendable {
         )
     }
 
-    private static func makeItem(from resource: [String: Any], fallbackType: String) -> ResourceListItem? {
+    private static func makeItem(
+        from resource: [String: Any],
+        fallbackType: String,
+        mode: SearchEntryMode = .match
+    ) -> ResourceListItem? {
         let fhirID = resource["id"] as? String ?? "(no id)"
         let type = resource["resourceType"] as? String ?? fallbackType
         guard
@@ -176,6 +229,7 @@ public struct HFSResourceOperations: Sendable {
         return ResourceListItem(
             fhirID: fhirID,
             resourceType: type,
+            mode: mode,
             prettyJSON: String(decoding: json, as: UTF8.self)
         )
     }
