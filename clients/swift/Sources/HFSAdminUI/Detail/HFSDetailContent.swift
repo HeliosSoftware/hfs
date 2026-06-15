@@ -5,6 +5,7 @@ struct HFSDetailContent: View {
     var destination: HFSAdminDestination
     @Binding var newResourceRequested: Bool
     @Binding var refreshJobsRequested: Bool
+    @Binding var newSubscriptionRequested: Bool
 
     var body: some View {
         switch destination {
@@ -14,6 +15,8 @@ struct HFSDetailContent: View {
             HFSResourcesView(newResourceRequested: $newResourceRequested)
         case .bulkJobs:
             HFSBulkJobsView(refreshJobsRequested: $refreshJobsRequested)
+        case .subscriptions:
+            HFSSubscriptionsView(newSubscriptionRequested: $newSubscriptionRequested)
         default:
             scaffold
         }
