@@ -18,16 +18,6 @@
       "reason": "conformsTo not yet implemented"
     },
     {
-      "groupName": "miscEngineTests",
-      "testName": "testContainedId",
-      "reason": "Multiple matches error - collection handling issue in resolve function"
-    },
-    {
-      "groupName": "miscEngineTests",
-      "testName": "testMultipleResolve",
-      "reason": "Multiple matches error - collection handling issue in resolve function"
-    },
-    {
       "groupName": "polymorphics",
       "testName": "testPolymorphicsB",
       "reason": "Test data issue?"
