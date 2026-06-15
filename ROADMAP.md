@@ -39,7 +39,12 @@ These capabilities are available today in the current release.
 
 **Terminology**
 
-- [Terminology service (HTS) — SQLite backend](crates/hts/README.md) — Standalone FHIR Terminology Server with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, and bulk import for HL7 NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
+- [Terminology service (HTS) — SQLite and PostgreSQL backends](crates/hts/README.md) — Standalone FHIR Terminology Server with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, and bulk import for HL7 NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
+
+**Standards**
+
+- [Bulk Data API — `$export`](crates/rest/README.md) — System / patient / group export with pre-signed S3 downloads
+- [Bulk Data API — `$bulk-submit`](crates/rest/README.md) — Bulk ingestion
 
 **Messaging**
 
@@ -59,11 +64,7 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Standards** | [Terminology — PostgreSQL backend](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
-| **Standards** | Bulk Data API — `$export` (system / patient / group), pre-signed S3 downloads | ✅ Shipped |
-| **Standards** | Bulk Data API — `$bulk-submit` (ingestion) | 🔵 Design |
-| **Analytics** | [SQL on FHIR](https://sql-on-fhir.org/ig/latest/) — HFS integration and operations update | 🟡 In progress |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
 ### Discussion Documents
@@ -71,7 +72,6 @@ Work that is currently underway or planned for the near term.
 We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These will be published as GitHub Discussions:
 
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
-- **Bulk Data API** — Defining the approach for `$export` / `$import` operations across HFS storage backends
 
 ---
 
@@ -186,7 +186,7 @@ Devitt's book defines nine key questions organizations must answer before choosi
 | Gap | Book Reference | Current Status |
 |-----|---------------|----------------|
 | **No patient-level access control** | Ch. 3 "Authorization" — SMART scopes are parsed but `patient/*` and `user/*` contexts are not enforced. Search results are not filtered by patient compartment. | 🔭 Later |
-| **Bulk Data API — `$export`** | Appendix I "Bulk data processing" — `$export` (system / patient / group) is now exposed via the REST layer with an embedded SQLite-backed worker pool by default and an optional Postgres + S3 multi-instance topology. `$bulk-submit` (ingestion) remains pending. | ✅ Shipped (export) / 🗺️ Next (submit) |
+| **Bulk Data API** | Appendix I "Bulk data processing" — `$export` (system / patient / group) is exposed via the REST layer with an embedded SQLite-backed worker pool by default and an optional Postgres + S3 multi-instance topology. `$bulk-submit` (ingestion) is also available. | ✅ Shipped |
 
 #### Moderate
 
