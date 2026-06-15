@@ -1,59 +1,10 @@
 import HFSOperations
 import SwiftUI
-
-/// A tracked Bulk Data `$export` job, owned by the Bulk Jobs screen.
-struct BulkExportJob: Identifiable {
-    enum State {
-        case running(progress: String?)
-        case completed(BulkExportManifest)
-        case failed(String)
-        case cancelled
-    }
-
-    let id = UUID()
-    let level: BulkExportLevel
-    let groupID: String?
-    let types: [String]
-    let since: String?
-    let statusURL: URL
-    let startedAt: Date
-    var state: State
-
-    var isRunning: Bool {
-        if case .running = state { return true }
-        return false
-    }
-
-    /// A one-line description of what was requested.
-    var requestSummary: String {
-        var parts = [level.label]
-        if level == .group, let groupID { parts.append("Group/\(groupID)") }
-        if !types.isEmpty { parts.append("_type=\(types.joined(separator: ","))") }
-        if let since, !since.isEmpty { parts.append("_since=\(since)") }
-        return parts.joined(separator: " · ")
-    }
-
-    var badgeKind: HFSJobStatusBadge.Kind {
-        switch state {
-        case .running: .running
-        case .completed: .completed
-        case .failed: .failed
-        case .cancelled: .cancelled
-        }
-    }
-
-    var badgeDetail: String? {
-        switch state {
-        case .running(let progress): progress
-        default: nil
-        }
-    }
-}
+import UniformTypeIdentifiers
 
 struct HFSBulkJobsView: View {
     @Environment(HFSAppModel.self) private var model
 
-    @State private var jobs: [BulkExportJob] = []
     @State private var selectedJobID: BulkExportJob.ID?
 
     // Kick-off form fields.
@@ -63,6 +14,13 @@ struct HFSBulkJobsView: View {
     @State private var sinceText = ""
     @State private var isStarting = false
     @State private var kickoffError: String?
+
+    // File download.
+    @State private var downloadingFileID: BulkExportFile.ID?
+    @State private var downloadedFile: NDJSONFile?
+    @State private var downloadFilename = "export.ndjson"
+    @State private var showFileExporter = false
+    @State private var downloadError: String?
 
     /// Toggled by the toolbar "Refresh Jobs" action in the root view.
     @Binding var refreshJobsRequested: Bool
@@ -97,13 +55,32 @@ struct HFSBulkJobsView: View {
         }
         .onChange(of: refreshJobsRequested) { _, requested in
             guard requested else { return }
-            Task { await pollAll() }
+            Task { await model.pollRunningExportJobs() }
             refreshJobsRequested = false
         }
         .task {
-            // Lightweight auto-poll: refresh running jobs every couple seconds
-            // for the lifetime of this screen.
-            await autoPollLoop()
+            // Catch up on any jobs that finished while this screen was away.
+            await model.pollRunningExportJobs()
+        }
+        .fileExporter(
+            isPresented: $showFileExporter,
+            document: downloadedFile,
+            contentType: NDJSONFile.ndjson,
+            defaultFilename: downloadFilename
+        ) { _ in
+            downloadedFile = nil
+        }
+        .alert(
+            "Download Failed",
+            isPresented: Binding(
+                get: { downloadError != nil },
+                set: { if !$0 { downloadError = nil } }
+            ),
+            presenting: downloadError
+        ) { _ in
+            Button("OK", role: .cancel) {}
+        } message: { message in
+            Text(message)
         }
     }
 
@@ -170,7 +147,7 @@ struct HFSBulkJobsView: View {
 
     @ViewBuilder
     private var jobsList: some View {
-        if jobs.isEmpty {
+        if model.exportJobs.isEmpty {
             ContentUnavailableView {
                 Label("No Jobs", systemImage: "arrow.up.doc")
             } description: {
@@ -178,7 +155,7 @@ struct HFSBulkJobsView: View {
             }
         } else {
             List(selection: $selectedJobID) {
-                ForEach(jobs) { job in
+                ForEach(model.exportJobs) { job in
                     jobRow(job).tag(job.id)
                 }
             }
@@ -245,7 +222,7 @@ struct HFSBulkJobsView: View {
             Spacer()
 
             Button {
-                Task { await poll(job.id) }
+                Task { await model.pollExportJob(job.id) }
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
@@ -255,7 +232,7 @@ struct HFSBulkJobsView: View {
             .disabled(!job.isRunning)
 
             Button(role: .destructive) {
-                Task { await cancel(job.id) }
+                Task { await model.cancelExportJob(job.id) }
             } label: {
                 Label("Cancel", systemImage: "xmark.octagon")
             }
@@ -360,6 +337,21 @@ struct HFSBulkJobsView: View {
                         .textSelection(.enabled)
                         .help(file.url.absoluteString)
                 }
+                TableColumn("") { file in
+                    Button {
+                        Task { await downloadFile(file) }
+                    } label: {
+                        if downloadingFileID == file.id {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.down.circle")
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(downloadingFileID != nil)
+                    .help("Download \(file.url.lastPathComponent)")
+                }
+                .width(40)
             }
             .frame(minHeight: 120, idealHeight: 220)
         }
@@ -368,14 +360,10 @@ struct HFSBulkJobsView: View {
     // MARK: - Actions
 
     private var selectedJob: BulkExportJob? {
-        jobs.first { $0.id == selectedJobID }
+        model.exportJobs.first { $0.id == selectedJobID }
     }
 
     private func startExport() async {
-        guard let operations = model.bulkDataOperations() else {
-            kickoffError = "Not connected to a server."
-            return
-        }
         kickoffError = nil
         isStarting = true
         defer { isStarting = false }
@@ -387,81 +375,56 @@ struct HFSBulkJobsView: View {
         let since = sinceText.trimmingCharacters(in: .whitespaces)
         let trimmedGroup = groupID.trimmingCharacters(in: .whitespaces)
 
-        do {
-            let kickoff = try await operations.kickOff(
-                level: level,
-                groupID: level == .group ? trimmedGroup : nil,
-                types: types,
-                since: since.isEmpty ? nil : since
-            )
-            let job = BulkExportJob(
-                level: level,
-                groupID: level == .group ? trimmedGroup : nil,
-                types: types,
-                since: since.isEmpty ? nil : since,
-                statusURL: kickoff.statusURL,
-                startedAt: Date(),
-                state: .running(progress: nil)
-            )
-            jobs.insert(job, at: 0)
-            selectedJobID = job.id
-            await poll(job.id)
-        } catch {
-            kickoffError = HFSAppModel.describe(error)
+        let error = await model.startExport(
+            level: level,
+            groupID: level == .group ? trimmedGroup : nil,
+            types: types,
+            since: since.isEmpty ? nil : since
+        )
+        if let error {
+            kickoffError = error
+        } else {
+            selectedJobID = model.exportJobs.first?.id
         }
     }
 
-    private func poll(_ jobID: BulkExportJob.ID) async {
-        guard
-            let operations = model.bulkDataOperations(),
-            let job = jobs.first(where: { $0.id == jobID }),
-            job.isRunning
-        else { return }
+    private func downloadFile(_ file: BulkExportFile) async {
+        guard let operations = model.bulkDataOperations() else { return }
+        downloadingFileID = file.id
+        defer { downloadingFileID = nil }
 
         do {
-            let status = try await operations.status(url: job.statusURL)
-            switch status {
-            case .inProgress(let progress):
-                updateState(jobID, .running(progress: progress))
-            case .complete(let manifest):
-                updateState(jobID, .completed(manifest))
-            }
+            let data = try await operations.downloadFile(url: file.url)
+            let name = file.url.lastPathComponent
+            downloadFilename = name.isEmpty ? "\(file.type).ndjson" : name
+            downloadedFile = NDJSONFile(data: data)
+            showFileExporter = true
         } catch {
-            updateState(jobID, .failed(HFSAppModel.describe(error)))
+            downloadError = HFSAppModel.describe(error)
         }
     }
+}
 
-    private func pollAll() async {
-        for job in jobs where job.isRunning {
-            await poll(job.id)
-        }
+/// A minimal `FileDocument` wrapping downloaded NDJSON bytes so the native
+/// `.fileExporter` save panel can write them to a user-chosen location.
+struct NDJSONFile: FileDocument {
+    /// The conventional bulk-data NDJSON type, falling back to plain data if the
+    /// system has no registered `ndjson` extension.
+    static let ndjson = UTType(filenameExtension: "ndjson") ?? .data
+
+    static var readableContentTypes: [UTType] { [ndjson, .json, .plainText, .data] }
+
+    var data: Data
+
+    init(data: Data) {
+        self.data = data
     }
 
-    private func cancel(_ jobID: BulkExportJob.ID) async {
-        guard
-            let operations = model.bulkDataOperations(),
-            let job = jobs.first(where: { $0.id == jobID })
-        else { return }
-
-        do {
-            try await operations.cancel(url: job.statusURL)
-            updateState(jobID, .cancelled)
-        } catch {
-            updateState(jobID, .failed(HFSAppModel.describe(error)))
-        }
+    init(configuration: ReadConfiguration) throws {
+        data = configuration.file.regularFileContents ?? Data()
     }
 
-    private func autoPollLoop() async {
-        while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(2))
-            if jobs.contains(where: { $0.isRunning }) {
-                await pollAll()
-            }
-        }
-    }
-
-    private func updateState(_ jobID: BulkExportJob.ID, _ state: BulkExportJob.State) {
-        guard let index = jobs.firstIndex(where: { $0.id == jobID }) else { return }
-        jobs[index].state = state
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
     }
 }
