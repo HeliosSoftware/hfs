@@ -221,6 +221,11 @@ public final class HFSAppModel {
         client.map(HFSBulkDataOperations.init)
     }
 
+    /// Builds Subscription search operations bound to the connected client.
+    public func subscriptionOperations() -> HFSSubscriptionOperations? {
+        client.map(HFSSubscriptionOperations.init)
+    }
+
     /// Re-fetches `/metadata` for the connected server and refreshes the Overview.
     public func refreshOverview() async {
         guard let client else {
