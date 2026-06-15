@@ -7,6 +7,9 @@ struct HFSResourcesView: View {
     @State private var selectedType: String?
     @State private var typeFilter = ""
     @State private var parameters: [ResourceSearchParameter] = []
+    @State private var includesText = ""
+    @State private var revIncludesText = ""
+    @State private var sortText = ""
     @State private var items: [ResourceListItem] = []
     @State private var total: Int?
     @State private var nextURL: URL?
@@ -62,6 +65,9 @@ struct HFSResourcesView: View {
         .searchable(text: $typeFilter, prompt: "Filter types")
         .task(id: selectedType) {
             parameters = []
+            includesText = ""
+            revIncludesText = ""
+            sortText = ""
             await runSearch()
         }
         .onChange(of: newResourceRequested) { _, requested in
@@ -160,10 +166,15 @@ struct HFSResourcesView: View {
         if isLoading {
             return "Loading…"
         }
-        if let total {
-            return "\(items.count) loaded of \(total)"
-        }
-        return "\(items.count) loaded"
+        let matches = items.filter { $0.mode != .include }.count
+        let includes = items.filter { $0.mode == .include }.count
+        var summary = total.map { "\(matches) of \($0)" } ?? "\(matches)"
+        if includes > 0 { summary += " (+\(includes) included)" }
+        return summary
+    }
+
+    private func splitCSV(_ text: String) -> [String] {
+        text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
     private func resourceSearchForm(type: String) -> some View {
@@ -219,6 +230,27 @@ struct HFSResourcesView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(isLoading)
                 }
+            }
+
+            Section("Modifiers") {
+                TextField("_include", text: $includesText, prompt: Text("Observation:patient"))
+                    .textFieldStyle(.roundedBorder)
+                    #if !os(macOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+                TextField("_revinclude", text: $revIncludesText, prompt: Text("Observation:patient"))
+                    .textFieldStyle(.roundedBorder)
+                    #if !os(macOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+                TextField("_sort", text: $sortText, prompt: Text("-_lastUpdated"))
+                    .textFieldStyle(.roundedBorder)
+                    #if !os(macOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
             }
         }
         .formStyle(.grouped)
@@ -286,16 +318,24 @@ struct HFSResourcesView: View {
     }
 
     private func resourceRow(_ item: ResourceListItem) -> some View {
-        Label {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.fhirID)
-                    .font(.callout.weight(.medium))
-                Text(item.resourceType)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        HStack(spacing: 8) {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.fhirID)
+                        .font(.callout.weight(.medium))
+                    Text(item.resourceType)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "doc.text")
             }
-        } icon: {
-            Image(systemName: "doc.text")
+
+            Spacer()
+
+            if item.mode == .include {
+                HFSStatusBadge(title: "include", systemImage: "arrow.turn.down.right", tint: .secondary)
+            }
         }
     }
 
@@ -461,6 +501,9 @@ struct HFSResourcesView: View {
             let page = try await operations.search(
                 resourceType: type,
                 parameters: parameters,
+                includes: splitCSV(includesText),
+                revIncludes: splitCSV(revIncludesText),
+                sort: sortText,
                 count: pageSize
             )
             guard generation == loadGeneration else { return }
