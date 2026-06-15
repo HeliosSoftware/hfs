@@ -88,8 +88,8 @@ Liquid Glass automatically where supported.
 | Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector, create/update/delete |
 | Search | ⏳ Scaffold placeholder |
 | Bulk Jobs | ✅ Live — `$export` kick-off (system/patient/group, `_type`/`_since`), auto-polling, manifest `Table`, cancel |
-| Audit | ⏳ Scaffold placeholder |
-| Subscriptions | ⏳ Scaffold placeholder |
+| Audit | ⛔️ Deferred — HFS records audit events to a write-only sink (reserved `__system__` tenant, not routable), so there is no REST endpoint to read them. Revisit when HFS exposes AuditEvent. |
+| Subscriptions | ✅ Live — list/filter by status, create (JSON editor), inspect (channel/endpoint/topic + JSON), delete |
 
 Other implemented foundations: the `HFSAppModel` observable state layer, the
 mockable `HFSHTTPTransport`, and XCTest suites that run without a live server.
@@ -123,15 +123,28 @@ Done:
    the completed manifest in a first-party `Table`. Job state is view-local for
    now (resets on navigation away); promoting it to `HFSAppModel` is a
    follow-up.
+10. ✅ **Subscriptions**: `HFSSubscriptionOperations` searches `Subscription`
+    resources (status filter, pagination) and parses channel/endpoint/topic
+    version-agnostically (R4 `channel.*`/`criteria`, R5 `channelType`/`endpoint`/
+    `topic`). The screen lists subscriptions with a custom
+    `HFSSubscriptionStatusBadge`, inspects each (summary + raw JSON), and
+    reuses the generic resource editor + delete for create/delete.
 
 Coming next:
 
-10. ⏭️ Remaining operations screens: Audit, Subscriptions.
 11. ⏭️ **SMART-on-FHIR** discovery, building on the existing token-provider
    abstraction (currently static bearer tokens only).
 12. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
 13. ⏭️ A dedicated Search screen — only if it adds cross-type search,
    `_include`/`_revinclude`, or sorting beyond the in-place Resources search.
+
+Deferred:
+
+- ⛔️ **Audit** screen. A FHIR `AuditEvent` browser was prototyped, but HFS
+  treats audit as a **write-only sink**: events are stored under the reserved,
+  non-routable `__system__` tenant with no REST read/search endpoint
+  (`GET /AuditEvent` returns empty, `GET /AuditEvent/{id}` is 404). The screen
+  was dropped until HFS exposes audit data via REST.
 
 ## Building
 
