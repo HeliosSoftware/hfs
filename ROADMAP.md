@@ -102,6 +102,7 @@ Longer-term ideas we are exploring. These are not yet committed and may evolve s
 ### FHIR Server Capabilities
 
 - **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
+- **GraphQL API** — [FHIR GraphQL](https://hl7.org/fhir/graphql.html) support for resource retrieval, search, and graph traversal as an alternative to the REST API
 
 ### Advanced Persistence
 
