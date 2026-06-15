@@ -113,8 +113,10 @@ Done:
 Coming next:
 
 8. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
-9. ⏭️ **Auth** (`HFSAuth`): static bearer token, then SMART-on-FHIR discovery
-   (currently `NoAccessTokenProvider`).
+9. ⏭️ **Auth** (`HFSAuth`): `StaticAccessTokenProvider` already exists at the
+   client layer (and `HFSClient` sends the bearer token); remaining work is
+   surfacing a token field in Settings, wiring it through `HFSAppModel` (the app
+   still defaults to `NoAccessTokenProvider`), then SMART-on-FHIR discovery.
 10. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
 11. ⏭️ A dedicated Search screen — only if it adds cross-type search,
    `_include`/`_revinclude`, or sorting beyond the in-place Resources search.
