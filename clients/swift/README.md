@@ -85,8 +85,7 @@ Liquid Glass automatically where supported.
 |--------|-------|
 | Settings | ✅ Live — connect/disconnect, validation, status feedback, persisted settings + connect-on-launch, optional bearer token |
 | Overview | ✅ Live — capability tiles from `/metadata`, refresh |
-| Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector, create/update/delete |
-| Search | ⏳ Scaffold placeholder |
+| Resources | ✅ Live — type list, search with parameters + `_include`/`_revinclude`/`_sort` (match/include tagged), pagination (`next`), JSON inspector, create/update/delete |
 | Bulk Jobs | ✅ Live — `$export` kick-off (system/patient/group, `_type`/`_since`), background auto-polling, manifest `Table`, output-file download, cancel |
 | Audit | ⛔️ Deferred — HFS records audit events to a write-only sink (reserved `__system__` tenant, not routable), so there is no REST endpoint to read them. Revisit when HFS exposes AuditEvent. |
 | Subscriptions | ✅ Live — list/filter by status, create (JSON editor), inspect (channel/endpoint/topic + JSON), delete |
@@ -130,14 +129,18 @@ Done:
     `topic`). The screen lists subscriptions with a custom
     `HFSSubscriptionStatusBadge`, inspects each (summary + raw JSON), and
     reuses the generic resource editor + delete for create/delete.
+11. ✅ **Advanced search folded into Resources**: `HFSResourceOperations.search`
+    gained `_include`/`_revinclude`/`_sort`, and parses `entry.search.mode` so
+    included resources are tagged in the list. A prototype standalone Search
+    screen was **consolidated into Resources** instead of shipping a second
+    near-duplicate browser. The status pills were unified behind a shared
+    `HFSStatusBadge` at the same time.
 
 Coming next:
 
-11. ⏭️ **SMART-on-FHIR** discovery, building on the existing token-provider
+12. ⏭️ **SMART-on-FHIR** discovery, building on the existing token-provider
    abstraction (currently static bearer tokens only).
-12. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
-13. ⏭️ A dedicated Search screen — only if it adds cross-type search,
-   `_include`/`_revinclude`, or sorting beyond the in-place Resources search.
+13. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
 
 Deferred:
 
@@ -146,6 +149,9 @@ Deferred:
   non-routable `__system__` tenant with no REST read/search endpoint
   (`GET /AuditEvent` returns empty, `GET /AuditEvent/{id}` is 404). The screen
   was dropped until HFS exposes audit data via REST.
+- ⛔️ **Cross-type / system search** (`GET /?_type=…`). HFS returns `405` at the
+  base URL, so the Resources search is single-type. Revisit if HFS adds
+  system-level search; the parsing already handles mixed-type result Bundles.
 
 ## Building
 
