@@ -321,7 +321,10 @@ mod tests {
         let resolved = resolve_one(&reference("1"), &candidates);
         match resolved {
             EvaluationResult::Object { map, .. } => {
-                assert_eq!(string_field(&map, "resourceType").as_deref(), Some("Organization"));
+                assert_eq!(
+                    string_field(&map, "resourceType").as_deref(),
+                    Some("Organization")
+                );
                 assert_eq!(string_field(&map, "id").as_deref(), Some("1"));
             }
             other => panic!("expected Organization object, got {other:?}"),
@@ -335,7 +338,10 @@ mod tests {
             ("id", string("p")),
             (
                 "contained",
-                obj(&[("resourceType", string("Practitioner")), ("id", string("pr1"))]),
+                obj(&[
+                    ("resourceType", string("Practitioner")),
+                    ("id", string("pr1")),
+                ]),
             ),
         ]);
         let candidates = pool(&[patient]);
@@ -379,8 +385,14 @@ mod tests {
         let resolved = resolve_one(&reference("Observation/missing"), &candidates);
         match &resolved {
             EvaluationResult::Object { map, type_info } => {
-                assert_eq!(string_field(map, "resourceType").as_deref(), Some("Observation"));
-                assert_eq!(type_info.as_ref().map(|t| t.name.as_str()), Some("Observation"));
+                assert_eq!(
+                    string_field(map, "resourceType").as_deref(),
+                    Some("Observation")
+                );
+                assert_eq!(
+                    type_info.as_ref().map(|t| t.name.as_str()),
+                    Some("Observation")
+                );
             }
             other => panic!("expected typed stub, got {other:?}"),
         }
@@ -405,8 +417,14 @@ mod tests {
                 "contained",
                 EvaluationResult::Collection {
                     items: vec![
-                        obj(&[("resourceType", string("Organization")), ("id", string("1"))]),
-                        obj(&[("resourceType", string("Organization")), ("id", string("2"))]),
+                        obj(&[
+                            ("resourceType", string("Organization")),
+                            ("id", string("1")),
+                        ]),
+                        obj(&[
+                            ("resourceType", string("Organization")),
+                            ("id", string("2")),
+                        ]),
                     ],
                     has_undefined_order: false,
                     type_info: None,
@@ -420,7 +438,10 @@ mod tests {
             .map(|r| resolve_one(r, &candidates))
             .collect();
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|r| matches!(r, EvaluationResult::Object { .. })));
+        assert!(
+            out.iter()
+                .all(|r| matches!(r, EvaluationResult::Object { .. }))
+        );
         assert_eq!(
             out.iter()
                 .filter_map(|r| match r {

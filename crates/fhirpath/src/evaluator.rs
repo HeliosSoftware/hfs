@@ -417,7 +417,9 @@ impl EvaluationContext {
         // copy-on-write. Require sole ownership — true for all call sites, which
         // add resources at setup time before any context cloning occurs.
         Arc::get_mut(&mut self.resources)
-            .expect("add_resource requires sole ownership of the resources Arc (call before cloning)")
+            .expect(
+                "add_resource requires sole ownership of the resources Arc (call before cloning)",
+            )
             .push(resource);
     }
 
@@ -1554,9 +1556,7 @@ fn evaluate_term(
             // Handle variables (%var, %context) next and return
             if let Invocation::Member(name) = invocation {
                 if let Some(var_name) = name.strip_prefix('%') {
-                    if var_name == "context"
-                        || var_name == "resource"
-                        || var_name == "rootResource"
+                    if var_name == "context" || var_name == "resource" || var_name == "rootResource"
                     {
                         // Return %context / %resource / %rootResource value. In this
                         // engine all three resolve to the resource(s) in scope: the
