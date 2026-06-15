@@ -65,6 +65,7 @@ Work that is currently underway or planned for the near term.
 | Area | Item | Status |
 |------|------|--------|
 | **Standards** | FHIR Validation engine | 🔵 Design |
+| **Developer Experience** | Administrative UI — web-based management console for server configuration and monitoring | 🔵 Design |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
 ### Discussion Documents
@@ -87,7 +88,6 @@ These items are well-understood and will be picked up once current work complete
 
 ### Developer Experience
 
-- **Administrative UI** — Web-based management console for server configuration and monitoring
 - **MCP Server for FHIR API** — Model Context Protocol integration for the FHIR REST API
 - **MCP Server for SQL on FHIR** — Model Context Protocol integration for analytics workflows
 - **Deployment Cookbooks** — Reference architectures and deployment templates covering standalone development servers, single-node production setups, composite storage configurations, and full CQRS architectures on AWS, Azure, and GCP
