@@ -13,6 +13,7 @@ public struct HFSAdminRootView: View {
     @State private var pendingAction: HFSAdminDestination?
     @State private var newResourceRequested = false
     @State private var refreshJobsRequested = false
+    @State private var newSubscriptionRequested = false
 
     public init() {}
 
@@ -25,7 +26,8 @@ public struct HFSAdminRootView: View {
             HFSDetailContent(
                 destination: selection,
                 newResourceRequested: $newResourceRequested,
-                refreshJobsRequested: $refreshJobsRequested
+                refreshJobsRequested: $refreshJobsRequested,
+                newSubscriptionRequested: $newSubscriptionRequested
             )
                 .navigationTitle(selection.title)
                 .toolbar {
@@ -86,6 +88,12 @@ public struct HFSAdminRootView: View {
         case .bulkJobs:
             if model.isConnected {
                 refreshJobsRequested = true
+            } else {
+                pendingAction = selection
+            }
+        case .subscriptions:
+            if model.isConnected {
+                newSubscriptionRequested = true
             } else {
                 pendingAction = selection
             }
