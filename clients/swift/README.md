@@ -42,8 +42,9 @@ Views render live state — there is no hardcoded status.
 Connection flow:
 
 1. **Settings** is a `Form` bound to `HFSAppModel` (Base URL, Tenant, FHIR
-   version). **Connect** probes `/metadata`; success sets `.connected`, parses an
-   Overview summary and the server's resource-type list, and stores the client.
+   version, and an optional bearer token). **Connect** probes `/metadata`;
+   success sets `.connected`, parses an Overview summary and the server's
+   resource-type list, and stores the client.
 2. The sidebar connection summary and the per-screen status strip reflect the
    live connection/tenant/version.
 3. **Overview** shows facts parsed from the CapabilityStatement (resource-type
@@ -82,7 +83,7 @@ Liquid Glass automatically where supported.
 
 | Screen | State |
 |--------|-------|
-| Settings | ✅ Live — connect/disconnect, validation, status feedback, persisted settings + connect-on-launch |
+| Settings | ✅ Live — connect/disconnect, validation, status feedback, persisted settings + connect-on-launch, optional bearer token |
 | Overview | ✅ Live — capability tiles from `/metadata`, refresh |
 | Resources | ✅ Live — type list, search with parameters, pagination (`next`), JSON inspector, create/update/delete |
 | Search | ⏳ Scaffold placeholder |
@@ -109,16 +110,20 @@ Done:
    toolbar action opens a JSON editor (`HFSCodeEditor`, with macOS smart-quote
    substitution disabled), and the inspector exposes edit/delete with
    confirmation.
+8. ✅ **Static bearer-token auth** (`HFSAuth`): an optional, session-only token
+   field in Settings is threaded through `HFSAppModel` into `HFSClient` via
+   `StaticAccessTokenProvider`. A blank/whitespace token falls back to
+   `NoAccessTokenProvider` (no `Authorization` header at all), so unsecured
+   servers are unchanged. The token is deliberately **not** persisted to
+   `UserDefaults` — the Keychain is its future home.
 
 Coming next:
 
-8. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
-9. ⏭️ **Auth** (`HFSAuth`): `StaticAccessTokenProvider` already exists at the
-   client layer (and `HFSClient` sends the bearer token); remaining work is
-   surfacing a token field in Settings, wiring it through `HFSAppModel` (the app
-   still defaults to `NoAccessTokenProvider`), then SMART-on-FHIR discovery.
-10. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
-11. ⏭️ A dedicated Search screen — only if it adds cross-type search,
+9. ⏭️ Operations screens: Bulk Jobs, Audit, Subscriptions.
+10. ⏭️ **SMART-on-FHIR** discovery, building on the existing token-provider
+   abstraction (currently static bearer tokens only).
+11. ⏭️ An iOS app under `clients/swift/Apps` depending on this package.
+12. ⏭️ A dedicated Search screen — only if it adds cross-type search,
    `_include`/`_revinclude`, or sorting beyond the in-place Resources search.
 
 ## Building
