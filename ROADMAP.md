@@ -81,9 +81,9 @@ These items are well-understood and will be picked up once current work complete
 
 ### FHIR Server Capabilities
 
-- **Persistence-layer audit events** — Wire audit logging for bulk export, purge, and reindex operations (audit functions exist, pending REST endpoints)
-- **Database-backed SQL-on-FHIR export job state** — Replace the in-memory job controller (`InMemoryController` in `crates/rest/src/export/`) behind the async `$viewdefinition-export` / `$sqlquery-export` operations with database-backed job state, following the pattern already used by Bulk Data `$export` (whose job store shares the primary database). Today, job status, tenant ownership, progress, and cancellation state live only in process memory: a server restart invalidates every in-flight and completed status URL (undermining the spec's 24-hour manifest validity), and a second instance cannot see jobs submitted to the first. ⚠️ **Until this change is complete, deployments serving SQL-on-FHIR async operations must not be clustered** — run a single HFS instance for these endpoints, or pin them to one instance behind the load balancer. Synchronous `$viewdefinition-run` / `$sqlquery-run` and Bulk Data `$export` are unaffected.
-- **Cluster-aware Subscription notification delivery** — Identified by the same review: the Subscriptions engine tracks connected WebSocket clients in process memory (`crates/subscriptions/src/channels/ws_manager.rs`), so in a multi-instance deployment only the instance holding a client's connection can deliver its notifications. Subscription resources themselves are database-backed; what's needed is a shared delivery channel (e.g., a message bus or pub/sub fan-out) so resource events on any instance reach clients connected to any other. Until then, WebSocket subscription delivery is single-instance / sticky-session only (rest-hook channels are unaffected).
+- **Persistence-layer audit events** ([#168](https://github.com/HeliosSoftware/hfs/issues/168)) — Wire audit logging for bulk export, purge, and reindex operations (audit functions exist, pending REST endpoints)
+- **Database-backed SQL-on-FHIR export job state** ([#169](https://github.com/HeliosSoftware/hfs/issues/169)) — Replace the in-memory job controller (`InMemoryController` in `crates/rest/src/export/`) behind the async `$viewdefinition-export` / `$sqlquery-export` operations with database-backed job state, following the pattern already used by Bulk Data `$export` (whose job store shares the primary database). Today, job status, tenant ownership, progress, and cancellation state live only in process memory: a server restart invalidates every in-flight and completed status URL (undermining the spec's 24-hour manifest validity), and a second instance cannot see jobs submitted to the first. ⚠️ **Until this change is complete, deployments serving SQL-on-FHIR async operations must not be clustered** — run a single HFS instance for these endpoints, or pin them to one instance behind the load balancer. Synchronous `$viewdefinition-run` / `$sqlquery-run` and Bulk Data `$export` are unaffected.
+- **Cluster-aware Subscription notification delivery** ([#170](https://github.com/HeliosSoftware/hfs/issues/170)) — Identified by the same review: the Subscriptions engine tracks connected WebSocket clients in process memory (`crates/subscriptions/src/channels/ws_manager.rs`), so in a multi-instance deployment only the instance holding a client's connection can deliver its notifications. Subscription resources themselves are database-backed; what's needed is a shared delivery channel (e.g., a message bus or pub/sub fan-out) so resource events on any instance reach clients connected to any other. Until then, WebSocket subscription delivery is single-instance / sticky-session only (rest-hook channels are unaffected).
 
 ### Developer Experience
 
@@ -128,6 +128,21 @@ An intelligent recommendation engine for storage configuration:
 |------|---------|
 | 🟡 | In progress — actively being developed |
 | 🔵 | Design — in planning or community discussion phase |
+
+---
+
+## 🐛 Open GitHub Issues
+
+Tracked work items currently open on the [issue tracker](https://github.com/HeliosSoftware/hfs/issues):
+
+| Issue | Title |
+|-------|-------|
+| [#170](https://github.com/HeliosSoftware/hfs/issues/170) | Cluster-aware Subscription notification delivery |
+| [#169](https://github.com/HeliosSoftware/hfs/issues/169) | Database-backed SQL-on-FHIR export job state |
+| [#168](https://github.com/HeliosSoftware/hfs/issues/168) | Persistence-layer audit events for bulk export, purge, and reindex |
+| [#167](https://github.com/HeliosSoftware/hfs/issues/167) | FHIRPath resolve(): add storage-backed resolution for server-stored resources |
+| [#145](https://github.com/HeliosSoftware/hfs/issues/145) | SoF export: re-sign S3 pre-signed download URLs on each manifest poll |
+| [#144](https://github.com/HeliosSoftware/hfs/issues/144) | SoF export: clean up partial results when a job is cancelled |
 
 ---
 
