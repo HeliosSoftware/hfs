@@ -216,6 +216,11 @@ public final class HFSAppModel {
         client.map(HFSResourceOperations.init)
     }
 
+    /// Builds Bulk Data `$export` operations bound to the connected client.
+    public func bulkDataOperations() -> HFSBulkDataOperations? {
+        client.map(HFSBulkDataOperations.init)
+    }
+
     /// Re-fetches `/metadata` for the connected server and refreshes the Overview.
     public func refreshOverview() async {
         guard let client else {
