@@ -13,12 +13,6 @@ extension HFSAdminDestination {
                 .init(title: "Recent Reads", value: "0", caption: "Session activity", systemImage: "clock"),
                 .init(title: "Pending Writes", value: "0", caption: "Draft changes", systemImage: "square.and.pencil")
             ]
-        case .search:
-            [
-                .init(title: "Saved Queries", value: "0", caption: "Local workspace", systemImage: "bookmark"),
-                .init(title: "Parameters", value: "--", caption: "Selected resource type", systemImage: "slider.horizontal.3"),
-                .init(title: "Results", value: "0", caption: "Current search", systemImage: "list.bullet")
-            ]
         case .bulkJobs:
             [
                 .init(title: "Exports", value: "0", caption: "Tracked jobs", systemImage: "arrow.up.doc"),
@@ -57,11 +51,6 @@ extension HFSAdminDestination {
             [
                 .init(title: "Resource Browser", detail: "A resource-type list, paged Bundle results, and JSON detail panel will share this workspace.", systemImage: "rectangle.split.3x1"),
                 .init(title: "Editor Surface", detail: "Create, update, patch, and delete actions can be layered in without changing navigation.", systemImage: "square.and.pencil")
-            ]
-        case .search:
-            [
-                .init(title: "Query Builder", detail: "Search parameters, modifiers, includes, and result count controls will live in one aligned form.", systemImage: "slider.horizontal.3"),
-                .init(title: "Result Inspector", detail: "Bundle rows and selected resource JSON will use the same detail components as Resources.", systemImage: "doc.richtext")
             ]
         case .bulkJobs:
             [

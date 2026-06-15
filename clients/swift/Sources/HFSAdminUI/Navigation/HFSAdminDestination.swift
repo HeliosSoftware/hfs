@@ -1,7 +1,6 @@
 enum HFSAdminDestination: String, CaseIterable, Identifiable, Hashable {
     case overview
     case resources
-    case search
     case bulkJobs
     case audit
     case subscriptions
@@ -13,7 +12,6 @@ enum HFSAdminDestination: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .overview: "Overview"
         case .resources: "Resources"
-        case .search: "Search"
         case .bulkJobs: "Bulk Jobs"
         case .audit: "Audit"
         case .subscriptions: "Subscriptions"
@@ -25,7 +23,7 @@ enum HFSAdminDestination: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .overview, .settings:
             .server
-        case .resources, .search:
+        case .resources:
             .fhir
         case .bulkJobs, .audit, .subscriptions:
             .operations
@@ -36,7 +34,6 @@ enum HFSAdminDestination: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .overview: "server.rack"
         case .resources: "folder"
-        case .search: "magnifyingglass"
         case .bulkJobs: "arrow.down.doc"
         case .audit: "list.bullet.clipboard"
         case .subscriptions: "dot.radiowaves.left.and.right"
@@ -50,8 +47,6 @@ enum HFSAdminDestination: String, CaseIterable, Identifiable, Hashable {
             "Server capability, storage, and tenant status"
         case .resources:
             "Browse, inspect, create, and update FHIR resources"
-        case .search:
-            "Run resource searches with reusable query controls"
         case .bulkJobs:
             "Monitor export and bulk-submit job lifecycle"
         case .audit:
@@ -67,7 +62,6 @@ enum HFSAdminDestination: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .overview: "Refresh"
         case .resources: "New Resource"
-        case .search: "Run Search"
         case .bulkJobs: "Refresh Jobs"
         case .audit: "Refresh Events"
         case .subscriptions: "New Subscription"
@@ -81,8 +75,6 @@ enum HFSAdminDestination: String, CaseIterable, Identifiable, Hashable {
             "arrow.clockwise"
         case .resources, .subscriptions:
             "plus"
-        case .search:
-            "magnifyingglass"
         case .settings:
             "bolt.horizontal"
         }
