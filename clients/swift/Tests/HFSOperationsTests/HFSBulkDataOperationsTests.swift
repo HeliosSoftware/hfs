@@ -167,6 +167,21 @@ final class HFSBulkDataOperationsTests: XCTestCase {
         XCTAssertEqual(transport.lastRequest?.url?.path, "/export-status/job-1")
     }
 
+    // MARK: - Download
+
+    func testDownloadFileFetchesRawBytes() async throws {
+        let ndjson = Data(#"{"resourceType":"Patient","id":"1"}\#n{"resourceType":"Patient","id":"2"}"#.utf8)
+        let transport = BulkStubTransport(statusCode: 200, data: ndjson, headers: [:])
+        let operations = try makeOperations(transport: transport)
+        let url = try XCTUnwrap(URL(string: "http://localhost:8080/export-file/job-1/Patient-1"))
+
+        let data = try await operations.downloadFile(url: url)
+
+        XCTAssertEqual(data, ndjson)
+        XCTAssertEqual(transport.lastRequest?.httpMethod, "GET")
+        XCTAssertEqual(transport.lastRequest?.url, url)
+    }
+
     // MARK: - Helpers
 
     private func makeOperations(transport: HFSHTTPTransport) throws -> HFSBulkDataOperations {
