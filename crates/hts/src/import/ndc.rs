@@ -202,11 +202,23 @@ fn read_product_txt_from_zip(path: &Path) -> Result<String, HtsError> {
     let mut entry = archive
         .by_index(idx)
         .map_err(|e| HtsError::InvalidRequest(format!("Cannot read ZIP entry: {e}")))?;
-    let mut buf = String::new();
+    let mut bytes = Vec::new();
     entry
-        .read_to_string(&mut buf)
+        .read_to_end(&mut bytes)
         .map_err(|e| HtsError::InvalidRequest(format!("Cannot read product.txt from ZIP: {e}")))?;
-    Ok(buf)
+    Ok(decode_ndc_text(bytes))
+}
+
+/// The FDA NDC distribution ships `product.txt` in Windows-1252 / Latin-1, not
+/// UTF-8 (drug names contain bytes such as `0xBF`), so a strict UTF-8 read
+/// fails outright. Try UTF-8 first (for any re-encoded copy) and fall back to a
+/// byte-wise Latin-1 → UTF-8 decode, which is lossless for every Latin-1
+/// codepoint. Mirrors `icd9_cm::decode_cms_text`.
+fn decode_ndc_text(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => e.into_bytes().into_iter().map(char::from).collect(),
+    }
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -356,6 +368,21 @@ mod tests {
         let header = "PRODUCTID\tPRODUCTNDC\tPROPRIETARYNAME";
         let result = resolve_columns(header);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_ndc_text_handles_latin1_bytes() {
+        // 0xBF is the exact byte that breaks a strict UTF-8 read of the real
+        // FDA product.txt (it precedes "Baryta muriatica"). Latin-1 maps the
+        // byte 0xBF to U+00BF ('¿'), losslessly.
+        let bytes = b"DRUG\t\xbfBaryta muriatica".to_vec();
+        assert_eq!(decode_ndc_text(bytes), "DRUG\t\u{00BF}Baryta muriatica");
+    }
+
+    #[test]
+    fn decode_ndc_text_passes_through_valid_utf8() {
+        let bytes = "Prozac® 20mg".as_bytes().to_vec();
+        assert_eq!(decode_ndc_text(bytes), "Prozac® 20mg");
     }
 
     fn sample_product_txt() -> String {
