@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG BINARY_NAME
 ARG EXPOSE_PORT=8080
@@ -12,11 +12,11 @@ RUN test -n "$BINARY_NAME" || { echo "BINARY_NAME build arg is required"; exit 1
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libssl3 ca-certificates && \
+    apt-get install -y --no-install-recommends libssl3t64 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN groupadd -g 1000 hfs && useradd -u 1000 -g hfs -m hfs
+RUN groupadd -g 1000 helios && useradd -u 1000 -g helios -m helios
 
 WORKDIR /app
 
@@ -29,7 +29,7 @@ RUN chmod +x /app/${BINARY_NAME}
 ENV BINARY_NAME=${BINARY_NAME}
 
 # Create writable data directory for SQLite and other persistent data
-RUN mkdir -p /data && chown hfs:hfs /data
+RUN mkdir -p /data && chown helios:helios /data
 VOLUME /data
 
 # Default host binding for all servers (each binary reads only its own env var)
@@ -40,7 +40,7 @@ ENV FHIRPATH_SERVER_HOST=0.0.0.0
 ENV HTS_SERVER_HOST=0.0.0.0
 ENV HTS_BOOTSTRAP_DIR=${BOOTSTRAP_DIR}
 
-USER hfs
+USER helios
 
 EXPOSE ${EXPOSE_PORT}
 
