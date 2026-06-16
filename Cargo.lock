@@ -3350,6 +3350,7 @@ dependencies = [
  "helios-fhirpath",
  "helios-fhirpath-support",
  "http 1.4.0",
+ "lru",
  "mime",
  "object_store",
  "parking_lot",
@@ -3369,6 +3370,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wiremock",
  "zip 2.4.2",
 ]
 
@@ -5474,6 +5476,7 @@ dependencies = [
  "pythonize",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

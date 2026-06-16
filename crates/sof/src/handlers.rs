@@ -20,6 +20,7 @@ use helios_sof::{
     get_fhir_version_string, get_newest_enabled_fhir_version,
     parse_view_definition_for_version as sof_parse_view_definition_for_version,
     process_view_definition, run_view_definition_with_options,
+    run_view_definition_with_options_remote,
 };
 use tracing::{debug, info};
 
@@ -536,12 +537,26 @@ pub async fn run_view_definition_handler(
         // duplicate `apply_result_filtering` pass that used to re-parse
         // and re-serialize the output — it was inefficient and
         // CSV-fragile (line-splits assumed no embedded newlines).
-        let filtered_output = run_view_definition_with_options(
-            view_definition,
-            bundle,
-            validated_params.format,
-            run_options,
-        )?;
+        // Remote `resolve()` (trusted-server prefetch) is configured via
+        // SOF_RESOLVE_* env vars; when inactive this is a no-op fast path.
+        let remote_config = helios_sof::RemoteResolveConfig::from_env();
+        let filtered_output = if remote_config.is_active() {
+            run_view_definition_with_options_remote(
+                view_definition,
+                bundle,
+                validated_params.format,
+                run_options,
+                &remote_config,
+            )
+            .await?
+        } else {
+            run_view_definition_with_options(
+                view_definition,
+                bundle,
+                validated_params.format,
+                run_options,
+            )?
+        };
 
         // Determine the MIME type for the response: each format's native
         // media type per the SoF v2 Common Operation Behavior table
