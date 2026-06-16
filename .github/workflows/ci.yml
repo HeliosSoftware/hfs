@@ -898,7 +898,7 @@ jobs:
               # Flatten the artifact structure: move binaries from target/release/ to root
               staging=$(mktemp -d)
               # Copy known binaries by name (artifacts lose executable permission)
-              for bin in hfs fhirpath-server fhirpath-cli sof-server sof-cli config-advisor; do
+              for bin in hfs fhirpath-server fhirpath-cli sof-server sof-cli config-advisor hts; do
                 if [[ "$target" == *"windows"* ]]; then
                   found=$(find "$dir/target" -maxdepth 3 -type f -name "${bin}.exe" 2>/dev/null | head -1)
                 else
