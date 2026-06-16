@@ -128,12 +128,15 @@ impl PostgresTerminologyBackend {
 
         {
             let mut client = pool.get().await.map_err(|e| {
-                HtsError::StorageError(format!("Failed to acquire PG connection: {e}"))
+                HtsError::StorageError(format!(
+                    "Failed to acquire PG connection: {}",
+                    error_chain(&e)
+                ))
             })?;
 
-            schema::apply(&client)
-                .await
-                .map_err(|e| HtsError::StorageError(format!("Failed to apply HTS schema: {e}")))?;
+            schema::apply(&client).await.map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply HTS schema: {}", error_chain(&e)))
+            })?;
 
             // Backfill `concept_closure` for any system that has hierarchy edges
             // but no closure rows yet. Idempotent and per-system, so existing
@@ -143,7 +146,10 @@ impl PostgresTerminologyBackend {
             schema::migrate_concept_closure_pg(&mut client)
                 .await
                 .map_err(|e| {
-                    HtsError::StorageError(format!("Failed to build concept_closure: {e}"))
+                    HtsError::StorageError(format!(
+                        "Failed to build concept_closure: {}",
+                        error_chain(&e)
+                    ))
                 })?;
         }
 
@@ -206,12 +212,33 @@ impl PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         schema::migrate_concept_closure_pg(&mut client)
             .await
-            .map_err(|e| HtsError::StorageError(format!("concept_closure migration: {e}")))?;
+            .map_err(|e| {
+                HtsError::StorageError(format!("concept_closure migration: {}", error_chain(&e)))
+            })?;
         Ok(())
     }
+}
+
+/// Render an error together with its full `source()` chain.
+///
+/// `tokio_postgres::Error`'s `Display` impl only prints the error *kind* —
+/// for a server-side failure that is the bare string `"db error"`. The actual
+/// SQLSTATE and `ERROR: …` message live in `source()`, so formatting such an
+/// error with `{e}` discards the one piece of information needed to diagnose
+/// it. Walking the chain preserves messages like
+/// `db error: ERROR: could not resize shared memory segment …`.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
 }
 
 fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
@@ -436,7 +463,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
                         tracing::warn!(
                             system_id = %sid,
-                            error = %e,
+                            error = %error_chain(&e),
                             "Failed to build concept_closure after import"
                         );
                     }
