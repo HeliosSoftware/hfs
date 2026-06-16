@@ -1239,7 +1239,10 @@ jobs:
             SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\""
           elif [ "$SERVER_NAME" = "hts" ]; then
             SERVICE_DESCRIPTION="Helios Terminology Server"
-            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
+            # hts uses a subcommand CLI: host/port/db flags live under `run`
+            # (top-level `hts` only takes an optional subcommand), unlike the
+            # other servers which accept --host at the top level.
+            SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME run --host 0.0.0.0"
             # SQLite backend (default); DB lives under the service WorkingDirectory (/opt/hts/data/hts.db)
             SERVICE_ENV="Environment=\"HTS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HTS_STORAGE_BACKEND=sqlite\"\nEnvironment=\"HTS_DATABASE_URL=/opt/$SERVER_NAME/data/hts.db\""
           fi
