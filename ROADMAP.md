@@ -104,6 +104,15 @@ Longer-term ideas we are exploring. These are not yet committed and may evolve s
 - **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
 - **GraphQL API** — [FHIR GraphQL](https://hl7.org/fhir/graphql.html) support for resource retrieval, search, and graph traversal as an alternative to the REST API
 
+### SQL-on-FHIR & FHIRPath
+
+Follow-ups to `resolve()` in SQL-on-FHIR, which today dereferences references against the input bundle (and their `contained` resources) and can optionally fetch from explicitly allowlisted, trusted remote servers:
+
+- **Logical (identifier-based) reference resolution** — `resolve()` handles literal `Reference.reference` strings (relative `Type/id`, absolute URLs, and `#contained` fragments). References that identify their target only by a business `identifier` (no `reference` string) are not yet resolved.
+- **Storage-backed and cross-run resolution cache for `resolve()`** ([#167](https://github.com/HeliosSoftware/hfs/issues/167)) — Resolve against server-stored resources, and persist fetched resources across runs, as a layer over the current in-bundle pool and per-run in-memory prefetch cache.
+- **Async FHIRPath evaluator** — The FHIRPath engine is synchronous (executed under Rayon by the SQL-on-FHIR core), so remote `resolve()` is handled by an up-front prefetch pass rather than inline I/O. A general async evaluator would let effectful functions (inline remote resolution, terminology lookups) run during evaluation.
+- **OAuth client-credentials for remote `resolve()`** — Trusted-server authentication is per-host bearer tokens today; a client-credentials grant flow would better suit servers fronted by OAuth.
+
 ### Advanced Persistence
 
 - Cassandra as a primary store
@@ -119,6 +128,20 @@ An intelligent recommendation engine for storage configuration:
 - Analyze a FHIR query and recommend an optimal persistence configuration
 - Leverage historical benchmark data to inform recommendations
 - Web UI for interactive configuration guidance
+
+### Build & Dependencies
+
+- **Upgrade `lru` to the latest version** — `helios-sof` uses `lru` for the
+  streaming remote-`resolve()` cross-chunk cache. It is currently pinned to `0.12`
+  to match `aws-sdk-s3`, which pins `lru = "^0.12"` as a non-optional dependency
+  (pulled by the optional `s3` feature in `helios-persistence` / `helios-rest`).
+  Matching the SDK keeps a single `lru` version compiled across all feature
+  combinations. The latest `lru` is 0.18; raising `helios-sof`'s pin would compile
+  two `lru` versions whenever `s3` is enabled, because the AWS SDK's `^0.12` pin (a
+  third-party crate we don't control) is semver-incompatible with 0.18. Bump
+  `helios-sof` to the latest `lru` once the AWS SDK updates its own pin, collapsing
+  back to a single version. Tracked so the pin is re-evaluated on the next AWS SDK
+  upgrade.
 
 ---
 

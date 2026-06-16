@@ -6,14 +6,18 @@
 use chrono::{DateTime, Utc};
 use helios_sof::{
     ChunkConfig, ChunkedResult, ContentType, NdjsonChunkReader, PreparedViewDefinition,
-    ProcessingStats, RunOptions, SofBundle, SofError as RustSofError, SofViewDefinition,
-    process_ndjson_chunked, run_view_definition, run_view_definition_with_options,
+    ProcessingStats, RemoteResolveConfig, RunOptions, SofBundle, SofError as RustSofError,
+    SofViewDefinition, parse_allowed_base_urls, process_ndjson_chunked,
+    process_ndjson_chunked_remote, run_view_definition, run_view_definition_with_options,
+    run_view_definition_with_options_remote,
 };
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
+use std::time::Duration;
 
 // Custom Python exception types - using different names to avoid conflicts
 pyo3::create_exception!(
@@ -757,6 +761,323 @@ fn py_process_ndjson_to_file(
     stats_to_pydict(py, &stats)
 }
 
+// --- Remote resolve() support -------------------------------------------------
+
+/// Parses a Python ViewDefinition + Bundle into version-specific SOF types.
+fn parse_sof_view_and_bundle(
+    view_def_json: serde_json::Value,
+    bundle_json: serde_json::Value,
+    fhir_version: &str,
+) -> PyResult<(SofViewDefinition, SofBundle)> {
+    match fhir_version {
+        #[cfg(feature = "R4")]
+        "R4" => {
+            let v: helios_fhir::r4::ViewDefinition =
+                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+            let b: helios_fhir::r4::Bundle =
+                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+            Ok((SofViewDefinition::R4(v), SofBundle::R4(b)))
+        }
+        #[cfg(feature = "R4B")]
+        "R4B" => {
+            let v: helios_fhir::r4b::ViewDefinition =
+                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+            let b: helios_fhir::r4b::Bundle =
+                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+            Ok((SofViewDefinition::R4B(v), SofBundle::R4B(b)))
+        }
+        #[cfg(feature = "R5")]
+        "R5" => {
+            let v: helios_fhir::r5::ViewDefinition =
+                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+            let b: helios_fhir::r5::Bundle =
+                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+            Ok((SofViewDefinition::R5(v), SofBundle::R5(b)))
+        }
+        #[cfg(feature = "R6")]
+        "R6" => {
+            let v: helios_fhir::r6::ViewDefinition =
+                serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?;
+            let b: helios_fhir::r6::Bundle =
+                serde_json::from_value(bundle_json).map_err(json_error_to_py_err)?;
+            Ok((SofViewDefinition::R6(v), SofBundle::R6(b)))
+        }
+        _ => Err(PyUnsupportedContentTypeError::new_err(format!(
+            "Unsupported FHIR version: {}",
+            fhir_version
+        ))),
+    }
+}
+
+/// Parses a Python ViewDefinition into a version-specific SOF type.
+fn parse_sof_view(
+    view_def_json: serde_json::Value,
+    fhir_version: &str,
+) -> PyResult<SofViewDefinition> {
+    match fhir_version {
+        #[cfg(feature = "R4")]
+        "R4" => Ok(SofViewDefinition::R4(
+            serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R4B")]
+        "R4B" => Ok(SofViewDefinition::R4B(
+            serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R5")]
+        "R5" => Ok(SofViewDefinition::R5(
+            serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?,
+        )),
+        #[cfg(feature = "R6")]
+        "R6" => Ok(SofViewDefinition::R6(
+            serde_json::from_value(view_def_json).map_err(json_error_to_py_err)?,
+        )),
+        _ => Err(PyUnsupportedContentTypeError::new_err(format!(
+            "Unsupported FHIR version: {}",
+            fhir_version
+        ))),
+    }
+}
+
+/// Builds a current-thread Tokio runtime to drive the async remote-resolve work.
+fn build_remote_runtime() -> PyResult<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| PyIoError::new_err(format!("failed to create async runtime: {}", e)))
+}
+
+/// Configuration for remote `resolve()` (fetching references from trusted servers).
+///
+/// Remote resolution is **off by default** and gated by a strict allowlist. Pass an
+/// instance to `run_view_definition_remote` / `process_ndjson_to_file_remote`.
+///
+/// Args:
+///     allowed_base_urls (list[str]): Trusted base URLs that references must match
+///         (scheme + host + port + path-prefix), e.g. ["https://fhir.example.org/r4"].
+///     enabled (bool): Master switch. Defaults to True (set False to disable).
+///     timeout_ms (int, optional): Per-request timeout in milliseconds.
+///     max_fetches (int, optional): Hard cap on fetches per run/stream.
+///     max_depth (int, optional): Rounds of chained-reference following.
+///     max_response_bytes (int, optional): Response size cap.
+///     concurrency (int, optional): Max concurrent fetches.
+///     allow_private_addresses (bool): Permit allowlisted hostnames to resolve to
+///         private/internal addresses (RFC1918 / IPv6-ULA), e.g. an internal load
+///         balancer. Loopback and link-local stay blocked. Defaults to False.
+///     cache_max_entries (int, optional): Max entries in the streaming cross-chunk cache.
+///     bearer_tokens (dict[str, str], optional): Per-host bearer tokens (host -> token).
+#[pyclass(name = "RemoteResolveConfig", module = "pysof", from_py_object)]
+#[derive(Clone)]
+struct PyRemoteResolveConfig {
+    inner: RemoteResolveConfig,
+}
+
+#[pymethods]
+impl PyRemoteResolveConfig {
+    #[new]
+    #[pyo3(signature = (
+        allowed_base_urls,
+        *,
+        enabled = true,
+        timeout_ms = None,
+        max_fetches = None,
+        max_depth = None,
+        max_response_bytes = None,
+        concurrency = None,
+        allow_private_addresses = false,
+        cache_max_entries = None,
+        bearer_tokens = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        allowed_base_urls: Vec<String>,
+        enabled: bool,
+        timeout_ms: Option<u64>,
+        max_fetches: Option<usize>,
+        max_depth: Option<usize>,
+        max_response_bytes: Option<usize>,
+        concurrency: Option<usize>,
+        allow_private_addresses: bool,
+        cache_max_entries: Option<usize>,
+        bearer_tokens: Option<HashMap<String, String>>,
+    ) -> Self {
+        let default = RemoteResolveConfig::default();
+        let inner = RemoteResolveConfig {
+            enabled,
+            allowed_base_urls: parse_allowed_base_urls(&allowed_base_urls.join(",")),
+            timeout: timeout_ms.map(Duration::from_millis).unwrap_or(default.timeout),
+            max_fetches: max_fetches.unwrap_or(default.max_fetches),
+            max_depth: max_depth.unwrap_or(default.max_depth),
+            max_response_bytes: max_response_bytes.unwrap_or(default.max_response_bytes),
+            concurrency: concurrency.map(|c| c.max(1)).unwrap_or(default.concurrency),
+            allow_private_addresses,
+            cache_max_entries: cache_max_entries.map(|c| c.max(1)).unwrap_or(default.cache_max_entries),
+            bearer_tokens: bearer_tokens
+                .map(|m| {
+                    m.into_iter()
+                        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        Self { inner }
+    }
+
+    /// Build configuration from the `SOF_RESOLVE_*` environment variables.
+    #[staticmethod]
+    fn from_env() -> Self {
+        Self {
+            inner: RemoteResolveConfig::from_env(),
+        }
+    }
+
+    /// Whether remote resolution will fetch anything (enabled and allowlist non-empty).
+    fn is_active(&self) -> bool {
+        self.inner.is_active()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RemoteResolveConfig(enabled={}, allowed_base_urls={}, allow_private_addresses={}, max_fetches={}, max_depth={})",
+            self.inner.enabled,
+            self.inner.allowed_base_urls.len(),
+            self.inner.allow_private_addresses,
+            self.inner.max_fetches,
+            self.inner.max_depth
+        )
+    }
+}
+
+/// Transform a FHIR Bundle using a ViewDefinition with remote `resolve()` enabled.
+///
+/// Like `run_view_definition_with_options`, but references pointing at trusted
+/// (allowlisted) servers are fetched and folded into the resolution pool before
+/// rows are generated.
+///
+/// Args:
+///     view_definition (dict): ViewDefinition resource.
+///     bundle (dict): FHIR Bundle resource.
+///     format (str): Output format ("csv", "csv_with_header", "json", "ndjson", "parquet").
+///     remote_config (RemoteResolveConfig): Remote resolution configuration.
+///     since (str, optional): Filter resources modified after this ISO8601 datetime.
+///     limit (int, optional): Limit the number of results.
+///     page (int, optional): Page number (1-based).
+///     fhir_version (str, optional): "R4" (default), "R4B", "R5", "R6".
+///
+/// Returns:
+///     bytes: Transformed data in the requested format.
+#[pyfunction]
+#[pyo3(signature = (view_definition, bundle, format, remote_config, *, since = None, limit = None, page = None, fhir_version = "R4"))]
+#[allow(clippy::too_many_arguments)]
+fn py_run_view_definition_with_options_remote(
+    py: Python<'_>,
+    view_definition: &Bound<'_, PyAny>,
+    bundle: &Bound<'_, PyAny>,
+    format: &str,
+    remote_config: PyRemoteResolveConfig,
+    since: Option<&str>,
+    limit: Option<usize>,
+    page: Option<usize>,
+    fhir_version: &str,
+) -> PyResult<Py<PyBytes>> {
+    let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
+    let view_def_json: serde_json::Value = pythonize::depythonize(view_definition)?;
+    let bundle_json: serde_json::Value = pythonize::depythonize(bundle)?;
+    let (sof_view_def, sof_bundle) =
+        parse_sof_view_and_bundle(view_def_json, bundle_json, fhir_version)?;
+
+    let mut options = RunOptions::default();
+    if let Some(since_str) = since {
+        options.since = Some(
+            since_str
+                .parse::<DateTime<Utc>>()
+                .map_err(|e| PyValueError::new_err(format!("Invalid 'since' datetime: {}", e)))?,
+        );
+    }
+    options.limit = limit;
+    options.page = page;
+
+    let config = remote_config.inner;
+    let runtime = build_remote_runtime()?;
+    // Release the GIL while performing network I/O and parallel row generation.
+    let result = py
+        .detach(|| {
+            runtime.block_on(run_view_definition_with_options_remote(
+                sof_view_def,
+                sof_bundle,
+                content_type,
+                options,
+                &config,
+            ))
+        })
+        .map_err(rust_sof_error_to_py_err)?;
+
+    Ok(PyBytes::new(py, &result).into())
+}
+
+/// Stream an NDJSON file through a ViewDefinition with remote `resolve()` enabled.
+///
+/// Like `process_ndjson_to_file` (streaming, bounded memory), but each chunk's
+/// references to trusted (allowlisted) servers are prefetched and folded into that
+/// chunk's resolution pool. A single shared cache spans the stream, so a reference
+/// recurring across chunks is fetched once and `max_fetches` is a per-stream cap.
+///
+/// Args:
+///     view_definition (dict): ViewDefinition resource.
+///     input_path (str): Path to the input NDJSON file.
+///     output_path (str): Path to write the output file.
+///     format (str): Output format ("csv", "csv_with_header", "ndjson", "json").
+///     remote_config (RemoteResolveConfig): Remote resolution configuration.
+///     chunk_size (int, optional): Resources per chunk. Defaults to 1000.
+///     skip_invalid (bool, optional): Skip invalid JSON lines. Defaults to False.
+///     fhir_version (str, optional): "R4" (default), "R4B", "R5", "R6".
+///
+/// Returns:
+///     dict: Processing statistics.
+#[pyfunction]
+#[pyo3(signature = (view_definition, input_path, output_path, format, remote_config, *, chunk_size = 1000, skip_invalid = false, fhir_version = "R4"))]
+#[allow(clippy::too_many_arguments)]
+fn py_process_ndjson_to_file_remote(
+    py: Python<'_>,
+    view_definition: &Bound<'_, PyAny>,
+    input_path: &str,
+    output_path: &str,
+    format: &str,
+    remote_config: PyRemoteResolveConfig,
+    chunk_size: usize,
+    skip_invalid: bool,
+    fhir_version: &str,
+) -> PyResult<Py<PyAny>> {
+    let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
+    let view_def_json: serde_json::Value = pythonize::depythonize(view_definition)?;
+    let sof_view_def = parse_sof_view(view_def_json, fhir_version)?;
+
+    let input_file = File::open(input_path).map_err(|e| PyIoError::new_err(e.to_string()))?;
+    let input_reader = BufReader::new(input_file);
+    let output_file = File::create(output_path).map_err(|e| PyIoError::new_err(e.to_string()))?;
+    let output_writer = std::io::BufWriter::new(output_file);
+
+    let config = ChunkConfig {
+        chunk_size,
+        skip_invalid_lines: skip_invalid,
+    };
+    let remote = remote_config.inner;
+    let runtime = build_remote_runtime()?;
+    let stats = py
+        .detach(|| {
+            runtime.block_on(process_ndjson_chunked_remote(
+                sof_view_def,
+                input_reader,
+                output_writer,
+                content_type,
+                config,
+                &remote,
+            ))
+        })
+        .map_err(rust_sof_error_to_py_err)?;
+
+    stats_to_pydict(py, &stats)
+}
+
 /// Python module definition
 #[pymodule]
 fn _pysof(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -771,9 +1092,15 @@ fn _pysof(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_parse_content_type, m)?)?;
     m.add_function(wrap_pyfunction!(py_get_supported_fhir_versions, m)?)?;
     m.add_function(wrap_pyfunction!(py_process_ndjson_to_file, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_run_view_definition_with_options_remote,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(py_process_ndjson_to_file_remote, m)?)?;
 
     // Add classes
     m.add_class::<ChunkedProcessor>()?;
+    m.add_class::<PyRemoteResolveConfig>()?;
 
     // Add exception classes with the Python names (not Py prefixed)
     m.add("SofError", m.py().get_type::<PySofError>())?;

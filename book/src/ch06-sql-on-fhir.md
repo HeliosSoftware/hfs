@@ -64,6 +64,124 @@ p1,1980-04-14,male,John,Smith,,john@example.com,555-1234,...
 
 ---
 
+## Resolving References Across Resources
+
+ViewDefinitions can follow a FHIR `Reference` to the resource it points at with
+the FHIRPath `resolve()` function. The resolution scope is the **entire input
+bundle**, so a view over one resource type can pull columns from a *different*
+resource elsewhere in the bundle. For example, flattening `Encounter`s together
+with their subject `Patient`:
+
+```json
+{
+  "resourceType": "ViewDefinition",
+  "resource": "Encounter",
+  "select": [
+    { "column": [{ "name": "encounter_id", "path": "id" }] },
+    {
+      "forEach": "subject.resolve()",
+      "column": [
+        { "name": "patient_id",     "path": "id" },
+        { "name": "patient_family", "path": "name.family" }
+      ]
+    }
+  ]
+}
+```
+
+Given a bundle that contains both the `Encounter` (`subject.reference =
+"Patient/pat-1"`) and the sibling `Patient/pat-1`, this produces one row joining
+the two resources. `resolve()` also works inside `where` clauses, e.g.
+`"path": "subject.resolve().gender = 'female'"`.
+
+What `resolve()` can dereference:
+
+- **Bundle-level references** — `Type/id` (e.g. `Patient/pat-1`) matched against
+  any resource in the input bundle, regardless of its type.
+- **Absolute URLs** — the trailing `Type/id` of a URL such as
+  `http://example.org/fhir/Patient/pat-1`.
+- **Contained resources** — `#fragment` (and bare-id) references resolved against
+  the `contained` array of the resource being processed.
+
+Behavior and limits:
+
+- A `Type/id` reference that matches no resource yields a typed stub, so
+  `resolve() is Patient` still evaluates correctly while data columns are null
+  (the reference simply produces null values rather than an error).
+- In **streaming NDJSON mode** (`sof-cli` on large `.ndjson` inputs), the scope
+  is limited to the current chunk; a reference that points at a resource in a
+  different chunk will not resolve. Use a single Bundle for full cross-resource
+  resolution.
+
+### Remote resolution against trusted servers
+
+By default `resolve()` only searches resources present in the input. You can
+optionally let it fetch references that point at **explicitly trusted** FHIR
+servers, so a reference like `https://fhir.example.org/r4/Patient/pat-1` is
+retrieved over the network and folded into the resolution pool before rows are
+generated.
+
+This is **off by default** and gated by a strict allowlist. Enable it with the
+`SOF_RESOLVE_*` environment variables (or the `sof-cli` flags):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SOF_RESOLVE_REMOTE` | `false` | Master switch. |
+| `SOF_RESOLVE_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated trusted bases, e.g. `https://fhir.example.org/r4,https://hapi.example.com/baseR4`. Empty ⇒ nothing is fetched. |
+| `SOF_RESOLVE_TIMEOUT_MS` | `5000` | Per-request timeout. |
+| `SOF_RESOLVE_MAX_FETCHES` | `256` | Hard cap on fetches per run. |
+| `SOF_RESOLVE_MAX_DEPTH` | `1` | Rounds of chained-reference following. |
+| `SOF_RESOLVE_MAX_RESPONSE_BYTES` | `5000000` | Response size cap. |
+| `SOF_RESOLVE_CONCURRENCY` | `8` | Max concurrent fetches. |
+| `SOF_RESOLVE_AUTH` | *(none)* | Optional per-host bearer tokens, `host=token,host2=token2`. |
+| `SOF_RESOLVE_ALLOW_PRIVATE_ADDRESSES` | `false` | Permit allowlisted hostnames to resolve to private/internal addresses (RFC1918 / IPv6-ULA), e.g. an internal load balancer. Loopback and link-local stay blocked. |
+| `SOF_RESOLVE_CACHE_MAX_ENTRIES` | `10000` | Max entries in the streaming cross-chunk fetched-resource cache (LRU, with negative caching). Bounds memory; evicted-then-reused references re-fetch. Ignored by the single-Bundle path. |
+
+```bash
+sof-cli --view v.json --bundle b.json \
+  --resolve-remote \
+  --resolve-allowed-base-urls "https://fhir.example.org/r4"
+
+# Internal deployment behind a load balancer (e.g. Traefik) addressed by hostname:
+sof-cli --view v.json --bundle b.json \
+  --resolve-remote \
+  --resolve-allowed-base-urls "https://fhir.internal.corp/r4" \
+  --resolve-allow-private-addresses
+```
+
+Security model (default-deny):
+
+- A reference is fetched only if it is an absolute `http`/`https` URL that matches
+  an allowlist entry on **scheme + host + port + path-prefix** (parsed-URL
+  comparison, never substring).
+- Hostnames are resolved and validated before connecting, and the HTTP client is
+  pinned to the validated addresses (this defeats DNS rebinding). By default a name
+  that resolves to a private, loopback, link-local, or otherwise non-public address
+  is **blocked**.
+- **Internal servers and load balancers** (e.g. Traefik) addressed by hostname are
+  supported via `SOF_RESOLVE_ALLOW_PRIVATE_ADDRESSES=true` /
+  `--resolve-allow-private-addresses`, which permits allowlisted hosts to resolve
+  to RFC1918 / IPv6-ULA addresses. Even then, **loopback and link-local (including
+  the `169.254.169.254` cloud-metadata endpoint) remain blocked**. Allowlisting a
+  literal IP (e.g. `https://10.0.0.5/r4`) is also accepted as an explicit operator
+  decision.
+- `http://` is permitted only where an `http://` base is explicitly allowlisted;
+  redirects are disabled; per-request timeout, response-size, and total-fetch
+  caps are enforced.
+- Any failure (disallowed host, timeout, non-2xx, oversize, unparseable) is
+  non-fatal — the reference falls back to the typed-stub/null behavior above.
+
+Notes:
+
+- Enabling remote resolution makes a run's output depend on remote server state
+  at query time, trading reproducibility for cross-server joins.
+- Remote resolution works in **streaming / NDJSON** mode too: each chunk's external references are prefetched and folded into that chunk's pool, with one cache shared across the whole stream (a reference recurring across chunks is fetched once, bounded by `SOF_RESOLVE_CACHE_MAX_ENTRIES`) and `SOF_RESOLVE_MAX_FETCHES` applied as a per-stream cap. Note this resolves *remote* references only — a reference to a resource in a **different chunk of the same input** is still not resolved locally (in-bundle resolution is per-chunk).
+- Resolution against arbitrary (non-allowlisted) servers and logical
+  (identifier-based) references remain out of scope; see issue
+  [#167](https://github.com/HeliosSoftware/hfs/issues/167).
+
+---
+
 ## Using sof-cli for Batch Transforms
 
 ```

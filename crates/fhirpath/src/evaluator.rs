@@ -423,6 +423,25 @@ impl EvaluationContext {
             .push(resource);
     }
 
+    /// Replaces the pool of resources available for resolution.
+    ///
+    /// This swaps the (`Arc`-shared) set of resources that `resolve()` searches —
+    /// see [`crate::resolve_function`] — **without** changing `this`, the FHIR
+    /// version, or `%context` / `%resource` / `%rootResource` semantics. Those all
+    /// derive from `this` (with `resources[0]` used only as a fallback when `this`
+    /// is `None`), so callers that have already set `this` to the resource under
+    /// evaluation can widen the resolution pool freely.
+    ///
+    /// SQL-on-FHIR uses this to expose the *entire input bundle* so that
+    /// `Reference.resolve()` can reach sibling resources elsewhere in the bundle,
+    /// not just the resource currently being processed and its `contained`
+    /// children. Sharing via `Arc` keeps this cheap across the many per-resource
+    /// (and per-iteration) contexts SOF creates, and it survives `Clone` into
+    /// lambda/child contexts.
+    pub fn set_resolution_scope(&mut self, resources: Arc<Vec<FhirResource>>) {
+        self.resources = resources;
+    }
+
     /// Sets a variable in the context to a string value
     ///
     /// This method is provided for backward compatibility with code that expects

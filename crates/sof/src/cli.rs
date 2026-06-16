@@ -134,7 +134,8 @@ use helios_sof::{
     ChunkConfig, ContentType, ParquetOptions, ProcessingStats, RunOptions, SofBundle,
     SofViewDefinition,
     data_source::{DataSource, UniversalDataSource, parse_fhir_content},
-    process_ndjson_chunked, run_view_definition_with_options,
+    process_ndjson_chunked, process_ndjson_chunked_remote, run_view_definition_with_options,
+    run_view_definition_with_options_remote,
 };
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read};
@@ -250,6 +251,40 @@ struct Args {
     /// Terminology server URL for FHIRPath terminology functions (memberOf, subsumes, etc.)
     #[arg(long, env = "SOF_TERMINOLOGY_SERVER")]
     terminology_server: Option<String>,
+
+    /// Enable remote resolution of `Reference.resolve()` against trusted servers.
+    /// Off by default; requires --resolve-allowed-base-urls (or SOF_RESOLVE_ALLOWED_BASE_URLS).
+    #[arg(long)]
+    resolve_remote: bool,
+
+    /// Comma-separated trusted base URLs that remote `resolve()` may fetch from,
+    /// e.g. `https://fhir.example.org/r4,https://hapi.example.com/baseR4`.
+    /// Overrides SOF_RESOLVE_ALLOWED_BASE_URLS. Other limits use SOF_RESOLVE_* env vars.
+    #[arg(long)]
+    resolve_allowed_base_urls: Option<String>,
+
+    /// Allow allowlisted hostnames to resolve to private/internal addresses
+    /// (RFC1918 / IPv6-ULA), e.g. for an internal load balancer such as Traefik.
+    /// Loopback and link-local (cloud-metadata) addresses remain blocked.
+    /// Overrides SOF_RESOLVE_ALLOW_PRIVATE_ADDRESSES.
+    #[arg(long)]
+    resolve_allow_private_addresses: bool,
+}
+
+/// Builds the remote-resolution config from env vars, with CLI flags taking
+/// precedence (CLI > env > default).
+fn build_remote_resolve_config(args: &Args) -> helios_sof::RemoteResolveConfig {
+    let mut config = helios_sof::RemoteResolveConfig::from_env();
+    if args.resolve_remote {
+        config.enabled = true;
+    }
+    if let Some(csv) = &args.resolve_allowed_base_urls {
+        config.allowed_base_urls = helios_sof::parse_allowed_base_urls(csv);
+    }
+    if args.resolve_allow_private_addresses {
+        config.allow_private_addresses = true;
+    }
+    config
 }
 
 /// Normalize a source path to a URL.
@@ -422,29 +457,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             skip_invalid_lines: args.skip_invalid,
         };
 
+        // Remote `resolve()` (trusted-server prefetch) for the streaming path uses
+        // a per-stream shared cache; inactive config takes the plain sync path.
+        let remote_config = build_remote_resolve_config(&args);
+
         // Create output writer
         let stats: ProcessingStats = match &args.output {
             Some(path) => {
                 let file = File::create(path)?;
                 let mut writer = BufWriter::new(file);
-                process_ndjson_chunked(
-                    view_definition,
-                    reader,
-                    &mut writer,
-                    content_type,
-                    chunk_config,
-                )?
+                if remote_config.is_active() {
+                    process_ndjson_chunked_remote(
+                        view_definition,
+                        reader,
+                        &mut writer,
+                        content_type,
+                        chunk_config,
+                        &remote_config,
+                    )
+                    .await?
+                } else {
+                    process_ndjson_chunked(
+                        view_definition,
+                        reader,
+                        &mut writer,
+                        content_type,
+                        chunk_config,
+                    )?
+                }
             }
             None => {
                 let stdout = io::stdout();
                 let mut handle = stdout.lock();
-                process_ndjson_chunked(
-                    view_definition,
-                    reader,
-                    &mut handle,
-                    content_type,
-                    chunk_config,
-                )?
+                if remote_config.is_active() {
+                    process_ndjson_chunked_remote(
+                        view_definition,
+                        reader,
+                        &mut handle,
+                        content_type,
+                        chunk_config,
+                        &remote_config,
+                    )
+                    .await?
+                } else {
+                    process_ndjson_chunked(
+                        view_definition,
+                        reader,
+                        &mut handle,
+                        content_type,
+                        chunk_config,
+                    )?
+                }
             }
         };
 
@@ -551,8 +614,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_parquet_with_splitting(view_definition, bundle, output, options)?;
     } else {
         // Standard processing for all other cases
-        let result =
-            run_view_definition_with_options(view_definition, bundle, content_type, options)?;
+        let remote_config = build_remote_resolve_config(&args);
+        let result = if remote_config.is_active() {
+            run_view_definition_with_options_remote(
+                view_definition,
+                bundle,
+                content_type,
+                options,
+                &remote_config,
+            )
+            .await?
+        } else {
+            run_view_definition_with_options(view_definition, bundle, content_type, options)?
+        };
 
         // Output result
         match args.output {
