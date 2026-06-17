@@ -2203,7 +2203,7 @@ pub async fn process_ndjson_chunked_remote<R: BufRead, W: Write>(
         output.write_all(b"[\n")?;
     }
 
-    while let Some(chunk) = reader.next() {
+    for chunk in reader.by_ref() {
         let chunk = chunk?;
 
         let external = if active {
