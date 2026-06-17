@@ -904,13 +904,17 @@ impl PyRemoteResolveConfig {
         let inner = RemoteResolveConfig {
             enabled,
             allowed_base_urls: parse_allowed_base_urls(&allowed_base_urls.join(",")),
-            timeout: timeout_ms.map(Duration::from_millis).unwrap_or(default.timeout),
+            timeout: timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(default.timeout),
             max_fetches: max_fetches.unwrap_or(default.max_fetches),
             max_depth: max_depth.unwrap_or(default.max_depth),
             max_response_bytes: max_response_bytes.unwrap_or(default.max_response_bytes),
             concurrency: concurrency.map(|c| c.max(1)).unwrap_or(default.concurrency),
             allow_private_addresses,
-            cache_max_entries: cache_max_entries.map(|c| c.max(1)).unwrap_or(default.cache_max_entries),
+            cache_max_entries: cache_max_entries
+                .map(|c| c.max(1))
+                .unwrap_or(default.cache_max_entries),
             bearer_tokens: bearer_tokens
                 .map(|m| {
                     m.into_iter()
