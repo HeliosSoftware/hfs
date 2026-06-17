@@ -1177,6 +1177,10 @@ jobs:
           if [ -d extracted/data ]; then
             cp -r extracted/data .
           fi
+          # Preserve bundled terminology distributions (hts bootstrap-on-startup)
+          if [ -d extracted/terminology-data ]; then
+            cp -r extracted/terminology-data .
+          fi
           rm -rf extracted
 
       - name: Deploy binary and create service
@@ -1197,6 +1201,16 @@ jobs:
           # Stop existing service (if running)
           $SSH_CMD "sudo systemctl stop $SERVER_NAME || true"
 
+          # Reset the database on each deploy so the server starts clean.
+          # For hts this also clears the bootstrap_imports ledger, so the
+          # HTS_BOOTSTRAP_DIR sync below re-imports every bundled terminology.
+          if [ "$SERVER_NAME" = "hfs" ]; then
+            $SSH_CMD "sudo rm -f /opt/$SERVER_NAME/fhir.db /opt/$SERVER_NAME/fhir.db-wal /opt/$SERVER_NAME/fhir.db-shm \
+                                 /opt/$SERVER_NAME/data/hfs.db /opt/$SERVER_NAME/data/hfs.db-wal /opt/$SERVER_NAME/data/hfs.db-shm"
+          elif [ "$SERVER_NAME" = "hts" ]; then
+            $SSH_CMD "sudo rm -f /opt/$SERVER_NAME/data/hts.db /opt/$SERVER_NAME/data/hts.db-wal /opt/$SERVER_NAME/data/hts.db-shm"
+          fi
+
           # Backup current version
           $SSH_CMD "sudo cp /opt/$SERVER_NAME/$SERVER_NAME \
              /opt/$SERVER_NAME/$SERVER_NAME.backup || true"
@@ -1207,6 +1221,12 @@ jobs:
           # Copy data directory (search parameters, etc.) if present
           if [ -d data ]; then
             $SCP_CMD -r data $DEPLOY_USER@$DEPLOY_HOST:/tmp/hfs-data
+          fi
+
+          # Copy bundled terminology distributions for hts bootstrap-on-startup
+          if [ "$SERVER_NAME" = "hts" ] && [ -d terminology-data ]; then
+            $SSH_CMD "rm -rf /tmp/hts-terminology-data"
+            $SCP_CMD -r terminology-data $DEPLOY_USER@$DEPLOY_HOST:/tmp/hts-terminology-data
           fi
 
           # Move binary to final location and set permissions
@@ -1221,10 +1241,17 @@ jobs:
             sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/data
           fi"
 
+          # Deploy bundled terminology distributions (hts) for bootstrap-on-startup
+          $SSH_CMD "if [ -d /tmp/hts-terminology-data ]; then
+            sudo rm -rf /opt/$SERVER_NAME/terminology-data
+            sudo mv /tmp/hts-terminology-data /opt/$SERVER_NAME/terminology-data
+            sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME/terminology-data
+          fi"
+
           # Ensure the directory is owned by deploy user so the service can write data files (e.g. fhir.db)
           $SSH_CMD "sudo chown $DEPLOY_USER:$DEPLOY_USER /opt/$SERVER_NAME"
 
-          # Create systemd service file if it doesn't exist
+          # Build the systemd unit definition for this server
           if [ "$SERVER_NAME" = "fhirpath-server" ]; then
             SERVICE_DESCRIPTION="FHIRPath Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
@@ -1243,12 +1270,16 @@ jobs:
             # (top-level `hts` only takes an optional subcommand), unlike the
             # other servers which accept --host at the top level.
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME run --host 0.0.0.0"
-            # SQLite backend (default); DB lives under the service WorkingDirectory (/opt/hts/data/hts.db)
-            SERVICE_ENV="Environment=\"HTS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HTS_STORAGE_BACKEND=sqlite\"\nEnvironment=\"HTS_DATABASE_URL=/opt/$SERVER_NAME/data/hts.db\""
+            # SQLite backend (default); DB lives under the service WorkingDirectory (/opt/hts/data/hts.db).
+            # HTS_BOOTSTRAP_DIR points at the bundled terminology distributions so
+            # the server auto-imports them on startup (idempotent via the
+            # bootstrap_imports ledger, which the DB reset above clears each deploy).
+            SERVICE_ENV="Environment=\"HTS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HTS_STORAGE_BACKEND=sqlite\"\nEnvironment=\"HTS_DATABASE_URL=/opt/$SERVER_NAME/data/hts.db\"\nEnvironment=\"HTS_BOOTSTRAP_DIR=/opt/$SERVER_NAME/terminology-data\""
           fi
 
-          $SSH_CMD "if [ ! -f /etc/systemd/system/$SERVER_NAME.service ]; then
-            sudo tee /etc/systemd/system/$SERVER_NAME.service > /dev/null <<EOF
+          # Always (re)write the unit so env changes (e.g. HTS_BOOTSTRAP_DIR)
+          # are reconciled on every deploy rather than only on first install.
+          $SSH_CMD "sudo tee /etc/systemd/system/$SERVER_NAME.service > /dev/null <<EOF
           [Unit]
           Description=$SERVICE_DESCRIPTION
           After=network.target
@@ -1266,9 +1297,8 @@ jobs:
           [Install]
           WantedBy=multi-user.target
           EOF
-            sudo systemctl daemon-reload
-            sudo systemctl enable $SERVER_NAME
-          fi"
+          sudo systemctl daemon-reload
+          sudo systemctl enable $SERVER_NAME"
 
           # Start the service
           $SSH_CMD "sudo systemctl start $SERVER_NAME"
