@@ -49,45 +49,7 @@ mod sof_conformance_tests {
     ///
     /// Each entry is a `(fixture_title::test_title, reason)` pair.  The test
     /// will be counted as "skipped" rather than "failed".
-    const KNOWN_SKIPS: &[(&str, &str)] = &[
-        // `%rowIndex` pseudo-constant is not implemented.
-        (
-            "row_index::%rowIndex at top level",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with forEach",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with forEachOrNull",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with nested forEach",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with repeat",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with unionAll",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex in unionAll without forEach",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex in unionAll inside forEach",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex for surrogate key",
-            "%rowIndex not implemented",
-        ),
-    ];
+    const KNOWN_SKIPS: &[(&str, &str)] = &[];
 
     // =========================================================================
     // Fixture loading
@@ -412,7 +374,14 @@ mod sof_conformance_tests {
         // 126 -> 124: SoF v2 PR #349 removed two `join()` fixtures from the
         // upstream `fhirpath.json` corpus, shrinking the total fixture count
         // (not a compiler regression).
-        const PASS_FLOOR: usize = 124;
+        //
+        // 124 -> 132: the upstream sync added `row_index.json` (9 fixtures for
+        // the `%rowIndex` environment variable) and the in-DB compiler now
+        // supports `%rowIndex` for SQLite. 8 of the 9 pass; the 9th
+        // (`%rowIndex in unionAll inside forEach`) still hits the pre-existing
+        // "unionAll nested inside another select" gap, like the nested-`repeat`
+        // fixtures it shares the failure floor with.
+        const PASS_FLOOR: usize = 132;
         assert!(
             passed >= PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {PASS_FLOOR}). \

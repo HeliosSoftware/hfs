@@ -121,6 +121,7 @@ tempfile = "3"
 # Async test utilities
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
+futures = "0.3"
 
 # JSON path for test assertions
 jsonpath-rust = "0.7"
@@ -135,7 +136,7 @@ regex = "1"
 # Brings up a PostgreSQL container locally — same versions used by
 # `helios-persistence`'s integration tests for binary-version parity.
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mongo"] }
 
 [package.metadata.docs.rs]
 features = ["R4", "sqlite"]

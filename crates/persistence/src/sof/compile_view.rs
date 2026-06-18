@@ -590,49 +590,63 @@ fn read_clause_columns_and_iter(
         } else {
             path.clone()
         };
-        let segments = split_path_into_segments(&unnest_path);
-        let last_idx = segments.len().saturating_sub(1);
-        for (i, seg_path) in segments.into_iter().enumerate() {
+        // Trailing-`[N]` (Mongo fall-through): `forEach: "contact.telecom[0]"`
+        // selects element N of the FLATTENED `contact.telecom` collection, not
+        // per-contact. Keep the full multi-field path in a single unnest so the
+        // emitter flattens before indexing (splitting into per-field unnests
+        // would apply `[N]` per parent element instead).
+        if let Some(n) = trailing_index {
             let alias = alias_seq.next();
-            let source = SqlExpr::JsonPath {
-                root: focus.clone(),
-                path: seg_path,
-            };
-            // Compile the trailing `where(crit)` filter against the LAST
-            // unnest's iteration alias, so `name.where(use=X)` filters the
-            // expanded `name` rows.
-            let on_filter = if i == last_idx {
-                if let Some(ref crit_src) = where_crit_src {
-                    let prev_root = env.root_alias.clone();
-                    env.root_alias = format!("{alias}.value");
-                    let pred = compile_fhirpath_expr(crit_src, env);
-                    env.root_alias = prev_root;
-                    Some(pred?)
+            let focus = format!("{alias}.value");
+            (
+                vec![UnnestStep {
+                    source: SqlExpr::JsonPath {
+                        root: parent_focus.to_string(),
+                        path: unnest_path,
+                    },
+                    out_alias: alias,
+                    left_join: is_left_join,
+                    on_filter: None,
+                    flat_index: Some(n),
+                }],
+                focus,
+            )
+        } else {
+            let segments = split_path_into_segments(&unnest_path);
+            let last_idx = segments.len().saturating_sub(1);
+            for (i, seg_path) in segments.into_iter().enumerate() {
+                let alias = alias_seq.next();
+                let source = SqlExpr::JsonPath {
+                    root: focus.clone(),
+                    path: seg_path,
+                };
+                // Compile the trailing `where(crit)` filter against the LAST
+                // unnest's iteration alias, so `name.where(use=X)` filters the
+                // expanded `name` rows.
+                let on_filter = if i == last_idx {
+                    if let Some(ref crit_src) = where_crit_src {
+                        let prev_root = env.root_alias.clone();
+                        env.root_alias = format!("{alias}.value");
+                        let pred = compile_fhirpath_expr(crit_src, env);
+                        env.root_alias = prev_root;
+                        Some(pred?)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
-            unnests.push(UnnestStep {
-                source,
-                out_alias: alias.clone(),
-                left_join: is_left_join && i == last_idx,
-                on_filter,
-                flat_index: None,
-            });
-            focus = format!("{alias}.value");
+                };
+                unnests.push(UnnestStep {
+                    source,
+                    out_alias: alias.clone(),
+                    left_join: is_left_join && i == last_idx,
+                    on_filter,
+                    flat_index: None,
+                });
+                focus = format!("{alias}.value");
+            }
+            (unnests, focus)
         }
-        // Apply trailing `[N]` semantics by tagging the LAST unnest with a
-        // limit/offset; the emitter wraps that unnest in a `LIMIT 1 OFFSET N`
-        // subquery so only the Nth element of the flattened collection is
-        // iterated.
-        if let Some(n) = trailing_index
-            && let Some(last) = unnests.last_mut()
-        {
-            last.flat_index = Some(n);
-        }
-        (unnests, focus)
     } else {
         (Vec::new(), parent_focus.to_string())
     };
