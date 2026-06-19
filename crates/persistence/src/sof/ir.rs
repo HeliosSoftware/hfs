@@ -212,6 +212,27 @@ pub enum SqlExpr {
         /// Zero-based index into the flattened chain.
         offset: i64,
     },
+
+    /// FHIRPath `%rowIndex` environment variable — the 0-based position of the
+    /// current element during iteration. The lowering depends on the enclosing
+    /// scope, which is captured at compile time (see [`RowIndexScope`]).
+    RowIndex(RowIndexScope),
+}
+
+/// The iteration scope a [`SqlExpr::RowIndex`] reference was compiled in.
+///
+/// Captured from the compiler's current focus alias so the emitter can pick the
+/// right source for the index without re-deriving scope at emit time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowIndexScope {
+    /// Resource/top level or any non-iterating scope — `%rowIndex` is always 0.
+    Top,
+    /// Inside a `forEach`/`forEachOrNull` whose lateral unnest uses the given
+    /// alias. SQLite reads `<alias>.key`; PostgreSQL reads `<alias>.ordinality`.
+    ForEach(String),
+    /// Inside a `repeat` whose recursive CTE uses the given alias. The CTE
+    /// projects a 0-based pre-order index column for `%rowIndex`.
+    Repeat(String),
 }
 
 /// Selects between `lowBoundary()` and `highBoundary()` semantics.

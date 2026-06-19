@@ -1,145 +1,107 @@
-//! SQL-on-FHIR v2 official conformance test suite — PostgreSQL in-DB runner.
+//! SQL-on-FHIR v2 official conformance test suite — MongoDB in-DB runner.
 //!
-//! Mirrors `sof_conformance.rs` (which targets SQLite) but wires the
-//! HTTP server's storage backend to a PostgreSQL container via
+//! Mirrors `sof_conformance.rs` (SQLite) and `sof_conformance_postgres.rs` (PG)
+//! but wires the HTTP server's storage backend to a MongoDB container via
 //! `testcontainers`. Same fixture set (`crates/sof/tests/sql-on-fhir-v2/tests/`),
 //! same comparator, same regression-floor pattern.
 //!
-//! Requires Docker (testcontainers spins up a real PostgreSQL instance).
-//! Matches the gating used by `crates/persistence/tests/sof_pg_runner.rs`
-//! and the other testcontainers-backed integration tests in this repo —
-//! bare `#[tokio::test]`, no `#[ignore]`, no env-var opt-in. CI's
-//! self-hosted runner has Docker available; the per-run container label
-//! (`github.run_id`) lets the workflow's cleanup job reap it.
+//! The MongoDB aggregation emitter is at parity with the SQL backends: it
+//! passes the same 132 fixtures. The remaining 12 failures are the identical
+//! structural-coverage gaps shared with SQLite/PostgreSQL (nested/sibling
+//! `repeat`, `unionAll` nested inside another `select`), absorbed by the
+//! regression floor.
+//!
+//! The Stage-1 emitter (`$unwind`/`$function`/`$facet`/server-side JS for
+//! `repeat`) requires server-side JavaScript to be enabled (the default for the
+//! conformance container).
+//!
+//! Requires Docker (testcontainers spins up a real MongoDB instance), matching
+//! the gating used by `sof_conformance_postgres.rs`.
 
-#![cfg(feature = "postgres")]
+#![cfg(feature = "mongodb")]
 
-mod sof_conformance_postgres_tests {
+mod sof_conformance_mongodb_tests {
     use axum::http::{HeaderName, HeaderValue};
     use axum_test::TestServer;
+    use futures::FutureExt;
     use helios_fhir::FhirVersion;
-    use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
-    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+    use helios_persistence::core::{Backend, ResourceStorage};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::panic::AssertUnwindSafe;
     use std::sync::Arc;
     use testcontainers::ImageExt;
     use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::mongo::Mongo;
     use tokio::sync::OnceCell;
 
     const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
 
     // =========================================================================
-    // Shared container setup — single PG container for the whole suite,
-    // mirroring `crates/persistence/tests/sof_pg_runner.rs`. Each conformance
+    // Shared container setup — single Mongo container for the whole suite. Each
     // fixture runs under a unique tenant id inside the same database so the
-    // container starts up once.
+    // container starts up once (mirrors the PostgreSQL suite).
     // =========================================================================
 
-    struct SharedPg {
-        host: String,
-        port: u16,
-        _container: testcontainers::ContainerAsync<Postgres>,
+    struct SharedMongo {
+        connection_string: String,
+        _container: testcontainers::ContainerAsync<Mongo>,
     }
 
-    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+    static SHARED_MONGO: OnceCell<SharedMongo> = OnceCell::const_new();
 
-    async fn shared_pg() -> &'static SharedPg {
-        SHARED_PG
+    async fn shared_mongo() -> &'static SharedMongo {
+        SHARED_MONGO
             .get_or_init(|| async {
+                // Label with the CI run id so the workflow's cleanup job can
+                // reap the container (mirrors the PostgreSQL conformance suite).
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Postgres::default()
+                let container = Mongo::default()
                     .with_label("github.run_id", &run_id)
                     .start()
                     .await
-                    .expect("failed to start PostgreSQL container");
-
+                    .expect("failed to start MongoDB container");
                 let port = container
-                    .get_host_port_ipv4(5432)
+                    .get_host_port_ipv4(27017)
                     .await
                     .expect("failed to get host port");
-
                 let host = container
                     .get_host()
                     .await
                     .expect("failed to get host")
                     .to_string();
-
-                // `data_dir` points at the workspace `data/` directory so the
-                // backend can load search-parameter definitions for the active
-                // FHIR version.
-                let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.join("data"))
-                    .unwrap_or_else(|| PathBuf::from("data"));
-
-                let config = PostgresConfig {
-                    host: host.clone(),
-                    port,
-                    dbname: "postgres".to_string(),
-                    user: "postgres".to_string(),
-                    password: Some("postgres".to_string()),
-                    max_connections: 5,
-                    data_dir: Some(data_dir),
-                    ..Default::default()
-                };
-
-                let backend = PostgresBackend::new(config)
-                    .await
-                    .expect("failed to create PostgresBackend");
-
-                backend
-                    .init_schema()
-                    .await
-                    .expect("failed to initialize schema");
-
-                SharedPg {
-                    host,
-                    port,
+                SharedMongo {
+                    connection_string: format!("mongodb://{host}:{port}"),
                     _container: container,
                 }
             })
             .await
     }
 
-    async fn create_backend() -> Arc<PostgresBackend> {
-        let pg = shared_pg().await;
-        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("data"))
-            .unwrap_or_else(|| PathBuf::from("data"));
-        let config = PostgresConfig {
-            host: pg.host.clone(),
-            port: pg.port,
-            dbname: "postgres".to_string(),
-            user: "postgres".to_string(),
-            password: Some("postgres".to_string()),
-            max_connections: 5,
-            data_dir: Some(data_dir),
+    async fn create_backend() -> Arc<MongoBackend> {
+        let mongo = shared_mongo().await;
+        let config = MongoBackendConfig {
+            connection_string: mongo.connection_string.clone(),
+            database_name: "sof_mongo_conformance".to_string(),
             ..Default::default()
         };
-        Arc::new(
-            PostgresBackend::new(config)
-                .await
-                .expect("failed to create PostgresBackend"),
-        )
+        let backend = MongoBackend::new(config).expect("failed to create MongoBackend");
+        backend
+            .initialize()
+            .await
+            .expect("failed to initialize MongoDB schema");
+        Arc::new(backend)
     }
 
-    // =========================================================================
-    // Known-skip list — same set as the SQLite suite (the IR is dialect-
-    // independent so anything skipped on SQLite is also skipped on PG).
-    // =========================================================================
-
+    // Stage-1 Mongo emitter unsupported constructs are absorbed by the floor,
+    // not enumerated here (see the module doc).
     const KNOWN_SKIPS: &[(&str, &str)] = &[];
 
     // =========================================================================
-    // Fixture loading (identical to sof_conformance.rs)
+    // Fixture loading (identical to the SQLite/PG suites)
     // =========================================================================
 
     #[derive(Debug)]
@@ -202,20 +164,19 @@ mod sof_conformance_postgres_tests {
 
     // =========================================================================
     // Per-fixture HTTP server. Each fixture seeds its own resources under a
-    // unique tenant so the shared container can host the whole suite without
-    // cross-fixture bleed.
+    // unique tenant so the shared container hosts the whole suite.
     // =========================================================================
 
     fn unique_tenant() -> (TenantContext, String) {
-        let id = format!("sof_pg_conf_{}", uuid::Uuid::new_v4().simple());
+        let id = format!("sof_mongo_conf_{}", uuid::Uuid::new_v4().simple());
         let tenant = TenantContext::new(TenantId::new(&id), TenantPermissions::full_access());
         (tenant, id)
     }
 
-    async fn create_test_server(backend: Arc<PostgresBackend>) -> TestServer {
+    async fn create_test_server(backend: Arc<MongoBackend>) -> TestServer {
         let runner = backend
             .sof_runner()
-            .expect("PostgresBackend must provide an in-DB SOF runner");
+            .expect("MongoBackend must provide an in-DB SOF runner");
         let config = ServerConfig::for_testing();
         let state =
             helios_rest::AppState::new(Arc::clone(&backend), config).with_sof_runner(runner);
@@ -223,11 +184,7 @@ mod sof_conformance_postgres_tests {
         TestServer::new(app).expect("failed to create test server")
     }
 
-    async fn seed_resources(
-        backend: &PostgresBackend,
-        tenant: &TenantContext,
-        resources: &[Value],
-    ) {
+    async fn seed_resources(backend: &MongoBackend, tenant: &TenantContext, resources: &[Value]) {
         for resource in resources {
             let rt = match resource["resourceType"].as_str() {
                 Some(t) => t,
@@ -328,12 +285,63 @@ mod sof_conformance_postgres_tests {
         None
     }
 
+    enum Outcome {
+        /// Passed; the `String` is an optional trailing note for the log line.
+        Pass(String),
+        Fail(String),
+    }
+
+    /// Runs one fixture test against the server and classifies the result.
+    /// Panics from `axum-test` (mid-stream runtime errors) propagate to the
+    /// caller's `catch_unwind`.
+    async fn evaluate_test(
+        server: &TestServer,
+        tenant_id: &str,
+        view_body: &Value,
+        test: &TestCase,
+    ) -> Outcome {
+        let resp = server
+            .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_str(tenant_id).unwrap())
+            .add_header(
+                axum::http::HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(view_body)
+            .await;
+
+        let status = resp.status_code();
+
+        if test.expect_error {
+            return if status.is_success() {
+                Outcome::Fail(format!("expected error but got {status}"))
+            } else {
+                Outcome::Pass(format!(" (expected error, got {status})"))
+            };
+        }
+
+        if !status.is_success() {
+            return Outcome::Fail(format!("unexpected HTTP {status}: {}", resp.text()));
+        }
+
+        let actual = parse_ndjson(&resp.text());
+        match &test.expect {
+            Some(expected) => match compare_rows(&actual, expected) {
+                None => Outcome::Pass(String::new()),
+                Some(mismatch) => Outcome::Fail(format!(
+                    "{mismatch}\n       actual:   {actual:?}\n       expected: {expected:?}"
+                )),
+            },
+            None => Outcome::Pass(" (no assertion)".to_string()),
+        }
+    }
+
     // =========================================================================
     // Main conformance test
     // =========================================================================
 
     #[tokio::test]
-    async fn test_sof_v2_conformance_in_db_postgres() {
+    async fn test_sof_v2_conformance_in_db_mongodb() {
         let fixtures = load_fixtures();
         let backend = create_backend().await;
 
@@ -356,89 +364,49 @@ mod sof_conformance_postgres_tests {
                     continue;
                 }
 
+                // The Stage-1 Mongo emitter can compile a pipeline that then
+                // fails at runtime (e.g. `$arrayElemAt` on a string). Such
+                // errors surface mid-stream and make `axum-test` panic, so each
+                // request is evaluated under `catch_unwind` and a panic is
+                // recorded as a failure rather than aborting the whole suite.
                 let view_body = normalise_view(&test.view);
-                let resp = server
-                    .post("/ViewDefinition/$viewdefinition-run?_format=ndjson")
-                    .add_header(X_TENANT_ID, HeaderValue::from_str(&tenant_id).unwrap())
-                    .add_header(
-                        axum::http::HeaderName::from_static("content-type"),
-                        HeaderValue::from_static("application/fhir+json"),
-                    )
-                    .json(&view_body)
-                    .await;
+                let outcome =
+                    AssertUnwindSafe(evaluate_test(&server, &tenant_id, &view_body, test))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            Outcome::Fail("request panicked (mid-stream runtime error)".to_string())
+                        });
 
-                let status = resp.status_code();
-
-                if test.expect_error {
-                    if status.is_success() {
-                        let msg = format!("FAIL  {key}: expected error but got {status}");
+                match outcome {
+                    Outcome::Pass(note) => {
+                        eprintln!("  PASS  {key}{note}");
+                        passed += 1;
+                    }
+                    Outcome::Fail(reason) => {
+                        let msg = format!("FAIL  {key}: {reason}");
                         eprintln!("  {msg}");
                         failure_msgs.push(msg);
                         failed += 1;
-                    } else {
-                        eprintln!("  PASS  {key} (expected error, got {status})");
-                        passed += 1;
                     }
-                    continue;
-                }
-
-                if !status.is_success() {
-                    let msg = format!("FAIL  {key}: unexpected HTTP {status}: {}", resp.text());
-                    eprintln!("  {msg}");
-                    failure_msgs.push(msg);
-                    failed += 1;
-                    continue;
-                }
-
-                let body = resp.text();
-                let actual = parse_ndjson(&body);
-
-                if let Some(expected) = &test.expect {
-                    match compare_rows(&actual, expected) {
-                        None => {
-                            eprintln!("  PASS  {key}");
-                            passed += 1;
-                        }
-                        Some(mismatch) => {
-                            let msg = format!(
-                                "FAIL  {key}: {mismatch}\n       actual:   {actual:?}\n       expected: {expected:?}"
-                            );
-                            eprintln!("  {msg}");
-                            failure_msgs.push(msg);
-                            failed += 1;
-                        }
-                    }
-                } else {
-                    eprintln!("  PASS  {key} (no assertion)");
-                    passed += 1;
                 }
             }
         }
 
         eprintln!(
-            "\nSoF v2 conformance (PostgreSQL): {passed} passed, {failed} failed, {skipped} skipped"
+            "\nSoF v2 conformance (MongoDB): {passed} passed, {failed} failed, {skipped} skipped"
         );
 
-        // Regression floor — mirrors the SQLite ratchet at
-        // `sof_conformance.rs`. The full SoF v2 corpus passes against
-        // PostgreSQL; lowering this requires the same justification as the
-        // SQLite floor (a fixture genuinely outside the in-DB runner's
-        // coverage, listed in `KNOWN_SKIPS` with a reason).
-        //
-        // 126 -> 124: SoF v2 PR #349 removed two `join()` fixtures from the
-        // upstream `fhirpath.json` corpus, shrinking the total fixture count
-        // (not a compiler regression).
-        //
-        // 124 -> 132: the upstream sync added `row_index.json` and the PG in-DB
-        // compiler now supports `%rowIndex` (`WITH ORDINALITY` for forEach, a
-        // pre-order `ord_path` in the repeat CTE). 8 of the 9 pass; the 9th
-        // (`%rowIndex in unionAll inside forEach`) hits the pre-existing
-        // "unionAll nested inside another select" gap, shared with the
-        // nested-`repeat` fixtures on the failure floor.
-        const PG_PASS_FLOOR: usize = 132;
+        // Regression floor — the Mongo aggregation emitter now passes the SAME
+        // 132 fixtures as the SQL backends. The remaining 12 failures are the
+        // identical structural-coverage gaps shared with SQLite/PostgreSQL
+        // (nested/sibling `repeat`, `unionAll` nested inside another `select`),
+        // so the floor matches the SQL suites exactly. A drop signals a
+        // Mongo-emitter regression; raise it only alongside the SQL floors.
+        const MONGO_PASS_FLOOR: usize = 132;
         assert!(
-            passed >= PG_PASS_FLOOR,
-            "regression: only {passed} fixtures pass (floor: {PG_PASS_FLOOR}). \
+            passed >= MONGO_PASS_FLOOR,
+            "regression: only {passed} fixtures pass (floor: {MONGO_PASS_FLOOR}). \
              Failures:\n  {}",
             failure_msgs.join("\n  "),
         );

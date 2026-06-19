@@ -2482,6 +2482,13 @@ fn extract_view_definition_constants<VD: ViewDefinitionTrait>(
 ) -> Result<HashMap<String, EvaluationResult>, SofError> {
     let mut variables = HashMap::new();
 
+    // `%rowIndex` is the FHIRPath environment variable tracking the 0-based position of the
+    // current element during iteration. It defaults to 0 at the resource/top level (and in any
+    // non-iterating scope, such as a `unionAll` branch without `forEach`). `forEach`,
+    // `forEachOrNull`, and `repeat` override it per iterated element (see
+    // `expand_for_each_combinations` / `expand_repeat_combinations`).
+    variables.insert("%rowIndex".to_string(), EvaluationResult::integer(0));
+
     if let Some(constants) = view_definition.constants() {
         for constant in constants {
             let name = constant
@@ -3236,6 +3243,23 @@ where
     Ok(new_combinations)
 }
 
+/// Clone the variable map and set `%rowIndex` to `index` for the current iteration element.
+///
+/// `forEach`, `forEachOrNull`, and `repeat` each rebind `%rowIndex` to the 0-based position of
+/// the element they are processing; nested selects and `unionAll` branches without their own
+/// iteration inherit this value through the cloned map.
+fn vars_with_row_index(
+    variables: &HashMap<String, EvaluationResult>,
+    index: usize,
+) -> HashMap<String, EvaluationResult> {
+    let mut item_vars = variables.clone();
+    item_vars.insert(
+        "%rowIndex".to_string(),
+        EvaluationResult::integer(index as i64),
+    );
+    item_vars
+}
+
 fn expand_for_each_combinations<S>(
     context: &EvaluationContext,
     select: &S,
@@ -3261,19 +3285,47 @@ where
 
     if iteration_items.is_empty() {
         if allow_null {
-            // forEachOrNull: generate null rows
+            // forEachOrNull: generate a single null row per existing combination. Per the spec,
+            // this row is evaluated against an empty element with `%rowIndex` = 0, so most columns
+            // resolve to null while a `%rowIndex` column still yields 0.
+            let empty_node = EvaluationResult::Object {
+                map: HashMap::new(),
+                type_info: None,
+            };
+            let item_vars = vars_with_row_index(variables, 0);
             let mut new_combinations = Vec::new();
             for existing_combo in existing_combinations {
                 let mut new_combo = existing_combo.clone();
 
-                // Set column values to null for this forEach scope
                 if let Some(columns) = select.column() {
                     for col in columns {
                         if let Some(col_name) = col.name() {
                             if let Some(col_index) =
                                 all_columns.iter().position(|name| name == col_name)
                             {
-                                new_combo.values[col_index] = None;
+                                let path = col.path().ok_or_else(|| {
+                                    SofError::InvalidViewDefinition(
+                                        "Column path is required".to_string(),
+                                    )
+                                })?;
+
+                                let result = if path == "$this" {
+                                    empty_node.clone()
+                                } else {
+                                    evaluate_path_on_item(
+                                        path,
+                                        &empty_node,
+                                        &item_vars,
+                                        &context.resources,
+                                    )?
+                                };
+
+                                let is_collection = col.collection().unwrap_or(false);
+                                new_combo.values[col_index] = if is_collection {
+                                    fhirpath_result_to_json_value_collection(result)
+                                } else {
+                                    fhirpath_result_to_json_value(result)
+                                };
                             }
                         }
                     }
@@ -3291,9 +3343,9 @@ where
     let mut new_combinations = Vec::new();
 
     // For each iteration item, create new combinations
-    for item in &iteration_items {
-        // Create a new context with the iteration item
-        let _item_context = create_iteration_context(item, variables, &context.resources);
+    for (idx, item) in iteration_items.iter().enumerate() {
+        // `%rowIndex` for this element scopes the columns evaluated below.
+        let item_vars = vars_with_row_index(variables, idx);
 
         for existing_combo in existing_combinations {
             let mut new_combo = existing_combo.clone();
@@ -3317,7 +3369,7 @@ where
                                 item.clone()
                             } else {
                                 // Evaluate the path on the iteration item
-                                evaluate_path_on_item(path, item, variables, &context.resources)?
+                                evaluate_path_on_item(path, item, &item_vars, &context.resources)?
                             };
 
                             // Check if this column is marked as a collection
@@ -3341,8 +3393,10 @@ where
     if let Some(nested_selects) = select.select() {
         let mut final_combinations = Vec::new();
 
-        for item in &iteration_items {
-            let item_context = create_iteration_context(item, variables, &context.resources);
+        for (idx, item) in iteration_items.iter().enumerate() {
+            // `%rowIndex` for this element scopes its own columns and any nested selects.
+            let item_vars = vars_with_row_index(variables, idx);
+            let item_context = create_iteration_context(item, &item_vars, &context.resources);
 
             // For each iteration item, we need to start with the combinations that have
             // the correct column values for this forEach scope
@@ -3370,7 +3424,7 @@ where
                                     evaluate_path_on_item(
                                         path,
                                         item,
-                                        variables,
+                                        &item_vars,
                                         &context.resources,
                                     )?
                                 };
@@ -3398,7 +3452,7 @@ where
                         nested_select,
                         &item_combinations,
                         all_columns,
-                        variables,
+                        &item_vars,
                     )?;
                 }
 
@@ -3413,8 +3467,11 @@ where
     if let Some(union_selects) = select.union_all() {
         let mut union_combinations = Vec::new();
 
-        for item in &iteration_items {
-            let item_context = create_iteration_context(item, variables, &context.resources);
+        for (idx, item) in iteration_items.iter().enumerate() {
+            // `%rowIndex` for this element is inherited by every unionAll branch that does not
+            // introduce its own `forEach`.
+            let item_vars = vars_with_row_index(variables, idx);
+            let item_context = create_iteration_context(item, &item_vars, &context.resources);
 
             // For each iteration item, process all unionAll selects
             for existing_combo in existing_combinations {
@@ -3439,7 +3496,7 @@ where
                                     evaluate_path_on_item(
                                         path,
                                         item,
-                                        variables,
+                                        &item_vars,
                                         &context.resources,
                                     )?
                                 };
@@ -3478,7 +3535,7 @@ where
                                             evaluate_path_on_item(
                                                 path,
                                                 item,
-                                                variables,
+                                                &item_vars,
                                                 &context.resources,
                                             )?
                                         };
@@ -3506,7 +3563,7 @@ where
                         union_select,
                         &select_combinations,
                         all_columns,
-                        variables,
+                        &item_vars,
                     )?;
                     union_combinations.extend(select_combinations);
                 }
@@ -3521,6 +3578,47 @@ where
     Ok(new_combinations)
 }
 
+/// Flatten a `repeat` recursive traversal into a pre-order list of descendant nodes.
+///
+/// Mirrors the reference implementation's `recursiveTraverse`: starting from `context`'s node,
+/// each repeat path is evaluated, and for every resulting object child the child is appended and
+/// then traversed in turn (the starting node itself is never included). Non-object results are
+/// ignored, matching the reference's `typeof childNode === 'object'` guard. The resulting order is
+/// what `%rowIndex` enumerates over.
+fn collect_repeat_nodes(
+    context: &EvaluationContext,
+    repeat_paths: &[&str],
+    variables: &HashMap<String, EvaluationResult>,
+    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    out: &mut Vec<EvaluationResult>,
+) -> Result<(), SofError> {
+    for repeat_path in repeat_paths {
+        let repeat_result = evaluate_expression(repeat_path, context).map_err(|e| {
+            SofError::FhirPathError(format!(
+                "Error evaluating repeat expression '{}': {}",
+                repeat_path, e
+            ))
+        })?;
+
+        for child_item in extract_iteration_items(repeat_result) {
+            // Only object nodes participate in the traversal (matches the reference impl).
+            if !matches!(child_item, EvaluationResult::Object { .. }) {
+                continue;
+            }
+            let child_context = create_iteration_context(&child_item, variables, resolution_scope);
+            out.push(child_item);
+            collect_repeat_nodes(
+                &child_context,
+                repeat_paths,
+                variables,
+                resolution_scope,
+                out,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn expand_repeat_combinations<S>(
     context: &EvaluationContext,
     select: &S,
@@ -3533,128 +3631,102 @@ where
     S: ViewDefinitionSelectTrait,
     S::Select: ViewDefinitionSelectTrait,
 {
-    // The repeat directive performs recursive traversal:
-    // 1. For each repeat path, find child elements from the current context
-    // 2. For each child element:
-    //    a. Evaluate columns in the child's context
-    //    b. Recursively process the child with the same repeat paths
-    // 3. Union all results together
+    // The repeat directive performs recursive traversal of the elements reachable via the repeat
+    // paths. We first flatten that traversal into a pre-order node list (see `collect_repeat_nodes`)
+    // so that each emitted node can be assigned a monotonic `%rowIndex` matching the reference
+    // implementation. The traversal is independent of `existing_combinations`, so it is collected
+    // once and applied to each incoming combination.
     //
     // Note: Unlike forEach, repeat does NOT process the current level's columns
     // - it ONLY processes elements found via the repeat paths
+    let mut nodes = Vec::new();
+    collect_repeat_nodes(
+        context,
+        repeat_paths,
+        variables,
+        &context.resources,
+        &mut nodes,
+    )?;
 
     let mut all_combinations = Vec::new();
 
-    // Process each existing combination
+    // Process each existing combination, emitting one row per traversed node (cross product).
     for existing_combo in existing_combinations {
-        // Process each repeat path to find children to traverse
-        for repeat_path in repeat_paths {
-            // Evaluate the repeat path to get child elements
-            let repeat_result = evaluate_expression(repeat_path, context).map_err(|e| {
-                SofError::FhirPathError(format!(
-                    "Error evaluating repeat expression '{}': {}",
-                    repeat_path, e
-                ))
-            })?;
+        for (idx, node) in nodes.iter().enumerate() {
+            // Each traversed node gets its own `%rowIndex` (its position in the flattened list).
+            let item_vars = vars_with_row_index(variables, idx);
+            let node_context = create_iteration_context(node, &item_vars, &context.resources);
 
-            let child_items = extract_iteration_items(repeat_result);
+            // Create a combination for this node with the repeat level's columns
+            let mut node_combo = existing_combo.clone();
 
-            // For each child item found via this repeat path
-            for child_item in &child_items {
-                // Create a combination for this child with current level's columns
-                let mut child_combo = existing_combo.clone();
+            if let Some(columns) = select.column() {
+                for col in columns {
+                    if let Some(col_name) = col.name() {
+                        if let Some(col_index) =
+                            all_columns.iter().position(|name| name == col_name)
+                        {
+                            let path = col.path().ok_or_else(|| {
+                                SofError::InvalidViewDefinition(
+                                    "Column path is required".to_string(),
+                                )
+                            })?;
 
-                // Evaluate columns in the context of this child item
-                if let Some(columns) = select.column() {
-                    for col in columns {
-                        if let Some(col_name) = col.name() {
-                            if let Some(col_index) =
-                                all_columns.iter().position(|name| name == col_name)
-                            {
-                                let path = col.path().ok_or_else(|| {
-                                    SofError::InvalidViewDefinition(
-                                        "Column path is required".to_string(),
-                                    )
-                                })?;
+                            // Evaluate the path on the traversed node
+                            let result = if path == "$this" {
+                                node.clone()
+                            } else {
+                                evaluate_path_on_item(path, node, &item_vars, &context.resources)?
+                            };
 
-                                // Evaluate the path on the child item
-                                let result = if path == "$this" {
-                                    child_item.clone()
-                                } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        child_item,
-                                        variables,
-                                        &context.resources,
-                                    )?
-                                };
-
-                                let is_collection = col.collection().unwrap_or(false);
-                                child_combo.values[col_index] = if is_collection {
-                                    fhirpath_result_to_json_value_collection(result)
-                                } else {
-                                    fhirpath_result_to_json_value(result)
-                                };
-                            }
+                            let is_collection = col.collection().unwrap_or(false);
+                            node_combo.values[col_index] = if is_collection {
+                                fhirpath_result_to_json_value_collection(result)
+                            } else {
+                                fhirpath_result_to_json_value(result)
+                            };
                         }
                     }
                 }
-
-                // Create context for this child item
-                let child_context =
-                    create_iteration_context(child_item, variables, &context.resources);
-
-                // Start with the child combination we just created
-                let mut child_combinations = vec![child_combo.clone()];
-
-                // Process nested selects (like forEach/forEachOrNull) in the child's context
-                if let Some(nested_selects) = select.select() {
-                    for nested_select in nested_selects {
-                        child_combinations = expand_select_combinations(
-                            &child_context,
-                            nested_select,
-                            &child_combinations,
-                            all_columns,
-                            variables,
-                        )?;
-                    }
-                }
-
-                // Apply unionAll branches in the child's context
-                if let Some(union_selects) = select.union_all() {
-                    let mut union_combinations = Vec::new();
-                    for combo in &child_combinations {
-                        for union_select in union_selects {
-                            let select_combinations = expand_select_combinations(
-                                &child_context,
-                                union_select,
-                                std::slice::from_ref(combo),
-                                all_columns,
-                                variables,
-                            )?;
-                            union_combinations.extend(select_combinations);
-                        }
-                    }
-                    child_combinations = union_combinations;
-                }
-
-                // Add the processed combinations to our results
-                // (these may have been filtered by forEach, which is correct)
-                all_combinations.extend(child_combinations);
-
-                // Now recursively process this child with the same repeat paths
-                // IMPORTANT: Use the original child_combo, not the forEach-filtered results
-                let recursive_combinations = expand_repeat_combinations(
-                    &child_context,
-                    select,
-                    &[child_combo],
-                    all_columns,
-                    repeat_paths,
-                    variables,
-                )?;
-
-                all_combinations.extend(recursive_combinations);
             }
+
+            // Start with the node combination we just created
+            let mut node_combinations = vec![node_combo];
+
+            // Process nested selects (like forEach/forEachOrNull) in the node's context
+            if let Some(nested_selects) = select.select() {
+                for nested_select in nested_selects {
+                    node_combinations = expand_select_combinations(
+                        &node_context,
+                        nested_select,
+                        &node_combinations,
+                        all_columns,
+                        &item_vars,
+                    )?;
+                }
+            }
+
+            // Apply unionAll branches in the node's context
+            if let Some(union_selects) = select.union_all() {
+                let mut union_combinations = Vec::new();
+                for combo in &node_combinations {
+                    for union_select in union_selects {
+                        let select_combinations = expand_select_combinations(
+                            &node_context,
+                            union_select,
+                            std::slice::from_ref(combo),
+                            all_columns,
+                            &item_vars,
+                        )?;
+                        union_combinations.extend(select_combinations);
+                    }
+                }
+                node_combinations = union_combinations;
+            }
+
+            // Add the processed combinations to our results
+            // (these may have been filtered by forEach, which is correct)
+            all_combinations.extend(node_combinations);
         }
     }
 
