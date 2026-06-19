@@ -29,9 +29,11 @@ done
   in-DB compiler does not yet cover):
   - `crates/rest/tests/sof_conformance.rs` — SQLite (in-memory, no Docker; floor 132).
   - `crates/rest/tests/sof_conformance_postgres.rs` — PostgreSQL via testcontainers (floor 132).
-  - `crates/rest/tests/sof_conformance_mongodb.rs` — MongoDB via testcontainers
-    (floor 59; the Stage-1 aggregation emitter doesn't yet cover `unionAll`,
-    `repeat`, collections, and several functions).
+  - `crates/rest/tests/sof_conformance_mongodb.rs` — MongoDB via testcontainers (floor 132).
+
+  All three in-DB suites share the same floor (132) and the same 12 failing
+  fixtures: nested/sibling `repeat` and `unionAll` nested inside another
+  `select`, which no in-DB compiler covers yet.
 
 ## Notes
 
@@ -50,9 +52,9 @@ execution engine:
 | SQLite | in-DB SQL compiler | full (top-level, forEach/forEachOrNull, repeat) |
 | PostgreSQL | in-DB SQL compiler | full (`WITH ORDINALITY` for forEach, pre-order `ord_path` in the repeat CTE) |
 | S3 | in-process `helios-sof` engine | full (the engine's own `forEach`/`repeat` support) |
-| MongoDB | in-DB aggregation (Stage 1) | top-level + forEach/forEachOrNull (`$unwind … includeArrayIndex`); `repeat`/`unionAll` are unsupported by the Stage-1 emitter regardless |
+| MongoDB | in-DB aggregation | full (`$unwind … includeArrayIndex` for forEach; `$function` pre-order traversal for repeat) |
 | Elasticsearch | — | no SOF runner; SOF is not served on ES |
 
-Across SQLite and PostgreSQL, 8 of the 9 `row_index.json` fixtures pass in-DB;
-the 9th (`%rowIndex in unionAll inside forEach`) depends on the orthogonal,
-pre-existing "unionAll nested inside another select" gap.
+Across all in-DB backends, 8 of the 9 `row_index.json` fixtures pass; the 9th
+(`%rowIndex in unionAll inside forEach`) depends on the orthogonal, pre-existing
+"unionAll nested inside another select" gap.
