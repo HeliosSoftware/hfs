@@ -338,13 +338,16 @@ jobs:
         run: cargo install cargo-llvm-cov
 
       - name: Generate code coverage
-        # Mirror the test job's `--all-features` so feature-gated backends
-        # (mongodb/postgres/elasticsearch/s3) — and their conformance suites,
-        # which exercise the in-DB SOF emitters — are measured. Docker is
-        # provisioned via DOCKER_HOST for the testcontainers-backed tests.
+        # Enable the in-DB storage backends so their SOF conformance suites
+        # (which exercise the postgres/mongodb emitters) are measured; Docker is
+        # provisioned via DOCKER_HOST for the testcontainers-backed tests. We do
+        # NOT use `--all-features`: that additionally enables R4B/R5/R6, whose
+        # generated model files (`crates/fhir/src/r4b|r5|r6.rs`) bloat the lcov
+        # report enough that Codecov's processing errors out. Default features
+        # keep FHIR at R4 only.
         # Skip docker-dependent email integration tests; they run in
         # subscriptions-channels.yml where mailpit is provisioned.
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info -- --skip email_
+        run: cargo llvm-cov --workspace --features postgres,mongodb --lcov --output-path lcov.info -- --skip email_
 
       # Upload coverage report as artifact
       - name: Upload Coverage Report
