@@ -363,6 +363,13 @@ pub struct ReindexOperation<S: ReindexableStorage> {
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     /// Cancellation channels.
     cancel_channels: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>,
+    /// Optional audit sink for emitting BALP `AuditEvent` records at each
+    /// reindex lifecycle transition.
+    #[cfg(feature = "audit")]
+    audit_sink: Option<Arc<dyn helios_audit::AuditSink>>,
+    /// `AuditEvent.source.observer` reference used for emitted events.
+    #[cfg(feature = "audit")]
+    audit_source_observer: String,
 }
 
 impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
@@ -373,7 +380,24 @@ impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
             extractor,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             cancel_channels: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "audit")]
+            audit_sink: None,
+            #[cfg(feature = "audit")]
+            audit_source_observer: "Device/hfs".to_string(),
         }
+    }
+
+    /// Wires an audit sink so each reindex lifecycle transition emits a
+    /// BALP-compliant `AuditEvent`.
+    #[cfg(feature = "audit")]
+    pub fn with_audit(
+        mut self,
+        sink: Arc<dyn helios_audit::AuditSink>,
+        source_observer: impl Into<String>,
+    ) -> Self {
+        self.audit_sink = Some(sink);
+        self.audit_source_observer = source_observer.into();
+        self
     }
 
     /// Starts a reindex operation.
@@ -401,6 +425,29 @@ impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
         let extractor = self.extractor.clone();
         let jobs = self.jobs.clone();
         let job_id_clone = job_id.clone();
+        #[cfg(feature = "audit")]
+        let request_types = request.resource_types.clone().unwrap_or_default();
+        #[cfg(feature = "audit")]
+        let audit_sink = self.audit_sink.clone();
+        #[cfg(feature = "audit")]
+        let audit_source_observer = self.audit_source_observer.clone();
+
+        // Emitted before `tokio::spawn` so the start event is always recorded
+        // before any concurrent terminal event from the background task.
+        #[cfg(feature = "audit")]
+        if let Some(ref sink) = audit_sink {
+            audit::record_reindex_event(
+                sink.as_ref(),
+                &audit_source_observer,
+                None,
+                &job_id,
+                "start",
+                &request_types,
+                0,
+                "0",
+            )
+            .await;
+        }
 
         // Spawn background task
         tokio::spawn(async move {
@@ -412,6 +459,12 @@ impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
                 extractor,
                 jobs,
                 cancel_rx,
+                #[cfg(feature = "audit")]
+                audit_sink,
+                #[cfg(feature = "audit")]
+                audit_source_observer,
+                #[cfg(feature = "audit")]
+                request_types,
             )
             .await;
         });
@@ -420,7 +473,69 @@ impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
     }
 
     /// Runs the reindex operation in the background.
+    ///
+    /// Wraps [`Self::run_reindex_inner`] with terminal-state audit emission:
+    /// after the inner driver returns (success, cancellation, or failure), the
+    /// final [`ReindexProgress`] is read and a BALP `AuditEvent` is emitted
+    /// via [`audit::record_reindex_event`].
+    #[allow(clippy::too_many_arguments)]
     async fn run_reindex(
+        job_id: String,
+        tenant: TenantContext,
+        request: ReindexRequest,
+        storage: Arc<S>,
+        extractor: Arc<SearchParameterExtractor>,
+        jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
+        cancel_rx: mpsc::Receiver<()>,
+        #[cfg(feature = "audit")] audit_sink: Option<Arc<dyn helios_audit::AuditSink>>,
+        #[cfg(feature = "audit")] audit_source_observer: String,
+        #[cfg(feature = "audit")] audit_resource_types: Vec<String>,
+    ) {
+        Self::run_reindex_inner(
+            job_id.clone(),
+            tenant,
+            request,
+            storage,
+            extractor,
+            jobs.clone(),
+            cancel_rx,
+        )
+        .await;
+
+        #[cfg(feature = "audit")]
+        if let Some(sink) = audit_sink.as_ref() {
+            let (status, processed) = {
+                let guard = jobs.read();
+                let progress = guard.get(&job_id);
+                (
+                    progress.map(|p| p.status).unwrap_or(ReindexStatus::Failed),
+                    progress.map(|p| p.processed_resources).unwrap_or(0),
+                )
+            };
+            let (phase, outcome) = match status {
+                ReindexStatus::Completed => ("complete", "0"),
+                ReindexStatus::Cancelled => ("cancel", "4"),
+                ReindexStatus::Failed => ("fail", "8"),
+                // In-flight states should not be observable post-return, but
+                // record them as failures rather than dropping the event.
+                ReindexStatus::Queued | ReindexStatus::InProgress => ("fail", "8"),
+            };
+            audit::record_reindex_event(
+                sink.as_ref(),
+                &audit_source_observer,
+                None,
+                &job_id,
+                phase,
+                &audit_resource_types,
+                processed,
+                outcome,
+            )
+            .await;
+        }
+    }
+
+    /// Inner driver — the original reindex loop with no audit wiring.
+    async fn run_reindex_inner(
         job_id: String,
         tenant: TenantContext,
         request: ReindexRequest,

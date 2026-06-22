@@ -156,6 +156,7 @@ pub mod extractors;
 pub mod fhir_types;
 pub mod handlers;
 pub mod middleware;
+pub mod reindex;
 pub mod responses;
 pub mod routing;
 pub mod state;
@@ -301,6 +302,18 @@ pub struct BulkSubmitBundle {
     pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
 }
 
+/// Optional providers for persistence-layer operations exposed over REST.
+///
+/// Each field defaults to `None`, in which case the corresponding handler
+/// returns 501.
+#[derive(Default)]
+pub struct OperationsBundle {
+    /// Backs the `$purge` operation.
+    pub purge: Option<Arc<dyn helios_persistence::core::storage::PurgableStorage>>,
+    /// Backs the `$reindex` operation.
+    pub reindex: Option<Arc<dyn reindex::ReindexController>>,
+}
+
 /// Creates the Axum application with custom configuration and optional authentication.
 ///
 /// When `auth_state` is `Some`, authentication and authorization middleware
@@ -341,6 +354,7 @@ where
         None,
         None,
         None,
+        OperationsBundle::default(),
     )
 }
 
@@ -380,6 +394,7 @@ where
         Some(bulk_export),
         None,
         None,
+        OperationsBundle::default(),
     )
 }
 
@@ -422,6 +437,7 @@ where
         bulk_export,
         bulk_submit,
         None,
+        OperationsBundle::default(),
     )
 }
 
@@ -466,12 +482,104 @@ where
         bulk_export,
         bulk_submit,
         settings_store,
+        OperationsBundle::default(),
+    )
+}
+
+/// Variant of [`create_app_with_auth_and_bulk`] that also wires the
+/// persistence-layer operations bundle (`$purge`, `$reindex`).
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_and_bulk_and_ops<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+    operations: OperationsBundle,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
+        None,
+        operations,
+    )
+}
+
+/// Like [`create_app_with_auth_bulk_and_settings`], but also wires the
+/// persistence-layer operations bundle (`$purge`, `$reindex`). This is the
+/// broadest public entry point — every optional subsystem can be supplied or
+/// omitted independently.
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_bulk_settings_and_ops<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+    operations: OperationsBundle,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
+        settings_store,
+        operations,
     )
 }
 
 /// Internal app builder shared by [`create_app_with_auth`],
 /// [`create_app_with_auth_and_bulk_export`], [`create_app_with_auth_and_bulk`],
-/// and [`create_app_with_auth_bulk_and_settings`].
+/// [`create_app_with_auth_bulk_and_settings`],
+/// [`create_app_with_auth_and_bulk_and_ops`], and
+/// [`create_app_with_auth_bulk_settings_and_ops`].
 #[allow(clippy::too_many_arguments)]
 fn build_app<S>(
     storage: Arc<S>,
@@ -482,6 +590,7 @@ fn build_app<S>(
     bulk_export: Option<BulkExportBundle>,
     bulk_submit: Option<BulkSubmitBundle>,
     settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+    operations: OperationsBundle,
 ) -> Router
 where
     S: ResourceStorage
@@ -663,6 +772,16 @@ where
     // Wire the per-user settings store if provided.
     let state = match settings_store {
         Some(store) => state.with_settings_store(store),
+        None => state,
+    };
+
+    // Wire the persistence-layer operations providers if provided.
+    let state = match operations.purge {
+        Some(provider) => state.with_purge_provider(provider),
+        None => state,
+    };
+    let state = match operations.reindex {
+        Some(controller) => state.with_reindex_controller(controller),
         None => state,
     };
 

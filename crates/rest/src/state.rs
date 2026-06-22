@@ -9,10 +9,13 @@ use std::sync::Arc;
 use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
 use helios_persistence::core::sof_runner::SofRunner;
+use helios_persistence::core::storage::PurgableStorage;
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, ExportOutputStore, ResourceStorage, SettingsStore,
     SubmitInputFetcher,
 };
+
+use crate::reindex::ReindexController;
 
 use crate::bulk_export_auth::ExportFileAuth;
 use crate::config::{BulkExportConfig, BulkSubmitConfig, ServerConfig};
@@ -100,6 +103,12 @@ pub struct AppState<S> {
 
     /// Bulk submit configuration.
     bulk_submit_config: Arc<BulkSubmitConfig>,
+
+    /// Backs the `$purge` operation; `None` ⇒ handler returns 501.
+    purge_provider: Option<Arc<dyn PurgableStorage>>,
+
+    /// Backs the `$reindex` operation; `None` ⇒ handler returns 501.
+    reindex_controller: Option<Arc<dyn ReindexController>>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -126,6 +135,8 @@ impl<S> Clone for AppState<S> {
             bulk_submit_output: self.bulk_submit_output.clone(),
             bulk_submit_file_auth: self.bulk_submit_file_auth.clone(),
             bulk_submit_config: Arc::clone(&self.bulk_submit_config),
+            purge_provider: self.purge_provider.clone(),
+            reindex_controller: self.reindex_controller.clone(),
         }
     }
 }
@@ -161,6 +172,8 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_output: None,
             bulk_submit_file_auth: None,
             bulk_submit_config,
+            purge_provider: None,
+            reindex_controller: None,
         }
     }
 
@@ -206,7 +219,31 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_output: None,
             bulk_submit_file_auth: None,
             bulk_submit_config,
+            purge_provider: None,
+            reindex_controller: None,
         }
+    }
+
+    /// Wires a [`PurgableStorage`] provider that backs the `$purge` operation.
+    pub fn with_purge_provider(mut self, provider: Arc<dyn PurgableStorage>) -> Self {
+        self.purge_provider = Some(provider);
+        self
+    }
+
+    /// Returns the configured purge provider, if any.
+    pub fn purge_provider(&self) -> Option<&Arc<dyn PurgableStorage>> {
+        self.purge_provider.as_ref()
+    }
+
+    /// Wires a [`ReindexController`] that backs the `$reindex` operation.
+    pub fn with_reindex_controller(mut self, controller: Arc<dyn ReindexController>) -> Self {
+        self.reindex_controller = Some(controller);
+        self
+    }
+
+    /// Returns the configured reindex controller, if any.
+    pub fn reindex_controller(&self) -> Option<&Arc<dyn ReindexController>> {
+        self.reindex_controller.as_ref()
     }
 
     /// Sets the SQL-on-FHIR runner for this application state.

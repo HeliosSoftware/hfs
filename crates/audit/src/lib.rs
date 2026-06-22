@@ -73,4 +73,4 @@ pub use middleware::{AuditAgent, AuditMiddlewareState, AuditResponseContext};
 pub use sink::AuditSink;
 #[cfg(feature = "cloudwatch")]
 pub use sinks::CloudWatchLogsSink;
-pub use sinks::{DatabaseSink, FileSink, NullSink};
+pub use sinks::{DatabaseSink, FileSink, InMemoryAuditSink, NullSink};
