@@ -1239,6 +1239,11 @@ mod sof_export_tests {
         fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
             None
         }
+        fn download_url(&self, _t: &str, _j: &str, _f: &str) -> Option<String> {
+            // This controller only ever reports `Failed`, so the manifest path
+            // that resolves download URLs is never exercised.
+            None
+        }
     }
 
     #[tokio::test]

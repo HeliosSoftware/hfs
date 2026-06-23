@@ -1134,12 +1134,16 @@ where
 fn build_completion_manifest(
     base_url: &str,
     job_id: &str,
-    files: &[crate::export::controller::CompletedFile],
+    outputs: &[(String, String)],
     submitted_at: chrono::DateTime<chrono::Utc>,
     completed_at: chrono::DateTime<chrono::Utc>,
     format: &str,
     client_tracking_id: Option<&str>,
 ) -> Value {
+    // `outputs` is a list of (view_name, download URL) pairs, one per shard,
+    // resolved fresh by the caller (see the completed-status branch) so S3
+    // pre-signed URLs carry a full TTL window on every poll.
+    //
     // Spec: one `output` per view, with `location` (1..*) repeating once per
     // shard inside it. Group by `view_name` while preserving first-seen
     // insertion order — this stays correct even if a controller emits files
@@ -1147,14 +1151,14 @@ fn build_completion_manifest(
     let mut output_order: Vec<String> = Vec::new();
     let mut locations_by_view: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for f in files {
-        if !locations_by_view.contains_key(&f.view_name) {
-            output_order.push(f.view_name.clone());
+    for (view_name, location) in outputs {
+        if !locations_by_view.contains_key(view_name) {
+            output_order.push(view_name.clone());
         }
         locations_by_view
-            .entry(f.view_name.clone())
+            .entry(view_name.clone())
             .or_default()
-            .push(f.url.clone());
+            .push(location.clone());
     }
     let output: Vec<Value> = output_order
         .into_iter()
@@ -1273,9 +1277,39 @@ where
             format,
             client_tracking_id,
         }) => {
+            // Resolve every shard's download URL fresh on this poll. For S3 this
+            // re-signs the GET URL so it carries a full TTL window from now; for
+            // server-routed sinks it is a stable route. A resolution failure
+            // (e.g. an S3 pre-signing error) must not yield a manifest with a
+            // missing/empty `location`, so surface it as a 500 instead.
+            let mut outputs: Vec<(String, String)> = Vec::with_capacity(files.len());
+            for f in &files {
+                match controller.download_url(tenant.tenant_id(), &job_id, &f.filename) {
+                    Some(url) => outputs.push((f.view_name.clone(), url)),
+                    None => {
+                        return Ok((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({
+                                "resourceType": "OperationOutcome",
+                                "issue": [{"severity": "error", "code": "processing",
+                                    "diagnostics": format!(
+                                        "Failed to resolve a download URL for export job '{job_id}'")}]
+                            })),
+                        )
+                            .into_response());
+                    }
+                }
+            }
+
             // Spec: the result URL and download URLs SHALL be valid for at least
-            // 24 hours and MAY carry an `Expires` header. Format is IMF-fixdate
-            // per RFC 7231.
+            // 24 hours and MAY carry an `Expires` header (IMF-fixdate, RFC 7231).
+            //
+            // `Expires` tracks the result-*retention* window, not the lifetime of
+            // any single pre-signed URL: download URLs are re-resolved on every
+            // poll (above), so a client re-polling within the window always gets
+            // a fresh URL even if an individual S3 pre-signature has a shorter
+            // TTL. 24h matches the default output-retention reaper, after which
+            // the job and its output are reclaimed.
             let expires_at = completed_at + chrono::Duration::hours(24);
             let expires_str = expires_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
             let mut headers = HeaderMap::new();
@@ -1288,7 +1322,7 @@ where
                 axum::Json(build_completion_manifest(
                     state.base_url(),
                     &job_id,
-                    &files,
+                    &outputs,
                     submitted_at,
                     completed_at,
                     &format,
