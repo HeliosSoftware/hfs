@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "Basic",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Basic",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Basic",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-06-13T17:13:29+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -56,7 +56,7 @@
     }
   ],
   "purpose": "Need some way to safely (without breaking interoperability) allow implementers to exchange content not supported by the initial set of declared resources.",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "w5",
@@ -287,7 +287,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -538,6 +538,12 @@
         "isModifierReason": "This element determines what kind of resource is being represented which drives the meaning of all of the other elements.",
         "isSummary": true,
         "binding": {
+          "extension": [
+            {
+              "url": "http://hl7.org/fhir/StructureDefinition/elementdefinition-isCommonBinding",
+              "valueBoolean": true
+            }
+          ],
           "strength": "extensible",
           "description": "Codes for all resources across R5 and all published previous versions since R2",
           "valueSet": "http://hl7.org/fhir/ValueSet/version-independent-resource-types"
@@ -763,6 +769,12 @@
         "isModifierReason": "This element determines what kind of resource is being represented which drives the meaning of all of the other elements.",
         "isSummary": true,
         "binding": {
+          "extension": [
+            {
+              "url": "http://hl7.org/fhir/StructureDefinition/elementdefinition-isCommonBinding",
+              "valueBoolean": true
+            }
+          ],
           "strength": "extensible",
           "description": "Codes for all resources across R5 and all published previous versions since R2",
           "valueSet": "http://hl7.org/fhir/ValueSet/version-independent-resource-types"

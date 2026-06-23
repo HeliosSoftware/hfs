@@ -264,13 +264,13 @@
     <valueCode value="oo"/>
   </extension>
   <url value="http://hl7.org/fhir/OperationDefinition/Observation-stats"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="Stats"/>
   <title value="Observation Statistics"/>
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-06-13T17:13:29+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -363,7 +363,7 @@
         <valueString value="ObservationStatsCode"/>
       </extension>
       <strength value="required"/>
-      <valueSet value="http://hl7.org/fhir/ValueSet/observation-statistics|6.0.0-ballot3"/>
+      <valueSet value="http://hl7.org/fhir/ValueSet/observation-statistics|6.0.0-ballot4"/>
     </binding>
   </parameter>
   <parameter>

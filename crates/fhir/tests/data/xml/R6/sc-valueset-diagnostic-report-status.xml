@@ -113,7 +113,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-diagnostic-report-status"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="DiagnosticReportStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Diagnostic Report Status&quot;"/>
   <status value="draft"/>

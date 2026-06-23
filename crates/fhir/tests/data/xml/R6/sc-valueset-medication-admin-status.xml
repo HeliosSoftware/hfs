@@ -85,7 +85,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-medication-admin-status"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="MedicationAdministrationStatusCodesCanonicalMap"/>
   <title value="Canonical Mapping for &quot;MedicationAdministration Status Codes&quot;"/>
   <status value="draft"/>

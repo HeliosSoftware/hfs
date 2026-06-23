@@ -44,6 +44,49 @@ pub(crate) type BoolMap = HashMap<String, bool>;
 pub(crate) type LookupResponseMap = HashMap<String, Arc<LookupResponse>>;
 pub(crate) type ValidateCodeResponseMap = HashMap<String, Arc<ValidateCodeResponse>>;
 
+/// Insert `(key, value)` into a bounded cache, evicting one existing entry when
+/// the map is already at `max` capacity.
+///
+/// The response and concept-flag caches are read under a shared (`read`) lock
+/// on the `$lookup` / `$validate-code` hot paths, so we deliberately do **not**
+/// track per-entry recency: true LRU would require taking a write lock on every
+/// read to bump a recency counter, serializing the very lookups the cache
+/// exists to speed up. Instead, when the map is full we evict a single
+/// arbitrary entry (std `HashMap` iteration order is randomized per process, so
+/// this is effectively random replacement) and admit the new key.
+///
+/// This replaces the previous "insert only while `len < max`" policy, which
+/// *froze* each cache once it filled: the first `max` distinct keys held their
+/// slots permanently and every later key missed forever, making the cache
+/// useless for any working set larger than `max` (e.g. diverse-code `$lookup`
+/// traffic against a 600 K-concept SNOMED system). Random replacement keeps the
+/// same memory ceiling while letting hot keys re-enter the cache.
+pub(crate) fn bounded_cache_insert<K, V, S>(
+    map: &mut HashMap<K, V, S>,
+    key: K,
+    value: V,
+    max: usize,
+) where
+    K: std::hash::Hash + Eq + Clone,
+    S: std::hash::BuildHasher,
+{
+    if max == 0 {
+        return;
+    }
+    // Only evict when inserting a genuinely new key would exceed the bound;
+    // overwriting an existing key does not grow the map.
+    if map.len() >= max && !map.contains_key(&key) {
+        // Clone one key to end the immutable borrow before removing. The keys
+        // here are small (`String` / `(String, String)`) and this only runs on
+        // a cache miss, so the clone is negligible next to the SQLite work that
+        // produced `value`.
+        if let Some(evict) = map.keys().next().cloned() {
+            map.remove(&evict);
+        }
+    }
+    map.insert(key, value);
+}
+
 /// Shared in-memory index for text-filtered implicit ValueSet expansions.
 ///
 /// Keyed by the implicit ValueSet URL.  Values are the combined entry list
@@ -202,6 +245,22 @@ impl SqliteTerminologyBackend {
     /// Returns [`HtsError::StorageError`] if the pool cannot be created or the
     /// schema migration fails.
     pub fn new(db_path: &str) -> Result<Self, HtsError> {
+        Self::new_inner(db_path, true)
+    }
+
+    /// Like [`Self::new`] but defers the expensive `concepts_fts` prebuild and
+    /// in-memory index pre-warm.
+    ///
+    /// The server startup path uses this so that bootstrap re-imports run
+    /// *before* the FTS index is materialized: building FTS in `new` would
+    /// (a) pay the 10–25 s prebuild on data that bootstrap is about to change,
+    /// and (b) leave the index stale for any re-imported system. Callers MUST
+    /// invoke [`Self::finalize_after_bootstrap`] before serving requests.
+    pub fn new_without_fts_prebuild(db_path: &str) -> Result<Self, HtsError> {
+        Self::new_inner(db_path, false)
+    }
+
+    fn new_inner(db_path: &str, prebuild_fts: bool) -> Result<Self, HtsError> {
         // Apply per-connection pragmas on every new connection from the pool.
         // journal_mode is file-level (WAL persists); the rest are per-connection.
         // `synchronous=NORMAL` is crash-safe under WAL (the journal mode set
@@ -286,47 +345,59 @@ impl SqliteTerminologyBackend {
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
+            schema::migrate_bootstrap_imports_columns(&conn).map_err(|e| {
+                HtsError::StorageError(format!(
+                    "Failed to apply bootstrap_imports column migration: {e}"
+                ))
+            })?;
 
-            // Clear the concept FTS index on every startup — it is always rebuilt
-            // synchronously by prebuild_concepts_fts below, so stale rows from a
-            // previous run must be removed first.
-            // The implicit_expansion_cache is intentionally kept across restarts:
-            // populate_implicit_cache runs inside a BEGIN EXCLUSIVE transaction, so
-            // SQLite rolls back any partial write on crash — the entries are always
-            // fully committed or fully absent.  Persisting the cache means repeated
-            // server restarts (e.g. benchmark reruns) start warm rather than cold.
-            // Cache entries are invalidated per-code-system when new data is imported
-            // (see fhir_bundle::write_code_system).
-            let _ = conn.execute_batch(
-                "DELETE FROM concepts_fts;
-                 DELETE FROM concepts_fts_built;
-                 DELETE FROM concepts_word_fts;",
-            );
+            // FTS prebuild + index pre-warm. Skipped when `prebuild_fts` is
+            // false (server startup path): bootstrap re-imports run first and
+            // [`Self::finalize_after_bootstrap`] performs these steps once on
+            // the final data. The implicit_expansion_cache is intentionally kept
+            // across restarts: populate_implicit_cache runs inside a BEGIN
+            // EXCLUSIVE transaction, so SQLite rolls back any partial write on
+            // crash — the entries are always fully committed or fully absent.
+            // Persisting the cache means repeated server restarts (e.g. benchmark
+            // reruns) start warm rather than cold. Cache entries are invalidated
+            // per-code-system when new data is imported (see
+            // fhir_bundle::write_code_system).
+            if prebuild_fts {
+                // Clear the concept FTS index — it is always rebuilt
+                // synchronously by prebuild_concepts_fts below, so stale rows
+                // from a previous run must be removed first.
+                let _ = conn.execute_batch(
+                    "DELETE FROM concepts_fts;
+                     DELETE FROM concepts_fts_built;
+                     DELETE FROM concepts_word_fts;",
+                );
 
-            // Update query-planner statistics for large tables.
-            let _ = conn.execute_batch(
-                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
-                 ANALYZE concept_properties; ANALYZE concept_designations; \
-                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
-            );
+                // Update query-planner statistics for large tables.
+                let _ = conn.execute_batch(
+                    "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                     ANALYZE concept_properties; ANALYZE concept_designations; \
+                     ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+                );
 
-            // Pre-populate the concepts_fts trigram index for every code system
-            // so that text-filtered $expand requests always use the fast FTS path.
-            // This runs synchronously before the server accepts requests; for large
-            // systems (SNOMED 638K, LOINC 181K) it can take 10–25 s total.
-            value_set::prebuild_concepts_fts(&conn);
+                // Pre-populate the concepts_fts trigram index for every code
+                // system so that text-filtered $expand requests always use the
+                // fast FTS path. This runs synchronously before the server
+                // accepts requests; for large systems (SNOMED 638K, LOINC 181K)
+                // it can take 10–25 s total.
+                value_set::prebuild_concepts_fts(&conn);
 
-            // Pre-warm the in-memory concept index from any implicit-expansion
-            // entries that are already persisted in implicit_expansion_cache.
-            // On a warm restart (e.g. repeated benchmark runs) this lets the
-            // async hot path in expand() fire immediately without waiting for a
-            // background build thread.  No-op on first run (empty cache).
-            value_set::prebuild_implicit_index(&conn, &implicit_index);
+                // Pre-warm the in-memory concept index from any implicit-expansion
+                // entries that are already persisted in implicit_expansion_cache.
+                // On a warm restart (e.g. repeated benchmark runs) this lets the
+                // async hot path in expand() fire immediately without waiting for
+                // a background build thread.  No-op on first run (empty cache).
+                value_set::prebuild_implicit_index(&conn, &implicit_index);
 
-            // Pre-warm the inline-compose in-memory index from any persisted
-            // "inline-compose:*" entries.  Eliminates spawn_blocking contention
-            // for repeated inline ValueSet $expand calls (e.g. EX06 benchmark).
-            value_set::prebuild_inline_compose_index(&conn, &inline_compose_index);
+                // Pre-warm the inline-compose in-memory index from any persisted
+                // "inline-compose:*" entries.  Eliminates spawn_blocking contention
+                // for repeated inline ValueSet $expand calls (e.g. EX06 benchmark).
+                value_set::prebuild_inline_compose_index(&conn, &inline_compose_index);
+            }
         }
 
         info!(db_path, "SQLite terminology backend initialized");
@@ -351,6 +422,56 @@ impl SqliteTerminologyBackend {
             cs_version_for_url_cache: Arc::new(RwLock::new(HashMap::new())),
             cs_exists_cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Perform the post-bootstrap preparation that [`Self::new`] would normally
+    /// do inline, but on the final post-import data.
+    ///
+    /// Intended to be called once after [`Self::new_without_fts_prebuild`] and
+    /// the bootstrap directory sync, before the server begins accepting
+    /// requests. It:
+    ///
+    /// 1. Rebuilds any concept closures that bootstrap re-imports invalidated.
+    ///    `migrate_concept_closure` only touches systems that have hierarchy
+    ///    edges but no closure rows, so unchanged systems cost nothing while a
+    ///    re-imported SNOMED/LOINC system is rebuilt.
+    /// 2. Clears and rebuilds the `concepts_fts` index on the final data and
+    ///    refreshes the in-memory implicit/inline-compose indexes and planner
+    ///    statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HtsError::StorageError`] if a pooled connection cannot be
+    /// acquired or the closure rebuild fails. FTS/index pre-warm failures are
+    /// non-fatal (logged via the underlying helpers) and do not error.
+    pub fn finalize_after_bootstrap(&self) -> Result<(), HtsError> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| HtsError::StorageError(format!("Failed to acquire connection: {e}")))?;
+
+        // Rebuild closures wiped by bootstrap re-import (idempotent — only
+        // systems missing closure rows are recomputed).
+        schema::migrate_concept_closure(&conn).map_err(|e| {
+            HtsError::StorageError(format!("Failed to rebuild concept closure: {e}"))
+        })?;
+
+        // Rebuild FTS + planner stats on the final data. Mirrors the block in
+        // `new_inner` that is skipped under `new_without_fts_prebuild`.
+        let _ = conn.execute_batch(
+            "DELETE FROM concepts_fts;
+             DELETE FROM concepts_fts_built;
+             DELETE FROM concepts_word_fts;",
+        );
+        let _ = conn.execute_batch(
+            "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+             ANALYZE concept_properties; ANALYZE concept_designations; \
+             ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+        );
+        value_set::prebuild_concepts_fts(&conn);
+        value_set::prebuild_implicit_index(&conn, &self.implicit_index);
+        value_set::prebuild_inline_compose_index(&conn, &self.inline_compose_index);
+        Ok(())
     }
 
     /// Open an **in-memory** SQLite database (useful for tests).
@@ -557,6 +678,35 @@ fn code_system_version_matches(actual: &str, pattern_segments: &[&str]) -> bool 
 
 // ── BundleImportBackend ────────────────────────────────────────────────────────
 
+impl SqliteTerminologyBackend {
+    /// Evict all in-memory indexes so the next expand re-reads fresh data.
+    ///
+    /// Per-instance CS metadata caches: highest stored version and existence
+    /// flags both flip when a new CS row is imported.  Flushed alongside the
+    /// global `cs_language_cache` invalidation that the sync writer already
+    /// triggers.
+    fn evict_import_caches(&self) {
+        if let Ok(mut guard) = self.implicit_index.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.inline_compose_index.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.property_result_cache.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.plain_fts_cache.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.cs_version_for_url_cache.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.cs_exists_cache.write() {
+            guard.clear();
+        }
+    }
+}
+
 #[async_trait]
 impl BundleImportBackend for SqliteTerminologyBackend {
     /// Parse a FHIR Bundle from raw JSON bytes and insert all contained
@@ -572,12 +722,6 @@ impl BundleImportBackend for SqliteTerminologyBackend {
     ) -> Result<ImportStats, HtsError> {
         let pool = self.pool.clone();
         let data_vec = data.to_vec();
-        let implicit_index = self.implicit_index.clone();
-        let inline_compose_index = self.inline_compose_index.clone();
-        let property_result_cache = self.property_result_cache.clone();
-        let plain_fts_cache = self.plain_fts_cache.clone();
-        let cs_version_for_url_cache = self.cs_version_for_url_cache.clone();
-        let cs_exists_cache = self.cs_exists_cache.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             crate::import::fhir_bundle::import_bundle_sync(&pool, &data_vec)
@@ -585,33 +729,58 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         .await
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
 
-        // Evict all in-memory indexes so the next expand re-reads fresh data.
         if result.is_ok() {
-            if let Ok(mut guard) = implicit_index.write() {
-                guard.clear();
-            }
-            if let Ok(mut guard) = inline_compose_index.write() {
-                guard.clear();
-            }
-            if let Ok(mut guard) = property_result_cache.write() {
-                guard.clear();
-            }
-            if let Ok(mut guard) = plain_fts_cache.write() {
-                guard.clear();
-            }
-            // Per-instance CS metadata caches: highest stored version and
-            // existence flags both flip when a new CS row is imported.  Flush
-            // alongside the global `cs_language_cache` invalidation that the
-            // sync writer already triggers.
-            if let Ok(mut guard) = cs_version_for_url_cache.write() {
-                guard.clear();
-            }
-            if let Ok(mut guard) = cs_exists_cache.write() {
-                guard.clear();
-            }
+            self.evict_import_caches();
         }
 
         result
+    }
+
+    /// Insert an already-parsed bundle, skipping the JSON parse step.
+    async fn import_parsed(
+        &self,
+        _ctx: &TenantContext,
+        parsed: crate::import::bundle_parser::ParsedBundle,
+    ) -> Result<ImportStats, HtsError> {
+        let pool = self.pool.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            crate::import::fhir_bundle::import_parsed_sync(&pool, &parsed)
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
+
+        if result.is_ok() {
+            self.evict_import_caches();
+        }
+
+        result
+    }
+
+    async fn code_system_has_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<bool, HtsError> {
+        let pool = self.pool.clone();
+        let url = url.to_string();
+        tokio::task::spawn_blocking(move || -> Result<bool, HtsError> {
+            let conn = pool
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM concepts c
+                     JOIN code_systems s ON c.system_id = s.id
+                     WHERE s.url = ?1
+                 )",
+                rusqlite::params![url],
+                |r| r.get(0),
+            )
+            .map_err(|e| HtsError::StorageError(e.to_string()))
+        })
+        .await
+        .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?
     }
 }
 
@@ -660,6 +829,44 @@ mod tests {
     #[test]
     fn supports_subsumption_is_true() {
         assert!(backend().supports_subsumption());
+    }
+
+    #[test]
+    fn bounded_cache_insert_evicts_instead_of_freezing() {
+        // The pre-fix policy froze the cache once full: keys beyond `max` were
+        // never admitted. With eviction, the map stays at `max` but always
+        // admits the newest key (the regression we are guarding against).
+        let mut map: HashMap<i32, i32> = HashMap::new();
+        let max = 3;
+        for i in 0..100 {
+            bounded_cache_insert(&mut map, i, i * 10, max);
+            assert!(map.len() <= max, "cache must never exceed its bound");
+            // The just-inserted key is always present (random replacement only
+            // evicts a *different*, pre-existing entry to make room).
+            assert_eq!(map.get(&i), Some(&(i * 10)), "newest key must be admitted");
+        }
+        assert_eq!(map.len(), max, "a saturated cache stays at its bound");
+    }
+
+    #[test]
+    fn bounded_cache_insert_overwrite_does_not_evict() {
+        // Re-inserting an existing key updates in place without evicting, so a
+        // full cache of distinct keys is preserved on a refresh.
+        let mut map: HashMap<&str, i32> = HashMap::new();
+        let max = 2;
+        bounded_cache_insert(&mut map, "a", 1, max);
+        bounded_cache_insert(&mut map, "b", 2, max);
+        bounded_cache_insert(&mut map, "a", 99, max); // overwrite, not grow
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("a"), Some(&99));
+        assert_eq!(map.get("b"), Some(&2));
+    }
+
+    #[test]
+    fn bounded_cache_insert_zero_max_is_noop() {
+        let mut map: HashMap<i32, i32> = HashMap::new();
+        bounded_cache_insert(&mut map, 1, 1, 0);
+        assert!(map.is_empty(), "max=0 must never store anything");
     }
 
     #[test]

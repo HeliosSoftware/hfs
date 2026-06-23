@@ -186,6 +186,9 @@ pub mod data_source;
 pub mod fhir_format;
 pub mod params;
 pub mod parquet_schema;
+pub mod reference_collector;
+pub mod remote_fetch;
+pub mod remote_resolver;
 pub mod sqlquery;
 pub mod traits;
 
@@ -193,6 +196,11 @@ pub use compartment::{resolve_group_members_to_patient_refs, resource_in_patient
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{
     ExtractedRunParams, body_has_view_definition, extract_run_params_from_json, split_csv_refs,
+};
+pub use remote_fetch::{RemoteResolver, prefetch_external_resources};
+pub use remote_resolver::{
+    AllowedBaseUrl, DenyReason, FetchDecision, RemoteResolveConfig, is_blocked_address,
+    is_disallowed_ip, parse_allowed_base_urls,
 };
 pub use sqlquery::{
     BoundParam, ColumnFhirType, DependsOnView, InMemorySqlEngine, LibraryParameter, QueryResult,
@@ -1679,6 +1687,37 @@ impl PreparedViewDefinition {
     /// Returns a `ChunkedResult` containing the rows generated from the chunk.
     /// Uses parallel processing via rayon for improved throughput.
     pub fn process_chunk(&self, chunk: ResourceChunk) -> Result<ChunkedResult, SofError> {
+        self.process_chunk_with_external(chunk, Vec::new())
+    }
+
+    /// Like [`Self::process_chunk`], but folds `external` resources into this
+    /// chunk's resolution pool. Used by the streaming remote-`resolve()` driver
+    /// ([`process_ndjson_chunked_remote`]) to inject resources prefetched from
+    /// trusted servers for references found in the chunk.
+    pub fn process_chunk_with_external(
+        &self,
+        chunk: ResourceChunk,
+        external: Vec<helios_fhir::FhirResource>,
+    ) -> Result<ChunkedResult, SofError> {
+        // Build the resolution pool for `resolve()` from the resources in this chunk
+        // plus any remotely-prefetched `external` resources.
+        //
+        // NOTE: in-bundle resolution in the streaming path is limited to the
+        // *current chunk* — a reference to a resource in another chunk of the same
+        // input cannot be resolved locally (it falls back to a typed stub / empty).
+        // Remote references (to allowlisted trusted servers) are resolved via the
+        // `external` resources prefetched per chunk with a cross-chunk cache. The
+        // non-streaming Bundle path resolves across the entire bundle.
+        let version = self.view_definition.version();
+        let mut pool: Vec<helios_fhir::FhirResource> = chunk
+            .resources
+            .iter()
+            .filter_map(|json| parse_json_to_fhir_resource(json.clone(), version).ok())
+            .collect();
+        pool.extend(external);
+        let resolution_scope: std::sync::Arc<Vec<helios_fhir::FhirResource>> =
+            std::sync::Arc::new(pool);
+
         // Process resources in parallel using rayon
         let results: Result<Vec<Vec<ProcessedRow>>, SofError> = chunk
             .resources
@@ -1694,7 +1733,7 @@ impl PreparedViewDefinition {
                     None
                 } else {
                     // Process single resource based on version
-                    Some(self.process_single_resource(resource_json))
+                    Some(self.process_single_resource(resource_json, &resolution_scope))
                 }
             })
             .collect();
@@ -1715,16 +1754,25 @@ impl PreparedViewDefinition {
     fn process_single_resource(
         &self,
         resource_json: &serde_json::Value,
+        resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
     ) -> Result<Vec<ProcessedRow>, SofError> {
         match &self.view_definition {
             #[cfg(feature = "R4")]
-            SofViewDefinition::R4(vd) => self.process_single_resource_generic(vd, resource_json),
+            SofViewDefinition::R4(vd) => {
+                self.process_single_resource_generic(vd, resource_json, resolution_scope)
+            }
             #[cfg(feature = "R4B")]
-            SofViewDefinition::R4B(vd) => self.process_single_resource_generic(vd, resource_json),
+            SofViewDefinition::R4B(vd) => {
+                self.process_single_resource_generic(vd, resource_json, resolution_scope)
+            }
             #[cfg(feature = "R5")]
-            SofViewDefinition::R5(vd) => self.process_single_resource_generic(vd, resource_json),
+            SofViewDefinition::R5(vd) => {
+                self.process_single_resource_generic(vd, resource_json, resolution_scope)
+            }
             #[cfg(feature = "R6")]
-            SofViewDefinition::R6(vd) => self.process_single_resource_generic(vd, resource_json),
+            SofViewDefinition::R6(vd) => {
+                self.process_single_resource_generic(vd, resource_json, resolution_scope)
+            }
         }
     }
 
@@ -1732,6 +1780,7 @@ impl PreparedViewDefinition {
         &self,
         view_definition: &VD,
         resource_json: &serde_json::Value,
+        resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
     ) -> Result<Vec<ProcessedRow>, SofError>
     where
         VD: ViewDefinitionTrait,
@@ -1741,6 +1790,8 @@ impl PreparedViewDefinition {
         let fhir_resource =
             parse_json_to_fhir_resource(resource_json.clone(), self.view_definition.version())?;
         let mut context = EvaluationContext::new(vec![fhir_resource]);
+        // Expose the chunk-wide pool so `resolve()` can reach sibling resources.
+        context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
 
         // Add variables to the context
         for (name, value) in &self.variables {
@@ -2037,40 +2088,13 @@ pub fn process_ndjson_chunked<R: BufRead, W: Write>(
         stats.output_rows += chunk_result.rows.len();
         stats.chunks_processed += 1;
 
-        // Write chunk output
-        match content_type {
-            ContentType::Csv | ContentType::CsvWithHeader => {
-                write_csv_chunk(&chunk_result, &mut output)?;
-            }
-            ContentType::NdJson => {
-                write_ndjson_chunk(&chunk_result, &mut output)?;
-            }
-            ContentType::Json => {
-                // Write JSON rows with proper comma handling
-                for (i, row) in chunk_result.rows.iter().enumerate() {
-                    if !is_first_chunk || i > 0 {
-                        output.write_all(b",\n")?;
-                    }
-
-                    let mut row_obj = serde_json::Map::new();
-                    for (j, column) in chunk_result.columns.iter().enumerate() {
-                        let value = row
-                            .values
-                            .get(j)
-                            .and_then(|v| v.as_ref())
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        row_obj.insert(column.clone(), value);
-                    }
-                    let json = serde_json::to_string_pretty(&serde_json::Value::Object(row_obj))?;
-                    output.write_all(json.as_bytes())?;
-                }
-            }
-            ContentType::Parquet => unreachable!(), // Already checked above
-        }
-
+        write_chunk_output(
+            &chunk_result,
+            content_type,
+            &mut output,
+            &mut is_first_chunk,
+        )?;
         output.flush()?;
-        is_first_chunk = false;
     }
 
     // Close JSON array if needed
@@ -2083,6 +2107,136 @@ pub fn process_ndjson_chunked<R: BufRead, W: Write>(
     // Update stats with line/skip counts from the iterator
     stats.total_lines_read = iterator.lines_read();
     stats.skipped_lines = iterator.skipped_lines();
+
+    Ok(stats)
+}
+
+/// Writes one chunk's rows in the requested streaming format. Shared by the sync
+/// ([`process_ndjson_chunked`]) and remote ([`process_ndjson_chunked_remote`])
+/// drivers. `is_first_chunk` is consulted (and cleared) only for JSON, to manage
+/// inter-row commas across chunks.
+fn write_chunk_output<W: Write>(
+    chunk_result: &ChunkedResult,
+    content_type: ContentType,
+    output: &mut W,
+    is_first_chunk: &mut bool,
+) -> Result<(), SofError> {
+    match content_type {
+        ContentType::Csv | ContentType::CsvWithHeader => {
+            write_csv_chunk(chunk_result, output)?;
+        }
+        ContentType::NdJson => {
+            write_ndjson_chunk(chunk_result, output)?;
+        }
+        ContentType::Json => {
+            // Write JSON rows with proper comma handling
+            for (i, row) in chunk_result.rows.iter().enumerate() {
+                if !*is_first_chunk || i > 0 {
+                    output.write_all(b",\n")?;
+                }
+
+                let mut row_obj = serde_json::Map::new();
+                for (j, column) in chunk_result.columns.iter().enumerate() {
+                    let value = row
+                        .values
+                        .get(j)
+                        .and_then(|v| v.as_ref())
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    row_obj.insert(column.clone(), value);
+                }
+                let json = serde_json::to_string_pretty(&serde_json::Value::Object(row_obj))?;
+                output.write_all(json.as_bytes())?;
+            }
+        }
+        ContentType::Parquet => unreachable!(), // Caller rejects Parquet for streaming
+    }
+
+    *is_first_chunk = false;
+    Ok(())
+}
+
+/// Streaming NDJSON processing with remote `resolve()` enabled.
+///
+/// Like [`process_ndjson_chunked`], but for each chunk it prefetches references
+/// pointing at trusted (allowlisted) servers and folds them into that chunk's
+/// resolution pool before row generation. A single [`RemoteResolver`] is shared
+/// across all chunks, so a reference recurring across chunks is fetched once
+/// (bounded LRU cache) and `SOF_RESOLVE_MAX_FETCHES` is a **per-stream** cap.
+///
+/// In-bundle resolution remains per-chunk (a reference to a resource in another
+/// chunk of the same input is not resolved locally). When `remote_config` is
+/// inactive this is equivalent to [`process_ndjson_chunked`].
+pub async fn process_ndjson_chunked_remote<R: BufRead, W: Write>(
+    view_definition: SofViewDefinition,
+    input: R,
+    mut output: W,
+    content_type: ContentType,
+    config: ChunkConfig,
+    remote_config: &RemoteResolveConfig,
+) -> Result<ProcessingStats, SofError> {
+    if content_type == ContentType::Parquet {
+        return Err(SofError::UnsupportedContentType(
+            "Parquet output is not supported for streaming. Use batch processing instead."
+                .to_string(),
+        ));
+    }
+
+    let version = view_definition.version();
+    let prepared = PreparedViewDefinition::new(view_definition)?;
+    let resource_type = prepared.target_resource_type().to_string();
+    let columns = prepared.columns().to_vec();
+    let mut reader =
+        NdjsonChunkReader::new(input, config).with_resource_type_filter(Some(resource_type));
+
+    // One resolver for the whole stream: cross-chunk cache + per-stream fetch cap.
+    let resolver = remote_fetch::RemoteResolver::new(remote_config.clone());
+    let active = remote_config.is_active();
+
+    let mut stats = ProcessingStats::default();
+    let mut is_first_chunk = true;
+
+    if content_type == ContentType::CsvWithHeader {
+        write_csv_header(&columns, &mut output)?;
+    }
+    if content_type == ContentType::Json {
+        output.write_all(b"[\n")?;
+    }
+
+    for chunk in reader.by_ref() {
+        let chunk = chunk?;
+
+        let external = if active {
+            let refs =
+                reference_collector::collect_reference_strings_from_resources(&chunk.resources);
+            let keys = reference_collector::collect_resource_keys_from_resources(&chunk.resources);
+            resolver.resolve(refs, &keys, version).await
+        } else {
+            Vec::new()
+        };
+
+        let chunk_result = prepared.process_chunk_with_external(chunk, external)?;
+
+        stats.resources_processed += chunk_result.resources_in_chunk;
+        stats.output_rows += chunk_result.rows.len();
+        stats.chunks_processed += 1;
+
+        write_chunk_output(
+            &chunk_result,
+            content_type,
+            &mut output,
+            &mut is_first_chunk,
+        )?;
+        output.flush()?;
+    }
+
+    if content_type == ContentType::Json {
+        output.write_all(b"\n]")?;
+    }
+    output.flush()?;
+
+    stats.total_lines_read = reader.lines_read();
+    stats.skipped_lines = reader.skipped_lines();
 
     Ok(stats)
 }
@@ -2198,8 +2352,62 @@ pub fn run_view_definition_with_options(
         bundle
     };
 
+    run_view_definition_inner(
+        view_definition,
+        filtered_bundle,
+        content_type,
+        options,
+        Vec::new(),
+    )
+}
+
+/// Runs a ViewDefinition with remote `resolve()` enabled.
+///
+/// When `config` is active, references pointing at trusted (allowlisted) servers
+/// are fetched up-front and folded into the resolution pool before the
+/// (synchronous) row generation runs. When inactive, this behaves exactly like
+/// [`run_view_definition_with_options`]. Remote resolution applies to the
+/// (non-streaming) Bundle path only.
+pub async fn run_view_definition_with_options_remote(
+    view_definition: SofViewDefinition,
+    bundle: SofBundle,
+    content_type: ContentType,
+    options: RunOptions,
+    config: &RemoteResolveConfig,
+) -> Result<Vec<u8>, SofError> {
+    let filtered_bundle = if let Some(since) = options.since {
+        filter_bundle_by_since(bundle, since)?
+    } else {
+        bundle
+    };
+
+    let external = if config.is_active() {
+        remote_fetch::prefetch_external_resources(&filtered_bundle, config).await
+    } else {
+        Vec::new()
+    };
+
+    run_view_definition_inner(
+        view_definition,
+        filtered_bundle,
+        content_type,
+        options,
+        external,
+    )
+}
+
+/// Shared tail of the run pipeline: process (with any external resources) →
+/// paginate → format. The `bundle` must already be `since`-filtered.
+fn run_view_definition_inner(
+    view_definition: SofViewDefinition,
+    bundle: SofBundle,
+    content_type: ContentType,
+    options: RunOptions,
+    external: Vec<helios_fhir::FhirResource>,
+) -> Result<Vec<u8>, SofError> {
     // Process the ViewDefinition to generate tabular data
-    let processed_result = process_view_definition(view_definition, filtered_bundle)?;
+    let processed_result =
+        process_view_definition_with_external(view_definition, bundle, external)?;
 
     // Apply pagination if needed
     let processed_result = if options.limit.is_some() || options.page.is_some() {
@@ -2220,6 +2428,17 @@ pub fn process_view_definition(
     view_definition: SofViewDefinition,
     bundle: SofBundle,
 ) -> Result<ProcessedResult, SofError> {
+    process_view_definition_with_external(view_definition, bundle, Vec::new())
+}
+
+/// Like [`process_view_definition`], but folds `external` resources (fetched by the
+/// remote `resolve()` prefetch) into the resolution pool. `external` must already
+/// be parsed in the bundle's FHIR version.
+pub fn process_view_definition_with_external(
+    view_definition: SofViewDefinition,
+    bundle: SofBundle,
+    external: Vec<helios_fhir::FhirResource>,
+) -> Result<ProcessedResult, SofError> {
     // Ensure both resources use the same FHIR version
     if view_definition.version() != bundle.version() {
         return Err(SofError::InvalidViewDefinition(
@@ -2230,19 +2449,19 @@ pub fn process_view_definition(
     match (view_definition, bundle) {
         #[cfg(feature = "R4")]
         (SofViewDefinition::R4(vd), SofBundle::R4(bundle)) => {
-            process_view_definition_generic(vd, bundle)
+            process_view_definition_generic(vd, bundle, external)
         }
         #[cfg(feature = "R4B")]
         (SofViewDefinition::R4B(vd), SofBundle::R4B(bundle)) => {
-            process_view_definition_generic(vd, bundle)
+            process_view_definition_generic(vd, bundle, external)
         }
         #[cfg(feature = "R5")]
         (SofViewDefinition::R5(vd), SofBundle::R5(bundle)) => {
-            process_view_definition_generic(vd, bundle)
+            process_view_definition_generic(vd, bundle, external)
         }
         #[cfg(feature = "R6")]
         (SofViewDefinition::R6(vd), SofBundle::R6(bundle)) => {
-            process_view_definition_generic(vd, bundle)
+            process_view_definition_generic(vd, bundle, external)
         }
         // This case should never happen due to the version check above,
         // but is needed for exhaustive pattern matching when multiple features are enabled
@@ -2262,6 +2481,13 @@ fn extract_view_definition_constants<VD: ViewDefinitionTrait>(
     view_definition: &VD,
 ) -> Result<HashMap<String, EvaluationResult>, SofError> {
     let mut variables = HashMap::new();
+
+    // `%rowIndex` is the FHIRPath environment variable tracking the 0-based position of the
+    // current element during iteration. It defaults to 0 at the resource/top level (and in any
+    // non-iterating scope, such as a `unionAll` branch without `forEach`). `forEach`,
+    // `forEachOrNull`, and `repeat` override it per iterated element (see
+    // `expand_for_each_combinations` / `expand_repeat_combinations`).
+    variables.insert("%rowIndex".to_string(), EvaluationResult::integer(0));
 
     if let Some(constants) = view_definition.constants() {
         for constant in constants {
@@ -2285,6 +2511,7 @@ fn extract_view_definition_constants<VD: ViewDefinitionTrait>(
 pub(crate) fn process_view_definition_generic<VD, B>(
     view_definition: VD,
     bundle: B,
+    external: Vec<helios_fhir::FhirResource>,
 ) -> Result<ProcessedResult, SofError>
 where
     VD: ViewDefinitionTrait,
@@ -2302,6 +2529,14 @@ where
         .resource()
         .ok_or_else(|| SofError::InvalidViewDefinition("Resource type is required".to_string()))?;
 
+    // Build the bundle-wide resolution scope *before* filtering by resource type.
+    // `resolve()` must be able to reach any resource in the input bundle (e.g.
+    // `Encounter.subject.resolve()` -> a sibling `Patient`), not just resources of
+    // the ViewDefinition's target type. This is parsed once and shared (via `Arc`)
+    // across every per-resource and per-iteration evaluation context below.
+    // `external` contributes remotely-prefetched resources to the same pool.
+    let resolution_scope = build_resolution_scope(&bundle, external);
+
     let filtered_resources = filter_resources(&bundle, target_resource_type)?;
 
     // Step 3: Apply where clauses to filter resources
@@ -2309,6 +2544,7 @@ where
         filtered_resources,
         view_definition.where_clauses(),
         &variables,
+        &resolution_scope,
     )?;
 
     // Step 4: Process all select clauses to generate rows with forEach support
@@ -2317,8 +2553,12 @@ where
     })?;
 
     // Generate rows for each resource using the forEach-aware approach
-    let (all_columns, rows) =
-        generate_rows_from_selects(&filtered_resources, select_clauses, &variables)?;
+    let (all_columns, rows) = generate_rows_from_selects(
+        &filtered_resources,
+        select_clauses,
+        &variables,
+        &resolution_scope,
+    )?;
 
     Ok(ProcessedResult {
         columns: all_columns,
@@ -2505,6 +2745,34 @@ fn get_column_names<S: ViewDefinitionSelectTrait>(select: &S) -> Result<Vec<Stri
     Ok(column_names)
 }
 
+/// Builds the bundle-wide resolution pool that `resolve()` searches.
+///
+/// Every resource in the input bundle — regardless of type — is parsed into a
+/// version-agnostic [`helios_fhir::FhirResource`] once and shared via `Arc`, so
+/// that `Reference.resolve()` can dereference to any sibling resource in the
+/// bundle (not only resources of the ViewDefinition's target type, and not only
+/// `contained` children of the resource under evaluation).
+///
+/// The returned pool is installed on each evaluation context via
+/// [`EvaluationContext::set_resolution_scope`].
+///
+/// `external` holds resources fetched from trusted remote servers (the remote
+/// `resolve()` prefetch, [`remote_fetch::prefetch_external_resources`]); they are
+/// appended *after* the bundle's own resources so that an in-bundle resource always
+/// wins over a remotely-fetched copy of the same `Type/id`.
+fn build_resolution_scope<B: BundleTrait>(
+    bundle: &B,
+    external: Vec<helios_fhir::FhirResource>,
+) -> std::sync::Arc<Vec<helios_fhir::FhirResource>> {
+    let mut resources: Vec<helios_fhir::FhirResource> = bundle
+        .entries()
+        .into_iter()
+        .map(|resource| resource.to_fhir_resource())
+        .collect();
+    resources.extend(external);
+    std::sync::Arc::new(resources)
+}
+
 // Generic resource filtering
 fn filter_resources<'a, B: BundleTrait>(
     bundle: &'a B,
@@ -2522,6 +2790,7 @@ fn apply_where_clauses<'a, R, W>(
     resources: Vec<&'a R>,
     where_clauses: Option<&[W]>,
     variables: &HashMap<String, EvaluationResult>,
+    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
 ) -> Result<Vec<&'a R>, SofError>
 where
     R: ResourceTrait,
@@ -2537,6 +2806,8 @@ where
             for where_clause in wheres {
                 let fhir_resource = resource.to_fhir_resource();
                 let mut context = EvaluationContext::new(vec![fhir_resource]);
+                // Expose the whole bundle so `where` clauses can use `resolve()`.
+                context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
 
                 // Add variables to the context
                 for (name, value) in variables {
@@ -2706,6 +2977,7 @@ fn generate_rows_from_selects<R, S>(
     resources: &[&R],
     selects: &[S],
     variables: &HashMap<String, EvaluationResult>,
+    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
 ) -> Result<(Vec<String>, Vec<ProcessedRow>), SofError>
 where
     R: ResourceTrait + Sync,
@@ -2718,8 +2990,13 @@ where
         .map(|resource| {
             // Each thread gets its own local column vector
             let mut local_columns = Vec::new();
-            let resource_rows =
-                generate_rows_for_resource(*resource, selects, &mut local_columns, variables)?;
+            let resource_rows = generate_rows_for_resource(
+                *resource,
+                selects,
+                &mut local_columns,
+                variables,
+                resolution_scope,
+            )?;
             Ok::<(Vec<String>, Vec<ProcessedRow>), SofError>((local_columns, resource_rows))
         })
         .collect();
@@ -2749,6 +3026,7 @@ fn generate_rows_for_resource<R, S>(
     selects: &[S],
     all_columns: &mut Vec<String>,
     variables: &HashMap<String, EvaluationResult>,
+    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
 ) -> Result<Vec<ProcessedRow>, SofError>
 where
     R: ResourceTrait,
@@ -2757,6 +3035,9 @@ where
 {
     let fhir_resource = resource.to_fhir_resource();
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    // Expose the whole bundle so column/forEach paths can use `resolve()`. `this`
+    // stays the current resource, so `%resource`/root semantics are unchanged.
+    context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
 
     // Add variables to the context
     for (name, value) in variables {
@@ -2962,6 +3243,23 @@ where
     Ok(new_combinations)
 }
 
+/// Clone the variable map and set `%rowIndex` to `index` for the current iteration element.
+///
+/// `forEach`, `forEachOrNull`, and `repeat` each rebind `%rowIndex` to the 0-based position of
+/// the element they are processing; nested selects and `unionAll` branches without their own
+/// iteration inherit this value through the cloned map.
+fn vars_with_row_index(
+    variables: &HashMap<String, EvaluationResult>,
+    index: usize,
+) -> HashMap<String, EvaluationResult> {
+    let mut item_vars = variables.clone();
+    item_vars.insert(
+        "%rowIndex".to_string(),
+        EvaluationResult::integer(index as i64),
+    );
+    item_vars
+}
+
 fn expand_for_each_combinations<S>(
     context: &EvaluationContext,
     select: &S,
@@ -2987,19 +3285,47 @@ where
 
     if iteration_items.is_empty() {
         if allow_null {
-            // forEachOrNull: generate null rows
+            // forEachOrNull: generate a single null row per existing combination. Per the spec,
+            // this row is evaluated against an empty element with `%rowIndex` = 0, so most columns
+            // resolve to null while a `%rowIndex` column still yields 0.
+            let empty_node = EvaluationResult::Object {
+                map: HashMap::new(),
+                type_info: None,
+            };
+            let item_vars = vars_with_row_index(variables, 0);
             let mut new_combinations = Vec::new();
             for existing_combo in existing_combinations {
                 let mut new_combo = existing_combo.clone();
 
-                // Set column values to null for this forEach scope
                 if let Some(columns) = select.column() {
                     for col in columns {
                         if let Some(col_name) = col.name() {
                             if let Some(col_index) =
                                 all_columns.iter().position(|name| name == col_name)
                             {
-                                new_combo.values[col_index] = None;
+                                let path = col.path().ok_or_else(|| {
+                                    SofError::InvalidViewDefinition(
+                                        "Column path is required".to_string(),
+                                    )
+                                })?;
+
+                                let result = if path == "$this" {
+                                    empty_node.clone()
+                                } else {
+                                    evaluate_path_on_item(
+                                        path,
+                                        &empty_node,
+                                        &item_vars,
+                                        &context.resources,
+                                    )?
+                                };
+
+                                let is_collection = col.collection().unwrap_or(false);
+                                new_combo.values[col_index] = if is_collection {
+                                    fhirpath_result_to_json_value_collection(result)
+                                } else {
+                                    fhirpath_result_to_json_value(result)
+                                };
                             }
                         }
                     }
@@ -3017,9 +3343,9 @@ where
     let mut new_combinations = Vec::new();
 
     // For each iteration item, create new combinations
-    for item in &iteration_items {
-        // Create a new context with the iteration item
-        let _item_context = create_iteration_context(item, variables);
+    for (idx, item) in iteration_items.iter().enumerate() {
+        // `%rowIndex` for this element scopes the columns evaluated below.
+        let item_vars = vars_with_row_index(variables, idx);
 
         for existing_combo in existing_combinations {
             let mut new_combo = existing_combo.clone();
@@ -3043,7 +3369,7 @@ where
                                 item.clone()
                             } else {
                                 // Evaluate the path on the iteration item
-                                evaluate_path_on_item(path, item, variables)?
+                                evaluate_path_on_item(path, item, &item_vars, &context.resources)?
                             };
 
                             // Check if this column is marked as a collection
@@ -3067,8 +3393,10 @@ where
     if let Some(nested_selects) = select.select() {
         let mut final_combinations = Vec::new();
 
-        for item in &iteration_items {
-            let item_context = create_iteration_context(item, variables);
+        for (idx, item) in iteration_items.iter().enumerate() {
+            // `%rowIndex` for this element scopes its own columns and any nested selects.
+            let item_vars = vars_with_row_index(variables, idx);
+            let item_context = create_iteration_context(item, &item_vars, &context.resources);
 
             // For each iteration item, we need to start with the combinations that have
             // the correct column values for this forEach scope
@@ -3093,7 +3421,12 @@ where
                                 let result = if path == "$this" {
                                     item.clone()
                                 } else {
-                                    evaluate_path_on_item(path, item, variables)?
+                                    evaluate_path_on_item(
+                                        path,
+                                        item,
+                                        &item_vars,
+                                        &context.resources,
+                                    )?
                                 };
 
                                 // Check if this column is marked as a collection
@@ -3119,7 +3452,7 @@ where
                         nested_select,
                         &item_combinations,
                         all_columns,
-                        variables,
+                        &item_vars,
                     )?;
                 }
 
@@ -3134,8 +3467,11 @@ where
     if let Some(union_selects) = select.union_all() {
         let mut union_combinations = Vec::new();
 
-        for item in &iteration_items {
-            let item_context = create_iteration_context(item, variables);
+        for (idx, item) in iteration_items.iter().enumerate() {
+            // `%rowIndex` for this element is inherited by every unionAll branch that does not
+            // introduce its own `forEach`.
+            let item_vars = vars_with_row_index(variables, idx);
+            let item_context = create_iteration_context(item, &item_vars, &context.resources);
 
             // For each iteration item, process all unionAll selects
             for existing_combo in existing_combinations {
@@ -3157,7 +3493,12 @@ where
                                 let result = if path == "$this" {
                                     item.clone()
                                 } else {
-                                    evaluate_path_on_item(path, item, variables)?
+                                    evaluate_path_on_item(
+                                        path,
+                                        item,
+                                        &item_vars,
+                                        &context.resources,
+                                    )?
                                 };
 
                                 // Check if this column is marked as a collection
@@ -3191,7 +3532,12 @@ where
                                         let result = if path == "$this" {
                                             item.clone()
                                         } else {
-                                            evaluate_path_on_item(path, item, variables)?
+                                            evaluate_path_on_item(
+                                                path,
+                                                item,
+                                                &item_vars,
+                                                &context.resources,
+                                            )?
                                         };
 
                                         // Check if this column is marked as a collection
@@ -3217,7 +3563,7 @@ where
                         union_select,
                         &select_combinations,
                         all_columns,
-                        variables,
+                        &item_vars,
                     )?;
                     union_combinations.extend(select_combinations);
                 }
@@ -3232,6 +3578,47 @@ where
     Ok(new_combinations)
 }
 
+/// Flatten a `repeat` recursive traversal into a pre-order list of descendant nodes.
+///
+/// Mirrors the reference implementation's `recursiveTraverse`: starting from `context`'s node,
+/// each repeat path is evaluated, and for every resulting object child the child is appended and
+/// then traversed in turn (the starting node itself is never included). Non-object results are
+/// ignored, matching the reference's `typeof childNode === 'object'` guard. The resulting order is
+/// what `%rowIndex` enumerates over.
+fn collect_repeat_nodes(
+    context: &EvaluationContext,
+    repeat_paths: &[&str],
+    variables: &HashMap<String, EvaluationResult>,
+    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    out: &mut Vec<EvaluationResult>,
+) -> Result<(), SofError> {
+    for repeat_path in repeat_paths {
+        let repeat_result = evaluate_expression(repeat_path, context).map_err(|e| {
+            SofError::FhirPathError(format!(
+                "Error evaluating repeat expression '{}': {}",
+                repeat_path, e
+            ))
+        })?;
+
+        for child_item in extract_iteration_items(repeat_result) {
+            // Only object nodes participate in the traversal (matches the reference impl).
+            if !matches!(child_item, EvaluationResult::Object { .. }) {
+                continue;
+            }
+            let child_context = create_iteration_context(&child_item, variables, resolution_scope);
+            out.push(child_item);
+            collect_repeat_nodes(
+                &child_context,
+                repeat_paths,
+                variables,
+                resolution_scope,
+                out,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn expand_repeat_combinations<S>(
     context: &EvaluationContext,
     select: &S,
@@ -3244,122 +3631,102 @@ where
     S: ViewDefinitionSelectTrait,
     S::Select: ViewDefinitionSelectTrait,
 {
-    // The repeat directive performs recursive traversal:
-    // 1. For each repeat path, find child elements from the current context
-    // 2. For each child element:
-    //    a. Evaluate columns in the child's context
-    //    b. Recursively process the child with the same repeat paths
-    // 3. Union all results together
+    // The repeat directive performs recursive traversal of the elements reachable via the repeat
+    // paths. We first flatten that traversal into a pre-order node list (see `collect_repeat_nodes`)
+    // so that each emitted node can be assigned a monotonic `%rowIndex` matching the reference
+    // implementation. The traversal is independent of `existing_combinations`, so it is collected
+    // once and applied to each incoming combination.
     //
     // Note: Unlike forEach, repeat does NOT process the current level's columns
     // - it ONLY processes elements found via the repeat paths
+    let mut nodes = Vec::new();
+    collect_repeat_nodes(
+        context,
+        repeat_paths,
+        variables,
+        &context.resources,
+        &mut nodes,
+    )?;
 
     let mut all_combinations = Vec::new();
 
-    // Process each existing combination
+    // Process each existing combination, emitting one row per traversed node (cross product).
     for existing_combo in existing_combinations {
-        // Process each repeat path to find children to traverse
-        for repeat_path in repeat_paths {
-            // Evaluate the repeat path to get child elements
-            let repeat_result = evaluate_expression(repeat_path, context).map_err(|e| {
-                SofError::FhirPathError(format!(
-                    "Error evaluating repeat expression '{}': {}",
-                    repeat_path, e
-                ))
-            })?;
+        for (idx, node) in nodes.iter().enumerate() {
+            // Each traversed node gets its own `%rowIndex` (its position in the flattened list).
+            let item_vars = vars_with_row_index(variables, idx);
+            let node_context = create_iteration_context(node, &item_vars, &context.resources);
 
-            let child_items = extract_iteration_items(repeat_result);
+            // Create a combination for this node with the repeat level's columns
+            let mut node_combo = existing_combo.clone();
 
-            // For each child item found via this repeat path
-            for child_item in &child_items {
-                // Create a combination for this child with current level's columns
-                let mut child_combo = existing_combo.clone();
+            if let Some(columns) = select.column() {
+                for col in columns {
+                    if let Some(col_name) = col.name() {
+                        if let Some(col_index) =
+                            all_columns.iter().position(|name| name == col_name)
+                        {
+                            let path = col.path().ok_or_else(|| {
+                                SofError::InvalidViewDefinition(
+                                    "Column path is required".to_string(),
+                                )
+                            })?;
 
-                // Evaluate columns in the context of this child item
-                if let Some(columns) = select.column() {
-                    for col in columns {
-                        if let Some(col_name) = col.name() {
-                            if let Some(col_index) =
-                                all_columns.iter().position(|name| name == col_name)
-                            {
-                                let path = col.path().ok_or_else(|| {
-                                    SofError::InvalidViewDefinition(
-                                        "Column path is required".to_string(),
-                                    )
-                                })?;
+                            // Evaluate the path on the traversed node
+                            let result = if path == "$this" {
+                                node.clone()
+                            } else {
+                                evaluate_path_on_item(path, node, &item_vars, &context.resources)?
+                            };
 
-                                // Evaluate the path on the child item
-                                let result = if path == "$this" {
-                                    child_item.clone()
-                                } else {
-                                    evaluate_path_on_item(path, child_item, variables)?
-                                };
-
-                                let is_collection = col.collection().unwrap_or(false);
-                                child_combo.values[col_index] = if is_collection {
-                                    fhirpath_result_to_json_value_collection(result)
-                                } else {
-                                    fhirpath_result_to_json_value(result)
-                                };
-                            }
+                            let is_collection = col.collection().unwrap_or(false);
+                            node_combo.values[col_index] = if is_collection {
+                                fhirpath_result_to_json_value_collection(result)
+                            } else {
+                                fhirpath_result_to_json_value(result)
+                            };
                         }
                     }
                 }
-
-                // Create context for this child item
-                let child_context = create_iteration_context(child_item, variables);
-
-                // Start with the child combination we just created
-                let mut child_combinations = vec![child_combo.clone()];
-
-                // Process nested selects (like forEach/forEachOrNull) in the child's context
-                if let Some(nested_selects) = select.select() {
-                    for nested_select in nested_selects {
-                        child_combinations = expand_select_combinations(
-                            &child_context,
-                            nested_select,
-                            &child_combinations,
-                            all_columns,
-                            variables,
-                        )?;
-                    }
-                }
-
-                // Apply unionAll branches in the child's context
-                if let Some(union_selects) = select.union_all() {
-                    let mut union_combinations = Vec::new();
-                    for combo in &child_combinations {
-                        for union_select in union_selects {
-                            let select_combinations = expand_select_combinations(
-                                &child_context,
-                                union_select,
-                                std::slice::from_ref(combo),
-                                all_columns,
-                                variables,
-                            )?;
-                            union_combinations.extend(select_combinations);
-                        }
-                    }
-                    child_combinations = union_combinations;
-                }
-
-                // Add the processed combinations to our results
-                // (these may have been filtered by forEach, which is correct)
-                all_combinations.extend(child_combinations);
-
-                // Now recursively process this child with the same repeat paths
-                // IMPORTANT: Use the original child_combo, not the forEach-filtered results
-                let recursive_combinations = expand_repeat_combinations(
-                    &child_context,
-                    select,
-                    &[child_combo],
-                    all_columns,
-                    repeat_paths,
-                    variables,
-                )?;
-
-                all_combinations.extend(recursive_combinations);
             }
+
+            // Start with the node combination we just created
+            let mut node_combinations = vec![node_combo];
+
+            // Process nested selects (like forEach/forEachOrNull) in the node's context
+            if let Some(nested_selects) = select.select() {
+                for nested_select in nested_selects {
+                    node_combinations = expand_select_combinations(
+                        &node_context,
+                        nested_select,
+                        &node_combinations,
+                        all_columns,
+                        &item_vars,
+                    )?;
+                }
+            }
+
+            // Apply unionAll branches in the node's context
+            if let Some(union_selects) = select.union_all() {
+                let mut union_combinations = Vec::new();
+                for combo in &node_combinations {
+                    for union_select in union_selects {
+                        let select_combinations = expand_select_combinations(
+                            &node_context,
+                            union_select,
+                            std::slice::from_ref(combo),
+                            all_columns,
+                            &item_vars,
+                        )?;
+                        union_combinations.extend(select_combinations);
+                    }
+                }
+                node_combinations = union_combinations;
+            }
+
+            // Add the processed combinations to our results
+            // (these may have been filtered by forEach, which is correct)
+            all_combinations.extend(node_combinations);
         }
     }
 
@@ -3371,6 +3738,7 @@ fn evaluate_path_on_item(
     path: &str,
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,
+    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
 ) -> Result<EvaluationResult, SofError> {
     // Create a temporary context with the iteration item as the root resource
     let mut temp_context = match item {
@@ -3383,6 +3751,10 @@ fn evaluate_path_on_item(
         }
         _ => EvaluationContext::new(vec![]),
     };
+    // Carry the bundle-wide resolution pool so chained `resolve()` calls (e.g.
+    // `forEach: list.resolve()` then a column that resolves a nested reference)
+    // can still reach sibling resources from this fresh, item-rooted context.
+    temp_context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
 
     // Add variables to the temporary context
     for (name, value) in variables {
@@ -3411,10 +3783,14 @@ fn evaluate_path_on_item(
 fn create_iteration_context(
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,
+    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
 ) -> EvaluationContext {
     // Create a new context with the iteration item as the root
     let mut context = EvaluationContext::new(vec![]);
     context.this = Some(item.clone());
+    // Keep the bundle-wide resolution pool available to nested selects/columns
+    // evaluated against this iteration item, so `resolve()` still works here.
+    context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
 
     // Preserve variables from the parent context
     for (name, value) in variables {

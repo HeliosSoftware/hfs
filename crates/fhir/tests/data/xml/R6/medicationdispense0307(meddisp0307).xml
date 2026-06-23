@@ -49,31 +49,5 @@
   </daysSupply>
   <whenPrepared value="2015-01-15T10:20:00Z"/>
   <whenHandedOver value="2015-01-15T16:20:00Z"/>
-  <dosageInstruction>
-    <simple>
-      <text value="Take 3 tablets (6mg) once daily"/>
-      <timing>
-        <repeat>
-          <frequency value="1"/>
-          <period value="1"/>
-          <periodUnit value="d"/>
-        </repeat>
-      </timing>
-      <doseAndRate>
-        <type>
-          <coding>
-            <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-            <code value="calculated"/>
-            <display value="Calculated"/>
-          </coding>
-        </type>
-        <doseQuantity>
-          <value value="6"/>
-          <unit value="mg"/>
-          <system value="http://unitsofmeasure.org"/>
-          <code value="mg"/>
-        </doseQuantity>
-      </doseAndRate>
-    </simple>
-  </dosageInstruction>
+  <dosageInstruction/>
 </MedicationDispense>

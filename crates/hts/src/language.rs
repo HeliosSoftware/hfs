@@ -11,37 +11,51 @@
 
 /// Rank a stored designation language tag against a requested tag.
 ///
-/// Lower rank is a better match; `None` means no match. For each truncation
-/// of the requested tag (`de-DE-1996` → `de-DE` → `de`), in order:
+/// Lower rank is a better match; `None` means no match. The tiers, from best
+/// to worst, encode the preference order "`es-ES`, then `esES`, then `es` or
+/// `es*`" (and likewise for every language):
 ///
-/// * the stored tag equals the candidate (case-insensitive) — rank `2*i`;
-/// * the stored tag extends the candidate with a `-` subtag (so `de`
-///   accepts `de-CH` but not `den`) — rank `2*i + 1`.
+/// * **0 — exact:** the stored tag equals the requested tag, region and all
+///   (`es-ES` → `es-ES`, case-insensitive).
+/// * **1 — separator-insensitive exact:** the stored tag equals the requested
+///   tag with separators removed (`es-ES` → `esES`).
+/// * **2 — same primary language:** the stored tag is the bare primary subtag
+///   of the request (`es-ES` → `es`) *or* any regional sibling/extension under
+///   that primary (`es-ES` → `es-AR`, `es-MX`; `es` → `es-MX`). These all share
+///   one tier, so a bare tag and its regional siblings are equal-preference —
+///   "`es` or `es*`, whichever appears first". A more specific tier-0/1 match,
+///   when one exists among the candidates, outranks and therefore excludes
+///   them.
 ///
-/// Examples (requested → stored): `de`→`de` is 0, `de`→`de-CH` is 1,
-/// `de-DE`→`de` is 2, `de-DE`→`de-CH` is 3, `de`→`den` is `None`.
+/// Examples (requested → stored): `es-ES`→`es-ES` is 0, `es-ES`→`esES` is 1,
+/// `es-ES`→`es` is 2, `es-ES`→`es-MX` is 2, `de`→`de-CH` is 2, `de`→`den` is
+/// `None`.
 pub(crate) fn lang_match_rank(requested: &str, stored: &str) -> Option<u32> {
-    let stored = stored.to_ascii_lowercase();
-    let mut candidate = requested.trim().to_ascii_lowercase();
-    let mut i = 0u32;
-    loop {
-        if stored == candidate {
-            return Some(2 * i);
-        }
-        if stored.len() > candidate.len()
-            && stored.starts_with(candidate.as_str())
-            && stored.as_bytes()[candidate.len()] == b'-'
-        {
-            return Some(2 * i + 1);
-        }
-        match candidate.rfind('-') {
-            Some(pos) => {
-                candidate.truncate(pos);
-                i += 1;
-            }
-            None => return None,
-        }
+    let r = requested.trim().to_ascii_lowercase();
+    let s = stored.trim().to_ascii_lowercase();
+
+    // Tier 0: exact match (identical region included).
+    if s == r {
+        return Some(0);
     }
+    // Tier 1: separator-insensitive exact match (es-ES vs esES). Only meaningful
+    // when the request carries a separator; otherwise this collapses into tier 0.
+    if r.contains('-') && s == r.replace('-', "") {
+        return Some(1);
+    }
+    // Tier 2: same primary language subtag — either the bare primary itself or
+    // any regional sibling/extension under it. The `de-DE` → bare `de` case
+    // (SNOMED RF2 ships bare language codes) lands here too.
+    let primary = r.split('-').next().unwrap_or(r.as_str());
+    if !primary.is_empty()
+        && (s == primary
+            || (s.len() > primary.len()
+                && s.starts_with(primary)
+                && s.as_bytes()[primary.len()] == b'-'))
+    {
+        return Some(2);
+    }
+    None
 }
 
 /// `true` when the stored tag satisfies the requested tag under
@@ -80,18 +94,28 @@ mod tests {
     }
 
     #[test]
-    fn stored_dialect_satisfies_bare_request() {
-        assert_eq!(lang_match_rank("de", "de-CH"), Some(1));
-        assert_eq!(lang_match_rank("fr", "fr-FR"), Some(1));
-        // No subtag boundary — must not match.
-        assert_eq!(lang_match_rank("de", "den"), None);
+    fn separator_insensitive_exact_is_tier_one() {
+        // es-ES, then esES — the hyphen-less form ranks just below exact.
+        assert_eq!(lang_match_rank("es-ES", "esES"), Some(1));
+        assert_eq!(lang_match_rank("zh-Hans-CN", "zhHansCN"), Some(1));
+        // For a bare request there is no separate hyphen-less form.
+        assert_eq!(lang_match_rank("de", "de"), Some(0));
     }
 
     #[test]
-    fn requested_dialect_truncates_to_bare_stored() {
+    fn bare_primary_and_regional_siblings_share_tier_two() {
+        // es-ES → es, and es-ES → es-AR / es-MX are all tier 2 ("es or es*").
+        assert_eq!(lang_match_rank("es-ES", "es"), Some(2));
+        assert_eq!(lang_match_rank("es-ES", "es-AR"), Some(2));
+        assert_eq!(lang_match_rank("es-ES", "es-MX"), Some(2));
+        // Bare request extends to any regional variant.
+        assert_eq!(lang_match_rank("de", "de-CH"), Some(2));
+        assert_eq!(lang_match_rank("fr", "fr-FR"), Some(2));
+        // SNOMED RF2 ships bare codes: a de-DE request must accept stored `de`.
         assert_eq!(lang_match_rank("de-DE", "de"), Some(2));
-        assert_eq!(lang_match_rank("de-DE", "de-CH"), Some(3));
-        assert_eq!(lang_match_rank("zh-Hans-CN", "zh"), Some(4));
+        assert_eq!(lang_match_rank("zh-Hans-CN", "zh"), Some(2));
+        // No subtag boundary — must not match.
+        assert_eq!(lang_match_rank("de", "den"), None);
     }
 
     #[test]
@@ -99,6 +123,9 @@ mod tests {
         assert_eq!(lang_match_rank("de", "en"), None);
         assert_eq!(lang_match_rank("de-DE", "en-US"), None);
         assert!(!lang_matches("sv-SE", "da"));
+        // A region-specific request must not match a *different* region when an
+        // unrelated primary is involved.
+        assert_eq!(lang_match_rank("es-ES", "en-US"), None);
     }
 
     #[test]

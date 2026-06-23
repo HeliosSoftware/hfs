@@ -273,6 +273,10 @@ Options:
       --storage-backend <BACKEND>  Storage backend [env: HTS_STORAGE_BACKEND=] [default: sqlite]
       --log-level <LOG_LEVEL>      Log level [env: HTS_LOG_LEVEL=] [default: info]
       --batch-size <N>             Resources per import batch [default: 500]
+      --languages <TAGS>           Comma-separated BCP-47 tags restricting imported
+                                   translation languages (SNOMED RF2, LOINC); English
+                                   is always retained [env: HTS_IMPORT_LANGUAGES=]
+                                   [default: all languages]
       --dry-run                    Parse only - no database writes
       --verbose                    Emit per-batch progress to stderr
   -h, --help                       Print help
@@ -372,6 +376,9 @@ Options:
 | `HTS_CORS_ORIGINS` | * | Allowed CORS origins |
 | `HTS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HTS_MAX_EXPANSION_SIZE` | 3500 | Maximum codes in a single ValueSet `$expand` response. Requests exceeding this limit return HTTP 422 with issue code `too-costly`. |
+| `HTS_BOOTSTRAP_DIR` | (none) | Directory of terminology files synchronized into the database on startup. The Docker image sets this to `/app/terminology-data`. |
+| `HTS_BOOTSTRAP_BATCH_SIZE` | 5000 | Concepts per import batch during bootstrap sync. Larger batches amortize per-batch transaction/bookkeeping overhead for big terminologies (SNOMED CT, LOINC) at the cost of peak memory. |
+| `HTS_IMPORT_LANGUAGES` | (all) | Comma-separated BCP-47 tags restricting which translation languages are imported from multilingual distributions (SNOMED RF2 descriptions, LOINC linguistic variants), e.g. `de,fr-FR`. Matching is BCP-47-aware and *best-tier*: a specific `es-ES` imports only `es-ES` (not the siblings `es-AR`/`es-MX`), while a bare `es` imports every `es-*`. English is always retained. Also available as `--languages` on `hts import`. Changing it re-triggers bootstrap imports of affected files. |
 
 Request bodies sent with `Content-Encoding: gzip` (also `deflate`, `br`,
 `zstd`) are decompressed transparently; unsupported encodings are rejected
@@ -406,6 +413,12 @@ concept_map_mappings  - source→target code mappings with equivalence
 ```
 
 The `value_set_expansions` table acts as a write-through cache: the first `$expand` call for a given ValueSet computes and stores the expansion; subsequent calls read from the cache directly. The cache is invalidated automatically when a CodeSystem or ValueSet is updated via PUT or DELETE.
+
+#### Indexing and caching
+
+Per-concept reads on the hot operation paths (`$lookup`, `$validate-code`, `$expand`) are served by dedicated indexes rather than table scans. Concept resolution uses the `UNIQUE(system_id, code)` index on `concepts` (so a separate explicit index on the same columns would be redundant), while properties and designations are keyed by `concept_id` — `concept_properties(concept_id, …)` and `concept_designations(concept_id)`. The transitive `concept_closure` table makes `$subsumes` and `is-a` filters O(1) index seeks instead of recursive traversals.
+
+On top of the SQL layer, the SQLite backend keeps small bounded in-memory caches of assembled `$lookup` / `$validate-code` responses and per-concept status flags, keyed on the full request. When a cache reaches its bound it evicts an existing entry (random replacement) and admits the new one, so a working set larger than the bound — e.g. diverse-code `$lookup` traffic against a 600 K-concept SNOMED system — keeps hot codes cached rather than freezing the cache at capacity and locking out every later code. Reads take a shared lock and never block each other; recency is deliberately not tracked, since bumping it on every read would require an exclusive lock and serialize lookups. Caches are flushed when the underlying data changes (import, PUT, DELETE).
 
 ### PostgreSQL
 
@@ -571,6 +584,48 @@ curl -X POST http://localhost:8090/CodeSystem/\$validate-code \
     ]
   }'
 ```
+
+#### Display validation
+
+When a `display` is supplied it is validated against the concept's display
+**and its designations**, honouring `displayLanguage` with the same
+BCP-47-aware matching used by `$lookup` (see [SNOMED CT](#snomed-ct) above). A
+designation counts as a valid display when it has no `use` (the default
+display), carries the FHIR `display` use, or is a terminology-native
+description type — notably SNOMED CT synonyms/FSNs, whose designation
+`use.system` is `http://snomed.info/sct`. So a request with
+`displayLanguage=de` and the matching German SNOMED term validates `true` and
+echoes that term back as `display`. Designations whose `use` marks them as an
+alternative-purpose label (e.g. the FHIR designation-usage `consumer-name`)
+are not treated as displays.
+
+By default a display that matches none of these is an `error` and flips
+`result` to `false` (FHIR `invalid-display`). The `lenient-display-validation`
+boolean parameter downgrades that mismatch to a `warning` while keeping
+`result=true`:
+
+```bash
+curl -X POST http://localhost:8090/CodeSystem/\$validate-code \
+  -H "Content-Type: application/fhir+json" \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [
+      {"name": "url",     "valueUri":    "http://loinc.org"},
+      {"name": "code",    "valueCode":   "718-7"},
+      {"name": "display", "valueString": "not the right display"},
+      {"name": "lenient-display-validation", "valueBoolean": true}
+    ]
+  }'
+```
+
+> **Provenance.** `lenient-display-validation` is defined in **FHIR R6**
+> (ballot) on
+> [`ValueSet/$validate-code`](https://build.fhir.org/valueset-operation-validate-code.html);
+> it is absent from the R4 and R5 operation definitions. HTS accepts it on
+> both `CodeSystem/$validate-code` and `ValueSet/$validate-code` regardless of
+> the resources' FHIR version — an opt-in superset of the published
+> definitions. The default (parameter absent or `false`) is the spec-mandated
+> behaviour across all versions: an invalid display fails validation.
 
 ### Expand a ValueSet
 
@@ -763,9 +818,23 @@ plus a BCP-47 dialect-tagged copy (`en-US`, `en-GB`, `da-DK`, `fr-CA`,
 `nl-BE`, `sv-SE`, …) when the refset is one of the published
 national-edition language refsets. `$lookup`, `$expand`, and
 `$validate-code` resolve these via the `displayLanguage` parameter or the
-`Accept-Language` HTTP header. Language matching is BCP-47-aware (RFC 4647):
-a request for `de-DE` (what a browser typically sends) finds designations
-tagged `de`, and a request for `fr` accepts `fr-CA`:
+`Accept-Language` HTTP header. Language matching is BCP-47-aware: a tag is
+ranked against stored designations in the preference order **exact
+(`es-ES`) → separator-insensitive (`esES`) → same primary language (`es`, or
+any regional sibling such as `es-AR`/`es-MX`, all equal-preference)**. So a
+request for `de-DE` (what a browser typically sends) finds designations
+tagged `de`, and a request for `fr` accepts `fr-CA`; when an exact `es-ES`
+designation exists it is preferred over `es`/`es-MX`.
+
+To import only a subset of the available languages (cutting designation
+volume and import time), pass `--languages` (or set `HTS_IMPORT_LANGUAGES`
+for the server bootstrap), e.g. `--languages de,fr-FR`. Selection follows the
+same precedence on a **best-tier** basis: for each requested tag only the
+best-ranked available languages are kept. A specific `es-ES` therefore imports
+**only** `es-ES` (excluding `es-AR`/`es-MX`), while a bare `es` — which can only
+reach the primary-language tier — imports every `es-*` variant. Excluded
+per-language Description and Language-refset files are skipped without being
+parsed; English is always retained because display selection depends on it:
 
 ```bash
 curl -X POST http://localhost:8090/CodeSystem/\$lookup \

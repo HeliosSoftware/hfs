@@ -26,8 +26,8 @@ use helios_fhirpath::parser::{Expression, Invocation, Literal, Term, TypeSpecifi
 use crate::core::sof_runner::SofError;
 
 use super::ir::{
-    BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, SqlExpr, SqlType,
-    UnaryOp,
+    BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, RowIndexScope,
+    SqlExpr, SqlType, UnaryOp,
 };
 
 /// Compile-time environment threaded through expression lowering.
@@ -92,7 +92,7 @@ impl CompileEnv {
             column_type_hint: None,
             next_where_alias: 0,
             resource_type: String::new(),
-            fhir_version: FhirVersion::default(),
+            fhir_version: FhirVersion::default_enabled(),
         }
     }
 
@@ -1042,6 +1042,20 @@ fn boundary_kind_from_hint(env: &CompileEnv) -> Result<BoundaryKind, SofError> {
 /// and reused on subsequent references in the same compilation. The runner
 /// receives the resolved values via [`CompileEnv::param_bindings`].
 fn resolve_external_constant(name: &str, env: &mut CompileEnv) -> Result<SqlExpr, SofError> {
+    // `%rowIndex` is a reserved environment variable, not a declared constant.
+    // Its value depends on the enclosing iteration scope, which we capture here
+    // from the current focus alias (`<alias>.value` for forEach, `<alias>.node`
+    // for repeat, the resource root otherwise).
+    if name == "rowIndex" {
+        let scope = if let Some(alias) = env.root_alias.strip_suffix(".value") {
+            RowIndexScope::ForEach(alias.to_string())
+        } else if let Some(alias) = env.root_alias.strip_suffix(".node") {
+            RowIndexScope::Repeat(alias.to_string())
+        } else {
+            RowIndexScope::Top
+        };
+        return Ok(SqlExpr::RowIndex(scope));
+    }
     let constant = env.constants.get(name).cloned().ok_or_else(|| {
         SofError::InvalidViewDefinition(format!(
             "FHIRPath references undefined constant '%{name}' (not declared in ViewDefinition.constant[])"

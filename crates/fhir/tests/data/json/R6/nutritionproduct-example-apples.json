@@ -1,6 +1,7 @@
 {
   "resourceType": "NutritionProduct",
   "id": "example-apples",
+  "status": "active",
   "code": {
     "coding": [
       {
@@ -11,7 +12,6 @@
     ],
     "text": "Apples, fuji, with skin, raw"
   },
-  "status": "active",
   "category": [
     {
       "coding": [

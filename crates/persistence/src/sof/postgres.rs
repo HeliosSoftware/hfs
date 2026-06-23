@@ -40,7 +40,7 @@ impl PgInDbRunner {
     pub fn new(pool: Pool) -> Self {
         Self {
             pool,
-            fhir_version: FhirVersion::default(),
+            fhir_version: FhirVersion::default_enabled(),
         }
     }
 

@@ -2004,11 +2004,11 @@
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/ElementDefinition"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="ElementDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-06-13T17:13:29+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -2030,7 +2030,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>
@@ -2403,7 +2403,7 @@
         </extension>
         <strength value="required"/>
         <description value="How a property is represented when serialized."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -2814,7 +2814,7 @@
         </extension>
         <strength value="required"/>
         <description value="How an element value is interpreted when discrimination is evaluated."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -2954,7 +2954,7 @@
         </extension>
         <strength value="required"/>
         <description value="How slices are interpreted when evaluating an instance."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -3767,7 +3767,7 @@
         </extension>
         <strength value="required"/>
         <description value="How resource references can be aggregated."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -3811,7 +3811,7 @@
         </extension>
         <strength value="required"/>
         <description value="Whether a reference needs to be version specific or version independent, or whether either can be used."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -5174,7 +5174,7 @@
         </extension>
         <strength value="required"/>
         <description value="SHALL applications comply with this constraint?"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -5278,7 +5278,7 @@
       <path value="ElementDefinition.constraint.source"/>
       <short value="Reference to original source of constraint"/>
       <definition value="A reference to the original source of the constraint, for traceability purposes."/>
-      <comment value="This is used when, e.g. rendering, where it is not useful to present inherited constraints when rendering the snapshot."/>
+      <comment value="This is used when it is not useful to present inherited constraints while rendering the snapshot."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -5673,7 +5673,7 @@
         </extension>
         <strength value="required"/>
         <description value="Indication of the degree of conformance expectations associated with a binding."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -5922,7 +5922,7 @@
         </extension>
         <strength value="required"/>
         <description value="The use of an additional binding."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ElementDefinition.binding.additional.valueSet">
@@ -6218,7 +6218,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -6495,7 +6495,7 @@
         </extension>
         <strength value="required"/>
         <description value="How a property is represented when serialized."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -6683,7 +6683,7 @@
         </extension>
         <strength value="required"/>
         <description value="How an element value is interpreted when discrimination is evaluated."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -6771,7 +6771,7 @@
         </extension>
         <strength value="required"/>
         <description value="How slices are interpreted when evaluating an instance."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -7231,7 +7231,7 @@
         </extension>
         <strength value="required"/>
         <description value="How resource references can be aggregated."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -7262,7 +7262,7 @@
         </extension>
         <strength value="required"/>
         <description value="Whether a reference needs to be version specific or version independent, or whether either can be used."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -8285,7 +8285,7 @@
         </extension>
         <strength value="required"/>
         <description value="SHALL applications comply with this constraint?"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -8350,7 +8350,7 @@
       <path value="ElementDefinition.constraint.source"/>
       <short value="Reference to original source of constraint"/>
       <definition value="A reference to the original source of the constraint, for traceability purposes."/>
-      <comment value="This is used when, e.g. rendering, where it is not useful to present inherited constraints when rendering the snapshot."/>
+      <comment value="This is used when it is not useful to present inherited constraints while rendering the snapshot."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -8562,7 +8562,7 @@
         </extension>
         <strength value="required"/>
         <description value="Indication of the degree of conformance expectations associated with a binding."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="v2"/>
@@ -8680,7 +8680,7 @@
         </extension>
         <strength value="required"/>
         <description value="The use of an additional binding."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ElementDefinition.binding.additional.valueSet">
@@ -8806,7 +8806,7 @@
         </extension>
         <strength value="required"/>
         <description value="BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="rim"/>

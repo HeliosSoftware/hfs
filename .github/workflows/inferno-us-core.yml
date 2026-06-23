@@ -1,7 +1,15 @@
 name: Inferno US Core Test Suite
 
 on:
-  workflow_dispatch: # Manual trigger only for initial implementation
+  workflow_dispatch: # Manual trigger
+  schedule:
+    # Weekly US Core conformance tracking run — Sunday 08:00 UTC (04:00 ET).
+    # Offset from the daily suites (hts-ig 03:00, hts 05:00) and clear of the
+    # weekday ci-extended 07:00 run, so this long (~2.5h) job has the
+    # self-hosted runners to itself. Runs as a status/early-warning signal —
+    # the suite is not yet consistently green, so treat a weekly red as a
+    # tracking indicator rather than a gate.
+    - cron: "0 8 * * 0"
 
 env:
   CARGO_TERM_COLOR: always
@@ -141,7 +149,13 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # Serialized: all matrix jobs share one Inferno instance, which runs a
+      # single test run at a time. Running two jobs in parallel made the second
+      # collide with the first's in-progress run ("Cannot run new test while
+      # another test run is in progress" / SQLite "database is locked"), and the
+      # per-job retry window (~30s) is far shorter than a run (~30min), so the
+      # loser always failed. One at a time avoids the contention entirely.
+      max-parallel: 1
       matrix:
         suite_id:
           [

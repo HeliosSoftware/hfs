@@ -10,8 +10,10 @@ struct TestCase {
     title: String,
     #[allow(dead_code)]
     description: String,
-    #[serde(rename = "fhirVersion")]
-    fhir_version: Vec<String>,
+    // Optional: some upstream fixtures (e.g. constant_types.json) omit `fhirVersion`, which the
+    // spec treats as "applies to all versions".
+    #[serde(rename = "fhirVersion", default)]
+    fhir_version: Option<Vec<String>>,
     resources: Vec<serde_json::Value>,
     tests: Vec<Test>,
 }
@@ -180,9 +182,18 @@ fn compare_results(actual: &[serde_json::Value], expected: &[serde_json::Value])
         return false;
     }
 
-    for (actual_row, expected_row) in actual.iter().zip(expected.iter()) {
-        if !compare_json_values(actual_row, expected_row) {
-            return false;
+    // Row order is not significant in SQL-on-FHIR (the official compliance runner canonicalizes
+    // both sides before comparing). Match as a multiset: every expected row must consume a distinct
+    // actual row.
+    let mut used = vec![false; actual.len()];
+    for expected_row in expected {
+        let matched = actual
+            .iter()
+            .enumerate()
+            .find(|(idx, actual_row)| !used[*idx] && compare_json_values(actual_row, expected_row));
+        match matched {
+            Some((idx, _)) => used[idx] = true,
+            None => return false,
         }
     }
 
@@ -219,8 +230,12 @@ fn run_test_file(test_file: &Path) -> Result<TestSuiteReport, Box<dyn std::error
 
     let mut test_reports = Vec::new();
 
-    // Check if we support the FHIR version
-    let supports_r4 = test_case.fhir_version.contains(&"4.0.1".to_string());
+    // Check if we support the FHIR version. A missing `fhirVersion` applies to all versions.
+    let supports_r4 = test_case
+        .fhir_version
+        .as_ref()
+        .map(|v| v.contains(&"4.0.1".to_string()))
+        .unwrap_or(true);
     if !supports_r4 {
         test_reports.push(TestReport {
             name: "version_check".to_string(),

@@ -39,7 +39,12 @@ These capabilities are available today in the current release.
 
 **Terminology**
 
-- [Terminology service (HTS) — SQLite backend](crates/hts/README.md) — Standalone FHIR Terminology Server with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, and bulk import for HL7 NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
+- [Terminology service (HTS) — SQLite and PostgreSQL backends](crates/hts/README.md) — Standalone FHIR Terminology Server with `$lookup`, `$expand`, `$validate-code`, `$subsumes`, `$translate`, `$closure`, and bulk import for HL7 NPM packages, SNOMED CT RF2, LOINC, ICD-10-CM, and RxNorm
+
+**Standards**
+
+- [Bulk Data API — `$export`](crates/rest/README.md) — System / patient / group export with pre-signed S3 downloads
+- [Bulk Data API — `$bulk-submit`](crates/rest/README.md) — Bulk ingestion
 
 **Messaging**
 
@@ -59,11 +64,8 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Standards** | [Terminology — PostgreSQL backend](https://github.com/HeliosSoftware/hfs/discussions/54) | 🟡 In progress |
 | **Standards** | FHIR Validation engine | 🔵 Design |
-| **Standards** | Bulk Data API — `$export` (system / patient / group), pre-signed S3 downloads | ✅ Shipped |
-| **Standards** | Bulk Data API — `$bulk-submit` (ingestion) | 🔵 Design |
-| **Analytics** | [SQL on FHIR](https://sql-on-fhir.org/ig/latest/) — HFS integration and operations update | 🟡 In progress |
+| **Developer Experience** | Administrative UI — web-based management console for server configuration and monitoring | 🔵 Design |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
 ### Discussion Documents
@@ -71,7 +73,6 @@ Work that is currently underway or planned for the near term.
 We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These will be published as GitHub Discussions:
 
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
-- **Bulk Data API** — Defining the approach for `$export` / `$import` operations across HFS storage backends
 
 ---
 
@@ -81,13 +82,12 @@ These items are well-understood and will be picked up once current work complete
 
 ### FHIR Server Capabilities
 
-- **Persistence-layer audit events** — Wire audit logging for bulk export, purge, and reindex operations (audit functions exist, pending REST endpoints)
-- **Database-backed SQL-on-FHIR export job state** — Replace the in-memory job controller (`InMemoryController` in `crates/rest/src/export/`) behind the async `$viewdefinition-export` / `$sqlquery-export` operations with database-backed job state, following the pattern already used by Bulk Data `$export` (whose job store shares the primary database). Today, job status, tenant ownership, progress, and cancellation state live only in process memory: a server restart invalidates every in-flight and completed status URL (undermining the spec's 24-hour manifest validity), and a second instance cannot see jobs submitted to the first. ⚠️ **Until this change is complete, deployments serving SQL-on-FHIR async operations must not be clustered** — run a single HFS instance for these endpoints, or pin them to one instance behind the load balancer. Synchronous `$viewdefinition-run` / `$sqlquery-run` and Bulk Data `$export` are unaffected.
-- **Cluster-aware Subscription notification delivery** — Identified by the same review: the Subscriptions engine tracks connected WebSocket clients in process memory (`crates/subscriptions/src/channels/ws_manager.rs`), so in a multi-instance deployment only the instance holding a client's connection can deliver its notifications. Subscription resources themselves are database-backed; what's needed is a shared delivery channel (e.g., a message bus or pub/sub fan-out) so resource events on any instance reach clients connected to any other. Until then, WebSocket subscription delivery is single-instance / sticky-session only (rest-hook channels are unaffected).
+- **Persistence-layer audit events** ([#168](https://github.com/HeliosSoftware/hfs/issues/168)) — Wire audit logging for bulk export, purge, and reindex operations (audit functions exist, pending REST endpoints)
+- **Database-backed SQL-on-FHIR export job state** ([#169](https://github.com/HeliosSoftware/hfs/issues/169)) — Replace the in-memory job controller (`InMemoryController` in `crates/rest/src/export/`) behind the async `$viewdefinition-export` / `$sqlquery-export` operations with database-backed job state, following the pattern already used by Bulk Data `$export` (whose job store shares the primary database). Today, job status, tenant ownership, progress, and cancellation state live only in process memory: a server restart invalidates every in-flight and completed status URL (undermining the spec's 24-hour manifest validity), and a second instance cannot see jobs submitted to the first. ⚠️ **Until this change is complete, deployments serving SQL-on-FHIR async operations must not be clustered** — run a single HFS instance for these endpoints, or pin them to one instance behind the load balancer. Synchronous `$viewdefinition-run` / `$sqlquery-run` and Bulk Data `$export` are unaffected.
+- **Cluster-aware Subscription notification delivery** ([#170](https://github.com/HeliosSoftware/hfs/issues/170)) — Identified by the same review: the Subscriptions engine tracks connected WebSocket clients in process memory (`crates/subscriptions/src/channels/ws_manager.rs`), so in a multi-instance deployment only the instance holding a client's connection can deliver its notifications. Subscription resources themselves are database-backed; what's needed is a shared delivery channel (e.g., a message bus or pub/sub fan-out) so resource events on any instance reach clients connected to any other. Until then, WebSocket subscription delivery is single-instance / sticky-session only (rest-hook channels are unaffected).
 
 ### Developer Experience
 
-- **Administrative UI** — Web-based management console for server configuration and monitoring
 - **MCP Server for FHIR API** — Model Context Protocol integration for the FHIR REST API
 - **MCP Server for SQL on FHIR** — Model Context Protocol integration for analytics workflows
 - **Deployment Cookbooks** — Reference architectures and deployment templates covering standalone development servers, single-node production setups, composite storage configurations, and full CQRS architectures on AWS, Azure, and GCP
@@ -102,6 +102,16 @@ Longer-term ideas we are exploring. These are not yet committed and may evolve s
 ### FHIR Server Capabilities
 
 - **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
+- **GraphQL API** — [FHIR GraphQL](https://hl7.org/fhir/graphql.html) support for resource retrieval, search, and graph traversal as an alternative to the REST API
+
+### SQL-on-FHIR & FHIRPath
+
+Follow-ups to `resolve()` in SQL-on-FHIR, which today dereferences references against the input bundle (and their `contained` resources) and can optionally fetch from explicitly allowlisted, trusted remote servers:
+
+- **Logical (identifier-based) reference resolution** — `resolve()` handles literal `Reference.reference` strings (relative `Type/id`, absolute URLs, and `#contained` fragments). References that identify their target only by a business `identifier` (no `reference` string) are not yet resolved.
+- **Storage-backed and cross-run resolution cache for `resolve()`** ([#167](https://github.com/HeliosSoftware/hfs/issues/167)) — Resolve against server-stored resources, and persist fetched resources across runs, as a layer over the current in-bundle pool and per-run in-memory prefetch cache.
+- **Async FHIRPath evaluator** — The FHIRPath engine is synchronous (executed under Rayon by the SQL-on-FHIR core), so remote `resolve()` is handled by an up-front prefetch pass rather than inline I/O. A general async evaluator would let effectful functions (inline remote resolution, terminology lookups) run during evaluation.
+- **OAuth client-credentials for remote `resolve()`** — Trusted-server authentication is per-host bearer tokens today; a client-credentials grant flow would better suit servers fronted by OAuth.
 
 ### Advanced Persistence
 
@@ -119,6 +129,20 @@ An intelligent recommendation engine for storage configuration:
 - Leverage historical benchmark data to inform recommendations
 - Web UI for interactive configuration guidance
 
+### Build & Dependencies
+
+- **Upgrade `lru` to the latest version** — `helios-sof` uses `lru` for the
+  streaming remote-`resolve()` cross-chunk cache. It is currently pinned to `0.12`
+  to match `aws-sdk-s3`, which pins `lru = "^0.12"` as a non-optional dependency
+  (pulled by the optional `s3` feature in `helios-persistence` / `helios-rest`).
+  Matching the SDK keeps a single `lru` version compiled across all feature
+  combinations. The latest `lru` is 0.18; raising `helios-sof`'s pin would compile
+  two `lru` versions whenever `s3` is enabled, because the AWS SDK's `^0.12` pin (a
+  third-party crate we don't control) is semver-incompatible with 0.18. Bump
+  `helios-sof` to the latest `lru` once the AWS SDK updates its own pin, collapsing
+  back to a single version. Tracked so the pin is re-evaluated on the next AWS SDK
+  upgrade.
+
 ---
 
 ## Status Legend
@@ -127,6 +151,21 @@ An intelligent recommendation engine for storage configuration:
 |------|---------|
 | 🟡 | In progress — actively being developed |
 | 🔵 | Design — in planning or community discussion phase |
+
+---
+
+## 🐛 Open GitHub Issues
+
+Tracked work items currently open on the [issue tracker](https://github.com/HeliosSoftware/hfs/issues):
+
+| Issue | Title |
+|-------|-------|
+| [#170](https://github.com/HeliosSoftware/hfs/issues/170) | Cluster-aware Subscription notification delivery |
+| [#169](https://github.com/HeliosSoftware/hfs/issues/169) | Database-backed SQL-on-FHIR export job state |
+| [#168](https://github.com/HeliosSoftware/hfs/issues/168) | Persistence-layer audit events for bulk export, purge, and reindex |
+| [#167](https://github.com/HeliosSoftware/hfs/issues/167) | FHIRPath resolve(): add storage-backed resolution for server-stored resources |
+| [#145](https://github.com/HeliosSoftware/hfs/issues/145) | SoF export: re-sign S3 pre-signed download URLs on each manifest poll |
+| [#144](https://github.com/HeliosSoftware/hfs/issues/144) | SoF export: clean up partial results when a job is cancelled |
 
 ---
 
@@ -185,7 +224,7 @@ Devitt's book defines nine key questions organizations must answer before choosi
 | Gap | Book Reference | Current Status |
 |-----|---------------|----------------|
 | **No patient-level access control** | Ch. 3 "Authorization" — SMART scopes are parsed but `patient/*` and `user/*` contexts are not enforced. Search results are not filtered by patient compartment. | 🔭 Later |
-| **Bulk Data API — `$export`** | Appendix I "Bulk data processing" — `$export` (system / patient / group) is now exposed via the REST layer with an embedded SQLite-backed worker pool by default and an optional Postgres + S3 multi-instance topology. `$bulk-submit` (ingestion) remains pending. | ✅ Shipped (export) / 🗺️ Next (submit) |
+| **Bulk Data API** | Appendix I "Bulk data processing" — `$export` (system / patient / group) is exposed via the REST layer with an embedded SQLite-backed worker pool by default and an optional Postgres + S3 multi-instance topology. `$bulk-submit` (ingestion) is also available. | ✅ Shipped |
 
 #### Moderate
 

@@ -14,9 +14,14 @@ use crate::core::sof_runner::SofError;
 
 use super::dialect::Dialect;
 use super::ir::{
-    BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, PlanNode, SqlExpr,
-    SqlType, UnaryOp,
+    BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, PlanNode,
+    RowIndexScope, SqlExpr, SqlType, UnaryOp,
 };
+
+/// Column the recursive `repeat` CTE projects to order the flattened traversal
+/// in pre-order. A sortable, zero-padded, dot-joined path of array indices;
+/// ranking it per resource yields the 0-based `%rowIndex`.
+const REPEAT_ORD_PATH_COL: &str = "ord_path";
 
 /// Compiled output for a single ViewDefinition.
 #[derive(Debug, Clone)]
@@ -210,6 +215,14 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         where_pred.push_str(p);
     }
 
+    // The CTE carries a sortable pre-order `ord_path` column so `%rowIndex` can
+    // rank traversal nodes. SQLite always emits it; PostgreSQL emits it only for
+    // a single step path (a single recursive self-reference) — multi-path PG
+    // repeats keep the original `(rid, node)` shape and don't support
+    // `%rowIndex`, which no fixture exercises.
+    let is_sqlite = dialect.lateral_keyword().is_empty();
+    let emit_ord_path = is_sqlite || step_paths.len() == 1;
+
     // Build seed branches — one SELECT per step path.
     let mut seed_branches: Vec<String> = Vec::with_capacity(step_paths.len());
     let mut step_branches: Vec<String> = Vec::with_capacity(step_paths.len());
@@ -218,25 +231,40 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
             root: "r.data".to_string(),
             path: path.clone(),
         };
-        let unnest = if dialect.lateral_keyword().is_empty() {
-            format!("{} je", emit_sqlite_unnest_source(&src))
-        } else {
+        let branch = if is_sqlite {
+            // SQLite carries a zero-padded `ord_path` of the element's `json_each`
+            // array index so the outer query can rank traversal nodes in
+            // pre-order for `%rowIndex` (see REPEAT_ORD_PATH_COL).
             format!(
-                "JOIN {}{} AS je(value) ON TRUE",
-                dialect.lateral_keyword(),
-                dialect.unnest_array(&emit_pg_unnest_source(&src))
-            )
-        };
-        let branch = if dialect.lateral_keyword().is_empty() {
-            format!(
-                "SELECT r.id AS rid, je.value AS node\n  FROM {} r, {}\n  WHERE {}",
-                scan.table, unnest, where_pred
+                "SELECT r.id AS rid, je.value AS node, printf('%010d', je.key) AS {ord}\n  \
+                 FROM {} r, {} je\n  WHERE {}",
+                scan.table,
+                emit_sqlite_unnest_source(&src),
+                where_pred,
+                ord = REPEAT_ORD_PATH_COL,
             )
         } else {
-            format!(
-                "SELECT r.id AS rid, je.value AS node\n  FROM {} r {}\n  WHERE {}",
-                scan.table, unnest, where_pred
-            )
+            // PostgreSQL: `WITH ORDINALITY` exposes the 1-based element position
+            // (only when we emit `ord_path`).
+            let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src));
+            let lateral = dialect.lateral_keyword();
+            if emit_ord_path {
+                format!(
+                    "SELECT r.id AS rid, je.value AS node, \
+                     lpad((je.ord - 1)::text, 10, '0') AS {ord}\n  \
+                     FROM {} r JOIN {lateral}{unnest} WITH ORDINALITY AS je(value, ord) ON TRUE\n  \
+                     WHERE {}",
+                    scan.table,
+                    where_pred,
+                    ord = REPEAT_ORD_PATH_COL,
+                )
+            } else {
+                format!(
+                    "SELECT r.id AS rid, je.value AS node\n  \
+                     FROM {} r JOIN {lateral}{unnest} AS je(value) ON TRUE\n  WHERE {}",
+                    scan.table, where_pred
+                )
+            }
         };
         seed_branches.push(branch);
     }
@@ -271,14 +299,26 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
                 root: prev_root.clone(),
                 path: super::ir::JsonPath(vec![PathStep::Field((*field).to_string())]),
             };
-            if dialect.lateral_keyword().is_empty() {
+            if is_sqlite {
                 from_parts.push(format!("{} {alias}", emit_sqlite_unnest_source(&src)));
             } else {
-                from_parts.push(format!(
-                    "{}{} AS {alias}(value)",
-                    dialect.lateral_keyword(),
-                    dialect.unnest_array(&emit_pg_unnest_source(&src))
-                ));
+                // The leaf unnest gets `WITH ORDINALITY` so the step branch can
+                // extend `ord_path` with this child's position (single-path PG
+                // only — see `emit_ord_path`).
+                let is_leaf = i == segs.len() - 1;
+                if emit_ord_path && is_leaf && !(is_pg_dialect && step_paths.len() > 1) {
+                    from_parts.push(format!(
+                        "{}{} WITH ORDINALITY AS {alias}(value, ord)",
+                        dialect.lateral_keyword(),
+                        dialect.unnest_array(&emit_pg_unnest_source(&src))
+                    ));
+                } else {
+                    from_parts.push(format!(
+                        "{}{} AS {alias}(value)",
+                        dialect.lateral_keyword(),
+                        dialect.unnest_array(&emit_pg_unnest_source(&src))
+                    ));
+                }
             }
             prev_root = format!("{alias}.value");
         }
@@ -298,8 +338,17 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
             }
             pg_lateral_branches.push(format!("SELECT {leaf_alias}.value FROM {from_clause}"));
         } else {
-            let from_clause = if dialect.lateral_keyword().is_empty() {
-                format!("{out_alias}, {}", from_parts.join(", "))
+            if dialect.lateral_keyword().is_empty() {
+                // SQLite: extend the parent's `ord_path` with this child's
+                // array index so descendants sort immediately after their
+                // parent (pre-order) and before the parent's later siblings.
+                let from_clause = format!("{out_alias}, {}", from_parts.join(", "));
+                step_branches.push(format!(
+                    "SELECT {out_alias}.rid, {leaf_alias}.value AS node, \
+                     {out_alias}.{ord} || '.' || printf('%010d', {leaf_alias}.key) AS {ord}\n  \
+                     FROM {from_clause}",
+                    ord = REPEAT_ORD_PATH_COL,
+                ));
             } else {
                 let mut s = out_alias.to_string();
                 for fp in &from_parts {
@@ -307,11 +356,20 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
                     s.push_str(fp);
                     s.push_str(" ON TRUE");
                 }
-                s
-            };
-            step_branches.push(format!(
-                "SELECT {out_alias}.rid, {leaf_alias}.value AS node\n  FROM {from_clause}"
-            ));
+                if emit_ord_path {
+                    // Extend the parent's `ord_path` with this child's position.
+                    step_branches.push(format!(
+                        "SELECT {out_alias}.rid, {leaf_alias}.value AS node, \
+                         {out_alias}.{ord} || '.' || lpad(({leaf_alias}.ord - 1)::text, 10, '0') AS {ord}\n  \
+                         FROM {s}",
+                        ord = REPEAT_ORD_PATH_COL,
+                    ));
+                } else {
+                    step_branches.push(format!(
+                        "SELECT {out_alias}.rid, {leaf_alias}.value AS node\n  FROM {s}"
+                    ));
+                }
+            }
         }
     }
     if is_pg_dialect && !pg_lateral_branches.is_empty() {
@@ -436,8 +494,15 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         }
     }
 
+    // The CTE carries the extra `ord_path` column (used by `%rowIndex` ranking)
+    // whenever we emit it; otherwise it keeps the original `(rid, node)` shape.
+    let cte_cols = if emit_ord_path {
+        format!("rid, node, {REPEAT_ORD_PATH_COL}")
+    } else {
+        "rid, node".to_string()
+    };
     let sql = format!(
-        "WITH RECURSIVE {out_alias}(rid, node) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}\nORDER BY 1",
+        "WITH RECURSIVE {out_alias}({cte_cols}) AS (\n  {cte_body}\n)\nSELECT\n  {}\nFROM {from_clause}\nORDER BY 1",
         select_parts.join(",\n  ")
     );
 
@@ -667,7 +732,12 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                          WHERE {on} LIMIT 1 OFFSET {idx}) AS {out_alias}(value) ON TRUE"
                     )
                 } else {
-                    format!("{join_kw} {lateral}{unnest} AS {out_alias}(value) ON {on}")
+                    // `WITH ORDINALITY` exposes a 1-based `ordinality` column so
+                    // `%rowIndex` (see `lower_row_index`) can read the element's
+                    // position. Harmless for forEach queries that don't use it.
+                    format!(
+                        "{join_kw} {lateral}{unnest} WITH ORDINALITY AS {out_alias}(value, ordinality) ON {on}"
+                    )
                 }
             };
             frame.joins.push(JoinClause { sql: join_sql });
@@ -705,12 +775,41 @@ impl<'a> ExprCtx<'a> {
     }
 }
 
+/// Lowers a `%rowIndex` reference to dialect-specific SQL (SQLite and PostgreSQL).
+///
+/// `COALESCE(.., 0)` on the `forEach` case covers the `forEachOrNull` empty
+/// case: a LEFT JOIN miss yields a NULL key/ordinality, which the spec maps to a
+/// null row with `%rowIndex` = 0.
+fn lower_row_index(scope: &RowIndexScope, dialect: &dyn Dialect) -> Result<String, SofError> {
+    let is_sqlite = dialect.lateral_keyword().is_empty();
+    Ok(match scope {
+        // Top level and non-iterating scopes are always 0.
+        RowIndexScope::Top => "0".to_string(),
+        RowIndexScope::ForEach(alias) if is_sqlite => {
+            // SQLite `json_each` exposes a 0-based integer `key` for array
+            // elements — exactly the iteration index.
+            format!("COALESCE(CAST({alias}.key AS INTEGER), 0)")
+        }
+        RowIndexScope::ForEach(alias) => {
+            // PostgreSQL `WITH ORDINALITY` exposes a 1-based ordinality.
+            format!("COALESCE(CAST({alias}.ordinality AS INTEGER) - 1, 0)")
+        }
+        // Both dialects: the recursive CTE carries a sortable pre-order
+        // `ord_path`; ranking it per resource yields the 0-based pre-order
+        // position.
+        RowIndexScope::Repeat(alias) => format!(
+            "(DENSE_RANK() OVER (PARTITION BY {alias}.rid ORDER BY {alias}.{REPEAT_ORD_PATH_COL}) - 1)"
+        ),
+    })
+}
+
 fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError> {
     match expr {
         SqlExpr::Lit(v) => Ok(lower_lit(v, ctx.dialect)),
         SqlExpr::JsonPath { root, path } => Ok(lower_json_path(root, path, ctx.dialect)),
         SqlExpr::Param(n) => Ok(ctx.dialect.placeholder(*n)),
         SqlExpr::ColRef(name) => Ok(name.clone()),
+        SqlExpr::RowIndex(scope) => lower_row_index(scope, ctx.dialect),
         SqlExpr::Cast { inner, ty } => {
             let inner = lower_expr(inner, ctx)?;
             Ok(ctx.dialect.cast(&inner, *ty))
@@ -1568,14 +1667,31 @@ fn lower_boundary(
             )
         }
         BoundaryKind::Time => {
-            let pad = match side {
+            // FHIRPath `lowBoundary()`/`highBoundary()` preserves the source's
+            // precision, so the emit dispatches on input length:
+            //
+            //   length 5  ("HH:MM")        → fill seconds + millis
+            //   length 8  ("HH:MM:SS")     → fill millis only (seconds are
+            //                                 already specified, so high does
+            //                                 NOT roll them to :59)
+            //   length 12 ("HH:MM:SS.fff") → already full precision, unchanged
+            //
+            // Anything else (malformed) returns NULL, matching the Date/DateTime
+            // emit's behavior for off-spec inputs.
+            let minute_pad = match side {
                 BoundarySide::Low => "':00.000'",
                 BoundarySide::High => "':59.999'",
+            };
+            let second_pad = match side {
+                BoundarySide::Low => "'.000'",
+                BoundarySide::High => "'.999'",
             };
             format!(
                 "CASE \
                    WHEN {src} IS NULL THEN NULL \
-                   WHEN length({src}) = 5 THEN {src} || {pad} \
+                   WHEN length({src}) = 5 THEN {src} || {minute_pad} \
+                   WHEN length({src}) = 8 THEN {src} || {second_pad} \
+                   WHEN length({src}) = 12 THEN {src} \
                    ELSE NULL END"
             )
         }

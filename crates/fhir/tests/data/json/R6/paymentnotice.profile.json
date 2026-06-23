@@ -2,7 +2,7 @@
   "resourceType": "StructureDefinition",
   "id": "PaymentNotice",
   "meta": {
-    "lastUpdated": "2025-12-17T09:50:17.012+00:00"
+    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,11 +27,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/PaymentNotice",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "PaymentNotice",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-06-13T17:13:29+00:00",
   "publisher": "HL7 International / Financial Management",
   "contact": [
     {
@@ -63,7 +63,7 @@
       ]
     }
   ],
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "workflow",
@@ -308,7 +308,7 @@
           ],
           "strength": "required",
           "description": "IETF language tag for a human language",
-          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3",
+          "valueSet": "http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4",
           "additional": [
             {
               "purpose": "starter",
@@ -537,7 +537,7 @@
         "short": "active | cancelled | draft | entered-in-error",
         "definition": "The status of the resource instance.",
         "comment": "This element is labeled as a modifier because the status contains codes that mark the resource as not currently valid.",
-        "requirements": "Need to track the status of the resource as \u0027draft\u0027 resources may undergo further edits while \u0027active\u0027 resources are immutable and may only have their status changed to \u0027cancelled\u0027.",
+        "requirements": "Needed to track the status of the resource as \u0027draft\u0027 resources may undergo further edits while \u0027active\u0027 resources are immutable and may only have their status changed to \u0027cancelled\u0027.",
         "min": 1,
         "max": "1",
         "base": {
@@ -572,7 +572,7 @@
           ],
           "strength": "required",
           "description": "A code specifying the state of the resource instance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -712,7 +712,7 @@
         "path": "PaymentNotice.created",
         "short": "Creation date",
         "definition": "The date when this resource was created.",
-        "requirements": "Need to record a timestamp for use by both the recipient and the issuer.",
+        "requirements": "Needed to record a timestamp for use by both the recipient and the issuer.",
         "min": 1,
         "max": "1",
         "base": {
@@ -814,7 +814,7 @@
         "path": "PaymentNotice.payment",
         "short": "Payment reference",
         "definition": "A reference to the payment which is the subject of this notice.",
-        "requirements": "Need to identify the actual payment.",
+        "requirements": "Needed to identify the actual payment.",
         "min": 0,
         "max": "1",
         "base": {
@@ -848,7 +848,7 @@
         "path": "PaymentNotice.paymentDate",
         "short": "Payment or clearing date",
         "definition": "The date when the above payment action occurred.",
-        "requirements": "Need to convey the date when the action being notified occurred.",
+        "requirements": "Needed to convey the date when the action being notified occurred.",
         "min": 0,
         "max": "1",
         "base": {
@@ -914,7 +914,7 @@
         "path": "PaymentNotice.recipient",
         "short": "Party being notified",
         "definition": "The party who is notified of the payment status.",
-        "requirements": "Need to identified the recipient of the notification.",
+        "requirements": "Needed to identified the recipient of the notification.",
         "min": 1,
         "max": "1",
         "base": {
@@ -1094,7 +1094,7 @@
         "short": "active | cancelled | draft | entered-in-error",
         "definition": "The status of the resource instance.",
         "comment": "This element is labeled as a modifier because the status contains codes that mark the resource as not currently valid.",
-        "requirements": "Need to track the status of the resource as \u0027draft\u0027 resources may undergo further edits while \u0027active\u0027 resources are immutable and may only have their status changed to \u0027cancelled\u0027.",
+        "requirements": "Needed to track the status of the resource as \u0027draft\u0027 resources may undergo further edits while \u0027active\u0027 resources are immutable and may only have their status changed to \u0027cancelled\u0027.",
         "min": 1,
         "max": "1",
         "type": [
@@ -1115,7 +1115,7 @@
           ],
           "strength": "required",
           "description": "A code specifying the state of the resource instance.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -1213,7 +1213,7 @@
         "path": "PaymentNotice.created",
         "short": "Creation date",
         "definition": "The date when this resource was created.",
-        "requirements": "Need to record a timestamp for use by both the recipient and the issuer.",
+        "requirements": "Needed to record a timestamp for use by both the recipient and the issuer.",
         "min": 1,
         "max": "1",
         "type": [
@@ -1287,7 +1287,7 @@
         "path": "PaymentNotice.payment",
         "short": "Payment reference",
         "definition": "A reference to the payment which is the subject of this notice.",
-        "requirements": "Need to identify the actual payment.",
+        "requirements": "Needed to identify the actual payment.",
         "min": 0,
         "max": "1",
         "type": [
@@ -1307,7 +1307,7 @@
         "path": "PaymentNotice.paymentDate",
         "short": "Payment or clearing date",
         "definition": "The date when the above payment action occurred.",
-        "requirements": "Need to convey the date when the action being notified occurred.",
+        "requirements": "Needed to convey the date when the action being notified occurred.",
         "min": 0,
         "max": "1",
         "type": [
@@ -1345,7 +1345,7 @@
         "path": "PaymentNotice.recipient",
         "short": "Party being notified",
         "definition": "The party who is notified of the payment status.",
-        "requirements": "Need to identified the recipient of the notification.",
+        "requirements": "Needed to identified the recipient of the notification.",
         "min": 1,
         "max": "1",
         "type": [

@@ -19,6 +19,41 @@ use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParam
 
 use super::schema;
 
+/// Builds a MongoDB client from a backend configuration.
+///
+/// Standalone (rather than a `&self` method) so both [`MongoBackend`] and the
+/// in-DB SOF runner can initialise the shared client cell from a cloned config.
+pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult<Client> {
+    let mut client_options = ClientOptions::parse(&config.connection_string)
+        .await
+        .map_err(|e| {
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "mongodb".to_string(),
+                message: e.to_string(),
+            })
+        })?;
+
+    client_options.max_pool_size = Some(config.max_connections);
+    client_options.connect_timeout = Some(Duration::from_millis(config.connect_timeout_ms));
+    client_options.app_name = Some("helios-persistence".to_string());
+
+    // Fail fast when no healthy server can be selected. `connect_timeout`
+    // only covers new TCP handshakes; this caps requests once server
+    // monitoring has marked the server unavailable.
+    client_options.server_selection_timeout = Some(SERVER_SELECTION_TIMEOUT);
+    // Recycle idle connections so stale ones (e.g. silently dropped by a
+    // NAT/firewall on a long-lived network path) are not handed out.
+    client_options.max_idle_time = Some(MAX_CONNECTION_IDLE_TIME);
+
+    Client::with_options(client_options).map_err(|e| {
+        StorageError::Backend(BackendError::Internal {
+            backend_name: "mongodb".to_string(),
+            message: format!("Failed to create MongoDB client: {}", e),
+            source: None,
+        })
+    })
+}
+
 /// Upper bound for selecting a usable server before an operation gives up.
 const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -37,8 +72,10 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 pub struct MongoBackend {
     config: MongoBackendConfig,
     /// Lazily initialized MongoDB client. MongoDB clients own their connection
-    /// pools, so each backend instance must reuse one client.
-    client: OnceCell<Client>,
+    /// pools, so each backend instance must reuse one client. Wrapped in an
+    /// `Arc` so the in-DB SOF runner can share the same pooled client (it is
+    /// constructed from `&self` but outlives the borrow).
+    client: Arc<OnceCell<Client>>,
     /// Search parameter registry (in-memory cache of active parameters).
     search_registry: Arc<RwLock<SearchParameterRegistry>>,
     /// Extractor for deriving searchable values from resources.
@@ -131,7 +168,7 @@ impl MongoBackend {
 
         Ok(Self {
             config,
-            client: OnceCell::new(),
+            client: Arc::new(OnceCell::new()),
             search_registry,
             search_extractor,
         })
@@ -311,44 +348,19 @@ impl MongoBackend {
     }
 
     /// Creates a MongoDB client from backend configuration.
-    async fn create_client(&self) -> StorageResult<Client> {
-        let mut client_options = ClientOptions::parse(&self.config.connection_string)
-            .await
-            .map_err(|e| {
-                StorageError::Backend(BackendError::ConnectionFailed {
-                    backend_name: "mongodb".to_string(),
-                    message: e.to_string(),
-                })
-            })?;
-
-        client_options.max_pool_size = Some(self.config.max_connections);
-        client_options.connect_timeout =
-            Some(Duration::from_millis(self.config.connect_timeout_ms));
-        client_options.app_name = Some("helios-persistence".to_string());
-
-        // Fail fast when no healthy server can be selected. `connect_timeout`
-        // only covers new TCP handshakes; this caps requests once server
-        // monitoring has marked the server unavailable.
-        client_options.server_selection_timeout = Some(SERVER_SELECTION_TIMEOUT);
-        // Recycle idle connections so stale ones (e.g. silently dropped by a
-        // NAT/firewall on a long-lived network path) are not handed out.
-        client_options.max_idle_time = Some(MAX_CONNECTION_IDLE_TIME);
-
-        Client::with_options(client_options).map_err(|e| {
-            StorageError::Backend(BackendError::Internal {
-                backend_name: "mongodb".to_string(),
-                message: format!("Failed to create MongoDB client: {}", e),
-                source: None,
-            })
-        })
-    }
-
     /// Returns the shared MongoDB client for this backend.
     pub(crate) async fn get_client(&self) -> StorageResult<Client> {
         self.client
-            .get_or_try_init(|| self.create_client())
+            .get_or_try_init(|| connect_client(&self.config))
             .await
             .cloned()
+    }
+
+    /// Returns a handle to the shared client cell, so collaborators constructed
+    /// from `&self` (e.g. the in-DB SOF runner) can lazily initialise and reuse
+    /// the same pooled client.
+    pub(crate) fn client_cell(&self) -> Arc<OnceCell<Client>> {
+        Arc::clone(&self.client)
     }
 
     /// Returns the configured MongoDB database handle.
@@ -538,7 +550,7 @@ impl MongoBackend {
     /// does not implement `:missing`, token `:not`/`:of-type`, reference
     /// `:identifier`, or uri `:above`/`:below`; advertising only what
     /// `search_impl` accepts keeps the CapabilityStatement honest.
-    fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
+    pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text"],
             SearchParamType::Token => vec!["text", "code-text"],

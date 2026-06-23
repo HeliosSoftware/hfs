@@ -1,6 +1,7 @@
 {
   "resourceType": "NutritionProduct",
   "id": "example-peanutbutter",
+  "status": "active",
   "code": {
     "coding": [
       {
@@ -11,7 +12,6 @@
     ],
     "text": "SKIPPY, PEANUT BUTTER"
   },
-  "status": "active",
   "category": [
     {
       "text": "Nut \u0026 Seed Butters"

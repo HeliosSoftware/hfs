@@ -34,26 +34,7 @@
             ]
           },
           "exclude": true,
-          "description": "alive at 90 days (excluding dead at 90 days)",
-          "timing": [
-            {
-              "contextCode": {
-                "coding": [
-                  {
-                    "system": "http://hl7.org/fhir/evidence-variable-event",
-                    "code": "study-start",
-                    "display": "Study Start"
-                  }
-                ]
-              },
-              "offsetDuration": {
-                "value": 90,
-                "unit": "days",
-                "system": "http://unitsofmeasure.org",
-                "code": "d"
-              }
-            }
-          ]
+          "description": "alive at 90 days (excluding dead at 90 days)"
         },
         {
           "code": {
@@ -75,26 +56,7 @@
             ]
           },
           "exclude": true,
-          "description": "not functionally dependent at 90 days (excluding functionally dependent at 90 days)",
-          "timing": [
-            {
-              "contextCode": {
-                "coding": [
-                  {
-                    "system": "http://hl7.org/fhir/evidence-variable-event",
-                    "code": "study-start",
-                    "display": "Study Start"
-                  }
-                ]
-              },
-              "offsetDuration": {
-                "value": 90,
-                "unit": "days",
-                "system": "http://unitsofmeasure.org",
-                "code": "d"
-              }
-            }
-          ]
+          "description": "not functionally dependent at 90 days (excluding functionally dependent at 90 days)"
         }
       ]
     }

@@ -15,7 +15,7 @@
 //!
 //! Advanced search/composite behavior remains part of later phases.
 
-mod backend;
+pub(crate) mod backend;
 mod bulk_export;
 pub(crate) mod schema;
 mod search_impl;

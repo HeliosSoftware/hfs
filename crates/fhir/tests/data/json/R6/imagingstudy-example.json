@@ -39,11 +39,13 @@
       },
       "description": "CT Surview 180",
       "numberOfInstances": 1,
-      "bodySite": {
-        "reference": {
-          "reference": "BodyStructure/tumor"
+      "bodySite": [
+        {
+          "reference": {
+            "reference": "BodyStructure/tumor"
+          }
         }
-      },
+      ],
       "instance": [
         {
           "uid": "2.16.124.113543.6003.189642796.63084.16748.2599092903",

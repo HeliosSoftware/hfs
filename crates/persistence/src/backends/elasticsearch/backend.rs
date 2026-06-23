@@ -549,7 +549,7 @@ impl ElasticsearchBackend {
     /// Returns supported modifiers for a parameter type.
     ///
     /// ES supports more modifiers than SQLite, especially for full-text.
-    fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
+    pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             SearchParamType::Token => {

@@ -25,7 +25,7 @@ cloudwatch = ["dep:aws-sdk-cloudwatchlogs", "dep:aws-config"]
 
 [dependencies]
 # FHIR models
-helios-fhir = { path = "../fhir", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.0", default-features = false }
 
 # Serialization
 serde.workspace = true

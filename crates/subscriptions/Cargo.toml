@@ -17,13 +17,13 @@ R6 = ["helios-fhir/R6", "helios-persistence/R6"]
 
 [dependencies]
 # FHIR models
-helios-fhir = { path = "../fhir", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.0", default-features = false }
 
 # Persistence (for TenantContext, StoredResource, etc.)
-helios-persistence = { path = "../persistence", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.0", default-features = false }
 
 # Outbound auth (OutboundAuthProvider trait + static-bearer impl)
-helios-auth = { path = "../auth" }
+helios-auth = { path = "../auth", version = "0.2.0" }
 
 # Serialization
 serde.workspace = true

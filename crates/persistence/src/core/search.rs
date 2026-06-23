@@ -293,6 +293,19 @@ pub trait SearchProvider: ResourceStorage {
     fn supports_contained_search(&self) -> bool {
         false
     }
+
+    /// Returns the search modifiers this backend actually honors for a given
+    /// parameter type (e.g. `exact`, `contains` for strings; `not`, `in` for
+    /// tokens). Used by the REST layer to advertise supported modifiers in the
+    /// CapabilityStatement.
+    ///
+    /// Defaults to an empty list (advertise nothing); real search backends
+    /// override this to reflect what their search implementation accepts so the
+    /// CapabilityStatement stays honest.
+    fn modifiers_for_param_type(&self, param_type: SearchParamType) -> Vec<&'static str> {
+        let _ = param_type;
+        Vec::new()
+    }
 }
 
 /// Search provider that supports searching across multiple resource types.

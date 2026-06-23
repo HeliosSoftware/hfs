@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ImplementationGuide"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -389,7 +389,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the implementation guide (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.0.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.1.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -667,7 +667,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Type this profile applies to
             <br/>Binding: 
-            <a href="valueset-resource-types.html">Resource Types</a> (
+            <a href="valueset-version-independent-resource-types.html">Version Independent Resource Types</a> (
             <a href="terminologies.html#required" title="To be conformant, the concept in this element SHALL be from the specified value set.">Required</a>)
             <br/>
           </td>
@@ -969,16 +969,12 @@
             <span title="ImplementationGuide.definition.page : A page / section in the implementation guide. The root page is the implementation guide home page.">page</span>
             <a name="ImplementationGuide.definition.page"> </a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
-          </td>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="types.html#BackBoneElement">BackboneElement</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Page/Section in the Guide
-            <br/>
-            <span style="font-style: italic" title="ig-3">+ Rule: Source must be absent if 'generated' is generated</span>
             <br/>
           </td>
         </tr>
@@ -995,7 +991,6 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="languages.html#translatable" title="This element is a candidate for being translated">T</a>
-            <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
@@ -1107,12 +1102,10 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="ImplementationGuide.definition.page.generation : A code that indicates how the page is generated.">generation</span>
+            <span title="ImplementationGuide.definition.page.generation : A code that indicates how the page is generated. If an implementation guide adopts a future or alternate generation capability not represented directly by this value set, use 'generated' and an extension to describe the specific mechanism used to create the page.">generation</span>
             <a name="ImplementationGuide.definition.page.generation"> </a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
-          </td>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">1..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#code">code</a>
@@ -1583,11 +1576,11 @@
     <valueCode value="anonymous"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/ImplementationGuide"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="ImplementationGuide"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-06-13T17:13:29+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -1604,7 +1597,7 @@
     </coding>
   </jurisdiction>
   <purpose value="An implementation guide is able to define default profiles that must apply to any use of a resource, so validation services may need to take one or more implementation guide resources when validating."/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="w5"/>
     <uri value="http://hl7.org/fhir/fivews"/>
@@ -1772,7 +1765,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -2137,7 +2130,7 @@
         </extension>
         <strength value="required"/>
         <description value="The lifecycle status of an artifact."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -2519,7 +2512,7 @@
         </extension>
         <strength value="required"/>
         <description value="The license that applies to an Implementation Guide (using an SPDX license Identifiers, or 'not-open-source'). The binding is required but new SPDX license Identifiers are allowed to be used (https://spdx.org/licenses/)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/spdx-license|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/spdx-license|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.fhirVersion">
@@ -2557,7 +2550,7 @@
         </extension>
         <strength value="required"/>
         <description value="All published FHIR Versions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.dependsOn">
@@ -2932,8 +2925,8 @@
           <valueBoolean value="true"/>
         </extension>
         <strength value="required"/>
-        <description value="One of the resource types defined as part of this version of FHIR."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/resource-types|6.0.0-ballot3"/>
+        <description value="One of the current or prior resource types defined as part of FHIR."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-resource-types|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.global.profile">
@@ -3444,7 +3437,7 @@
         </extension>
         <strength value="required"/>
         <description value="All published FHIR Versions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.definition.resource.name">
@@ -3605,13 +3598,6 @@
         <expression value="hasValue() or (children().count() &gt; id.count())"/>
         <source value="http://hl7.org/fhir/StructureDefinition/Element"/>
       </constraint>
-      <constraint>
-        <key value="ig-3"/>
-        <severity value="error"/>
-        <human value="Source must be absent if 'generated' is generated"/>
-        <expression value="generation='generated' implies source.empty()"/>
-        <source value="http://hl7.org/fhir/StructureDefinition/ImplementationGuide"/>
-      </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -3732,7 +3718,6 @@
       <type>
         <code value="markdown"/>
       </type>
-      <condition value="ig-3"/>
       <constraint>
         <key value="ele-1"/>
         <severity value="error"/>
@@ -3801,7 +3786,7 @@
     <element id="ImplementationGuide.definition.page.generation">
       <path value="ImplementationGuide.definition.page.generation"/>
       <short value="html | markdown | xml | generated"/>
-      <definition value="A code that indicates how the page is generated."/>
+      <definition value="A code that indicates how the page is generated. If an implementation guide adopts a future or alternate generation capability not represented directly by this value set, use 'generated' and an extension to describe the specific mechanism used to create the page."/>
       <min value="1"/>
       <max value="1"/>
       <base>
@@ -3812,7 +3797,6 @@
       <type>
         <code value="code"/>
       </type>
-      <condition value="ig-3"/>
       <constraint>
         <key value="ele-1"/>
         <severity value="error"/>
@@ -3829,7 +3813,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code that indicates how the page is generated."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/guide-page-generation|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/guide-page-generation|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.definition.page.page">
@@ -5018,7 +5002,7 @@
         </extension>
         <strength value="required"/>
         <description value="The lifecycle status of an artifact."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="w5"/>
@@ -5256,7 +5240,7 @@
         </extension>
         <strength value="required"/>
         <description value="The license that applies to an Implementation Guide (using an SPDX license Identifiers, or 'not-open-source'). The binding is required but new SPDX license Identifiers are allowed to be used (https://spdx.org/licenses/)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/spdx-license|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/spdx-license|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.fhirVersion">
@@ -5282,7 +5266,7 @@
         </extension>
         <strength value="required"/>
         <description value="All published FHIR Versions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.dependsOn">
@@ -5389,8 +5373,8 @@
           <valueBoolean value="true"/>
         </extension>
         <strength value="required"/>
-        <description value="One of the resource types defined as part of this version of FHIR."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/resource-types|6.0.0-ballot3"/>
+        <description value="One of the current or prior resource types defined as part of FHIR."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-resource-types|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.global.profile">
@@ -5529,7 +5513,7 @@
         </extension>
         <strength value="required"/>
         <description value="All published FHIR Versions."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.definition.resource.name">
@@ -5618,13 +5602,6 @@
       <type>
         <code value="BackboneElement"/>
       </type>
-      <constraint>
-        <key value="ig-3"/>
-        <severity value="error"/>
-        <human value="Source must be absent if 'generated' is generated"/>
-        <expression value="generation='generated' implies source.empty()"/>
-        <source value="http://hl7.org/fhir/StructureDefinition/ImplementationGuide"/>
-      </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -5648,7 +5625,6 @@
       <type>
         <code value="markdown"/>
       </type>
-      <condition value="ig-3"/>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -5686,13 +5662,12 @@
     <element id="ImplementationGuide.definition.page.generation">
       <path value="ImplementationGuide.definition.page.generation"/>
       <short value="html | markdown | xml | generated"/>
-      <definition value="A code that indicates how the page is generated."/>
+      <definition value="A code that indicates how the page is generated. If an implementation guide adopts a future or alternate generation capability not represented directly by this value set, use 'generated' and an extension to describe the specific mechanism used to create the page."/>
       <min value="1"/>
       <max value="1"/>
       <type>
         <code value="code"/>
       </type>
-      <condition value="ig-3"/>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -5702,7 +5677,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code that indicates how the page is generated."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/guide-page-generation|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/guide-page-generation|6.0.0-ballot4"/>
       </binding>
     </element>
     <element id="ImplementationGuide.definition.page.page">

@@ -34,6 +34,14 @@ use crate::middleware::content_type::{FhirContentType, negotiate_format};
 use crate::responses::format_resource_response;
 use crate::state::AppState;
 
+/// Extension URL used to advertise the search modifiers a parameter supports.
+///
+/// FHIR R4/R5 `CapabilityStatement.rest.resource.searchParam` has no native
+/// `modifier` element, so the modifiers a backend actually honors are carried as
+/// repeating `valueCode` extensions on the `searchParam` entry.
+const SEARCH_MODIFIER_EXTENSION_URL: &str =
+    "http://heliossoftware.com/fhir/StructureDefinition/capabilitystatement-search-modifier";
+
 /// Handler for the capabilities interaction.
 ///
 /// Returns a CapabilityStatement describing the server's capabilities.
@@ -139,10 +147,41 @@ where
     // evaluate contained search (others reject them with 501).
     let supports_contained = state.storage().supports_contained_search();
 
+    // Per-parameter-type modifier sets the backend actually honors. Used to
+    // advertise supported modifiers (as `valueCode` extensions) on each
+    // resource-specific search param.
+    let modifier_map: std::collections::HashMap<SearchParamType, Vec<&'static str>> = [
+        SearchParamType::Number,
+        SearchParamType::Date,
+        SearchParamType::String,
+        SearchParamType::Token,
+        SearchParamType::Reference,
+        SearchParamType::Composite,
+        SearchParamType::Quantity,
+        SearchParamType::Uri,
+        SearchParamType::Special,
+    ]
+    .into_iter()
+    .map(|t| (t, state.storage().modifiers_for_param_type(t)))
+    .collect();
+
     let registry = state.storage().search_param_registry().read();
+
+    // Reverse-include index (target type -> "Source:code" tokens) for advertising
+    // each resource's real `searchRevInclude` targets.
+    let revinclude_by_target = build_revinclude_index(&registry);
+
     let resources: Vec<serde_json::Value> = resource_types
         .iter()
-        .map(|rt| build_resource_capability(rt, &registry, supports_contained))
+        .map(|rt| {
+            build_resource_capability(
+                rt,
+                &registry,
+                supports_contained,
+                &modifier_map,
+                &revinclude_by_target,
+            )
+        })
         .collect();
 
     #[allow(unused_mut)]
@@ -299,6 +338,8 @@ fn build_resource_capability(
     resource_type: &str,
     registry: &SearchParameterRegistry,
     supports_contained: bool,
+    modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
+    revinclude_by_target: &std::collections::HashMap<String, std::collections::BTreeSet<String>>,
 ) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "type": resource_type,
@@ -321,10 +362,25 @@ fn build_resource_capability(
         "conditionalRead": "full-support",
         "conditionalUpdate": true,
         "conditionalDelete": "single",
-        "searchInclude": ["*"],
-        "searchRevInclude": ["*"],
-        "searchParam": build_search_params(resource_type, registry, supports_contained)
+        "searchParam": build_search_params(resource_type, registry, supports_contained, modifier_map)
     });
+
+    // Advertise real `_include` targets: one "Type:code" per reference param on
+    // this type. Omitted entirely when the type has no reference params.
+    let search_include = build_search_includes(resource_type, registry);
+    if !search_include.is_empty() {
+        entry["searchInclude"] = serde_json::Value::Array(search_include);
+    }
+
+    // Advertise real `_revinclude` targets: "Source:code" tokens from other
+    // types' reference params that point at this type.
+    if let Some(rev) = revinclude_by_target.get(resource_type) {
+        if !rev.is_empty() {
+            entry["searchRevInclude"] = serde_json::Value::Array(
+                rev.iter().cloned().map(serde_json::Value::String).collect(),
+            );
+        }
+    }
     // Bulk Data Access IG: per-resource `$export` operation entries on Patient
     // and Group, in addition to the system-level `$export` advertised at
     // `rest[0].operation`.
@@ -354,6 +410,7 @@ fn build_search_params(
     resource_type: &str,
     registry: &SearchParameterRegistry,
     supports_contained: bool,
+    modifier_map: &std::collections::HashMap<SearchParamType, Vec<&'static str>>,
 ) -> Vec<serde_json::Value> {
     let mut params = build_common_search_params(supports_contained);
     let mut seen: std::collections::HashSet<String> = params
@@ -372,6 +429,24 @@ fn build_search_params(
         });
         if let Some(doc) = &def.description {
             param["documentation"] = serde_json::Value::String(doc.clone());
+        }
+        // Advertise the modifiers this backend honors for the param's type.
+        // R4/R5 `searchParam` has no `modifier` element, so they ride along as
+        // repeating `valueCode` extensions.
+        if let Some(modifiers) = modifier_map.get(&def.param_type) {
+            if !modifiers.is_empty() {
+                param["extension"] = serde_json::Value::Array(
+                    modifiers
+                        .iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "url": SEARCH_MODIFIER_EXTENSION_URL,
+                                "valueCode": m,
+                            })
+                        })
+                        .collect(),
+                );
+            }
         }
         params.push(param);
     }
@@ -392,6 +467,51 @@ fn fhir_search_param_type(t: SearchParamType) -> &'static str {
         SearchParamType::Uri => "uri",
         SearchParamType::Special => "special",
     }
+}
+
+/// Builds the reverse-include index used for `searchRevInclude`: maps each target
+/// resource type to the sorted set of "SourceType:code" tokens from every active
+/// reference search param that targets it.
+fn build_revinclude_index(
+    registry: &SearchParameterRegistry,
+) -> std::collections::HashMap<String, std::collections::BTreeSet<String>> {
+    let mut index: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    for source_type in registry.resource_types() {
+        for def in registry.get_active_params(&source_type) {
+            if def.param_type != SearchParamType::Reference || def.code.starts_with('_') {
+                continue;
+            }
+            if let Some(targets) = &def.target {
+                let token = format!("{}:{}", source_type, def.code);
+                for target in targets {
+                    index
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(token.clone());
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Returns the `searchInclude` tokens ("Type:code") for a resource type: one per
+/// active reference search param defined on it.
+fn build_search_includes(
+    resource_type: &str,
+    registry: &SearchParameterRegistry,
+) -> Vec<serde_json::Value> {
+    let mut includes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for def in registry.get_active_params(resource_type) {
+        if def.param_type == SearchParamType::Reference && !def.code.starts_with('_') {
+            includes.insert(format!("{}:{}", resource_type, def.code));
+        }
+    }
+    includes
+        .into_iter()
+        .map(serde_json::Value::String)
+        .collect()
 }
 
 /// Builds common search parameters supported by all resources.
@@ -486,5 +606,101 @@ mod tests {
         let with = param_names(&build_common_search_params(true));
         assert!(with.contains(&"_contained".to_string()));
         assert!(with.contains(&"_containedType".to_string()));
+    }
+
+    fn ref_param(
+        url: &str,
+        code: &str,
+        base: &str,
+        targets: &[&str],
+    ) -> helios_persistence::search::SearchParameterDefinition {
+        helios_persistence::search::SearchParameterDefinition::new(
+            url,
+            code,
+            SearchParamType::Reference,
+            format!("{base}.{code}"),
+        )
+        .with_base([base])
+        .with_targets(targets.iter().copied())
+    }
+
+    #[test]
+    fn includes_and_revincludes_derived_from_reference_params() {
+        use helios_persistence::search::SearchParameterRegistry;
+
+        let mut reg = SearchParameterRegistry::new();
+        reg.register(ref_param(
+            "http://example.org/Patient-general-practitioner",
+            "general-practitioner",
+            "Patient",
+            &["Practitioner", "Organization"],
+        ))
+        .unwrap();
+        reg.register(ref_param(
+            "http://example.org/Observation-subject",
+            "subject",
+            "Observation",
+            &["Patient"],
+        ))
+        .unwrap();
+
+        // searchInclude for a type = its own reference params as "Type:code".
+        let includes: Vec<String> = build_search_includes("Patient", &reg)
+            .into_iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(includes, vec!["Patient:general-practitioner".to_string()]);
+
+        // searchRevInclude index: each target type maps to the "Source:code"
+        // tokens that point at it.
+        let rev = build_revinclude_index(&reg);
+        assert!(rev.get("Patient").unwrap().contains("Observation:subject"));
+        assert!(
+            rev.get("Practitioner")
+                .unwrap()
+                .contains("Patient:general-practitioner")
+        );
+        // Observation has no reference param pointing at it.
+        assert!(!rev.contains_key("Observation"));
+    }
+
+    #[test]
+    fn resource_specific_params_carry_modifier_extension() {
+        use helios_persistence::search::{SearchParameterDefinition, SearchParameterRegistry};
+        use std::collections::HashMap;
+
+        let mut reg = SearchParameterRegistry::new();
+        reg.register(
+            SearchParameterDefinition::new(
+                "http://example.org/Patient-name",
+                "name",
+                SearchParamType::String,
+                "Patient.name",
+            )
+            .with_base(["Patient"]),
+        )
+        .unwrap();
+
+        let mut modifier_map: HashMap<SearchParamType, Vec<&'static str>> = HashMap::new();
+        modifier_map.insert(SearchParamType::String, vec!["exact", "contains"]);
+
+        let params = build_search_params("Patient", &reg, false, &modifier_map);
+        let name = params
+            .iter()
+            .find(|p| p["name"] == "name")
+            .expect("name param advertised");
+        let ext = name["extension"]
+            .as_array()
+            .expect("modifier extension present");
+        let codes: Vec<&str> = ext
+            .iter()
+            .map(|e| e["valueCode"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, vec!["exact", "contains"]);
+        assert_eq!(ext[0]["url"], SEARCH_MODIFIER_EXTENSION_URL);
+
+        // Common control params (e.g. _id) do not carry the modifier extension.
+        let id = params.iter().find(|p| p["name"] == "_id").unwrap();
+        assert!(id.get("extension").is_none());
     }
 }

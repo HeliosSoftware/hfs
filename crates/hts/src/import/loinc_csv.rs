@@ -15,7 +15,9 @@
 //! `de-DE`). The English `display` is left untouched. Because both the `hts
 //! import` CLI and the server bootstrap funnel LOINC ZIPs through
 //! [`import_loinc_csv`], language variants are picked up automatically by both
-//! paths — no extra flag or file is required.
+//! paths — no extra flag or file is required. The imported language set can
+//! optionally be restricted via [`LanguageFilter`] (`HTS_IMPORT_LANGUAGES` /
+//! `--languages`); excluded variant files are skipped without being parsed.
 //!
 //! # ⚠️  LICENSE REQUIRED
 //!
@@ -32,8 +34,9 @@ use zip::ZipArchive;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::import::ImportStats;
+use crate::import::LanguageFilter;
 use crate::import::bundle_builder::{
-    BuilderConcept, BuilderDesignation, CodeSystemMeta, build_code_system_bundle,
+    BuilderConcept, BuilderDesignation, CodeSystemMeta, build_parsed_code_system,
 };
 
 // ── LOINC constants ───────────────────────────────────────────────────────────
@@ -88,17 +91,23 @@ struct LoincParseResult {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Import a LOINC distribution ZIP through the given backend.
+///
+/// `languages` restricts which linguistic-variant translations are ingested
+/// as designations (see [`LanguageFilter`]); excluded variant files are never
+/// parsed. The English main-table content is unaffected.
 pub async fn import_loinc_csv(
     backend: &dyn BundleImportBackend,
     ctx: &TenantContext,
     path: &Path,
     batch_size: usize,
     dry_run: bool,
+    languages: &LanguageFilter,
 ) -> Result<ImportStats, HtsError> {
     const FORMAT: &str = "loinc";
     let batch_size = batch_size.max(1);
 
     let path_owned = path.to_path_buf();
+    let languages = languages.clone();
     let parsed = tokio::task::spawn_blocking(move || -> Result<LoincParseResult, HtsError> {
         let paths = find_loinc_paths(&path_owned)?;
         let loinc_table_path = &paths.loinc_table;
@@ -150,29 +159,49 @@ pub async fn import_loinc_csv(
             None => HashMap::new(),
         };
 
-        // code → (language → translated display). Last writer wins per language.
-        let mut translations: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // First pass: resolve every linguistic-variant file's language tag so
+        // the language filter can make a *best-tier* decision over the whole
+        // candidate set (e.g. keep `es-ES` and drop `es-AR`/`es-MX`), rather
+        // than admitting every tag that loosely matches.
+        let mut variant_langs: Vec<(&String, String, String)> = Vec::new();
         for variant_path in &paths.lv_variants {
             let filename = variant_path
                 .rsplit('/')
                 .next()
                 .unwrap_or(variant_path)
                 .to_string();
-            let Some(language) = derive_language_tag(&filename, &lv_index) else {
-                parse_errors.push(format!(
+            match derive_language_tag(&filename, &lv_index) {
+                Some(language) => variant_langs.push((variant_path, filename, language)),
+                None => parse_errors.push(format!(
                     "Cannot determine language for linguistic-variant file '{filename}' — skipped"
-                ));
+                )),
+            }
+        }
+        // Best-tier retained set across all candidate languages. English
+        // designations are always kept (consistent with SNOMED), independent of
+        // the filter.
+        let retained = languages.resolve_retained(variant_langs.iter().map(|(_, _, l)| l.as_str()));
+
+        // code → (language → translated display). Last writer wins per language.
+        let mut translations: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for (variant_path, filename, language) in &variant_langs {
+            if !crate::language::lang_matches("en", language) && !retained.contains(language) {
+                tracing::info!(
+                    file = %filename,
+                    language = %language,
+                    "skipping LOINC linguistic variant excluded by language filter"
+                );
                 continue;
-            };
+            }
             let mut zip = open_zip(&path_owned)?;
-            let entry = match zip.by_name(variant_path) {
+            let entry = match zip.by_name(variant_path.as_str()) {
                 Ok(e) => e,
                 Err(e) => {
                     parse_errors.push(format!("Cannot open {variant_path}: {e} — skipped"));
                     continue;
                 }
             };
-            let rows = parse_linguistic_variant(entry, &filename, &mut parse_errors)?;
+            let rows = parse_linguistic_variant(entry, filename, &mut parse_errors)?;
             for (code, value) in rows {
                 translations
                     .entry(code)
@@ -292,9 +321,19 @@ pub async fn import_loinc_csv(
         content: "complete",
     };
 
+    // Probe once before loading: if the system has no concepts yet, every
+    // concept in every batch is brand-new, so the per-concept
+    // delete-before-reinsert can be skipped across the whole load. On a
+    // re-import (system already populated) we leave it off so replacement
+    // semantics still apply. Probe failure falls back to the safe path.
+    let fresh_load = !backend
+        .code_system_has_concepts(ctx, LOINC_URL)
+        .await
+        .unwrap_or(true);
+
     // Seed: empty CodeSystem to upsert metadata.
-    let seed_bytes = build_code_system_bundle(&meta, &[]);
-    let seed_stats = backend.import_bundle(ctx, &seed_bytes).await?;
+    let seed = build_parsed_code_system(&meta, &[]);
+    let seed_stats = backend.import_parsed(ctx, seed).await?;
     stats.code_systems = seed_stats.code_systems;
     stats.errors.extend(seed_stats.errors);
 
@@ -335,8 +374,9 @@ pub async fn import_loinc_csv(
             })
             .collect();
 
-        let bytes = build_code_system_bundle(&meta, &builder);
-        let chunk_stats = backend.import_bundle(ctx, &bytes).await?;
+        let mut parsed = build_parsed_code_system(&meta, &builder);
+        parsed.fresh_load = fresh_load;
+        let chunk_stats = backend.import_parsed(ctx, parsed).await?;
         stats.errors.extend(chunk_stats.errors);
         stats.concepts += chunk.len() as u32;
 
@@ -877,6 +917,53 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         tmp
     }
 
+    /// Build a ZIP carrying the regional variant set from the user-reported
+    /// case: de-AT, de-DE, es-AR, es-ES, es-MX. The numeric ids (15/91/92/93)
+    /// are absent from `LV_INDEX_CSV` so `derive_language_tag` resolves those
+    /// tags from the filename letters (id 8 maps to de-DE via the index).
+    fn make_test_loinc_zip_with_regional_variants() -> NamedTempFile {
+        let tmp = NamedTempFile::with_suffix(".zip").unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+            let opts = zip::write::FileOptions::default();
+
+            zip.start_file("LoincTable/Loinc.csv", opts).unwrap();
+            zip.write_all(LOINC_TABLE_CSV.as_bytes()).unwrap();
+            zip.start_file(
+                "AccessoryFiles/MultiAxialHierarchy/MultiAxialHierarchy.csv",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(HIERARCHY_CSV.as_bytes()).unwrap();
+            zip.start_file(
+                "AccessoryFiles/LinguisticVariants/LinguisticVariants.csv",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(LV_INDEX_CSV.as_bytes()).unwrap();
+
+            // German variants (LONG_COMMON_NAME-style, 1 row each): de-AT, de-DE.
+            for fname in ["deAT15LinguisticVariant.csv", "deDE8LinguisticVariant.csv"] {
+                zip.start_file(format!("AccessoryFiles/LinguisticVariants/{fname}"), opts)
+                    .unwrap();
+                zip.write_all(LV_DE_CSV.as_bytes()).unwrap();
+            }
+            // Spanish variants (axes-synthesized, 2 rows each): es-AR, es-ES, es-MX.
+            for fname in [
+                "esAR92LinguisticVariant.csv",
+                "esES91LinguisticVariant.csv",
+                "esMX93LinguisticVariant.csv",
+            ] {
+                zip.start_file(format!("AccessoryFiles/LinguisticVariants/{fname}"), opts)
+                    .unwrap();
+                zip.write_all(LV_ES_AXES_CSV.as_bytes()).unwrap();
+            }
+
+            zip.finish().unwrap();
+        }
+        tmp
+    }
+
     fn count_rows(backend: &SqliteTerminologyBackend, table: &str) -> i64 {
         let conn = backend.pool().get().unwrap();
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -937,9 +1024,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         let conn = backend.pool().get().unwrap();
         let definition: Option<String> = conn
@@ -958,9 +1052,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        let stats = import_loinc_csv(&backend, &ctx, zip_file.path(), 500, true)
-            .await
-            .expect("dry-run should succeed");
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            true,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("dry-run should succeed");
 
         assert_eq!(stats.code_systems, 1);
         assert!(stats.concepts > 0);
@@ -975,9 +1076,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        let stats = import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .expect("live import should succeed");
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("live import should succeed");
 
         assert_eq!(stats.code_systems, 1);
         // 3 LOINC codes + 3 LP codes = 6 total concepts
@@ -994,12 +1102,26 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count_rows(&backend, "code_systems"), 1);
         assert_eq!(count_rows(&backend, "concepts"), 6);
@@ -1012,9 +1134,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        let stats = import_loinc_csv(&backend, &ctx, zip_file.path(), 2, false)
-            .await
-            .unwrap();
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            2,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.concepts, 6);
         assert_eq!(count_rows(&backend, "concepts"), 6);
     }
@@ -1030,6 +1159,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             Path::new("/nonexistent/loinc.zip"),
             500,
             false,
+            &LanguageFilter::default(),
         )
         .await;
         assert!(result.is_err());
@@ -1067,9 +1197,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             zip.finish().unwrap();
         }
 
-        let stats = import_loinc_csv(&backend, &ctx, tmp.path(), 500, false)
-            .await
-            .expect("should pick LoincTable/Loinc.csv, not the accessory file");
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            tmp.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("should pick LoincTable/Loinc.csv, not the accessory file");
         assert_eq!(stats.concepts, 6);
         assert_eq!(count_rows(&backend, "concepts"), 6);
     }
@@ -1188,9 +1325,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip_with_variants();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .expect("import with linguistic variants should succeed");
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("import with linguistic variants should succeed");
 
         // 2 French + 1 German translation = 3 designation rows.
         assert_eq!(count_rows(&backend, "concept_designations"), 3);
@@ -1220,14 +1364,151 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
     }
 
     #[tokio::test]
+    async fn import_loinc_csv_language_filter_skips_excluded_variants() {
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_loinc_zip_with_variants();
+
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::parse("fr"),
+        )
+        .await
+        .expect("import with language filter should succeed");
+
+        // Only the 2 French translations survive; the German variant file is
+        // skipped without being parsed.
+        assert_eq!(count_rows(&backend, "concept_designations"), 2);
+
+        let conn = backend.pool().get().unwrap();
+        let de_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_designations WHERE language = 'de-DE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(de_count, 0);
+
+        // The English display is unaffected by the filter.
+        let display: String = conn
+            .query_row(
+                "SELECT display FROM concepts WHERE code = '2160-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(display, "Creatinine [Mass/volume] in Serum or Plasma");
+    }
+
+    #[tokio::test]
+    async fn import_loinc_best_tier_excludes_regional_siblings() {
+        // The user-reported case: filter `de,es-ES` against de-AT, de-DE,
+        // es-AR, es-ES, es-MX. `es-ES` is an exact match, so es-AR/es-MX are
+        // dropped; `de` only reaches the regional-sibling tier, so both German
+        // variants are kept.
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_loinc_zip_with_regional_variants();
+
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::parse("de,es-ES"),
+        )
+        .await
+        .expect("import with language filter should succeed");
+
+        let conn = backend.pool().get().unwrap();
+        let count = |lang: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM concept_designations WHERE language = ?1",
+                [lang],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("de-AT"), 1, "de-AT kept (de* sibling tier)");
+        assert_eq!(count("de-DE"), 1, "de-DE kept (de* sibling tier)");
+        assert_eq!(count("es-ES"), 2, "es-ES kept (exact match)");
+        assert_eq!(count("es-AR"), 0, "es-AR dropped (es-ES exact outranks)");
+        assert_eq!(count("es-MX"), 0, "es-MX dropped (es-ES exact outranks)");
+        // 2 German + 2 Spanish designations, nothing else.
+        assert_eq!(count_rows(&backend, "concept_designations"), 4);
+    }
+
+    #[tokio::test]
+    async fn loinc_fresh_load_skip_then_narrowed_reimport_replaces() {
+        // First import is a fresh load (system empty → fresh_load path skips the
+        // delete-before-reinsert). Both French and German designations land.
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        let zip_file = make_test_loinc_zip_with_variants();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_rows(&backend, "concept_designations"), 3); // fr×2 + de×1
+
+        // Re-import with a narrower filter. The system now has concepts, so the
+        // probe must flip fresh_load OFF and the per-concept replacement must
+        // run — dropping the German designation. This is the interaction that
+        // would silently leave stale rows if the skip path were taken on a
+        // re-import.
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::parse("fr"),
+        )
+        .await
+        .unwrap();
+        let conn = backend.pool().get().unwrap();
+        let de: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_designations WHERE language = 'de-DE'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            de, 0,
+            "stale German designations must be removed on re-import"
+        );
+        assert_eq!(count_rows(&backend, "concept_designations"), 2); // fr×2 only
+    }
+
+    #[tokio::test]
     async fn import_loinc_csv_dry_run_counts_designations() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip_with_variants();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, true)
-            .await
-            .expect("dry-run should succeed");
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            true,
+            &LanguageFilter::default(),
+        )
+        .await
+        .expect("dry-run should succeed");
 
         // Dry-run writes nothing.
         assert_eq!(count_rows(&backend, "concept_designations"), 0);
@@ -1240,9 +1521,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         let ctx = TenantContext::system();
         let zip_file = make_test_loinc_zip();
 
-        import_loinc_csv(&backend, &ctx, zip_file.path(), 500, false)
-            .await
-            .unwrap();
+        import_loinc_csv(
+            &backend,
+            &ctx,
+            zip_file.path(),
+            500,
+            false,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(count_rows(&backend, "concept_designations"), 0);
     }
 
@@ -1269,9 +1557,16 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             zip.finish().unwrap();
         }
 
-        let stats = import_loinc_csv(&backend, &ctx, tmp.path(), 500, true)
-            .await
-            .unwrap();
+        let stats = import_loinc_csv(
+            &backend,
+            &ctx,
+            tmp.path(),
+            500,
+            true,
+            &LanguageFilter::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(stats.concepts > 0, "got 0 concepts");
         assert!(

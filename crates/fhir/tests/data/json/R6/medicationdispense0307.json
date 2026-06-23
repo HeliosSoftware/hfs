@@ -51,37 +51,6 @@
   },
   "whenPrepared": "2015-01-15T10:20:00Z",
   "whenHandedOver": "2015-01-15T16:20:00Z",
-  "dosageInstruction": {
-    "simple": {
-      "text": "Take 3 tablets (6mg) once daily",
-      "timing": {
-        "repeat": {
-          "frequency": 1,
-          "period": 1,
-          "periodUnit": "d"
-        }
-      },
-      "doseAndRate": [
-        {
-          "type": {
-            "coding": [
-              {
-                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                "code": "calculated",
-                "display": "Calculated"
-              }
-            ]
-          },
-          "doseQuantity": {
-            "value": 6,
-            "unit": "mg",
-            "system": "http://unitsofmeasure.org",
-            "code": "mg"
-          }
-        }
-      ]
-    }
-  },
   "meta": {
     "tag": [
       {

@@ -136,44 +136,7 @@ mod sof_conformance_postgres_tests {
     // independent so anything skipped on SQLite is also skipped on PG).
     // =========================================================================
 
-    const KNOWN_SKIPS: &[(&str, &str)] = &[
-        (
-            "row_index::%rowIndex at top level",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with forEach",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with forEachOrNull",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with nested forEach",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with repeat",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex with unionAll",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex in unionAll without forEach",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex in unionAll inside forEach",
-            "%rowIndex not implemented",
-        ),
-        (
-            "row_index::%rowIndex for surrogate key",
-            "%rowIndex not implemented",
-        ),
-    ];
+    const KNOWN_SKIPS: &[(&str, &str)] = &[];
 
     // =========================================================================
     // Fixture loading (identical to sof_conformance.rs)
@@ -465,7 +428,14 @@ mod sof_conformance_postgres_tests {
         // 126 -> 124: SoF v2 PR #349 removed two `join()` fixtures from the
         // upstream `fhirpath.json` corpus, shrinking the total fixture count
         // (not a compiler regression).
-        const PG_PASS_FLOOR: usize = 124;
+        //
+        // 124 -> 132: the upstream sync added `row_index.json` and the PG in-DB
+        // compiler now supports `%rowIndex` (`WITH ORDINALITY` for forEach, a
+        // pre-order `ord_path` in the repeat CTE). 8 of the 9 pass; the 9th
+        // (`%rowIndex in unionAll inside forEach`) hits the pre-existing
+        // "unionAll nested inside another select" gap, shared with the
+        // nested-`repeat` fixtures on the failure floor.
+        const PG_PASS_FLOOR: usize = 132;
         assert!(
             passed >= PG_PASS_FLOOR,
             "regression: only {passed} fixtures pass (floor: {PG_PASS_FLOOR}). \

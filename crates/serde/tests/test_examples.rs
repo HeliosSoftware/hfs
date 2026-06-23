@@ -301,6 +301,34 @@ fn json_skip_list(_version: &str) -> &'static [(&'static str, &'static str)] {
             "Requirements-example1.json",
             "R6 Requirements statements lose `category` arrays during roundtrip serialization",
         ),
+        (
+            "provenance-ex-patient-merged.json",
+            "Contains null in authorization array where struct TempCodeableReference expected",
+        ),
+        (
+            "provenance-example-advanced.json",
+            "Contains null in authorization array where struct TempCodeableReference expected",
+        ),
+        (
+            "provenance-example-correction-replacement.json",
+            "Contains null in authorization array where struct TempCodeableReference expected",
+        ),
+        (
+            "provenance-example-delete.json",
+            "Contains null in authorization array where struct TempCodeableReference expected",
+        ),
+        (
+            "provenance-example-sig.json",
+            "Contains null in authorization array where struct TempCodeableReference expected",
+        ),
+        (
+            "provenance-example-verify.json",
+            "Contains null in authorization array where struct TempCodeableReference expected",
+        ),
+        (
+            "provenance-example-bundle-allergyintolerance.json",
+            "Contains null in AllergyIntolerance.category array - invalid FHIR JSON",
+        ),
     ];
 
     JSON_SKIPS

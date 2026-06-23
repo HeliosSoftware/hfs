@@ -59,17 +59,6 @@
           "display": "Biopsy - action"
         }
       ]
-    },
-    "bodySite": {
-      "concept": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "10200004",
-            "display": "Liver structure"
-          }
-        ]
-      }
     }
   },
   "processing": [

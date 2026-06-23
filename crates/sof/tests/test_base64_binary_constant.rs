@@ -9,9 +9,11 @@ struct TestCase {
     title: String,
     #[allow(dead_code)]
     description: String,
+    // Optional: some upstream fixtures (e.g. constant_types.json) omit
+    // `fhirVersion`, which the spec treats as "applies to all versions".
     #[allow(dead_code)]
-    #[serde(rename = "fhirVersion")]
-    fhir_version: Vec<String>,
+    #[serde(rename = "fhirVersion", default)]
+    fhir_version: Option<Vec<String>>,
     resources: Vec<serde_json::Value>,
     tests: Vec<Test>,
 }

@@ -20,4 +20,4 @@ proc-macro2 = "1.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 heck = "0.5" # For case conversion
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.47" }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.0" }
