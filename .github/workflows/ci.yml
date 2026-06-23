@@ -279,6 +279,13 @@ jobs:
         #     misissued certificate with name constraints; AWS endpoints
         #     don't use name-constrained intermediates.
         #   - RUSTSEC-2026-0104 (CRL panic): the AWS SDK doesn't parse CRLs.
+        #
+        # quinn-proto 0.11.14 (transitive via reqwest's QUIC/HTTP3 support).
+        # RUSTSEC-2026-0185 is a remote memory-exhaustion DoS triggered by an
+        # attacker feeding unbounded out-of-order QUIC stream fragments to a
+        # quinn endpoint. We only use reqwest as an HTTP/1.1+2 client and never
+        # accept inbound QUIC connections, so the vulnerable reassembly path is
+        # unreachable. Remove once reqwest pulls quinn-proto >= 0.11.15.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0118
@@ -288,6 +295,7 @@ jobs:
           --ignore RUSTSEC-2026-0098
           --ignore RUSTSEC-2026-0099
           --ignore RUSTSEC-2026-0104
+          --ignore RUSTSEC-2026-0185
  
   coverage:
     name: Code Coverage

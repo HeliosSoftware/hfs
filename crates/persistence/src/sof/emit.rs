@@ -337,38 +337,36 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
                 }
             }
             pg_lateral_branches.push(format!("SELECT {leaf_alias}.value FROM {from_clause}"));
+        } else if dialect.lateral_keyword().is_empty() {
+            // SQLite: extend the parent's `ord_path` with this child's
+            // array index so descendants sort immediately after their
+            // parent (pre-order) and before the parent's later siblings.
+            let from_clause = format!("{out_alias}, {}", from_parts.join(", "));
+            step_branches.push(format!(
+                "SELECT {out_alias}.rid, {leaf_alias}.value AS node, \
+                 {out_alias}.{ord} || '.' || printf('%010d', {leaf_alias}.key) AS {ord}\n  \
+                 FROM {from_clause}",
+                ord = REPEAT_ORD_PATH_COL,
+            ));
         } else {
-            if dialect.lateral_keyword().is_empty() {
-                // SQLite: extend the parent's `ord_path` with this child's
-                // array index so descendants sort immediately after their
-                // parent (pre-order) and before the parent's later siblings.
-                let from_clause = format!("{out_alias}, {}", from_parts.join(", "));
+            let mut s = out_alias.to_string();
+            for fp in &from_parts {
+                s.push_str(" JOIN ");
+                s.push_str(fp);
+                s.push_str(" ON TRUE");
+            }
+            if emit_ord_path {
+                // Extend the parent's `ord_path` with this child's position.
                 step_branches.push(format!(
                     "SELECT {out_alias}.rid, {leaf_alias}.value AS node, \
-                     {out_alias}.{ord} || '.' || printf('%010d', {leaf_alias}.key) AS {ord}\n  \
-                     FROM {from_clause}",
+                     {out_alias}.{ord} || '.' || lpad(({leaf_alias}.ord - 1)::text, 10, '0') AS {ord}\n  \
+                     FROM {s}",
                     ord = REPEAT_ORD_PATH_COL,
                 ));
             } else {
-                let mut s = out_alias.to_string();
-                for fp in &from_parts {
-                    s.push_str(" JOIN ");
-                    s.push_str(fp);
-                    s.push_str(" ON TRUE");
-                }
-                if emit_ord_path {
-                    // Extend the parent's `ord_path` with this child's position.
-                    step_branches.push(format!(
-                        "SELECT {out_alias}.rid, {leaf_alias}.value AS node, \
-                         {out_alias}.{ord} || '.' || lpad(({leaf_alias}.ord - 1)::text, 10, '0') AS {ord}\n  \
-                         FROM {s}",
-                        ord = REPEAT_ORD_PATH_COL,
-                    ));
-                } else {
-                    step_branches.push(format!(
-                        "SELECT {out_alias}.rid, {leaf_alias}.value AS node\n  FROM {s}"
-                    ));
-                }
+                step_branches.push(format!(
+                    "SELECT {out_alias}.rid, {leaf_alias}.value AS node\n  FROM {s}"
+                ));
             }
         }
     }
