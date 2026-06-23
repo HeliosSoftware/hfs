@@ -149,6 +149,10 @@ impl ExportSink for InMemorySink {
     }
 
     fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
+        // Shards are keyed `{job_id}/{filename}`, so dropping every entry under
+        // the `{job_id}/` prefix removes exactly this job's output and leaves
+        // other jobs untouched. Always succeeds — a job with no shards is a
+        // no-op retain.
         let prefix = format!("{job_id}/");
         self.data.retain(|k, _| !k.starts_with(&prefix));
         Ok(())
@@ -284,6 +288,12 @@ impl ExportSink for S3Sink {
 
     /// Lists every object under `{key_prefix}exports/{job_id}/` and deletes
     /// them, paging through the listing until exhausted.
+    ///
+    /// Idempotent: a job with no objects produces an empty listing and returns
+    /// `Ok(())`, so re-deleting an already-cleaned job is a harmless no-op.
+    /// Runs on the blocking pool (like [`write_shard`](Self::write_shard) /
+    /// [`read_shard`](Self::read_shard)) to bridge the synchronous trait method
+    /// to the async S3 SDK.
     fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
         let bucket = self.bucket.clone();
         let client = Arc::clone(&self.client);
