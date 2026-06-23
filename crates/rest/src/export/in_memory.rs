@@ -181,6 +181,16 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                     );
                 }
             }
+
+            // If the job was cancelled mid-run, `set_status_if_running` left it
+            // Cancelled — any shards this task wrote before observing the cancel
+            // are now orphaned. Delete them (the cancel handler already cleaned
+            // up whatever existed at DELETE time; this covers the race).
+            if matches!(jobs.get(&jid).as_deref(), Some(JobStatus::Cancelled)) {
+                if let Err(e) = sink.delete_job(&jid) {
+                    warn!(job_id = %jid, error = %e, "failed to delete partial export output after cancelled run");
+                }
+            }
         });
 
         job_id
@@ -197,22 +207,40 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         if !self.tenant_matches(tenant_id, job_id) {
             return false;
         }
-        if let Some(mut entry) = self.jobs.get_mut(job_id) {
+        // Capture whether this DELETE is the transition into Cancelled, while
+        // holding the lock only for the state change itself.
+        let now_cancelled = if let Some(mut entry) = self.jobs.get_mut(job_id) {
             match &*entry {
                 JobStatus::Running { .. } => {
                     *entry = JobStatus::Cancelled;
                     true
                 }
-                // Already done/failed/cancelled — return true (found it)
-                _ => true,
+                // Already done/failed/cancelled — return true (found it).
+                _ => false,
             }
         } else {
-            false
+            return false;
+        };
+
+        // Spec (operations-common, HL7/sql-on-fhir#365): SHOULD clean up partial
+        // results on cancel. Drop any shards written so far. A background task
+        // still draining will clean up whatever it writes after this point when
+        // it observes the Cancelled state (see `submit`).
+        if now_cancelled {
+            if let Err(e) = self.sink.delete_job(job_id) {
+                warn!(%job_id, error = %e, "failed to delete partial export output on cancel");
+            }
         }
+        true
     }
 
     fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>> {
         if !self.tenant_matches(tenant_id, job_id) {
+            return None;
+        }
+        // A cancelled job's shards must 404 even if deletion is still draining,
+        // so a poll racing the cleanup never serves partial output.
+        if matches!(self.jobs.get(job_id).as_deref(), Some(JobStatus::Cancelled)) {
             return None;
         }
         self.sink.read_shard(job_id, filename)
@@ -712,5 +740,63 @@ mod tests {
                 other => panic!("cancelled job must stay Cancelled, got {other:?}"),
             }
         }
+    }
+
+    /// Spec (operations-common, HL7/sql-on-fhir#365): cancelling a job SHOULD
+    /// clean up partial results. The shards written before the DELETE must be
+    /// removed from the sink, and the download route must 404 afterwards.
+    #[tokio::test]
+    async fn cancel_deletes_partial_output_and_download_404s() {
+        let release = Arc::new(Notify::new());
+        let runner = Arc::new(BlockingRunner {
+            release: Arc::clone(&release),
+        });
+        // Keep a handle on the sink (shares the inner Arc<DashMap>) so the test
+        // can both seed a partial shard and assert it was deleted.
+        let sink = InMemorySink::new("http://localhost");
+        let controller = InMemoryController::new(runner, sink.clone(), None);
+
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork::Views(vec![NamedView {
+                name: "patients".to_string(),
+                view: serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }),
+            }]),
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+
+        // Simulate a shard the running job had already streamed out.
+        sink.write_shard(&job_id, 0, b"{\"id\":\"a\"}\n".to_vec(), "ndjson")
+            .unwrap();
+        assert!(
+            controller
+                .read_shard("t1", &job_id, "shard-0.ndjson")
+                .is_some(),
+            "shard should be downloadable while the job is running"
+        );
+
+        // Cancel: partial output is dropped and the download route 404s.
+        assert!(controller.cancel("t1", &job_id));
+        assert!(
+            sink.read_shard(&job_id, "shard-0.ndjson").is_none(),
+            "cancel must delete partial shards from the sink"
+        );
+        assert!(
+            controller
+                .read_shard("t1", &job_id, "shard-0.ndjson")
+                .is_none(),
+            "download route must 404 for a cancelled job"
+        );
+
+        release.notify_one();
     }
 }
