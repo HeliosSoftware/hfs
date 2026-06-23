@@ -17,7 +17,7 @@ pub use controller::{
     CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobStatus,
     NamedSqlQuery, SqlExportLimits, SqlTableSource,
 };
-pub use in_memory::InMemoryController;
+pub use in_memory::{CleanupConfig, InMemoryController};
 pub use planner::DEFAULT_SHARD_ROWS;
 #[cfg(feature = "s3")]
 pub use sink::S3Sink;
