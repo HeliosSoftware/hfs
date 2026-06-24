@@ -1,6 +1,15 @@
 # Helios FHIR Server — Web UI Requirements
 
-**Status:** Draft v1 · **Date:** 2026-06-01 · **Owner:** Helios Software
+**Status:** Draft v2 · **Date:** 2026-06-23 · **Owner:** Helios Software
+**Changelog (v2):** Updated for the recent FHIR search work — `_list`,
+`_score`, and `_contained`/`_containedType` are now implemented (only `_query`
+remains rejected); `GET /metadata` now advertises **real** per-resource search
+parameters and per-type modifiers (so the search catalog can be sourced from
+`/metadata` again); token `:in`/`:above`/`:below`/`:not-in` now return `501`
+when unsatisfiable instead of silently ignoring; search values are now
+partially unescaped (`\,` and `\\`); and `Prefer: handling=strict` now rejects
+unknown params and unsortable `_sort` fields. Sections §4.1, §7, §11, §12, and
+§18 were revised.
 **Target binary:** `hfs` (the Helios FHIR Server) only
 **Purpose of this document:** Capture, comprehensively, every capability the
 `hfs` server exposes so that they can be driven through a web-based user
@@ -34,6 +43,9 @@ operation contracts:
 - FHIR (all versions): https://hl7.org/fhir/
 - RESTful API: https://hl7.org/fhir/http.html
 - Search: https://hl7.org/fhir/search.html
+  (continuous build / R6: https://build.fhir.org/search.html — the source for the
+  `:of-type` spelling, the `special` type for `_text`/`_content`, and the
+  modifier/prefix groupings in §7)
 - Bundle / transaction: https://hl7.org/fhir/bundle.html, https://hl7.org/fhir/http.html#transaction
 - Bulk Data Access IG ($export): https://hl7.org/fhir/uv/bulkdata/
 - SMART on FHIR: https://hl7.org/fhir/smart-app-launch/
@@ -101,10 +113,17 @@ These apply to the whole application and frame every screen.
   does not list, show only enabled resource types, expose only advertised search
   parameters by default, and reflect `conditionalCreate/Update/Delete`,
   `updateCreate`, `versioning`, and `searchInclude`/`searchRevInclude` support.
-  (Exception: the current server's CapabilityStatement does **not** advertise
-  resource-specific search parameters or modifiers — see §7.9 — so the Search
-  Builder catalog must be sourced from the bundled FHIR `SearchParameter`
-  definitions rather than `/metadata`.)
+  As of the CapabilityStatement work, `/metadata` now advertises **real**
+  per-resource-type search parameters (sourced from the loaded FHIR
+  `SearchParameter` registry), **real** target-specific `searchInclude` /
+  `searchRevInclude` tokens (`Type:code`, not `*`), and the supported
+  **modifiers per parameter** — the last carried as repeating `valueCode`
+  extensions (`http://heliossoftware.com/fhir/StructureDefinition/capabilitystatement-search-modifier`)
+  because R4/R5 `CapabilityStatement.rest.resource.searchParam` has no native
+  `modifier` field. The Search Builder catalog can therefore be driven from
+  `/metadata` again (see §7.9, §12). Two residual caveats: `_score` is not
+  advertised (it is an output/sort concept, not a query param — §7.10) and
+  `_source` is not currently advertised even though it is indexed (§7.1).
 - The UI MUST surface `GET /health`, `GET /_liveness`, `GET /_readiness` status
   (primarily for P2) — e.g. a status indicator with backend name and timestamp.
 
@@ -277,21 +296,31 @@ MongoDB backend**; the SQLite path has **no** no-FTS5 guard, so on a SQLite buil
 compiled without FTS5 these queries hit a missing-table error rather than
 degrading to a clean empty result. Bundled SQLite normally ships with FTS5, so
 this is an edge case — but do not rely on "matches nothing" as the failure mode.
-Their spec type is `special`, though the CapabilityStatement currently advertises
-them as `string` — see §7.9.) `_filter` is also implemented on the SQLite backend
-(an undocumented, unadvertised extra; note a `_filter` that fails to parse is
-**silently dropped** with only a logged warning, not rejected). `hfs` does **not**
-implement `_query`, `_list`, `_contained` / `_containedType`, or `_score` — but
-note it **silently ignores** them (returns an unfiltered result, even under
-`Prefer: handling=strict`) rather than rejecting them. The builder MUST NOT offer
-the unimplemented params, and MUST NOT rely on the server to reject them.
+Their spec type is `special`, and the CapabilityStatement now advertises them as
+`special` (corrected — see §7.9).) `_filter` is also implemented on the SQLite
+backend (an undocumented, unadvertised extra; note a `_filter` that fails to parse
+is **silently dropped** with only a logged warning, not rejected).
 
-- **Value escaping (gap).** FHIR uses a backslash to escape the special
-  characters `, | $ \` inside a search value. `hfs` performs **no** unescaping, so
-  a literal comma always splits OR-values and a literal `|` always splits a token
-  into `system|code`. The Search Builder MUST handle escaping itself and SHOULD
-  warn when a user-entered token system URL or string value contains an unescaped
-  special character, because the server will otherwise mis-split it (see §18).
+- **Newly implemented control params.** `_list`, `_score`, and
+  `_contained`/`_containedType` are now implemented across the backends (see
+  §7.10 for exact behavior). The **only** control param still rejected is
+  `_query` (named queries), which now returns a **`400`** (`InvalidParameter`),
+  not a silent `200`. The builder MUST NOT offer `_query`.
+- **Strict handling now rejects unknowns.** Under `Prefer: handling=strict`,
+  genuinely unknown search parameters are now rejected with `400`; the lenient
+  default still ignores them. (This is separate from the silent-ignore behaviors
+  that remain for misconfigured-but-known inputs — see §18.)
+
+- **Value escaping (now partial).** FHIR uses a backslash to escape the special
+  characters `, | $ \` inside a search value. `hfs` now unescapes **`\,` and
+  `\\`** at the OR-list-splitting layer, so a backslash-escaped comma is correctly
+  kept as a literal value rather than splitting OR-alternatives. However, **`\|`
+  and `\$` are still NOT unescaped** — they pass through literally, so an
+  unescaped (or backslash-escaped) `|` still splits a token into `system|code`,
+  and `$` is not handled. The Search Builder SHOULD still escape values itself
+  (emit `\,` for literal commas) and SHOULD warn when a token system URL or string
+  value contains a `|` or `$`, because the server will otherwise mis-split or
+  mis-parse it (see §18).
 
 ### 7.2 Modifiers
 Expose type-appropriate modifiers in the builder. The groupings below reflect
@@ -300,11 +329,11 @@ what `hfs` actually parses and validates (`SearchModifier::is_valid_for` in
 spec-compliance work, these now align with the published FHIR spec except for the
 few items called out under "Deviations" below.
 - **All types:** `:missing`
-- **String:** `:exact`, `:contains`, `:text`, `:text-advanced`
+- **String:** `:exact`, `:contains`, `:text`
 - **Token:** `:not`, `:text`, `:in`, `:above`, `:below`, `:of-type`,
   `:code-text`, `:text-advanced`
 - **Reference:** `:identifier`, `:[Type]` (target type), `:contains`, `:text`,
-  `:above`, `:below`, `:code-text`
+  `:above`, `:below`, `:code-text`, `:text-advanced`
 - **Uri:** `:contains`, `:above`, `:below`
 - `_include` / `_revinclude` modifier: `:iterate`
 - **Not supported — do not offer (or clearly mark unavailable):** `:not-in` is
@@ -317,28 +346,29 @@ few items called out under "Deviations" below.
   `:below` **against code hierarchies** — **delegate to a terminology server**
   (see §11) only when one is configured. (Reference and uri `:above`/`:below` are
   resolved locally via URL/path-prefix hierarchy and need no terminology server.)
-  **Important:** when no terminology server is configured, token `:in`/`:above`/
-  `:below` are **silently ignored** — the server does NOT return `501`; it falls
-  through and still returns `200`. The exact mechanism is messy: `:in` is searched
-  as the ValueSet *URL treated as a literal code* (so it matches nothing in
-  practice), and the SQLite token handler has **no** `:above`/`:below` branch at
-  all, so those effectively no-op / degrade to roughly exact-code matching. A
-  failed terminology `$expand` (server configured but the call errors) likewise
-  **fails open** — the parameter is dropped and the search continues unfiltered.
-  Only `:not-in` returns
-  `501` (always — see below). The UI therefore MUST gate these modifiers on
-  *configuration detection* (§11), not on catching a `501`, and SHOULD indicate
-  when a terminology server is required and whether one is configured.
-- **Advertised vs. validated — caution:** the served `GET /metadata` does **not**
-  advertise modifiers at all, and lists no resource-specific search params. The
-  REST CapabilityStatement (`crates/rest/src/handlers/capabilities.rs`) is static:
-  for *every* resource type it returns only the seven common search params with no
-  `modifier` field. The richer per-type modifier set (`modifiers_for_type` in the
-  SQLite backend) is computed but **never wired into the HTTP response**.
-  Consequently the UI CANNOT source its search-parameter or modifier catalog from
-  `/metadata` (contra §4.1/§12); it must drive the Search Builder from the bundled
-  FHIR `SearchParameter` definitions and the modifier/prefix groupings in this
-  section instead. See §7.9 for the full advertisement gap.
+  **Important (changed):** when no terminology server is configured, the server now
+  **rejects** a token `:in`/`:above`/`:below` with **`501 Not Implemented`**
+  rather than silently ignoring it — a much cleaner contract than the old
+  fall-through-to-literal-match behavior. (`:in` is token-only so it always needs
+  terminology; `:above`/`:below` are rejected only when applied to a **token**
+  param — on reference/uri params they resolve locally and are unaffected.) A
+  terminology `$expand` that *errors* while a server **is** configured may still
+  fail open (parameter dropped, search continues) — so a configured server is not
+  a guarantee. The UI SHOULD therefore still gate these modifiers on
+  *configuration/capability detection* (§11) for the best UX, but MAY also treat a
+  `501` as confirmation they are unavailable. It SHOULD indicate when a terminology
+  server is required and whether one is configured.
+- **Advertised vs. validated (now aligned):** the served `GET /metadata` now
+  advertises **real** resource-specific search params (from the loaded
+  `SearchParameter` registry) and, per param, the **supported modifiers** as
+  repeating `valueCode` extensions (R4/R5 `searchParam` has no native `modifier`
+  field, so an extension carries them — see §4.1). The richer per-type modifier
+  set (`modifiers_for_param_type` / each backend's capability) is now wired into
+  the HTTP response. The UI MAY therefore source its search-parameter and modifier
+  catalog from `/metadata` (per §4.1/§12). The modifier/prefix groupings in this
+  section remain the authoritative cross-reference and a fallback when reading the
+  extension is impractical. See §7.9 for the (now small) residual advertisement
+  caveats.
 - **`:of-type` spelling:** the parser accepts **both** `:of-type` (the spec /
   build.fhir.org spelling) and the legacy R4 `:ofType`, and the
   CapabilityStatement advertises `:of-type`. The UI SHOULD emit `:of-type`.
@@ -348,11 +378,10 @@ few items called out under "Deviations" below.
     **reference**, and **uri**, which matches build.fhir.org (the spec defines
     `:contains` for reference, string, and uri). Listed here only to correct an
     earlier note that wrongly called this string-only.
-  - `:text-advanced` — `hfs` accepts it on **string** or **token**; the spec
-    defines it for **reference** and **token**. `hfs` thus deviates in *both*
-    directions (wrongly accepts it on string, wrongly rejects it on reference), so
-    the UI SHOULD offer `:text-advanced` on **token only** — the safe intersection
-    of spec and `hfs`.
+  - *(No longer a deviation)* `:text-advanced` — `hfs` now accepts it on
+    **token** and **reference**, matching the spec. (It was previously accepted on
+    string and rejected on reference.) The UI MAY offer `:text-advanced` on token
+    and reference; note it still depends on the FTS5 full-text index to be useful.
   - `:not-in` — the spec restricts it to **token** (as `hfs` does), but `hfs`
     returns `501` for it regardless (see above).
 
@@ -368,9 +397,9 @@ params, and no `sa`/`eb` on number).
   server therefore neither rejects a nonsensical prefix (e.g. `name=gt2020` on a
   string param is *not* a `400`) nor enforces any type-scoping. In particular
   `sa`/`eb` on number/quantity are **not** rejected and actually **execute** — the
-  number/quantity handlers implement them. (The internal `is_valid_for` table
-  restricts `sa`/`eb` to date, which is itself wrong — the spec allows quantity
-  too — but the table is dead code today, so it has no runtime effect.)
+  number/quantity handlers implement them. (The internal `is_valid_for` table has
+  since been corrected to allow `sa`/`eb` on date **and** quantity, but it remains
+  dead code on the request path today, so it has no runtime effect either way.)
 - **Implication for the UI:** do your own prefix/type scoping client-side and do
   **not** rely on the server to reject malformed prefix usage; a raw query that
   misuses a prefix will generally return `200` (with the prefix either applied or
@@ -387,10 +416,14 @@ params, and no `sa`/`eb` on number).
   when applicable, but **never `first` or `last`**. The UI MUST drive paging from
   `next`/`previous` only and SHOULD NOT offer jump-to-first/last page controls.
 - `_sort` (comma-separated; `-` prefix = descending; multi-field supported).
-  **Caution:** an unsupported sort field (composite/special/unresolved) is
-  **silently ignored** — the server falls back to sorting by `id` with no error or
-  warning. The UI MUST NOT assume a requested sort was honored; only `_id`,
-  `_lastUpdated`, and indexed typed params sort reliably.
+  `_sort=_score` ranks by relevance on full-text backends (Elasticsearch) and
+  falls back to default order elsewhere (§7.10). **Caution:** under the lenient
+  default, an unsupported sort field (composite/special/unresolved) is **silently
+  ignored** — the server falls back to sorting by `id` with no error or warning, so
+  the UI MUST NOT assume a requested sort was honored; only `_id`, `_lastUpdated`,
+  `_score`, and indexed typed params sort reliably. Under `Prefer: handling=strict`
+  the server now **rejects** an unsortable `_sort` field with `400` instead of
+  falling back, so a strict request gives the UI a definitive signal.
 - `_total` (`accurate|estimate|none`) — show `Bundle.total` when present. Note
   `estimate` currently runs the same exact `COUNT(*)` as `accurate` (no cheaper
   estimate path), so it carries the same cost.
@@ -437,28 +470,76 @@ params, and no `sa`/`eb` on number).
   resources may be missed. The UI SHOULD NOT present compartment results as
   exhaustive for such types.
 
-### 7.9 CapabilityStatement advertisement gap (discovery caveat)
-The served `GET /metadata` is **static** and identical for every resource type
-(`crates/rest/src/handlers/capabilities.rs`):
-- `searchParam` lists only the seven common params (`_id`, `_lastUpdated`,
-  `_tag`, `_profile`, `_security`, `_text`, `_content`) — **no resource-specific
-  search params and no `modifier` field** on any param.
-- `searchInclude` / `searchRevInclude` are advertised as `["*"]` unconditionally,
-  not validated against real target types.
-- `_text` / `_content` are advertised as type `string` (the spec type is
-  `special`).
+### 7.9 CapabilityStatement search advertisement (now largely real)
+The served `GET /metadata` (`crates/rest/src/handlers/capabilities.rs`) now
+advertises real per-resource search capability:
+- `searchParam` lists the **real resource-specific search parameters** for each
+  type, sourced from the loaded FHIR `SearchParameter` registry — not just the
+  common params. Each param carries its supported **modifiers** as repeating
+  `valueCode` extensions on the URL
+  `http://heliossoftware.com/fhir/StructureDefinition/capabilitystatement-search-modifier`
+  (R4/R5 `searchParam` has no native `modifier` field). The per-type modifier
+  list reflects each backend's actual capability (e.g. SQLite intentionally omits
+  `not-in`, which is unimplemented).
+- The **common** params advertised on every type are `_id`, `_lastUpdated`,
+  `_tag`, `_profile`, `_security`, `_text`, `_content`, and `_list`; `_contained`
+  and `_containedType` are added **conditionally** when the backend supports
+  contained search (`supports_contained_search()`).
+- `searchInclude` / `searchRevInclude` are now **real `Type:code` tokens** derived
+  from each type's reference params (and a reverse-include index), not the old
+  unconditional `["*"]`. A type with no reference params omits `searchInclude`
+  entirely.
+- `_text` / `_content` are now advertised with the correct type **`special`** (was
+  `string`).
 
-The backend computes far richer per-type capabilities (hundreds of loaded FHIR
-`SearchParameter` definitions; a per-type modifier set via `modifiers_for_type`),
-but **none of it reaches the HTTP CapabilityStatement**. Implication for the UI:
-the §4.1/§12 guidance to "expose only advertised search parameters" and build a
-"search-parameter catalog per resource type" from `/metadata` **cannot** be
-satisfied by the current server — a `/metadata`-driven catalog would show seven
-params and no modifiers for every type. Until the server advertises real params,
-the Search Builder MUST source its parameter and modifier catalog from the
-bundled FHIR `SearchParameter` definitions (and the groupings in §7.2–§7.3),
-treating those as the source of truth. This should be tracked as a server-side
-gap (see §18).
+Implication for the UI: the §4.1/§12 guidance to source a "search-parameter
+catalog per resource type" from `/metadata` is now **satisfiable** — the Search
+Builder can read params, modifiers (from the extension), and include/revinclude
+targets directly from `/metadata`. The §7.2–§7.3 groupings remain a useful
+cross-check/fallback.
+
+Residual caveats (track as minor server-side gaps, §18):
+- Modifiers ride on a **vendor extension**, not the native `modifier` field, so a
+  generic FHIR client that only reads `searchParam.modifier` will not see them.
+- `_score` is **not** advertised (it is an output/sort concept, not a query param
+  — §7.10), and `_source` is **not** advertised even though it is indexed (§7.1).
+
+### 7.10 Newly-implemented search controls (`_list`, `_score`, `_contained`)
+These were previously hard-rejected/silently-ignored and are now implemented. The
+**only** control param still unsupported is `_query` (returns `400`).
+
+- **`_list`** — `_list=<List id>` or `_list=List/<id>` filters results to the
+  members of a stored `List` resource. The server resolves it application-side
+  (reads the List, takes `entry.item.reference`s targeting the searched type that
+  are not `deleted`, and rewrites them into an `_id` filter), so it works on
+  **all backends**. Multiple `_list` params intersect (AND). A **missing/unknown
+  List id returns an empty result set** (no error). The **functional lists**
+  (`$current-*` pseudo-list values) are **not** implemented and return `501`. UI:
+  offer a List picker; warn that a non-existent list silently yields zero rows.
+- **`_score`** — not an input filter (any `_score=` query value is accepted but
+  ignored). Its effect is on **output**: `Bundle.entry.search.score` is populated
+  when the backend computes a relevance score. Only **Elasticsearch** produces
+  real scores (full-text relevance); SQLite/PostgreSQL/MongoDB accept the param
+  but emit no score. `_sort=_score` ranks by relevance on Elasticsearch and falls
+  back to default order on the others (§7.4). `_score` is **not** advertised in
+  `/metadata`. UI: surface a score column only when entries actually carry one.
+- **`_contained` / `_containedType`** — search over **contained** resources.
+  - `_contained=false` (default) matches only top-level resources; `=true`
+    matches contained resources only; `=both` matches both. An invalid value is
+    `400`.
+  - `_containedType=container` (default) returns the **containing** resource;
+    `=contained` returns the **contained** resource itself. Invalid value is `400`.
+  - Supported on **all four** backends (SQLite, PostgreSQL, Elasticsearch,
+    MongoDB) — each sets `supports_contained_search()=true`. A backend that does
+    not support it returns a clean **`501`** for `_contained=true|both` (so the UI
+    can gate on the advertised `_contained` param from §7.9 or on the `501`).
+  - **Known limitations** the UI should account for: `_containedType=contained`
+    returns the contained resource with `id` set to its local id, **not** the
+    `Container/{id}#{localId}` fragment form; repeated same-named params on
+    contained matching are **OR**, not AND; and contained indexing is **not yet
+    wired in the transaction/batch paths** (create/update and `$reindex` are
+    covered), so resources written via a transaction Bundle may not be
+    contained-searchable until reindexed.
 
 ---
 
@@ -543,11 +624,15 @@ resource body.
   functions to an external terminology server (HTS) **only when
   `HFS_TERMINOLOGY_SERVER` is configured**. (`:not-in` is **never** delegated — it
   returns `501` regardless of configuration; see §7.2.)
-- **Critical behavior:** when no terminology server is configured, the server does
-  **not** reject `:in`/`:above`/`:below` — it **silently ignores** them and
-  returns a `200` with literal-match (effectively wrong) results. The UI therefore
-  CANNOT rely on an HTTP error to detect unavailability; it MUST gate these
-  modifiers on configuration/capability detection.
+- **Behavior (changed):** when no terminology server is configured, the server now
+  **rejects** a token `:in`/`:above`/`:below` with **`501 Not Implemented`**
+  rather than silently returning literal-match results. (On reference/uri params,
+  `:above`/`:below` resolve locally and are unaffected.) So a `501` is now a
+  reliable signal of unavailability — but the UI SHOULD still gate these modifiers
+  on configuration/capability detection for the best UX (disable rather than let
+  the user submit a request that will `501`). One residual edge: when a server
+  **is** configured but the `$expand` call errors, the param may fail open
+  (dropped, search continues) — a configured server is not an absolute guarantee.
 - UI requirements:
   - The UI MUST detect whether terminology delegation is available (via server
     capability/config signaling) and **only then**:
@@ -555,9 +640,10 @@ resource body.
     - show a **link-out to the configured terminology server (HTS)** in
       navigation (§5, item 12) and contextually near terminology-dependent
       controls.
-  - When no terminology server is configured, these modifiers and the link MUST
-    be hidden or disabled with an explanatory tooltip (since the server will
-    otherwise accept them and return misleading results).
+  - When no terminology server is configured, these modifiers and the link SHOULD
+    be hidden or disabled with an explanatory tooltip; if a request is sent anyway,
+    the UI MUST present the resulting `501` legibly (which scope/feature is
+    missing) rather than as an opaque error.
 
 ---
 
@@ -571,9 +657,13 @@ A dedicated area (and underpinning for §4.1) that exposes:
 - **SMART configuration** (`GET /.well-known/smart-configuration`): endpoints,
   scopes, capabilities.
 - **Search-parameter catalog**: browsable list of search parameters per resource
-  type (feeds the Search Builder). Note the served CapabilityStatement advertises
-  only the seven common params with no modifiers (§7.9), so this catalog must be
-  sourced from the bundled FHIR `SearchParameter` definitions, not `/metadata`.
+  type (feeds the Search Builder). The served CapabilityStatement now advertises
+  real per-type params, their supported modifiers (via a `valueCode` extension),
+  and real `searchInclude`/`searchRevInclude` targets (§7.9), so this catalog can
+  be sourced from `/metadata`. The bundled FHIR `SearchParameter` definitions and
+  the §7.2–§7.3 groupings remain a fallback and a cross-check (e.g. for clients
+  that do not read the vendor modifier extension, or for `_score`/`_source` which
+  are not advertised).
 
 ---
 
@@ -764,24 +854,39 @@ delivers, but may scaffold UI ahead of them (clearly marked).
 - **Chained / `_has` search:** resolved application-side (uniform across
   backends); nested `_has` supported. Reverse `_has` is capped at 4 (hardcoded,
   **not** configurable); forward chaining currently has **no** depth cap (§7.6).
-- **CapabilityStatement under-advertises search:** `GET /metadata` advertises only
-  seven common search params (and no modifiers) for every resource type; the UI
-  must source its search catalog elsewhere (§7.9).
-- **Silent-ignore search behaviors:** several unsupported or misconfigured search
-  inputs return `200` with wrong/unfiltered results instead of an error —
-  `:in`/`:above`/`:below` with no terminology server (§11), `_query`/`_list`/
-  `_score`/`_contained` (§7.1), a `_filter` that fails to parse (§7.1), and
-  unsupported `_sort` fields (§7.4). The UI must not treat a `200` as confirmation
-  the filter/sort was applied.
+- **CapabilityStatement search advertisement (now real):** `GET /metadata`
+  advertises real per-type search params, their modifiers (via a `valueCode`
+  extension, not the native `modifier` field), and real `searchInclude`/
+  `searchRevInclude` targets, so the UI MAY source its search catalog from
+  `/metadata` (§7.9). Residual minor gaps: `_score` and `_source` are not
+  advertised, and modifiers ride a vendor extension.
+- **Reduced silent-ignore surface:** the old "returns `200` with wrong/unfiltered
+  results" behavior has been narrowed. Now: `_query` → `400`; token
+  `:in`/`:above`/`:below`/`:not-in` that cannot be satisfied → `501` (§11);
+  `_contained` on an unsupporting backend → `501`; and under `Prefer:
+  handling=strict`, unknown params and unsortable `_sort` fields → `400`. The
+  **remaining** silent behaviors the UI must still not treat a `200` as success
+  for: a `_filter` that fails to parse is silently dropped (§7.1); an unsupported
+  `_sort` field is silently ignored under the **lenient** default (§7.4); and an
+  unknown param is ignored under lenient. The UI must not treat a lenient `200` as
+  confirmation the filter/sort was applied.
 - **No prefix/parameter-type validation:** `hfs` never validates search prefixes
-  against parameter type, so misuse (e.g. `gt` on a string param, or `sa`/`eb` on
-  number — which the spec allows only for date/quantity) is neither rejected nor
-  reliably honored — the UI must scope prefixes client-side (§7.3).
-- **No search-value escaping:** the server does not unescape `\,` `\|` `\$` `\\`
-  in search values, so literal commas/pipes in user input are mis-split into
-  OR-values / token `system|code`. The UI must escape on its own (§7.1).
+  against parameter type on the request path, so misuse (e.g. `gt` on a string
+  param, or `sa`/`eb` on number) is neither rejected nor reliably honored — the UI
+  must scope prefixes client-side (§7.3).
+- **Partial search-value escaping:** the server now unescapes `\,` and `\\` in
+  search values (so backslash-escaped commas are kept literal), but still does
+  **not** unescape `\|` or `\$`, so literal pipes in user input are still mis-split
+  into token `system|code`. The UI must emit `\,` for literal commas and guard
+  `|`/`$` itself (§7.1).
 - **Search pagination links:** Bundles never include `first`/`last` links — paging
   must use `next`/`previous` only (§7.4).
+- **No system-level (cross-type) search:** search is type-scoped only —
+  `GET /{type}?…` and `POST /{type}/_search`. There is no system-wide
+  `GET /?_type=…` or root `POST /_search` (root `POST /` is batch/transaction), so
+  the spec's all-types search and the `_type` parameter are not available. The
+  Search Builder MUST require a resource type and MUST NOT offer an all-types
+  search entry point.
 - **No `$validate`, `$everything`, `$graph`, `$document` operations.**
 - **No GraphQL endpoint.**
 - **No user-defined custom `$operations` registration.**
