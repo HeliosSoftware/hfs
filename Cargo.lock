@@ -2997,7 +2997,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helios-audit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3016,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "helios-auth"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bitflags 2.11.1",
@@ -3035,7 +3035,7 @@ dependencies = [
 
 [[package]]
 name = "helios-cds-hooks"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhir"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "clap",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhir-gen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "clap",
@@ -3081,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhir-macro"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "heck",
  "helios-fhirpath-support",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "helios-fhirpath"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3132,14 +3132,14 @@ dependencies = [
 
 [[package]]
 name = "helios-fhirpath-support"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rust_decimal",
 ]
 
 [[package]]
 name = "helios-hfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "helios-hts"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3206,7 +3206,7 @@ dependencies = [
 
 [[package]]
 name = "helios-persistence"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "helios-rest"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3306,7 +3306,7 @@ dependencies = [
 
 [[package]]
 name = "helios-serde"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "helios-fhir",
  "helios-fhir-macro",
@@ -3322,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "helios-serde-support"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3330,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "helios-sof"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3376,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "helios-subscriptions"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5464,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "pysof"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "csv",
