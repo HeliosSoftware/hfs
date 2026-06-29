@@ -20,7 +20,7 @@ SOURCE_TYPE_RESTFUL_INTERACTION_VS = "http://hl7.org/fhir/ValueSet/type-restful-
 SOURCE_SYSTEM_RESTFUL_INTERACTION_VS = "http://hl7.org/fhir/ValueSet/system-restful-interaction"
 SOURCE_INTERACTION_TRIGGER_VS = "http://hl7.org/fhir/ValueSet/interaction-trigger"
 SOURCE_TESTSCRIPT_OPERATION_CODES_VS = "http://hl7.org/fhir/ValueSet/testscript-operation-codes"
-DEFAULT_TX_BASE_URL = "https://tx.fhir.org/r5"
+DEFAULT_TX_BASE_URL = "https://hts.heliossoftware.com"
 
 VALID_AUDIT_EVENT_TYPE_CODES = {"rest", "hl7-v2", "hl7-v3", "document", "object"}
 VALID_RESTFUL_INTERACTION_CODES = {
@@ -95,7 +95,7 @@ TERMINOLOGY_SOURCES = [
         "note": "Cross-check context for operation-style interaction codes.",
     },
     {
-        "name": "tx-r5-live-validation",
+        "name": "hts-live-validation",
         "url": DEFAULT_TX_BASE_URL,
         "mode": "strict",
         "applies_to": "Every extracted AuditEvent code usage (system+code)",
@@ -1054,7 +1054,7 @@ def main() -> int:
     if terminology_context.get("tx_validation") is not None:
         tx_result = terminology_context["tx_validation"]
         lines.append("")
-        lines.append("### tx.fhir.org/r5 Validation")
+        lines.append("### Terminology Server Validation")
         lines.append("")
         lines.append(f"- Base URL: `{tx_result['tx_base_url']}`")
         lines.append(f"- Total code occurrences validated: **{tx_result['total_occurrences']}**")

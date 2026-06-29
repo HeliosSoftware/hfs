@@ -723,7 +723,7 @@ jobs:
           )
 
           if printf "%s\n" "$VALIDATOR_HELP" | grep -q -- "--tx-base-url"; then
-            VALIDATE_ARGS+=(--tx-base-url "https://tx.fhir.org/r5")
+            VALIDATE_ARGS+=(--tx-base-url "https://hts.heliossoftware.com")
           fi
           if printf "%s\n" "$VALIDATOR_HELP" | grep -q -- "--tx-timeout-seconds"; then
             VALIDATE_ARGS+=(--tx-timeout-seconds 12)
