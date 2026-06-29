@@ -594,7 +594,7 @@ def build_terminology_context(events: list[dict[str, Any]], tx_validation: dict[
     sources = [dict(source) for source in TERMINOLOGY_SOURCES]
     if tx_validation is not None:
         for source in sources:
-            if source.get("name") == "tx-r5-live-validation":
+            if source.get("name") == "hts-live-validation":
                 source["url"] = tx_validation.get("tx_base_url", source["url"])
 
     context = {
