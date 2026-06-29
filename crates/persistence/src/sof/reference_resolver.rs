@@ -97,24 +97,15 @@ impl StorageReferenceResolver for StorageBackedResolver {
             return Vec::new();
         }
 
-        // Cap fan-out before doing any I/O.
-        let capped = &refs[..refs.len().min(self.max_fanout)];
-        if capped.len() < refs.len() {
+        // Group ids by resource type, fairly capping fan-out before any I/O, so
+        // each type is read with a single tenant-scoped `read_batch`.
+        let (ids_by_type, total) = group_and_cap_refs(refs, self.max_fanout);
+        if total > self.max_fanout {
             warn!(
-                requested = refs.len(),
+                requested = total,
                 cap = self.max_fanout,
                 "storage resolve(): reference fan-out exceeded cap; extra references left unresolved"
             );
-        }
-
-        // Group ids by resource type so each type is read with a single
-        // tenant-scoped `read_batch`.
-        let mut ids_by_type: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (resource_type, id) in capped {
-            ids_by_type
-                .entry(resource_type.as_str())
-                .or_default()
-                .push(id.as_str());
         }
 
         let mut out = Vec::new();
@@ -142,6 +133,59 @@ impl StorageReferenceResolver for StorageBackedResolver {
         }
         out
     }
+}
+
+/// Groups `refs` by resource type, fairly capping the total at `max_fanout`.
+///
+/// `refs` arrives sorted lexicographically by `"Type/id"` (it originates from a
+/// [`BTreeSet`] in [`collect_missing_references`]), so a naive prefix-slice cap
+/// would silently drop every reference of a later-alphabetical resource type
+/// once the budget is hit (e.g. 1000 `Observation`s would crowd out a lone
+/// `Practitioner`). Instead the budget is filled round-robin across types, so
+/// each type keeps a fair share and no type is dropped wholesale.
+///
+/// Returns the grouped (and possibly capped) ids plus the total number of
+/// references seen before capping, so the caller can warn when any were dropped.
+fn group_and_cap_refs(
+    refs: &[(String, String)],
+    max_fanout: usize,
+) -> (BTreeMap<&str, Vec<&str>>, usize) {
+    let mut by_type: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (resource_type, id) in refs {
+        by_type
+            .entry(resource_type.as_str())
+            .or_default()
+            .push(id.as_str());
+    }
+
+    let total = refs.len();
+    if total <= max_fanout {
+        return (by_type, total);
+    }
+
+    // Fill the budget round-robin across types: one id per type per round, in
+    // sorted-type order, until the cap is reached or every type is exhausted.
+    let mut capped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut budget = max_fanout;
+    let mut round = 0;
+    'fill: while budget > 0 {
+        let mut progressed = false;
+        for (resource_type, ids) in &by_type {
+            if let Some(&id) = ids.get(round) {
+                capped.entry(*resource_type).or_default().push(id);
+                progressed = true;
+                budget -= 1;
+                if budget == 0 {
+                    break 'fill;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+        round += 1;
+    }
+    (capped, total)
 }
 
 /// Collects the distinct relative `Type/id` references found anywhere in
@@ -292,6 +336,57 @@ mod tests {
         ];
         let refs = collect_missing_references(&bundle);
         assert_eq!(refs, vec![("Patient".to_string(), "123".to_string())]);
+    }
+
+    #[test]
+    fn fair_cap_is_noop_under_budget() {
+        let refs = vec![
+            ("Patient".to_string(), "1".to_string()),
+            ("Observation".to_string(), "2".to_string()),
+        ];
+        let (grouped, total) = group_and_cap_refs(&refs, 1000);
+        assert_eq!(total, 2);
+        assert_eq!(grouped.get("Patient").map(Vec::len), Some(1));
+        assert_eq!(grouped.get("Observation").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn fair_cap_keeps_later_alphabetical_types() {
+        // Regression: a flat prefix-slice cap of the lexicographically-sorted
+        // ref list keeps 1000 `Observation`s and drops the lone `Practitioner`
+        // entirely. The fair round-robin cap must keep the Practitioner.
+        let mut refs: Vec<(String, String)> = (0..1000)
+            .map(|i| ("Observation".to_string(), format!("o{i}")))
+            .collect();
+        refs.push(("Practitioner".to_string(), "p1".to_string()));
+
+        let (capped, total) = group_and_cap_refs(&refs, 1000);
+        assert_eq!(total, 1001);
+        let kept: usize = capped.values().map(Vec::len).sum();
+        assert_eq!(kept, 1000, "must respect the fan-out cap");
+        assert_eq!(
+            capped.get("Practitioner").map(Vec::len),
+            Some(1),
+            "later-alphabetical type must not be dropped wholesale"
+        );
+        assert_eq!(capped.get("Observation").map(Vec::len), Some(999));
+    }
+
+    #[test]
+    fn fair_cap_spreads_budget_across_many_types() {
+        // 10 types, 100 ids each (1000 total), cap 500 → each type keeps 50.
+        let mut refs: Vec<(String, String)> = Vec::new();
+        for t in 0..10 {
+            for i in 0..100 {
+                refs.push((format!("Type{t:02}"), format!("id{i}")));
+            }
+        }
+        let (capped, total) = group_and_cap_refs(&refs, 500);
+        assert_eq!(total, 1000);
+        assert_eq!(capped.len(), 10, "every type must survive the cap");
+        for (ty, ids) in &capped {
+            assert_eq!(ids.len(), 50, "type {ty} should get an even share");
+        }
     }
 
     #[test]
