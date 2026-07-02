@@ -195,6 +195,18 @@ jobs:
         # nor the request, so HTS cannot reproduce total=2384. Added upstream
         # 2026-06-08 (HL7/fhir-tx-ecosystem-ig@e187e74).
         version/vs-expand-versionless
+        # search/search-filter-yes — the primary `response` fixture is a
+        # HIERARCHICAL expansion (data-exchange with data-exchange1/2/3 nested
+        # under it). Upstream added a FLAT variant fixture
+        # (search-expand-filter-yes-flat-response.json) in
+        # HL7/fhir-tx-ecosystem-ig@7409a11a but never wired it via a
+        # `response:flat` key in test-cases.json (unlike search-all-yes, which
+        # got both). HTS returns a spec-valid FLAT expansion that matches that
+        # flat fixture byte-for-byte; a flat $expand is explicitly permitted
+        # (that's why the framework carries `response:flat` at all). Excluded
+        # pending an upstream PR to add the missing `response:flat` wiring.
+        # Added upstream 2026-07-01 (HL7/fhir-tx-ecosystem-ig@7409a11a).
+        search/search-filter-yes
     strategy:
       fail-fast: false
       matrix:

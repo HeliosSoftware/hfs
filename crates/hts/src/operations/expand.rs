@@ -472,6 +472,17 @@ fn populate_properties<'a, B: TerminologyBackend>(
         for c in contains.iter_mut() {
             if let Some(list) = map.remove(&(c.system.clone(), c.code.clone())) {
                 let cs_types = prop_types_by_system.get(&c.system);
+                // Dedupe identical (property, value) pairs. `concept_property_values`
+                // joins by CodeSystem URL only, so when the same URL is stored
+                // in more than one version (e.g. v3-ActReason from UTG plus the
+                // IG's own cs-act-reason.json fixture), a concept's `status`
+                // property is returned once per version. The IG
+                // `tho/expand-vs-act-exclusion` fixture expects a single
+                // `status` entry — an exact-pair dedupe collapses the versions
+                // while still allowing genuinely-distinct same-code properties
+                // (e.g. multiple `parent` values) through.
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
                 c.properties = list
                     .into_iter()
                     .filter(|(code, value)| {
@@ -485,6 +496,7 @@ fn populate_properties<'a, B: TerminologyBackend>(
                         // Only emit when the status is non-active.
                         !(code == "status" && value == "active")
                     })
+                    .filter(|pair| seen.insert(pair.clone()))
                     .map(|(code, value)| {
                         // Pick the FHIR `value[x]` shape from the property
                         // code:

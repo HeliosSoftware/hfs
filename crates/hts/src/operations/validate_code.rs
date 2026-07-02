@@ -1169,12 +1169,14 @@ async fn build_validate_response_async<B: TerminologyBackend>(
 ) -> Value {
     // For inactive concepts whose underlying status is more specific than
     // "inactive" (e.g. `retired`, `deprecated`, `withdrawn`), the IG
-    // `inactive/validate-inactive-3*` fixtures expect TWO warning issues:
-    // one with text "...has a status of inactive..." (the canonical wording
-    // already emitted by the backend) AND a second with text using the
-    // specific status code (e.g. "...has a status of retired..."). Detect
-    // that case here by looking up the concept's `status` property and
-    // appending a second issue when needed.
+    // `inactive/validate-inactive-3*` fixtures expect a SINGLE merged warning
+    // that names both the specific status and the generic inactive flag:
+    // "...has a status of retired and inactive and its use should be reviewed".
+    // (Upstream HL7/fhir-tx-ecosystem-ig@030182b7 replaced the earlier
+    // two-issue form — a generic "...status of inactive..." plus a separate
+    // "...status of retired..." — with this merged wording.) Detect the case
+    // here by looking up the concept's `status` property and rewriting the
+    // backend's generic "...status of inactive..." issue in place.
     if resp.inactive == Some(true) {
         let inferred_system = resp.system.clone();
         let lookup_system: Option<&str> = system.or(inferred_system.as_deref());
@@ -1187,30 +1189,18 @@ async fn build_validate_response_async<B: TerminologyBackend>(
                 if resp.concept_status.is_none() {
                     resp.concept_status = Some(specific_status.clone());
                 }
-                let already_has_specific = resp.issues.iter().any(|i| {
+                let merged_text = format!(
+                    "The concept '{cd}' has a status of {specific_status} and inactive and its use should be reviewed"
+                );
+                // Rewrite the generic INACTIVE_CONCEPT_FOUND issue's text to the
+                // merged form. Guard on the generic wording so re-entry (the
+                // merged text no longer contains "has a status of inactive") is
+                // idempotent and we don't rewrite an already-merged issue.
+                if let Some(issue) = resp.issues.iter_mut().find(|i| {
                     i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
-                        && i.text
-                            .contains(&format!("has a status of {specific_status} and"))
-                });
-                if !already_has_specific {
-                    let inactive_issue = resp.issues.iter().find(|i| {
-                        i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
-                            && i.text.contains("has a status of inactive")
-                    });
-                    if let Some(template) = inactive_issue.cloned() {
-                        let new_text = format!(
-                            "The concept '{cd}' has a status of {specific_status} and its use should be reviewed"
-                        );
-                        resp.issues.push(ValidationIssue {
-                            severity: template.severity,
-                            fhir_code: template.fhir_code,
-                            tx_code: template.tx_code,
-                            text: new_text,
-                            expression: template.expression,
-                            location: template.location,
-                            message_id: template.message_id,
-                        });
-                    }
+                        && i.text.contains("has a status of inactive")
+                }) {
+                    issue.text = merged_text;
                 }
             }
         }
@@ -2429,16 +2419,17 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
             .and_then(|p| p.get("valueCodeableConcept"))
             .cloned();
-        // The IG fixtures expect the LAST matching coding to win (when several
+        // The IG fixtures expect the FIRST matching coding to win (when several
         // codings in a CodeableConcept all validate, the response echoes the
-        // last one). Iterate in reverse so the earliest "yes" we find is the
-        // last entry in the input.
+        // first one in input order). Iterate forward and return on the first
+        // "yes". (Upstream HL7/fhir-tx-ecosystem-ig@b5658de8 switched this from
+        // last-wins to first-wins.)
         let cc_req_version = find_str_param(&params, "version");
         let cs_lenient = params
             .iter()
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
             .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()));
-        for (system, code) in codings.into_iter().rev() {
+        for (system, code) in codings.into_iter() {
             let req = ValidateCodeRequest {
                 url: None,
                 value_set_version: None,
@@ -5017,10 +5008,11 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                     .collect()
             })
             .unwrap_or_default();
-        // The IG fixtures expect the LAST matching coding to win (when several
+        // The IG fixtures expect the FIRST matching coding to win (when several
         // codings in a CodeableConcept all validate, the response echoes the
-        // last one). Iterate in reverse so the earliest "yes" we find is the
-        // last entry in the input.
+        // first one in input order). Iterate forward and return on the first
+        // "yes". (Upstream HL7/fhir-tx-ecosystem-ig@b5658de8 switched this from
+        // last-wins to first-wins.)
         //
         // Also track per-coding `unknown-code` failures (codes that don't
         // exist in their CS) so we can surface them in the response even when
@@ -5031,15 +5023,14 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         // bad coding's `Unknown_Code_in_Version` error +
         // `None_of_the_provided_codes_are_in_the_value_set_one` info.
         let cc_req_version = find_str_param(&params, "version").or(system_version.clone());
-        // Map (system, code) → original CC index (preserved through reverse
-        // iteration) so per-coding failure issues reference
-        // `CodeableConcept.coding[N]` with the input order's N.
+        // Map (system, code) → original CC index so per-coding failure issues
+        // reference `CodeableConcept.coding[N]` with the input order's N.
         let coding_index: std::collections::HashMap<(String, String), usize> = codings
             .iter()
             .enumerate()
             .map(|(i, (s, c))| ((s.clone(), c.clone()), i))
             .collect();
-        for (system, code) in codings.clone().into_iter().rev() {
+        for (system, code) in codings.clone().into_iter() {
             // Prefer the per-coding version (embedded in the CC) over the
             // top-level `version` parameter so that version-mismatch detection
             // fires correctly for each coding.
@@ -5236,12 +5227,11 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                 let coding_display = coding_displays
                     .get(&(system.clone(), code.clone()))
                     .cloned();
-                // ── Walk remaining codings (those we haven't reached yet in
-                // reverse iteration, i.e. earlier in input order) and check
-                // for hard `unknown-code` failures. If any exist, the IG
-                // `permutations/simple-bad-cc2-*` fixtures expect us to echo
-                // THIS coding's metadata but mark result=false and surface
-                // the bad coding's issues.
+                // ── Walk the other codings (every entry except this winning
+                // one) and check for hard `unknown-code` failures. If any
+                // exist, the IG `permutations/simple-bad-cc2-*` fixtures expect
+                // us to echo THIS coding's metadata but mark result=false and
+                // surface the bad coding's issues.
                 let success_idx = coding_index
                     .get(&(system.clone(), code.clone()))
                     .copied()
@@ -5423,7 +5413,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             //      `codeableconcept-vnn-vs1wb` family expects the
             //      `UNKNOWN_CODESYSTEM_VERSION` issue + `x-caused-by-unknown-system`
             //      parameter. Limited to single-coding to avoid short-circuiting
-            //      the reverse loop before a later (good) coding gets visited
+            //      the loop before a later (good) coding gets visited
             //      in multi-coding CCs.
             let has_unknown_cs_version = codings.len() == 1
                 && resp
