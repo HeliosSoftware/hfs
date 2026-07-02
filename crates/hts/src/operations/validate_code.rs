@@ -4984,6 +4984,12 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
             .as_ref()
             .and_then(|cc| cc.get("coding").and_then(|v| v.as_array()))
             .map(|arr| {
+                // Keep the FIRST occurrence per (system, code) so the display
+                // matches the first-wins coding selection below. Two codings
+                // can share a (system, code) with different displays (e.g. the
+                // IG `overload/validate-good2a` fixture: code2 with "Display #2"
+                // then "Display 2") — last-wins `.collect()` would echo the
+                // wrong coding's display and resolve the wrong CS version.
                 arr.iter()
                     .filter_map(|c| {
                         let s = c.get("system").and_then(|v| v.as_str())?.to_string();
@@ -4991,13 +4997,17 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         let d = c.get("display").and_then(|v| v.as_str())?.to_string();
                         Some(((s, cd), d))
                     })
-                    .collect()
+                    .fold(std::collections::HashMap::new(), |mut m, (k, v)| {
+                        m.entry(k).or_insert(v);
+                        m
+                    })
             })
             .unwrap_or_default();
         let coding_versions: std::collections::HashMap<(String, String), String> = cc_value
             .as_ref()
             .and_then(|cc| cc.get("coding").and_then(|v| v.as_array()))
             .map(|arr| {
+                // First-occurrence-wins, as for `coding_displays` above.
                 arr.iter()
                     .filter_map(|c| {
                         let s = c.get("system").and_then(|v| v.as_str())?.to_string();
@@ -5005,7 +5015,10 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         let v = c.get("version").and_then(|v| v.as_str())?.to_string();
                         Some(((s, cd), v))
                     })
-                    .collect()
+                    .fold(std::collections::HashMap::new(), |mut m, (k, v)| {
+                        m.entry(k).or_insert(v);
+                        m
+                    })
             })
             .unwrap_or_default();
         // The IG fixtures expect the FIRST matching coding to win (when several
@@ -5025,11 +5038,14 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         let cc_req_version = find_str_param(&params, "version").or(system_version.clone());
         // Map (system, code) → original CC index so per-coding failure issues
         // reference `CodeableConcept.coding[N]` with the input order's N.
+        // First-occurrence-wins to match the first-wins coding selection.
         let coding_index: std::collections::HashMap<(String, String), usize> = codings
             .iter()
             .enumerate()
-            .map(|(i, (s, c))| ((s.clone(), c.clone()), i))
-            .collect();
+            .fold(std::collections::HashMap::new(), |mut m, (i, (s, c))| {
+                m.entry((s.clone(), c.clone())).or_insert(i);
+                m
+            });
         for (system, code) in codings.clone().into_iter() {
             // Prefer the per-coding version (embedded in the CC) over the
             // top-level `version` parameter so that version-mismatch detection
