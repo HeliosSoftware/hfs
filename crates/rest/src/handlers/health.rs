@@ -27,20 +27,16 @@ use crate::state::AppState;
 ///
 /// - `200 OK` - Server is healthy
 /// - `503 Service Unavailable` - Server is unhealthy
-pub async fn health_handler<S>(State(state): State<AppState<S>>) -> RestResult<Response>
+pub async fn health_handler<S>(State(_state): State<AppState<S>>) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
 {
     debug!("Processing health check request");
 
-    // Perform a simple check - we could add more sophisticated checks here
-    let backend_name = state.storage().backend_name();
-
     let health_response = serde_json::json!({
         "status": "ok",
         "service": "hfs",
         "version": env!("CARGO_PKG_VERSION"),
-        "backend": backend_name,
         "uptime_seconds": helios_observability::uptime::uptime_seconds(),
         "started_at": helios_observability::uptime::started_at_rfc3339(),
         "timestamp": chrono::Utc::now().to_rfc3339()
@@ -67,7 +63,7 @@ pub async fn liveness_handler() -> impl IntoResponse {
 /// # HTTP Request
 ///
 /// `GET [base]/_readiness`
-pub async fn readiness_handler<S>(State(state): State<AppState<S>>) -> RestResult<Response>
+pub async fn readiness_handler<S>(State(_state): State<AppState<S>>) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
 {
@@ -75,11 +71,8 @@ where
 
     // Try a simple operation to verify storage is working
     // In a real implementation, we might try a count or read operation
-    let backend_name = state.storage().backend_name();
-
     let response = serde_json::json!({
         "status": "ready",
-        "backend": backend_name,
         "checks": {
             "storage": "ok"
         }

@@ -46,6 +46,12 @@ pub async fn track(req: Request, next: Next) -> Response {
 
     span.record("http.status_code", status);
 
+    // Feed the in-process rolling log that backs the dashboard traffic widgets
+    // (windowed req/s, latency percentiles, per-tenant rollup). Cheap: a single
+    // bounded-buffer push. Tenant is recorded here for the per-tenant view but,
+    // as above, never becomes a Prometheus label.
+    crate::reqlog::record(status, elapsed, &tenant);
+
     let method = method.as_str().to_owned();
     let status = status.to_string();
     metrics::counter!(

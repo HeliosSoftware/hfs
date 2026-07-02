@@ -42,6 +42,12 @@ pub fn router() -> Router {
     Router::new().route("/metrics", get(render))
 }
 
+// Note: per-tenant resource-count gauges are intentionally NOT exported here.
+// The `/metrics` endpoint is public (unauthenticated, for Prometheus scraping),
+// and tenant is never a metric label — exporting per-tenant counts would leak
+// cross-tenant data to any anonymous scraper. Per-tenant stored-resource counts
+// are served only via the authenticated console `resource-counts` JSON endpoint.
+
 /// Render the Prometheus exposition text. The `uptime_seconds` gauge is set
 /// immediately before rendering because the pull exporter has no scrape
 /// callback.

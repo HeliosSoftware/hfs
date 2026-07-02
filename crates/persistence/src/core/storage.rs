@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
@@ -14,6 +15,33 @@ use crate::core::sof_runner::SofRunner;
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
+
+/// One UTC-day bucket of stored-resource counts.
+///
+/// Returned by [`ResourceStorage::count_by_day`] to back "FHIR resources over
+/// time" dashboards. See that method for the precise counting semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyResourceCount {
+    /// The UTC calendar day this bucket covers.
+    pub day: NaiveDate,
+    /// Number of non-deleted, current-version resources whose `last_updated`
+    /// falls on `day`.
+    pub count: u64,
+}
+
+/// One `(weekday, hour)` cell of write-activity, used by
+/// [`ResourceStorage::activity_histogram`] to back the dashboard's "Activity"
+/// heatmap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityCell {
+    /// UTC day of week, `0` = Sunday … `6` = Saturday (matching JavaScript's
+    /// `Date.getDay()`, so the frontend can index directly).
+    pub weekday: u8,
+    /// UTC hour of day, `0` … `23`.
+    pub hour: u8,
+    /// Number of write operations (resource versions) in this cell.
+    pub count: u64,
+}
 
 /// Audit event helpers for purge operations.
 #[cfg(feature = "audit")]
@@ -380,6 +408,120 @@ pub trait ResourceStorage: Send + Sync {
     /// The default implementation returns `None`.
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
         None
+    }
+
+    /// Counts non-deleted resources for several types in one call.
+    ///
+    /// Returns `(resource_type, count)` pairs in the same order as
+    /// `resource_types`. The default implementation issues one
+    /// [`count`](Self::count) query per type; backends may override with a
+    /// single grouped query.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_types` - The FHIR resource types to count
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        let mut counts = Vec::with_capacity(resource_types.len());
+        for &rt in resource_types {
+            counts.push((rt.to_string(), self.count(tenant, Some(rt)).await?));
+        }
+        Ok(counts)
+    }
+
+    /// Counts non-deleted, current-version resources of `resource_type`,
+    /// grouped by the UTC calendar day of their `last_updated`, restricted to
+    /// days on or after `since`.
+    ///
+    /// Only non-empty days are returned, in ascending day order. This powers
+    /// "FHIR resources over time" dashboards.
+    ///
+    /// # Semantics
+    ///
+    /// A resource contributes to the day of its **most recent** version, so a
+    /// running cumulative sum of these buckets converges to the current total
+    /// reported by [`count`](Self::count); it does not reconstruct historical
+    /// creation dates. A creation-time-accurate series would require
+    /// aggregating `resource_history` and is intentionally out of scope here.
+    ///
+    /// The default implementation returns an empty series for backends that
+    /// cannot bucket by time; callers should treat that as "no time resolution
+    /// available" and fall back to the current total.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_type` - The FHIR resource type to bucket
+    /// * `since` - Inclusive lower bound; only days on or after this instant
+    async fn count_by_day(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _since: DateTime<Utc>,
+    ) -> StorageResult<Vec<DailyResourceCount>> {
+        Ok(Vec::new())
+    }
+
+    /// Buckets write activity into a weekly-rhythm grid by UTC weekday and hour.
+    ///
+    /// Every resource version (create, update, or delete) recorded in
+    /// `resource_history` on or after `since` counts as one write operation; the
+    /// result is the per-`(weekday, hour)` operation count aggregated across the
+    /// whole window. Only non-empty cells are returned, so callers densify into
+    /// the full 7×24 grid themselves.
+    ///
+    /// This powers the dashboard "Activity" heatmap. It reflects **writes only**
+    /// — reads and searches are not in `resource_history`; an
+    /// all-operations variant would draw from `AuditEvent` instead.
+    ///
+    /// The default implementation returns an empty grid for backends that cannot
+    /// bucket by time.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `since` - Inclusive lower bound; only versions on or after this instant
+    async fn activity_histogram(
+        &self,
+        _tenant: &TenantContext,
+        _since: DateTime<Utc>,
+    ) -> StorageResult<Vec<ActivityCell>> {
+        Ok(Vec::new())
+    }
+
+    /// Counts non-deleted resources grouped by resource type for `tenant`,
+    /// returning one `(resource_type, count)` pair per type present. Order is
+    /// unspecified; callers sort as needed.
+    ///
+    /// Powers the dashboard "resource composition" treemap. Unlike
+    /// [`count_by_types`](Self::count_by_types), the caller does not supply the
+    /// type list — every stored type is discovered via a single `GROUP BY`. The
+    /// default implementation returns an empty list (it cannot enumerate types
+    /// without such a query); the SQL and document backends override it.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    async fn count_all_types(
+        &self,
+        _tenant: &TenantContext,
+    ) -> StorageResult<Vec<(String, u64)>> {
+        Ok(Vec::new())
+    }
+
+    /// Counts non-deleted resources grouped by tenant across the entire backend.
+    ///
+    /// **This intentionally spans tenants** and exists for operator/admin
+    /// dashboards (the per-tenant comparison widget), not for tenant-scoped
+    /// request handling — hence it takes no [`TenantContext`]. The default
+    /// implementation returns an empty list; the SQL and document backends
+    /// override it with a single `GROUP BY tenant_id`.
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        Ok(Vec::new())
     }
 }
 

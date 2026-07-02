@@ -592,6 +592,7 @@ async fn serve(
 /// returns `(config, None)`.
 async fn init_auth_with_audit(
     audit_sink: Arc<dyn AuditSink>,
+    tenant_url_routing: bool,
 ) -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
     let auth_config = AuthConfig::from_env();
 
@@ -667,6 +668,7 @@ async fn init_auth_with_audit(
         audit_sink,
         audit_source_observer: audit_config.source_observer.clone(),
         audit_exclusion_filter: ExclusionFilter::new(audit_config.exclusions.clone()),
+        tenant_url_routing,
     });
 
     Ok((auth_config, Some(auth_state)))
@@ -786,7 +788,11 @@ async fn main() -> anyhow::Result<()> {
     let (audit_sink, audit_state) = init_audit(&config, backend_mode).await?;
 
     // Initialize authentication (with audit bridge if audit is enabled)
-    let (auth_config, auth_state) = init_auth_with_audit(audit_sink).await?;
+    let (auth_config, auth_state) = init_auth_with_audit(
+        audit_sink,
+        config.multitenancy.routing_mode.supports_url_path(),
+    )
+    .await?;
 
     let audit_config = AuditConfig::from_env();
 

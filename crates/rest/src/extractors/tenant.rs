@@ -143,7 +143,7 @@ where
         // verify that the JWT tenant matches any header/URL tenant to prevent
         // confusion between URL context and actual data access.
         if let Some(principal) = parts.extensions.get::<helios_auth::Principal>() {
-            if let Some(jwt_tenant) = principal.tenant_id() {
+            if let Some(jwt_tenant) = principal.tenant_id().filter(|t| !t.is_empty()) {
                 if config.multitenancy.strict_validation {
                     let resolver = TenantResolver::new(&config.multitenancy);
                     let resolved =
@@ -165,6 +165,36 @@ where
                     crate::tenant::TenantSource::JwtClaim,
                 ));
             }
+
+            // A Principal is present (auth enabled + token validated) but the token
+            // carries no (usable) tenant claim. We must NOT trust the client-supplied
+            // X-Tenant-ID header or URL-path tenant here — doing so would let an
+            // authenticated caller widen access to an arbitrary tenant by spoofing
+            // the header.
+            //
+            // Determine what tenant the REQUEST asked for. If the client explicitly
+            // selected a specific, non-default tenant via header/URL, fail loud: a
+            // claimless token silently collapsing to the default would commingle
+            // distinct tenants into one bucket in a multitenant-with-auth deployment.
+            // If nothing (or only the default) was requested, fall back to the
+            // configured default so single-tenant-with-auth deployments keep working.
+            let resolver = TenantResolver::new(&config.multitenancy);
+            let resolved = resolver.resolve(parts, &config.multitenancy, &config.default_tenant);
+            if resolved.tenant_id_str() != config.default_tenant {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Authenticated token is missing the required tenant claim".to_string(),
+                ));
+            }
+            // Fail closed on a misconfigured empty default tenant rather than
+            // building an empty-tenant context (mirrors the resolver path below).
+            if config.default_tenant.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "Invalid tenant ID".to_string()));
+            }
+            return Ok(TenantExtractor::new(
+                &config.default_tenant,
+                TenantSource::Default,
+            ));
         }
 
         // Create resolver based on configuration

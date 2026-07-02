@@ -36,5 +36,6 @@
 
 pub mod metrics;
 pub mod middleware;
+pub mod reqlog;
 pub mod telemetry;
 pub mod uptime;

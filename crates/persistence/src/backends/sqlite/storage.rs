@@ -476,6 +476,214 @@ impl ResourceStorage for SqliteBackend {
 
         Ok(count as u64)
     }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        // `last_updated` is stored as an RFC3339 UTC string (Utc::now().to_rfc3339()),
+        // e.g. `2026-06-01T14:30:00.123+00:00` — always `+00:00`, with a fixed-width
+        // `YYYY-MM-DDTHH:MM:SS` prefix. Its first 10 characters are the UTC calendar
+        // day, so we bucket on that prefix in SELECT/GROUP BY. The WHERE filter, by
+        // contrast, ranges over the *raw* column so the `(tenant_id, last_updated)`
+        // index can prune by date (wrapping the column in `substr(...)` would force a
+        // full scan). `since_bound` is the start-of-day timestamp for `since` in the
+        // stored format; since every stored value shares that fixed prefix and any
+        // sub-day suffix (`.` = 0x2E or `+` = 0x2B) sorts at/after `...T00:00:00+00:00`,
+        // the lexicographic `>=` selects exactly the rows the day-prefix filter did.
+        let since_bound = since
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is always a valid time")
+            .and_utc()
+            .to_rfc3339();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT substr(last_updated, 1, 10) AS day, COUNT(*) AS n \
+                 FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                   AND last_updated >= ?3 \
+                 GROUP BY day ORDER BY day",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare count_by_day: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![tenant_id, resource_type, since_bound], |row| {
+                let day: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((day, n))
+            })
+            .map_err(|e| internal_error(format!("Failed to query count_by_day: {}", e)))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (day_str, n) = row
+                .map_err(|e| internal_error(format!("Failed to read count_by_day row: {}", e)))?;
+            if let Ok(day) = chrono::NaiveDate::parse_from_str(&day_str, "%Y-%m-%d") {
+                out.push(crate::core::DailyResourceCount {
+                    day,
+                    count: n.max(0) as u64,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<crate::core::ActivityCell>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        // Start-of-day bound for `since` in the stored RFC3339 UTC format; see
+        // `count_by_day` for why a raw-column `last_updated >= ?` range is both
+        // sargable (uses the `(tenant_id, last_updated)` history index) and selects
+        // exactly the same rows the old `substr(last_updated, 1, 10) >= day` filter did.
+        let since_bound = since
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is always a valid time")
+            .and_utc()
+            .to_rfc3339();
+
+        // `strftime` parses the stored RFC3339 UTC string and yields UTC weekday
+        // (`%w`: 0=Sunday..6=Saturday) and hour (`%H`: 00..23).
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST(strftime('%w', last_updated) AS INTEGER) AS wd, \
+                        CAST(strftime('%H', last_updated) AS INTEGER) AS hr, \
+                        COUNT(*) AS n \
+                 FROM resource_history \
+                 WHERE tenant_id = ?1 AND last_updated >= ?2 \
+                 GROUP BY wd, hr",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare activity_histogram: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![tenant_id, since_bound], |row| {
+                let wd: i64 = row.get(0)?;
+                let hr: i64 = row.get(1)?;
+                let n: i64 = row.get(2)?;
+                Ok((wd, hr, n))
+            })
+            .map_err(|e| internal_error(format!("Failed to query activity_histogram: {}", e)))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (wd, hr, n) = row
+                .map_err(|e| internal_error(format!("Failed to read activity row: {}", e)))?;
+            out.push(crate::core::ActivityCell {
+                weekday: wd.clamp(0, 6) as u8,
+                hour: hr.clamp(0, 23) as u8,
+                count: n.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_all_types(
+        &self,
+        tenant: &TenantContext,
+    ) -> StorageResult<Vec<(String, u64)>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut stmt = conn
+            .prepare(
+                "SELECT resource_type, COUNT(*) FROM resources \
+                 WHERE tenant_id = ?1 AND is_deleted = 0 \
+                 GROUP BY resource_type",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare count_all_types: {}", e)))?;
+        let rows = stmt
+            .query_map(params![tenant_id], |row| {
+                let rt: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((rt, n.max(0) as u64))
+            })
+            .map_err(|e| internal_error(format!("Failed to query count_all_types: {}", e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("count_all_types row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        // An empty `IN ()` is invalid SQL; nothing to count.
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Bind tenant_id as ?1 and each requested type as ?2, ?3, ...; the type
+        // names are bound as parameters, never interpolated into the SQL text.
+        let placeholders = (0..resource_types.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT resource_type, COUNT(*) FROM resources \
+             WHERE tenant_id = ?1 AND is_deleted = 0 AND resource_type IN ({}) \
+             GROUP BY resource_type",
+            placeholders
+        );
+
+        // Positional bind values matching the `?1..?n` order above: tenant first,
+        // then the requested types.
+        let mut binds: Vec<&str> = Vec::with_capacity(resource_types.len() + 1);
+        binds.push(tenant_id);
+        binds.extend_from_slice(resource_types);
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| internal_error(format!("Failed to prepare count_by_types: {}", e)))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds), |row| {
+                let rt: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((rt, n.max(0) as u64))
+            })
+            .map_err(|e| internal_error(format!("Failed to query count_by_types: {}", e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("count_by_types row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT tenant_id, COUNT(*) FROM resources \
+                 WHERE is_deleted = 0 GROUP BY tenant_id",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare count_by_tenant: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let tid: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((tid, n.max(0) as u64))
+            })
+            .map_err(|e| internal_error(format!("Failed to query count_by_tenant: {}", e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("count_by_tenant row: {}", e)))?);
+        }
+        Ok(out)
+    }
 }
 
 // Search Index Helpers

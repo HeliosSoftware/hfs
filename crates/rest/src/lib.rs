@@ -651,6 +651,13 @@ where
         }
     };
 
+    // Handles to the state for the console-metrics routers (public + protected),
+    // merged below — the public tier outside the auth layer, the protected tier
+    // behind it (see further down).
+    let console_public_state = state.clone();
+    let console_protected_state = state.clone();
+    let console_admin_state = state.clone();
+
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
 
@@ -678,6 +685,58 @@ where
     } else {
         router
     };
+
+    // Public console metrics — only the server-global `uptime` endpoint — are
+    // mounted OUTSIDE the auth/audit layers above (mirroring `/metrics`/`/health`)
+    // so the console can show liveness without a bearer token. Still covered by
+    // the shared CORS / timeout / body-limit / tracing stack applied below.
+    let router = router.merge(routing::console_metrics::public_routes(console_public_state));
+
+    // Tenant-scoped console metrics sit behind the same bearer-token auth as the
+    // FHIR routes. The tenant is taken authoritatively from the JWT claim (see
+    // TenantExtractor), so a spoofed `X-Tenant-ID` cannot widen access, and each
+    // handler only ever reads the caller's own tenant. `authz_middleware` no
+    // longer mis-classifies these `/console/*` paths as FHIR operations (see
+    // `extract_operation`), so it is a no-op here — authentication alone is the
+    // control. When auth is disabled server-wide, this tier is unprotected like
+    // every other route, matching existing behaviour.
+    let protected_console = routing::console_metrics::protected_routes(console_protected_state);
+    let protected_console = if let Some(ref auth) = auth_state {
+        protected_console
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::authz_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::auth_middleware,
+            ))
+    } else {
+        protected_console
+    };
+    let router = router.merge(protected_console);
+
+    // Cross-tenant console metrics (`tenants`, `traffic`) expose data spanning
+    // every tenant, so they require an administrative, system-context scope on top
+    // of authentication. `admin_authz_middleware` requires `system/*.r`, rejecting
+    // ordinary user-/patient-context tokens (even wildcard ones) with `403`. As
+    // with the other tiers, when auth is disabled server-wide there is no
+    // Principal and the middleware passes through, keeping dev-mode behaviour.
+    let admin_console = routing::console_metrics::admin_routes(console_admin_state);
+    let admin_console = if let Some(ref auth) = auth_state {
+        admin_console
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::admin_authz_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                middleware::auth::auth_middleware,
+            ))
+    } else {
+        admin_console
+    };
+    let router = router.merge(admin_console);
 
     // Build middleware stack
     let service_builder = ServiceBuilder::new()
