@@ -219,7 +219,7 @@ pub fn per_tenant(window_seconds: i64) -> Vec<TenantTraffic> {
             }
         })
         .collect();
-    out.sort_by(|a, b| b.sample_count.cmp(&a.sample_count));
+    out.sort_by_key(|b| std::cmp::Reverse(b.sample_count));
     out
 }
 
