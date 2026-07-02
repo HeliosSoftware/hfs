@@ -9,11 +9,20 @@
 use std::sync::OnceLock;
 
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 use crate::uptime;
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
+/// Latency histogram buckets (seconds) for `http_request_duration_seconds`.
+/// Configuring explicit buckets makes `metrics-exporter-prometheus` emit a real
+/// Prometheus **histogram** (`_bucket` / `le` series) instead of a summary, so
+/// `histogram_quantile()` works and quantiles aggregate correctly across
+/// instances scraped into one backend. A standard HTTP-latency spread.
+const LATENCY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Install the global Prometheus recorder. A global `service="<service_name>"`
 /// label is attached so the generic metric names (`http_requests_total`, …)
@@ -31,6 +40,11 @@ pub fn init(service_name: &str) {
     }
     let handle = PrometheusBuilder::new()
         .add_global_label("service", service_name)
+        .set_buckets_for_metric(
+            Matcher::Full("http_request_duration_seconds".to_string()),
+            LATENCY_BUCKETS,
+        )
+        .expect("failed to set latency histogram buckets")
         .install_recorder()
         .expect("failed to install Prometheus recorder");
     let _ = HANDLE.set(handle);

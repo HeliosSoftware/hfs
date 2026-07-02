@@ -55,6 +55,26 @@ const MAX_WINDOW_DAYS: i64 = 365;
 /// `types` parameter.
 const MAX_REQUESTED_TYPES: usize = 50;
 
+/// Classifies the storage backend as cluster-shared vs. instance-local for the
+/// `scope` / `resources_scope` fields. The console `count_*` calls delegate to
+/// the primary CRUD store, so shared-ness tracks that primary: networked stores
+/// (PostgreSQL, MongoDB, S3) are shared across a fleet (`"cluster"`), while
+/// SQLite (a per-instance file) is instance-local (`"single-instance"`).
+///
+/// This is derived from [`ResourceStorage::is_cluster_shared`], whose
+/// conservative default is `"single-instance"` so an unknown backend never
+/// over-claims cluster-consistency. Composite backends delegate to their primary
+/// store, so a Postgres-primary composite (e.g. `postgres-elasticsearch`) is
+/// correctly labelled `"cluster"` and a SQLite-primary composite (e.g.
+/// `sqlite-elasticsearch`) `"single-instance"`.
+fn resources_scope<S: ResourceStorage>(storage: &S) -> &'static str {
+    if storage.is_cluster_shared() {
+        "cluster"
+    } else {
+        "single-instance"
+    }
+}
+
 /// `GET /console/metrics/uptime`
 ///
 /// Reports process uptime (seconds since start, plus a human-readable form),
@@ -62,6 +82,14 @@ const MAX_REQUESTED_TYPES: usize = 50;
 /// as explicitly untracked rather than fabricated — a real availability
 /// percentage (e.g. "99.98% over 30d") would require health-probe history that
 /// HFS does not yet record.
+///
+/// **Scope: single-instance.** `uptime_seconds` is the age of *this* process
+/// only, and `scope` is `"single-instance"`. Behind a load balancer this reflects
+/// just the instance that served the request. The answering instance's hostname
+/// is deliberately NOT returned here — this endpoint is unauthenticated, and a
+/// hostname is infrastructure-identifying; instance attribution lives on the
+/// authenticated `traffic`/`tenants` endpoints. Aggregate Prometheus `/metrics`
+/// for fleet-wide figures.
 pub async fn uptime_handler<S>(State(_state): State<AppState<S>>) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
@@ -72,6 +100,7 @@ where
 
     let body = json!({
         "service": "hfs",
+        "scope": "single-instance",
         "version": env!("CARGO_PKG_VERSION"),
         "started_at": helios_observability::uptime::started_at_rfc3339(),
         "now": chrono::Utc::now().to_rfc3339(),
@@ -200,6 +229,7 @@ where
 
     let body = json!({
         "tenant": tenant_id,
+        "scope": resources_scope(state.storage()),
         "generated_at": now.to_rfc3339(),
         "window": {
             "interval": "day",
@@ -278,6 +308,7 @@ where
 
     let body = json!({
         "tenant": tenant_id,
+        "scope": resources_scope(state.storage()),
         "generated_at": now.to_rfc3339(),
         "source": "writes",
         "window": {
@@ -299,6 +330,12 @@ where
 /// — derived from the in-process rolling request log
 /// ([`helios_observability::reqlog`]). Unlike the Prometheus `/metrics` counters,
 /// these arrive already windowed and ready to chart, with no PromQL.
+///
+/// **Scope: single-instance.** The request log is per-process, so every figure
+/// here reflects only the instance that answered (identified by the top-level
+/// `instance` field; `scope` is `"single-instance"`). In a clustered deployment
+/// behind a load balancer, fleet-wide throughput and latency must be aggregated
+/// from Prometheus `/metrics`, not from this endpoint.
 ///
 /// Query parameters (all optional):
 /// - `window` — look-back in seconds, clamped to `60..=86_400` (default 3600).
@@ -337,6 +374,8 @@ where
         .collect();
 
     let body = json!({
+        "instance": helios_observability::uptime::instance_id(),
+        "scope": "single-instance",
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "window_seconds": stats.window_seconds,
         "covered_seconds": stats.covered_seconds,
@@ -409,6 +448,7 @@ where
 
     let body = json!({
         "tenant": tenant_id,
+        "scope": resources_scope(state.storage()),
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "total_resources": total,
         "distinct_types": distinct_types,
@@ -423,6 +463,17 @@ where
 /// Per-tenant comparison: authoritative stored-resource counts (cross-tenant
 /// backend aggregate) joined with windowed traffic (best-effort, from the
 /// in-process request log). Sorted by resource count, busiest first.
+///
+/// **Mixed scope.** The per-row `resources` column is a shared-DB cross-tenant
+/// aggregate whose `resources_scope` is backend-derived (`"cluster"` on
+/// PostgreSQL/MongoDB, `"single-instance"` on SQLite), but the per-row traffic
+/// columns (`requests_per_second` / `p95_ms` / `error_rate`) come from this
+/// process's request log and reflect only the instance that answered
+/// (`traffic_scope: "single-instance"`, identified by the top-level `instance`
+/// field). Fleet-wide *per-tenant* traffic cannot come from Prometheus
+/// `/metrics` — tenant is deliberately not a metric label (it is recorded as a
+/// trace/OTLP span attribute instead), so per-tenant fleet aggregation must come
+/// from the tracing/OTLP backend, not from `/metrics`.
 ///
 /// Query parameters (all optional):
 /// - `window` — traffic look-back in seconds, clamped to `60..=86_400`
@@ -481,6 +532,9 @@ where
     }
 
     let body = json!({
+        "instance": helios_observability::uptime::instance_id(),
+        "resources_scope": resources_scope(state.storage()),
+        "traffic_scope": "single-instance",
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "window_seconds": window,
         "tenant_count": tenants.len(),

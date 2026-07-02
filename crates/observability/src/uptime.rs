@@ -32,6 +32,17 @@ pub fn started_at_rfc3339() -> String {
     STARTED_AT.get().map(|t| t.to_rfc3339()).unwrap_or_default()
 }
 
+/// Identifier for this process instance, used to disambiguate per-instance
+/// figures (uptime, in-process traffic) in a clustered deployment behind a load
+/// balancer. Reads the `HOSTNAME` env var — set to the pod/container name by
+/// Kubernetes and Docker — and falls back to `"unknown"` when unset or empty.
+pub fn instance_id() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -211,6 +211,15 @@ pub trait ResourceStorage: Send + Sync {
     /// Returns a human-readable name for this storage backend.
     fn backend_name(&self) -> &'static str;
 
+    /// Whether this backend's stored data is shared across all HFS instances in a
+    /// cluster (a networked database) vs. local to one instance (e.g. an on-disk
+    /// SQLite file). Used to label console metrics honestly in multi-instance
+    /// deployments. Conservative default: `false` (never over-claims cluster
+    /// consistency).
+    fn is_cluster_shared(&self) -> bool {
+        false
+    }
+
     /// Creates a new resource.
     ///
     /// # Arguments

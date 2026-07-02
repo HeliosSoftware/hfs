@@ -517,6 +517,10 @@ impl ResourceStorage for MongoBackend {
         "mongodb"
     }
 
+    fn is_cluster_shared(&self) -> bool {
+        true
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::mongodb::MongoInDbRunner;
         // Native in-DB runner: compiles the ViewDefinition to an aggregation

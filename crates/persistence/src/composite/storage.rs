@@ -715,6 +715,10 @@ impl ResourceStorage for CompositeStorage {
         "composite"
     }
 
+    fn is_cluster_shared(&self) -> bool {
+        self.primary.is_cluster_shared()
+    }
+
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
         // SQL-on-FHIR runs as in-DB SQL against the primary store (where all
         // writes land), so delegate to the primary backend. Composites whose
