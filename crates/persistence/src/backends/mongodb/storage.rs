@@ -1252,10 +1252,9 @@ impl ResourceStorage for MongoBackend {
             }},
         ];
 
-        let mut cursor = history
-            .aggregate(pipeline)
-            .await
-            .map_err(|e| internal_error(format!("Failed to aggregate activity histogram: {}", e)))?;
+        let mut cursor = history.aggregate(pipeline).await.map_err(|e| {
+            internal_error(format!("Failed to aggregate activity histogram: {}", e))
+        })?;
 
         let mut out = Vec::new();
         while cursor
@@ -1286,10 +1285,7 @@ impl ResourceStorage for MongoBackend {
         Ok(out)
     }
 
-    async fn count_all_types(
-        &self,
-        tenant: &TenantContext,
-    ) -> StorageResult<Vec<(String, u64)>> {
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();

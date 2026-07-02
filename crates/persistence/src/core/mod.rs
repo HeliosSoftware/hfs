@@ -148,8 +148,8 @@ pub use search::{
 };
 pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
-    ActivityCell, ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage,
+    ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult,
+    ConditionalStorage, ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage,
     ResourceStorage,
 };
 pub use transaction::{

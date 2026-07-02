@@ -522,8 +522,8 @@ impl ResourceStorage for SqliteBackend {
 
         let mut out = Vec::new();
         for row in rows {
-            let (day_str, n) = row
-                .map_err(|e| internal_error(format!("Failed to read count_by_day row: {}", e)))?;
+            let (day_str, n) =
+                row.map_err(|e| internal_error(format!("Failed to read count_by_day row: {}", e)))?;
             if let Ok(day) = chrono::NaiveDate::parse_from_str(&day_str, "%Y-%m-%d") {
                 out.push(crate::core::DailyResourceCount {
                     day,
@@ -576,8 +576,8 @@ impl ResourceStorage for SqliteBackend {
 
         let mut out = Vec::new();
         for row in rows {
-            let (wd, hr, n) = row
-                .map_err(|e| internal_error(format!("Failed to read activity row: {}", e)))?;
+            let (wd, hr, n) =
+                row.map_err(|e| internal_error(format!("Failed to read activity row: {}", e)))?;
             out.push(crate::core::ActivityCell {
                 weekday: wd.clamp(0, 6) as u8,
                 hour: hr.clamp(0, 23) as u8,
@@ -587,10 +587,7 @@ impl ResourceStorage for SqliteBackend {
         Ok(out)
     }
 
-    async fn count_all_types(
-        &self,
-        tenant: &TenantContext,
-    ) -> StorageResult<Vec<(String, u64)>> {
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
         let mut stmt = conn

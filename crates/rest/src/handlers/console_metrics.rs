@@ -157,7 +157,10 @@ where
     for rt in &types {
         let total = totals_by_type.get(rt.as_str()).copied().unwrap_or(0);
 
-        let buckets = state.storage().count_by_day(ctx, rt.as_str(), since).await?;
+        let buckets = state
+            .storage()
+            .count_by_day(ctx, rt.as_str(), since)
+            .await?;
 
         // Collapse buckets into a day -> count map, summing only days inside the
         // window (defensive against any future-dated `last_updated`).

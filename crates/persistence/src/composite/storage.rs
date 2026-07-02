@@ -935,10 +935,7 @@ impl ResourceStorage for CompositeStorage {
         self.primary.activity_histogram(tenant, since).await
     }
 
-    async fn count_all_types(
-        &self,
-        tenant: &TenantContext,
-    ) -> StorageResult<Vec<(String, u64)>> {
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         self.primary.count_all_types(tenant).await
     }
 

@@ -272,8 +272,7 @@ fn build_series(
         .map(|(i, mut lat)| {
             let count = lat.len();
             // Offset (seconds before now) at which this bucket *starts*.
-            let offset_seconds =
-                window - (i as f64 * bucket_secs).round() as i64;
+            let offset_seconds = window - (i as f64 * bucket_secs).round() as i64;
             TrafficBucket {
                 offset_seconds: offset_seconds.max(0),
                 requests_per_second: count as f64 / bucket_secs.max(1.0),
@@ -333,6 +332,9 @@ mod tests {
             "empty tenant should roll up under \"default\""
         );
         // Busiest-first ordering preserved.
-        assert!(rows.windows(2).all(|w| w[0].sample_count >= w[1].sample_count));
+        assert!(
+            rows.windows(2)
+                .all(|w| w[0].sample_count >= w[1].sample_count)
+        );
     }
 }

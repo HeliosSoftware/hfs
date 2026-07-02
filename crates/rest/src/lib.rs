@@ -690,7 +690,9 @@ where
     // mounted OUTSIDE the auth/audit layers above (mirroring `/metrics`/`/health`)
     // so the console can show liveness without a bearer token. Still covered by
     // the shared CORS / timeout / body-limit / tracing stack applied below.
-    let router = router.merge(routing::console_metrics::public_routes(console_public_state));
+    let router = router.merge(routing::console_metrics::public_routes(
+        console_public_state,
+    ));
 
     // Tenant-scoped console metrics sit behind the same bearer-token auth as the
     // FHIR routes. The tenant is taken authoritatively from the JWT claim (see

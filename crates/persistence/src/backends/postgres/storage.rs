@@ -542,10 +542,7 @@ impl ResourceStorage for PostgresBackend {
         Ok(out)
     }
 
-    async fn count_all_types(
-        &self,
-        tenant: &TenantContext,
-    ) -> StorageResult<Vec<(String, u64)>> {
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let rows = client

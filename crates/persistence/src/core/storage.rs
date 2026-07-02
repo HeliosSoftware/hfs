@@ -506,10 +506,7 @@ pub trait ResourceStorage: Send + Sync {
     /// # Arguments
     ///
     /// * `tenant` - The tenant context for this operation
-    async fn count_all_types(
-        &self,
-        _tenant: &TenantContext,
-    ) -> StorageResult<Vec<(String, u64)>> {
+    async fn count_all_types(&self, _tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         Ok(Vec::new())
     }
 

@@ -1153,7 +1153,10 @@ mod tests {
             !message.contains("password"),
             "rollback text leaked raw backend detail: {message}"
         );
-        assert!(!message.contains("postgres"), "leaked backend name: {message}");
+        assert!(
+            !message.contains("postgres"),
+            "leaked backend name: {message}"
+        );
     }
 
     #[tokio::test]
