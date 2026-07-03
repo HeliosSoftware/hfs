@@ -16,6 +16,7 @@ default-members = [
 	"crates/hfs",
 	"crates/persistence",
 	"crates/rest",
+	"crates/web",
 	"crates/sof",
 	"crates/cds-hooks",
 	"crates/hts",
