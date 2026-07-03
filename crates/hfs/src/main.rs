@@ -40,9 +40,9 @@ use helios_rest::bulk_export_auth::BearerScopeAuth;
 // Settings-capable standalone backends (SQLite, PostgreSQL) also host the
 // per-user settings store, wired alongside bulk export/submit.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-use helios_rest::create_app_with_auth_bulk_and_settings;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_rest::create_app_with_auth_and_bulk;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_rest::create_app_with_auth_bulk_and_settings;
 // Composite/secondary backends (MongoDB, Elasticsearch, S3) that do not host a
 // settings store and so use the plain app builder.
 #[cfg(any(feature = "mongodb", feature = "elasticsearch", feature = "s3"))]
