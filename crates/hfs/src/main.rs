@@ -32,19 +32,21 @@ use helios_persistence::backends::local_fs::LocalFsOutputStore;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_persistence::core::SettingsStore;
 use helios_persistence::core::{
-    BulkExportJobStore, DefaultExportWorker, ExportOutputStore, WorkerId,
+    BulkExportJobStore, BulkSubmitJobStore, DefaultExportWorker, DefaultSubmitWorker,
+    ExportOutputStore, SubmitInputFetcher, WorkerId,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_rest::bulk_export_auth::BearerScopeAuth;
-// Settings-capable standalone backends (SQLite, PostgreSQL).
+// Settings-capable standalone backends (SQLite, PostgreSQL) also host the
+// per-user settings store, wired alongside bulk export/submit.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-use helios_rest::create_app_with_auth_bulk_export_and_settings;
+use helios_rest::create_app_with_auth_bulk_and_settings;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_rest::create_app_with_auth_and_bulk;
 // Composite/secondary backends (MongoDB, Elasticsearch, S3) that do not host a
-// settings store and so use the plain app builders.
+// settings store and so use the plain app builder.
 #[cfg(any(feature = "mongodb", feature = "elasticsearch", feature = "s3"))]
 use helios_rest::create_app_with_auth;
-#[cfg(any(feature = "mongodb", feature = "elasticsearch"))]
-use helios_rest::create_app_with_auth_and_bulk_export;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -515,13 +517,14 @@ async fn start_mongodb(
     {
         let jobs = build_embedded_job_store(&config)?;
         if let Some(bundle) = build_bulk_export(&config, backend.clone(), jobs).await? {
-            let app = create_app_with_auth_and_bulk_export(
+            let app = create_app_with_auth_and_bulk(
                 backend,
                 config.clone(),
                 auth_config,
                 auth_state,
                 audit_state,
-                bundle,
+                Some(bundle),
+                None,
             );
             return serve(app, &config, serve_audit_state).await;
         }
@@ -848,16 +851,19 @@ async fn start_sqlite(
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
 
-    // The SQLite backend also hosts the per-user settings store.
+    // The SQLite backend also hosts the per-user settings store, so it always
+    // keeps ownership of the backend Arc and uses the settings-capable builder.
     let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
-    let bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
-    let app = create_app_with_auth_bulk_export_and_settings(
+    let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
+    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
+    let app = create_app_with_auth_bulk_and_settings(
         backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
-        bundle,
+        export_bundle,
+        submit_bundle,
         settings_store,
     );
     serve(app, &config, serve_audit_state).await
@@ -1083,6 +1089,190 @@ fn spawn_export_workers<Dp>(
     );
 }
 
+/// Builds the bulk-submit subsystem (input fetcher + output store + file auth +
+/// worker pool) from a caller-supplied job store. Returns `None` when bulk submit
+/// is disabled. The job store is the same backend instance that holds the FHIR
+/// resources (so ingestion writes go to the primary store).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn build_bulk_submit(
+    config: &ServerConfig,
+    jobs: Arc<dyn BulkSubmitJobStore>,
+) -> anyhow::Result<Option<helios_rest::BulkSubmitBundle>> {
+    let cfg = config.bulk_submit.clone();
+    info!(
+        "Bulk submit config: enabled={} output_backend={} requires_access_token={}",
+        cfg.enabled, cfg.output_backend, cfg.requires_access_token
+    );
+    if !cfg.enabled {
+        return Ok(None);
+    }
+
+    // --- Output store (status-manifest artifacts) -----------------------
+    let output: Arc<dyn ExportOutputStore> = match cfg.output_backend.as_str() {
+        "local-fs" => {
+            let output_dir = cfg
+                .output_dir
+                .clone()
+                .or_else(|| {
+                    config
+                        .data_dir
+                        .as_ref()
+                        .map(|d| format!("{}/submit", d.display()))
+                })
+                .unwrap_or_else(|| "./data/submit".to_string());
+            Arc::new(LocalFsOutputStore::new(output_dir, config.base_url.clone()))
+        }
+        "s3" => {
+            #[cfg(feature = "s3")]
+            {
+                use helios_persistence::backends::s3::{
+                    AccessTokenMode, AwsS3Client, AwsS3ClientOptions, S3OutputStore,
+                };
+                let bucket = cfg.s3_bucket.clone().ok_or_else(|| {
+                    anyhow::anyhow!("HFS_BULK_SUBMIT_S3_BUCKET is required for OUTPUT_BACKEND=s3")
+                })?;
+                let region = std::env::var("HFS_BULK_SUBMIT_S3_REGION")
+                    .ok()
+                    .or_else(|| std::env::var("HFS_S3_REGION").ok());
+                let sdk_config = AwsS3Client::load_sdk_config(region.as_deref()).await;
+                let client = Arc::new(AwsS3Client::from_sdk_config_with_options(
+                    &sdk_config,
+                    AwsS3ClientOptions {
+                        endpoint_url: std::env::var("HFS_BULK_SUBMIT_S3_ENDPOINT").ok(),
+                        force_path_style: parse_env_bool(
+                            "HFS_BULK_SUBMIT_S3_FORCE_PATH_STYLE",
+                            false,
+                        ),
+                    },
+                ));
+                Arc::new(S3OutputStore::new(
+                    client,
+                    bucket,
+                    config.base_url.clone(),
+                    AccessTokenMode::parse(&cfg.requires_access_token),
+                    std::time::Duration::from_secs(cfg.file_url_ttl_secs),
+                ))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "HFS_BULK_SUBMIT_OUTPUT_BACKEND=s3 requires the 's3' feature. \
+                     Build with: cargo build -p helios-hfs --features s3"
+                );
+            }
+        }
+        other => anyhow::bail!("invalid HFS_BULK_SUBMIT_OUTPUT_BACKEND '{other}'"),
+    };
+
+    // --- Remote input fetcher (+ optional outbound SMART client) --------
+    // When a client_id + private key are configured, protected-file fetches use
+    // a read-scoped `client_credentials` token; otherwise they surface a recorded
+    // manifest-level error.
+    let token_provider: Option<Arc<dyn helios_persistence::core::FileTokenProvider>> =
+        match (cfg.client_id.as_deref(), cfg.private_key.as_deref()) {
+            (Some(client_id), Some(pem)) => {
+                match helios_rest::bulk_submit_oauth::JwtClientCredentialsTokenProvider::new(
+                    client_id,
+                    pem,
+                    &cfg.signing_alg,
+                ) {
+                    Some(p) => Some(p),
+                    None => anyhow::bail!(
+                        "HFS_BULK_SUBMIT_PRIVATE_KEY could not be parsed as a {} PEM key",
+                        cfg.signing_alg
+                    ),
+                }
+            }
+            _ => None,
+        };
+    let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(
+        helios_rest::bulk_submit_fetcher::HttpSubmitInputFetcher::new(
+            token_provider,
+            cfg.outbound_scope.clone(),
+        ),
+    );
+
+    spawn_submit_workers(jobs.clone(), fetcher.clone(), output.clone(), &cfg);
+
+    Ok(Some(helios_rest::BulkSubmitBundle {
+        jobs,
+        fetcher,
+        output,
+        file_auth: Arc::new(BearerScopeAuth),
+    }))
+}
+
+/// Spawns the in-process submit worker pool and the periodic cleanup task.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn spawn_submit_workers(
+    jobs: Arc<dyn BulkSubmitJobStore>,
+    fetcher: Arc<dyn SubmitInputFetcher>,
+    output: Arc<dyn ExportOutputStore>,
+    cfg: &helios_rest::config::BulkSubmitConfig,
+) {
+    if cfg.disable_local_worker {
+        info!("Bulk submit in-process worker pool is disabled");
+        return;
+    }
+    let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
+    for i in 0..cfg.worker_concurrency {
+        let jobs = jobs.clone();
+        let fetcher = fetcher.clone();
+        let output = output.clone();
+        let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
+        tokio::spawn(async move {
+            let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone());
+            loop {
+                match jobs.claim_next_manifest(&worker_id, lease).await {
+                    Ok(Some(claimed)) => {
+                        if let Err(e) = worker.run_job(claimed).await {
+                            tracing::error!("submit worker job failed: {e}");
+                        }
+                    }
+                    Ok(None) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("submit worker claim failed: {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    }
+    // Periodic cleanup of expired submission artifacts.
+    let cleanup_jobs = jobs.clone();
+    let cleanup_output = output.clone();
+    let interval = std::time::Duration::from_secs(cfg.cleanup_interval_secs);
+    let output_ttl = std::time::Duration::from_secs(cfg.output_ttl_secs);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match cleanup_jobs
+                .list_expired_submissions(chrono::Utc::now(), output_ttl, 100)
+                .await
+            {
+                Ok(expired) => {
+                    for (tenant, sub_id) in expired {
+                        let job_id = helios_persistence::core::submission_output_job_id(&sub_id);
+                        let _ = cleanup_output.delete_job_outputs(&tenant, &job_id).await;
+                        let _ = cleanup_jobs
+                            .delete_submission_artifacts(&tenant, &sub_id)
+                            .await;
+                        let _ = cleanup_jobs.clear_poll_token(&tenant, &sub_id).await;
+                    }
+                }
+                Err(e) => tracing::error!("submit cleanup scan failed: {e}"),
+            }
+        }
+    });
+
+    info!(
+        "Bulk submit worker pool started ({} workers)",
+        cfg.worker_concurrency
+    );
+}
+
 /// Fallback when sqlite feature is not enabled.
 #[cfg(not(feature = "sqlite"))]
 async fn start_sqlite(
@@ -1205,14 +1395,17 @@ async fn start_sqlite_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
-    if let Some(bundle) = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await? {
-        let app = create_app_with_auth_and_bulk_export(
+    let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
+    let submit_bundle = build_bulk_submit(&config, sqlite.clone()).await?;
+    if export_bundle.is_some() || submit_bundle.is_some() {
+        let app = create_app_with_auth_and_bulk(
             composite,
             config.clone(),
             auth_config,
             auth_state,
             audit_state,
-            bundle,
+            export_bundle,
+            submit_bundle,
         );
         return serve(app, &config, serve_audit_state).await;
     }
@@ -1270,16 +1463,19 @@ async fn start_postgres(
     let backend = Arc::new(backend);
 
     let serve_audit_state = audit_state.clone();
-    // The PostgreSQL backend also hosts the per-user settings store.
+    // The PostgreSQL backend also hosts the per-user settings store, so it always
+    // keeps ownership of the backend Arc and uses the settings-capable builder.
     let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
-    let bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
-    let app = create_app_with_auth_bulk_export_and_settings(
+    let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
+    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
+    let app = create_app_with_auth_bulk_and_settings(
         backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
-        bundle,
+        export_bundle,
+        submit_bundle,
         settings_store,
     );
     serve(app, &config, serve_audit_state).await
@@ -1424,14 +1620,17 @@ async fn start_postgres_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
-    if let Some(bundle) = build_bulk_export(&config, pg.clone(), pg.clone()).await? {
-        let app = create_app_with_auth_and_bulk_export(
+    let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
+    let submit_bundle = build_bulk_submit(&config, pg.clone()).await?;
+    if export_bundle.is_some() || submit_bundle.is_some() {
+        let app = create_app_with_auth_and_bulk(
             composite,
             config.clone(),
             auth_config,
             auth_state,
             audit_state,
-            bundle,
+            export_bundle,
+            submit_bundle,
         );
         return serve(app, &config, serve_audit_state).await;
     }
@@ -1584,13 +1783,14 @@ async fn start_mongodb_elasticsearch(
     {
         let jobs = build_embedded_job_store(&config)?;
         if let Some(bundle) = build_bulk_export(&config, mongo.clone(), jobs).await? {
-            let app = create_app_with_auth_and_bulk_export(
+            let app = create_app_with_auth_and_bulk(
                 composite,
                 config.clone(),
                 auth_config,
                 auth_state,
                 audit_state,
-                bundle,
+                Some(bundle),
+                None,
             );
             return serve(app, &config, serve_audit_state).await;
         }
@@ -1872,13 +2072,14 @@ async fn start_s3_elasticsearch(
     {
         let jobs = build_embedded_job_store(&config)?;
         if let Some(bundle) = build_bulk_export(&config, s3.clone(), jobs).await? {
-            let app = create_app_with_auth_and_bulk_export(
+            let app = create_app_with_auth_and_bulk(
                 composite,
                 config.clone(),
                 auth_config,
                 auth_state,
                 audit_state,
-                bundle,
+                Some(bundle),
+                None,
             );
             return serve(app, &config, serve_audit_state).await;
         }

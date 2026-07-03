@@ -5,7 +5,10 @@
 
 use std::collections::HashSet;
 
-use crate::types::{SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use crate::types::{
+    CompartmentMembership, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+    SearchValue, strip_reference_version,
+};
 
 use super::parameter_handlers::{
     CompositeHandler, DateHandler, NumberHandler, QuantityHandler, ReferenceHandler, StringHandler,
@@ -239,6 +242,16 @@ impl QueryBuilder {
             }
         }
 
+        // Compartment membership: a resource is in the compartment if it
+        // references the compartment via ANY of the membership params (OR),
+        // per the FHIR CompartmentDefinition. Applied as a single subquery.
+        if let Some(comp) = &query.compartment {
+            // Last condition appended, so no need to advance `current_offset`.
+            if let Some(condition) = self.build_compartment_condition(comp, current_offset) {
+                conditions.push(condition);
+            }
+        }
+
         // Combine all conditions with AND
         if !conditions.is_empty() {
             let mut combined = conditions.remove(0);
@@ -251,6 +264,116 @@ impl QueryBuilder {
         }
 
         base
+    }
+
+    /// Builds the `_contained` match subquery.
+    ///
+    /// Returns SQL selecting `(resource_type, resource_id, contained_local_id)`
+    /// from `search_index` for contained resources (`is_contained = 1`) of the
+    /// searched type (`contained_type = ?2`) that match every standard search
+    /// parameter. Matching is keyed on the contained entity
+    /// `(resource_id, contained_local_id)` via `GROUP BY ... HAVING
+    /// COUNT(DISTINCT param_name) >= <n>`, so a container only matches when a
+    /// single contained resource satisfies all parameters.
+    ///
+    /// Param layout: `?1` = tenant, `?2` = contained type, then value params.
+    /// Returns `None` when no standard parameter contributes a condition
+    /// (special `_`-params and composites are not applied to contained matching).
+    ///
+    /// Limitation: repeated occurrences of the same parameter name are treated
+    /// as OR rather than AND for the distinct-name count.
+    pub fn build_contained(&self, query: &SearchQuery) -> Option<SqlFragment> {
+        let mut branches: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
+        let mut distinct_names: HashSet<String> = HashSet::new();
+        // ?1 = tenant, ?2 = contained_type already consumed by the caller.
+        let mut offset = 2;
+
+        for param in &query.parameters {
+            if param.name.starts_with('_')
+                || matches!(
+                    param.param_type,
+                    SearchParamType::Composite | SearchParamType::Special
+                )
+            {
+                continue;
+            }
+
+            let mut or_conditions = Vec::new();
+            let mut local_offset = offset;
+            for value in &param.values {
+                if let Some(cond) = self.build_value_condition(param, value, local_offset) {
+                    local_offset += cond.params.len();
+                    or_conditions.push(cond);
+                }
+            }
+            if or_conditions.is_empty() {
+                continue;
+            }
+            let mut combined = or_conditions.remove(0);
+            for cond in or_conditions {
+                combined = combined.or(cond);
+            }
+            offset += combined.params.len();
+            branches.push(format!(
+                "(param_name = '{}' AND ({}))",
+                param.name, combined.sql
+            ));
+            params.extend(combined.params);
+            distinct_names.insert(param.name.clone());
+        }
+
+        if branches.is_empty() {
+            return None;
+        }
+
+        let sql = format!(
+            "SELECT resource_type, resource_id, contained_local_id FROM search_index \
+             WHERE tenant_id = ?1 AND is_contained = 1 AND contained_type = ?2 AND ({}) \
+             GROUP BY resource_type, resource_id, contained_local_id \
+             HAVING COUNT(DISTINCT param_name) >= {}",
+            branches.join(" OR "),
+            distinct_names.len()
+        );
+        Some(SqlFragment::with_params(sql, params))
+    }
+
+    /// Builds the compartment-membership subquery: matches resources that
+    /// reference `comp.reference` via ANY of `comp.params` (logical OR), which
+    /// is how a resource joins a FHIR compartment. Reference matching mirrors the
+    /// standard reference handler (version-agnostic). Returns `None` if there are
+    /// no membership params or no reference.
+    fn build_compartment_condition(
+        &self,
+        comp: &CompartmentMembership,
+        param_offset: usize,
+    ) -> Option<SqlFragment> {
+        if comp.params.is_empty() || comp.reference.is_empty() {
+            return None;
+        }
+
+        // Membership params come from the bundled FHIR CompartmentDefinitions
+        // (trusted, e.g. "patient"), but bind nothing user-controlled here: build
+        // a safe `IN (...)` list by escaping any single quotes defensively.
+        let in_list = comp
+            .params
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let base = strip_reference_version(&comp.reference);
+        let p1 = param_offset + 1;
+        let p2 = param_offset + 2;
+
+        Some(SqlFragment::with_params(
+            format!(
+                "resource_id IN (SELECT resource_id FROM search_index \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
+                 AND (value_reference = ?{p1} OR value_reference LIKE ?{p2} || '/_history/%'))"
+            ),
+            vec![SqlParam::string(base), SqlParam::string(base)],
+        ))
     }
 
     /// Builds a condition for a single search parameter.
@@ -521,12 +644,16 @@ impl QueryBuilder {
                     conditions.push(sql);
                 }
                 Err(e) => {
-                    // Log parse error but continue with other filters
+                    // A malformed `_filter` must NOT be silently dropped — that
+                    // would return an unfiltered superset (everything matching
+                    // the other params). Fail closed: emit a match-nothing
+                    // condition so the client gets zero results, not wrong ones.
                     tracing::warn!(
-                        "Failed to parse _filter expression '{}': {}",
+                        "Failed to parse _filter expression '{}': {} — failing closed (no matches)",
                         value.value,
                         e
                     );
+                    conditions.push(SqlFragment::new("1 = 0"));
                 }
             }
         }

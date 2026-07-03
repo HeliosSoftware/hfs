@@ -10,6 +10,11 @@ rust-version.workspace = true
 description = "Helios Terminology Server — FHIR Terminology Operations"
 keywords = ["helios-software", "hl7", "fhir", "terminology", "healthcare"]
 categories = ["web-programming"]
+# Bundled terminology archives (~148 MiB: VSAC, PHINVADS, ICD-10-CM, SNOMED,
+# HL7 packages, etc.) are runtime bootstrap/import data, not compile-time
+# inputs. Excluding them keeps the published crate under crates.io's upload
+# limit; operators mount this data at runtime (see config.rs / main.rs).
+exclude = ["terminology-data/**"]
 
 [lib]
 name = "helios_hts"
@@ -30,14 +35,14 @@ R6 = ["helios-fhir/R6", "helios-persistence/R6"]
 
 [dependencies]
 helios-fhir = { workspace = true }
-helios-persistence = { path = "../persistence", version = "0.1.47", default-features = false, features = ["sqlite"] }
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["sqlite"] }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "query"] }
 futures = "0.3"
 bytes = "1"
 tower = { version = "0.5" }
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "compression-full", "decompression-full"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { workspace = true }
 serde = { workspace = true }
@@ -55,6 +60,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.0", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
+sha2 = "0.10"
 
 # SQLite (default)
 rusqlite = { version = "0.33", features = ["bundled"], optional = true }

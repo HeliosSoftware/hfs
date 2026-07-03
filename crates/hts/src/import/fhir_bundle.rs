@@ -33,6 +33,18 @@ pub(crate) fn import_bundle_sync(
     data: &[u8],
 ) -> Result<ImportStats, HtsError> {
     let parsed = bundle_parser::parse_bundle(data)?;
+    import_parsed_sync(pool, &parsed)
+}
+
+/// Insert an already-parsed bundle into SQLite. Shared by
+/// [`import_bundle_sync`] and the direct
+/// [`BundleImportBackend::import_parsed`](crate::import::BundleImportBackend::import_parsed)
+/// path used by the chunked filesystem importers.
+#[cfg(feature = "sqlite")]
+pub(crate) fn import_parsed_sync(
+    pool: &Pool<SqliteConnectionManager>,
+    parsed: &ParsedBundle,
+) -> Result<ImportStats, HtsError> {
     let mut conn = pool
         .get()
         .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
@@ -48,23 +60,29 @@ pub(crate) fn import_bundle_sync(
     // SNOMED CT (~640K concepts, ~1 280 batches = hours). Skipping per-batch
     // rebuilds is safe: write_code_system deletes the stale closure, and
     // migrate_concept_closure at server startup rebuilds it exactly once.
+    // Probed with EXISTS rather than COUNT(*): the answer only distinguishes
+    // empty from non-empty, and a COUNT over an ever-growing concept set would
+    // make each batch of a chunked bulk load (SNOMED RF2, LOINC) scan all
+    // previously imported rows.
     let systems_needing_closure: Vec<String> = parsed
         .code_systems
         .iter()
         .filter_map(|cs| {
-            let count: i64 = conn
+            let has_concepts: bool = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM concepts c
-                     JOIN code_systems s ON c.system_id = s.id
-                     WHERE s.url = ?1",
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concepts c
+                         JOIN code_systems s ON c.system_id = s.id
+                         WHERE s.url = ?1
+                     )",
                     rusqlite::params![cs.url],
                     |r| r.get(0),
                 )
-                .unwrap_or(0);
-            if count == 0 {
-                Some(cs.url.clone())
-            } else {
+                .unwrap_or(false);
+            if has_concepts {
                 None
+            } else {
+                Some(cs.url.clone())
             }
         })
         .collect();
@@ -77,7 +95,7 @@ pub(crate) fn import_bundle_sync(
     let tx = conn
         .transaction()
         .map_err(|e| HtsError::StorageError(format!("Begin transaction: {e}")))?;
-    write_parsed_bundle(&tx, &parsed, &mut stats)?;
+    write_parsed_bundle(&tx, parsed, &mut stats)?;
     tx.commit()
         .map_err(|e| HtsError::StorageError(format!("Commit transaction: {e}")))?;
 
@@ -123,7 +141,7 @@ pub(crate) fn write_parsed_bundle(
     stats.errors.extend(parsed.parse_errors.iter().cloned());
     for cs in &parsed.code_systems {
         let url = cs.url.as_str();
-        if let Err(e) = write_code_system(conn, cs, stats) {
+        if let Err(e) = write_code_system(conn, cs, stats, parsed.fresh_load) {
             stats
                 .errors
                 .push(format!("CodeSystem '{url}' import failed: {e}"));
@@ -157,7 +175,9 @@ pub(crate) fn import_code_system(
     stats: &mut ImportStats,
 ) -> Result<(), HtsError> {
     if let Some(parsed) = bundle_parser::parse_code_system_value(cs_json) {
-        write_code_system(conn, &parsed, stats)
+        // CRUD single-resource path: the target may already hold concepts, so
+        // always replace (never skip the child delete).
+        write_code_system(conn, &parsed, stats, false)
     } else {
         Err(HtsError::InvalidRequest(
             "CodeSystem.url is required".into(),
@@ -170,6 +190,11 @@ fn write_code_system(
     conn: &Connection,
     cs: &ParsedCodeSystem,
     stats: &mut ImportStats,
+    // When `true` the caller guarantees this code system had no concepts before
+    // the import session, so each concept's properties/designations cannot have
+    // pre-existing rows and the delete-before-reinsert is skipped (fast path for
+    // first-time bulk loads). See [`ParsedBundle::fresh_load`].
+    skip_child_delete: bool,
 ) -> Result<(), HtsError> {
     let resource_json = serde_json::to_string(&cs.resource_json).ok();
     let now = utc_now();
@@ -307,12 +332,17 @@ fn write_code_system(
         }
 
         // Properties.
-        // Delete existing rows first so reimports stay idempotent.  We only do
-        // this when the incoming concept carries at least one non-empty property
-        // so that stub "content=not-present" re-imports don't wipe RF2/LOINC
-        // properties that were loaded separately.
-        let has_props = concept.properties.iter().any(|p| !p.value.is_empty());
-        if has_props {
+        // Delete existing rows first so re-imports fully replace the prior set
+        // rather than accumulating or leaving filtered-out rows behind. This is
+        // unconditional — even when the incoming concept carries zero non-empty
+        // properties — because each importer assembles a concept's complete
+        // property/designation set into a single struct before writing, and a
+        // concept code appears in exactly one import batch. Stub
+        // "content=not-present" seed imports carry an *empty concepts array*, so
+        // this loop never runs for them and their separately-loaded data is
+        // safe. Skipped entirely on a fresh load, where there is nothing to
+        // delete (see `skip_child_delete`).
+        if !skip_child_delete {
             conn.execute(
                 "DELETE FROM concept_properties WHERE concept_id = ?1",
                 rusqlite::params![concept_id],
@@ -342,9 +372,12 @@ fn write_code_system(
             }
         }
 
-        // Designations — same idempotency guard.
-        let has_desigs = !concept.designations.is_empty();
-        if has_desigs {
+        // Designations — replace for the same reason. This is what makes a
+        // narrower HTS_IMPORT_LANGUAGES re-import actually drop the
+        // previously-imported translations: a concept that now yields zero
+        // designations after filtering must still have its stale rows removed.
+        // Skipped on a fresh load (nothing to delete).
+        if !skip_child_delete {
             conn.execute(
                 "DELETE FROM concept_designations WHERE concept_id = ?1",
                 rusqlite::params![concept_id],
@@ -959,5 +992,78 @@ mod tests {
             .unwrap();
         // A→B and B→C
         assert_eq!(count, 2, "Two hierarchy edges should be materialized");
+    }
+
+    /// A bundle with one CodeSystem whose single concept carries the given
+    /// designations and properties. Used to verify re-import replacement.
+    fn cs_with_concept_extras(designations: &str, properties: &str) -> String {
+        format!(
+            r#"{{
+              "resourceType": "Bundle",
+              "type": "collection",
+              "entry": [{{
+                "resource": {{
+                  "resourceType": "CodeSystem",
+                  "url": "http://example.org/cs",
+                  "version": "1.0",
+                  "status": "active",
+                  "content": "complete",
+                  "concept": [{{
+                    "code": "A",
+                    "display": "Alpha",
+                    "designation": [{designations}],
+                    "property": [{properties}]
+                  }}]
+                }}
+              }}]
+            }}"#
+        )
+    }
+
+    fn count_rows(b: &SqliteTerminologyBackend, table: &str) -> i64 {
+        let conn = b.pool().get().unwrap();
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} d \
+             JOIN concepts c ON c.id = d.concept_id \
+             JOIN code_systems s ON s.id = c.system_id \
+             WHERE s.url = 'http://example.org/cs'"
+        );
+        conn.query_row(&sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// Re-importing a concept must *replace* its designations and properties,
+    /// not accumulate or leave stale rows — even when the new set is smaller or
+    /// empty (the filtered-language re-import case). Regression for the
+    /// `has_props`/`has_desigs` guards that previously skipped the delete when
+    /// the incoming slice was empty.
+    #[tokio::test]
+    async fn reimport_replaces_designations_and_properties() {
+        let b = backend();
+        let ctx = ctx();
+
+        // First import: two designations (en + de) and one property.
+        let first = cs_with_concept_extras(
+            r#"{ "language": "en", "value": "Alpha" },
+               { "language": "de", "value": "Alpha-DE" }"#,
+            r#"{ "code": "p1", "valueString": "v1" }"#,
+        );
+        b.import_bundle(&ctx, first.as_bytes()).await.unwrap();
+        assert_eq!(count_rows(&b, "concept_designations"), 2);
+        assert_eq!(count_rows(&b, "concept_properties"), 1);
+
+        // Re-import with a narrower set: only the English designation, no
+        // properties. The German designation and the property must be gone.
+        let second = cs_with_concept_extras(r#"{ "language": "en", "value": "Alpha" }"#, "");
+        b.import_bundle(&ctx, second.as_bytes()).await.unwrap();
+        assert_eq!(
+            count_rows(&b, "concept_designations"),
+            1,
+            "stale German designation must be removed on re-import"
+        );
+        assert_eq!(
+            count_rows(&b, "concept_properties"),
+            0,
+            "stale property must be removed on re-import"
+        );
     }
 }

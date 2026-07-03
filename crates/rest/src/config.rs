@@ -10,12 +10,12 @@
 //! | `HFS_SERVER_PORT` | 8080 | Server port |
 //! | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 //! | `HFS_LOG_LEVEL` | info | Log level |
-//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes) |
+//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 //! | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 //! | `HFS_ENABLE_CORS` | true | Enable CORS |
 //! | `HFS_CORS_ORIGINS` | * | Allowed origins |
 //! | `HFS_CORS_METHODS` | GET,POST,PUT,PATCH,DELETE,OPTIONS | Allowed methods |
-//! | `HFS_CORS_HEADERS` | Content-Type,Authorization,Accept,If-Match,If-None-Match,Prefer | Allowed headers |
+//! | `HFS_CORS_HEADERS` | Content-Type,Authorization,Accept,If-Match,If-None-Match,Prefer,Content-Encoding | Allowed headers |
 //! | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 //! | `HFS_BASE_URL` | http://localhost:8080 | Server base URL |
 //! | `HFS_DEFAULT_FHIR_VERSION` | R4 | Default FHIR version (R4, R4B, R5, R6) |
@@ -426,6 +426,207 @@ impl BulkExportConfig {
     }
 }
 
+/// Bulk Data **Submit** (`$bulk-submit`) configuration, loaded from
+/// `HFS_BULK_SUBMIT_*` environment variables.
+///
+/// HFS acts as the Data Consumer: it accepts submissions, fetches the referenced
+/// manifests/files, ingests them, and serves a status manifest whose
+/// `output`/`error`/`deleted` artifacts are written to the output store below.
+#[derive(Debug, Clone)]
+pub struct BulkSubmitConfig {
+    /// Master switch — when `false`, the `$bulk-submit` endpoints return `501`.
+    pub enabled: bool,
+    /// Output store for status artifacts: `local-fs` or `s3`.
+    pub output_backend: String,
+    /// Local-FS output root directory.
+    pub output_dir: Option<String>,
+    /// S3 bucket for status artifacts (required when `output_backend = s3`).
+    pub s3_bucket: Option<String>,
+    /// Manifest access-token posture: `auto`, `true`, or `false`.
+    pub requires_access_token: String,
+    /// Pre-signed download-URL lifetime, in seconds.
+    pub file_url_ttl_secs: u64,
+    /// How long status artifacts are retained after completion, in seconds.
+    pub output_ttl_secs: u64,
+    /// Maximum manifests this pod ingests concurrently.
+    pub worker_concurrency: u32,
+    /// When `true`, this pod does not run in-process submit workers.
+    pub disable_local_worker: bool,
+    /// Cap on simultaneous in-flight submissions per tenant.
+    pub max_concurrent_per_tenant: u32,
+    /// Resources per ingestion batch.
+    pub batch_size: u32,
+    /// Initial lease length issued at manifest claim, in seconds.
+    pub lease_duration_secs: u64,
+    /// Worker heartbeat cadence, in seconds.
+    pub heartbeat_interval_secs: u64,
+    /// How often the cleanup task scans for expired submissions, in seconds.
+    pub cleanup_interval_secs: u64,
+    /// When `true`, reject a new submission while one is in-progress (`429`).
+    pub block_concurrent_submission: bool,
+    /// OAuth `client_id` HFS presents when fetching protected provider files.
+    pub client_id: Option<String>,
+    /// PEM private key HFS signs its `private_key_jwt` client assertion with.
+    pub private_key: Option<String>,
+    /// Signing algorithm for the client assertion (`ES384` or `RS384`).
+    pub signing_alg: String,
+    /// Read scope requested for the outbound file-retrieval token.
+    pub outbound_scope: String,
+}
+
+impl Default for BulkSubmitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            output_backend: "local-fs".to_string(),
+            output_dir: None,
+            s3_bucket: None,
+            requires_access_token: "auto".to_string(),
+            file_url_ttl_secs: 3600,
+            output_ttl_secs: 86400,
+            worker_concurrency: 2,
+            disable_local_worker: false,
+            max_concurrent_per_tenant: 4,
+            batch_size: 1000,
+            lease_duration_secs: 60,
+            heartbeat_interval_secs: 20,
+            cleanup_interval_secs: 300,
+            block_concurrent_submission: false,
+            client_id: None,
+            private_key: None,
+            signing_alg: "ES384".to_string(),
+            outbound_scope: "system/*.rs".to_string(),
+        }
+    }
+}
+
+impl BulkSubmitConfig {
+    /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars.
+    pub fn from_env() -> Self {
+        fn env_bool(key: &str, default: bool) -> bool {
+            std::env::var(key)
+                .map(|s| {
+                    let s = s.to_lowercase();
+                    s == "true" || s == "1"
+                })
+                .unwrap_or(default)
+        }
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        fn env_u32(key: &str, default: u32) -> u32 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let d = Self::default();
+        Self {
+            enabled: env_bool("HFS_BULK_SUBMIT_ENABLED", d.enabled),
+            output_backend: std::env::var("HFS_BULK_SUBMIT_OUTPUT_BACKEND")
+                .unwrap_or(d.output_backend),
+            output_dir: std::env::var("HFS_BULK_SUBMIT_OUTPUT_DIR").ok(),
+            s3_bucket: std::env::var("HFS_BULK_SUBMIT_S3_BUCKET").ok(),
+            requires_access_token: std::env::var("HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN")
+                .unwrap_or(d.requires_access_token),
+            file_url_ttl_secs: env_u64("HFS_BULK_SUBMIT_FILE_URL_TTL", d.file_url_ttl_secs),
+            output_ttl_secs: env_u64("HFS_BULK_SUBMIT_OUTPUT_TTL", d.output_ttl_secs),
+            worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
+            disable_local_worker: env_bool(
+                "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
+                d.disable_local_worker,
+            ),
+            max_concurrent_per_tenant: env_u32(
+                "HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT",
+                d.max_concurrent_per_tenant,
+            ),
+            batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
+            lease_duration_secs: env_u64("HFS_BULK_SUBMIT_LEASE_DURATION", d.lease_duration_secs),
+            heartbeat_interval_secs: env_u64(
+                "HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL",
+                d.heartbeat_interval_secs,
+            ),
+            cleanup_interval_secs: env_u64(
+                "HFS_BULK_SUBMIT_CLEANUP_INTERVAL",
+                d.cleanup_interval_secs,
+            ),
+            block_concurrent_submission: env_bool(
+                "HFS_BULK_SUBMIT_BLOCK_CONCURRENT_SUBMISSION",
+                d.block_concurrent_submission,
+            ),
+            client_id: std::env::var("HFS_BULK_SUBMIT_CLIENT_ID").ok(),
+            private_key: std::env::var("HFS_BULK_SUBMIT_PRIVATE_KEY").ok(),
+            signing_alg: std::env::var("HFS_BULK_SUBMIT_SIGNING_ALG").unwrap_or(d.signing_alg),
+            outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
+                .unwrap_or(d.outbound_scope),
+        }
+    }
+
+    /// Validates the bulk-submit configuration.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if !matches!(self.output_backend.as_str(), "local-fs" | "s3") {
+            errors.push(format!(
+                "HFS_BULK_SUBMIT_OUTPUT_BACKEND '{}' invalid (expected local-fs|s3)",
+                self.output_backend
+            ));
+        }
+        if self.output_backend == "s3" && self.s3_bucket.is_none() {
+            errors.push("HFS_BULK_SUBMIT_S3_BUCKET is required when OUTPUT_BACKEND=s3".to_string());
+        }
+        if !matches!(
+            self.requires_access_token.as_str(),
+            "auto" | "true" | "false"
+        ) {
+            errors.push(format!(
+                "HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN '{}' invalid (expected auto|true|false)",
+                self.requires_access_token
+            ));
+        }
+        if self.output_backend == "local-fs" && self.requires_access_token == "false" {
+            errors.push(
+                "HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN=false is invalid with OUTPUT_BACKEND=local-fs"
+                    .to_string(),
+            );
+        }
+        if !matches!(self.signing_alg.as_str(), "ES384" | "RS384") {
+            errors.push(format!(
+                "HFS_BULK_SUBMIT_SIGNING_ALG '{}' invalid (expected ES384|RS384)",
+                self.signing_alg
+            ));
+        }
+        if self.worker_concurrency == 0 {
+            errors.push("HFS_BULK_SUBMIT_WORKER_CONCURRENCY must be >= 1".to_string());
+        }
+        if self.max_concurrent_per_tenant == 0 {
+            errors.push("HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT must be >= 1".to_string());
+        }
+        if self.batch_size == 0 {
+            errors.push("HFS_BULK_SUBMIT_BATCH_SIZE must be >= 1".to_string());
+        }
+        if self.heartbeat_interval_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL must be > 0".to_string());
+        }
+        if self.lease_duration_secs <= self.heartbeat_interval_secs {
+            errors.push(
+                "HFS_BULK_SUBMIT_LEASE_DURATION must be greater than HEARTBEAT_INTERVAL"
+                    .to_string(),
+            );
+        }
+        if self.cleanup_interval_secs == 0 {
+            errors.push("HFS_BULK_SUBMIT_CLEANUP_INTERVAL must be > 0".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
 /// Server configuration for the FHIR REST API.
 ///
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
@@ -447,6 +648,10 @@ pub struct ServerConfig {
     pub log_level: String,
 
     /// Maximum request body size in bytes.
+    ///
+    /// For requests sent with `Content-Encoding`, the limit applies to the
+    /// *decompressed* body, so a small highly-compressed payload cannot
+    /// bypass it.
     #[arg(long, env = "HFS_MAX_BODY_SIZE", default_value = "10485760")]
     pub max_body_size: usize,
 
@@ -474,7 +679,7 @@ pub struct ServerConfig {
     #[arg(
         long,
         env = "HFS_CORS_HEADERS",
-        default_value = "Content-Type,Authorization,Accept,If-Match,If-None-Match,If-None-Exist,If-Modified-Since,Prefer,X-Tenant-ID"
+        default_value = "Content-Type,Authorization,Accept,If-Match,If-None-Match,If-None-Exist,If-Modified-Since,Prefer,X-Tenant-ID,Content-Encoding"
     )]
     pub cors_headers: String,
 
@@ -556,6 +761,70 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
+    /// Enable SQL-on-FHIR operations ($viewdefinition-run, $viewdefinition-export).
+    /// When enabled, the configured storage backend MUST provide an in-DB
+    /// SOF runner (sqlite or postgres) — there is no in-process fallback.
+    #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
+    pub sof_enabled: bool,
+
+    /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
+    #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
+    pub export_sink: String,
+
+    /// Root directory for filesystem export sink.
+    #[arg(long, env = "HFS_EXPORT_DIR", default_value = "./exports")]
+    pub export_dir: String,
+
+    /// S3 bucket name for S3 export sink.
+    #[arg(long, env = "HFS_EXPORT_S3_BUCKET")]
+    pub export_s3_bucket: Option<String>,
+
+    /// S3 region for S3 export sink (defaults to AWS credential-chain region).
+    #[arg(long, env = "HFS_EXPORT_S3_REGION")]
+    pub export_s3_region: Option<String>,
+
+    /// Pre-signed URL TTL (seconds) for S3 export sink.
+    ///
+    /// Defaults to 24 hours: the SQL-on-FHIR spec requires `output.location`
+    /// download URLs to remain valid for at least 24 hours after export
+    /// completion (matching the `Expires` header on the completion poll).
+    #[arg(long, env = "HFS_EXPORT_PRESIGN_TTL_SECS", default_value = "86400")]
+    pub export_presign_ttl_secs: u64,
+
+    /// Maximum concurrent export jobs.
+    #[arg(long, env = "HFS_EXPORT_MAX_CONCURRENCY", default_value = "4")]
+    pub export_max_concurrency: usize,
+
+    /// Target rows per output shard for `$viewdefinition-export`.
+    /// Large result sets are split into multiple files of this size.
+    #[arg(long, env = "HFS_EXPORT_SHARD_ROWS", default_value = "500000")]
+    pub export_shard_rows: usize,
+
+    /// Export job controller backend: "memory" (default, in-process).
+    /// Future values: "kafka", "sqs".
+    #[arg(long, env = "HFS_EXPORT_CONTROLLER", default_value = "memory")]
+    pub export_controller: String,
+
+    /// Maximum rows returned by `$sqlquery-run`.
+    #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
+    pub sof_sqlquery_max_rows: usize,
+
+    /// Maximum rows materialized per depends-on ViewDefinition by `$sqlquery-run`.
+    #[arg(
+        long,
+        env = "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+        default_value = "1000000"
+    )]
+    pub sof_sqlquery_max_source_rows_per_vd: usize,
+
+    /// Maximum number of depends-on ViewDefinitions a single SQLQuery Library may declare.
+    #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
+    pub sof_sqlquery_max_vds: usize,
+
+    /// Hard timeout (seconds) for `$sqlquery-run` queries.
+    #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
+    pub sof_sqlquery_timeout_secs: u64,
+
     /// URL of the Helios Terminology Server (HTS) for terminology operations.
     ///
     /// When set, HFS delegates the following operations to the HTS:
@@ -576,6 +845,10 @@ pub struct ServerConfig {
     /// Bulk data export configuration (loaded from environment variables).
     #[arg(skip)]
     pub bulk_export: BulkExportConfig,
+
+    /// Bulk data submit configuration (loaded from environment variables).
+    #[arg(skip)]
+    pub bulk_submit: BulkSubmitConfig,
 }
 
 impl ServerConfig {
@@ -596,7 +869,7 @@ impl Default for ServerConfig {
             enable_cors: true,
             cors_origins: "*".to_string(),
             cors_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS".to_string(),
-            cors_headers: "Content-Type,Authorization,Accept,If-Match,If-None-Match,If-None-Exist,If-Modified-Since,Prefer,X-Tenant-ID".to_string(),
+            cors_headers: "Content-Type,Authorization,Accept,If-Match,If-None-Match,If-None-Exist,If-Modified-Since,Prefer,X-Tenant-ID,Content-Encoding".to_string(),
             default_tenant: "default".to_string(),
             base_url: "http://localhost:8080".to_string(),
             database_url: None,
@@ -613,9 +886,23 @@ impl Default for ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            sof_enabled: true,
+            export_sink: "fs".to_string(),
+            export_dir: "./exports".to_string(),
+            export_s3_bucket: None,
+            export_s3_region: None,
+            export_presign_ttl_secs: 86_400,
+            export_max_concurrency: 4,
+            export_shard_rows: 500_000,
+            export_controller: "memory".to_string(),
+            sof_sqlquery_max_rows: 100_000,
+            sof_sqlquery_max_source_rows_per_vd: 1_000_000,
+            sof_sqlquery_max_vds: 16,
+            sof_sqlquery_timeout_secs: 30,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
+            bulk_submit: BulkSubmitConfig::default(),
         }
     }
 }
@@ -632,6 +919,8 @@ impl ServerConfig {
         config.multitenancy = MultitenancyConfig::from_env();
         // Load bulk export config from environment
         config.bulk_export = BulkExportConfig::from_env();
+        // Load bulk submit config from environment
+        config.bulk_submit = BulkSubmitConfig::from_env();
         config
     }
 
@@ -673,6 +962,10 @@ impl ServerConfig {
             errors.append(&mut bulk_errors);
         }
 
+        if let Err(mut submit_errors) = self.bulk_submit.validate() {
+            errors.append(&mut submit_errors);
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -711,9 +1004,23 @@ impl ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            sof_enabled: true,
+            export_sink: "fs".to_string(),
+            export_dir: "./exports".to_string(),
+            export_s3_bucket: None,
+            export_s3_region: None,
+            export_presign_ttl_secs: 86_400,
+            export_max_concurrency: 4,
+            export_shard_rows: 500_000,
+            export_controller: "memory".to_string(),
+            sof_sqlquery_max_rows: 100_000,
+            sof_sqlquery_max_source_rows_per_vd: 1_000_000,
+            sof_sqlquery_max_vds: 16,
+            sof_sqlquery_timeout_secs: 30,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
+            bulk_submit: BulkSubmitConfig::default(),
         }
     }
 
@@ -1249,6 +1556,166 @@ mod tests {
         };
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("SINCE_NEWLY_ADDED")));
+    }
+
+    // ── BulkSubmitConfig::validate ────────────────────────────────
+
+    #[test]
+    fn test_bulk_submit_config_default_is_valid() {
+        assert!(BulkSubmitConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_invalid_output_backend() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "gcs".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("OUTPUT_BACKEND")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_s3_output_requires_bucket() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "s3".to_string(),
+            s3_bucket: None,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("S3_BUCKET")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_s3_output_with_bucket_ok() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "s3".to_string(),
+            s3_bucket: Some("my-bucket".to_string()),
+            ..BulkSubmitConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_invalid_requires_access_token() {
+        let cfg = BulkSubmitConfig {
+            requires_access_token: "maybe".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("REQUIRES_ACCESS_TOKEN")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_local_fs_requires_access_token_false_invalid() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "local-fs".to_string(),
+            requires_access_token: "false".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("local-fs")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_invalid_signing_alg() {
+        let cfg = BulkSubmitConfig {
+            signing_alg: "HS256".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("SIGNING_ALG")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_rs384_signing_alg_ok() {
+        let cfg = BulkSubmitConfig {
+            signing_alg: "RS384".to_string(),
+            ..BulkSubmitConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_worker_concurrency() {
+        let cfg = BulkSubmitConfig {
+            worker_concurrency: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("WORKER_CONCURRENCY")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_max_concurrent_per_tenant() {
+        let cfg = BulkSubmitConfig {
+            max_concurrent_per_tenant: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("MAX_CONCURRENT_PER_TENANT")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_batch_size() {
+        let cfg = BulkSubmitConfig {
+            batch_size: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("BATCH_SIZE")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_heartbeat_interval() {
+        let cfg = BulkSubmitConfig {
+            heartbeat_interval_secs: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("HEARTBEAT_INTERVAL")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_lease_must_exceed_heartbeat() {
+        let cfg = BulkSubmitConfig {
+            lease_duration_secs: 10,
+            heartbeat_interval_secs: 20,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("LEASE_DURATION")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_zero_cleanup_interval() {
+        let cfg = BulkSubmitConfig {
+            cleanup_interval_secs: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("CLEANUP_INTERVAL")));
+    }
+
+    #[test]
+    fn test_bulk_submit_config_collects_multiple_errors() {
+        let cfg = BulkSubmitConfig {
+            output_backend: "bogus".to_string(),
+            signing_alg: "bogus".to_string(),
+            worker_concurrency: 0,
+            batch_size: 0,
+            ..BulkSubmitConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.len() >= 4);
+    }
+
+    #[test]
+    fn test_server_config_validate_propagates_bulk_submit_errors() {
+        let mut config = ServerConfig::default();
+        config.bulk_submit.signing_alg = "nope".to_string();
+        let errs = config.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("SIGNING_ALG")));
     }
 
     // ── display for StorageBackendMode ────────────────────────────

@@ -296,7 +296,7 @@ Object creation syntax (`typename { element: value, ... }`): ✅
 | `extension(url)` | ✅ | Full support with variable URL resolution |
 | `hasValue()` | ✅ | Tests if primitive has a value beyond extensions |
 | `getValue()` | ❌ | Not implemented |
-| `resolve()` | ❌ | Requires resource resolver integration |
+| `resolve()` | ✅ | In-scope resolution: `contained` resources and resources available to the evaluation context (matched by `Type/id`, including the trailing `Type/id` of an absolute URL); unresolved `Type/id` references return a typed stub so `resolve() is X` works. In SQL-on-FHIR the resolution scope is the **whole input bundle**, so a ViewDefinition can follow a `Reference` to a sibling resource (e.g. `Encounter.subject.resolve()` → `Patient`). Remote resolution against **explicitly allowlisted** servers is available opt-in (`SOF_RESOLVE_*`); see [SQL-on-FHIR → Resolving References](ch06-sql-on-fhir.md). Storage-backed resolution remains tracked in [#167](https://github.com/HeliosSoftware/hfs/issues/167). |
 | `ofType()` (FHIR form) | ✅ | Full FHIR type support |
 | `elementDefinition()` | ❌ | Not implemented |
 | `slice()` | ❌ | Not implemented |

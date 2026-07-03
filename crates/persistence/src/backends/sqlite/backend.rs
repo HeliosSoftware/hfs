@@ -152,6 +152,17 @@ impl SqliteBackend {
         } else {
             SqliteConnectionManager::file(path.as_ref())
         };
+        // Per-connection initialiser: register the in-DB SOF runner's helper
+        // UDFs (`fhir_last_segment`) so SQL emitted by the FHIRPath compiler
+        // can call them directly without dialect-specific shimming.
+        let manager = manager.with_init(|conn| {
+            crate::sof::sqlite_udfs::register(conn).map_err(|e| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(format!("failed to register SOF SQLite UDFs: {e}")),
+                )
+            })
+        });
 
         let pool = Pool::builder()
             .max_size(config.max_connections)
@@ -369,6 +380,11 @@ impl SqliteBackend {
         Ok(count)
     }
 
+    /// Returns a clone of the connection pool (cheap — pool is `Arc`-backed internally).
+    pub(crate) fn pool(&self) -> Pool<SqliteConnectionManager> {
+        self.pool.clone()
+    }
+
     /// Get a connection from the pool.
     pub(crate) fn get_connection(
         &self,
@@ -498,6 +514,9 @@ impl Backend for SqliteBackend {
                 | BackendCapability::OffsetPagination
                 | BackendCapability::Transactions
                 | BackendCapability::OptimisticLocking
+                | BackendCapability::BulkExport
+                | BackendCapability::BulkSubmitIngest
+                | BackendCapability::BulkSubmitRestWorker
                 | BackendCapability::Include
                 | BackendCapability::Revinclude
                 | BackendCapability::SharedSchema
@@ -518,6 +537,9 @@ impl Backend for SqliteBackend {
             BackendCapability::OffsetPagination,
             BackendCapability::Transactions,
             BackendCapability::OptimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
             BackendCapability::Include,
             BackendCapability::Revinclude,
             BackendCapability::SharedSchema,
@@ -691,19 +713,18 @@ impl SearchCapabilityProvider for SqliteBackend {
 
 impl SqliteBackend {
     /// Returns supported modifiers for a parameter type.
-    fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
+    pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             // `not-in` is intentionally omitted: the SQLite backend returns 501
             // for it (negated value-set filtering is unimplemented), so it must
-            // not be advertised. `code`/`text-advanced` are implemented by the
-            // token handler and were previously under-advertised.
+            // not be advertised. `text-advanced` is implemented by the token
+            // handler and was previously under-advertised.
             SearchParamType::Token => vec![
                 "not",
                 "text",
                 "in",
                 "of-type",
-                "code",
                 "code-text",
                 "text-advanced",
                 "missing",
@@ -753,6 +774,9 @@ mod tests {
         assert!(backend.supports(BackendCapability::Crud));
         assert!(backend.supports(BackendCapability::BasicSearch));
         assert!(backend.supports(BackendCapability::Transactions));
+        assert!(backend.supports(BackendCapability::BulkExport));
+        assert!(backend.supports(BackendCapability::BulkSubmitIngest));
+        assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
         assert!(!backend.supports(BackendCapability::FullTextSearch));
     }
 
@@ -836,7 +860,8 @@ mod tests {
         assert!(token_mods.contains(&"not"));
         assert!(token_mods.contains(&"text"));
         assert!(token_mods.contains(&"of-type"));
-        assert!(token_mods.contains(&"code"));
+        // `:code` is a non-spec modifier and must not be advertised.
+        assert!(!token_mods.contains(&"code"));
         assert!(token_mods.contains(&"text-advanced"));
         // `not-in` returns 501, so it must not be advertised as supported.
         assert!(!token_mods.contains(&"not-in"));

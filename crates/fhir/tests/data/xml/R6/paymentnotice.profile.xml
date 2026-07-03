@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="PaymentNotice"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -347,11 +347,11 @@
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/PaymentNotice"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="PaymentNotice"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-06-13T17:13:29+00:00"/>
   <publisher value="HL7 International / Financial Management"/>
   <contact>
     <telecom>
@@ -373,7 +373,7 @@
       <display value="World"/>
     </coding>
   </jurisdiction>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -582,7 +582,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -763,7 +763,7 @@
       <short value="active | cancelled | draft | entered-in-error"/>
       <definition value="The status of the resource instance."/>
       <comment value="This element is labeled as a modifier because the status contains codes that mark the resource as not currently valid."/>
-      <requirements value="Need to track the status of the resource as 'draft' resources may undergo further edits while 'active' resources are immutable and may only have their status changed to 'cancelled'."/>
+      <requirements value="Needed to track the status of the resource as 'draft' resources may undergo further edits while 'active' resources are immutable and may only have their status changed to 'cancelled'."/>
       <min value="1"/>
       <max value="1"/>
       <base>
@@ -791,7 +791,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code specifying the state of the resource instance."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -905,7 +905,7 @@
       <path value="PaymentNotice.created"/>
       <short value="Creation date"/>
       <definition value="The date when this resource was created."/>
-      <requirements value="Need to record a timestamp for use by both the recipient and the issuer."/>
+      <requirements value="Needed to record a timestamp for use by both the recipient and the issuer."/>
       <min value="1"/>
       <max value="1"/>
       <base>
@@ -991,7 +991,7 @@
       <path value="PaymentNotice.payment"/>
       <short value="Payment reference"/>
       <definition value="A reference to the payment which is the subject of this notice."/>
-      <requirements value="Need to identify the actual payment."/>
+      <requirements value="Needed to identify the actual payment."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1018,7 +1018,7 @@
       <path value="PaymentNotice.paymentDate"/>
       <short value="Payment or clearing date"/>
       <definition value="The date when the above payment action occurred."/>
-      <requirements value="Need to convey the date when the action being notified occurred."/>
+      <requirements value="Needed to convey the date when the action being notified occurred."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1072,7 +1072,7 @@
       <path value="PaymentNotice.recipient"/>
       <short value="Party being notified"/>
       <definition value="The party who is notified of the payment status."/>
-      <requirements value="Need to identified the recipient of the notification."/>
+      <requirements value="Needed to identified the recipient of the notification."/>
       <min value="1"/>
       <max value="1"/>
       <base>
@@ -1218,7 +1218,7 @@
       <short value="active | cancelled | draft | entered-in-error"/>
       <definition value="The status of the resource instance."/>
       <comment value="This element is labeled as a modifier because the status contains codes that mark the resource as not currently valid."/>
-      <requirements value="Need to track the status of the resource as 'draft' resources may undergo further edits while 'active' resources are immutable and may only have their status changed to 'cancelled'."/>
+      <requirements value="Needed to track the status of the resource as 'draft' resources may undergo further edits while 'active' resources are immutable and may only have their status changed to 'cancelled'."/>
       <min value="1"/>
       <max value="1"/>
       <type>
@@ -1234,7 +1234,7 @@
         </extension>
         <strength value="required"/>
         <description value="A code specifying the state of the resource instance."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -1312,7 +1312,7 @@
       <path value="PaymentNotice.created"/>
       <short value="Creation date"/>
       <definition value="The date when this resource was created."/>
-      <requirements value="Need to record a timestamp for use by both the recipient and the issuer."/>
+      <requirements value="Needed to record a timestamp for use by both the recipient and the issuer."/>
       <min value="1"/>
       <max value="1"/>
       <type>
@@ -1374,7 +1374,7 @@
       <path value="PaymentNotice.payment"/>
       <short value="Payment reference"/>
       <definition value="A reference to the payment which is the subject of this notice."/>
-      <requirements value="Need to identify the actual payment."/>
+      <requirements value="Needed to identify the actual payment."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -1389,7 +1389,7 @@
       <path value="PaymentNotice.paymentDate"/>
       <short value="Payment or clearing date"/>
       <definition value="The date when the above payment action occurred."/>
-      <requirements value="Need to convey the date when the action being notified occurred."/>
+      <requirements value="Needed to convey the date when the action being notified occurred."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -1419,7 +1419,7 @@
       <path value="PaymentNotice.recipient"/>
       <short value="Party being notified"/>
       <definition value="The party who is notified of the payment status."/>
-      <requirements value="Need to identified the recipient of the notification."/>
+      <requirements value="Needed to identified the recipient of the notification."/>
       <min value="1"/>
       <max value="1"/>
       <type>

@@ -147,6 +147,44 @@ result = pysof.run_view_definition_with_options(
 )
 ```
 
+### Remote `resolve()` (Trusted Servers)
+
+`resolve()` dereferences references against the input bundle by default. You can
+optionally let it fetch references that point at **explicitly trusted** FHIR
+servers and fold them into the resolution pool before rows are generated. This is
+**off by default** and gated by a strict allowlist (matching scheme + host + port
++ path-prefix; private/loopback addresses are blocked unless opted in).
+
+```python
+import pysof
+
+config = pysof.RemoteResolveConfig(
+    ["https://fhir.example.org/r4"],   # trusted base URLs (allowlist)
+    max_fetches=256,                    # per-run/-stream fetch cap
+    max_depth=1,                        # chained-reference rounds
+    allow_private_addresses=False,      # allow internal LBs (e.g. Traefik) by hostname
+    bearer_tokens={"fhir.example.org": "TOKEN"},  # optional per-host auth
+)
+
+# Or build it from SOF_RESOLVE_* environment variables:
+# config = pysof.RemoteResolveConfig.from_env()
+
+result = pysof.run_view_definition_remote(
+    view_definition, bundle, "json", config, fhir_version="R4"
+)
+
+# Streaming NDJSON with remote resolve() (one shared cache across chunks):
+stats = pysof.process_ndjson_to_file_remote(
+    view_definition, "input.ndjson", "output.json", "ndjson", config, chunk_size=1000
+)
+```
+
+When `config.is_active()` is `False` (disabled or empty allowlist) these behave
+exactly like their non-remote counterparts. Enabling remote resolution makes
+output depend on remote server state at run time. See the
+[SQL-on-FHIR guide](../../book/src/ch06-sql-on-fhir.md) for the full security
+model and configuration reference.
+
 ### Utility Functions
 
 ```python

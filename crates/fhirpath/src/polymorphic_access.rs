@@ -161,44 +161,75 @@ fn get_polymorphic_fields(
 ) -> Vec<(String, EvaluationResult)> {
     let mut matches = Vec::new();
 
-    // Check for direct field match first
     if let Some(value) = obj.get(base_name) {
         matches.push((base_name.to_string(), value.clone()));
     }
 
-    // Look for fields that start with the base name and have a type suffix
-    for (field_name, value) in obj {
-        // Skip if we already have this field
-        if matches.iter().any(|(name, _)| name == field_name) {
-            continue;
+    // Preferred path: when `obj` identifies a FHIR resource, consult the
+    // generated `FIELD_TYPES` table for that parent and pull out only the
+    // typed variants that are both declared in the spec and present in the
+    // data. More accurate than the JSON-key prefix scan below, which can
+    // match unrelated fields whose names happen to start with `base_name`.
+    let mut consulted_field_types = false;
+    if let Some(EvaluationResult::String(resource_type, _, _)) = obj.get("resourceType")
+        && let Some(table) = helios_fhir::field_types(helios_fhir::FhirVersion::default_enabled())
+    {
+        consulted_field_types = true;
+        for (parent, field, _ty, _is_collection) in table {
+            if parent != resource_type {
+                continue;
+            }
+            let Some(suffix) = field.strip_prefix(base_name) else {
+                continue;
+            };
+            if !suffix
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+            {
+                continue;
+            }
+            if matches.iter().any(|(n, _)| n == field) {
+                continue;
+            }
+            if let Some(value) = obj.get(*field) {
+                let converted = convert_fhir_field_to_fhirpath_type(value, suffix);
+                matches.push(((*field).to_string(), converted));
+            }
         }
+    }
 
-        // Check if this field starts with our base name
-        if field_name.starts_with(base_name) && field_name.len() > base_name.len() {
-            // Check if the character after base name is uppercase (indicating a type suffix)
-            if let Some(c) = field_name.chars().nth(base_name.len()) {
-                if c.is_uppercase() {
-                    // Extract the type suffix
-                    let type_suffix = &field_name[base_name.len()..];
-                    // Convert the value based on the type suffix
-                    let converted_value = convert_fhir_field_to_fhirpath_type(value, type_suffix);
-                    matches.push((field_name.clone(), converted_value));
+    // Fallback for nested objects (no `resourceType`) and for the
+    // version-feature-disabled case — preserves prior behavior so callers
+    // working below the resource root still resolve typed variants.
+    if !consulted_field_types {
+        for (field_name, value) in obj {
+            if matches.iter().any(|(name, _)| name == field_name) {
+                continue;
+            }
+            if field_name.starts_with(base_name) && field_name.len() > base_name.len() {
+                if let Some(c) = field_name.chars().nth(base_name.len()) {
+                    if c.is_uppercase() {
+                        let type_suffix = &field_name[base_name.len()..];
+                        let converted_value =
+                            convert_fhir_field_to_fhirpath_type(value, type_suffix);
+                        matches.push((field_name.clone(), converted_value));
+                    }
                 }
             }
         }
     }
 
-    // Special case for Observation resources with value field
-    // This prioritization helps with common patterns
-    if base_name == "value" && matches.len() > 1 {
-        // Check if this is an Observation
-        if obj.get("resourceType") == Some(&EvaluationResult::string("Observation".to_string())) {
-            // Prioritize valueQuantity for Observation resources if it exists
-            if let Some(idx) = matches.iter().position(|(name, _)| name == "valueQuantity") {
-                let item = matches.remove(idx);
-                matches.insert(0, item);
-            }
-        }
+    // Observation/`value` policy: prefer `valueQuantity` when present. This
+    // is a FHIRPath-evaluator product choice (the FHIR spec doesn't declare
+    // it canonical), kept stable through the structural refactor above.
+    if base_name == "value"
+        && matches.len() > 1
+        && obj.get("resourceType") == Some(&EvaluationResult::string("Observation".to_string()))
+        && let Some(idx) = matches.iter().position(|(name, _)| name == "valueQuantity")
+    {
+        let item = matches.remove(idx);
+        matches.insert(0, item);
     }
 
     matches
@@ -360,15 +391,42 @@ pub fn is_choice_element_with_context(field_name: &str, context_metadata: Option
         return false;
     }
 
-    // Without metadata, we can't reliably determine if it's a choice element
-    // Be conservative and return false to avoid false positives
-    false
+    // Without metadata, consult the generated `FIELD_TYPES` table for the
+    // default FHIR version: `field_name` is a choice base if at least one
+    // field in any parent type has the form `<field_name><UppercaseLetter>...`.
+    is_polymorphic_base_in_default_version(field_name)
 }
 
 /// Convenience function that calls is_choice_element_with_context without metadata.
 /// This is less accurate but maintains backward compatibility.
 pub fn is_choice_element(field_name: &str) -> bool {
     is_choice_element_with_context(field_name, None)
+}
+
+/// Returns true when `name` is the base of a polymorphic FHIR field in the
+/// default FHIR version's generated `FIELD_TYPES` table — i.e. some declared
+/// field is `<name><UppercaseLetter>...`. Lets the no-context choice-element
+/// check return a useful answer for common polymorphic bases (`value`,
+/// `effective`, `onset`, …) instead of the always-false fallback that
+/// preceded this.
+fn is_polymorphic_base_in_default_version(name: &str) -> bool {
+    let table: &[(&str, &str, &str, bool)] = match helios_fhir::FhirVersion::default_enabled() {
+        #[cfg(feature = "R4")]
+        helios_fhir::FhirVersion::R4 => helios_fhir::r4::FIELD_TYPES,
+        #[cfg(feature = "R4B")]
+        helios_fhir::FhirVersion::R4B => helios_fhir::r4b::FIELD_TYPES,
+        #[cfg(feature = "R5")]
+        helios_fhir::FhirVersion::R5 => helios_fhir::r5::FIELD_TYPES,
+        #[cfg(feature = "R6")]
+        helios_fhir::FhirVersion::R6 => helios_fhir::r6::FIELD_TYPES,
+        #[allow(unreachable_patterns)]
+        _ => return false,
+    };
+    table.iter().any(|(_, f, _, _)| {
+        f.strip_prefix(name)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_ascii_uppercase())
+    })
 }
 
 /// Applies a type-based operation to a value, handling polymorphic choice elements.

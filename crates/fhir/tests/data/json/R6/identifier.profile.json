@@ -16,11 +16,11 @@
     }
   ],
   "url": "http://hl7.org/fhir/StructureDefinition/Identifier",
-  "version": "6.0.0-ballot3",
+  "version": "6.0.0-ballot4",
   "name": "Identifier",
   "status": "active",
   "experimental": false,
-  "date": "2025-12-17T09:50:17+00:00",
+  "date": "2026-06-13T17:13:29+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -53,7 +53,7 @@
     }
   ],
   "purpose": "Need to be able to identify things with confidence and be sure that the identification is not subject to misinterpretation.",
-  "fhirVersion": "6.0.0-ballot3",
+  "fhirVersion": "6.0.0-ballot4",
   "mapping": [
     {
       "identity": "v2",
@@ -255,7 +255,7 @@
           ],
           "strength": "required",
           "description": "Identifies the purpose for this identifier, if known .",
-          "valueSet": "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -384,7 +384,7 @@
         "path": "Identifier.value",
         "short": "The value that is unique",
         "definition": "The portion of the identifier typically relevant to the user and which is unique within the context of the system.",
-        "comment": "If the value is a full URI, then the system SHALL be urn:ietf:rfc:3986.  The value\u0027s primary purpose is computational mapping.  As a result, it may be normalized for comparison purposes (e.g. removing non-significant whitespace, dashes, etc.)  A value formatted for human display can be conveyed using the [http://hl7.org/fhir/StructureDefinition/rendered-value](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-rendered-value.html)). Identifier.value is to be treated as case sensitive unless knowledge of the Identifier.system allows the processer to be confident that non-case-sensitive processing is safe.",
+        "comment": "If the value is a full URI, then the system SHALL be urn:ietf:rfc:3986.  The value\u0027s primary purpose is computational mapping.  As a result, it may be normalized for comparison purposes (e.g. removing non-significant whitespace, dashes, etc.)  A value formatted for human display can be conveyed using the [http://hl7.org/fhir/StructureDefinition/rendered-value](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-rendered-value.html)). Identifier.value is to be treated as case sensitive unless knowledge of the Identifier.system allows the processor to be confident that non-case-sensitive processing is safe.",
         "min": 0,
         "max": "1",
         "base": {
@@ -588,7 +588,7 @@
           ],
           "strength": "required",
           "description": "Identifies the purpose for this identifier, if known .",
-          "valueSet": "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot3"
+          "valueSet": "http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot4"
         },
         "mapping": [
           {
@@ -687,7 +687,7 @@
         "path": "Identifier.value",
         "short": "The value that is unique",
         "definition": "The portion of the identifier typically relevant to the user and which is unique within the context of the system.",
-        "comment": "If the value is a full URI, then the system SHALL be urn:ietf:rfc:3986.  The value\u0027s primary purpose is computational mapping.  As a result, it may be normalized for comparison purposes (e.g. removing non-significant whitespace, dashes, etc.)  A value formatted for human display can be conveyed using the [http://hl7.org/fhir/StructureDefinition/rendered-value](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-rendered-value.html)). Identifier.value is to be treated as case sensitive unless knowledge of the Identifier.system allows the processer to be confident that non-case-sensitive processing is safe.",
+        "comment": "If the value is a full URI, then the system SHALL be urn:ietf:rfc:3986.  The value\u0027s primary purpose is computational mapping.  As a result, it may be normalized for comparison purposes (e.g. removing non-significant whitespace, dashes, etc.)  A value formatted for human display can be conveyed using the [http://hl7.org/fhir/StructureDefinition/rendered-value](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-rendered-value.html)). Identifier.value is to be treated as case sensitive unless knowledge of the Identifier.system allows the processor to be confident that non-case-sensitive processing is safe.",
         "min": 0,
         "max": "1",
         "type": [

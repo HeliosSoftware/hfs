@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="QuestionnaireResponse"/>
   <meta>
-    <lastUpdated value="2025-11-27T16:48:47.349+00:00"/>
+    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -306,6 +306,8 @@
             <span style="font-style: italic" title="qrs-1">+ Rule: Item cannot contain both item and answer</span>
             <br/>
             <span style="font-style: italic" title="qrs-2">+ Rule: Repeated answers are combined in the answers array of a single item</span>
+            <br/>
+            <span style="font-style: italic" title="qrs-4">+ Rule: The same answer cannot be specified more than once for the same question</span>
             <br/>
             <br/>
           </td>
@@ -698,11 +700,11 @@
     <valueCode value="patient"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/QuestionnaireResponse"/>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="QuestionnaireResponse"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2025-11-27T16:48:47+00:00"/>
+  <date value="2026-06-13T17:13:29+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -719,7 +721,7 @@
     </coding>
   </jurisdiction>
   <purpose value="To support structured, hierarchical reporting of data gathered using digital forms and other questionnaires."/>
-  <fhirVersion value="6.0.0-ballot3"/>
+  <fhirVersion value="6.0.0-ballot4"/>
   <mapping>
     <identity value="workflow"/>
     <uri value="http://hl7.org/fhir/workflow"/>
@@ -921,7 +923,7 @@
         </extension>
         <strength value="required"/>
         <description value="IETF language tag for a human language"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4"/>
         <additional>
           <purpose value="starter"/>
           <valueSet value="http://hl7.org/fhir/ValueSet/languages"/>
@@ -1237,7 +1239,7 @@
         </extension>
         <strength value="required"/>
         <description value="Lifecycle status of the questionnaire response."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/questionnaire-answers-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/questionnaire-answers-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -1506,6 +1508,13 @@
         <expression value="repeat(answer|item).select(item.where(answer.value.exists()).linkId.isDistinct()).allTrue()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/QuestionnaireResponse"/>
       </constraint>
+      <constraint>
+        <key value="qrs-4"/>
+        <severity value="error"/>
+        <human value="The same answer cannot be specified more than once for the same question"/>
+        <expression value="answer.value.isDistinct().allTrue()"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/QuestionnaireResponse"/>
+      </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -1724,6 +1733,7 @@
       </type>
       <condition value="qrs-1"/>
       <condition value="qrs-2"/>
+      <condition value="qrs-4"/>
       <constraint>
         <key value="ele-1"/>
         <severity value="error"/>
@@ -2111,7 +2121,7 @@
         </extension>
         <strength value="required"/>
         <description value="Lifecycle status of the questionnaire response."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/questionnaire-answers-status|6.0.0-ballot3"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/questionnaire-answers-status|6.0.0-ballot4"/>
       </binding>
       <mapping>
         <identity value="workflow"/>
@@ -2295,6 +2305,13 @@
         <code value="BackboneElement"/>
       </type>
       <constraint>
+        <key value="qrs-4"/>
+        <severity value="error"/>
+        <human value="The same answer cannot be specified more than once for the same question"/>
+        <expression value="answer.value.isDistinct().allTrue()"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/QuestionnaireResponse"/>
+      </constraint>
+      <constraint>
         <key value="qrs-2"/>
         <severity value="error"/>
         <human value="Repeated answers are combined in the answers array of a single item"/>
@@ -2393,6 +2410,7 @@
       </type>
       <condition value="qrs-1"/>
       <condition value="qrs-2"/>
+      <condition value="qrs-4"/>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>

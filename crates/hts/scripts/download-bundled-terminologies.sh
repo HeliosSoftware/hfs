@@ -135,18 +135,15 @@ try_download "ICD-9-CM ${ICD9CM_VERSION}" \
     "ICD-9-CM-${ICD9CM_VERSION}-master-descriptions.zip"
 
 # ---------- 4. UCUM ------------------------------------------------------------
-# Already bundled inside the HL7 THO tarball (see step 1). Importing THO
-# covers this — no separate download needed. Left in the script as a
-# reference for customers who want to import UCUM without THO; uncomment
-# and delete the THO UCUM entries to use it standalone.
-echo
-echo "=== UCUM ==="
-echo "  [bundled] included in hl7.terminology.*.tgz — no separate file"
-RESULTS+=("SKIP  UCUM -> bundled in THO")
 # Landing page: https://github.com/ucum-org/ucum/releases
-# try_download "UCUM ${UCUM_VERSION}" \
-#     "https://raw.githubusercontent.com/ucum-org/ucum/${UCUM_VERSION}/ucum-essence.xml" \
-#     "ucum-essence-${UCUM_VERSION}.xml"
+# The HL7 THO tarball ships only the UCUM *ValueSets* (ucum-units, ucum-common)
+# and a NamingSystem — NOT the UCUM CodeSystem itself, so importing THO alone
+# leaves http://unitsofmeasure.org without any concepts to $lookup/$validate.
+# Fetch the canonical ucum-essence.xml so the UCUM code system loads. The
+# filename keeps "ucum"/"essence" so HTS bootstrap auto-detects the format.
+try_download "UCUM ${UCUM_VERSION}" \
+    "https://raw.githubusercontent.com/ucum-org/ucum/${UCUM_VERSION}/ucum-essence.xml" \
+    "ucum-essence-${UCUM_VERSION}.xml"
 
 # ---------- 5. NCI Thesaurus (NCIt) -------------------------------------------
 # Landing page: https://evs.nci.nih.gov/evs-download/thesaurus-downloads

@@ -6,13 +6,50 @@ use std::collections::HashMap;
 
 use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
 use helios_persistence::types::{
-    CompositeSearchComponent, IncludeDirective, IncludeType, ReverseChainedParameter,
-    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
-    SummaryMode, TotalMode,
+    CompositeSearchComponent, ContainedMode, ContainedReturn, IncludeDirective, IncludeType,
+    ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
+    SearchValue, SortDirective, SummaryMode, TotalMode,
 };
 
 use super::SearchParams;
 use crate::error::RestError;
+
+/// Splits a FHIR search value into its comma-separated OR-alternatives,
+/// respecting backslash escaping.
+///
+/// Per the FHIR spec, the characters `, | $ \` are escaped with a leading
+/// backslash inside a value. Only the comma is the OR-list separator at this
+/// layer, so we split on *unescaped* commas and unescape `\,` and `\\` here.
+/// Other escapes (`\|`, `\$`) are left intact for the backend's token/composite
+/// parsing to interpret.
+fn split_unescaped_commas(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.peek() {
+                Some(',') => {
+                    cur.push(',');
+                    chars.next();
+                }
+                Some('\\') => {
+                    cur.push('\\');
+                    chars.next();
+                }
+                // Preserve other escapes (e.g. `\|`, `\$`) for downstream parsing.
+                _ => cur.push('\\'),
+            },
+            ',' => {
+                out.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur.trim().to_string());
+    out
+}
 
 /// Builds a SearchQuery from REST parameters.
 ///
@@ -82,6 +119,37 @@ pub fn build_search_query(
         query.elements = elements.to_vec();
     }
 
+    // Process _contained / _containedType
+    if let Some(v) = params.get("_contained") {
+        query.contained = match v.as_str() {
+            "false" | "" => ContainedMode::Off,
+            "true" => ContainedMode::On,
+            "both" => ContainedMode::Both,
+            other => {
+                return Err(RestError::InvalidParameter {
+                    param: "_contained".to_string(),
+                    message: format!(
+                        "invalid _contained value '{other}' (expected 'true', 'false', or 'both')"
+                    ),
+                });
+            }
+        };
+    }
+    if let Some(v) = params.get("_containedType") {
+        query.contained_return = match v.as_str() {
+            "container" | "" => ContainedReturn::Container,
+            "contained" => ContainedReturn::Contained,
+            other => {
+                return Err(RestError::InvalidParameter {
+                    param: "_containedType".to_string(),
+                    message: format!(
+                        "invalid _containedType value '{other}' (expected 'container' or 'contained')"
+                    ),
+                });
+            }
+        };
+    }
+
     // Process _include directives
     for include in params.include() {
         if let Some(directive) = parse_include_directive(include, IncludeType::Include) {
@@ -113,6 +181,17 @@ pub fn build_search_query(
         if name == "_has" || name.starts_with("_has:") {
             if let Some(reverse_chain) = parse_has_parameter(name, value)? {
                 query.reverse_chains.push(reverse_chain);
+            }
+            continue;
+        }
+
+        // Handle _list: restrict results to members of the referenced List
+        // resource(s). Resolved application-side into an `_id` filter. A value
+        // may be a bare logical id (`42`) or a `List/42` reference; both are
+        // accepted and normalized to the logical id by the resolver.
+        if name == "_list" {
+            if !value.is_empty() {
+                query.list.push(value.to_string());
             }
             continue;
         }
@@ -207,7 +286,10 @@ fn parse_search_parameter(
     // date/number/quantity types per FHIR. For tokens/strings/references/uris,
     // the raw value is the value — e.g. status code "appended" must not be
     // misread as Ap-prefix + "pended".
-    let raw_values: Vec<&str> = value.split(',').map(str::trim).collect();
+    // Split the OR-list on UNescaped commas and unescape `\,` / `\\`, per FHIR
+    // value escaping. A literal comma in a value is written `\,` and must not
+    // start a new OR-alternative.
+    let raw_values: Vec<String> = split_unescaped_commas(value);
     let tentative_values: Vec<SearchValue> =
         raw_values.iter().map(|v| SearchValue::parse(v)).collect();
 
@@ -246,7 +328,10 @@ fn parse_search_parameter(
     ) {
         tentative_values
     } else {
-        raw_values.iter().map(|v| SearchValue::eq(*v)).collect()
+        raw_values
+            .iter()
+            .map(|v| SearchValue::eq(v.clone()))
+            .collect()
     };
 
     let mut param = SearchParameter {
@@ -633,6 +718,22 @@ mod tests {
         let (name, modifier) = parse_parameter_name("name");
         assert_eq!(name, "name");
         assert!(modifier.is_none());
+    }
+
+    #[test]
+    fn test_split_unescaped_commas() {
+        // Plain OR-list splits on commas.
+        assert_eq!(split_unescaped_commas("a,b,c"), vec!["a", "b", "c"]);
+        // An escaped comma stays part of one value and is unescaped.
+        assert_eq!(
+            split_unescaped_commas("Smith\\, John,Doe"),
+            vec!["Smith, John", "Doe"]
+        );
+        // Escaped backslash is unescaped; other escapes (\|) are preserved.
+        assert_eq!(split_unescaped_commas("a\\\\b"), vec!["a\\b"]);
+        assert_eq!(split_unescaped_commas("sys\\|code"), vec!["sys\\|code"]);
+        // Surrounding whitespace is trimmed.
+        assert_eq!(split_unescaped_commas(" a , b "), vec!["a", "b"]);
     }
 
     #[test]

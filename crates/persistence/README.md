@@ -375,7 +375,8 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | Multiple fields                                                             | ✓      | ✓          | ◐       | ✗         | ○     | ✓             | ✗   |
 | **[Bulk Operations](https://hl7.org/fhir/uv/bulkdata/)**                    |
 | [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ◐   |
-| [Bulk Submit](https://hackmd.io/@argonaut/rJoqHZrPle)                       | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
+| [Bulk Submit ingest](https://hackmd.io/@argonaut/rJoqHZrPle)                | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
+| [Bulk Submit REST worker](https://hackmd.io/@argonaut/rJoqHZrPle)           | ✓      | ✓          | ✗       | ✗         | ✗     | ✗             | ✗   |
 
 **Notes on partial cells:**
 
@@ -409,7 +410,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   each instance as one nested object with inline component values and matches with a single nested
   query. See `docs/search-spec-assessment.md`.
 
-The S3 backend is intentionally storage-focused (CRUD/version/history/bulk submit) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
+The S3 backend is intentionally storage-focused (CRUD/version/history and `BulkSubmitProvider` ingestion) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. `$bulk-submit` REST worker/job state also belongs to SQLite or PostgreSQL; S3 supports only the synchronous ingest provider. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
 ### Primary/Secondary Role Matrix
 
@@ -799,7 +800,7 @@ let composite = CompositeStorage::new(config, backends)?
 
 ## S3 Backend
 
-The S3 backend is a storage-focused persistence backend using AWS S3 object storage. It handles CRUD, versioning/history, and bulk-submit workflows but is intentionally not a FHIR search engine. For bulk export, S3 participates in two narrower roles: `S3Backend` can provide resource batches for system-level exports, and `S3OutputStore` can store finalized NDJSON output files. Bulk-export job state, progress, manifests, leases, and file metadata are not stored in S3; they live in SQLite or PostgreSQL.
+The S3 backend is a storage-focused persistence backend using AWS S3 object storage. It handles CRUD, versioning/history, and synchronous bulk-submit ingest provider workflows, but is intentionally not a FHIR search engine. For bulk export, S3 participates in two narrower roles: `S3Backend` can provide resource batches for system-level exports, and `S3OutputStore` can store finalized NDJSON output files. Bulk-export and `$bulk-submit` REST worker job state, progress, manifests, leases, and file metadata are not stored in S3; they live in SQLite or PostgreSQL.
 
 ### Scope
 

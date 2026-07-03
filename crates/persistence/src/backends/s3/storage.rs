@@ -316,6 +316,38 @@ impl S3Backend {
         Ok(keys)
     }
 
+    /// Scans every live (non-deleted) resource of `resource_type` for `tenant`
+    /// and returns their raw FHIR JSON content.
+    ///
+    /// Shares the `list_current_keys` + `get_json_object` walk used by bulk
+    /// export ([`super::bulk_export`]); used by the in-process SQL-on-FHIR
+    /// runner to feed the `helios-sof` engine.
+    pub(crate) async fn scan_live_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<Vec<Value>> {
+        let location = self.tenant_location(tenant)?;
+        let keys = self
+            .list_current_keys(&location, Some(resource_type))
+            .await?;
+
+        let mut resources = Vec::new();
+        for key in keys {
+            let Some((resource, _)) = self
+                .get_json_object::<StoredResource>(&location.bucket, &key)
+                .await?
+            else {
+                continue;
+            };
+            if resource.is_deleted() {
+                continue;
+            }
+            resources.push(resource.content().clone());
+        }
+        Ok(resources)
+    }
+
     /// Loads history entries by scanning all index event objects under `prefix`.
     ///
     /// For each event key found, the corresponding versioned history snapshot is
@@ -432,6 +464,25 @@ impl S3Backend {
 impl ResourceStorage for S3Backend {
     fn backend_name(&self) -> &'static str {
         "s3"
+    }
+
+    fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
+        use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
+        use crate::sof::reference_resolver::StorageBackedResolver;
+        // S3 is object storage with no query engine, so SQL-on-FHIR runs
+        // in-process over the scanned resources via the `helios-sof` engine.
+        let scan: std::sync::Arc<dyn ResourceScan> = std::sync::Arc::new(self.clone());
+        // Enable storage-backed `resolve()`: the same S3 backend serves as the
+        // tenant-scoped reference resolver, so a view's `reference.resolve()` can
+        // dereference a stored `Type/id` that is not in the scanned set.
+        let resolver = std::sync::Arc::new(StorageBackedResolver::new(
+            std::sync::Arc::new(self.clone()),
+            StorageBackedResolver::DEFAULT_MAX_FANOUT,
+        ));
+        Some(std::sync::Arc::new(
+            InProcessSofRunner::new(scan, FhirVersion::default_enabled(), "s3-in-process")
+                .with_reference_resolver(resolver),
+        ))
     }
 
     async fn create(
@@ -1119,6 +1170,19 @@ impl ConditionalStorage for S3Backend {
             backend_name: "S3".to_string(),
             capability: "conditional_delete".to_string(),
         }))
+    }
+}
+
+#[async_trait]
+impl crate::sof::in_process::ResourceScan for S3Backend {
+    async fn scan_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        self.scan_live_resources(tenant, resource_type)
+            .await
+            .map_err(|e| crate::core::sof_runner::SofError::Storage(e.to_string()))
     }
 }
 

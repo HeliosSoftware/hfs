@@ -7,6 +7,7 @@
       <display value="test health data"/>
     </security>
   </meta>
+  <status value="active"/>
   <code>
     <coding>
       <system value="https://fdc.nal.usda.gov/"/>
@@ -15,7 +16,6 @@
     </coding>
     <text value="SKIPPY, PEANUT BUTTER"/>
   </code>
-  <status value="active"/>
   <category>
     <text value="Nut &amp; Seed Butters"/>
   </category>

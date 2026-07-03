@@ -103,12 +103,8 @@ fn test_join_function_empty_collection() {
     // Test joining non-existent given names
     let result = evaluate_expression("name.given.join(',')", &context).unwrap();
 
-    match result {
-        EvaluationResult::String(s, _, _) => {
-            assert_eq!(s, ""); // Empty collection should produce empty string
-        }
-        _ => panic!("Expected string result, got: {:?}", result),
-    }
+    // Per FHIRPath spec, join on an empty collection returns an empty collection.
+    assert_eq!(result, EvaluationResult::Empty);
 }
 
 #[test]

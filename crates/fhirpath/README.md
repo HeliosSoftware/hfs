@@ -458,7 +458,7 @@ These functions extend the base FHIRPath specification with FHIR-specific capabi
     *   [extension()](https://build.fhir.org/fhirpath.html#functions): ✅ (Full support with variable URL resolution)
     *   [hasValue()](https://build.fhir.org/fhirpath.html#functions): ✅ (Tests if primitive has actual value beyond extensions)
     *   [getValue()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented
-    *   [resolve()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented (Requires resource resolver integration)
+    *   [resolve()](https://build.fhir.org/fhirpath.html#functions): ✅ (In-scope resolution: contained resources and resources in the evaluation context; returns a typed stub for unresolved `Type/id` references. No external/DB resolution — see [#167](https://github.com/HeliosSoftware/hfs/issues/167) for the storage-backed resolver follow-up.)
     *   [ofType()](https://build.fhir.org/fhirpath.html#functions): ✅ (Full FHIR type support)
     *   [elementDefinition()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented
     *   [slice()](https://build.fhir.org/fhirpath.html#functions): ❌ Not Implemented
@@ -761,7 +761,17 @@ The server can be configured via command-line arguments or environment variables
 | `FHIRPATH_CORS_ORIGINS` | `--cors-origins` | Allowed origins (comma-separated) | `*` |
 | `FHIRPATH_CORS_METHODS` | `--cors-methods` | Allowed methods | `GET,POST,OPTIONS` |
 | `FHIRPATH_CORS_HEADERS` | `--cors-headers` | Allowed headers | Common headers |
+| `FHIRPATH_MAX_BODY_SIZE` | `--max-body-size` | Max request body size in bytes, measured after decompression | `10485760` |
 | `FHIRPATH_DEBUG_TRACE` | — | Enable step-by-step debug trace output | `false` |
+
+#### HTTP Compression
+
+Request bodies sent with `Content-Encoding: gzip` (or `deflate`, `br`, `zstd`)
+are decompressed transparently before parsing; unsupported encodings are
+rejected with `415 Unsupported Media Type`. Responses are compressed when the
+client advertises support via `Accept-Encoding`, with `Content-Encoding` and
+`Vary: Accept-Encoding` set. Because `FHIRPATH_MAX_BODY_SIZE` is enforced on the
+decompressed body, a small highly-compressed payload cannot bypass the limit.
 
 #### Starting the Server
 

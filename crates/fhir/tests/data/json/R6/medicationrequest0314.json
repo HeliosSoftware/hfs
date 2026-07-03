@@ -44,46 +44,6 @@
       }
     }
   ],
-  "dosageInstruction": {
-    "simple": {
-      "text": "75mcg daily",
-      "timing": {
-        "repeat": {
-          "frequency": 1,
-          "period": 1,
-          "periodUnit": "d"
-        }
-      },
-      "route": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "26643006",
-            "display": "Oral Route (qualifier value)"
-          }
-        ]
-      },
-      "doseAndRate": [
-        {
-          "type": {
-            "coding": [
-              {
-                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                "code": "ordered",
-                "display": "Ordered"
-              }
-            ]
-          },
-          "doseQuantity": {
-            "value": 75,
-            "unit": "mcg",
-            "system": "http://unitsofmeasure.org",
-            "code": "ug"
-          }
-        }
-      ]
-    }
-  },
   "dispenseRequest": {
     "validityPeriod": {
       "start": "2015-01-15",

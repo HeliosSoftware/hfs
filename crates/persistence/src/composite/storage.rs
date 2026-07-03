@@ -48,9 +48,9 @@ use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
     IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatchFormat, PatientExportProvider,
-    ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, StorageCapabilities,
-    SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider, TypeHistoryProvider,
-    VersionedStorage,
+    ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
+    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
@@ -715,6 +715,14 @@ impl ResourceStorage for CompositeStorage {
         "composite"
     }
 
+    fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        // SQL-on-FHIR runs as in-DB SQL against the primary store (where all
+        // writes land), so delegate to the primary backend. Composites whose
+        // primary is SOF-capable (e.g. sqlite-elasticsearch) thus expose a
+        // runner; others inherit `None`.
+        self.primary.sof_runner()
+    }
+
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
     async fn create(
         &self,
@@ -978,6 +986,45 @@ impl SearchProvider for CompositeStorage {
                 crate::search::SearchParameterRegistry::new(),
             ))
         })
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.supports_contained_search();
+            }
+        }
+        self.search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+            .map(|p| p.supports_contained_search())
+            .unwrap_or(false)
+    }
+
+    fn modifiers_for_param_type(
+        &self,
+        param_type: crate::types::SearchParamType,
+    ) -> Vec<&'static str> {
+        // Same routing as `search`: defer to the dedicated Search backend when
+        // configured, otherwise the primary provider.
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+        {
+            if let Some(provider) = self.search_providers.get(&search_backend.id) {
+                return provider.modifiers_for_param_type(param_type);
+            }
+        }
+        self.search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+            .map(|p| p.modifiers_for_param_type(param_type))
+            .unwrap_or_default()
     }
 }
 

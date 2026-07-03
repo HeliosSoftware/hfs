@@ -16,7 +16,9 @@
 //! - [`health`] - Health check endpoint
 
 pub mod batch;
+pub mod bulk_common;
 pub mod bulk_export;
+pub mod bulk_submit;
 pub mod capabilities;
 pub mod compartment;
 pub mod create;
@@ -27,6 +29,7 @@ pub mod patch;
 pub mod read;
 pub mod search;
 pub mod smart_discovery;
+pub mod sof;
 #[cfg(feature = "subscriptions")]
 pub mod subscription_event;
 #[cfg(feature = "subscriptions")]
@@ -57,6 +60,10 @@ pub use batch::batch_handler;
 pub use bulk_export::{
     export_cancel_handler, export_download_handler, export_status_handler,
     group_export_kickoff_handler, patient_export_kickoff_handler, system_export_kickoff_handler,
+};
+pub use bulk_submit::{
+    bulk_submit_cancel_handler, bulk_submit_file_handler, bulk_submit_kickoff_handler,
+    bulk_submit_poll_handler, bulk_submit_status_kickoff_handler,
 };
 pub use capabilities::capabilities_handler;
 pub use compartment::compartment_search_handler;

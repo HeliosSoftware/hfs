@@ -115,11 +115,19 @@
 //! | `HFS_SERVER_PORT` | 8080 | Server port |
 //! | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 //! | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
-//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes) |
+//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; measured after decompression for compressed requests) |
 //! | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 //! | `HFS_ENABLE_CORS` | true | Enable CORS |
 //! | `HFS_CORS_ORIGINS` | * | Allowed CORS origins |
 //! | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
+//!
+//! ## HTTP Compression
+//!
+//! Request bodies sent with `Content-Encoding: gzip` (or `deflate`, `br`,
+//! `zstd`) are decompressed transparently before parsing; unsupported
+//! encodings are rejected with `415 Unsupported Media Type`. Responses are
+//! compressed when the client advertises support via `Accept-Encoding`, with
+//! `Content-Encoding` and `Vary: Accept-Encoding` set accordingly.
 //!
 //! ## Architecture
 //!
@@ -139,8 +147,11 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 pub mod bulk_export_auth;
+pub mod bulk_submit_fetcher;
+pub mod bulk_submit_oauth;
 pub mod config;
 pub mod error;
+pub mod export;
 pub mod extractors;
 pub mod fhir_types;
 pub mod handlers;
@@ -167,7 +178,10 @@ use helios_persistence::core::{
 };
 use tower::ServiceBuilder;
 use tower_http::{
+    compression::CompressionLayer,
+    compression::predicate::{NotForContentType, Predicate, SizeAbove},
     cors::{Any, CorsLayer},
+    decompression::RequestDecompressionLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -274,6 +288,19 @@ pub struct BulkExportBundle {
     pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
 }
 
+/// The bulk-submit job store, input fetcher, output store, and download
+/// authorizer, wired into [`AppState`] by [`create_app_with_auth_and_bulk_export`].
+pub struct BulkSubmitBundle {
+    /// Job-state store (claim + worker storage + ingestion engine + lifecycle).
+    pub jobs: Arc<dyn helios_persistence::core::BulkSubmitJobStore>,
+    /// Remote input fetcher (manifest + NDJSON retrieval).
+    pub fetcher: Arc<dyn helios_persistence::core::SubmitInputFetcher>,
+    /// Output store for status-manifest artifacts.
+    pub output: Arc<dyn helios_persistence::core::ExportOutputStore>,
+    /// Download authorizer (reuses the export file-auth trait).
+    pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
+}
+
 /// Creates the Axum application with custom configuration and optional authentication.
 ///
 /// When `auth_state` is `Some`, authentication and authorization middleware
@@ -311,6 +338,7 @@ where
         auth_config,
         auth_state,
         audit_state,
+        None,
         None,
         None,
     )
@@ -351,21 +379,65 @@ where
         audit_state,
         Some(bulk_export),
         None,
+        None,
     )
 }
 
-/// Like [`create_app_with_auth_and_bulk_export`], but also wires the per-user
-/// settings store (used by the `/_user/settings` endpoints). `bulk_export` is
-/// optional so this single entry point covers both bulk-enabled and bulk-less
-/// deployments of a settings-capable backend (SQLite, PostgreSQL).
+/// Like [`create_app_with_auth`], but wires **either or both** of the bulk-export
+/// and bulk-submit subsystems. Either bundle may be `None` independently, so bulk
+/// submit can be enabled with bulk export disabled (and vice versa).
 #[allow(clippy::too_many_arguments)]
-pub fn create_app_with_auth_bulk_export_and_settings<S>(
+pub fn create_app_with_auth_and_bulk<S>(
     storage: Arc<S>,
     config: ServerConfig,
     auth_config: helios_auth::AuthConfig,
     auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
     audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
     bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
+        None,
+    )
+}
+
+/// Like [`create_app_with_auth_and_bulk`], but also wires the per-user settings
+/// store (used by the `/_user/settings` endpoints). `bulk_export` and
+/// `bulk_submit` are each optional, so this single entry point covers every
+/// combination for a settings-capable backend (SQLite, PostgreSQL).
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_bulk_and_settings<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
     settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
 ) -> Router
 where
@@ -392,13 +464,14 @@ where
         auth_state,
         audit_state,
         bulk_export,
+        bulk_submit,
         settings_store,
     )
 }
 
 /// Internal app builder shared by [`create_app_with_auth`],
-/// [`create_app_with_auth_and_bulk_export`], and
-/// [`create_app_with_auth_bulk_export_and_settings`].
+/// [`create_app_with_auth_and_bulk_export`], [`create_app_with_auth_and_bulk`],
+/// and [`create_app_with_auth_bulk_and_settings`].
 #[allow(clippy::too_many_arguments)]
 fn build_app<S>(
     storage: Arc<S>,
@@ -407,6 +480,7 @@ fn build_app<S>(
     auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
     audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
     bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
     settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
 ) -> Router
 where
@@ -434,6 +508,9 @@ where
         info!("Authentication is ENABLED");
     }
 
+    // Storage arrives pre-wrapped in an Arc so we can share it with the SofRunner.
+    let storage_arc = storage;
+
     let (app_audit_sink, app_audit_source_observer) = audit_state
         .as_ref()
         .map(|audit| {
@@ -450,8 +527,8 @@ where
     let outbound_auth_provider = auth_config.outbound_provider();
 
     // Create application state
-    let state = AppState::with_auth_and_audit(
-        storage,
+    let mut state = AppState::with_auth_and_audit(
+        Arc::clone(&storage_arc),
         config.clone(),
         auth_config,
         auth_state.clone(),
@@ -459,9 +536,112 @@ where
         app_audit_source_observer,
     );
 
+    // Wire SQL-on-FHIR runner and export controller. The SOF runtime path is
+    // in-DB SQL only — backends without a SOF runner can't serve
+    // `$viewdefinition-run` and the handler returns 501 if SOF is enabled
+    // without one.
+    if config.sof_enabled {
+        let Some(runner) = storage_arc.sof_runner() else {
+            // Hard config error — surfaced as a startup panic so misconfiguration
+            // doesn't silently disable a feature the operator asked for.
+            panic!(
+                "HFS_SOF_ENABLED=true but storage backend '{}' does not provide an in-DB SOF \
+                 runner; either disable SOF or use a backend that supports it (sqlite, postgres)",
+                storage_arc.backend_name()
+            );
+        };
+        info!(
+            runner = runner.runner_name(),
+            fhir_version = ?config.default_fhir_version,
+            "Using in-DB SofRunner"
+        );
+
+        // Keep a clone for the export controller before moving runner into state.
+        let runner_for_export = Arc::clone(&runner);
+        state = state.with_sof_runner(runner);
+
+        // Wire the export job controller.
+        use crate::export::{ExportJobController, FilesystemSink, InMemoryController};
+        let controller: Arc<dyn ExportJobController> = {
+            let max_concurrency = Some(config.export_max_concurrency);
+            let shard_rows = Some(config.export_shard_rows);
+
+            #[cfg(feature = "s3")]
+            if config.export_sink.to_lowercase() == "s3" {
+                use crate::export::S3Sink;
+                let bucket = config
+                    .export_s3_bucket
+                    .clone()
+                    .unwrap_or_else(|| "hfs-exports".to_string());
+                let region = config.export_s3_region.clone();
+                let ttl = config.export_presign_ttl_secs;
+
+                info!(bucket = %bucket, "Export controller: InMemory + S3Sink");
+
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(S3Sink::from_config(
+                        bucket.clone(),
+                        region,
+                        String::new(),
+                        ttl,
+                    ))
+                }) {
+                    Ok(sink) => Arc::new(InMemoryController::with_shard_rows(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                    )),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            dir = %config.export_dir,
+                            "S3 export sink init failed — falling back to FilesystemSink"
+                        );
+                        let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                        Arc::new(InMemoryController::with_shard_rows(
+                            runner_for_export,
+                            sink,
+                            max_concurrency,
+                            shard_rows,
+                        ))
+                    }
+                }
+            } else {
+                info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
+                let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                Arc::new(InMemoryController::with_shard_rows(
+                    runner_for_export,
+                    sink,
+                    max_concurrency,
+                    shard_rows,
+                ))
+            }
+
+            #[cfg(not(feature = "s3"))]
+            {
+                info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
+                let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
+                Arc::new(InMemoryController::with_shard_rows(
+                    runner_for_export,
+                    sink,
+                    max_concurrency,
+                    shard_rows,
+                ))
+            }
+        };
+        state = state.with_export_controller(controller);
+    }
+
     // Wire the bulk-export subsystem if provided.
     let state = match bulk_export {
         Some(b) => state.with_bulk_export(b.jobs, b.output, b.file_auth),
+        None => state,
+    };
+
+    // Wire the bulk-submit subsystem if provided.
+    let state = match bulk_submit {
+        Some(b) => state.with_bulk_submit(b.jobs, b.fetcher, b.output, b.file_auth),
         None => state,
     };
 
@@ -562,6 +742,31 @@ where
             axum::http::StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(config.request_timeout),
         ));
+
+    // Transparently decompress request bodies sent with `Content-Encoding`
+    // (gzip, deflate, br, zstd) and compress responses when the client sends
+    // `Accept-Encoding`. Unsupported request encodings get 415. Because the
+    // decompression layer replaces the request body before any extractor or
+    // handler reads it, the body-size limit below applies to the
+    // *decompressed* bytes — a small highly-compressed payload cannot bypass
+    // `HFS_MAX_BODY_SIZE`. Kept inside the CORS layer so 415/413 error
+    // responses still carry CORS headers for browser clients.
+    //
+    // Never re-compress Parquet or ZIP output (SoF run/export responses) —
+    // both are already compressed, so HTTP-level compression would only burn
+    // CPU for no size win. Both parquet media-type identifiers are excluded:
+    // `application/vnd.apache.parquet` (the spec's native media type) and
+    // the legacy `application/parquet` alias, matching sof-server's
+    // predicate.
+    let compress_predicate = SizeAbove::new(32)
+        .and(NotForContentType::const_new("application/parquet"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apache.parquet",
+        ))
+        .and(NotForContentType::const_new("application/zip"));
+    let router = router
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new().compress_when(compress_predicate));
 
     // Add CORS if enabled
     let router = if config.enable_cors {

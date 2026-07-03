@@ -94,9 +94,12 @@ pub mod bulk_export;
 pub mod bulk_export_output;
 pub mod bulk_export_worker;
 pub mod bulk_submit;
+pub mod bulk_submit_input;
+pub mod bulk_submit_worker;
 pub mod capabilities;
 pub mod history;
 pub mod search;
+pub mod sof_runner;
 pub mod storage;
 pub mod transaction;
 pub mod user_settings;
@@ -123,6 +126,13 @@ pub use bulk_submit::{
     StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
     SubmissionManifest, SubmissionStatus, SubmissionSummary,
 };
+pub use bulk_submit_input::{
+    FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
+};
+pub use bulk_submit_worker::{
+    BulkSubmitJobStore, DefaultSubmitWorker, ManifestLease, ManifestWorkerView, PollTokenTarget,
+    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+};
 pub use capabilities::{
     CapabilityProvider, GlobalSearchCapabilities, Interaction, ResourceCapabilities,
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
@@ -137,6 +147,7 @@ pub use search::{
     RevincludeProvider, SearchProvider, SearchResult, TerminologySearchProvider,
     TextSearchProvider, resolve_includes_iterative,
 };
+pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, PatchFormat, PurgableStorage, ResourceStorage,

@@ -38,6 +38,41 @@ impl SqliteSearchIndexWriter {
         "#
     }
 
+    /// INSERT SQL for a contained index entry: the same 24 base columns as
+    /// [`Self::insert_sql`] plus `is_contained`, `contained_type`, and
+    /// `contained_local_id` (`?25..?27`). The base columns' `resource_type` /
+    /// `resource_id` identify the *container*; `contained_type` is the nested
+    /// resource's type. Bind the base params from
+    /// [`Self::to_sql_params`] followed by `1`, the contained type, and the
+    /// contained local id.
+    pub fn insert_contained_sql() -> &'static str {
+        r#"
+        INSERT INTO search_index (
+            tenant_id, resource_type, resource_id, param_name, param_url,
+            value_string, value_token_system, value_token_code, value_token_display,
+            value_date, value_date_precision,
+            value_number, value_quantity_value, value_quantity_unit, value_quantity_system,
+            value_reference, value_uri, composite_group,
+            value_identifier_type_system, value_identifier_type_code,
+            value_reference_display,
+            value_quantity_canonical_value, value_quantity_canonical_unit,
+            value_string_folded,
+            is_contained, contained_type, contained_local_id
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8, ?9,
+            ?10, ?11,
+            ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18,
+            ?19, ?20,
+            ?21,
+            ?22, ?23,
+            ?24,
+            ?25, ?26, ?27
+        )
+        "#
+    }
+
     /// Generates the DELETE SQL for clearing a resource's index entries.
     pub fn delete_sql() -> &'static str {
         "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3"

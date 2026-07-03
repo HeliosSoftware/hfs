@@ -186,7 +186,7 @@
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Provenance </b></p><p>Provenance for: </p><ul><li><a href="broken-link.html">urn:uuid:88f151c0-a954-468a-88bd-5ae15c08e059</a></li><li><a href="broken-link.html">http://example.org/fhir/Patient/123a</a></li></ul><p>Summary</p><table class="grid"><tr><td>Activity</td><td><span title="Codes:">data entry</span></td></tr></table><p><b>Agents</b></p><table class="grid"><tr><td><b>who</b></td></tr><tr><td>Clerical Staff</td></tr></table></div>
         </text>
         <target>
-          <!--  the client doesn't and can't know what versions will be assigned, nor can 
+          <!--  the client does not and can't know what versions will be assigned, nor can 
              it know what id will be assigned to the first two of these resources, so it 
              cannot provide version specific references. What it can do is ask for these
              references to be made version specific by the server 

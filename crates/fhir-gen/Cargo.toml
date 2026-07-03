@@ -22,9 +22,10 @@ skip-r6-download = []
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
 clap = { version = "4.4", features = ["derive"] }
 chrono = { workspace = true }
+
 
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }

@@ -128,12 +128,15 @@ impl PostgresTerminologyBackend {
 
         {
             let mut client = pool.get().await.map_err(|e| {
-                HtsError::StorageError(format!("Failed to acquire PG connection: {e}"))
+                HtsError::StorageError(format!(
+                    "Failed to acquire PG connection: {}",
+                    error_chain(&e)
+                ))
             })?;
 
-            schema::apply(&client)
-                .await
-                .map_err(|e| HtsError::StorageError(format!("Failed to apply HTS schema: {e}")))?;
+            schema::apply(&client).await.map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply HTS schema: {}", error_chain(&e)))
+            })?;
 
             // Backfill `concept_closure` for any system that has hierarchy edges
             // but no closure rows yet. Idempotent and per-system, so existing
@@ -143,7 +146,10 @@ impl PostgresTerminologyBackend {
             schema::migrate_concept_closure_pg(&mut client)
                 .await
                 .map_err(|e| {
-                    HtsError::StorageError(format!("Failed to build concept_closure: {e}"))
+                    HtsError::StorageError(format!(
+                        "Failed to build concept_closure: {}",
+                        error_chain(&e)
+                    ))
                 })?;
         }
 
@@ -206,12 +212,33 @@ impl PostgresTerminologyBackend {
             .pool
             .get()
             .await
-            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {}", error_chain(&e))))?;
         schema::migrate_concept_closure_pg(&mut client)
             .await
-            .map_err(|e| HtsError::StorageError(format!("concept_closure migration: {e}")))?;
+            .map_err(|e| {
+                HtsError::StorageError(format!("concept_closure migration: {}", error_chain(&e)))
+            })?;
         Ok(())
     }
+}
+
+/// Render an error together with its full `source()` chain.
+///
+/// `tokio_postgres::Error`'s `Display` impl only prints the error *kind* —
+/// for a server-side failure that is the bare string `"db error"`. The actual
+/// SQLSTATE and `ERROR: …` message live in `source()`, so formatting such an
+/// error with `{e}` discards the one piece of information needed to diagnose
+/// it. Walking the chain preserves messages like
+/// `db error: ERROR: could not resize shared memory segment …`.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
 }
 
 fn build_pool(database_url: &str) -> Result<Pool, HtsError> {
@@ -322,11 +349,19 @@ impl BundleImportBackend for PostgresTerminologyBackend {
     /// contained resources into the PostgreSQL normalized tables.
     async fn import_bundle(
         &self,
-        _ctx: &TenantContext,
+        ctx: &TenantContext,
         data: &[u8],
     ) -> Result<ImportStats, HtsError> {
         let parsed = bundle_parser::parse_bundle(data)?;
+        self.import_parsed(ctx, parsed).await
+    }
 
+    /// Write an already-parsed bundle, skipping the JSON parse step.
+    async fn import_parsed(
+        &self,
+        _ctx: &TenantContext,
+        parsed: bundle_parser::ParsedBundle,
+    ) -> Result<ImportStats, HtsError> {
         let mut client = self
             .pool
             .get()
@@ -340,19 +375,25 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         // because rebuilding per chunk is O(n²) — the SNOMED full closure
         // is built once via the end-of-CLI `migrate_concept_closure_pg` call.
         // Mirrors the SQLite import_bundle pattern.
+        // Probed with EXISTS rather than COUNT(*): the answer only
+        // distinguishes empty from non-empty, and a COUNT over an
+        // ever-growing concept set would make each batch of a chunked bulk
+        // load scan all previously imported rows.
         let mut systems_needing_closure: Vec<String> = Vec::new();
         for cs in &parsed.code_systems {
             let row = client
                 .query_opt(
-                    "SELECT COUNT(*) FROM concepts c
-                     JOIN code_systems s ON c.system_id = s.id
-                     WHERE s.url = $1",
+                    "SELECT EXISTS(
+                         SELECT 1 FROM concepts c
+                         JOIN code_systems s ON c.system_id = s.id
+                         WHERE s.url = $1
+                     )",
                     &[&cs.url],
                 )
                 .await
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
-            let count: i64 = row.map(|r| r.get(0)).unwrap_or(0);
-            if count == 0 {
+            let has_concepts: bool = row.map(|r| r.get(0)).unwrap_or(false);
+            if !has_concepts {
                 systems_needing_closure.push(cs.url.clone());
             }
         }
@@ -366,7 +407,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         stats.errors.extend(parsed.parse_errors.iter().cloned());
 
         for cs in &parsed.code_systems {
-            if let Err(e) = write_code_system(&tx, cs, &mut stats).await {
+            if let Err(e) = write_code_system(&tx, cs, &mut stats, parsed.fresh_load).await {
                 stats
                     .errors
                     .push(format!("CodeSystem '{}' import failed: {e}", cs.url));
@@ -422,7 +463,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
                     if let Err(e) = schema::build_concept_closure_pg(&mut client, &sid).await {
                         tracing::warn!(
                             system_id = %sid,
-                            error = %e,
+                            error = %error_chain(&e),
                             "Failed to build concept_closure after import"
                         );
                     }
@@ -435,6 +476,30 @@ impl BundleImportBackend for PostgresTerminologyBackend {
         self.clear_response_caches();
 
         Ok(stats)
+    }
+
+    async fn code_system_has_concepts(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<bool, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS(
+                     SELECT 1 FROM concepts c
+                     JOIN code_systems s ON c.system_id = s.id
+                     WHERE s.url = $1
+                 )",
+                &[&url],
+            )
+            .await
+            .map_err(|e| HtsError::StorageError(e.to_string()))?;
+        Ok(row.get(0))
     }
 
     /// Delete all HTS normalized rows for the resource identified by `resource_url`.
@@ -510,6 +575,11 @@ async fn write_code_system(
     client: &impl GenericClient,
     cs: &ParsedCodeSystem,
     stats: &mut ImportStats,
+    // When `true` the caller guarantees this code system had no concepts before
+    // the import session, so the per-concept delete-before-reinsert of
+    // properties/designations is skipped (fast path for first-time bulk loads).
+    // See [`crate::import::bundle_parser::ParsedBundle::fresh_load`].
+    skip_child_delete: bool,
 ) -> Result<(), HtsError> {
     let resource_json = Some(cs.resource_json.clone());
     let now = utc_now();
@@ -642,6 +712,31 @@ async fn write_code_system(
         // Hierarchy from nesting or "parent" property.
         if let Some(ref parent) = concept.parent_code {
             insert_hierarchy(client, &system_id, parent, &concept.code).await?;
+        }
+
+        // Replace any prior child rows for this concept so a re-import fully
+        // supersedes the previous set rather than duplicating rows or leaving
+        // filtered-out languages behind (the concept row itself is upserted, so
+        // its id is stable). A concept that now yields zero designations after a
+        // narrower language filter must still lose its old ones. Stub
+        // "content=not-present" imports carry an empty concepts array, so this
+        // loop never runs for them. Skipped on a fresh load (nothing to
+        // delete). Mirrors import/fhir_bundle.rs (SQLite).
+        if !skip_child_delete {
+            client
+                .execute(
+                    "DELETE FROM concept_properties WHERE concept_id = $1",
+                    &[&concept_id],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
+            client
+                .execute(
+                    "DELETE FROM concept_designations WHERE concept_id = $1",
+                    &[&concept_id],
+                )
+                .await
+                .map_err(|e| HtsError::StorageError(e.to_string()))?;
         }
 
         for prop in &concept.properties {

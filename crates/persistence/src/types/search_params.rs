@@ -1,7 +1,10 @@
 //! FHIR search parameter types.
 //!
 //! This module defines types for representing FHIR search parameters,
-//! including parameter types, modifiers, and prefixes.
+//! including parameter types, modifiers, and prefixes. `SearchParamType`
+//! itself was lifted to `helios_fhir::search::SearchParamType` so
+//! `helios-sof` can use it without a circular dep; it is re-exported here
+//! for backwards-compat with persistence callers.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -9,67 +12,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// FHIR search parameter types.
-///
-/// See: https://build.fhir.org/search.html#ptypes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchParamType {
-    #[default]
-    /// A simple string, like a name or description.
-    String,
-    /// A search against a URI.
-    Uri,
-    /// A search for a number.
-    Number,
-    /// A search for a date, dateTime, or period.
-    Date,
-    /// A quantity, with a number and units.
-    Quantity,
-    /// A code from a code system or value set.
-    Token,
-    /// A reference to another resource.
-    Reference,
-    /// A composite search parameter that combines others.
-    Composite,
-    /// Special search parameters (_id, _lastUpdated, etc.).
-    Special,
-}
-
-impl fmt::Display for SearchParamType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SearchParamType::String => write!(f, "string"),
-            SearchParamType::Uri => write!(f, "uri"),
-            SearchParamType::Number => write!(f, "number"),
-            SearchParamType::Date => write!(f, "date"),
-            SearchParamType::Quantity => write!(f, "quantity"),
-            SearchParamType::Token => write!(f, "token"),
-            SearchParamType::Reference => write!(f, "reference"),
-            SearchParamType::Composite => write!(f, "composite"),
-            SearchParamType::Special => write!(f, "special"),
-        }
-    }
-}
-
-impl FromStr for SearchParamType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "string" => Ok(SearchParamType::String),
-            "uri" => Ok(SearchParamType::Uri),
-            "number" => Ok(SearchParamType::Number),
-            "date" => Ok(SearchParamType::Date),
-            "quantity" => Ok(SearchParamType::Quantity),
-            "token" => Ok(SearchParamType::Token),
-            "reference" => Ok(SearchParamType::Reference),
-            "composite" => Ok(SearchParamType::Composite),
-            "special" => Ok(SearchParamType::Special),
-            _ => Err(format!("unknown search parameter type: {}", s)),
-        }
-    }
-}
+pub use helios_fhir::search::SearchParamType;
 
 /// Search modifiers that can be applied to search parameters.
 ///
@@ -101,8 +44,6 @@ pub enum SearchModifier {
     Type(String),
     /// Match on type (token parameters for polymorphic elements).
     OfType,
-    /// Match on code only (token parameters).
-    CodeOnly,
     /// Iterate through results (_include modifier).
     Iterate,
     /// Advanced text search with synonyms and linguistic matching (FHIR v6.0.0).
@@ -136,7 +77,6 @@ impl fmt::Display for SearchModifier {
             SearchModifier::Identifier => write!(f, "identifier"),
             SearchModifier::Type(t) => write!(f, "{}", t),
             SearchModifier::OfType => write!(f, "ofType"),
-            SearchModifier::CodeOnly => write!(f, "code"),
             SearchModifier::Iterate => write!(f, "iterate"),
             SearchModifier::TextAdvanced => write!(f, "text-advanced"),
             SearchModifier::CodeText => write!(f, "code-text"),
@@ -162,7 +102,6 @@ impl SearchModifier {
             // the form advertised in our CapabilityStatement; accept the legacy
             // camelCase `ofType` too so older clients keep working.
             "of-type" | "oftype" => Some(SearchModifier::OfType),
-            "code" => Some(SearchModifier::CodeOnly),
             "iterate" => Some(SearchModifier::Iterate),
             "text-advanced" => Some(SearchModifier::TextAdvanced),
             "code-text" => Some(SearchModifier::CodeText),
@@ -213,11 +152,13 @@ impl SearchModifier {
                 param_type == SearchParamType::Reference
             }
             SearchModifier::OfType => param_type == SearchParamType::Token,
-            SearchModifier::CodeOnly => param_type == SearchParamType::Token,
             SearchModifier::Iterate => false, // Only for _include/_revinclude
-            SearchModifier::TextAdvanced => {
-                param_type == SearchParamType::String || param_type == SearchParamType::Token
-            }
+            // Per the FHIR spec (build.fhir.org), `:text-advanced` is defined for
+            // reference and token parameters (NOT string).
+            SearchModifier::TextAdvanced => matches!(
+                param_type,
+                SearchParamType::Token | SearchParamType::Reference
+            ),
             // `:code-text` is defined for token and reference params (matches a
             // code's display, or the indexed `Reference.display`).
             SearchModifier::CodeText => matches!(
@@ -316,7 +257,12 @@ impl SearchPrefix {
                     SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
                 )
             }
-            SearchPrefix::Sa | SearchPrefix::Eb => param_type == SearchParamType::Date,
+            // Per the FHIR spec, `sa`/`eb` (starts-after / ends-before) apply to
+            // date and quantity ordered types (not number).
+            SearchPrefix::Sa | SearchPrefix::Eb => matches!(
+                param_type,
+                SearchParamType::Date | SearchParamType::Quantity
+            ),
             SearchPrefix::Ap => {
                 matches!(
                     param_type,
@@ -671,6 +617,21 @@ pub struct SearchQuery {
     /// Reverse chain parameters (_has).
     pub reverse_chains: Vec<ReverseChainedParameter>,
 
+    /// `_list` filters: logical ids of `List` resources whose `entry.item`
+    /// references restrict the result set. Multiple values are AND-ed (a result
+    /// must be a member of every listed `List`). Resolved application-side into
+    /// an `_id` filter by [`crate::search::list_resolver`], so any backend can
+    /// execute the rewritten query.
+    pub list: Vec<String>,
+
+    /// `_contained` mode: whether the search matches against resources nested in
+    /// other resources' `contained[]` arrays.
+    pub contained: ContainedMode,
+
+    /// `_containedType`: when a contained resource matches, whether to return the
+    /// container resource (default) or the contained resource itself.
+    pub contained_return: ContainedReturn,
+
     /// Include directives.
     pub includes: Vec<IncludeDirective>,
 
@@ -695,8 +656,54 @@ pub struct SearchQuery {
     /// Elements to include (_elements).
     pub elements: Vec<String>,
 
+    /// Compartment membership filter, when this is a compartment search
+    /// (`GET /{compartmentType}/{id}/{targetType}`). Restricts results to
+    /// resources that reference the compartment via *any* of the membership
+    /// params (OR), per the FHIR CompartmentDefinition.
+    pub compartment: Option<CompartmentMembership>,
+
     /// Raw query parameters for debugging.
     pub raw_params: HashMap<String, Vec<String>>,
+}
+
+/// Compartment membership constraint for a compartment search.
+///
+/// A resource is in the compartment if it references `reference` through *any*
+/// of the `params` reference search parameters (logical OR). See
+/// https://hl7.org/fhir/compartmentdefinition.html.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CompartmentMembership {
+    /// The membership reference search parameters (e.g. `patient`, `recorder`,
+    /// `asserter`). Matching ANY of these satisfies membership.
+    pub params: Vec<String>,
+    /// The compartment reference value, e.g. `Patient/123`.
+    pub reference: String,
+}
+
+/// Mode for the `_contained` parameter — whether contained resources (nested in
+/// another resource's `contained[]`) participate in matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainedMode {
+    /// `_contained=false` (default): match only top-level resources.
+    #[default]
+    Off,
+    /// `_contained=true`: match contained resources only.
+    On,
+    /// `_contained=both`: match both top-level and contained resources.
+    Both,
+}
+
+/// Mode for the `_containedType` parameter — what to return when a contained
+/// resource matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainedReturn {
+    /// `_containedType=container` (default): return the container resource.
+    #[default]
+    Container,
+    /// `_containedType=contained`: return the contained resource itself.
+    Contained,
 }
 
 /// Mode for _total parameter.
@@ -918,6 +925,9 @@ mod tests {
         assert!(SearchPrefix::Gt.is_valid_for(SearchParamType::Date));
         assert!(!SearchPrefix::Gt.is_valid_for(SearchParamType::String));
         assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Date));
+        // `sa`/`eb` apply to date and quantity, but not number, per the spec.
+        assert!(SearchPrefix::Sa.is_valid_for(SearchParamType::Quantity));
+        assert!(SearchPrefix::Eb.is_valid_for(SearchParamType::Quantity));
         assert!(!SearchPrefix::Sa.is_valid_for(SearchParamType::Number));
     }
 

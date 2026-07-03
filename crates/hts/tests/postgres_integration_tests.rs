@@ -11,7 +11,7 @@
 
 use helios_hts::backends::PostgresTerminologyBackend;
 use helios_hts::error::HtsError;
-use helios_hts::import::BundleImportBackend;
+use helios_hts::import::{BundleImportBackend, LanguageFilter};
 use helios_hts::traits::{
     CodeSystemOperations, ConceptMapOperations, TerminologyMetadata, ValueSetOperations,
 };
@@ -322,6 +322,85 @@ async fn lookup_filters_properties() {
 
     assert_eq!(resp.properties.len(), 1);
     assert_eq!(resp.properties[0].code, "parent");
+}
+
+#[tokio::test]
+async fn lookup_display_language_falls_back_to_newest_other_version() {
+    let backend = fresh_backend().await;
+    let base = base_url!("lkp-mv");
+    let cs_url = format!("{base}cs");
+
+    // Two coexisting versions of one canonical URL: the newest (20260601)
+    // has only English content; the older edition carries the German term.
+    for (version, designations) in [
+        ("20260601", serde_json::json!([])),
+        (
+            "20260515",
+            serde_json::json!([{"language": "de", "value": "Farbe"}]),
+        ),
+    ] {
+        let uid = uuid::Uuid::new_v4().simple().to_string();
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{
+                "resource": {
+                    "resourceType": "CodeSystem",
+                    "id": format!("cs-{uid}"),
+                    "url": cs_url,
+                    "name": "TestCS",
+                    "version": version,
+                    "status": "active",
+                    "content": "complete",
+                    "concept": [{
+                        "code": "C1",
+                        "display": format!("Color ({version})"),
+                        "designation": designations
+                    }]
+                }
+            }]
+        });
+        backend
+            .import_bundle(&ctx(), &serde_json::to_vec(&bundle).unwrap())
+            .await
+            .expect("Seed import should succeed");
+    }
+
+    // Unversioned lookup resolves 20260601 (no German) — the German
+    // designation must be served from the older 20260515 edition.
+    let resp = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: cs_url.clone(),
+            code: "C1".into(),
+            display_language: Some("de".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.display.as_deref(), Some("Farbe"));
+    assert_eq!(resp.version.as_deref(), Some("20260601"));
+    assert_eq!(resp.designations.len(), 1);
+    assert_eq!(resp.designations[0].language.as_deref(), Some("de"));
+
+    // An explicit version pin is respected strictly: no fallback.
+    let resp = CodeSystemOperations::lookup(
+        &backend,
+        &ctx(),
+        LookupRequest {
+            system: cs_url,
+            code: "C1".into(),
+            version: Some("20260601".into()),
+            display_language: Some("de".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.display.as_deref(), Some("Color (20260601)"));
+    assert!(resp.designations.is_empty());
 }
 
 #[tokio::test]
@@ -1973,9 +2052,16 @@ LP7786-3.LP10156-0.718-7,3,LP10156-0,718-7,Hemoglobin\r\n";
         zip.finish().unwrap();
     }
 
-    let stats = import_loinc_csv(&backend, &ctx(), tmp.path(), 500, false)
-        .await
-        .unwrap();
+    let stats = import_loinc_csv(
+        &backend,
+        &ctx(),
+        tmp.path(),
+        500,
+        false,
+        &LanguageFilter::default(),
+    )
+    .await
+    .unwrap();
 
     // 3 LOINC codes + 3 LP category nodes = 6 concepts.
     assert_eq!(stats.concepts, 6);

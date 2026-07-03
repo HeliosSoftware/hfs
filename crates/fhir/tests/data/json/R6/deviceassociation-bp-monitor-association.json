@@ -95,9 +95,13 @@
   "focus": {
     "reference": "#example-patient"
   },
-  "bodyStructure": {
-    "reference": "#left-arm-structure"
-  },
+  "bodyStructure": [
+    {
+      "reference": {
+        "reference": "#left-arm-structure"
+      }
+    }
+  ],
   "period": {
     "start": "2025-06-01",
     "end": "2025-06-05"

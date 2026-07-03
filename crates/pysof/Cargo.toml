@@ -16,14 +16,17 @@ name = "pysof"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = ">=0.27", features = ["extension-module", "generate-import-lib"] }
-helios-sof = { path = "../sof", version = "0.1.47", default-features = false }
-helios-fhir = { path = "../fhir", version = "0.1.47", default-features = false }
+pyo3 = { version = ">=0.29", features = ["extension-module", "generate-import-lib"] }
+helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
-pythonize = "0.27"
+pythonize = "0.29"
 csv = "1.3"
+# Drives helios-sof's async remote-resolve functions from the synchronous
+# PyO3 entry points via a current-thread runtime.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 
 [features]
 default = ["R4"]
@@ -37,4 +40,4 @@ R6 = ["helios-sof/R6", "helios-fhir/R6"]
 openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
-pyo3-build-config = "0.27"
+pyo3-build-config = "0.29"

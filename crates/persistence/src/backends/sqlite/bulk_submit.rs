@@ -1,24 +1,57 @@
 //! Bulk submit implementation for SQLite backend.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use rusqlite::params;
 use serde_json::Value;
+use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::core::ResourceStorage;
+use crate::core::bulk_export::ExportJobId;
+use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
     StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
     SubmissionManifest, SubmissionStatus, SubmissionSummary,
 };
+use crate::core::bulk_submit_worker::{
+    ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
+    SubmitFileRow, SubmitWorkerStorage,
+};
 use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
-use crate::tenant::TenantContext;
+use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::SqliteBackend;
+
+/// Process-local lock serializing manifest claims for the single-instance SQLite
+/// job store (SQLite has no `SELECT … FOR UPDATE SKIP LOCKED`).
+static SUBMIT_CLAIM_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Builds a `LeaseError::LeaseLost` for a submit manifest (the shared variant
+/// carries an `ExportJobId`, so we encode `submission/manifest` into it).
+fn lease_lost(lease: &ManifestLease) -> LeaseError {
+    LeaseError::LeaseLost {
+        job_id: ExportJobId::from_string(format!("{}/{}", lease.submission_id, lease.manifest_id)),
+    }
+}
+
+/// Derives the ingest FHIR version from a stored `outputFormat` MIME string.
+fn fhir_version_from_output_format(output_format: Option<&str>) -> FhirVersion {
+    output_format
+        .and_then(|fmt| {
+            fmt.split(';').find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix("fhirVersion=")
+                    .and_then(FhirVersion::from_mime_param)
+            })
+        })
+        .unwrap_or_else(FhirVersion::default_enabled)
+}
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -1210,6 +1243,675 @@ impl BulkSubmitRollbackProvider for SqliteBackend {
     }
 }
 
+#[async_trait]
+impl SubmitClaimStrategy for SqliteBackend {
+    async fn claim_next_manifest(
+        &self,
+        worker_id: &WorkerId,
+        lease_duration: StdDuration,
+    ) -> StorageResult<Option<ManifestLease>> {
+        let _guard = SUBMIT_CLAIM_LOCK.lock().await;
+        let conn = self.get_connection()?;
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let lease_expiry = now
+            + chrono::Duration::from_std(lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+        let lease_expiry_str = lease_expiry.to_rfc3339();
+
+        // Find one eligible manifest with a fetchable URL: pending, or processing
+        // with an expired lease. Only manifests of non-terminal submissions count.
+        let row: Option<(String, String, String, String, i64)> = conn
+            .query_row(
+                "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token
+                 FROM bulk_manifests m
+                 JOIN bulk_submissions s
+                   ON s.tenant_id = m.tenant_id AND s.submitter = m.submitter
+                      AND s.submission_id = m.submission_id
+                 WHERE m.manifest_url IS NOT NULL
+                   AND s.status = 'in-progress'
+                   AND (m.status = 'pending'
+                        OR (m.status = 'processing'
+                            AND (m.lease_expiry IS NULL OR m.lease_expiry < ?1)))
+                 ORDER BY m.added_at LIMIT 1",
+                params![now_str],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .ok();
+
+        let Some((tenant_id, submitter, submission_id, manifest_id, fencing_token)) = row else {
+            return Ok(None);
+        };
+        let new_token = fencing_token + 1;
+
+        conn.execute(
+            "UPDATE bulk_manifests
+             SET status = 'processing', worker_id = ?1, lease_expiry = ?2, fencing_token = ?3
+             WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
+            params![
+                worker_id.as_str(),
+                lease_expiry_str,
+                new_token,
+                tenant_id,
+                submitter,
+                submission_id,
+                manifest_id
+            ],
+        )
+        .map_err(|e| internal_error(format!("Failed to claim manifest: {}", e)))?;
+
+        Ok(Some(ManifestLease {
+            tenant: TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
+            submission_id: SubmissionId::new(submitter, submission_id),
+            manifest_id,
+            worker_id: worker_id.clone(),
+            lease_expiry,
+            fencing_token: new_token as u64,
+        }))
+    }
+
+    async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        let now = Utc::now();
+        let new_expiry = now + chrono::Duration::seconds(60);
+        let affected = conn
+            .execute(
+                "UPDATE bulk_manifests SET lease_expiry = ?1
+                 WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4
+                   AND manifest_id = ?5 AND worker_id = ?6 AND fencing_token = ?7",
+                params![
+                    new_expiry.to_rfc3339(),
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| LeaseError::Storage(internal_error(format!("heartbeat failed: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(new_expiry)
+        }
+    }
+
+    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+        let conn = self.get_connection()?;
+        conn.execute(
+            "UPDATE bulk_manifests
+             SET status = 'pending', worker_id = NULL, lease_expiry = NULL
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4
+               AND worker_id = ?5 AND fencing_token = ?6 AND status = 'processing'",
+            params![
+                lease.tenant.tenant_id().as_str(),
+                lease.submission_id.submitter,
+                lease.submission_id.submission_id,
+                lease.manifest_id,
+                lease.worker_id.as_str(),
+                lease.fencing_token as i64
+            ],
+        )
+        .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SubmitWorkerStorage for SqliteBackend {
+    async fn get_manifest_for_worker(
+        &self,
+        lease: &ManifestLease,
+    ) -> Result<ManifestWorkerView, LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        type Row = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
+        let row: Row = conn
+            .query_row(
+                "SELECT manifest_url, fhir_base_url, output_format, file_request_headers,
+                        oauth_metadata_urls, file_encryption_key, last_processed_line
+                 FROM bulk_manifests
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
+                params![
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .map_err(|_| lease_lost(lease))?;
+
+        let (
+            manifest_url,
+            fhir_base_url,
+            output_format,
+            headers_json,
+            oauth_json,
+            encryption_json,
+            last_processed_line,
+        ) = row;
+
+        let file_request_headers: Vec<(String, String)> = headers_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let oauth_metadata_urls: Vec<String> = oauth_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let file_encryption_key: Option<Value> = encryption_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let fhir_version = fhir_version_from_output_format(output_format.as_deref());
+
+        Ok(ManifestWorkerView {
+            manifest_id: lease.manifest_id.clone(),
+            manifest_url,
+            fhir_base_url,
+            output_format,
+            file_request_headers,
+            oauth_metadata_urls,
+            file_encryption_key,
+            last_processed_line: last_processed_line.max(0) as u64,
+            fhir_version,
+        })
+    }
+
+    async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        let affected = conn
+            .execute(
+                "UPDATE bulk_manifests SET status = 'processing'
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
+                params![
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| LeaseError::Storage(internal_error(format!("mark processing: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn update_manifest_progress(
+        &self,
+        lease: &ManifestLease,
+        processed_entries: u64,
+        failed_entries: u64,
+        last_processed_line: u64,
+    ) -> Result<(), LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        let affected = conn
+            .execute(
+                "UPDATE bulk_manifests
+                 SET processed_entries = ?1, failed_entries = ?2, last_processed_line = ?3
+                 WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6
+                   AND manifest_id = ?7 AND worker_id = ?8 AND fencing_token = ?9",
+                params![
+                    processed_entries as i64,
+                    failed_entries as i64,
+                    last_processed_line as i64,
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update progress: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn record_submit_file(
+        &self,
+        lease: &ManifestLease,
+        file: &SubmitFileRecord,
+    ) -> Result<(), LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        // Fence: only record if we still hold the lease.
+        let holds: bool = conn
+            .query_row(
+                "SELECT 1 FROM bulk_manifests
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
+                params![
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !holds {
+            return Err(lease_lost(lease));
+        }
+
+        let count_severity = file
+            .count_severity
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok());
+        conn.execute(
+            "INSERT INTO bulk_submit_files
+             (tenant_id, submitter, submission_id, manifest_url, file_type, resource_type,
+              part_index, fencing_token, file_path, line_count, byte_count, count_severity,
+              created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                lease.tenant.tenant_id().as_str(),
+                lease.submission_id.submitter,
+                lease.submission_id.submission_id,
+                file.manifest_url,
+                file.file_type,
+                file.resource_type,
+                file.part_index as i64,
+                lease.fencing_token as i64,
+                file.file_path,
+                file.line_count as i64,
+                file.byte_count as i64,
+                count_severity,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|e| LeaseError::Storage(internal_error(format!("record submit file: {e}"))))?;
+        Ok(())
+    }
+
+    async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        let affected = conn
+            .execute(
+                "UPDATE bulk_manifests SET status = 'completed', worker_id = NULL, lease_expiry = NULL
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
+                params![
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| LeaseError::Storage(internal_error(format!("finish manifest: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn fail_manifest(
+        &self,
+        lease: &ManifestLease,
+        _error_message: &str,
+    ) -> Result<(), LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        let affected = conn
+            .execute(
+                "UPDATE bulk_manifests SET status = 'failed', worker_id = NULL, lease_expiry = NULL
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
+                params![
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| LeaseError::Storage(internal_error(format!("fail manifest: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn set_manifest_fetch_params(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        manifest_id: &str,
+        fhir_base_url: Option<&str>,
+        output_format: Option<&str>,
+        file_request_headers: &[(String, String)],
+        oauth_metadata_urls: &[String],
+        file_encryption_key: Option<&Value>,
+    ) -> StorageResult<()> {
+        let conn = self.get_connection()?;
+        let headers_json = serde_json::to_string(file_request_headers).ok();
+        let oauth_json = serde_json::to_string(oauth_metadata_urls).ok();
+        let encryption_json = file_encryption_key.and_then(|v| serde_json::to_string(v).ok());
+        conn.execute(
+            "UPDATE bulk_manifests
+             SET fhir_base_url = ?1, output_format = ?2, file_request_headers = ?3,
+                 oauth_metadata_urls = ?4, file_encryption_key = ?5
+             WHERE tenant_id = ?6 AND submitter = ?7 AND submission_id = ?8 AND manifest_id = ?9",
+            params![
+                fhir_base_url,
+                output_format,
+                headers_json,
+                oauth_json,
+                encryption_json,
+                tenant.tenant_id().as_str(),
+                id.submitter,
+                id.submission_id,
+                manifest_id
+            ],
+        )
+        .map_err(|e| internal_error(format!("set manifest fetch params: {e}")))?;
+        Ok(())
+    }
+
+    async fn replace_manifest_by_url(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        manifest_url: &str,
+    ) -> StorageResult<Vec<String>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut stmt = conn
+            .prepare(
+                "SELECT manifest_id FROM bulk_manifests
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_url = ?4 AND status != 'replaced'",
+            )
+            .map_err(|e| internal_error(format!("prepare replace lookup: {e}")))?;
+        let ids: Vec<String> = stmt
+            .query_map(
+                params![tenant_id, id.submitter, id.submission_id, manifest_url],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| internal_error(format!("query replace lookup: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        conn.execute(
+            "UPDATE bulk_manifests SET status = 'replaced'
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_url = ?4",
+            params![tenant_id, id.submitter, id.submission_id, manifest_url],
+        )
+        .map_err(|e| internal_error(format!("mark replaced: {e}")))?;
+        Ok(ids)
+    }
+
+    async fn set_submission_kickoff_meta(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+        owner_subject: Option<&str>,
+        request_url: &str,
+        requires_access_token: bool,
+    ) -> StorageResult<()> {
+        let conn = self.get_connection()?;
+        conn.execute(
+            "UPDATE bulk_submissions
+             SET owner_subject = ?1, request_url = ?2, requires_access_token = ?3
+             WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6",
+            params![
+                owner_subject,
+                request_url,
+                requires_access_token as i64,
+                tenant.tenant_id().as_str(),
+                id.submitter,
+                id.submission_id
+            ],
+        )
+        .map_err(|e| internal_error(format!("set kickoff meta: {e}")))?;
+        Ok(())
+    }
+
+    async fn ensure_poll_token(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<String> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT poll_token FROM bulk_submissions
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+                params![tenant_id, id.submitter, id.submission_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| internal_error(format!("read poll token: {e}")))?;
+        if let Some(token) = existing {
+            return Ok(token);
+        }
+        let token = Uuid::new_v4().to_string();
+        conn.execute(
+            "UPDATE bulk_submissions SET poll_token = ?1
+             WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4",
+            params![token, tenant_id, id.submitter, id.submission_id],
+        )
+        .map_err(|e| internal_error(format!("set poll token: {e}")))?;
+        Ok(token)
+    }
+
+    async fn list_expired_submissions(
+        &self,
+        now: DateTime<Utc>,
+        ttl: StdDuration,
+        limit: u32,
+    ) -> StorageResult<Vec<(TenantContext, SubmissionId)>> {
+        let conn = self.get_connection()?;
+        let cutoff = (now
+            - chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(86400)))
+        .to_rfc3339();
+        let mut stmt = conn
+            .prepare(
+                "SELECT tenant_id, submitter, submission_id FROM bulk_submissions
+                 WHERE updated_at < ?1 ORDER BY updated_at LIMIT ?2",
+            )
+            .map_err(|e| internal_error(format!("prepare expired: {e}")))?;
+        let rows = stmt
+            .query_map(params![cutoff, limit], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| internal_error(format!("query expired: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (tenant_id, submitter, submission_id) =
+                row.map_err(|e| internal_error(format!("row expired: {e}")))?;
+            out.push((
+                TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
+                SubmissionId::new(submitter, submission_id),
+            ));
+        }
+        Ok(out)
+    }
+
+    async fn resolve_poll_token(&self, token: &str) -> StorageResult<Option<PollTokenTarget>> {
+        let conn = self.get_connection()?;
+        let row: Option<(String, String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT tenant_id, submitter, submission_id, owner_subject
+                 FROM bulk_submissions WHERE poll_token = ?1",
+                params![token],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .ok();
+        Ok(row.map(
+            |(tenant_id, submitter, submission_id, owner_subject)| PollTokenTarget {
+                tenant: TenantContext::new(
+                    TenantId::new(tenant_id),
+                    TenantPermissions::full_access(),
+                ),
+                submission_id: SubmissionId::new(submitter, submission_id),
+                owner_subject,
+            },
+        ))
+    }
+
+    async fn clear_poll_token(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<()> {
+        let conn = self.get_connection()?;
+        conn.execute(
+            "UPDATE bulk_submissions SET poll_token = NULL
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+            params![tenant.tenant_id().as_str(), id.submitter, id.submission_id],
+        )
+        .map_err(|e| internal_error(format!("clear poll token: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_submit_files(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Vec<SubmitFileRow>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT manifest_url, file_type, resource_type, part_index, fencing_token,
+                        file_path, line_count, byte_count, count_severity
+                 FROM bulk_submit_files
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                 ORDER BY id",
+            )
+            .map_err(|e| internal_error(format!("prepare list files: {e}")))?;
+        let rows = stmt
+            .query_map(
+                params![tenant.tenant_id().as_str(), id.submitter, id.submission_id],
+                |r| {
+                    let count_severity: Option<String> = r.get(8)?;
+                    Ok(SubmitFileRow {
+                        manifest_url: r.get(0)?,
+                        file_type: r.get(1)?,
+                        resource_type: r.get(2)?,
+                        part_index: r.get::<_, i64>(3)? as u32,
+                        fencing_token: r.get::<_, i64>(4)? as u64,
+                        file_path: r.get(5)?,
+                        line_count: r.get::<_, i64>(6)? as u64,
+                        byte_count: r.get::<_, i64>(7)? as u64,
+                        count_severity: count_severity
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok()),
+                    })
+                },
+            )
+            .map_err(|e| internal_error(format!("query list files: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("row list files: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    async fn delete_submission_artifacts(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<()> {
+        let conn = self.get_connection()?;
+        conn.execute(
+            "DELETE FROM bulk_submit_files
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+            params![tenant.tenant_id().as_str(), id.submitter, id.submission_id],
+        )
+        .map_err(|e| internal_error(format!("delete artifacts: {e}")))?;
+        Ok(())
+    }
+
+    async fn count_active_submissions(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        let conn = self.get_connection()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bulk_submissions
+                 WHERE tenant_id = ?1 AND status = 'in-progress'",
+                params![tenant.tenant_id().as_str()],
+                |r| r.get(0),
+            )
+            .map_err(|e| internal_error(format!("count active submissions: {e}")))?;
+        Ok(count.max(0) as u64)
+    }
+
+    async fn ensure_transaction_time(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<DateTime<Utc>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT transaction_time FROM bulk_submissions
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+                params![tenant_id, id.submitter, id.submission_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| internal_error(format!("read transaction_time: {e}")))?;
+        if let Some(ts) = existing.as_deref() {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+                return Ok(dt.with_timezone(&Utc));
+            }
+        }
+        let now = Utc::now();
+        conn.execute(
+            "UPDATE bulk_submissions SET transaction_time = ?1
+             WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4",
+            params![now.to_rfc3339(), tenant_id, id.submitter, id.submission_id],
+        )
+        .map_err(|e| internal_error(format!("set transaction_time: {e}")))?;
+        Ok(now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1471,5 +2173,171 @@ mod tests {
         assert_eq!(counts.total, 2);
         assert_eq!(counts.success, 2);
         assert_eq!(counts.error_count(), 0);
+    }
+
+    async fn seed_claimable(backend: &SqliteBackend, tenant: &TenantContext) -> SubmissionId {
+        let sub_id = SubmissionId::generate("worker-system");
+        backend
+            .create_submission(tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                tenant,
+                &sub_id,
+                Some("http://example.com/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        sub_id
+    }
+
+    #[tokio::test]
+    async fn test_claim_heartbeat_finish() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = seed_claimable(&backend, &tenant).await;
+        let worker = WorkerId::new("w1");
+
+        let lease = backend
+            .claim_next_manifest(&worker, StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("a manifest should be claimable");
+        assert_eq!(lease.submission_id, sub_id);
+        assert_eq!(lease.fencing_token, 1);
+
+        // A second claim finds nothing (the only manifest is now processing w/ fresh lease).
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("w2"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        backend.heartbeat(&lease).await.unwrap();
+        backend.mark_manifest_processing(&lease).await.unwrap();
+        backend
+            .update_manifest_progress(&lease, 5, 1, 6)
+            .await
+            .unwrap();
+        backend.finish_manifest(&lease).await.unwrap();
+
+        // After completion nothing is claimable.
+        assert!(
+            backend
+                .claim_next_manifest(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fencing_blocks_zombie_writer() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_claimable(&backend, &tenant).await;
+
+        // Claim with a zero-duration lease so it is immediately reclaimable.
+        let stale = backend
+            .claim_next_manifest(&WorkerId::new("old"), StdDuration::from_secs(0))
+            .await
+            .unwrap()
+            .unwrap();
+        // A new worker reclaims it (bumps the fencing token).
+        let fresh = backend
+            .claim_next_manifest(&WorkerId::new("new"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fresh.fencing_token > stale.fencing_token);
+
+        // The stale lease can no longer mutate the manifest.
+        assert!(matches!(
+            backend.heartbeat(&stale).await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        assert!(matches!(
+            backend.finish_manifest(&stale).await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        // The fresh lease still works.
+        backend.finish_manifest(&fresh).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_poll_token_lifecycle() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = SubmissionId::generate("poll-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+
+        let token = backend.ensure_poll_token(&tenant, &sub_id).await.unwrap();
+        // Idempotent: same token returned.
+        assert_eq!(
+            token,
+            backend.ensure_poll_token(&tenant, &sub_id).await.unwrap()
+        );
+
+        let resolved = backend.resolve_poll_token(&token).await.unwrap().unwrap();
+        assert_eq!(resolved.submission_id, sub_id);
+
+        backend.clear_poll_token(&tenant, &sub_id).await.unwrap();
+        assert!(backend.resolve_poll_token(&token).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_record_and_delete_artifacts() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_claimable(&backend, &tenant).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+
+        backend
+            .record_submit_file(
+                &lease,
+                &SubmitFileRecord {
+                    manifest_url: Some("http://example.com/manifest.json".to_string()),
+                    file_type: "error".to_string(),
+                    resource_type: None,
+                    part_index: 0,
+                    file_path: "tenant/sub/error-0.ndjson".to_string(),
+                    line_count: 3,
+                    byte_count: 120,
+                    count_severity: Some(json!({"error": 3})),
+                },
+            )
+            .await
+            .unwrap();
+
+        let files = backend
+            .list_submit_files(&tenant, &lease.submission_id)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_type, "error");
+        assert_eq!(files[0].line_count, 3);
+
+        backend
+            .delete_submission_artifacts(&tenant, &lease.submission_id)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .list_submit_files(&tenant, &lease.submission_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

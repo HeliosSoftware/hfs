@@ -30,7 +30,15 @@
   },
   "status": "active",
   "operationalStatus": "on",
-  "color": "blue",
+  "color": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/color-names",
+        "code": "blue",
+        "display": "Blue"
+      }
+    ]
+  },
   "category": {
     "coding": [
       {
@@ -48,7 +56,15 @@
   },
   "calibration": [
     {
-      "state": "calibrated",
+      "state": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/metric-calibration-state",
+            "code": "calibrated",
+            "display": "Calibrated"
+          }
+        ]
+      },
       "time": "2016-12-28T09:03:04-05:00"
     }
   ],

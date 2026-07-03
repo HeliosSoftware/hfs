@@ -15,9 +15,7 @@ use helios_persistence::core::bulk_submit::{
 };
 use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
 use helios_persistence::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
-use helios_persistence::core::{
-    Backend, BackendCapability, BackendKind, ResourceStorage, VersionedStorage,
-};
+use helios_persistence::core::{BackendCapability, ResourceStorage, VersionedStorage};
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::json;
@@ -70,27 +68,18 @@ fn make_bucket_per_tenant_backend(prefix: String) -> Option<S3Backend> {
 
 #[test]
 fn test_s3_capabilities_declared() {
-    let config = S3BackendConfig {
-        tenancy_mode: S3TenancyMode::PrefixPerTenant {
-            bucket: "dummy".to_string(),
-        },
-        validate_buckets_on_startup: false,
-        ..Default::default()
-    };
+    let capabilities = S3Backend::declared_capabilities();
 
-    // Build with provider chain config load, no AWS calls because validation is disabled.
-    let backend = S3Backend::from_env(config).expect("backend creation");
-
-    assert_eq!(backend.kind(), BackendKind::S3);
-    assert!(backend.supports(BackendCapability::Crud));
-    assert!(backend.supports(BackendCapability::Versioning));
-    assert!(backend.supports(BackendCapability::InstanceHistory));
-    assert!(backend.supports(BackendCapability::TypeHistory));
-    assert!(backend.supports(BackendCapability::SystemHistory));
-    assert!(backend.supports(BackendCapability::BulkExport));
-    assert!(backend.supports(BackendCapability::BulkImport));
-    assert!(!backend.supports(BackendCapability::BasicSearch));
-    assert!(!backend.supports(BackendCapability::Transactions));
+    assert!(capabilities.contains(&BackendCapability::Crud));
+    assert!(capabilities.contains(&BackendCapability::Versioning));
+    assert!(capabilities.contains(&BackendCapability::InstanceHistory));
+    assert!(capabilities.contains(&BackendCapability::TypeHistory));
+    assert!(capabilities.contains(&BackendCapability::SystemHistory));
+    assert!(capabilities.contains(&BackendCapability::BulkExport));
+    assert!(capabilities.contains(&BackendCapability::BulkSubmitIngest));
+    assert!(!capabilities.contains(&BackendCapability::BulkSubmitRestWorker));
+    assert!(!capabilities.contains(&BackendCapability::BasicSearch));
+    assert!(!capabilities.contains(&BackendCapability::Transactions));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

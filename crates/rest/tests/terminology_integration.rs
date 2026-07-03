@@ -157,10 +157,11 @@ async fn test_in_modifier_calls_hts_expand() {
     assert_eq!(url_param["valueUri"], "http://example.org/vs");
 }
 
-/// When no terminology server is configured, `:in` params pass through to the
-/// storage layer unchanged (no HTTP calls are made).
+/// When no terminology server is configured, a token `:in` modifier cannot be
+/// satisfied and must be rejected with `501` rather than silently falling
+/// through to literal matching (which would return misleading results).
 #[tokio::test]
-async fn test_in_modifier_passthrough_when_no_terminology_server() {
+async fn test_in_modifier_returns_not_implemented_without_terminology_server() {
     let backend = SqliteBackend::in_memory().expect("SQLite in-memory failed");
     backend.init_schema().expect("Schema init failed");
 
@@ -169,19 +170,17 @@ async fn test_in_modifier_passthrough_when_no_terminology_server() {
     let app = create_app_with_config(backend, config);
     let server = TestServer::new(app).expect("TestServer init failed");
 
-    // The search will reach the persistence layer with the raw :in param.
-    // SQLite will likely ignore or fail the modifier, but no HTTP call is made.
     let response = server
         .get("/Patient")
         .add_query_param("code:in", "http://example.org/vs")
         .await;
 
-    // We just assert the server doesn't panic and returns a Bundle (or error).
-    // The exact status depends on SQLite modifier handling.
-    let status = response.status_code().as_u16();
-    assert!(
-        status == 200 || status == 400,
-        "Expected 200 (empty bundle) or 400, got {status}"
+    // Fail loud: `:in` needs a terminology server, so it returns 501 (no HTTP
+    // call to an external server is made because none is configured).
+    assert_eq!(
+        response.status_code().as_u16(),
+        501,
+        "Expected 501 for :in without a configured terminology server"
     );
 }
 

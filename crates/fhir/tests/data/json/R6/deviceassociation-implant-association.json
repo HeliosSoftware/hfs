@@ -80,9 +80,13 @@
   "subject": {
     "reference": "#example-patient"
   },
-  "bodyStructure": {
-    "reference": "#heart-structure"
-  },
+  "bodyStructure": [
+    {
+      "reference": {
+        "reference": "#heart-structure"
+      }
+    }
+  ],
   "period": {
     "start": "2022-01-01"
   },

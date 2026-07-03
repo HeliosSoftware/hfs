@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/cds-hooks"
 readme = "README.md"
-keywords = ["helios-software", "hl7", "fhir", "cds-hooks", "clinical-decision-support"]
+keywords = ["helios-software", "hl7", "fhir", "cds-hooks", "decision-support"]
 
 [dependencies]
 serde = { workspace = true }

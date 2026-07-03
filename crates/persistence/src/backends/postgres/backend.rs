@@ -479,6 +479,13 @@ impl PostgresBackend {
         &self.config
     }
 
+    /// Returns a clone of the underlying connection pool.
+    ///
+    /// `deadpool_postgres::Pool` is `Clone` (Arc-backed), so this is cheap.
+    pub(crate) fn pool(&self) -> Pool {
+        self.pool.clone()
+    }
+
     /// Returns a reference to the search parameter registry.
     pub fn search_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
         &self.search_registry
@@ -540,6 +547,9 @@ impl Backend for PostgresBackend {
                 | BackendCapability::Transactions
                 | BackendCapability::OptimisticLocking
                 | BackendCapability::PessimisticLocking
+                | BackendCapability::BulkExport
+                | BackendCapability::BulkSubmitIngest
+                | BackendCapability::BulkSubmitRestWorker
                 | BackendCapability::Include
                 | BackendCapability::Revinclude
                 | BackendCapability::SharedSchema
@@ -565,6 +575,9 @@ impl Backend for PostgresBackend {
             BackendCapability::Transactions,
             BackendCapability::OptimisticLocking,
             BackendCapability::PessimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
             BackendCapability::Include,
             BackendCapability::Revinclude,
             BackendCapability::SharedSchema,
@@ -739,7 +752,7 @@ impl SearchCapabilityProvider for PostgresBackend {
 
 impl PostgresBackend {
     /// Returns supported modifiers for a parameter type.
-    fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
+    pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             // `not-in` is intentionally omitted: it returns 501 (negated

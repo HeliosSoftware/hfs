@@ -14,18 +14,13 @@
     },
     {
       "groupName": "testConformsTo",
-      "testName": "*", 
+      "testName": "*",
       "reason": "conformsTo not yet implemented"
     },
     {
       "groupName": "miscEngineTests",
       "testName": "testContainedId",
-      "reason": "Multiple matches error - collection handling issue in resolve function"
-    },
-    {
-      "groupName": "miscEngineTests",
-      "testName": "testMultipleResolve",
-      "reason": "Multiple matches error - collection handling issue in resolve function"
+      "reason": "Output type fidelity: 'contained.id' returns FHIR type 'string' instead of 'id' (primitive id type not preserved through server evaluation). Unrelated to resolve()."
     },
     {
       "groupName": "polymorphics",

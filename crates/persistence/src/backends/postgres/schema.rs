@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Initialize the database schema.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -274,6 +274,8 @@ async fn migrate_schema(
             8 => migrate_v8_to_v9(client).await?,
             9 => migrate_v9_to_v10(client).await?,
             10 => migrate_v10_to_v11(client).await?,
+            11 => migrate_v11_to_v12(client).await?,
+            12 => migrate_v12_to_v13(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -635,31 +637,93 @@ async fn migrate_v7_to_v8(client: &deadpool_postgres::Client) -> StorageResult<(
     Ok(())
 }
 
-/// v8 -> v9: add `value_reference_display` for reference text modifiers
-/// (`:text`/`:code-text` on reference params). Additive and nullable; existing
-/// rows stay NULL until the resource is reindexed.
+/// Migrate from schema version 8 to version 9.
+///
+/// Adds the async Bulk Data Submit worker layer on top of the existing
+/// synchronous bulk-submit ingestion tables (mirrors the SQLite v8->v9 migration).
 async fn migrate_v8_to_v9(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    add_bulk_submit_worker_schema(client, "Migration v8->v9").await
+}
+
+async fn add_bulk_submit_worker_schema(
+    client: &deadpool_postgres::Client,
+    migration_label: &str,
+) -> StorageResult<()> {
+    let migrations = [
+        // bulk_submissions: REST status + auth columns.
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS owner_subject TEXT",
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS poll_token TEXT",
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS transaction_time TIMESTAMPTZ",
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS requires_access_token BOOLEAN",
+        "ALTER TABLE bulk_submissions ADD COLUMN IF NOT EXISTS request_url TEXT",
+        // bulk_manifests: worker lease/fencing + kickoff parameters + resume cursor.
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS worker_id TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS lease_expiry TIMESTAMPTZ",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS fhir_base_url TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS output_format TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS file_request_headers TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS oauth_metadata_urls TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS file_encryption_key TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS last_processed_line BIGINT NOT NULL DEFAULT 0",
+    ];
+    for sql in &migrations {
+        client
+            .execute(*sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("{} failed: {}", migration_label, e)))?;
+    }
+
     client
         .execute(
-            "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_reference_display TEXT",
+            "CREATE TABLE IF NOT EXISTS bulk_submit_files (
+                id BIGSERIAL PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                submitter TEXT NOT NULL,
+                submission_id TEXT NOT NULL,
+                manifest_url TEXT,
+                file_type TEXT NOT NULL,
+                resource_type TEXT,
+                part_index INTEGER NOT NULL DEFAULT 0,
+                fencing_token BIGINT NOT NULL DEFAULT 0,
+                file_path TEXT NOT NULL,
+                line_count BIGINT NOT NULL DEFAULT 0,
+                byte_count BIGINT NOT NULL DEFAULT 0,
+                count_severity TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                FOREIGN KEY (tenant_id, submitter, submission_id)
+                    REFERENCES bulk_submissions(tenant_id, submitter, submission_id) ON DELETE CASCADE
+            )",
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v8->v9 failed: {}", e)))?;
-    client
-        .execute(
-            "CREATE INDEX IF NOT EXISTS idx_search_reference_display
-             ON search_index(tenant_id, resource_type, param_name, value_reference_display)",
-            &[],
-        )
-        .await
-        .map_err(|e| pg_error(format!("Migration v8->v9 index failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Failed to create bulk_submit_files: {}", e)))?;
+
+    let indexes = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_submissions_poll_token
+         ON bulk_submissions(poll_token)",
+        "CREATE INDEX IF NOT EXISTS idx_bulk_manifests_claim
+         ON bulk_manifests(tenant_id, status, lease_expiry)",
+        "CREATE INDEX IF NOT EXISTS idx_bulk_submit_files_submission
+         ON bulk_submit_files(tenant_id, submitter, submission_id)",
+    ];
+    for sql in &indexes {
+        client
+            .execute(*sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("{} index failed: {}", migration_label, e)))?;
+    }
+
     Ok(())
 }
 
-/// v9 -> v10: UCUM-canonical quantity columns + case/accent-folded string column.
+/// v9 -> v10: reference display, UCUM-canonical quantity columns,
+/// and case/accent-folded string column.
 async fn migrate_v9_to_v10(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_reference_display TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_display
+         ON search_index(tenant_id, resource_type, param_name, value_reference_display)",
         "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_quantity_canonical_value DOUBLE PRECISION",
         "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_quantity_canonical_unit TEXT",
         "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS value_string_folded TEXT",
@@ -677,13 +741,40 @@ async fn migrate_v9_to_v10(client: &deadpool_postgres::Client) -> StorageResult<
     Ok(())
 }
 
-/// v10 -> v11: Add the `user_settings` table backing the per-user UI settings
+/// v10 -> v11: Add columns supporting `_contained` search. Index rows extracted
+/// from a container's `contained[]` entries are flagged `is_contained = TRUE`
+/// and carry the contained resource's type and local id; the row's
+/// `resource_type` / `resource_id` continue to identify the container.
+async fn migrate_v10_to_v11(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS is_contained BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS contained_type TEXT",
+        "ALTER TABLE search_index ADD COLUMN IF NOT EXISTS contained_local_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_search_contained
+         ON search_index(tenant_id, contained_type, is_contained, param_name)",
+    ];
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v10->v11 failed: {}", e)))?;
+    }
+    Ok(())
+}
+
+/// v11 -> v12: add async Bulk Data Submit worker schema for databases that
+/// reached v11 through main before this feature branch was merged.
+async fn migrate_v11_to_v12(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    add_bulk_submit_worker_schema(client, "Migration v11->v12").await
+}
+
+/// v12 -> v13: Add the `user_settings` table backing the per-user UI settings
 /// store (theme, default tenant, active FHIR version, recent queries, …).
 ///
 /// One opaque JSONB document is stored per user, keyed by `user_key`, with a
 /// monotonic `version` for optimistic locking. This table is independent of the
 /// FHIR `resources` table so UI preferences never leak into FHIR machinery.
-async fn migrate_v10_to_v11(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "CREATE TABLE IF NOT EXISTS user_settings (
@@ -695,7 +786,7 @@ async fn migrate_v10_to_v11(client: &deadpool_postgres::Client) -> StorageResult
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v10->v11 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v12->v13 failed: {}", e)))?;
     Ok(())
 }
 

@@ -27,9 +27,6 @@
 //! _filter=(status eq active or status eq pending) and category eq urgent
 //! ```
 
-// Error enum variant and struct fields are self-documenting
-#![allow(missing_docs)]
-
 use super::query_builder::{SqlFragment, SqlParam};
 
 /// Comparison operators supported by _filter.
@@ -99,7 +96,9 @@ impl FilterOp {
 /// Logical operators for combining filter expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicalOp {
+    /// Logical AND.
     And,
+    /// Logical OR.
     Or,
 }
 
@@ -108,14 +107,20 @@ pub enum LogicalOp {
 pub enum FilterExpr {
     /// A simple comparison: paramName op value
     Comparison {
+        /// Search parameter name.
         param: String,
+        /// Comparison operator.
         op: FilterOp,
+        /// Right-hand value as parsed from the filter source.
         value: String,
     },
     /// Logical combination of expressions
     Logical {
+        /// Left-hand sub-expression.
         left: Box<FilterExpr>,
+        /// Combining operator.
         op: LogicalOp,
+        /// Right-hand sub-expression.
         right: Box<FilterExpr>,
     },
     /// Negation of an expression
@@ -125,7 +130,9 @@ pub enum FilterExpr {
 /// Filter parsing error.
 #[derive(Debug, Clone)]
 pub struct FilterParseError {
+    /// Human-readable parser failure detail.
     pub message: String,
+    /// Byte offset within the input where the failure was detected.
     pub position: usize,
 }
 

@@ -1,6 +1,7 @@
 //! SearchProvider, TextSearchProvider, IncludeProvider, and RevincludeProvider
 //! implementations for the Elasticsearch backend.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -163,6 +164,13 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // `_contained` search post-processes contained-doc hits into containers or
+        // contained resources; standard search excludes contained docs via the
+        // query builder's `must_not is_contained`.
+        if query.contained != crate::types::ContainedMode::Off {
+            return self.search_contained(tenant, query).await;
+        }
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
@@ -194,6 +202,7 @@ impl SearchProvider for ElasticsearchBackend {
         let count = query.count.unwrap_or(20) as usize;
 
         let mut resources = Vec::new();
+        let mut scores: HashMap<String, f64> = HashMap::new();
         let mut last_sort: Option<Vec<Value>> = None;
         let mut last_resource_id = String::new();
 
@@ -213,6 +222,12 @@ impl SearchProvider for ElasticsearchBackend {
             }
 
             if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
+                // Capture the relevance score for `Bundle.entry.search.score`.
+                // `_score` is null when a field sort overrides relevance scoring,
+                // so only record finite scores.
+                if let Some(score) = hit.get("_score").and_then(|s| s.as_f64()) {
+                    scores.insert(stored.url(), score);
+                }
                 last_resource_id = stored.id().to_string();
                 resources.push(stored);
             }
@@ -261,6 +276,10 @@ impl SearchProvider for ElasticsearchBackend {
 
         let page = Page::new(resources, page_info);
         let mut result = SearchResult::new(page);
+
+        if !scores.is_empty() {
+            result = result.with_scores(scores);
+        }
 
         if let Some(t) = total {
             result = result.with_total(t);
@@ -316,6 +335,147 @@ impl SearchProvider for ElasticsearchBackend {
         &self,
     ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
         self.search_registry()
+    }
+
+    fn supports_contained_search(&self) -> bool {
+        true
+    }
+
+    fn modifiers_for_param_type(
+        &self,
+        param_type: crate::types::SearchParamType,
+    ) -> Vec<&'static str> {
+        Self::modifiers_for_type(param_type)
+    }
+}
+
+impl ElasticsearchBackend {
+    /// Executes a `_contained=true|both` search. The query builder restricts the
+    /// hit set (`is_contained=true` for `on`; no restriction for `both`); this
+    /// post-processes each hit: contained-doc hits resolve to their container
+    /// (`_containedType=container`, default) or the contained resource itself
+    /// (`_containedType=contained`), while top-level hits (only present for
+    /// `both`) pass through. Single window (no keyset cursor).
+    async fn search_contained(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        use crate::types::ContainedReturn;
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = &query.resource_type;
+        let index = self.index_name(tenant_id, resource_type);
+
+        // Fetch a generous window of candidate hits (offset/count applied below).
+        let mut es_query =
+            EsQueryBuilder::new(tenant_id, resource_type, index.clone()).build(query);
+        let count = query.count.unwrap_or(100) as usize;
+        let offset = query.offset.unwrap_or(0) as usize;
+        if let Some(obj) = es_query.body.as_object_mut() {
+            obj.insert("size".to_string(), json!(offset + count));
+            obj.remove("from");
+            obj.remove("search_after");
+        }
+
+        let body = match send_search_with_retry(self, &index, es_query.body).await? {
+            Some(v) => v,
+            None => return Ok(SearchResult::new(Page::new(vec![], PageInfo::end()))),
+        };
+        let hits = body
+            .get("hits")
+            .and_then(|h| h.get("hits"))
+            .and_then(|h| h.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut items: Vec<StoredResource> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for hit in &hits {
+            let Some(source) = hit.get("_source") else {
+                continue;
+            };
+            if source
+                .get("is_deleted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let is_contained = source
+                .get("is_contained")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if !is_contained {
+                // Top-level hit (only in `both` mode) — pass through.
+                if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
+                    if seen.insert(stored.url()) {
+                        items.push(stored);
+                    }
+                }
+                continue;
+            }
+
+            let (Some(container_type), Some(container_id)) = (
+                source.get("container_type").and_then(|v| v.as_str()),
+                source.get("container_id").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+
+            match query.contained_return {
+                ContainedReturn::Container => {
+                    if !seen.insert(format!("{container_type}/{container_id}")) {
+                        continue;
+                    }
+                    if let Some(container) = self.read(tenant, container_type, container_id).await?
+                    {
+                        items.push(container);
+                    }
+                }
+                ContainedReturn::Contained => {
+                    // The contained doc's `content` IS the contained resource;
+                    // return it directly with its local id.
+                    if let Some(stored) = parse_hit_to_stored_resource(source, tenant)? {
+                        let local_id = source
+                            .get("contained_local_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_else(|| stored.id());
+                        let key = format!("{container_type}/{container_id}#{local_id}");
+                        if seen.insert(key) {
+                            let rebuilt = StoredResource::from_storage(
+                                stored.resource_type().to_string(),
+                                local_id.to_string(),
+                                stored.version_id().to_string(),
+                                tenant.tenant_id().clone(),
+                                stored.content().clone(),
+                                stored.created_at(),
+                                stored.last_modified(),
+                                None,
+                                stored.fhir_version(),
+                            );
+                            items.push(rebuilt);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply the offset/count window.
+        let total = if query.wants_total() {
+            Some(items.len() as u64)
+        } else {
+            None
+        };
+        let windowed: Vec<StoredResource> = items.into_iter().skip(offset).take(count).collect();
+        let page = Page::new(windowed, PageInfo::end());
+        let mut result = SearchResult::new(page);
+        if let Some(t) = total {
+            result = result.with_total(t);
+        }
+        Ok(result)
     }
 }
 

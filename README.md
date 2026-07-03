@@ -243,7 +243,7 @@ AWS_REGION=us-east-1 \
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size (bytes) |
+| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
@@ -251,6 +251,10 @@ AWS_REGION=us-east-1 \
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
 | `HFS_RETURN_GONE` | `true` | Return `410 Gone` for deleted resources (vs `404`) |
 | `HFS_REQUIRE_IF_MATCH` | `false` | Require `If-Match` header for updates |
+
+Request bodies may be sent compressed (`Content-Encoding: gzip`, `deflate`,
+`br`, or `zstd`); unsupported encodings are rejected with `415`. Responses are
+compressed when the client sends `Accept-Encoding`.
 
 **CORS**
 
@@ -344,6 +348,8 @@ JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HF
 | `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow subscription deliveries to private or loopback endpoints; intended for local development and CI only |
 | `HFS_BULK_EXPORT_ENABLED` | `true` | Enable the [Bulk Data Export](crates/rest/README.md#bulk-data-export) `$export` operation; when `false`, all `$export` endpoints return `501` |
 | `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Bulk export output store: `local-fs` or `s3`. See the [rest crate README](crates/rest/README.md#bulk-data-export) for the full `HFS_BULK_EXPORT_*` table |
+| `HFS_BULK_SUBMIT_ENABLED` | `true` | Enable the Bulk Data Submit `$bulk-submit` operation (HFS as Data Consumer — fetches a provider manifest and ingests it); when `false`, all `$bulk-submit` endpoints return `501`. Available on `sqlite`/`postgres` (+ `-elasticsearch` composites). See the "Bulk Data Submit" section of `CLAUDE.md` for the full `HFS_BULK_SUBMIT_*` table |
+| `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Bulk submit status-artifact store: `local-fs` or `s3` |
 
 The SMTP delivery channel (`HFS_SUBSCRIPTION_SMTP_*`) and delivery-retry tuning (`HFS_SUBSCRIPTION_HANDSHAKE_*`) are documented in the [helios-subscriptions README](crates/subscriptions/README.md).
 
@@ -562,7 +568,7 @@ Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
 # License
 
-The Helios FHIR Server is licensed under the [MIT License](LICENSE).
+The Helios FHIR Server is licensed under the [MIT License](LICENSE.md).
 
 # Community
 

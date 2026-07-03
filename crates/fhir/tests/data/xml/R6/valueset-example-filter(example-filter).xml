@@ -20,7 +20,7 @@
           <a href="codesystem-example.html">
             <code>http://hl7.org/fhir/CodeSystem/example</code>
           </a>
-          <span title="Version is not explicitly stated, which means it is fixed to the version provided in this specification"> version 📦6.0.0-ballot3</span> where acme-plasma  = true
+          <span title="Version is not explicitly stated, which means it is fixed to the version provided in this specification"> version 📦6.0.0-ballot4</span> where acme-plasma  = true
         </li>
       </ul>
     </div>
@@ -33,7 +33,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:oid:2.16.840.1.113883.4.642.3.3148"/>
   </identifier>
-  <version value="6.0.0-ballot3"/>
+  <version value="6.0.0-ballot4"/>
   <name value="ACMECholCodesPlasma"/>
   <title value="ACME Codes for Cholesterol: Plasma only"/>
   <status value="draft"/>

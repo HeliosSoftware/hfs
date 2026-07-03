@@ -42,10 +42,31 @@ fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
 
+/// Extracts the `value[x]` payload from a FHIRPath Patch `Parameters.part`
+/// entry whose `name` is `"value"`. Returns the value of the first key
+/// matching `value[A-Z]…` (e.g. `valueString`, `valueQuantity`,
+/// `valueReference`), so every FHIR polymorphic variant is accepted rather
+/// than only the handful the patch handler used to special-case.
+fn extract_part_value(part: &Value) -> Option<Value> {
+    part.as_object()?.iter().find_map(|(k, v)| {
+        let suffix = k.strip_prefix("value")?;
+        suffix
+            .chars()
+            .next()?
+            .is_ascii_uppercase()
+            .then(|| v.clone())
+    })
+}
+
 #[async_trait]
 impl ResourceStorage for PostgresBackend {
     fn backend_name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
+        use crate::sof::postgres::PgInDbRunner;
+        Some(std::sync::Arc::new(PgInDbRunner::new(self.pool())))
     }
 
     async fn create(
@@ -519,11 +540,45 @@ impl PostgresBackend {
             }
         }
 
+        // Index any contained resources for `_contained` search.
+        self.index_contained_resources(client, tenant_id, resource_type, resource_id, resource)
+            .await?;
+
         // Index FTS content for _text and _content searches
         self.index_fts_content(client, tenant_id, resource_type, resource_id, resource)
             .await?;
 
         Ok(())
+    }
+
+    /// Extracts and indexes a container's `contained[]` resources for
+    /// `_contained` search. Each contained resource's search values are written
+    /// as `is_contained = TRUE` rows whose `resource_type` / `resource_id`
+    /// identify the container. Returns the number of entries written.
+    async fn index_contained_resources(
+        &self,
+        client: &deadpool_postgres::Client,
+        tenant_id: &str,
+        container_type: &str,
+        container_id: &str,
+        resource: &Value,
+    ) -> StorageResult<usize> {
+        let mut count = 0;
+        let container = (container_type, container_id);
+        for contained in self.search_extractor().extract_contained(resource) {
+            for value in &contained.values {
+                PostgresSearchIndexWriter::write_contained_entry(
+                    client,
+                    tenant_id,
+                    container,
+                    (&contained.contained_type, &contained.local_id),
+                    value,
+                )
+                .await?;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Index full-text search content for _text and _content searches.
@@ -2142,13 +2197,7 @@ impl PostgresBackend {
                             .map(|s| s.to_string());
                     }
                     Some("value") => {
-                        op_value = part
-                            .get("valueString")
-                            .or_else(|| part.get("valueBoolean"))
-                            .or_else(|| part.get("valueInteger"))
-                            .or_else(|| part.get("valueDecimal"))
-                            .or_else(|| part.get("valueCode"))
-                            .cloned();
+                        op_value = extract_part_value(part);
                     }
                     _ => {}
                 }
@@ -2775,6 +2824,12 @@ impl ReindexableStorage for PostgresBackend {
             .await?;
             count += 1;
         }
+
+        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
+        // search entries.
+        count += self
+            .index_contained_resources(&client, tenant_id, resource_type, resource_id, resource)
+            .await?;
 
         Ok(count)
     }

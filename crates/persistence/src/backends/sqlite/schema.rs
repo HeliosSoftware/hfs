@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -268,6 +268,8 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             8 => migrate_v8_to_v9(conn)?,
             9 => migrate_v9_to_v10(conn)?,
             10 => migrate_v10_to_v11(conn)?,
+            11 => migrate_v11_to_v12(conn)?,
+            12 => migrate_v12_to_v13(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -948,28 +950,163 @@ fn migrate_v7_to_v8(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
-/// v8 → v9: add `value_reference_display` for reference text modifiers
-/// (`:text`/`:code-text`/`:text-advanced` on reference params). Additive and
-/// nullable; existing rows stay NULL until the resource is reindexed.
+/// Migrate from schema version 8 to version 9.
+///
+/// Adds the async Bulk Data Submit worker layer on top of the existing
+/// synchronous bulk-submit ingestion tables:
+/// - `bulk_submissions`: poll-token / owner / transaction-time / access-token /
+///   request-url columns (REST status + auth need these).
+/// - `bulk_manifests`: worker lease + fencing columns, the kickoff parameters
+///   needed to fetch the remote manifest (fhir base url, output format, request
+///   headers, oauth metadata urls, encryption key), and a resume cursor.
+/// - `bulk_submit_files`: status-manifest output/error/deleted artifact rows.
 fn migrate_v8_to_v9(conn: &Connection) -> StorageResult<()> {
-    // SQLite has no `ADD COLUMN IF NOT EXISTS`; the column may already exist if
-    // the table was created fresh at v9, so ignore a duplicate-column error.
-    let _ = conn.execute(
-        "ALTER TABLE search_index ADD COLUMN value_reference_display TEXT",
-        [],
-    );
+    add_bulk_submit_worker_schema(conn)
+}
+
+fn add_bulk_submit_worker_schema(conn: &Connection) -> StorageResult<()> {
+    // bulk_submissions: REST status + auth columns.
+    let submission_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_submissions)")
+            .map_err(|e| migration_err(format!("pragma bulk_submissions: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let submission_adds = [
+        (
+            "owner_subject",
+            "ALTER TABLE bulk_submissions ADD COLUMN owner_subject TEXT",
+        ),
+        (
+            "poll_token",
+            "ALTER TABLE bulk_submissions ADD COLUMN poll_token TEXT",
+        ),
+        (
+            "transaction_time",
+            "ALTER TABLE bulk_submissions ADD COLUMN transaction_time TEXT",
+        ),
+        (
+            "requires_access_token",
+            "ALTER TABLE bulk_submissions ADD COLUMN requires_access_token INTEGER",
+        ),
+        (
+            "request_url",
+            "ALTER TABLE bulk_submissions ADD COLUMN request_url TEXT",
+        ),
+    ];
+    for (col, sql) in &submission_adds {
+        if !submission_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add {col}: {e}")))?;
+        }
+    }
+
+    // bulk_manifests: worker lease/fencing + kickoff parameters + resume cursor.
+    let manifest_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_manifests)")
+            .map_err(|e| migration_err(format!("pragma bulk_manifests: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let manifest_adds = [
+        (
+            "worker_id",
+            "ALTER TABLE bulk_manifests ADD COLUMN worker_id TEXT",
+        ),
+        (
+            "lease_expiry",
+            "ALTER TABLE bulk_manifests ADD COLUMN lease_expiry TEXT",
+        ),
+        (
+            "fencing_token",
+            "ALTER TABLE bulk_manifests ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "fhir_base_url",
+            "ALTER TABLE bulk_manifests ADD COLUMN fhir_base_url TEXT",
+        ),
+        (
+            "output_format",
+            "ALTER TABLE bulk_manifests ADD COLUMN output_format TEXT",
+        ),
+        (
+            "file_request_headers",
+            "ALTER TABLE bulk_manifests ADD COLUMN file_request_headers TEXT",
+        ),
+        (
+            "oauth_metadata_urls",
+            "ALTER TABLE bulk_manifests ADD COLUMN oauth_metadata_urls TEXT",
+        ),
+        (
+            "file_encryption_key",
+            "ALTER TABLE bulk_manifests ADD COLUMN file_encryption_key TEXT",
+        ),
+        (
+            "last_processed_line",
+            "ALTER TABLE bulk_manifests ADD COLUMN last_processed_line INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (col, sql) in &manifest_adds {
+        if !manifest_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add {col}: {e}")))?;
+        }
+    }
+
+    // Status-manifest artifact rows (output/error/deleted NDJSON parts).
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_search_reference_display
-         ON search_index(tenant_id, resource_type, param_name, value_reference_display)",
+        "CREATE TABLE IF NOT EXISTS bulk_submit_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            submitter TEXT NOT NULL,
+            submission_id TEXT NOT NULL,
+            manifest_url TEXT,
+            file_type TEXT NOT NULL,
+            resource_type TEXT,
+            part_index INTEGER NOT NULL DEFAULT 0,
+            fencing_token INTEGER NOT NULL DEFAULT 0,
+            file_path TEXT NOT NULL,
+            line_count INTEGER NOT NULL DEFAULT 0,
+            byte_count INTEGER NOT NULL DEFAULT 0,
+            count_severity TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (tenant_id, submitter, submission_id)
+                REFERENCES bulk_submissions(tenant_id, submitter, submission_id) ON DELETE CASCADE
+        )",
         [],
     )
-    .map_err(|e| migration_err(format!("create reference_display index: {e}")))?;
+    .map_err(|e| migration_err(format!("create bulk_submit_files: {e}")))?;
+
+    let indexes = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_submissions_poll_token
+         ON bulk_submissions(poll_token)",
+        "CREATE INDEX IF NOT EXISTS idx_bulk_manifests_claim
+         ON bulk_manifests(tenant_id, status, lease_expiry)",
+        "CREATE INDEX IF NOT EXISTS idx_bulk_submit_files_submission
+         ON bulk_submit_files(tenant_id, submitter, submission_id)",
+    ];
+    for index_sql in &indexes {
+        conn.execute(index_sql, [])
+            .map_err(|e| migration_err(format!("create index: {e}")))?;
+    }
+
     Ok(())
 }
 
 /// Migrate from schema version 9 to version 10.
 ///
 /// Adds:
+/// - reference display text for reference modifiers;
 /// - UCUM-canonicalized quantity columns so quantity search matches across
 ///   equivalent units (e.g. `1 g` ⇄ `1000 mg`); and
 /// - a case/accent-folded string column so string search is accent-insensitive.
@@ -979,6 +1116,10 @@ fn migrate_v8_to_v9(conn: &Connection) -> StorageResult<()> {
 fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
     // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore duplicate-column errors
     // (the columns may already exist if the table was created fresh at v10).
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN value_reference_display TEXT",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE search_index ADD COLUMN value_quantity_canonical_value REAL",
         [],
@@ -991,6 +1132,12 @@ fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
         "ALTER TABLE search_index ADD COLUMN value_string_folded TEXT",
         [],
     );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_display
+         ON search_index(tenant_id, resource_type, param_name, value_reference_display)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create reference_display index: {e}")))?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical
          ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)",
@@ -1008,12 +1155,50 @@ fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
 
 /// Migrate from schema version 10 to version 11.
 ///
+/// Adds columns supporting `_contained` search: index rows extracted from a
+/// container's `contained[]` entries are flagged `is_contained = 1` and carry
+/// the contained resource's type and local id. The row's `resource_type` /
+/// `resource_id` continue to identify the *container* (preserving the FK to
+/// `resources`), while `contained_type` records the nested resource's type.
+fn migrate_v10_to_v11(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore duplicate-column errors.
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN is_contained INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN contained_type TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN contained_local_id TEXT",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_search_contained
+         ON search_index(tenant_id, contained_type, is_contained, param_name)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create contained index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 11 to version 12.
+///
+/// Adds the async Bulk Data Submit worker schema for databases that reached v11
+/// through main before this feature branch was merged.
+fn migrate_v11_to_v12(conn: &Connection) -> StorageResult<()> {
+    add_bulk_submit_worker_schema(conn)
+}
+
+/// Migrate from schema version 12 to version 13.
+///
 /// Adds the `user_settings` table that backs the per-user UI settings store
 /// (theme, default tenant, active FHIR version, recent queries, …). One opaque
 /// JSON document is stored per user, keyed by `user_key`, with a monotonic
 /// `version` for optimistic locking. This table is intentionally independent of
 /// the FHIR `resources` table so UI preferences never leak into FHIR machinery.
-fn migrate_v10_to_v11(conn: &Connection) -> StorageResult<()> {
+fn migrate_v12_to_v13(conn: &Connection) -> StorageResult<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS user_settings (
             user_key   TEXT NOT NULL PRIMARY KEY,
@@ -1194,6 +1379,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 7); // 3 export + 4 submit tables
+    }
+
+    #[test]
+    fn test_migration_v8_to_v9_adds_submit_worker_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema_v1(&conn).unwrap();
+        let _ = get_schema_version(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        migrate_v3_to_v4(&conn).unwrap();
+        migrate_v4_to_v5(&conn).unwrap();
+        migrate_v5_to_v6(&conn).unwrap();
+        migrate_v6_to_v7(&conn).unwrap();
+        migrate_v7_to_v8(&conn).unwrap();
+        set_schema_version(&conn, 8).unwrap();
+
+        migrate_v8_to_v9(&conn).unwrap();
+
+        let has_column = |table: &str, col: &str| -> bool {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|c| c == col)
+        };
+
+        for col in [
+            "owner_subject",
+            "poll_token",
+            "transaction_time",
+            "requires_access_token",
+            "request_url",
+        ] {
+            assert!(has_column("bulk_submissions", col), "missing {col}");
+        }
+        for col in [
+            "worker_id",
+            "lease_expiry",
+            "fencing_token",
+            "fhir_base_url",
+            "output_format",
+            "file_request_headers",
+            "oauth_metadata_urls",
+            "file_encryption_key",
+            "last_processed_line",
+        ] {
+            assert!(has_column("bulk_manifests", col), "missing {col}");
+        }
+
+        let files_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='bulk_submit_files'",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+            .unwrap()
+            > 0;
+        assert!(files_exists);
+
+        // Idempotent re-run (mirrors initialize_schema running it on a fresh DB).
+        migrate_v8_to_v9(&conn).unwrap();
     }
 
     #[test]

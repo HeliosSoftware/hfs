@@ -9,7 +9,15 @@
     {
       "use": "official",
       "system": "urn:dicom:uid",
-      "value": "urn:oid:2.16.124.113543.6003.1154777499.30246.19789.3503430046"
+      "value": "urn:oid:2.16.124.113543.6003.1154777499.30246.19789.3503430046",
+      "type": {
+        "coding": [
+          {
+            "system": "http://dicom.nema.org/resources/ontology/DCM",
+            "code": "110180"
+          }
+        ]
+      }
     },
     {
       "use": "secondary",
@@ -123,18 +131,20 @@
           "reference": "Endpoint/example-wadors"
         }
       ],
-      "bodySite": {
-        "concept": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "74670003",
-              "display": "Wrist Joint"
-            }
-          ]
+      "bodySite": [
+        {
+          "concept": {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "74670003",
+                "display": "Wrist Joint"
+              }
+            ]
+          }
         }
-      },
-      "started": "2011-01-01T11:01:20+03:00",
+      ],
+      "started": "2017-01-01T11:11:23+03:00",
       "performer": [
         {
           "function": {

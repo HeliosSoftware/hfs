@@ -117,7 +117,11 @@ use std::sync::Arc;
 /// ```
 pub struct EvaluationContext {
     /// The FHIR resources being evaluated (available for context access)
-    pub resources: Vec<FhirResource>,
+    /// Shared via `Arc` so resources survive context cloning (`FhirResource` is
+    /// not `Clone`, but `Arc` clones cheaply by ref-count). This lets lambda
+    /// scopes (`where()`, `select()`, …), which run in child contexts, still see
+    /// the root resources for `%context`, `%resource`, and `resolve()`.
+    pub resources: Arc<Vec<FhirResource>>,
 
     /// The FHIR version being used for type checking and resource validation
     pub fhir_version: FhirVersion,
@@ -167,9 +171,9 @@ pub struct EvaluationContext {
 impl Clone for EvaluationContext {
     fn clone(&self) -> Self {
         EvaluationContext {
-            // Resources cannot be cloned, so child contexts start with empty resources
-            // This is a limitation but doesn't affect typical usage patterns
-            resources: Vec::new(),
+            // Resources are shared via Arc, so clones (and the child/parent chain)
+            // keep visibility of the root resources.
+            resources: self.resources.clone(),
             fhir_version: self.fhir_version,
             variables: self.variables.clone(),
             this: self.this.clone(),
@@ -233,7 +237,7 @@ impl EvaluationContext {
         let this = resources.first().map(convert_resource_to_result);
 
         Self {
-            resources,
+            resources: Arc::new(resources),
             fhir_version,
             variables: HashMap::new(),
             this,
@@ -266,7 +270,7 @@ impl EvaluationContext {
         let this = resources.first().map(convert_resource_to_result);
 
         Self {
-            resources,
+            resources: Arc::new(resources),
             fhir_version,
             variables: HashMap::new(),
             this,
@@ -296,7 +300,7 @@ impl EvaluationContext {
     /// A new empty `EvaluationContext` instance
     pub fn new_empty(fhir_version: FhirVersion) -> Self {
         Self {
-            resources: Vec::new(),
+            resources: Arc::new(Vec::new()),
             fhir_version,
             variables: HashMap::new(),
             this: None,
@@ -409,7 +413,33 @@ impl EvaluationContext {
     ///
     /// * `resource` - The FHIR resource to add to the context
     pub fn add_resource(&mut self, resource: FhirResource) {
-        self.resources.push(resource);
+        // Resources are shared via Arc and FhirResource is not Clone, so we can't
+        // copy-on-write. Require sole ownership — true for all call sites, which
+        // add resources at setup time before any context cloning occurs.
+        Arc::get_mut(&mut self.resources)
+            .expect(
+                "add_resource requires sole ownership of the resources Arc (call before cloning)",
+            )
+            .push(resource);
+    }
+
+    /// Replaces the pool of resources available for resolution.
+    ///
+    /// This swaps the (`Arc`-shared) set of resources that `resolve()` searches —
+    /// see [`crate::resolve_function`] — **without** changing `this`, the FHIR
+    /// version, or `%context` / `%resource` / `%rootResource` semantics. Those all
+    /// derive from `this` (with `resources[0]` used only as a fallback when `this`
+    /// is `None`), so callers that have already set `this` to the resource under
+    /// evaluation can widen the resolution pool freely.
+    ///
+    /// SQL-on-FHIR uses this to expose the *entire input bundle* so that
+    /// `Reference.resolve()` can reach sibling resources elsewhere in the bundle,
+    /// not just the resource currently being processed and its `contained`
+    /// children. Sharing via `Arc` keeps this cheap across the many per-resource
+    /// (and per-iteration) contexts SOF creates, and it survives `Clone` into
+    /// lambda/child contexts.
+    pub fn set_resolution_scope(&mut self, resources: Arc<Vec<FhirResource>>) {
+        self.resources = resources;
     }
 
     /// Sets a variable in the context to a string value
@@ -506,14 +536,12 @@ impl EvaluationContext {
     ///
     /// A new `EvaluationContext` with this context as its parent
     pub fn create_child_context(&self) -> EvaluationContext {
-        // Resources are not cloned in parent context to avoid Clone requirement
-        // Child context will maintain its own reference to resources
-        // This is a limitation of the current architecture but doesn't affect
-        // functionality since resources are typically only accessed from the
-        // active context, not parent contexts
+        // Resources are shared via Arc so the child (used for lambda bodies like
+        // where()/select()) still sees the root resources — needed for %context,
+        // %resource, and resolve() inside lambdas.
 
         EvaluationContext {
-            resources: Vec::new(), // Child starts with empty resources
+            resources: self.resources.clone(), // Cheap Arc clone — shares root resources
             fhir_version: self.fhir_version,
             variables: HashMap::new(), // Start with empty variables in child
             this: self.this.clone(),
@@ -1547,8 +1575,11 @@ fn evaluate_term(
             // Handle variables (%var, %context) next and return
             if let Invocation::Member(name) = invocation {
                 if let Some(var_name) = name.strip_prefix('%') {
-                    if var_name == "context" {
-                        // Return %context value
+                    if var_name == "context" || var_name == "resource" || var_name == "rootResource"
+                    {
+                        // Return %context / %resource / %rootResource value. In this
+                        // engine all three resolve to the resource(s) in scope: the
+                        // root resource being evaluated.
                         // Correctly wrap the entire conditional result in Ok()
                         return Ok(if context.resources.is_empty() {
                             EvaluationResult::Empty
@@ -1663,8 +1694,9 @@ fn evaluate_term(
         Term::Literal(literal) => Ok(evaluate_literal(literal)), // Wrap in Ok
         Term::ExternalConstant(name) => {
             // Look up external constant in the context
-            // Special handling for %context
-            if name == "context" {
+            // Special handling for %context / %resource / %rootResource — all
+            // resolve to the resource(s) currently in scope.
+            if name == "context" || name == "resource" || name == "rootResource" {
                 Ok(if context.resources.is_empty() {
                     EvaluationResult::Empty
                 } else if context.resources.len() == 1 {
@@ -1853,7 +1885,15 @@ fn evaluate_invocation_with_context(
                     };
 
                     // Check if trying to override system variables
-                    let system_vars = ["%context", "%ucum", "%sct", "%loinc", "%vs"];
+                    let system_vars = [
+                        "%context",
+                        "%resource",
+                        "%rootResource",
+                        "%ucum",
+                        "%sct",
+                        "%loinc",
+                        "%vs",
+                    ];
                     if system_vars.contains(&var_name.as_str()) {
                         return Err(EvaluationError::SemanticError(format!(
                             "Cannot override system variable '{}'",
@@ -2534,7 +2574,15 @@ fn evaluate_invocation(
                     };
 
                     // Check if trying to override system variables
-                    let system_vars = ["%context", "%ucum", "%sct", "%loinc", "%vs"];
+                    let system_vars = [
+                        "%context",
+                        "%resource",
+                        "%rootResource",
+                        "%ucum",
+                        "%sct",
+                        "%loinc",
+                        "%vs",
+                    ];
                     if system_vars.contains(&var_name.as_str()) {
                         return Err(EvaluationError::SemanticError(format!(
                             "Cannot override system variable '{}'",
@@ -4739,7 +4787,7 @@ fn call_function(
                     }
                     Ok(EvaluationResult::string(string_items.join(separator)))
                 }
-                EvaluationResult::Empty => Ok(EvaluationResult::string(String::new())), // {}.join(sep) -> ""
+                EvaluationResult::Empty => Ok(EvaluationResult::Empty), // {}.join(sep) -> {} per FHIRPath spec
                 EvaluationResult::String(s, _, _) => Ok(EvaluationResult::string(s.clone())), // Single string -> same string
                 _ => Err(EvaluationError::TypeError(
                     "join requires string items or a collection of strings".to_string(),
@@ -6286,6 +6334,16 @@ fn call_function(
             // Delegate to the reference key functions module
             crate::reference_key_functions::get_reference_key_function(invocation_base, args)
         }
+        "resolve" => {
+            // Dereference a Reference (or reference string) to the resource it points
+            // to, searching resources in scope (context + contained).
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'resolve' expects 0 arguments".to_string(),
+                ));
+            }
+            crate::resolve_function::resolve_function(invocation_base, context)
+        }
         "hasValue" => {
             // hasValue() returns true if the element is a primitive with an actual value
             // Returns false if element is empty or is a primitive with extensions but no value
@@ -6529,6 +6587,7 @@ fn call_function(
                 "highBoundary",
                 "getResourceKey",
                 "getReferenceKey",
+                "resolve",
                 "sum",
                 "min",
                 "max",
@@ -9023,59 +9082,28 @@ fn could_be_typed_polymorphic_field(
     obj: &HashMap<String, EvaluationResult>,
     context: &EvaluationContext,
 ) -> bool {
-    // Extract potential base name
     let base_name = extract_potential_polymorphic_base(field_name);
-
-    // If we couldn't extract a base name, it's not a typed polymorphic field
     if base_name == field_name {
         return false;
     }
 
-    // For strict mode checking, we need to determine if this is a polymorphic field
-    // by examining the object structure and metadata
-
-    // First, check if we have metadata about choice elements
-    // Look for the resourceType to get metadata
-    if let Some(EvaluationResult::String(_resource_type, _, _)) = obj.get("resourceType") {
-        // Try to get metadata for this resource type
-        // Since we can't directly access the metadata here, we need to use a different approach
-
-        // Check if the base name follows common polymorphic patterns
-        // Common polymorphic fields in FHIR include: value[x], effective[x], onset[x], etc.
-        // In strict mode, we want to be conservative and check if this could be polymorphic
-
-        // Look for evidence that this is a polymorphic field:
-        // 1. The field name has a camelCase pattern with type suffix
-        // 2. There might be other fields with the same base name
-        // 3. The base name is commonly known as polymorphic
-
-        // Check if there are other fields with the same base name
-        let has_other_variants = obj.keys().any(|key| {
-            key != field_name
-                && key.starts_with(&base_name)
-                && key.len() > base_name.len()
-                && key
-                    .chars()
-                    .nth(base_name.len())
-                    .is_some_and(|c| c.is_uppercase())
-        });
-
-        // If we find other variants, it's definitely polymorphic
-        if has_other_variants {
-            return true;
-        }
-
-        // Even without other variants present, check if this looks like a typed polymorphic field
-        // by examining if the suffix is a valid FHIR type using our type checking infrastructure
-        let suffix = &field_name[base_name.len()..];
-
-        // Use the new function to check if the suffix is a valid FHIR type
-        if crate::resource_type::is_valid_fhir_type_suffix(suffix, &context.fhir_version) {
-            return true;
-        }
+    // We need a parent FHIR type to answer authoritatively. If the object
+    // carries `resourceType`, use it; otherwise fall through to the
+    // suffix-validity heuristic so deeply-nested objects still get a useful
+    // answer (the original behavior was to silently return false for those
+    // — that's strictly worse than checking the suffix).
+    if let Some(EvaluationResult::String(resource_type, _, _)) = obj.get("resourceType")
+        && helios_fhir::get_field_type(context.fhir_version, resource_type, field_name).is_some()
+    {
+        return true;
     }
 
-    false
+    // Suffix-validity fallback: if the camelCase split yields a known FHIR
+    // type code as the suffix, treat the field as a typed polymorphic
+    // variant. This covers extension fields and any parent types that the
+    // FIELD_TYPES table doesn't reach from `resourceType` alone.
+    let suffix = &field_name[base_name.len()..];
+    crate::resource_type::is_valid_fhir_type_suffix(suffix, &context.fhir_version)
 }
 
 /// Extracts the potential base name from what might be a typed polymorphic field
