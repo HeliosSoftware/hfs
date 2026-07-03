@@ -229,9 +229,10 @@ mod tests {
 
         let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
         backend.init_schema().expect("init schema");
-        // `AppState::new` leaves the settings store unset.
+        // `AppState::new` leaves the settings store unset. The `Ok` variant
+        // (`&Arc<dyn SettingsStore>`) is not `Debug`, so match instead of unwrap.
         let state = AppState::new(Arc::new(backend), ServerConfig::default());
-        let err = settings_store(&state).unwrap_err();
-        assert!(matches!(err, RestError::NotImplemented { .. }));
+        let result = settings_store(&state);
+        assert!(matches!(result, Err(RestError::NotImplemented { .. })));
     }
 }

@@ -1005,6 +1005,7 @@ mod builder_tests {
             None,
             None,
             None,
+            None,
             Some(settings),
         );
     }
