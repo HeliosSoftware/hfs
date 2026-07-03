@@ -14,7 +14,7 @@ default-members = [
 	"crates/serde",
 	"crates/serde-support",
 	"crates/hfs",
-	"crates/ui",
+	"crates/web",
 	"crates/persistence",
 	"crates/rest",
 	"crates/sof",

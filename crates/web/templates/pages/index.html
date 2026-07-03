@@ -1,0 +1,24 @@
+{% extends "layouts/base.html" %}
+
+{% block content %}
+<h1>Helios FHIR Server</h1>
+<p class="lede">Server-rendered, HTMX-first UI. This panel is refreshed as an HTML fragment.</p>
+
+<div id="status">
+  {% include "partials/status.html" %}
+</div>
+
+<!--
+  Progressive enhancement: this is a real link. Without JavaScript, clicking it
+  performs a hard navigation to /ui/status, which returns a full page. With htmx
+  loaded, the request carries the HX-Request header and the handler returns just
+  the fragment, swapped into #status.
+-->
+<a
+  class="button"
+  href="/ui/status"
+  hx-get="/ui/status"
+  hx-target="#status"
+  hx-swap="innerHTML"
+>Refresh status</a>
+{% endblock %}
