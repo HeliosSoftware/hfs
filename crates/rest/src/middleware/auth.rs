@@ -669,4 +669,95 @@ mod tests {
         assert!(extract_operation_for_routing("/_x/Patient/123", "GET", false).is_none());
         assert_eq!(extract_operation("/_x/Patient/123", "GET"), None);
     }
+
+    // ── Additional branch coverage for `extract_operation` ──
+
+    #[test]
+    fn test_extract_operation_patch() {
+        // PATCH /Patient/123 → Update (same variant as PUT).
+        let (rt, op) = extract_operation("/Patient/123", "PATCH").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Update);
+    }
+
+    #[test]
+    fn test_extract_operation_type_history_is_read() {
+        // GET /Patient/_history — 2 segments, second starts with '_' → Read (history).
+        let (rt, op) = extract_operation("/Patient/_history", "GET").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    #[test]
+    fn test_extract_operation_head_search() {
+        // HEAD is classified like GET: HEAD /Patient → Search.
+        let (rt, op) = extract_operation("/Patient", "HEAD").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_extract_operation_head_read() {
+        // HEAD /Patient/123 → Read.
+        let (rt, op) = extract_operation("/Patient/123", "HEAD").unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Read);
+    }
+
+    #[test]
+    fn test_extract_operation_head_compartment_search() {
+        // HEAD is in the compartment-search branch too: target type, Search.
+        let (rt, op) = extract_operation("/Patient/123/Observation", "HEAD").unwrap();
+        assert_eq!(rt, "Observation");
+        assert_eq!(op, FhirOperation::Search);
+    }
+
+    #[test]
+    fn test_extract_operation_dollar_system_op_none() {
+        // A first segment starting with '$' is a system-level operation → None.
+        assert!(extract_operation("/$export", "GET").is_none());
+        assert!(extract_operation("/$export", "POST").is_none());
+    }
+
+    #[test]
+    fn test_extract_operation_unknown_method_none() {
+        // Methods other than GET/HEAD/POST/PUT/PATCH/DELETE fall through to None.
+        assert!(extract_operation("/Patient", "OPTIONS").is_none());
+        assert!(extract_operation("/Patient/123", "OPTIONS").is_none());
+    }
+
+    // ── Additional branch coverage for `extract_operation_for_routing` ──
+
+    #[test]
+    fn test_url_routing_delete_strips_tenant() {
+        // DELETE /{tenant}/Patient/123 → Delete on Patient (tenant stripped).
+        let (rt, op) = extract_operation_for_routing("/acme/Patient/123", "DELETE", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Delete);
+    }
+
+    #[test]
+    fn test_url_routing_patch_strips_tenant() {
+        let (rt, op) = extract_operation_for_routing("/acme/Patient/123", "PATCH", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Update);
+    }
+
+    #[test]
+    fn test_url_routing_reserved_first_segment_not_stripped() {
+        // A reserved first segment (a real FHIR resource type) is never treated as
+        // a tenant, so with routing on it classifies exactly like the raw path.
+        let (rt, op) = extract_operation_for_routing("/Observation", "POST", true).unwrap();
+        assert_eq!(rt, "Observation");
+        assert_eq!(op, FhirOperation::Create);
+    }
+
+    #[test]
+    fn test_url_routing_search_post_strips_tenant() {
+        // POST /{tenant}/Patient/_search → Search on Patient (tenant stripped).
+        let (rt, op) =
+            extract_operation_for_routing("/acme/Patient/_search", "POST", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Search);
+    }
 }
