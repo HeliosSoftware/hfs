@@ -180,7 +180,15 @@ where
             // configured default so single-tenant-with-auth deployments keep working.
             let resolver = TenantResolver::new(&config.multitenancy);
             let resolved = resolver.resolve(parts, &config.multitenancy, &config.default_tenant);
-            if resolved.tenant_id_str() != config.default_tenant {
+            // An empty resolved tenant means nothing real was requested — e.g. an
+            // empty JWT tenant claim re-surfaced by the resolver's JwtTenantExtractor
+            // (which runs even in HeaderOnly mode), with no header/URL tenant
+            // supplied. Treat that as "no request" and fall back to the configured
+            // default. Only a genuine, non-empty, non-default header/URL tenant
+            // yields 403, preserving tenant isolation.
+            if !resolved.tenant_id_str().is_empty()
+                && resolved.tenant_id_str() != config.default_tenant
+            {
                 return Err((
                     StatusCode::FORBIDDEN,
                     "Authenticated token is missing the required tenant claim".to_string(),

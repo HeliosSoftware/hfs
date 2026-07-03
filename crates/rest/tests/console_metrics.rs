@@ -22,7 +22,6 @@ use std::sync::Arc;
 use axum::http::{HeaderName, HeaderValue};
 use axum_test::TestServer;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
-use helios_persistence::core::ResourceStorage;
 use helios_rest::ServerConfig;
 use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
 
