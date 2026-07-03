@@ -958,3 +958,54 @@ pub fn init_logging(level: &str) {
         .with(filter)
         .init();
 }
+
+#[cfg(all(test, feature = "sqlite"))]
+mod builder_tests {
+    use super::*;
+    use helios_persistence::backends::sqlite::SqliteBackend;
+
+    fn backend() -> Arc<SqliteBackend> {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        Arc::new(backend)
+    }
+
+    /// SOF is disabled so `build_app` skips the in-DB runner / export-controller
+    /// path and stays a pure, side-effect-free router build.
+    fn config() -> ServerConfig {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = false;
+        config
+    }
+
+    /// The generic bulk builder wires a router with no bundles (bulk export and
+    /// bulk submit both disabled).
+    #[tokio::test]
+    async fn builds_app_with_bulk_builder_and_no_bundles() {
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config(),
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// The settings-capable builder wires the settings store into the router.
+    #[tokio::test]
+    async fn builds_app_with_settings_store() {
+        let backend = backend();
+        let settings: Arc<dyn helios_persistence::core::SettingsStore> = backend.clone();
+        let _app: Router = create_app_with_auth_bulk_and_settings(
+            backend,
+            config(),
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            Some(settings),
+        );
+    }
+}

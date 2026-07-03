@@ -262,4 +262,44 @@ mod tests {
             .unwrap();
         assert_eq!(updated.version, 2);
     }
+
+    #[tokio::test]
+    async fn get_settings_surfaces_decode_error_for_corrupt_row() {
+        let backend = backend();
+        // Write a row whose `data` blob is not valid JSON, bypassing the store.
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute(
+                "INSERT INTO user_settings (user_key, data, version, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "corrupt",
+                    b"not json".as_slice(),
+                    1_i64,
+                    "2020-01-01T00:00:00Z"
+                ],
+            )
+            .unwrap();
+        }
+        let err = backend.get_settings("corrupt").await.unwrap_err();
+        assert!(matches!(err, StorageError::Backend(_)));
+    }
+
+    #[tokio::test]
+    async fn get_settings_tolerates_unparseable_timestamp() {
+        let backend = backend();
+        // Valid JSON document but a malformed `updated_at`: read must not fail.
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute(
+                "INSERT INTO user_settings (user_key, data, version, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["odd-ts", b"{}".as_slice(), 3_i64, "not-a-timestamp"],
+            )
+            .unwrap();
+        }
+        let stored = backend.get_settings("odd-ts").await.unwrap().unwrap();
+        assert_eq!(stored.version, 3);
+        assert_eq!(stored.document, json!({}));
+    }
 }

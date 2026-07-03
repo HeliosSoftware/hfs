@@ -169,3 +169,69 @@ fn settings_response(stored: StoredUserSettings) -> Response {
 fn weak_etag(version: i64) -> String {
     format!("W/\"{version}\"")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn parse_object_body_rejects_empty() {
+        let err = parse_object_body(&Bytes::new()).unwrap_err();
+        assert!(matches!(err, RestError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn parse_object_body_rejects_invalid_json() {
+        let err = parse_object_body(&Bytes::from_static(b"{ not json")).unwrap_err();
+        assert!(matches!(err, RestError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn parse_object_body_rejects_non_object() {
+        let err = parse_object_body(&Bytes::from_static(b"[1, 2, 3]")).unwrap_err();
+        assert!(matches!(err, RestError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn parse_object_body_accepts_object() {
+        let value = parse_object_body(&Bytes::from_static(b"{\"theme\":\"dark\"}")).unwrap();
+        assert!(value.is_object());
+    }
+
+    #[test]
+    fn parse_if_match_version_variants() {
+        let with_if_match = |raw: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_MATCH, raw.parse().unwrap());
+            ConditionalHeaders::from_headers(&headers)
+        };
+        assert_eq!(parse_if_match_version(&with_if_match("W/\"5\"")), Some(5));
+        assert_eq!(parse_if_match_version(&with_if_match("\"7\"")), Some(7));
+        assert_eq!(parse_if_match_version(&with_if_match("9")), Some(9));
+        // A wildcard means "no version precondition".
+        assert_eq!(parse_if_match_version(&with_if_match("*")), None);
+        // An unparseable value is ignored rather than rejected.
+        assert_eq!(parse_if_match_version(&with_if_match("garbage")), None);
+        // An absent header yields no precondition.
+        assert_eq!(
+            parse_if_match_version(&ConditionalHeaders::from_headers(&HeaderMap::new())),
+            None
+        );
+    }
+
+    /// Backends without a settings store surface `501 Not Implemented`.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn settings_store_absent_returns_not_implemented() {
+        use crate::config::ServerConfig;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        // `AppState::new` leaves the settings store unset.
+        let state = AppState::new(Arc::new(backend), ServerConfig::default());
+        let err = settings_store(&state).unwrap_err();
+        assert!(matches!(err, RestError::NotImplemented { .. }));
+    }
+}
