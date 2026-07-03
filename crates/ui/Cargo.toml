@@ -1,12 +1,12 @@
 [package]
-name = "helios-web"
+name = "helios-ui"
 version.workspace = true
 edition.workspace = true
 description = "Optional server-rendered HTMX web UI for the Helios FHIR Server"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/web"
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/ui"
 keywords = ["helios-software", "fhir", "ui", "htmx"]
 
 [dependencies]

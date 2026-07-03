@@ -1,4 +1,4 @@
-# helios-web — HTMX-first web UI for HFS
+# helios-ui — HTMX-first web UI for HFS
 
 This crate is the foundation for a server-rendered, **HTMX-first** web UI for the
 Helios FHIR Server. It is a thin Axum library crate that owns templates, static
@@ -82,14 +82,14 @@ note the version bump in the commit.
 
 ## Rules of the road — where things go
 
-- `crates/web/src/` — Axum handlers/routers returning `impl IntoResponse`
+- `crates/ui/src/` — Axum handlers/routers returning `impl IntoResponse`
   (HTML). **Thin:** parse request → call into `helios-rest` /
   `helios-persistence` / `helios-hts` → render a template.
-- `crates/web/templates/` — `.html` templates:
+- `crates/ui/templates/` — `.html` templates:
   - `layouts/` — shared document shells (`base.html`).
   - `pages/` — full documents (extend a layout).
   - `partials/` — HTMX-swappable fragments (no `<html>` wrapper).
-- `crates/web/assets/` — vendored, pinned `htmx.min.js`, CSS, images. Embedded;
+- `crates/ui/assets/` — vendored, pinned `htmx.min.js`, CSS, images. Embedded;
   never fetched at runtime.
 - Handlers branch on the **`HX-Request`** header to return a fragment vs. a full
   page (progressive enhancement).
@@ -145,7 +145,7 @@ Mounted under `/ui` when running `hfs` (the `ui` feature is on by default; the
 cargo run -p helios-hfs --features ui   # then open http://127.0.0.1:8080/ui
 ```
 
-`cargo build`, `cargo clippy`, and `cargo test -p helios-web` are clean.
+`cargo build`, `cargo clippy`, and `cargo test -p helios-ui` are clean.
 
 ### Left for follow-up work
 

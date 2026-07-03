@@ -3254,7 +3254,7 @@ dependencies = [
  "helios-rest",
  "helios-sof",
  "helios-subscriptions",
- "helios-web",
+ "helios-ui",
  "openssl",
  "parking_lot",
  "reqwest",
@@ -3498,7 +3498,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "helios-web"
+name = "helios-ui"
 version = "0.2.1"
 dependencies = [
  "askama",

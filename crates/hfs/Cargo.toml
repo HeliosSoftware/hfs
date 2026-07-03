@@ -25,7 +25,7 @@ R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-audit/R6"]
 
 # Build options
 skip-r6-download = []
-ui = ["dep:helios-web"]
+ui = ["dep:helios-ui"]
 headless = []
 
 # Database backends
@@ -58,7 +58,7 @@ helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.1" }
 helios-audit = { path = "../audit", version = "0.2.1", default-features = false }
 helios-subscriptions = { path = "../subscriptions", version = "0.2.1", optional = true, default-features = false }
-helios-web = { path = "../web", version = "0.2.1", optional = true }
+helios-ui = { path = "../ui", version = "0.2.1", optional = true }
 
 # Export job controller
 dashmap = "6"
