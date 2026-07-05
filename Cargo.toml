@@ -9,6 +9,7 @@ default-members = [
 	"crates/fhir",
 	"crates/fhir-gen",
 	"crates/fhir-macro",
+	"crates/fhir-validator",
 	"crates/fhirpath",
 	"crates/fhirpath-support",
 	"crates/serde",
@@ -38,4 +39,5 @@ rust-version = "1.90"
 serde = { version = "=1.0.224", features = ["derive"] }
 serde_json = "=1.0.144"
 helios-fhir = { path = "crates/fhir", version = "0.2.1", default-features = false }
+helios-fhir-validator = { path = "crates/fhir-validator", version = "0.2.1", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }

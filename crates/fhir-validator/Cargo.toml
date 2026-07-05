@@ -1,0 +1,34 @@
+[package]
+name = "helios-fhir-validator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "FHIR resource validator for HFS — FHIR Schema based structural and profile validation"
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/fhir-validator"
+keywords = ["helios-software", "hl7", "fhir", "validation", "fhir-schema"]
+
+[features]
+default = ["R4"]
+# Version features are placeholders until the converter/pack phases wire
+# helios-fhir (and helios-fhirpath) cascades in. Kept so downstream crates can
+# already forward their version features to this crate.
+R4 = []
+R4B = []
+R5 = []
+R6 = []
+
+[dependencies]
+# `rc` enables Deserialize/Serialize for Arc<T> — element schemas are shared
+# by reference across cooperative schema sets.
+serde = { workspace = true, features = ["rc"] }
+# `preserve_order` is load-bearing: the conformance contract requires errors
+# to be emitted in document key order.
+serde_json = { workspace = true, features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
