@@ -9,6 +9,7 @@
 
 mod errors;
 mod path;
+mod slicing;
 mod walk;
 
 pub use errors::{ErrorKind, Severity, ValidationError};

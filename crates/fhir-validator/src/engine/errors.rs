@@ -49,6 +49,11 @@ pub enum ErrorKind {
     // ------------------------------------------------------------------
     /// A primitive value failed its type-class or regex check.
     PrimitiveValue,
+    /// An array item matched no slice under `rules: closed`, or an unmatched
+    /// item preceded matched items under `rules: openAtEnd`.
+    SliceUnmatched,
+    /// Matched items violate the declared slice order (`ordered: true`).
+    SliceOrder,
     /// A referenced schema (root, `base`, or complex `type`) could not be
     /// resolved. The reference validator throws here; we report and continue.
     UnknownSchema,
@@ -179,17 +184,48 @@ pub(crate) fn msg_slice_max(max: u64, actual: u64) -> String {
     format!("Slice defines the following max cardinality: '{max}', actual cardinality: '{actual}'")
 }
 
-/// [helios] fixed-value mismatch. The reference validator's wording coerces
-/// JS objects to `[object Object]`; no fixture pins it, so we render JSON.
+/// Render a value for message text: bare strings (like the reference
+/// validator's template interpolation), compact JSON for everything else.
+pub(crate) fn render_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// [helios] fixed-value mismatch. Matches the reference wording for scalars;
+/// composites render as compact JSON (the reference coerces JS objects to
+/// `[object Object]`, which no fixture pins).
 pub(crate) fn msg_fixed_value(expected: &Value, actual: &Value) -> String {
     format!(
-        "Expected value to be exactly equal to 'fixed' pattern '{expected}', but got: '{actual}'"
+        "Expected value to be exactly equal to 'fixed' pattern '{}', but got: '{}'",
+        render_value(expected),
+        render_value(actual)
     )
 }
 
-/// [helios] pattern-value mismatch (same JSON-rendering rationale as fixed).
+/// [helios] pattern-value mismatch (same rendering rationale as fixed).
 pub(crate) fn msg_pattern_value(expected: &Value, actual: &Value) -> String {
-    format!("Expected value to match 'pattern' '{expected}', but got: '{actual}'")
+    format!(
+        "Expected value to match 'pattern' '{}', but got: '{}'",
+        render_value(expected),
+        render_value(actual)
+    )
+}
+
+/// [helios] `rules: closed` violation, at the unmatched item's path.
+pub(crate) fn msg_slice_closed_unmatched() -> String {
+    "item does not match any slice in closed slicing".to_string()
+}
+
+/// [helios] `rules: openAtEnd` violation, at the unmatched item's path.
+pub(crate) fn msg_slice_open_at_end() -> String {
+    "unmatched item must be at the end of the array (openAtEnd slicing)".to_string()
+}
+
+/// [helios] `ordered: true` violation, at the out-of-order item's path.
+pub(crate) fn msg_slice_order(slice: &str) -> String {
+    format!("slice '{slice}' is out of order (ordered slicing)")
 }
 
 /// [helios] a schema reference could not be resolved (reference validator
@@ -251,6 +287,33 @@ mod tests {
         assert_eq!(msg_excluded("gender"), "excluded property gender is present");
         assert_eq!(msg_min(1, 0), "expected 1 > 0");
         assert_eq!(msg_max(2, 3), "expected 2 < 3");
+    }
+
+    /// Helios-owned wording, pinned here and by the extended fixtures.
+    #[test]
+    fn helios_messages_match_extended_fixture_literals() {
+        assert_eq!(
+            msg_fixed_value(&json!("male"), &json!("female")),
+            "Expected value to be exactly equal to 'fixed' pattern 'male', but got: 'female'"
+        );
+        assert_eq!(
+            msg_pattern_value(&json!({"system": "http://x"}), &json!({"text": "M"})),
+            "Expected value to match 'pattern' '{\"system\":\"http://x\"}', but got: '{\"text\":\"M\"}'"
+        );
+        assert_eq!(
+            msg_slice_closed_unmatched(),
+            "item does not match any slice in closed slicing"
+        );
+        assert_eq!(
+            msg_slice_open_at_end(),
+            "unmatched item must be at the end of the array (openAtEnd slicing)"
+        );
+        assert_eq!(msg_slice_order("home"), "slice 'home' is out of order (ordered slicing)");
+        assert_eq!(
+            serde_json::to_value(ErrorKind::SliceUnmatched).unwrap(),
+            json!("slice-unmatched")
+        );
+        assert_eq!(serde_json::to_value(ErrorKind::SliceOrder).unwrap(), json!("slice-order"));
     }
 
     #[test]

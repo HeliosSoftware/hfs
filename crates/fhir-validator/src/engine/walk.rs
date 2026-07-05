@@ -51,7 +51,7 @@ const RESOURCE_TYPE_NAME: &str = "Resource";
 /// A cooperative schema set (the *schemata*): insertion-ordered, ancestors
 /// first, deduplicated both by resolution key and by schema identity.
 #[derive(Clone, Default)]
-struct SchemaSet {
+pub(super) struct SchemaSet {
     map: IndexMap<String, Arc<FhirSchema>>,
     /// Identity dedup (`Arc` pointer): the same schema reachable under
     /// several aliases (name and canonical URL) is added once.
@@ -75,20 +75,20 @@ impl SchemaSet {
         self.map.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    fn schemas(&self) -> impl Iterator<Item = &Arc<FhirSchema>> {
+    pub(super) fn schemas(&self) -> impl Iterator<Item = &Arc<FhirSchema>> {
         self.map.values()
     }
 }
 
-struct WalkCtx<'a> {
+pub(super) struct WalkCtx<'a> {
     resolver: &'a dyn SchemaResolver,
     errors: Vec<ValidationError>,
     deferred: Vec<Deferred>,
-    path: PathTracker,
+    pub(super) path: PathTracker,
 }
 
 impl WalkCtx<'_> {
-    fn error(&mut self, kind: ErrorKind, message: String) {
+    pub(super) fn error(&mut self, kind: ErrorKind, message: String) {
         self.errors.push(ValidationError::new(kind, self.path.render_dotted(), message));
     }
 
@@ -182,8 +182,9 @@ fn add_profile(
 
 /// Pull `schema` into `set` together with everything it references:
 /// its `base` chain first (ancestors-first ordering), then its complex
-/// `type` (skipped for primitive leaves), then the schema itself.
-fn add_schemas_to_set(
+/// `type` (skipped for primitive leaves), then any `elementReference`
+/// target, then the schema itself.
+pub(super) fn add_schemas_to_set(
     ctx: &mut WalkCtx<'_>,
     set: &mut SchemaSet,
     schema: Arc<FhirSchema>,
@@ -212,11 +213,43 @@ fn add_schemas_to_set(
             }
         }
 
+    // `elementReference` pulls another element's schema into the set —
+    // the mechanism behind recursive structures like Questionnaire.item.
+    // Cycles terminate via the identity dedup above.
+    if let Some(segments) = schema.element_reference.clone() {
+        let ref_key = segments.join(".");
+        match resolve_element_reference(ctx.resolver, &segments) {
+            Some(target) => add_schemas_to_set(ctx, set, target, &ref_key),
+            None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&ref_key)),
+        }
+    }
+
     set.map.insert(key.to_string(), schema);
 }
 
+/// Navigate an element reference: `["Questionnaire", "elements", "item"]` —
+/// a root schema name followed by alternating `"elements"` / element-name
+/// segments.
+fn resolve_element_reference(
+    resolver: &dyn SchemaResolver,
+    segments: &[String],
+) -> Option<Arc<FhirSchema>> {
+    let (root, rest) = segments.split_first()?;
+    let mut current = resolver.resolve(root)?;
+    let mut iter = rest.iter();
+    while let Some(marker) = iter.next() {
+        if marker != "elements" {
+            return None;
+        }
+        let name = iter.next()?;
+        let next = current.elements.as_ref()?.get(name)?.clone();
+        current = next;
+    }
+    Some(current)
+}
+
 /// Validate one data node against a cooperative schema set.
-fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
+pub(super) fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
     // Dynamic `Resource` resolution: an element typed `Resource` takes its
     // concrete schema from the nested `resourceType` at validation time
     // (Bundle.entry.resource, contained, Parameters.parameter.resource).
@@ -252,7 +285,16 @@ fn validate_node(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
 
     for (key, value) in obj {
         ctx.path.push_key(key);
-        eval_element(ctx, set, &mut multi_choice, key, value);
+        // `_foo` sidecars carry the Element part (id/extension) of a
+        // primitive `foo` — they pair with the base element rather than
+        // resolving as elements themselves.
+        if let Some(base_key) = key.strip_prefix('_')
+            && !base_key.is_empty()
+        {
+            handle_sidecar(ctx, set, key, base_key, value);
+        } else {
+            eval_element(ctx, set, &mut multi_choice, key, value);
+        }
         ctx.path.pop();
     }
 
@@ -418,15 +460,78 @@ fn eval_element(
                 }
         }
 
-        // Phase 2: slicing (mark/sweep) runs here, before per-item recursion.
+        // Slicing (mark/sweep). Items validated cooperatively with their
+        // matched slice schemas are consumed — the plain per-item pass below
+        // skips them so base-set errors are not emitted twice.
+        let consumed = super::slicing::validate_slices(ctx, &elset, items);
 
         for (index, item) in items.iter().enumerate() {
+            if consumed.contains(&index) {
+                continue;
+            }
             ctx.path.push_index(index);
             validate_node(ctx, &elset, item);
             ctx.path.pop();
         }
     } else {
         validate_node(ctx, &elset, value);
+    }
+}
+
+/// Validate a `_foo` primitive-extension sidecar.
+///
+/// The sidecar pairs with the base element `foo`: it is only legal when some
+/// layer declares `foo` with a primitive type, it mirrors `foo`'s
+/// array-vs-singular shape, and its content (per item for arrays, with
+/// `null` gaps allowed) validates against the resolver's `Element` schema.
+fn handle_sidecar(
+    ctx: &mut WalkCtx<'_>,
+    set: &SchemaSet,
+    key: &str,
+    base_key: &str,
+    value: &Value,
+) {
+    // Collect the base element's sub-set; choice bookkeeping is discarded
+    // (a sidecar is not a branch occurrence).
+    let mut scratch: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut base_elset = SchemaSet::new();
+    collect_schemas_for_element(ctx, set, &mut base_elset, &mut scratch, base_key);
+
+    // Stray sidecar, or sidecar on a non-primitive element: unknown.
+    if base_elset.is_empty() || !base_elset.schemas().any(|s| s.is_primitive()) {
+        ctx.error(ErrorKind::UnknownElement, errors::msg_unknown_element(key));
+        return;
+    }
+
+    // The sidecar mirrors the base element's shape.
+    let expect_array = base_elset.schemas().any(|s| s.array == Some(true));
+    match (expect_array, value.is_array()) {
+        (true, false) => ctx.error(ErrorKind::NotArray, errors::msg_not_array(key)),
+        (false, true) => ctx.error(ErrorKind::NotSingular, errors::msg_not_singular(key)),
+        _ => {}
+    }
+
+    // Validate the Element part(s). Without a resolvable `Element` schema
+    // (core packs always carry one) the content is left unchecked.
+    let Some(element_schema) = ctx.resolver.resolve("Element") else {
+        return;
+    };
+    let mut element_set = SchemaSet::new();
+    add_schemas_to_set(ctx, &mut element_set, element_schema, "Element");
+
+    match value {
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                if item.is_null() {
+                    continue;
+                }
+                ctx.path.push_index(index);
+                validate_node(ctx, &element_set, item);
+                ctx.path.pop();
+            }
+        }
+        Value::Null => {}
+        other => validate_node(ctx, &element_set, other),
     }
 }
 
@@ -440,13 +545,17 @@ fn collect_schemas_for_element(
     multi_choice: &mut IndexMap<String, Vec<String>>,
     key: &str,
 ) {
-    // Phase 2: `extensions` maps compile into slicing here when
-    // key == "extension".
-
     let layers: Vec<(String, Arc<FhirSchema>)> = set
         .iter()
         .map(|(name, schema)| (name.to_string(), Arc::clone(schema)))
         .collect();
+
+    // Every layer's `extensions` map compiles into a synthetic slicing on
+    // the `extension` element, matched by `{url}` — authoring sugar rewritten
+    // into the core slicing primitive at validation time.
+    if key == "extension" {
+        compile_extensions(ctx, &layers, elset);
+    }
 
     let mut choice_group: Option<String> = None;
     for (layer_name, layer) in &layers {
@@ -480,6 +589,92 @@ fn collect_schemas_for_element(
             }
         }
     }
+}
+
+/// Compile `extensions` maps from every layer into one synthetic
+/// slicing-bearing schema on the `extension` element. Each entry becomes a
+/// slice matched by `{url: <ext.url>}` carrying the entry's `min`/`max`; its
+/// slice schema is the entry (minus url/min/max) overlaid by the schema the
+/// extension's url resolves to.
+///
+/// An unresolvable extension url is reported as `unknown-schema` and the
+/// entry-only schema is used (the reference validator throws instead).
+fn compile_extensions(
+    ctx: &mut WalkCtx<'_>,
+    layers: &[(String, Arc<FhirSchema>)],
+    elset: &mut SchemaSet,
+) {
+    use crate::schema::{Match, Slice, Slicing};
+
+    let mut slices: IndexMap<String, Slice> = IndexMap::new();
+    for (_, layer) in layers {
+        let Some(extensions) = &layer.extensions else {
+            continue;
+        };
+        for (ext_name, entry) in extensions {
+            let Some(url) = entry.url.clone() else {
+                continue;
+            };
+            let resolved = ctx.resolver.resolve(&url);
+            if resolved.is_none() {
+                ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&url));
+            }
+            let merged = merge_extension_schema(entry, resolved.as_deref());
+            slices.insert(
+                ext_name.clone(),
+                Slice {
+                    match_: Some(Match {
+                        type_: Some("pattern".to_string()),
+                        value: Some(serde_json::json!({ "url": url })),
+                        resolve_ref: None,
+                    }),
+                    min: entry.min,
+                    max: entry.max,
+                    order: None,
+                    reslice: None,
+                    slice_is_constraining: None,
+                    schema: Some(Arc::new(merged)),
+                },
+            );
+        }
+    }
+
+    if !slices.is_empty() {
+        let synthetic = FhirSchema {
+            slicing: Some(Slicing { slices, rules: None, ordered: None }),
+            ..Default::default()
+        };
+        add_schemas_to_set(ctx, elset, Arc::new(synthetic), "extension");
+    }
+}
+
+/// Shallow overlay merge for extension slice schemas, mirroring the
+/// reference validator's `Object.assign(entry-minus-url/min/max, resolved)`:
+/// fields present on the resolved extension schema win; entry fields fill
+/// the gaps.
+fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> FhirSchema {
+    let mut out = entry.clone();
+    out.url = None;
+    out.min = None;
+    out.max = None;
+
+    let Some(r) = resolved else {
+        return out;
+    };
+
+    macro_rules! overlay {
+        ($($field:ident),* $(,)?) => {
+            $(if r.$field.is_some() {
+                out.$field = r.$field.clone();
+            })*
+        };
+    }
+    overlay!(
+        url, name, base, kind, derivation, type_, array, scalar, min, max, elements, required,
+        excluded, element_reference, choices, choice_of, fixed, pattern, binding, constraints,
+        refers, slicing, extensions, modifier, must_support, summary, regex,
+    );
+    out
 }
 
 /// Lodash-style `_.isMatch`: partial deep match. Every key present in
