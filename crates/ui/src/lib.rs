@@ -262,6 +262,20 @@ mod tests {
         assert!(Assets::get("logo.png").is_some());
     }
 
+    /// The theme script persists the choice to the per-user settings document
+    /// (#197): it must read the document on load and merge-patch `theme` on
+    /// toggle, with localStorage kept as the first-paint cache. Guards the
+    /// wiring; the endpoint round-trip itself is covered in helios-rest's
+    /// `user_settings` tests.
+    #[test]
+    fn theme_script_is_wired_to_user_settings() {
+        let file = Assets::get("theme.js").expect("theme.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("theme.js is UTF-8");
+        assert!(source.contains("/_user/settings"));
+        assert!(source.contains("PATCH"));
+        assert!(source.contains("hfs-theme"), "localStorage cache stays");
+    }
+
     /// Both theme buttons render, and icons are inlined (so `currentColor`
     /// theming applies) rather than referenced as external images.
     #[test]
