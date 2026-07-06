@@ -472,6 +472,17 @@ fn populate_properties<'a, B: TerminologyBackend>(
         for c in contains.iter_mut() {
             if let Some(list) = map.remove(&(c.system.clone(), c.code.clone())) {
                 let cs_types = prop_types_by_system.get(&c.system);
+                // Dedupe identical (property, value) pairs. `concept_property_values`
+                // joins by CodeSystem URL only, so when the same URL is stored
+                // in more than one version (e.g. v3-ActReason from UTG plus the
+                // IG's own cs-act-reason.json fixture), a concept's `status`
+                // property is returned once per version. The IG
+                // `tho/expand-vs-act-exclusion` fixture expects a single
+                // `status` entry — an exact-pair dedupe collapses the versions
+                // while still allowing genuinely-distinct same-code properties
+                // (e.g. multiple `parent` values) through.
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
                 c.properties = list
                     .into_iter()
                     .filter(|(code, value)| {
@@ -485,6 +496,7 @@ fn populate_properties<'a, B: TerminologyBackend>(
                         // Only emit when the status is non-active.
                         !(code == "status" && value == "active")
                     })
+                    .filter(|pair| seen.insert(pair.clone()))
                     .map(|(code, value)| {
                         // Pick the FHIR `value[x]` shape from the property
                         // code:
@@ -626,6 +638,50 @@ fn pure_full_system_includes(value_set: Option<&Value>) -> Option<Vec<(String, O
         out.push((system.to_string(), version));
     }
     Some(out)
+}
+
+/// Systems of any include that designates a hierarchy subtree via an `is-a` or
+/// `descendent-of` filter on `concept`/`code`. Such a compose should expand
+/// hierarchically by default (nest matched concepts under their in-result
+/// ancestors) — tx.fhir.org behaviour, pinned by the IG `search/search-filter-yes`
+/// fixture, which upstream flipped from a flat to a nested expected expansion.
+/// Any non-empty exclude disqualifies (curated set, not a faithful subtree).
+/// Returns None when no include carries a subsumption filter, so plain
+/// full-system, enumerated, and text-`filter`-only composes keep the flat
+/// default. Unlike [`pure_full_system_includes`] the caller applies this to the
+/// URL-resolved ValueSet too, not just inline composes.
+fn subsumption_filter_includes(value_set: Option<&Value>) -> Option<Vec<(String, Option<String>)>> {
+    let compose = value_set?.get("compose")?;
+    if compose
+        .get("exclude")
+        .and_then(|e| e.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return None;
+    }
+    let includes = compose.get("include")?.as_array()?;
+    let mut out = Vec::new();
+    for inc in includes {
+        let Some(system) = inc.get("system").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(filters) = inc.get("filter").and_then(|f| f.as_array()) else {
+            continue;
+        };
+        let is_subsumption = filters.iter().any(|f| {
+            let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            let prop = f.get("property").and_then(|v| v.as_str()).unwrap_or("");
+            matches!(op, "is-a" | "descendent-of") && matches!(prop, "concept" | "code")
+        });
+        if is_subsumption {
+            let version = inc
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            out.push((system.to_string(), version));
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// The HL7 `hl7TermMaintInfra` system + code identifying a designation as
@@ -1556,6 +1612,42 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 }
             }
             if all_isa {
+                hierarchical = Some(true);
+            }
+        }
+        // A compose that designates a hierarchy subtree via an is-a /
+        // descendent-of filter also defaults to tree mode — and unlike the
+        // pure-full-system case this applies to URL-resolved ValueSets too
+        // (the IG `search/search-filter-yes` fixture is URL-resolved). Inspect
+        // the inline compose when present, else fetch the referenced VS.
+        if hierarchical.is_none() {
+            let ctx = TenantContext::system();
+            let resolved_vs: Option<Value> = if value_set.is_some() {
+                value_set.clone()
+            } else if let Some(u) = url.as_ref() {
+                ValueSetOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(u.clone()),
+                        version: pipe_version.clone(),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut v| v.pop())
+            } else {
+                None
+            };
+            // No `code_system_is_hierarchical` gate here: an is-a /
+            // descendent-of filter already implies a hierarchy intent, and over
+            // a flat CS it resolves to just the filter's own code, so nesting is
+            // a harmless no-op. Gating on hierarchy detection would instead
+            // silently drop nesting when that probe under-reports (as it does
+            // for the `search` CS).
+            if subsumption_filter_includes(resolved_vs.as_ref()).is_some() {
                 hierarchical = Some(true);
             }
         }
