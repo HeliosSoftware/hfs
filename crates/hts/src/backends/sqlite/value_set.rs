@@ -872,76 +872,21 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                     });
                                 }
                             }
-                            // Atrius fork: stored intensional VS + text filter uses the
-                            // same FTS-first path as inline compose (see
-                            // docs/fork-ecl-fts-typeahead-expand.md). Avoids full ECL
-                            // materialisation and concept-id ordering on filtered typeahead.
-                            let codes = if let Some(filter) = req.filter.as_deref() {
-                                if let Some(compose_str) = compose_json.as_deref() {
-                                    if let Ok(compose) =
-                                        serde_json::from_str::<serde_json::Value>(compose_str)
-                                    {
-                                        let limit_hint =
-                                            req.count.map(|c| ((c as usize) * 10).max(100));
-                                        let prop_key = format!(
-                                            "prop-result:{:016x}",
-                                            fnv64(compose_str.as_bytes())
-                                        );
-                                        let plain_key = format!(
-                                            "plain-fts:{:016x}",
-                                            fnv64(compose_str.as_bytes())
-                                        );
-                                        expand_inline_filtered(
-                                            &conn,
-                                            &compose,
-                                            filter,
-                                            limit_hint,
-                                            &mut warnings,
-                                            Some((&prop_key, &property_result_cache)),
-                                            Some((&plain_key, &plain_fts_cache)),
-                                        )?
-                                    } else {
-                                        compute_expansion_with_versions(
-                                            &backend,
-                                            &conn,
-                                            compose_json.as_deref(),
-                                            &mut vec![],
-                                            &req.force_system_versions,
-                                            &req.system_version_defaults,
-                                            &req.default_value_set_versions,
-                                        )?
-                                    }
-                                } else {
-                                    compute_expansion_with_versions(
-                                        &backend,
-                                        &conn,
-                                        compose_json.as_deref(),
-                                        &mut vec![],
-                                        &req.force_system_versions,
-                                        &req.system_version_defaults,
-                                        &req.default_value_set_versions,
-                                    )?
-                                }
-                            } else {
-                                compute_expansion_with_versions(
-                                    &backend,
-                                    &conn,
-                                    compose_json.as_deref(),
-                                    &mut vec![],
-                                    &req.force_system_versions,
-                                    &req.system_version_defaults,
-                                    &req.default_value_set_versions,
-                                )?
-                            };
+                            let codes = compute_expansion_with_versions(
+                                &backend,
+                                &conn,
+                                compose_json.as_deref(),
+                                &mut vec![],
+                                &req.force_system_versions,
+                                &req.system_version_defaults,
+                                &req.default_value_set_versions,
+                            )?;
                             // Cache only when no version overrides were
                             // applied — caching with overrides would poison
                             // subsequent unforced requests with the wrong
                             // version's codes. Also skip caching for
                             // multi-version overload composes (PK collisions).
-                            // Skip caching filtered expansions — partial ranked
-                            // results must not replace the full expansion cache.
-                            if req.filter.is_none()
-                                && req.force_system_versions.is_empty()
+                            if req.force_system_versions.is_empty()
                                 && req.system_version_defaults.is_empty()
                                 && req.default_value_set_versions.is_empty()
                                 && !multi_version
@@ -1172,7 +1117,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // Apply optional free-text filter (code or display substring match).
             let filtered: Vec<ExpansionContains> = if let Some(filter) = req.filter.as_deref() {
                 let lower = filter.to_lowercase();
-                let mut hits: Vec<ExpansionContains> = all_codes
+                all_codes
                     .into_iter()
                     .filter(|c| {
                         c.code.to_lowercase().contains(&lower)
@@ -1181,10 +1126,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 .map(|d| d.to_lowercase().contains(&lower))
                                 .unwrap_or(false)
                     })
-                    .collect();
-                // Atrius fork: rank cached full expansions for typeahead UX.
-                sort_typeahead_candidates(&mut hits, &lower);
-                hits
+                    .collect()
             } else {
                 all_codes
             };
@@ -2565,10 +2507,11 @@ fn expand_inline_filtered(
         // When the request carries both a text filter and compose filter(s), two
         // strategies are possible:
         //
-        //   FTS-first — query FTS by text → bounded candidate set → apply compose
-        //               filters in Rust (hierarchy, property=, or ECL constraint).
-        //               Used when filters are batchable OR when an ECL constraint is
-        //               present (Atrius fork — see docs/fork-ecl-fts-typeahead-expand.md).
+        //   FTS-first — query `concepts_fts` by display text → bounded candidate
+        //               set → apply hierarchy/property= in Rust.  Optimal when
+        //               there is NO property= filter: a 3+-char trigram query is
+        //               highly selective (<1 000 candidates), and an is-a walk
+        //               over that small set is cheap.
         //
         //   Property-first — start from `idx_concept_properties_value` (property,
         //               value, concept_id) → O(K_property) rows → text filter in
@@ -2584,8 +2527,8 @@ fn expand_inline_filtered(
         // `all_batchable` — true when every compose filter has a fast in-Rust
         // implementation in `apply_compose_filters_to_candidates`: property=,
         // hierarchy ops (is-a / descendent-of / generalizes / child-of), or
-        // regex.  ECL `constraint` filters use `ecl::filter_candidates` instead
-        // of full expansion when the FTS-first path is taken.
+        // regex.  False for ECL `constraint` filters which need full ECL
+        // evaluation.
         let compose_filters: &[serde_json::Value] = inc["filter"]
             .as_array()
             .map(|a| a.as_slice())
@@ -2616,32 +2559,21 @@ fn expand_inline_filtered(
             None
         };
 
-        let has_ecl_constraint = compose_filters
-            .iter()
-            .any(|f| f["property"].as_str() == Some("constraint") && f["op"].as_str() == Some("="));
-
-        // Atrius fork: ECL + text filter → FTS-first + filter_candidates + rank.
-        // docs/fork-ecl-fts-typeahead-expand.md
-        if filter_lower.len() >= 3 && !has_eq_filter && (all_batchable || has_ecl_constraint) {
-            // FTS-first: text index narrows candidates, compose filters (including ECL)
-            // intersect in Rust, then rank for typeahead UX.
+        if filter_lower.len() >= 3 && all_batchable && !has_eq_filter {
+            // FTS-first path: hierarchy + text, no property= filter.
+            // FTS narrows to text-matching candidates; hierarchy walk runs on
+            // the already-small set via apply_compose_filters_to_candidates.
             ensure_concepts_fts(conn, &system_id)?;
-            let mut candidates = fts_candidates_ranked_for_system(
-                conn,
-                &system_id,
-                system_url,
-                &filter_lower,
-                limit_hint,
-            )?;
+            let candidates =
+                fts_candidates_for_system(conn, &system_id, system_url, &filter_lower)?;
             if !candidates.is_empty() {
-                candidates = apply_compose_filters_to_candidates(
+                let filtered = apply_compose_filters_to_candidates(
                     conn,
                     &system_id,
                     compose_filters,
                     candidates,
                 )?;
-                sort_typeahead_candidates(&mut candidates, &filter_lower);
-                results.extend(candidates);
+                results.extend(filtered);
             }
             continue;
         }
@@ -4979,169 +4911,60 @@ fn batch_direct_children_in_set(
     Ok(codes)
 }
 
-/// Return concepts in `system_id` matching `filter_lower`, ranked for typeahead.
+/// Return all concepts in `system_id` matching `filter_lower` via FTS5 trigram.
 ///
-/// **Atrius fork** (`docs/fork-ecl-fts-typeahead-expand.md`): prefers
-/// `concepts_search_fts` (preferred display + synonym designations) with FTS5
-/// `bm25`, then applies clinical heuristics via [`sort_typeahead_candidates`].
-/// Falls back to `concepts_fts` (display only) when the search index is empty.
-fn fts_candidates_ranked_for_system(
+/// The caller is responsible for calling [`ensure_concepts_fts`] first.
+/// Returns at most 5 000 entries (sufficient for any realistic text filter result).
+fn fts_candidates_for_system(
     conn: &Connection,
     system_id: &str,
     system_url: &str,
     filter_lower: &str,
-    limit_hint: Option<usize>,
 ) -> Result<Vec<ExpansionContains>, HtsError> {
     let match_expr = fts5_quote(filter_lower);
-    let limit = limit_hint
-        .map(|h| (h * 10).clamp(100, 5000))
-        .unwrap_or(5000) as i64;
-
-    let search_populated: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM concepts_search_fts WHERE system_id = ?1 LIMIT 1)",
-            [system_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
-
-    let ranked_codes: Vec<(String, f64)> = if search_populated {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT code, MIN(bm25(concepts_search_fts)) AS rank
-                 FROM concepts_search_fts
-                 WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
-                 GROUP BY code
-                 ORDER BY rank ASC
-                 LIMIT ?3",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        stmt.query_map(rusqlite::params![match_expr, system_id, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    } else {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT code, display, bm25(concepts_fts) AS rank
-                 FROM concepts_fts
-                 WHERE concepts_fts MATCH ?1 AND system_id = ?2
-                 ORDER BY rank ASC
-                 LIMIT ?3",
-            )
-            .map_err(|e| HtsError::StorageError(e.to_string()))?;
-        stmt.query_map(rusqlite::params![match_expr, system_id, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(2)?))
-        })
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-    };
-
-    if ranked_codes.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let codes: Vec<String> = ranked_codes.iter().map(|(c, _)| c.clone()).collect();
-    let codes_json =
-        serde_json::to_string(&codes).map_err(|e| HtsError::StorageError(e.to_string()))?;
-    let mut display_stmt = conn
+    let mut stmt = conn
         .prepare_cached(
-            "SELECT code, display FROM concepts
-             WHERE system_id = ?1 AND code IN (SELECT value FROM json_each(?2))",
+            "SELECT code, display FROM concepts_fts \
+             WHERE concepts_fts MATCH ?1 AND system_id = ?2 \
+             LIMIT 5000",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
-    let displays: HashMap<String, Option<String>> = display_stmt
-        .query_map(rusqlite::params![system_id, codes_json], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })
-        .map_err(|e| HtsError::StorageError(e.to_string()))?
-        .collect::<rusqlite::Result<HashMap<_, _>>>()
-        .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    Ok(ranked_codes
-        .into_iter()
-        .filter_map(|(code, _rank)| {
-            displays.get(&code).map(|display| ExpansionContains {
+    let rows = stmt
+        .query_map(rusqlite::params![match_expr, system_id], |row| {
+            Ok(ExpansionContains {
                 system: system_url.to_owned(),
                 version: None,
-                code,
-                display: display.clone(),
+                code: row.get(0)?,
+                display: row.get(1)?,
                 is_abstract: None,
+
                 inactive: None,
+
                 designations: vec![],
+
                 properties: vec![],
                 extensions: vec![],
                 contains: vec![],
             })
         })
-        .collect())
-}
-
-/// Re-rank typeahead hits for clinician-facing search (exact / short terms first).
-///
-/// Secondary sort after FTS5 `bm25` in [`fts_candidates_ranked_for_system`].
-/// Aligns with SNOMED Search and Data Entry Guide: prefer exact/preferred terms
-/// and short common phrases over long FSNs.
-fn sort_typeahead_candidates(candidates: &mut [ExpansionContains], query: &str) {
-    candidates.sort_by(|a, b| {
-        typeahead_match_score(query, a)
-            .cmp(&typeahead_match_score(query, b))
-            .then_with(|| {
-                a.display
-                    .as_deref()
-                    .unwrap_or("")
-                    .len()
-                    .cmp(&b.display.as_deref().unwrap_or("").len())
-            })
-            .then_with(|| a.code.cmp(&b.code))
-    });
-}
-
-fn typeahead_match_score(query: &str, hit: &ExpansionContains) -> i32 {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return i32::MAX;
-    }
-    let display = hit.display.as_deref().unwrap_or("").to_lowercase();
-    let code = hit.code.to_lowercase();
-
-    if display == q {
-        return 0;
-    }
-    if code == q {
-        return 1;
-    }
-    if typeahead_word_match(&display, &q) {
-        return 20 + display.len() as i32;
-    }
-    if display.starts_with(&q) {
-        return 10 + display.len() as i32;
-    }
-    if let Some(pos) = display.find(&q) {
-        return 30 + pos as i32 + display.len() as i32;
-    }
-    i32::MAX
-}
-
-fn typeahead_word_match(display: &str, query: &str) -> bool {
-    display
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|word| word == query)
+        .map_err(|e| HtsError::StorageError(e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| HtsError::StorageError(e.to_string()))?;
+    Ok(rows)
 }
 
 /// Apply compose `filter[]` entries to an already-bounded candidate set.
 ///
 /// Used by the FTS-first path in [`expand_inline_filtered`]: FTS gives a small
 /// set of text-matching candidates; this function checks each one against the
-/// hierarchy / property / ECL filters without expanding the full subtree.
+/// hierarchy / property filters without expanding the full subtree.
 ///
 /// Supported filter types:
-/// - `constraint = <ECL>` → batch ECL membership via closure table
 /// - `concept is-a / descendent-of / generalizes` → batch ancestor walk
 /// - `<property> = <value>` (non-ECL) → batch property equality lookup
+///
+/// ECL `constraint` filters are NOT handled here — callers must verify
+/// `all_batchable` before invoking this function.
 fn apply_compose_filters_to_candidates(
     conn: &Connection,
     system_id: &str,
@@ -5166,12 +4989,6 @@ fn apply_compose_filters_to_candidates(
         };
 
         match (property_norm, op) {
-            ("constraint", "=") => {
-                // Atrius fork: batch ECL membership without full expansion.
-                let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
-                let valid = ecl::filter_candidates(conn, system_id, value, &codes)?;
-                candidates.retain(|c| valid.contains(&c.code));
-            }
             ("concept", "is-a") => {
                 let codes: Vec<String> = candidates.iter().map(|c| c.code.clone()).collect();
                 let valid = batch_descendants_in_set(conn, system_id, value, true, &codes)?;
@@ -8276,8 +8093,6 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
         return Err(HtsError::StorageError(e.to_string()));
     }
 
-    populate_concepts_search_fts_for_system(conn, system_id)?;
-
     if let Err(e) = conn.execute(
         "INSERT OR IGNORE INTO concepts_fts_built (system_id) VALUES (?1)",
         [system_id],
@@ -8288,41 +8103,6 @@ fn ensure_concepts_fts(conn: &Connection, system_id: &str) -> Result<(), HtsErro
 
     conn.execute_batch("COMMIT")
         .map_err(|e| HtsError::StorageError(e.to_string()))
-}
-
-/// Populate `concepts_search_fts` with preferred terms and synonym designations.
-///
-/// Atrius fork — see `docs/fork-ecl-fts-typeahead-expand.md`. Designation rows
-/// use negative `rowid` (`-cd.id`) to avoid colliding with concept `id` rowids.
-fn populate_concepts_search_fts_for_system(
-    conn: &Connection,
-    system_id: &str,
-) -> Result<(), HtsError> {
-    conn.execute(
-        "DELETE FROM concepts_search_fts WHERE system_id = ?1",
-        [system_id],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    conn.execute(
-        "INSERT INTO concepts_search_fts(rowid, system_id, code, term)
-         SELECT id, system_id, code, display FROM concepts
-         WHERE system_id = ?1 AND display IS NOT NULL AND display != ''",
-        [system_id],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    conn.execute(
-        "INSERT INTO concepts_search_fts(rowid, system_id, code, term)
-         SELECT -cd.id, c.system_id, c.code, cd.value
-         FROM concept_designations cd
-         JOIN concepts c ON c.id = cd.concept_id
-         WHERE c.system_id = ?1 AND cd.value IS NOT NULL AND cd.value != ''",
-        [system_id],
-    )
-    .map_err(|e| HtsError::StorageError(e.to_string()))?;
-
-    Ok(())
 }
 
 /// When `filter_lower` is provided and has ≥ 3 characters, the FTS5 trigram
@@ -8594,30 +8374,6 @@ pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
     ) {
         let _ = conn.execute_batch("ROLLBACK");
         tracing::warn!("prebuild_concepts_fts: word-prefix INSERT failed: {e}");
-        return;
-    }
-
-    if let Err(e) = conn.execute(
-        "INSERT INTO concepts_search_fts(rowid, system_id, code, term)
-         SELECT id, system_id, code, display FROM concepts
-         WHERE display IS NOT NULL AND display != ''",
-        [],
-    ) {
-        let _ = conn.execute_batch("ROLLBACK");
-        tracing::warn!("prebuild_concepts_fts: search FTS preferred-term INSERT failed: {e}");
-        return;
-    }
-
-    if let Err(e) = conn.execute(
-        "INSERT INTO concepts_search_fts(rowid, system_id, code, term)
-         SELECT -cd.id, c.system_id, c.code, cd.value
-         FROM concept_designations cd
-         JOIN concepts c ON c.id = cd.concept_id
-         WHERE cd.value IS NOT NULL AND cd.value != ''",
-        [],
-    ) {
-        let _ = conn.execute_batch("ROLLBACK");
-        tracing::warn!("prebuild_concepts_fts: search FTS designation INSERT failed: {e}");
         return;
     }
 
