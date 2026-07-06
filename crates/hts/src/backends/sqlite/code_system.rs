@@ -516,6 +516,16 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                             normalized_code: None,
                         });
                     }
+                    // UCUM essence stores atomic codes only; composed units like `mg`
+                    // validate structurally (matches tx.fhir.org).
+                    if crate::ucum_validate::is_ucum_url(&system)
+                        && crate::ucum_validate::is_valid_ucum_code(&req.code)
+                    {
+                        return Ok(crate::ucum_validate::composed_code_success(
+                            &req.code,
+                            cs_version_str,
+                        ));
+                    }
                     let text = match cs_version_str.as_deref() {
                         Some(v) => format!(
                             "Unknown code '{}' in the CodeSystem '{}' version '{}'",
@@ -1800,6 +1810,10 @@ fn resolve_code_system_uncached(
                 .find(|(id, _, _)| id == &matched_id)
                 .expect("matched id was sourced from candidates")
         }
+        Some(ver) if crate::backends::code_system_version_is_current(ver) => candidates
+            .into_iter()
+            .next()
+            .expect("non-empty checked"),
         Some(ver) => candidates
             .iter()
             .find(|(_, _, v)| v.as_deref() == Some(ver))
@@ -1812,8 +1826,12 @@ fn resolve_code_system_uncached(
     Ok(chosen)
 }
 
-/// Fetch every (id, name, version) row for `url`, sorted with the highest
-/// version first so `None`-version requests default to the newest revision.
+/// Fetch every (id, name, version) row for `url`.
+///
+/// Sort order (see `docs/ig-publisher-compatibility.md`):
+/// complete/supplement → rows with concepts → highest version → id.
+/// Ensures full LOINC/SNOMED imports beat empty stubs when IG Publisher validates
+/// with unpinned or `version=current` requests.
 fn fetch_versions(
     conn: &rusqlite::Connection,
     url: &str,
@@ -1825,7 +1843,17 @@ fn fetch_versions(
              FROM code_systems \
              WHERE url = ?1 \
                AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2) \
-             ORDER BY COALESCE(version, '') DESC",
+             ORDER BY (CASE COALESCE(content, 'complete') \
+                            WHEN 'complete'   THEN 0 \
+                            WHEN 'supplement' THEN 0 \
+                            WHEN 'fragment'   THEN 1 \
+                            WHEN 'example'    THEN 1 \
+                            WHEN 'not-present' THEN 2 \
+                            ELSE 1 END), \
+                      (CASE WHEN EXISTS \
+                          (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
+                          THEN 0 ELSE 1 END), \
+                      COALESCE(version, '') DESC, id",
         )
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -2313,6 +2341,45 @@ mod tests {
         assert!(resp.result);
         assert_eq!(resp.display, Some("Alpha Beta Charlie".into()));
         assert!(resp.message.is_none());
+    }
+
+    fn seed_snomed_current_stub(b: &SqliteTerminologyBackend) {
+        let conn = b.pool().get().unwrap();
+        conn.execute_batch(
+            "INSERT INTO code_systems
+                 (id, url, version, name, status, content, created_at, updated_at)
+             VALUES ('snomed-current-stub', 'http://snomed.info/sct', 'current',
+                     'SNOMED CT', 'active', 'not-present', '2024-01-01', '2024-01-01'),
+                    ('snomed-ed', 'http://snomed.info/sct', '20260501', 'SNOMED CT',
+                     'active', 'complete', '2024-01-01', '2024-01-01');
+
+             INSERT INTO concepts (id, system_id, code, display)
+             VALUES (300, 'snomed-ed', '394659003', 'Acute coronary syndrome');",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_code_version_current_resolves_loaded_edition() {
+        let b = backend();
+        seed_snomed_current_stub(&b);
+
+        let resp = b
+            .validate_code(
+                &ctx(),
+                ValidateCodeRequest {
+                    system: Some("http://snomed.info/sct".into()),
+                    code: "394659003".into(),
+                    version: Some("current".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(resp.result, "expected ACS code to validate with version=current");
+        assert_eq!(resp.display.as_deref(), Some("Acute coronary syndrome"));
+        assert_eq!(resp.cs_version.as_deref(), Some("20260501"));
     }
 
     #[tokio::test]

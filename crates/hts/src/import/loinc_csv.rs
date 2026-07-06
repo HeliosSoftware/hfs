@@ -86,6 +86,8 @@ struct LoincParseResult {
     /// Per-language designation counts, sorted for deterministic reporting.
     designations_by_language: Vec<(String, usize)>,
     parse_errors: Vec<String>,
+    /// Release version parsed from a `Loinc_<ver>/` ZIP path segment, if present.
+    release_version: Option<String>,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -285,6 +287,7 @@ pub async fn import_loinc_csv(
             designation_count,
             designations_by_language,
             parse_errors,
+            release_version: paths.release_version,
         })
     })
     .await
@@ -311,10 +314,11 @@ pub async fn import_loinc_csv(
         return Ok(stats);
     }
 
+    let release_version = parsed.release_version.clone();
     let meta = CodeSystemMeta {
         id: LOINC_ID,
         url: LOINC_URL,
-        version: None,
+        version: release_version.as_deref(),
         name: Some(LOINC_NAME),
         title: Some(LOINC_TITLE),
         status: "active",
@@ -417,6 +421,30 @@ struct LoincArchivePaths {
     /// Per-language `*LinguisticVariant.csv` files (excludes the index), sorted
     /// for deterministic processing order.
     lv_variants: Vec<String>,
+    /// Parsed from a top-level `Loinc_<ver>/` directory in the ZIP, e.g. `2.82`.
+    release_version: Option<String>,
+}
+
+/// Extract LOINC release version from a ZIP entry path such as
+/// `Loinc_2.82/LoincTable/Loinc.csv`.
+///
+/// Stored on `CodeSystem.version` at import time so unpinned `$validate-code`
+/// and `version=current` resolution prefer the full release over empty HL7 or
+/// consult-minimal stub rows. See `docs/ig-publisher-compatibility.md`.
+fn loinc_release_version_from_entry(entry_path: &str) -> Option<String> {
+    for segment in entry_path.split('/') {
+        let lower = segment.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("loinc_") {
+            let ver = rest.trim();
+            if !ver.is_empty()
+                && ver.chars()
+                    .all(|c| c.is_ascii_digit() || c == '.')
+            {
+                return Some(ver.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
@@ -426,6 +454,7 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
     let mut hierarchy_path: Option<String> = None;
     let mut lv_index: Option<String> = None;
     let mut lv_variants: Vec<String> = Vec::new();
+    let mut release_version: Option<String> = None;
 
     for i in 0..zip.len() {
         let entry = zip
@@ -442,7 +471,10 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
             // `LoincUniversalLabOrdersValueSet.csv` would be false positives
             // for a looser prefix match.
             if filename == "loinc.csv" || filename == "loinctable.csv" {
-                loinc_path = Some(name);
+                if loinc_path.is_none() {
+                    release_version = loinc_release_version_from_entry(&name);
+                    loinc_path = Some(name);
+                }
             } else if filename.contains("multiaxial") || filename.contains("componenthierarchy") {
                 hierarchy_path = Some(name);
             } else if filename == "linguisticvariants.csv" {
@@ -470,6 +502,7 @@ fn find_loinc_paths(path: &Path) -> Result<LoincArchivePaths, HtsError> {
         })?,
         lv_index,
         lv_variants,
+        release_version,
     })
 }
 
@@ -1534,6 +1567,18 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
         assert_eq!(count_rows(&backend, "concept_designations"), 0);
     }
 
+    #[test]
+    fn loinc_release_version_from_entry_parses_top_level_folder() {
+        assert_eq!(
+            super::loinc_release_version_from_entry("Loinc_2.82/LoincTable/Loinc.csv").as_deref(),
+            Some("2.82")
+        );
+        assert_eq!(
+            super::loinc_release_version_from_entry("LoincTable/Loinc.csv"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn import_loinc_nested_zip_layout() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
@@ -1562,7 +1607,7 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             &ctx,
             tmp.path(),
             500,
-            true,
+            false,
             &LanguageFilter::default(),
         )
         .await
@@ -1574,5 +1619,15 @@ LOINC_NUM,COMPONENT,LONG_COMMON_NAME,SHORTNAME\r\n\
             "unexpected errors: {:?}",
             stats.errors
         );
+
+        let conn = backend.pool().get().unwrap();
+        let version: Option<String> = conn
+            .query_row(
+                "SELECT version FROM code_systems WHERE url = 'http://loinc.org'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version.as_deref(), Some("2.77"));
     }
 }

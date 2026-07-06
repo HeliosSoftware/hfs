@@ -3234,6 +3234,7 @@ dependencies = [
  "futures",
  "helios-fhir",
  "helios-persistence",
+ "octofhir-ucum",
  "r2d2",
  "r2d2_sqlite",
  "regex",

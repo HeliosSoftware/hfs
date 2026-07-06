@@ -3,6 +3,15 @@
 //! All FHIR operation endpoints accept and return `application/fhir+json`
 //! bodies whose `resourceType` is `"Parameters"`. These helpers encapsulate
 //! the common patterns so each handler stays focused on business logic.
+//!
+//! ## IG Publisher compatibility
+//!
+//! [HL7 FHIR IG Publisher](https://github.com/HL7/fhir-ig-publisher) often uses
+//! parameter **names** that match the value type (`valueCoding`, `valueCodeableConcept`)
+//! rather than the FHIR operation definition names (`coding`, `codeableConcept`).
+//! [`extract_coding_full`] and [`extract_codeable_concept`] accept both. See
+//! [`coding_entries_from_codeable_concept`] for single-object vs array `coding`
+//! payloads. Full notes: `docs/ig-publisher-compatibility.md`.
 
 use serde_json::{Value, json};
 
@@ -127,14 +136,104 @@ pub fn extract_coding(params: &[Value], name: &str) -> Option<(String, String, O
 }
 
 /// Like [`extract_coding`] but also returns `Coding.version` as the 4th element.
+///
+/// Accepts parameter name `name` or, when `name` is `"coding"`, the IG
+/// Publisher alias `"valueCoding"` (same `valueCoding` payload).
 pub fn extract_coding_full(
     params: &[Value],
     name: &str,
 ) -> Option<(String, String, Option<String>, Option<String>)> {
-    let coding = params
+    extract_coding_full_named(params, name).or_else(|| {
+        if name == "coding" {
+            extract_coding_full_named(params, "valueCoding")
+        } else {
+            None
+        }
+    })
+}
+
+/// Resolve a Coding payload from a single Parameters entry.
+///
+/// Accepts `valueCoding`, a nested `part` array (IG Publisher / Java HAPI
+/// client encoding), or an embedded `resource` with `resourceType: Coding`.
+fn coding_value_from_parameter(param: &Value) -> Option<Value> {
+    if let Some(v) = param.get("valueCoding") {
+        return Some(v.clone());
+    }
+    if let Some(res) = param.get("resource") {
+        if res.get("resourceType").and_then(|v| v.as_str()) == Some("Coding") {
+            return Some(res.clone());
+        }
+    }
+    let parts = param.get("part")?.as_array()?;
+    assemble_coding_from_parts(parts)
+}
+
+/// Build a Coding object from a FHIR Parameters `part` list (`system`, `code`, …).
+fn assemble_coding_from_parts(parts: &[Value]) -> Option<Value> {
+    let mut obj = serde_json::Map::new();
+    for part in parts {
+        let name = part.get("name").and_then(|v| v.as_str())?;
+        if let Some(nested) = part.get("part").and_then(|p| p.as_array()) {
+            if name == "coding" {
+                if let Some(inner) = assemble_coding_from_parts(nested) {
+                    obj.insert(name.to_string(), inner);
+                }
+            } else if let Some(inner) = assemble_coding_from_parts(nested) {
+                obj.insert(name.to_string(), inner);
+            }
+            continue;
+        }
+        if let Some(vc) = part.get("valueCoding") {
+            obj.insert(name.to_string(), vc.clone());
+            continue;
+        }
+        if let Some(s) = extract_any_string_value(part) {
+            obj.insert(name.to_string(), Value::String(s));
+        } else if let Some(v) = part.get("valueBoolean") {
+            obj.insert(name.to_string(), v.clone());
+        }
+    }
+    if obj.get("code").is_some() {
+        Some(Value::Object(obj))
+    } else {
+        None
+    }
+}
+
+/// Resolve a CodeableConcept payload from a single Parameters entry.
+fn codeable_concept_from_parameter(param: &Value) -> Option<Value> {
+    if let Some(v) = param.get("valueCodeableConcept") {
+        return Some(v.clone());
+    }
+    if let Some(res) = param.get("resource") {
+        if res.get("resourceType").and_then(|v| v.as_str()) == Some("CodeableConcept") {
+            return Some(res.clone());
+        }
+    }
+    let parts = param.get("part")?.as_array()?;
+    let mut codings: Vec<Value> = Vec::new();
+    for part in parts {
+        if part.get("name").and_then(|v| v.as_str()) == Some("coding") {
+            if let Some(c) = coding_value_from_parameter(part) {
+                codings.push(c);
+            }
+        }
+    }
+    if !codings.is_empty() {
+        return Some(json!({"coding": codings}));
+    }
+    assemble_coding_from_parts(parts).map(|c| json!({"coding": [c]}))
+}
+
+fn extract_coding_full_named(
+    params: &[Value],
+    name: &str,
+) -> Option<(String, String, Option<String>, Option<String>)> {
+    let param = params
         .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?
-        .get("valueCoding")?;
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?;
+    let coding = coding_value_from_parameter(param)?;
     // FHIR ValueSet/$validate-code allows a Coding without `system` (validate
     // by code alone, scoped by VS membership). Fall back to an empty string
     // so downstream paths can detect "no system" without rejecting the
@@ -181,17 +280,54 @@ pub fn collect_resource_params(params: &[Value], name: &str) -> Vec<Value> {
 
 /// Extract a `valueCodeableConcept` parameter, returning all `(system, code)` pairs.
 ///
-/// Looks for the first parameter named `name` that carries a
-/// `valueCodeableConcept` object and collects every `coding` entry that
-/// contains both `system` and `code` fields.  Returns `None` if the parameter
-/// is absent; returns an empty `Vec` if the `coding` array is missing or all
-/// entries are incomplete.
+/// Accepts parameter name `name` or, when `name` is `"codeableConcept"`, the IG
+/// Publisher alias `"valueCodeableConcept"`.
 pub fn extract_codeable_concept(params: &[Value], name: &str) -> Option<Vec<(String, String)>> {
-    let cc = params
+    extract_codeable_concept_named(params, name).or_else(|| {
+        if name == "codeableConcept" {
+            extract_codeable_concept_named(params, "valueCodeableConcept")
+        } else {
+            None
+        }
+    })
+}
+
+/// Return the `valueCodeableConcept` payload for `codeableConcept` or IG
+/// Publisher alias `valueCodeableConcept`.
+pub fn find_codeable_concept_param(params: &[Value]) -> Option<Value> {
+    for name in ["codeableConcept", "valueCodeableConcept"] {
+        if let Some(param) = params
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
+        {
+            if let Some(cc) = codeable_concept_from_parameter(param) {
+                return Some(cc);
+            }
+        }
+    }
+    None
+}
+
+/// Normalize `CodeableConcept.coding` to a vec of Coding objects.
+///
+/// Accepts a JSON array (FHIR spec) or a single object (IG Publisher / tooling).
+pub(crate) fn coding_entries_from_codeable_concept(cc: &Value) -> Option<Vec<Value>> {
+    let coding = cc.get("coding")?;
+    if let Some(arr) = coding.as_array() {
+        Some(arr.clone())
+    } else if coding.is_object() {
+        Some(vec![coding.clone()])
+    } else {
+        None
+    }
+}
+
+fn extract_codeable_concept_named(params: &[Value], name: &str) -> Option<Vec<(String, String)>> {
+    let param = params
         .iter()
-        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?
-        .get("valueCodeableConcept")?;
-    let codings = cc.get("coding")?.as_array()?;
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))?;
+    let cc = codeable_concept_from_parameter(param)?;
+    let codings = coding_entries_from_codeable_concept(&cc)?;
     let pairs = codings
         .iter()
         .filter_map(|c| {
@@ -347,7 +483,7 @@ mod tests {
     // ── extract_coding ─────────────────────────────────────────────────────────
 
     #[test]
-    fn extract_coding_full() {
+    fn extract_coding_full_fields() {
         let params = vec![json!({
             "name": "coding",
             "valueCoding": {"system": "http://cs.org", "code": "A", "display": "Alpha"}
@@ -382,6 +518,49 @@ mod tests {
             "valueCoding": {"system": "http://cs.org", "code": "A"}
         })];
         assert!(extract_coding(&params, "coding").is_none());
+    }
+
+    #[test]
+    fn extract_coding_accepts_parameters_part_encoding() {
+        let params = vec![json!({
+            "name": "coding",
+            "part": [
+                {"name": "system", "valueUri": "http://snomed.info/sct"},
+                {"name": "code", "valueCode": "371530004"},
+                {"name": "display", "valueString": "Clinical consultation report"}
+            ]
+        })];
+        let result = extract_coding_full(&params, "coding").unwrap();
+        assert_eq!(result.0, "http://snomed.info/sct");
+        assert_eq!(result.1, "371530004");
+        assert_eq!(result.2.as_deref(), Some("Clinical consultation report"));
+    }
+
+    #[test]
+    fn extract_coding_accepts_embedded_coding_resource() {
+        let params = vec![json!({
+            "name": "coding",
+            "resource": {
+                "resourceType": "Coding",
+                "system": "http://loinc.org",
+                "code": "98181-1"
+            }
+        })];
+        let result = extract_coding(&params, "coding").unwrap();
+        assert_eq!(result.0, "http://loinc.org");
+        assert_eq!(result.1, "98181-1");
+    }
+
+    #[test]
+    fn extract_coding_accepts_value_coding_alias() {
+        let params = vec![json!({
+            "name": "valueCoding",
+            "valueCoding": {"system": "http://cs.org", "code": "A", "version": "current"}
+        })];
+        let result = extract_coding_full(&params, "coding").unwrap();
+        assert_eq!(result.0, "http://cs.org");
+        assert_eq!(result.1, "A");
+        assert_eq!(result.3.as_deref(), Some("current"));
     }
 
     // ── extract_codeable_concept ───────────────────────────────────────────────
@@ -424,5 +603,49 @@ mod tests {
     fn extract_codeable_concept_missing_param_returns_none() {
         let params: Vec<Value> = vec![];
         assert!(extract_codeable_concept(&params, "codeableConcept").is_none());
+    }
+
+    #[test]
+    fn extract_codeable_concept_accepts_parameters_part_encoding() {
+        let params = vec![json!({
+            "name": "codeableConcept",
+            "part": [{
+                "name": "coding",
+                "part": [
+                    {"name": "system", "valueUri": "http://snomed.info/sct"},
+                    {"name": "code", "valueCode": "371530004"},
+                    {"name": "display", "valueString": "Clinical consultation report"}
+                ]
+            }]
+        })];
+        let codings = extract_codeable_concept(&params, "codeableConcept").unwrap();
+        assert_eq!(codings.len(), 1);
+        assert_eq!(codings[0], ("http://snomed.info/sct".into(), "371530004".into()));
+        let cc = find_codeable_concept_param(&params).unwrap();
+        assert!(coding_entries_from_codeable_concept(&cc).is_some());
+    }
+
+    #[test]
+    fn extract_codeable_concept_accepts_value_codeable_concept_alias() {
+        let params = vec![json!({
+            "name": "valueCodeableConcept",
+            "valueCodeableConcept": {
+                "coding": [{"system": "http://cs.org", "code": "C"}]
+            }
+        })];
+        let codings = extract_codeable_concept(&params, "codeableConcept").unwrap();
+        assert_eq!(codings, vec![("http://cs.org".into(), "C".into())]);
+    }
+
+    #[test]
+    fn extract_codeable_concept_accepts_single_coding_object() {
+        let params = vec![json!({
+            "name": "codeableConcept",
+            "valueCodeableConcept": {
+                "coding": {"system": "http://cs.org", "code": "C"}
+            }
+        })];
+        let codings = extract_codeable_concept(&params, "codeableConcept").unwrap();
+        assert_eq!(codings, vec![("http://cs.org".into(), "C".into())]);
     }
 }

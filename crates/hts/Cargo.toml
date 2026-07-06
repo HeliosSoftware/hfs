@@ -61,6 +61,7 @@ clap = { version = "4.0", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 sha2 = "0.10"
+octofhir-ucum = "0.5"
 
 # SQLite (default)
 rusqlite = { version = "0.33", features = ["bundled"], optional = true }
