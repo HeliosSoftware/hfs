@@ -56,7 +56,19 @@
       "authorizationServicesEnabled": false,
       "protocol": "openid-connect",
       "defaultClientScopes": ["system/*.cruds"],
-      "optionalClientScopes": ["system/Patient.rs", "system/Observation.r"]
+      "optionalClientScopes": ["system/Patient.rs", "system/Observation.r"],
+      "protocolMappers": [
+        {
+          "name": "hfs-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "hfs-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
     },
     {
       "clientId": "hfs-readonly-client",
@@ -74,7 +86,19 @@
       "authorizationServicesEnabled": false,
       "protocol": "openid-connect",
       "defaultClientScopes": ["system/Patient.rs"],
-      "optionalClientScopes": ["system/Observation.r"]
+      "optionalClientScopes": ["system/Observation.r"],
+      "protocolMappers": [
+        {
+          "name": "hfs-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "hfs-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
     }
   ]
 }
