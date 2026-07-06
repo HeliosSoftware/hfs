@@ -35,6 +35,7 @@ pub mod subscription_event;
 #[cfg(feature = "subscriptions")]
 pub mod subscriptions;
 pub mod update;
+pub mod validate;
 pub mod versions;
 pub mod vread;
 #[cfg(feature = "subscriptions")]
@@ -77,5 +78,8 @@ pub use patch::patch_handler;
 pub use read::{head_read_handler, read_handler};
 pub use search::{search_get_handler, search_post_handler};
 pub use update::{conditional_update_handler, update_handler};
+pub use validate::{
+    validate_instance_get_handler, validate_instance_post_handler, validate_type_handler,
+};
 pub use versions::versions_handler;
 pub use vread::vread_handler;

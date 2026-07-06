@@ -93,6 +93,10 @@ pub struct AppState<S> {
 
     /// Bulk submit configuration.
     bulk_submit_config: Arc<BulkSubmitConfig>,
+
+    /// Resource validation service ($validate + optional write-path
+    /// enforcement). Always present; write-path behavior is config-gated.
+    validation: Arc<crate::validation::ValidationService>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -118,6 +122,7 @@ impl<S> Clone for AppState<S> {
             bulk_submit_output: self.bulk_submit_output.clone(),
             bulk_submit_file_auth: self.bulk_submit_file_auth.clone(),
             bulk_submit_config: Arc::clone(&self.bulk_submit_config),
+            validation: Arc::clone(&self.validation),
         }
     }
 }
@@ -152,6 +157,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_output: None,
             bulk_submit_file_auth: None,
             bulk_submit_config,
+            validation: Arc::new(crate::validation::ValidationService::new()),
         }
     }
 
@@ -196,7 +202,23 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_output: None,
             bulk_submit_file_auth: None,
             bulk_submit_config,
+            validation: Arc::new(crate::validation::ValidationService::new()),
         }
+    }
+
+    /// Replaces the validation service (e.g. one configured with a
+    /// terminology provider or non-default constraint suppression).
+    pub fn with_validation(
+        mut self,
+        validation: Arc<crate::validation::ValidationService>,
+    ) -> Self {
+        self.validation = validation;
+        self
+    }
+
+    /// Returns the resource validation service.
+    pub fn validation(&self) -> &crate::validation::ValidationService {
+        &self.validation
     }
 
     /// Sets the SQL-on-FHIR runner for this application state.

@@ -161,6 +161,7 @@ pub mod routing;
 pub mod state;
 pub mod tenant;
 pub mod terminology;
+pub mod validation;
 
 // Re-export commonly used types
 pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};

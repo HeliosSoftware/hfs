@@ -276,6 +276,17 @@ where
             "/bulk-submit-file/{poll_token}/{part}",
             get(handlers::bulk_submit_file_handler::<S>),
         )
+        // Resource validation ($validate) — operation routes precede the
+        // catch-all (matchit gives static segments priority over {id}).
+        .route(
+            "/{resource_type}/$validate",
+            post(handlers::validate_type_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$validate",
+            get(handlers::validate_instance_get_handler::<S>)
+                .post(handlers::validate_instance_post_handler::<S>),
+        )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
         .route("/{resource_type}", post(handlers::create_handler::<S>))
