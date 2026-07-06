@@ -235,7 +235,6 @@ mod tests {
         .render()
         .expect("status renders");
 
-        assert!(html.contains("1.2.3"));
         assert!(html.contains("Last checked: 42"));
         assert!(!html.contains("<html"));
         assert!(!html.contains("<!doctype"));

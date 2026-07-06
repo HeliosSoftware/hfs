@@ -106,7 +106,6 @@ async fn htmx_fragment_is_localized_too() {
 
     let html = body_text(response).await;
     assert!(html.contains("Última comprobación:"));
-    assert!(html.contains("9.9.9"));
     assert!(!html.contains("<html"), "fragment, not a full page");
 }
 

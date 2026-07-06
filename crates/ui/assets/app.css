@@ -346,16 +346,11 @@ a.nav-item:hover {
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   height: 53px;
   padding: 0 32px;
   border-bottom: 1px solid var(--divider);
   box-shadow: 0 1px 0 var(--divider-glint);
-}
-
-.topbar__crumb {
-  font-weight: 500;
-  color: var(--text);
 }
 
 .topbar__tools {
@@ -571,15 +566,6 @@ a.nav-item:hover {
 
 .status-line {
   margin: 0;
-}
-
-.status-line strong {
-  font-weight: 500;
-  color: var(--text);
-}
-
-.status-line .updated-at {
-  margin-left: 8px;
 }
 
 .status-footer .refresh {

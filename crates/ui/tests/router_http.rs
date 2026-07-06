@@ -76,7 +76,6 @@ async fn status_is_a_fragment_for_htmx_and_varies_on_the_header() {
     );
 
     let html = body_text(response).await;
-    assert!(html.contains("9.9.9"));
     assert!(html.contains("Last checked:"));
     assert!(!html.contains("<html"), "fragment, not a full page");
 }
