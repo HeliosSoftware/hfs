@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Helios FHIR Server{% endblock %}</title>
+  <link rel="stylesheet" href="/ui/assets/app.css">
+  <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
+  <script src="/ui/assets/htmx.min.js" defer></script>
+</head>
+<body>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
