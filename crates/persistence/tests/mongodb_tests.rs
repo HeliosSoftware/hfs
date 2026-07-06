@@ -2659,3 +2659,38 @@ async fn mongodb_integration_settings_get_surfaces_decode_error() {
     let err = backend.get_settings(&user).await.unwrap_err();
     assert!(matches!(err, StorageError::Backend(_)));
 }
+
+/// A row with a valid JSON document but a non-datetime `updated_at` must still
+/// read back successfully — the malformed timestamp falls back to "now" rather
+/// than failing the read. Mirrors the SQLite `user_settings`
+/// `get_settings_tolerates_unparseable_timestamp` coverage.
+#[tokio::test]
+async fn mongodb_integration_settings_get_tolerates_unparseable_timestamp() {
+    let Some(backend) = settings_mongo::backend("settings_odd_ts").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_get_tolerates_unparseable_timestamp (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("odd-ts");
+
+    // Valid JSON document but a malformed `updated_at` (a string, not a BSON
+    // datetime): the read must not fail, bypassing the store to plant the row.
+    let client = Client::with_uri_str(&backend.config().connection_string)
+        .await
+        .expect("connect raw mongo client");
+    let db = client.database(&backend.config().database_name);
+    db.collection::<Document>("user_settings")
+        .insert_one(doc! {
+            "user_key": &user,
+            "data": "{}",
+            "version": 3_i64,
+            "updated_at": "not-a-timestamp",
+        })
+        .await
+        .expect("insert user_settings row with odd timestamp");
+
+    let stored = backend.get_settings(&user).await.unwrap().unwrap();
+    assert_eq!(stored.version, 3);
+    assert_eq!(stored.document, json!({}));
+}
