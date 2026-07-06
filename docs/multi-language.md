@@ -56,7 +56,7 @@ Browser ──Accept-Language: de-DE, de;q=0.9, en;q=0.7──▶  hfs (Axum)
    │                                                        │
    │                        ┌───────────────────────────────┼───────────────┐
    │                        ▼                               ▼               ▼
-   │                 helios-web (UI)               helios-rest (API)   helios-hts
+   │                 helios-ui (UI)                helios-rest (API)   helios-hts
    │                 renders Askama template        OperationOutcome    $expand/$lookup
    │                 + Fluent catalog (Layer 1)     text (Layer 3)      displayLanguage
    │                                                                    (Layer 5)
@@ -282,7 +282,9 @@ rules of the road in §3.3 have been violated.
 Structure that lands with the UI crate (#186), not here: the negotiation
 middleware, the Askama/Fluent template helper, and the `Cargo.toml` wiring — this
 branch establishes the **shape and the rules**; the runtime wiring rides on the
-`helios-web` foundation so the two don't conflict.
+`helios-ui` foundation so the two don't conflict. That wiring now lives in
+`crates/ui/src/i18n.rs` (the `RequestLocale` middleware, the `hfs_lang`
+switcher cookie, and the Fluent lookup helper the templates use).
 
 ---
 
