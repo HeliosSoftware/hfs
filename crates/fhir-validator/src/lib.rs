@@ -40,6 +40,26 @@
 //! The behavioral contract is the vendored FHIR Schema conformance suite in
 //! `tests/fixtures/upstream/` (exact ordered error matching), plus Helios
 //! extended fixtures in `tests/fixtures/extended/`.
+//!
+//! ## Current limitations (hardening backlog)
+//!
+//! - Slice matchers: only `pattern` matching is evaluated. `type`,
+//!   `profile`, `binding`, and `resolve-ref` matchers are parsed but inert
+//!   (such slices match nothing and never enforce a minimum; the converter
+//!   emits a warning when it cannot build a pattern match).
+//! - `refers` (reference target types) is carried but not enforced.
+//! - `extensible`-strength bindings are never checked (only `required`,
+//!   per the FHIR Schema spec); a warning mode may come later.
+//! - Constraint evaluation resolves `%resource`/`%rootResource` to the root
+//!   resource and evaluates via `path.all(expr)`, so invariants relying on
+//!   nested-resource `%resource` semantics can misfire (helios-fhirpath
+//!   limitation; see `fhirpath_effects`).
+//! - Schema sets are assembled per node without cross-resource memoization;
+//!   structural validation of a typical Patient measures ~300µs in debug
+//!   builds (see `tests/pack_smoke.rs`), so this has not been worth it yet.
+//! - Core extension definitions (`extension-definitions.json`) are not in
+//!   the vendored spec bundles, so pack profiles whose `extensions` sugar
+//!   references core extension URLs report `unknown-schema` when exercised.
 
 pub mod converter;
 pub mod effects;

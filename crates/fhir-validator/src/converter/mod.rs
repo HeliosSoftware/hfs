@@ -169,15 +169,14 @@ impl EdType {
     pub(crate) fn effective_code(&self) -> String {
         if let Some(suffix) = self.code.strip_prefix("http://hl7.org/fhirpath/System.") {
             for ext in &self.extension {
-                if ext.url == FHIR_TYPE_EXTENSION {
-                    if let Some(v) = ext
+                if ext.url == FHIR_TYPE_EXTENSION
+                    && let Some(v) = ext
                         .value_url
                         .as_deref()
                         .or(ext.value_uri.as_deref())
                         .or(ext.value_string.as_deref())
-                    {
-                        return v.to_string();
-                    }
+                {
+                    return v.to_string();
                 }
             }
             let mut chars = suffix.chars();
