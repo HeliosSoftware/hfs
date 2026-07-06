@@ -70,6 +70,48 @@ error-not-found = No se encontró el recurso solicitado.
 error-unauthorized = No está autorizado para realizar esta acción.
 error-generic = Algo salió mal. Vuelva a intentarlo.
 
+## Estructura del panel (Figma «Dashboard V1.1»)
+
+nav-section-work = Trabajo
+nav-section-batch-data = Lotes y datos
+nav-section-server = Servidor
+nav-section-conditional = Condicional
+
+nav-home = Inicio
+nav-search = Buscar
+nav-resource-editor = Editor de recursos
+nav-history-versions = Historial y versiones
+nav-compartments = Compartimentos
+nav-batch-transaction = Lote / Transacción
+nav-bulk-export = Exportación masiva
+nav-sql-on-fhir = SQL-on-FHIR
+nav-capability-conformance = Capacidad y conformidad
+nav-admin-ops = Administración / Operaciones
+nav-subscriptions = Suscripciones
+
+tenant-heading = Tenants
+tenant-all = Todos los tenants
+tenant-search-placeholder = Buscar tenants
+
+theme-label = Tema
+theme-light = Tema claro
+theme-dark = Tema oscuro
+
+fhir-version = FHIR { $version }
+
+card-resource-types = Tipos de recursos
+card-resource-types-sub = habilitados para { $version }
+card-stored-resources = Recursos almacenados
+card-stored-resources-sub = en el tenant activo
+card-export-jobs = Trabajos de exportación
+card-export-jobs-sub = en ejecución ({ $queued } en cola)
+card-uptime = Disponibilidad
+card-uptime-sub = últimos 30 días
+
+chart-title = Recursos FHIR en el tiempo
+chart-unit-patients = pacientes
+chart-expand = Ampliar el gráfico
+
 ## Pie de página
 
 footer-copyright = © { $year } { -org-name }
