@@ -349,6 +349,9 @@ a.nav-item:hover {
   justify-content: flex-end;
   height: 53px;
   padding: 0 32px;
+  /* Same surface as the sidebar (the body background), not the content
+     pane's — the header and the left menu read as one frame. */
+  background: var(--bg);
   border-bottom: 1px solid var(--divider);
   box-shadow: 0 1px 0 var(--divider-glint);
 }
