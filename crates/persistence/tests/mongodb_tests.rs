@@ -2395,6 +2395,7 @@ fn unique_user_key(prefix: &str) -> String {
 /// the tests skip.
 mod settings_mongo {
     use super::{MongoBackend, MongoBackendConfig, build_test_database_name, test_mongo_url};
+    use helios_persistence::core::Backend; // brings `initialize` into scope
     use testcontainers::ImageExt;
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::mongo::Mongo;
