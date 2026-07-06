@@ -563,6 +563,9 @@ async fn serve(
     config: &ServerConfig,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
+    #[cfg(all(feature = "ui", not(feature = "headless")))]
+    let app = helios_ui::mount(app, env!("CARGO_PKG_VERSION"));
+
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
