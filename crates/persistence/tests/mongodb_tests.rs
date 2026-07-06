@@ -2592,9 +2592,11 @@ async fn mongodb_integration_settings_concurrent_patches_serialize() {
     let backend = Arc::new(backend);
     let user = unique_user_key("concurrent");
 
-    // Seed an empty document so all racers start from version 1.
-    backend.put_settings(&user, json!({}), None).await.unwrap();
-
+    // Deliberately do NOT seed a document: the racers start from version 0, so
+    // exactly one wins the initial insert and the rest hit the unique-index
+    // duplicate-key path and retry into the version-conditioned update. This
+    // exercises both the insert race and the update race in one test.
+    //
     // Fire many unconditional single-key merge-patches concurrently. The
     // version-conditioned write + retry loop must serialize them so every key
     // survives (no lost updates) despite the read-modify-write race.
@@ -2622,6 +2624,38 @@ async fn mongodb_integration_settings_concurrent_patches_serialize() {
             "key k{i} was lost to a read-modify-write race"
         );
     }
-    // Initial put (v1) + 12 successful patches.
-    assert_eq!(final_doc.version, 13);
+    // 12 patches, each a distinct successful write from version 0 upward.
+    assert_eq!(final_doc.version, 12);
+}
+
+/// A row whose `data` is not valid JSON must surface a backend error on read,
+/// rather than panicking or silently returning an empty document. Mirrors the
+/// SQLite/PostgreSQL `user_settings` decode-error coverage.
+#[tokio::test]
+async fn mongodb_integration_settings_get_surfaces_decode_error() {
+    let Some(backend) = settings_mongo::backend("settings_decode_err").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_get_surfaces_decode_error (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("corrupt");
+
+    // Write a row whose `data` blob is not valid JSON, bypassing the store.
+    let client = Client::with_uri_str(&backend.config().connection_string)
+        .await
+        .expect("connect raw mongo client");
+    let db = client.database(&backend.config().database_name);
+    db.collection::<Document>("user_settings")
+        .insert_one(doc! {
+            "user_key": &user,
+            "data": "not json",
+            "version": 1_i64,
+            "updated_at": mongodb::bson::DateTime::from_millis(0),
+        })
+        .await
+        .expect("insert corrupt user_settings row");
+
+    let err = backend.get_settings(&user).await.unwrap_err();
+    assert!(matches!(err, StorageError::Backend(_)));
 }
