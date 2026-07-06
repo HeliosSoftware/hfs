@@ -300,6 +300,14 @@ jobs:
         # helios-serde's own quick-xml (client FHIR XML) is already on 0.41 and
         # sits behind the non-default `xml` feature. Remove these once
         # object_store and octofhir-ucum ship builds on quick-xml >= 0.41.
+        #
+        # crossbeam-epoch 0.9.18 (transitive; present on main identically).
+        # RUSTSEC-2026-0204 is an invalid-pointer dereference in the
+        # `fmt::Pointer` impl for `Atomic`/`Shared`, reachable only when
+        # debug-formatting an already-invalid epoch pointer — we never format
+        # these types. 0.9.18 is the latest release; no fixed version exists yet.
+        # Ambient advisory (published 2026-07-06, after main's last green run).
+        # Remove once crossbeam-epoch ships a patched release.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0118
@@ -312,6 +320,7 @@ jobs:
           --ignore RUSTSEC-2026-0185
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
+          --ignore RUSTSEC-2026-0204
  
   coverage:
     name: Code Coverage
