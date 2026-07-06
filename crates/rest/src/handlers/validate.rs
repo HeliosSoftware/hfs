@@ -122,10 +122,10 @@ fn unwrap_inputs(body: Option<Value>, query: &ValidateQuery) -> Result<ValidateI
     if mode_raw.is_none() {
         mode_raw = query.mode.clone();
     }
-    if let Some(p) = &query.profile {
-        if !profiles.iter().any(|existing| existing == p) {
-            profiles.push(p.clone());
-        }
+    if let Some(p) = &query.profile
+        && !profiles.iter().any(|existing| existing == p)
+    {
+        profiles.push(p.clone());
     }
 
     let mode = ValidateMode::parse(mode_raw.as_deref())?;
@@ -144,6 +144,7 @@ async fn respond<S>(
     fhir_version: helios_fhir::FhirVersion,
     inputs: ValidateInputs,
     resource_type: &str,
+    tenant_id: &str,
     req_headers: &HeaderMap,
 ) -> RestResult<Response>
 where
@@ -170,19 +171,19 @@ where
     };
 
     // The resource must be of the addressed type.
-    if let Some(body_type) = resource.get("resourceType").and_then(Value::as_str) {
-        if body_type != resource_type {
-            return Err(RestError::BadRequest {
-                message: format!(
-                    "Resource type in body ({body_type}) does not match URL ({resource_type})"
-                ),
-            });
-        }
+    if let Some(body_type) = resource.get("resourceType").and_then(Value::as_str)
+        && body_type != resource_type
+    {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "Resource type in body ({body_type}) does not match URL ({resource_type})"
+            ),
+        });
     }
 
     let issues = state
         .validation()
-        .validate_resource(fhir_version, &resource, inputs.profiles)
+        .validate_resource(fhir_version, &resource, inputs.profiles, Some(tenant_id))
         .await;
 
     debug!(
@@ -200,7 +201,7 @@ where
 pub async fn validate_type_handler<S>(
     State(state): State<AppState<S>>,
     Path(resource_type): Path<String>,
-    _tenant: TenantExtractor,
+    tenant: TenantExtractor,
     version: FhirVersionExtractor,
     Query(query): Query<ValidateQuery>,
     req_headers: HeaderMap,
@@ -210,7 +211,15 @@ where
     S: ResourceStorage + Send + Sync,
 {
     let inputs = unwrap_inputs(Some(body), &query)?;
-    respond(&state, version.storage_version(), inputs, &resource_type, &req_headers).await
+    respond(
+        &state,
+        version.storage_version(),
+        inputs,
+        &resource_type,
+        tenant.tenant_id(),
+        &req_headers,
+    )
+    .await
 }
 
 /// `GET [base]/[type]/[id]/$validate` — validate the stored resource.
@@ -236,7 +245,15 @@ where
 
     let mut inputs = unwrap_inputs(None, &query)?;
     inputs.resource = Some(stored.content().clone());
-    respond(&state, version.storage_version(), inputs, &resource_type, &req_headers).await
+    respond(
+        &state,
+        version.storage_version(),
+        inputs,
+        &resource_type,
+        tenant.tenant_id(),
+        &req_headers,
+    )
+    .await
 }
 
 /// `POST [base]/[type]/[id]/$validate` — validate the body in the context
@@ -244,7 +261,7 @@ where
 pub async fn validate_instance_post_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, _id)): Path<(String, String)>,
-    _tenant: TenantExtractor,
+    tenant: TenantExtractor,
     version: FhirVersionExtractor,
     Query(query): Query<ValidateQuery>,
     req_headers: HeaderMap,
@@ -254,5 +271,13 @@ where
     S: ResourceStorage + Send + Sync,
 {
     let inputs = unwrap_inputs(Some(body), &query)?;
-    respond(&state, version.storage_version(), inputs, &resource_type, &req_headers).await
+    respond(
+        &state,
+        version.storage_version(),
+        inputs,
+        &resource_type,
+        tenant.tenant_id(),
+        &req_headers,
+    )
+    .await
 }

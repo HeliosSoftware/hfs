@@ -128,6 +128,28 @@ curl http://localhost:8080/clinic-a/Patient
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
 | `HFS_REQUIRE_IF_MATCH` | `false` | Require If-Match header for updates |
 
+## Resource Validation
+
+FHIR Schema based validation (helios-fhir-validator). `$validate` is always
+available (`POST /[type]/$validate`, `GET|POST /[type]/[id]/$validate`);
+these settings gate the write path and tune the shared service. Stored
+StructureDefinitions (per tenant) become validatable profiles on write.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_VALIDATION_MODE` | `off` | Write-path validation: `off`, `log`, or `enforce` (422 on invalid) |
+| `HFS_VALIDATION_META_PROFILES` | `true` | Validate against `meta.profile` claims |
+| `HFS_VALIDATION_UNKNOWN_PROFILE` | `warn` | Unresolvable profiles: `warn`, `error`, or `ignore` |
+| `HFS_VALIDATION_CONSTRAINTS` | `true` | Evaluate FHIRPath invariants |
+| `HFS_VALIDATION_SUPPRESS_CONSTRAINTS` | `dom-6` | Comma-separated constraint ids to skip |
+| `HFS_VALIDATION_TERMINOLOGY` | `off` | Required-binding checks: `off` or `remote` (`ValueSet/$validate-code` against `HFS_TERMINOLOGY_SERVER`) |
+| `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | `3000` | Per-check terminology timeout |
+| `HFS_VALIDATION_TERMINOLOGY_FAIL` | `open` | Terminology outage posture: `open` (warn) or `closed` (error) |
+| `HFS_VALIDATION_STORED_PROFILES` | `true` | Maintain per-tenant profile registries from stored StructureDefinitions |
+
+Note: tenant profile registries are in-memory and populated by
+StructureDefinition writes since process start (no startup warm-load yet).
+
 ## API Endpoints
 
 | Interaction | Method | URL |

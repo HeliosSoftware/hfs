@@ -227,6 +227,28 @@ where
         }
     }
 
+    // Write-path validation: transactions are atomic, so any invalid write
+    // entry rejects the whole bundle before anything executes.
+    for (index, entry, _) in &indexed_entries {
+        if !matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
+            continue;
+        }
+        let Some(resource) = &entry.resource else {
+            continue;
+        };
+        let (resource_type, _) = parse_request_url(&entry.url)
+            .map_err(|e| RestError::BadRequest { message: format!("Entry {}: {}", index, e) })?;
+        state
+            .validation()
+            .check_write(
+                tenant.tenant_id(),
+                FhirVersion::default_enabled(),
+                &resource_type,
+                resource,
+            )
+            .await?;
+    }
+
     // Sort by processing order: DELETE -> POST -> PUT/PATCH -> GET
     indexed_entries.sort_by_key(|(_, entry, _)| method_processing_order(&entry.method));
 
@@ -248,6 +270,23 @@ where
 
     match result {
         Ok(bundle_result) => {
+            // Stored StructureDefinitions feed the tenant's profile
+            // registry. The request content is what was stored (modulo
+            // server-assigned id/meta, which the converter does not read).
+            for (_, entry, _) in &indexed_entries {
+                if matches!(entry.method, BundleMethod::Post | BundleMethod::Put)
+                    && let Some(resource) = &entry.resource
+                    && resource.get("resourceType").and_then(Value::as_str)
+                        == Some("StructureDefinition")
+                {
+                    state.validation().upsert_stored_profile(
+                        tenant.tenant_id(),
+                        FhirVersion::default_enabled(),
+                        resource,
+                    );
+                }
+            }
+
             // Reorder results back to original entry order
             let mut ordered_results: Vec<(usize, &BundleEntry, &BundleEntryResult)> =
                 indexed_entries
@@ -382,6 +421,20 @@ where
                 }
             };
 
+            // Write-path validation (per-entry outcome in batch semantics).
+            if let Err(e) = state
+                .validation()
+                .check_write(
+                    tenant.tenant_id(),
+                    FhirVersion::default_enabled(),
+                    &resource_type,
+                    &resource,
+                )
+                .await
+            {
+                return create_error_result(422, &validation_failure_message(&e));
+            }
+
             // Use default FHIR version for batch operations
             match state
                 .storage()
@@ -393,7 +446,16 @@ where
                 )
                 .await
             {
-                Ok(stored) => BundleEntryResult::created(stored),
+                Ok(stored) => {
+                    if resource_type == "StructureDefinition" {
+                        state.validation().upsert_stored_profile(
+                            tenant.tenant_id(),
+                            FhirVersion::default_enabled(),
+                            stored.content(),
+                        );
+                    }
+                    BundleEntryResult::created(stored)
+                }
                 Err(e) => create_error_result(400, &e.to_string()),
             }
         }
@@ -405,6 +467,20 @@ where
                     return create_error_result(400, "PUT entry missing resource");
                 }
             };
+
+            // Write-path validation (per-entry outcome in batch semantics).
+            if let Err(e) = state
+                .validation()
+                .check_write(
+                    tenant.tenant_id(),
+                    FhirVersion::default_enabled(),
+                    &resource_type,
+                    &resource,
+                )
+                .await
+            {
+                return create_error_result(422, &validation_failure_message(&e));
+            }
 
             // Use default FHIR version for batch operations
             match state
@@ -419,6 +495,13 @@ where
                 .await
             {
                 Ok((stored, created)) => {
+                    if resource_type == "StructureDefinition" {
+                        state.validation().upsert_stored_profile(
+                            tenant.tenant_id(),
+                            FhirVersion::default_enabled(),
+                            stored.content(),
+                        );
+                    }
                     if created {
                         BundleEntryResult::created(stored)
                     } else {
@@ -665,6 +748,33 @@ fn parse_request_url(url: &str) -> Result<(String, String), String> {
 }
 
 /// Creates an error BundleEntryResult.
+/// Flatten an enforce-mode validation failure into a per-entry message
+/// (batch entry outcomes are message-based).
+fn validation_failure_message(error: &RestError) -> String {
+    if let RestError::ValidationFailed { outcome } = error {
+        let details: Vec<String> = outcome
+            .get("issue")
+            .and_then(|i| i.as_array())
+            .map(|issues| {
+                issues
+                    .iter()
+                    .filter_map(|issue| {
+                        issue
+                            .get("details")
+                            .and_then(|d| d.get("text"))
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !details.is_empty() {
+            return format!("Validation failed: {}", details.join("; "));
+        }
+    }
+    format!("Validation failed: {error}")
+}
+
 fn create_error_result(status: u16, message: &str) -> BundleEntryResult {
     let outcome = serde_json::json!({
         "resourceType": "OperationOutcome",
