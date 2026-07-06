@@ -17,7 +17,7 @@ use helios_persistence::core::{
     Backend, BackendCapability, BackendKind, BundleEntry, BundleMethod, BundleProvider,
     BundleResult, ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage,
     ConditionalUpdateResult, HistoryParams, IncludeProvider, InstanceHistoryProvider, PatchFormat,
-    ResourceStorage, RevincludeProvider, SearchProvider, SystemHistoryProvider,
+    ResourceStorage, RevincludeProvider, SearchProvider, SettingsStore, SystemHistoryProvider,
     TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
@@ -2371,4 +2371,182 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
             .any(|r| r.resource_type() == "Observation" && r.id() == observation.id()),
         "search() should populate `included` from revinclude resolution"
     );
+}
+
+// ============================================================================
+// Per-user settings store
+// ============================================================================
+
+/// A user key unique to each test, so tests sharing a database don't collide on
+/// the single-document-per-user `user_settings` collection.
+fn unique_user_key(prefix: &str) -> String {
+    format!("{}|{}", prefix, uuid::Uuid::new_v4().simple())
+}
+
+#[tokio::test]
+async fn mongodb_integration_settings_get_missing_is_none() {
+    let Some(backend) = create_backend("settings_missing").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_get_missing_is_none (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("missing");
+    assert!(backend.get_settings(&user).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn mongodb_integration_settings_put_get_and_version() {
+    let Some(backend) = create_backend("settings_round_trip").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_put_get_and_version (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("round-trip");
+    let doc = json!({"theme": "dark", "recentQueries": {"Patient": ["name=smith"]}});
+
+    let stored = backend
+        .put_settings(&user, doc.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(stored.version, 1);
+
+    let fetched = backend.get_settings(&user).await.unwrap().unwrap();
+    assert_eq!(fetched.document, doc);
+    assert_eq!(fetched.version, 1);
+
+    // A second unconditional write replaces the document and bumps the version.
+    let second = backend
+        .put_settings(&user, json!({"theme": "light"}), None)
+        .await
+        .unwrap();
+    assert_eq!(second.version, 2);
+    assert_eq!(second.document, json!({"theme": "light"}));
+}
+
+#[tokio::test]
+async fn mongodb_integration_settings_patch_merges_and_deletes() {
+    let Some(backend) = create_backend("settings_patch").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_patch_merges_and_deletes (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("patch");
+    backend
+        .put_settings(
+            &user,
+            json!({"theme": "dark", "defaultTenant": "acme"}),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let patched = backend
+        .patch_settings(
+            &user,
+            json!({"theme": "light", "defaultTenant": null}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.document, json!({"theme": "light"}));
+    assert_eq!(patched.version, 2);
+}
+
+#[tokio::test]
+async fn mongodb_integration_settings_patch_on_missing_creates_document() {
+    let Some(backend) = create_backend("settings_patch_create").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_patch_on_missing_creates_document (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("patch-create");
+    let patched = backend
+        .patch_settings(&user, json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert_eq!(patched.document, json!({"theme": "dark"}));
+    assert_eq!(patched.version, 1);
+}
+
+#[tokio::test]
+async fn mongodb_integration_settings_optimistic_lock() {
+    let Some(backend) = create_backend("settings_lock").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_optimistic_lock (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("lock");
+
+    // `Some(0)` asserts "does not exist yet" — succeeds for the first write.
+    backend
+        .put_settings(&user, json!({"a": 1}), Some(0))
+        .await
+        .unwrap(); // version 1
+
+    // A stale precondition against an existing document is rejected.
+    let err = backend
+        .put_settings(&user, json!({"a": 2}), Some(0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })
+    ));
+
+    // A matching precondition succeeds and bumps the version.
+    let ok = backend
+        .put_settings(&user, json!({"a": 2}), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(ok.version, 2);
+}
+
+#[tokio::test]
+async fn mongodb_integration_settings_concurrent_patches_serialize() {
+    let Some(backend) = create_backend("settings_concurrent").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_concurrent_patches_serialize (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let user = unique_user_key("concurrent");
+
+    // Seed an empty document so all racers start from version 1.
+    backend.put_settings(&user, json!({}), None).await.unwrap();
+
+    // Fire many unconditional single-key merge-patches concurrently. The
+    // version-conditioned write + retry loop must serialize them so every key
+    // survives (no lost updates) despite the read-modify-write race.
+    let mut handles = Vec::new();
+    for i in 0..12 {
+        let backend = backend.clone();
+        let user = user.clone();
+        handles.push(tokio::spawn(async move {
+            backend
+                .patch_settings(&user, json!({ format!("k{i}"): i }), None)
+                .await
+                .unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let final_doc = backend.get_settings(&user).await.unwrap().unwrap();
+    let obj = final_doc.document.as_object().unwrap();
+    for i in 0..12 {
+        assert_eq!(
+            obj.get(&format!("k{i}")),
+            Some(&json!(i)),
+            "key k{i} was lost to a read-modify-write race"
+        );
+    }
+    // Initial put (v1) + 12 successful patches.
+    assert_eq!(final_doc.version, 13);
 }

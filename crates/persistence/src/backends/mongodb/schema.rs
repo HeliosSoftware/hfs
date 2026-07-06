@@ -12,7 +12,7 @@ use crate::error::{BackendError, StorageError, StorageResult};
 use super::backend::MongoBackendConfig;
 
 /// Current MongoDB schema version.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -43,6 +43,7 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
     ensure_resources_indexes(database).await?;
     ensure_history_indexes(database).await?;
     ensure_search_indexes(database).await?;
+    ensure_user_settings_indexes(database).await?;
     set_schema_version(database, SCHEMA_VERSION).await?;
     Ok(())
 }
@@ -54,6 +55,7 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
         ensure_resources_indexes(database).await?;
         ensure_history_indexes(database).await?;
         ensure_search_indexes(database).await?;
+        ensure_user_settings_indexes(database).await?;
         set_schema_version(database, SCHEMA_VERSION).await?;
     }
     Ok(())
@@ -244,6 +246,27 @@ async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
         doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_identifier_type_system": 1_i32, "value_identifier_type_code": 1_i32 },
         "idx_search_identifier_type",
         false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Index for the per-user UI settings store. One document per user, keyed by a
+/// unique `user_key`, so the settings store can rely on the index to serialize
+/// concurrent first-writes (a lost insert race surfaces as a duplicate-key
+/// error). Kept separate from the FHIR `resources` collection so UI preferences
+/// never surface in FHIR machinery (`CapabilityStatement`, search, history,
+/// export).
+async fn ensure_user_settings_indexes(database: &Database) -> StorageResult<()> {
+    let user_settings =
+        database.collection::<Document>(super::user_settings::USER_SETTINGS_COLLECTION);
+
+    create_index(
+        &user_settings,
+        doc! { "user_key": 1_i32 },
+        "idx_user_settings_key",
+        true,
     )
     .await?;
 

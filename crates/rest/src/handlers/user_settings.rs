@@ -115,7 +115,16 @@ where
 }
 
 /// Returns the configured settings store, or a `501 Not Implemented` error when
-/// the active backend does not provide one (e.g. MongoDB, S3, Elasticsearch).
+/// the active backend does not provide one.
+///
+/// The per-user settings store is implemented by every standalone *primary*
+/// backend that offers the required read-modify-write + monotonic-version
+/// primitives: SQLite, PostgreSQL, and MongoDB. It is intentionally unavailable
+/// on backends that are not a transactional primary FHIR store — notably the
+/// S3 object store (whose recommended role is archival and whose concurrency /
+/// version story differs; tracked in issue #199) and Elasticsearch (search-only,
+/// never a standalone primary). The message names the supported backends so an
+/// operator on an unsupported one gets an explained `501` rather than a bare one.
 fn settings_store<S>(state: &AppState<S>) -> RestResult<&Arc<dyn SettingsStore>>
 where
     S: ResourceStorage + Send + Sync,
@@ -123,7 +132,9 @@ where
     state
         .settings_store()
         .ok_or_else(|| RestError::NotImplemented {
-            feature: "per-user settings (requires the SQLite or PostgreSQL backend)".to_string(),
+            feature: "per-user settings (supported on the SQLite, PostgreSQL, and MongoDB \
+                      backends; not available on the S3 or Elasticsearch backends)"
+                .to_string(),
         })
 }
 
