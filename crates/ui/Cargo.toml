@@ -27,3 +27,9 @@ axum-htmx = { version = "0.8", features = ["auto-vary"] }
 # `axum-embed` serves them with precompressed (br/gzip/deflate) negotiation.
 rust-embed = "8"
 axum-embed = "0.1"
+
+[dev-dependencies]
+# Drive the mounted router end-to-end (routes, middleware, fallback) in tests.
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -3564,7 +3564,10 @@ dependencies = [
  "axum",
  "axum-embed",
  "axum-htmx",
+ "http-body-util",
  "rust-embed",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
