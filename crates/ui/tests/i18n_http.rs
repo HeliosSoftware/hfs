@@ -44,8 +44,7 @@ async fn accept_language_selects_the_ui_language() {
     );
     let html = body_text(response).await;
     assert!(html.contains(r#"<html lang="de">"#));
-    assert!(html.contains("Status aktualisieren"));
-    assert!(html.contains("Zuletzt geprüft:"));
+    assert!(html.contains("Startseite"));
 }
 
 #[tokio::test]
@@ -71,7 +70,7 @@ async fn lang_override_wins_and_persists_in_a_cookie() {
 
     let html = body_text(response).await;
     assert!(html.contains(r#"<html lang="es">"#));
-    assert!(html.contains("Actualizar estado"));
+    assert!(html.contains("Inicio"));
 }
 
 #[tokio::test]
@@ -118,5 +117,5 @@ async fn default_is_english() {
 
     let html = body_text(response).await;
     assert!(html.contains(r#"<html lang="en">"#));
-    assert!(html.contains("Refresh status"));
+    assert!(html.contains(">Home<"));
 }

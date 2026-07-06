@@ -197,7 +197,6 @@ mod tests {
 
         assert!(html.contains("Helios FHIR Server"));
         assert!(html.contains("1.2.3"));
-        assert!(html.contains(r#"hx-get="/ui/status""#));
         assert!(html.contains("/ui/assets/htmx.min.js"));
         // No runtime CDN dependency.
         assert!(!html.contains("unpkg.com"));
@@ -217,8 +216,7 @@ mod tests {
         .expect("index renders");
 
         assert!(html.contains(r#"<html lang="es">"#));
-        assert!(html.contains("Actualizar estado"));
-        assert!(html.contains("Última comprobación: 42"));
+        assert!(html.contains("Inicio"));
         // The language switcher marks the active locale.
         assert!(html.contains(r#"href="?lang=es" aria-current="true""#));
     }

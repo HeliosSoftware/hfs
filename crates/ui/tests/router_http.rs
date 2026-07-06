@@ -31,7 +31,6 @@ async fn index_serves_the_full_landing_page() {
     let html = body_text(response).await;
     assert!(html.contains("<!doctype html>"));
     assert!(html.contains("9.9.9"));
-    assert!(html.contains(r#"hx-get="/ui/status""#));
 }
 
 #[tokio::test]

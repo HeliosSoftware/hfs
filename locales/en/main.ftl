@@ -37,7 +37,6 @@ home-lede = Server-rendered, HTMX-first UI. This panel is refreshed as an HTML f
 ## Status panel
 
 status-last-checked = Last checked: { $timestamp }
-action-refresh-status = Refresh status
 
 ## Dashboard / health
 

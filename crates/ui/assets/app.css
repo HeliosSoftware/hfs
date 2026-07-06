@@ -553,27 +553,6 @@ a.nav-item:hover {
   fill: var(--muted);
 }
 
-/* ---------- Status footer (htmx read path) ---------- */
-
-.status-footer {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  margin-top: 24px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.status-line {
-  margin: 0;
-}
-
-.status-footer .refresh {
-  font-weight: 500;
-  color: var(--accent);
-  text-decoration: none;
-}
-
 /* ---------- Narrow screens: stack the shell ---------- */
 
 @media (max-width: 900px) {

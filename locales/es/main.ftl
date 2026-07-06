@@ -35,7 +35,6 @@ home-lede = Interfaz renderizada en el servidor y basada en HTMX. Este panel se 
 ## Panel de estado
 
 status-last-checked = Última comprobación: { $timestamp }
-action-refresh-status = Actualizar estado
 
 ## Panel / estado
 
