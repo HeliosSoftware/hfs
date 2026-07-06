@@ -2383,11 +2383,85 @@ fn unique_user_key(prefix: &str) -> String {
     format!("{}|{}", prefix, uuid::Uuid::new_v4().simple())
 }
 
+/// Backend provisioning for the settings-store tests.
+///
+/// Unlike the rest of this suite — which only runs against an externally
+/// supplied mongo (`HFS_TEST_MONGODB_URL`) — these tests also start an ephemeral
+/// standalone Mongo testcontainer when no URL is set, so they run (and cover the
+/// [`SettingsStore`] impl) in CI where Docker is available, mirroring how the
+/// PostgreSQL suite is provisioned. The settings store uses version-conditioned
+/// writes rather than multi-document transactions, so a standalone (non
+/// replica-set) Mongo is sufficient. When neither a URL nor Docker is available
+/// the tests skip.
+mod settings_mongo {
+    use super::{MongoBackend, MongoBackendConfig, build_test_database_name, test_mongo_url};
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::mongo::Mongo;
+    use tokio::sync::OnceCell;
+
+    /// Mongo endpoint shared across the settings tests. Holds the container so it
+    /// stays alive for the test binary; reaped by the testcontainers watchdog and
+    /// the CI cleanup step (by `github.run_id` label), matching the PG suite.
+    struct SharedMongo {
+        connection_string: String,
+        _container: Option<testcontainers::ContainerAsync<Mongo>>,
+    }
+
+    static SHARED: OnceCell<Option<SharedMongo>> = OnceCell::const_new();
+
+    async fn shared() -> Option<&'static SharedMongo> {
+        SHARED
+            .get_or_init(|| async {
+                // Prefer an explicitly provided mongo (fast local runs).
+                if let Some(url) = test_mongo_url() {
+                    return Some(SharedMongo {
+                        connection_string: url,
+                        _container: None,
+                    });
+                }
+                // Otherwise start an ephemeral standalone Mongo container; if
+                // Docker is unavailable, `start()` errors and the tests skip.
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = Mongo::default()
+                    .with_label("github.run_id", &run_id)
+                    .start()
+                    .await
+                    .ok()?;
+                let host = container.get_host().await.ok()?;
+                let port = container.get_host_port_ipv4(27017).await.ok()?;
+                Some(SharedMongo {
+                    connection_string: format!("mongodb://{host}:{port}/"),
+                    _container: Some(container),
+                })
+            })
+            .await
+            .as_ref()
+    }
+
+    /// Returns a schema-initialised backend against the shared mongo, or `None`
+    /// when no mongo is available (skip).
+    pub(super) async fn backend(test_name: &str) -> Option<MongoBackend> {
+        let shared = shared().await?;
+        let config = MongoBackendConfig {
+            connection_string: shared.connection_string.clone(),
+            database_name: build_test_database_name(test_name),
+            ..Default::default()
+        };
+        let backend = MongoBackend::new(config).expect("failed to create MongoBackend");
+        backend
+            .initialize()
+            .await
+            .expect("failed to initialize MongoDB schema");
+        Some(backend)
+    }
+}
+
 #[tokio::test]
 async fn mongodb_integration_settings_get_missing_is_none() {
-    let Some(backend) = create_backend("settings_missing").await else {
+    let Some(backend) = settings_mongo::backend("settings_missing").await else {
         eprintln!(
-            "Skipping mongodb_integration_settings_get_missing_is_none (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_settings_get_missing_is_none (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2397,9 +2471,9 @@ async fn mongodb_integration_settings_get_missing_is_none() {
 
 #[tokio::test]
 async fn mongodb_integration_settings_put_get_and_version() {
-    let Some(backend) = create_backend("settings_round_trip").await else {
+    let Some(backend) = settings_mongo::backend("settings_round_trip").await else {
         eprintln!(
-            "Skipping mongodb_integration_settings_put_get_and_version (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_settings_put_get_and_version (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2427,9 +2501,9 @@ async fn mongodb_integration_settings_put_get_and_version() {
 
 #[tokio::test]
 async fn mongodb_integration_settings_patch_merges_and_deletes() {
-    let Some(backend) = create_backend("settings_patch").await else {
+    let Some(backend) = settings_mongo::backend("settings_patch").await else {
         eprintln!(
-            "Skipping mongodb_integration_settings_patch_merges_and_deletes (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_settings_patch_merges_and_deletes (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2457,9 +2531,9 @@ async fn mongodb_integration_settings_patch_merges_and_deletes() {
 
 #[tokio::test]
 async fn mongodb_integration_settings_patch_on_missing_creates_document() {
-    let Some(backend) = create_backend("settings_patch_create").await else {
+    let Some(backend) = settings_mongo::backend("settings_patch_create").await else {
         eprintln!(
-            "Skipping mongodb_integration_settings_patch_on_missing_creates_document (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_settings_patch_on_missing_creates_document (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2474,9 +2548,9 @@ async fn mongodb_integration_settings_patch_on_missing_creates_document() {
 
 #[tokio::test]
 async fn mongodb_integration_settings_optimistic_lock() {
-    let Some(backend) = create_backend("settings_lock").await else {
+    let Some(backend) = settings_mongo::backend("settings_lock").await else {
         eprintln!(
-            "Skipping mongodb_integration_settings_optimistic_lock (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_settings_optimistic_lock (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2508,9 +2582,9 @@ async fn mongodb_integration_settings_optimistic_lock() {
 
 #[tokio::test]
 async fn mongodb_integration_settings_concurrent_patches_serialize() {
-    let Some(backend) = create_backend("settings_concurrent").await else {
+    let Some(backend) = settings_mongo::backend("settings_concurrent").await else {
         eprintln!(
-            "Skipping mongodb_integration_settings_concurrent_patches_serialize (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_settings_concurrent_patches_serialize (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
