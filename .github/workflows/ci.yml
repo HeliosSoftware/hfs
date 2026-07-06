@@ -286,6 +286,20 @@ jobs:
         # quinn endpoint. We only use reqwest as an HTTP/1.1+2 client and never
         # accept inbound QUIC connections, so the vulnerable reassembly path is
         # unreachable. Remove once reqwest pulls quinn-proto >= 0.11.15.
+        #
+        # quick-xml < 0.41 (two transitive copies: 0.37.5 via object_store,
+        # 0.38.4 via octofhir-ucum). Both RUSTSEC-2026-0194 (O(N^2) duplicate-
+        # attribute check) and RUSTSEC-2026-0195 (unbounded namespace-decl
+        # allocation) are DoS-via-malicious-XML fixed in 0.41.0. Neither copy
+        # parses attacker-controlled input:
+        #   - octofhir-ucum uses quick-xml as a build-dependency only (parsing
+        #     the bundled UCUM essence XML at build time); it is never linked
+        #     into the shipped binary.
+        #   - object_store parses XML responses from configured S3/Azure/GCS
+        #     endpoints (trusted cloud infrastructure), not FHIR client input.
+        # helios-serde's own quick-xml (client FHIR XML) is already on 0.41 and
+        # sits behind the non-default `xml` feature. Remove these once
+        # object_store and octofhir-ucum ship builds on quick-xml >= 0.41.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0118
@@ -296,6 +310,8 @@ jobs:
           --ignore RUSTSEC-2026-0099
           --ignore RUSTSEC-2026-0104
           --ignore RUSTSEC-2026-0185
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
  
   coverage:
     name: Code Coverage
