@@ -1,10 +1,16 @@
 //! MongoDB backend tests.
 //!
-//! Run compile-only/unit tests with:
+//! Run with:
 //! `cargo test -p helios-persistence --features mongodb --test mongodb_tests`
 //!
-//! To run integration tests that hit a real MongoDB instance, set:
-//! `HFS_TEST_MONGODB_URL=mongodb://localhost:27017`
+//! The integration tests provision MongoDB automatically: when Docker is
+//! available they start an ephemeral standalone Mongo testcontainer (so the
+//! suite runs in CI), and they otherwise use `HFS_TEST_MONGODB_URL` if set
+//! (e.g. `HFS_TEST_MONGODB_URL=mongodb://localhost:27017` to target a specific
+//! instance). When neither is available the integration tests skip.
+//!
+//! Multi-document transaction tests additionally require a replica set; against
+//! a standalone server they skip only the transaction-specific assertions.
 
 #![cfg(feature = "mongodb")]
 
@@ -128,7 +134,7 @@ fn test_mongodb_phase4_capabilities() {
 async fn mongodb_integration_transaction_bundle_topology_behavior() {
     let Some(backend) = create_backend("bundle_topology_behavior").await else {
         eprintln!(
-            "Skipping mongodb_integration_transaction_bundle_topology_behavior (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_transaction_bundle_topology_behavior (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -183,6 +189,72 @@ fn test_mongo_url() -> Option<String> {
     std::env::var("HFS_TEST_MONGODB_URL").ok()
 }
 
+/// Shared MongoDB endpoint for the integration suite.
+///
+/// Prefers an externally supplied server (`HFS_TEST_MONGODB_URL`, e.g. for local
+/// runs against a specific instance) and otherwise starts a single ephemeral
+/// **standalone** Mongo testcontainer shared across the whole test binary, so the
+/// suite runs in CI (where Docker is available) instead of silently skipping.
+/// Each test still uses a unique database name, so they don't collide on the
+/// shared server.
+///
+/// Multi-document transactions require a replica set, which a standalone server
+/// does not provide; the transaction tests detect this and skip that portion
+/// (see [`process_transaction_or_skip`]). Everything else — CRUD, search,
+/// history, pagination, tenancy, conditional ops — runs. If neither a URL nor
+/// Docker is available the tests skip.
+mod shared_mongo {
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::mongo::Mongo;
+    use tokio::sync::OnceCell;
+
+    struct SharedMongo {
+        connection_string: String,
+        /// Kept alive for the duration of the test binary; reaped by the
+        /// testcontainers watchdog and the CI cleanup step (by `github.run_id`
+        /// label). `None` when an external `HFS_TEST_MONGODB_URL` is used.
+        _container: Option<testcontainers::ContainerAsync<Mongo>>,
+    }
+
+    static SHARED: OnceCell<Option<SharedMongo>> = OnceCell::const_new();
+
+    async fn shared() -> Option<&'static SharedMongo> {
+        SHARED
+            .get_or_init(|| async {
+                // Prefer an explicitly provided mongo (fast local runs).
+                if let Some(url) = super::test_mongo_url() {
+                    return Some(SharedMongo {
+                        connection_string: url,
+                        _container: None,
+                    });
+                }
+                // Otherwise start an ephemeral standalone Mongo container; if
+                // Docker is unavailable, `start()` errors and the suite skips.
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = Mongo::default()
+                    .with_label("github.run_id", &run_id)
+                    .start()
+                    .await
+                    .ok()?;
+                let host = container.get_host().await.ok()?;
+                let port = container.get_host_port_ipv4(27017).await.ok()?;
+                Some(SharedMongo {
+                    connection_string: format!("mongodb://{host}:{port}/"),
+                    _container: Some(container),
+                })
+            })
+            .await
+            .as_ref()
+    }
+
+    /// Connection string for the shared mongo, or `None` when no mongo is
+    /// available (neither `HFS_TEST_MONGODB_URL` nor a startable container).
+    pub(super) async fn connection_string() -> Option<String> {
+        Some(shared().await?.connection_string.clone())
+    }
+}
+
 fn create_tenant(tenant_id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access())
 }
@@ -195,7 +267,7 @@ async fn create_backend_with_search_offloaded(
     test_name: &str,
     search_offloaded: bool,
 ) -> Option<MongoBackend> {
-    let connection_string = test_mongo_url()?;
+    let connection_string = shared_mongo::connection_string().await?;
 
     let config = MongoBackendConfig {
         connection_string,
@@ -217,7 +289,7 @@ async fn create_backend_with_search_offloaded(
 /// Creates a backend whose registry is loaded from the repo's spec files, so
 /// non-embedded search parameters (e.g. `value-quantity`) are active.
 async fn create_backend_with_full_registry(test_name: &str) -> Option<MongoBackend> {
-    let connection_string = test_mongo_url()?;
+    let connection_string = shared_mongo::connection_string().await?;
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -277,7 +349,7 @@ async fn mongodb_total_created_connections(connection_string: &str) -> Option<i6
 async fn mongodb_integration_create_read_update_delete() {
     let Some(backend) = create_backend("crud").await else {
         eprintln!(
-            "Skipping mongodb_integration_create_read_update_delete (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_create_read_update_delete (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -332,9 +404,9 @@ async fn mongodb_integration_create_read_update_delete() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
-    let Some(connection_string) = test_mongo_url() else {
+    let Some(connection_string) = shared_mongo::connection_string().await else {
         eprintln!(
-            "Skipping mongodb_integration_reuses_client_pool_under_concurrent_read_search (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_reuses_client_pool_under_concurrent_read_search (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -425,7 +497,7 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
 async fn mongodb_integration_transaction_bundle_create_and_resolve_references() {
     let Some(backend) = create_backend("bundle_create_resolve_references").await else {
         eprintln!(
-            "Skipping mongodb_integration_transaction_bundle_create_and_resolve_references (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_transaction_bundle_create_and_resolve_references (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -509,7 +581,7 @@ async fn mongodb_integration_transaction_bundle_create_and_resolve_references() 
 async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_delete() {
     let Some(backend) = create_backend("bundle_mixed_operations").await else {
         eprintln!(
-            "Skipping mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_delete (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_delete (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -646,7 +718,7 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 async fn mongodb_integration_transaction_bundle_conditional_headers() {
     let Some(backend) = create_backend("bundle_conditional_headers").await else {
         eprintln!(
-            "Skipping mongodb_integration_transaction_bundle_conditional_headers (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_transaction_bundle_conditional_headers (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -772,7 +844,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
 async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
     let Some(backend) = create_backend("bundle_rollback_failure").await else {
         eprintln!(
-            "Skipping mongodb_integration_transaction_bundle_rolls_back_on_failure (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_transaction_bundle_rolls_back_on_failure (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -844,7 +916,9 @@ async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
 #[tokio::test]
 async fn mongodb_integration_tenant_isolation() {
     let Some(backend) = create_backend("tenant").await else {
-        eprintln!("Skipping mongodb_integration_tenant_isolation (set HFS_TEST_MONGODB_URL)");
+        eprintln!(
+            "Skipping mongodb_integration_tenant_isolation (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
         return;
     };
 
@@ -892,7 +966,9 @@ async fn mongodb_integration_tenant_isolation() {
 #[tokio::test]
 async fn mongodb_integration_count_and_batch() {
     let Some(backend) = create_backend("count_batch").await else {
-        eprintln!("Skipping mongodb_integration_count_and_batch (set HFS_TEST_MONGODB_URL)");
+        eprintln!(
+            "Skipping mongodb_integration_count_and_batch (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
         return;
     };
 
@@ -930,7 +1006,9 @@ async fn mongodb_integration_count_and_batch() {
 #[tokio::test]
 async fn mongodb_integration_create_or_update() {
     let Some(backend) = create_backend("create_or_update").await else {
-        eprintln!("Skipping mongodb_integration_create_or_update (set HFS_TEST_MONGODB_URL)");
+        eprintln!(
+            "Skipping mongodb_integration_create_or_update (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
         return;
     };
 
@@ -975,7 +1053,7 @@ async fn mongodb_integration_create_or_update() {
 async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
     let Some(backend) = create_backend("versioned_vread").await else {
         eprintln!(
-            "Skipping mongodb_integration_versioned_storage_vread_and_list_versions (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_versioned_storage_vread_and_list_versions (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1045,7 +1123,7 @@ async fn mongodb_integration_versioned_storage_vread_and_list_versions() {
 async fn mongodb_integration_update_with_match_and_delete_with_match() {
     let Some(backend) = create_backend("if_match").await else {
         eprintln!(
-            "Skipping mongodb_integration_update_with_match_and_delete_with_match (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_update_with_match_and_delete_with_match (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1124,7 +1202,9 @@ async fn mongodb_integration_update_with_match_and_delete_with_match() {
 #[tokio::test]
 async fn mongodb_integration_history_providers() {
     let Some(backend) = create_backend("history_providers").await else {
-        eprintln!("Skipping mongodb_integration_history_providers (set HFS_TEST_MONGODB_URL)");
+        eprintln!(
+            "Skipping mongodb_integration_history_providers (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
         return;
     };
 
@@ -1214,7 +1294,7 @@ async fn mongodb_integration_history_providers() {
 async fn mongodb_integration_history_delete_trial_use_not_supported() {
     let Some(backend) = create_backend("history_delete_not_supported").await else {
         eprintln!(
-            "Skipping mongodb_integration_history_delete_trial_use_not_supported (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_history_delete_trial_use_not_supported (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1263,7 +1343,9 @@ async fn mongodb_integration_contained_search() {
     use helios_persistence::types::{ContainedMode, ContainedReturn};
 
     let Some(backend) = create_backend_with_full_registry("contained_search").await else {
-        eprintln!("Skipping mongodb_integration_contained_search (set HFS_TEST_MONGODB_URL)");
+        eprintln!(
+            "Skipping mongodb_integration_contained_search (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
         return;
     };
     let tenant = create_tenant("tenant-contained");
@@ -1364,7 +1446,9 @@ async fn mongodb_integration_contained_search() {
 #[tokio::test]
 async fn mongodb_integration_search_quantity() {
     let Some(backend) = create_backend_with_full_registry("search_quantity").await else {
-        eprintln!("Skipping mongodb_integration_search_quantity (set HFS_TEST_MONGODB_URL)");
+        eprintln!(
+            "Skipping mongodb_integration_search_quantity (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
         return;
     };
 
@@ -1445,7 +1529,9 @@ async fn mongodb_integration_compartment_search() {
     use helios_persistence::types::CompartmentMembership;
 
     let Some(backend) = create_backend_with_full_registry("compartment_search").await else {
-        eprintln!("Skipping mongodb_integration_compartment_search (set HFS_TEST_MONGODB_URL)");
+        eprintln!(
+            "Skipping mongodb_integration_compartment_search (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
         return;
     };
 
@@ -1535,7 +1621,7 @@ async fn mongodb_integration_compartment_search() {
 async fn mongodb_integration_search_token_string_and_offset_pagination() {
     let Some(backend) = create_backend("search_token_string").await else {
         eprintln!(
-            "Skipping mongodb_integration_search_token_string_and_offset_pagination (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_search_token_string_and_offset_pagination (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1603,7 +1689,7 @@ async fn mongodb_integration_search_token_string_and_offset_pagination() {
 async fn mongodb_integration_search_cursor_pagination_roundtrip() {
     let Some(backend) = create_backend("search_cursor_roundtrip").await else {
         eprintln!(
-            "Skipping mongodb_integration_search_cursor_pagination_roundtrip (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_search_cursor_pagination_roundtrip (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1673,7 +1759,7 @@ async fn mongodb_integration_search_cursor_pagination_roundtrip() {
 async fn mongodb_integration_conditional_create_exists() {
     let Some(backend) = create_backend("conditional_create").await else {
         eprintln!(
-            "Skipping mongodb_integration_conditional_create_exists (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_conditional_create_exists (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1725,7 +1811,7 @@ async fn mongodb_integration_conditional_create_exists() {
 async fn mongodb_integration_conditional_update_delete_and_no_match() {
     let Some(backend) = create_backend("conditional_update_delete").await else {
         eprintln!(
-            "Skipping mongodb_integration_conditional_update_delete_and_no_match (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_conditional_update_delete_and_no_match (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1803,7 +1889,7 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
 async fn mongodb_integration_conditional_create_multiple_matches() {
     let Some(backend) = create_backend("conditional_multiple_matches").await else {
         eprintln!(
-            "Skipping mongodb_integration_conditional_create_multiple_matches (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_conditional_create_multiple_matches (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1853,7 +1939,7 @@ async fn mongodb_integration_conditional_create_multiple_matches() {
 async fn mongodb_integration_conditional_patch_not_supported() {
     let Some(backend) = create_backend("conditional_patch_not_supported").await else {
         eprintln!(
-            "Skipping mongodb_integration_conditional_patch_not_supported (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_conditional_patch_not_supported (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1881,7 +1967,7 @@ async fn mongodb_integration_conditional_patch_not_supported() {
 async fn mongodb_integration_search_parameter_create_registers_active() {
     let Some(backend) = create_backend("search_param_create_active").await else {
         eprintln!(
-            "Skipping mongodb_integration_search_parameter_create_registers_active (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_search_parameter_create_registers_active (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1927,7 +2013,7 @@ async fn mongodb_integration_search_parameter_create_registers_active() {
 async fn mongodb_integration_search_parameter_create_draft_not_registered() {
     let Some(backend) = create_backend("search_param_create_draft").await else {
         eprintln!(
-            "Skipping mongodb_integration_search_parameter_create_draft_not_registered (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_search_parameter_create_draft_not_registered (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -1966,7 +2052,7 @@ async fn mongodb_integration_search_parameter_create_draft_not_registered() {
 async fn mongodb_integration_search_parameter_update_status_change() {
     let Some(backend) = create_backend("search_param_update_status").await else {
         eprintln!(
-            "Skipping mongodb_integration_search_parameter_update_status_change (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_search_parameter_update_status_change (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2040,7 +2126,7 @@ async fn mongodb_integration_search_parameter_update_status_change() {
 async fn mongodb_integration_search_parameter_delete_unregisters() {
     let Some(backend) = create_backend("search_param_delete_unregister").await else {
         eprintln!(
-            "Skipping mongodb_integration_search_parameter_delete_unregisters (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_search_parameter_delete_unregisters (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2096,7 +2182,7 @@ async fn mongodb_integration_search_offloaded_prevents_search_index_writes() {
         create_backend_with_search_offloaded("search_offloaded_no_index", true).await
     else {
         eprintln!(
-            "Skipping mongodb_integration_search_offloaded_prevents_search_index_writes (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_search_offloaded_prevents_search_index_writes (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2162,7 +2248,7 @@ async fn mongodb_integration_search_offloaded_prevents_search_index_writes() {
 async fn mongodb_integration_standalone_search_writes_search_index() {
     let Some(backend) = create_backend("search_index_written_standalone").await else {
         eprintln!(
-            "Skipping mongodb_integration_standalone_search_writes_search_index (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_standalone_search_writes_search_index (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2197,7 +2283,7 @@ async fn mongodb_integration_search_parameter_registry_updates_when_offloaded() 
         create_backend_with_search_offloaded("search_param_offloaded_registry", true).await
     else {
         eprintln!(
-            "Skipping mongodb_integration_search_parameter_registry_updates_when_offloaded (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_search_parameter_registry_updates_when_offloaded (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
@@ -2257,9 +2343,9 @@ async fn mongodb_integration_search_parameter_registry_updates_when_offloaded() 
 
 #[tokio::test]
 async fn mongodb_integration_resolve_include_and_revinclude() {
-    let Some(connection_string) = test_mongo_url() else {
+    let Some(connection_string) = shared_mongo::connection_string().await else {
         eprintln!(
-            "Skipping mongodb_integration_resolve_include_and_revinclude (set HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_resolve_include_and_revinclude (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
