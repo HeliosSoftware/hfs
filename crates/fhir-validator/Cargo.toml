@@ -12,15 +12,18 @@ keywords = ["helios-software", "hl7", "fhir", "validation", "fhir-schema"]
 
 [features]
 default = ["R4"]
-# Version features are placeholders until the converter/pack phases wire
-# helios-fhir (and helios-fhirpath) cascades in. Kept so downstream crates can
-# already forward their version features to this crate.
-R4 = []
-R4B = []
-R5 = []
-R6 = []
+R4 = ["helios-fhir/R4"]
+R4B = ["helios-fhir/R4B"]
+R5 = ["helios-fhir/R5"]
+R6 = ["helios-fhir/R6"]
+# Enables the generate-schema-packs binary (dev-time; reads the FHIR spec
+# bundles from crates/fhir-gen/resources and writes packs/).
+gen-packs = []
+# Enables the validator-cli binary.
+cli = ["dep:clap"]
 
 [dependencies]
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
 # `rc` enables Deserialize/Serialize for Arc<T> — element schemas are shared
 # by reference across cooperative schema sets.
 serde = { workspace = true, features = ["rc"] }
@@ -28,7 +31,20 @@ serde = { workspace = true, features = ["rc"] }
 # to be emitted in document key order.
 serde_json = { workspace = true, features = ["preserve_order"] }
 indexmap = { version = "2", features = ["serde"] }
+# Schema pack (de)compression.
+flate2 = "1"
+clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[[bin]]
+name = "generate-schema-packs"
+path = "src/bin/generate_schema_packs.rs"
+required-features = ["gen-packs"]
+
+[[bin]]
+name = "validator-cli"
+path = "src/bin/validator_cli.rs"
+required-features = ["cli"]

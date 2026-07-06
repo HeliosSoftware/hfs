@@ -3149,6 +3149,9 @@ dependencies = [
 name = "helios-fhir-validator"
 version = "0.2.1"
 dependencies = [
+ "clap",
+ "flate2",
+ "helios-fhir",
  "indexmap 2.14.0",
  "serde",
  "serde_json",

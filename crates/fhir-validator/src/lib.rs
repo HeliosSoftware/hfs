@@ -41,8 +41,10 @@
 //! `tests/fixtures/upstream/` (exact ordered error matching), plus Helios
 //! extended fixtures in `tests/fixtures/extended/`.
 
+pub mod converter;
 pub mod effects;
 pub mod engine;
+pub mod packs;
 pub mod resolver;
 pub mod schema;
 
