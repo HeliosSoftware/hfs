@@ -28,6 +28,16 @@ language-en = Englisch
 language-es = Spanisch
 language-de = Deutsch
 
+## Startseite
+
+home-lede = Serverseitig gerenderte, HTMX-basierte Oberfläche. Dieses Panel wird als HTML-Fragment aktualisiert.
+
+## Statuspanel
+
+status-version = hfs-Version { $version }
+status-last-checked = Zuletzt geprüft: { $timestamp }
+action-refresh-status = Status aktualisieren
+
 ## Übersicht / Status
 
 dashboard-heading = Server-Übersicht

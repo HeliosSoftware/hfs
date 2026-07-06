@@ -30,6 +30,16 @@ language-en = English
 language-es = Spanish
 language-de = German
 
+## Home / landing page
+
+home-lede = Server-rendered, HTMX-first UI. This panel is refreshed as an HTML fragment.
+
+## Status panel
+
+status-version = hfs version { $version }
+status-last-checked = Last checked: { $timestamp }
+action-refresh-status = Refresh status
+
 ## Dashboard / health
 
 dashboard-heading = Server dashboard

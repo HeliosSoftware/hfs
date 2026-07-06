@@ -28,6 +28,16 @@ language-en = Inglés
 language-es = Español
 language-de = Alemán
 
+## Página de inicio
+
+home-lede = Interfaz renderizada en el servidor y basada en HTMX. Este panel se actualiza como un fragmento HTML.
+
+## Panel de estado
+
+status-version = hfs, versión { $version }
+status-last-checked = Última comprobación: { $timestamp }
+action-refresh-status = Actualizar estado
+
 ## Panel / estado
 
 dashboard-heading = Panel del servidor

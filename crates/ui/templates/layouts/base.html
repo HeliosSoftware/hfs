@@ -1,14 +1,24 @@
 <!doctype html>
-<html lang="en">
+<html lang="{{ i18n.lang() }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}Helios FHIR Server{% endblock %}</title>
+  <title>{% block title %}{{ i18n.t("app-title") }}{% endblock %}</title>
   <link rel="stylesheet" href="/ui/assets/app.css">
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
 </head>
 <body>
+  <!--
+    Language switcher: real links, so it works without JavaScript. ?lang=
+    overrides the negotiated locale and the middleware persists the choice
+    in the hfs_lang cookie (see crates/ui/src/i18n.rs).
+  -->
+  <nav class="lang-switcher" aria-label="{{ i18n.t("language-label") }}">
+    <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %}>{{ i18n.t("language-en") }}</a>
+    <a href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %}>{{ i18n.t("language-es") }}</a>
+    <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %}>{{ i18n.t("language-de") }}</a>
+  </nav>
   <main>
     {% block content %}{% endblock %}
   </main>

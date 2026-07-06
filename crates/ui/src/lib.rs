@@ -14,17 +14,25 @@
 //! navigation (or vice versa).
 //!
 //! The router is mounted under `/ui` by the `hfs` binary via [`mount`].
+//!
+//! All user-visible text is resolved from the Fluent catalogs in `locales/`
+//! against the locale negotiated per request by [`i18n::negotiate_locale`]
+//! (see `docs/multi-language.md`); templates hold catalog keys, not prose.
+
+mod i18n;
 
 use askama::Template;
 use axum::{
     Router,
     extract::State,
     http::StatusCode,
+    middleware,
     response::{Html, IntoResponse, Response},
     routing::get,
 };
 use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
+use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,12 +61,14 @@ struct Status {
 #[template(path = "pages/index.html")]
 struct IndexPage {
     status: Status,
+    i18n: I18n,
 }
 
 #[derive(Template)]
 #[template(path = "partials/status.html")]
 struct StatusPartial {
     status: Status,
+    i18n: I18n,
 }
 
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
@@ -72,6 +82,9 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
+        // One negotiated locale per request, in request extensions; every
+        // handler and template reads this same value.
+        .layer(middleware::from_fn(i18n::negotiate_locale))
         .with_state(WebState {
             version: hfs_version,
         })
@@ -79,20 +92,26 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
 }
 
 /// Full landing page.
-async fn index(State(state): State<WebState>) -> Response {
+async fn index(State(state): State<WebState>, locale: RequestLocale) -> Response {
     render(IndexPage {
         status: current_status(state.version),
+        i18n: I18n::new(locale),
     })
 }
 
 /// Status read path. Returns a fragment to htmx (`HX-Request`) and a full page
 /// on a hard navigation, so the same URL works with and without JavaScript.
-async fn status(State(state): State<WebState>, HxRequest(is_htmx): HxRequest) -> Response {
+async fn status(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    HxRequest(is_htmx): HxRequest,
+) -> Response {
     let status = current_status(state.version);
+    let i18n = I18n::new(locale);
     if is_htmx {
-        render(StatusPartial { status })
+        render(StatusPartial { status, i18n })
     } else {
-        render(IndexPage { status })
+        render(IndexPage { status, i18n })
     }
 }
 
@@ -125,6 +144,10 @@ fn unix_timestamp_seconds() -> u64 {
 mod tests {
     use super::*;
 
+    fn i18n(tag: &str) -> I18n {
+        I18n::from_tag(tag).expect("supported locale")
+    }
+
     #[test]
     fn index_page_renders_version_and_local_assets() {
         let html = IndexPage {
@@ -132,6 +155,7 @@ mod tests {
                 version: "1.2.3",
                 checked_at: 42,
             },
+            i18n: i18n("en"),
         }
         .render()
         .expect("index renders");
@@ -145,12 +169,32 @@ mod tests {
     }
 
     #[test]
+    fn index_page_renders_in_the_negotiated_locale() {
+        let html = IndexPage {
+            status: Status {
+                version: "1.2.3",
+                checked_at: 42,
+            },
+            i18n: i18n("es"),
+        }
+        .render()
+        .expect("index renders");
+
+        assert!(html.contains(r#"<html lang="es">"#));
+        assert!(html.contains("Actualizar estado"));
+        assert!(html.contains("Última comprobación: 42"));
+        // The language switcher marks the active locale.
+        assert!(html.contains(r#"href="?lang=es" aria-current="true""#));
+    }
+
+    #[test]
     fn status_partial_is_fragment_not_full_page() {
         let html = StatusPartial {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
             },
+            i18n: i18n("en"),
         }
         .render()
         .expect("status renders");

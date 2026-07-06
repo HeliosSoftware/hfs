@@ -1,8 +1,8 @@
 {% extends "layouts/base.html" %}
 
 {% block content %}
-<h1>Helios FHIR Server</h1>
-<p class="lede">Server-rendered, HTMX-first UI. This panel is refreshed as an HTML fragment.</p>
+<h1>{{ i18n.t("app-title") }}</h1>
+<p class="lede">{{ i18n.t("home-lede") }}</p>
 
 <div id="status">
   {% include "partials/status.html" %}
@@ -20,5 +20,5 @@
   hx-get="/ui/status"
   hx-target="#status"
   hx-swap="innerHTML"
->Refresh status</a>
+>{{ i18n.t("action-refresh-status") }}</a>
 {% endblock %}
