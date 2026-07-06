@@ -44,10 +44,11 @@ TX_USER_AGENT = (
 # that default-resolves the bare canonical URL to the 4.0.1 fragment rejects the
 # other four codes (e.g. `object`, which AuditEvent.type legitimately uses). The
 # previous tx.fhir.org/r5 backend default-resolved to 1.0.0, so this only
-# surfaced after pointing at hts.heliossoftware.com. Pin the complete version so
-# validation resolves against the full concept list.
+# surfaced after pointing at hts.heliossoftware.com. Pin the complete THO version
+# (server-agnostic — any conformant THO host serves it) so validation resolves
+# against the full concept list.
 TX_SYSTEM_VERSION_OVERRIDES = {
-    "http://terminology.hl7.org/CodeSystem/audit-event-type": "1.0.0",
+    AUDIT_EVENT_TYPE_SYSTEM: "1.0.0",
 }
 
 VALID_AUDIT_EVENT_TYPE_CODES = {"rest", "hl7-v2", "hl7-v3", "document", "object"}
