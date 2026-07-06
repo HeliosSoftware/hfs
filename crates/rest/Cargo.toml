@@ -116,6 +116,10 @@ aes-gcm = { version = "0.10", optional = true }
 # HTTP testing
 axum-test = "18.0"
 
+# Inject synthetic request-log traffic in console-metrics tests (the same
+# in-process request log the handlers read for per-tenant traffic).
+helios-observability = { path = "../observability" }
+
 # gzip test payloads for HTTP compression tests
 flate2 = "1"
 
