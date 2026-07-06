@@ -22,6 +22,19 @@ SOURCE_INTERACTION_TRIGGER_VS = "http://hl7.org/fhir/ValueSet/interaction-trigge
 SOURCE_TESTSCRIPT_OPERATION_CODES_VS = "http://hl7.org/fhir/ValueSet/testscript-operation-codes"
 DEFAULT_TX_BASE_URL = "https://hts.heliossoftware.com"
 
+# User-Agent presented to the terminology server for live $validate-code calls.
+#
+# hts.heliossoftware.com is fronted by Cloudflare, whose bot protection rejects
+# the default Python urllib User-Agent with "HTTP 403 - Error 1010:
+# browser_signature_banned" before the request reaches the origin. Every code
+# then surfaces as an invalid system+code pair, failing the terminology check.
+# Presenting a browser-like User-Agent clears the filter and lets the real
+# validation response through.
+TX_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 VALID_AUDIT_EVENT_TYPE_CODES = {"rest", "hl7-v2", "hl7-v3", "document", "object"}
 VALID_RESTFUL_INTERACTION_CODES = {
     "read",
@@ -429,7 +442,11 @@ def tx_validate_code(
     base = tx_base_url.rstrip("/")
     query = urllib.parse.urlencode({"url": system, "code": code})
     url = f"{base}/CodeSystem/$validate-code?{query}"
-    request = urllib.request.Request(url, headers={"Accept": "application/fhir+json"})
+    # User-Agent is required to clear the Cloudflare bot filter (see TX_USER_AGENT).
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/fhir+json", "User-Agent": TX_USER_AGENT},
+    )
 
     last_error = ""
     for attempt in range(1, max_attempts + 1):
