@@ -35,6 +35,21 @@ TX_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+# Explicit CodeSystem versions to pin on $validate-code requests, keyed by system.
+#
+# Some HL7 terminology CodeSystems ship a stripped-down copy under the FHIR-core
+# version alongside the complete standalone THO version. audit-event-type is the
+# case we hit: version 4.0.1 (bundled with FHIR R4) defines only `rest`, while
+# the full THO version 1.0.0 adds hl7-v2, hl7-v3, document, and object. A server
+# that default-resolves the bare canonical URL to the 4.0.1 fragment rejects the
+# other four codes (e.g. `object`, which AuditEvent.type legitimately uses). The
+# previous tx.fhir.org/r5 backend default-resolved to 1.0.0, so this only
+# surfaced after pointing at hts.heliossoftware.com. Pin the complete version so
+# validation resolves against the full concept list.
+TX_SYSTEM_VERSION_OVERRIDES = {
+    "http://terminology.hl7.org/CodeSystem/audit-event-type": "1.0.0",
+}
+
 VALID_AUDIT_EVENT_TYPE_CODES = {"rest", "hl7-v2", "hl7-v3", "document", "object"}
 VALID_RESTFUL_INTERACTION_CODES = {
     "read",
@@ -440,7 +455,11 @@ def tx_validate_code(
     max_attempts: int = 2,
 ) -> tuple[bool, str]:
     base = tx_base_url.rstrip("/")
-    query = urllib.parse.urlencode({"url": system, "code": code})
+    params = {"url": system, "code": code}
+    version = TX_SYSTEM_VERSION_OVERRIDES.get(system)
+    if version:
+        params["version"] = version
+    query = urllib.parse.urlencode(params)
     url = f"{base}/CodeSystem/$validate-code?{query}"
     # User-Agent is required to clear the Cloudflare bot filter (see TX_USER_AGENT).
     request = urllib.request.Request(
