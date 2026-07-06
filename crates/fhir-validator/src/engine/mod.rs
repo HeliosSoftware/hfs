@@ -9,14 +9,27 @@
 
 mod errors;
 mod path;
+mod primitives;
 mod slicing;
 mod walk;
 
 pub use errors::{ErrorKind, Severity, ValidationError};
 pub use path::dotted_to_fhirpath;
 
-use crate::effects::Deferred;
+/// Crate-internal access to the effect-issue message templates (the full
+/// template catalog lives in `errors.rs`, the single source of truth).
+pub(crate) mod messages {
+    pub(crate) use super::errors::{
+        msg_constraint_not_evaluable as constraint_not_evaluable,
+        msg_fhirpath_constraint as fhirpath_constraint,
+        msg_terminology_binding as terminology_binding,
+        msg_terminology_unavailable as terminology_unavailable,
+    };
+}
+
+use crate::effects::{Deferred, EffectHandlers};
 use crate::resolver::SchemaResolver;
+use helios_fhir::FhirVersion;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -79,5 +92,21 @@ impl Validator {
     /// instead of being executed.
     pub fn validate_sync(&self, resource: &Value, opts: &ValidationOptions) -> SyncOutcome {
         walk::validate(self.resolver.as_ref(), resource, opts)
+    }
+
+    /// Full validation: the structural walk plus execution of the deferred
+    /// FHIRPath constraints and terminology bindings through `effects`.
+    /// Structural issues come first, then constraint issues, then binding
+    /// issues (each in walk order).
+    pub async fn validate(
+        &self,
+        resource: &Value,
+        version: FhirVersion,
+        opts: &ValidationOptions,
+        effects: &EffectHandlers<'_>,
+    ) -> Vec<ValidationError> {
+        let SyncOutcome { mut errors, deferred } = self.validate_sync(resource, opts);
+        crate::effects::execute(resource, version, &deferred, effects, &mut errors).await;
+        errors
     }
 }

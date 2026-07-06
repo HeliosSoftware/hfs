@@ -3149,12 +3149,16 @@ dependencies = [
 name = "helios-fhir-validator"
 version = "0.2.1"
 dependencies = [
+ "async-trait",
  "clap",
  "flate2",
  "helios-fhir",
+ "helios-fhirpath",
  "indexmap 2.14.0",
+ "regex",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3340,6 +3344,7 @@ dependencies = [
  "helios-audit",
  "helios-auth",
  "helios-fhir",
+ "helios-fhir-validator",
  "helios-persistence",
  "helios-serde",
  "helios-sof",

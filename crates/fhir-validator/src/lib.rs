@@ -48,7 +48,13 @@ pub mod packs;
 pub mod resolver;
 pub mod schema;
 
-pub use effects::Deferred;
+#[cfg(feature = "fhirpath")]
+pub mod fhirpath_effects;
+
+pub use effects::{
+    CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
+    EffectHandlers, TerminologyError, TerminologyProvider,
+};
 pub use engine::{
     dotted_to_fhirpath, ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError,
     ValidationOptions, Validator,

@@ -314,6 +314,9 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
     // set is borrowed, and Arc clones are cheap.
     let schemas: Vec<Arc<FhirSchema>> = set.schemas().cloned().collect();
     for schema in &schemas {
+        if schema.is_primitive() {
+            super::primitives::validate_primitive(ctx, schema, data);
+        }
         if let Some(fixed) = &schema.fixed
             && data != fixed {
                 ctx.error(ErrorKind::FixedValue, errors::msg_fixed_value(fixed, data));
@@ -345,6 +348,7 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 path: ctx.path.render_dotted(),
                 binding: binding.clone(),
                 value: data.clone(),
+                type_hint: schema.type_.clone(),
             });
         }
         if schema.elements.is_some() && !data.is_object() {

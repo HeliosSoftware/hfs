@@ -48,3 +48,8 @@ fn extended_sidecars() {
 fn extended_element_reference() {
     run_extended("element_reference.json");
 }
+
+#[test]
+fn extended_primitives() {
+    run_extended("primitives.json");
+}

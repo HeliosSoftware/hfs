@@ -228,6 +228,44 @@ pub(crate) fn msg_slice_order(slice: &str) -> String {
     format!("slice '{slice}' is out of order (ordered slicing)")
 }
 
+/// [helios] a primitive value has the wrong JSON type class.
+pub(crate) fn msg_primitive_type(type_name: &str, json_type: &str) -> String {
+    format!("expected {type_name}, got {json_type}")
+}
+
+/// [helios] a primitive string value failed the type's regex.
+pub(crate) fn msg_primitive_regex(type_name: &str, value: &str) -> String {
+    format!("value '{value}' is not a valid {type_name}")
+}
+
+/// [reference] `FHIRPath constraint {id} error: {human}` — the wording of
+/// the reference validator, including its fallback when `human` is absent.
+pub(crate) fn msg_fhirpath_constraint(id: &str, human: Option<&str>) -> String {
+    format!(
+        "FHIRPath constraint {id} error: {}",
+        human.unwrap_or("property \"human\" is not provided")
+    )
+}
+
+/// [reference] terminology-binding failure wording.
+pub(crate) fn msg_terminology_binding(value: &Value, value_set: &str) -> String {
+    format!(
+        "Provided coded value '{}' does not pass validation against the following valueset: '{value_set}'",
+        render_value(value)
+    )
+}
+
+/// [helios] the terminology service could not be reached / errored.
+pub(crate) fn msg_terminology_unavailable(value_set: &str, detail: &str) -> String {
+    format!("terminology validation against '{value_set}' could not be performed: {detail}")
+}
+
+/// [helios] constraint evaluation itself failed (parse error, non-boolean
+/// result, typed-model mismatch).
+pub(crate) fn msg_constraint_not_evaluable(id: &str, detail: &str) -> String {
+    format!("FHIRPath constraint {id} could not be evaluated: {detail}")
+}
+
 /// [helios] a schema reference could not be resolved (reference validator
 /// throws `could not resolve ["…"]`; we report and continue).
 pub(crate) fn msg_unknown_schema(reference: &str) -> String {
