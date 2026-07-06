@@ -57,10 +57,39 @@ struct Status {
     checked_at: u64,
 }
 
+/// Dashboard metrics rendered by `pages/index.html` (design: Figma
+/// "Dashboard V1.1"). Sample values from the design frame until the real
+/// read paths into `helios-persistence` land (README: "Left for follow-up
+/// work") — swapping them in is a handler-only change.
+struct DashboardMetrics {
+    fhir_version: &'static str,
+    resource_types: &'static str,
+    stored_resources: &'static str,
+    export_jobs: &'static str,
+    export_jobs_queued: u32,
+    uptime_percent: &'static str,
+    chart_total: &'static str,
+}
+
+impl DashboardMetrics {
+    fn sample() -> Self {
+        DashboardMetrics {
+            fhir_version: "R4",
+            resource_types: "142",
+            stored_resources: "61.4k",
+            export_jobs: "13",
+            export_jobs_queued: 1,
+            uptime_percent: "99.98",
+            chart_total: "1,204",
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "pages/index.html")]
 struct IndexPage {
     status: Status,
+    metrics: DashboardMetrics,
     i18n: I18n,
 }
 
@@ -95,6 +124,7 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
 async fn index(State(state): State<WebState>, locale: RequestLocale) -> Response {
     render(IndexPage {
         status: current_status(state.version),
+        metrics: DashboardMetrics::sample(),
         i18n: I18n::new(locale),
     })
 }
@@ -111,7 +141,11 @@ async fn status(
     if is_htmx {
         render(StatusPartial { status, i18n })
     } else {
-        render(IndexPage { status, i18n })
+        render(IndexPage {
+            status,
+            metrics: DashboardMetrics::sample(),
+            i18n,
+        })
     }
 }
 
@@ -155,6 +189,7 @@ mod tests {
                 version: "1.2.3",
                 checked_at: 42,
             },
+            metrics: DashboardMetrics::sample(),
             i18n: i18n("en"),
         }
         .render()
@@ -175,6 +210,7 @@ mod tests {
                 version: "1.2.3",
                 checked_at: 42,
             },
+            metrics: DashboardMetrics::sample(),
             i18n: i18n("es"),
         }
         .render()
@@ -214,5 +250,36 @@ mod tests {
     #[test]
     fn css_asset_is_embedded() {
         assert!(Assets::get("app.css").is_some());
+    }
+
+    /// The dashboard shell's own assets: theme switcher, vendored Figtree,
+    /// and the brand logo exported from the design file.
+    #[test]
+    fn design_assets_are_embedded() {
+        assert!(Assets::get("theme.js").is_some());
+        assert!(Assets::get("fonts/figtree-latin.woff2").is_some());
+        assert!(Assets::get("fonts/figtree-latin-ext.woff2").is_some());
+        assert!(Assets::get("logo.png").is_some());
+    }
+
+    /// Both theme buttons render, and icons are inlined (so `currentColor`
+    /// theming applies) rather than referenced as external images.
+    #[test]
+    fn index_page_renders_theme_toggle_and_inline_icons() {
+        let html = IndexPage {
+            status: Status {
+                version: "1.2.3",
+                checked_at: 42,
+            },
+            metrics: DashboardMetrics::sample(),
+            i18n: i18n("en"),
+        }
+        .render()
+        .expect("index renders");
+
+        assert!(html.contains(r#"data-set-theme="light""#));
+        assert!(html.contains(r#"data-set-theme="dark""#));
+        assert!(html.contains("<svg"));
+        assert!(html.contains(r#"fill="currentColor""#));
     }
 }

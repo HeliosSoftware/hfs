@@ -70,6 +70,48 @@ error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.
 error-generic = Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.
 
+## Dashboard-Gerüst (Figma „Dashboard V1.1“)
+
+nav-section-work = Arbeit
+nav-section-batch-data = Batch & Daten
+nav-section-server = Server
+nav-section-conditional = Bedingt
+
+nav-home = Startseite
+nav-search = Suche
+nav-resource-editor = Ressourcen-Editor
+nav-history-versions = Verlauf & Versionen
+nav-compartments = Compartments
+nav-batch-transaction = Batch / Transaktion
+nav-bulk-export = Bulk-Export
+nav-sql-on-fhir = SQL-on-FHIR
+nav-capability-conformance = Capability & Konformität
+nav-admin-ops = Admin / Betrieb
+nav-subscriptions = Abonnements
+
+tenant-heading = Tenants
+tenant-all = Alle Tenants
+tenant-search-placeholder = Tenants durchsuchen
+
+theme-label = Farbschema
+theme-light = Helles Design
+theme-dark = Dunkles Design
+
+fhir-version = FHIR { $version }
+
+card-resource-types = Ressourcentypen
+card-resource-types-sub = aktiviert für { $version }
+card-stored-resources = Gespeicherte Ressourcen
+card-stored-resources-sub = im aktiven Tenant
+card-export-jobs = Export-Jobs
+card-export-jobs-sub = laufend ({ $queued } in der Warteschlange)
+card-uptime = Verfügbarkeit
+card-uptime-sub = letzte 30 Tage
+
+chart-title = FHIR-Ressourcen im Zeitverlauf
+chart-unit-patients = Patienten
+chart-expand = Diagramm vergrößern
+
 ## Fußzeile
 
 footer-copyright = © { $year } { -org-name }
