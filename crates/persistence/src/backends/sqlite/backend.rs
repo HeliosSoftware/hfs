@@ -152,10 +152,26 @@ impl SqliteBackend {
         } else {
             SqliteConnectionManager::file(path.as_ref())
         };
-        // Per-connection initialiser: register the in-DB SOF runner's helper
-        // UDFs (`fhir_last_segment`) so SQL emitted by the FHIRPath compiler
-        // can call them directly without dialect-specific shimming.
-        let manager = manager.with_init(|conn| {
+        // Per-connection initialiser. `busy_timeout` and `foreign_keys` are
+        // PER-CONNECTION settings, so they must be applied to every connection the
+        // pool creates — not just once. Previously they were set on a single
+        // connection in `configure_connection()`, leaving the rest of the pool with
+        // the SQLite default `busy_timeout = 0`; under concurrent writes those
+        // connections failed immediately with "database is locked" instead of
+        // waiting for the lock. (WAL is a persistent DB-level setting and stays in
+        // `configure_connection()` — setting journal_mode concurrently as the pool
+        // warms up can itself contend on the DB lock.)
+        //
+        // This closure also registers the in-DB SOF runner's helper UDFs
+        // (`fhir_last_segment`) so SQL emitted by the FHIRPath compiler can call
+        // them directly without dialect-specific shimming.
+        let busy_timeout_ms = config.busy_timeout_ms;
+        let enable_foreign_keys = config.enable_foreign_keys;
+        let manager = manager.with_init(move |conn| {
+            conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64))?;
+            if enable_foreign_keys {
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),

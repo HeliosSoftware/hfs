@@ -509,12 +509,43 @@ impl Transaction for PostgresTransaction {
 
 impl Drop for PostgresTransaction {
     fn drop(&mut self) {
-        // If transaction wasn't explicitly committed or rolled back, attempt rollback.
-        // Note: We can't do async in Drop, so we just log a warning.
-        // The connection will be returned to the pool and PostgreSQL will auto-rollback
-        // any uncommitted transaction when the connection is recycled.
-        if self.active {
-            tracing::warn!("PostgreSQL transaction dropped without explicit commit or rollback");
+        // If the transaction wasn't explicitly committed or rolled back, we must
+        // still ROLLBACK before the connection is returned to the pool. deadpool's
+        // default recycling does NOT reset session state, so a connection handed
+        // back with an open transaction poisons the pool: the next checkout fails
+        // with "there is already a transaction in progress", cascading across every
+        // subsequent request that reuses it. (The previous code assumed recycling
+        // auto-rolls-back, which is false — this was the cause of the import-suite
+        // failure cascade under concurrent load.)
+        //
+        // Drop can't be async, so move the client into a spawned task that issues
+        // the ROLLBACK and only then drops it — the connection returns to the pool
+        // clean, and only after the rollback completes.
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tracing::warn!(
+                    "PostgreSQL transaction dropped without explicit commit/rollback; rolling back before pool return"
+                );
+                handle.spawn(async move {
+                    // Ignore the result: the connection drops (returns to the pool)
+                    // when this task ends regardless, and a failed rollback here
+                    // just means a broken connection deadpool will discard anyway.
+                    let _ = client.execute("ROLLBACK", &[]).await;
+                });
+            }
+            Err(_) => {
+                // No async runtime (e.g. a synchronous test drop): can't roll back.
+                tracing::warn!(
+                    "PostgreSQL transaction dropped without explicit commit/rollback and no runtime available to roll back; connection may re-enter the pool with an open transaction"
+                );
+            }
         }
     }
 }
