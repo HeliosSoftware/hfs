@@ -5,8 +5,8 @@ on:
   workflow_call: # invoked by ci.yml as a release conformance gate
   schedule:
     # Nightly conformance run at 05:00 UTC — catches regressions even when no
-    # HTS code changed (tx.fhir.org behaviour drift, transitive dependency
-    # bumps, UTG package updates). Offset from ci-extended.yml's 07:00 UTC
+    # HTS code changed (transitive dependency bumps, UTG package updates that
+    # would drift from the pinned golden values). Offset from ci-extended.yml's 07:00 UTC
     # weekday run so the two don't contend for self-hosted runners.
     - cron: "0 5 * * *"
 
@@ -87,7 +87,11 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────────────
   # End-to-end conformance tests against real UTG terminology data
-  # Compares every operation against tx.fhir.org as source of truth
+  # Every operation is asserted against pinned golden values (the stable,
+  # HL7-defined displays/totals/outcomes for these UTG code systems). These
+  # were previously compared live against tx.fhir.org; per #183 CI no longer
+  # depends on that shared public server. The golden values are captured from
+  # the reference and documented inline beside each assertion.
   # ─────────────────────────────────────────────────────────────────────────────
   integration-test:
     name: Integration tests — FHIR ${{ matrix.label }}
@@ -99,10 +103,8 @@ jobs:
         include:
           - label: R4
             utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r4.tgz
-            tx_base: https://tx.fhir.org/r4
           - label: R5
             utg_url: https://build.fhir.org/ig/HL7/UTG/hl7.terminology.r5.tgz
-            tx_base: https://tx.fhir.org/r5
 
     steps:
       - name: Checkout code
@@ -189,7 +191,6 @@ jobs:
       - name: Run terminology integration tests (${{ matrix.label }})
         env:
           HTS_BASE: http://localhost:${{ env.HTS_PORT }}
-          TX_BASE: ${{ matrix.tx_base }}
           FHIR_LABEL: ${{ matrix.label }}
         run: |
           # Do NOT use set -e here — all tests must run before reporting failures.
@@ -222,13 +223,6 @@ jobs:
               -d "$2"
           }
 
-          tx_post() {
-            curl -sf --max-time 60 \
-              -X POST "$TX_BASE/$1" \
-              -H "Content-Type: application/fhir+json" \
-              -d "$2"
-          }
-
           # Returns only the HTTP status code (used to assert 4xx error responses)
           hts_status() {
             curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
@@ -253,52 +247,42 @@ jobs:
               | head -1
           }
 
-          # Compare a boolean parameter between HTS and tx.fhir.org.
-          # Hard-fails if either server is unreachable or values differ.
-          compare_bool() {
-            local name="$1" endpoint="$2" body="$3" field="$4"
-            local hts_resp tx_resp hts_val tx_val
+          # Assert an HTS boolean parameter equals a pinned golden value.
+          # (Previously compared live against tx.fhir.org; see #183.)
+          expect_bool() {
+            local name="$1" endpoint="$2" body="$3" field="$4" expected="$5"
+            local hts_resp hts_val
 
             hts_resp=$(hts_post "$endpoint" "$body") || {
-              fail "$name" "success" "HTS request failed"
-              return
-            }
-            tx_resp=$(tx_post "$endpoint" "$body") || {
-              fail "$name" "success" "tx.fhir.org request failed"
+              fail "$name" "$expected" "HTS request failed"
               return
             }
 
             hts_val=$(extract_bool "$hts_resp" "$field")
-            tx_val=$(extract_bool "$tx_resp" "$field")
 
-            if [ "$hts_val" = "$tx_val" ]; then
+            if [ "$hts_val" = "$expected" ]; then
               pass "$name (${field}=${hts_val})"
             else
-              fail "$name" "$tx_val" "$hts_val"
+              fail "$name" "$expected" "$hts_val"
             fi
           }
 
-          # Compare a string/code parameter between HTS and tx.fhir.org.
-          compare_str() {
-            local name="$1" endpoint="$2" body="$3" field="$4"
-            local hts_resp tx_resp hts_val tx_val
+          # Assert an HTS string/code parameter equals a pinned golden value.
+          expect_str() {
+            local name="$1" endpoint="$2" body="$3" field="$4" expected="$5"
+            local hts_resp hts_val
 
             hts_resp=$(hts_post "$endpoint" "$body") || {
-              fail "$name" "success" "HTS request failed"
-              return
-            }
-            tx_resp=$(tx_post "$endpoint" "$body") || {
-              fail "$name" "success" "tx.fhir.org request failed"
+              fail "$name" "$expected" "HTS request failed"
               return
             }
 
             hts_val=$(extract_str "$hts_resp" "$field")
-            tx_val=$(extract_str "$tx_resp" "$field")
 
-            if [ "$hts_val" = "$tx_val" ]; then
+            if [ "$hts_val" = "$expected" ]; then
               pass "$name (${field}='${hts_val}')"
             else
-              fail "$name" "$tx_val" "$hts_val"
+              fail "$name" "$expected" "$hts_val"
             fi
           }
 
@@ -316,20 +300,26 @@ jobs:
           # ═══════════════════════════════════════════════════════════════════
           section "\$lookup (CodeSystem)"
 
-          # Tests 1–3: display of M / F / UN must match tx.fhir.org
+          # Tests 1–3: display of M / F / UN — golden values per HL7 UTG v3-AdministrativeGender
           for CODE in M F UN; do
-            compare_str "lookup v3-AdministrativeGender $CODE display" \
+            case "$CODE" in
+              M)  EXP_DISPLAY="Male" ;;
+              F)  EXP_DISPLAY="Female" ;;
+              UN) EXP_DISPLAY="Undifferentiated" ;;
+            esac
+            expect_str "lookup v3-AdministrativeGender $CODE display" \
               'CodeSystem/$lookup' \
               '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"'"$CODE"'"}]}' \
-              "display"
+              "display" "$EXP_DISPLAY"
           done
 
-          # Tests 4–6: display of active / completed / cancelled must match tx.fhir.org
+          # Tests 4–6: display of active / completed / cancelled — golden values per HL7 UTG
+          # v3-ActStatus, whose concept displays equal their codes.
           for CODE in active completed cancelled; do
-            compare_str "lookup v3-ActStatus $CODE display" \
+            expect_str "lookup v3-ActStatus $CODE display" \
               'CodeSystem/$lookup' \
               '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_ACTSTATUS"'"},{"name":"code","valueCode":"'"$CODE"'"}]}' \
-              "display"
+              "display" "$CODE"
           done
 
           # Test 7: response includes a 'name' parameter (CodeSystem name)
@@ -359,19 +349,19 @@ jobs:
           # ═══════════════════════════════════════════════════════════════════
           section "\$validate-code (CodeSystem)"
 
-          # Tests 9–10: known valid codes → result=true, matches tx.fhir.org
+          # Tests 9–10: known valid codes → result=true (golden)
           for CODE in M F; do
-            compare_bool "validate-code CS v3-AdministrativeGender $CODE result" \
+            expect_bool "validate-code CS v3-AdministrativeGender $CODE result" \
               'CodeSystem/$validate-code' \
               '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"'"$CODE"'"}]}' \
-              "result"
+              "result" "true"
           done
 
-          # Test 11: invalid code → result=false, matches tx.fhir.org
-          compare_bool "validate-code CS v3-AdministrativeGender INVALID_XYZ result=false" \
+          # Test 11: invalid code → result=false (golden)
+          expect_bool "validate-code CS v3-AdministrativeGender INVALID_XYZ result=false" \
             'CodeSystem/$validate-code' \
             '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"INVALID_XYZ"}]}' \
-            "result"
+            "result" "false"
 
           # Test 12: correct display → result=true (HTS assertion)
           RESP=$(hts_post 'CodeSystem/$validate-code' \
@@ -386,36 +376,36 @@ jobs:
             fail "validate-code CS v3-AdministrativeGender M display=Male" "true" "$RESULT"
           fi
 
-          # Test 13: wrong display → result=false, matches tx.fhir.org
-          compare_bool "validate-code CS v3-AdministrativeGender M display=Female result=false" \
+          # Test 13: wrong display → result=false (golden)
+          expect_bool "validate-code CS v3-AdministrativeGender M display=Female result=false" \
             'CodeSystem/$validate-code' \
             '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_GENDER"'"},{"name":"code","valueCode":"M"},{"name":"display","valueString":"Female"}]}' \
-            "result"
+            "result" "false"
 
-          # Test 14: v3-ActStatus active → result=true, matches tx.fhir.org
-          compare_bool "validate-code CS v3-ActStatus active result=true" \
+          # Test 14: v3-ActStatus active → result=true (golden)
+          expect_bool "validate-code CS v3-ActStatus active result=true" \
             'CodeSystem/$validate-code' \
             '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CS_ACTSTATUS"'"},{"name":"code","valueCode":"active"}]}' \
-            "result"
+            "result" "true"
 
           # ═══════════════════════════════════════════════════════════════════
           # §3  $validate-code (ValueSet)
           # ═══════════════════════════════════════════════════════════════════
           section "\$validate-code (ValueSet)"
 
-          # Tests 15–16: M and F valid in v3-AdministrativeGender VS, matches tx
+          # Tests 15–16: M and F valid in v3-AdministrativeGender VS → result=true (golden)
           for CODE in M F; do
-            compare_bool "validate-code VS v3-AdministrativeGender $CODE result=true" \
+            expect_bool "validate-code VS v3-AdministrativeGender $CODE result=true" \
               'ValueSet/$validate-code' \
               '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"},{"name":"code","valueCode":"'"$CODE"'"},{"name":"system","valueUri":"'"$CS_GENDER"'"}]}' \
-              "result"
+              "result" "true"
           done
 
-          # Test 17: invalid code in VS → result=false, matches tx.fhir.org
-          compare_bool "validate-code VS v3-AdministrativeGender INVALID_XYZ result=false" \
+          # Test 17: invalid code in VS → result=false (golden)
+          expect_bool "validate-code VS v3-AdministrativeGender INVALID_XYZ result=false" \
             'ValueSet/$validate-code' \
             '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"},{"name":"code","valueCode":"INVALID_XYZ"},{"name":"system","valueUri":"'"$CS_GENDER"'"}]}' \
-            "result"
+            "result" "false"
 
           # Test 18: coding parameter form (valueCoding) → result=true
           RESP=$(hts_post 'ValueSet/$validate-code' \
@@ -430,33 +420,29 @@ jobs:
             fail "validate-code VS v3-AdministrativeGender valueCoding M" "true" "$RESULT"
           fi
 
-          # Test 19: v3-ActStatus active in VS → result=true, matches tx.fhir.org
-          compare_bool "validate-code VS v3-ActStatus active result=true" \
+          # Test 19: v3-ActStatus active in VS → result=true (golden)
+          expect_bool "validate-code VS v3-ActStatus active result=true" \
             'ValueSet/$validate-code' \
             '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_ACTSTATUS"'"},{"name":"code","valueCode":"active"},{"name":"system","valueUri":"'"$CS_ACTSTATUS"'"}]}' \
-            "result"
+            "result" "true"
 
           # ═══════════════════════════════════════════════════════════════════
           # §4  $expand (ValueSet)
           # ═══════════════════════════════════════════════════════════════════
           section "\$expand (ValueSet)"
 
-          # Test 20: v3-AdministrativeGender expansion total matches tx.fhir.org
+          # Test 20: v3-AdministrativeGender expansion total — golden value: 3 (M, F, UN)
+          GOLD_GENDER_EXPAND_TOTAL=3
           EXPAND_BODY='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_GENDER"'"}]}'
           HTS_EXP=$(hts_post 'ValueSet/$expand' "$EXPAND_BODY") || {
             fail "expand v3-AdministrativeGender" "success" "HTS request failed"
             HTS_EXP="{}"
           }
-          TX_EXP=$(tx_post 'ValueSet/$expand' "$EXPAND_BODY") || {
-            fail "expand v3-AdministrativeGender" "success" "tx.fhir.org request failed"
-            TX_EXP="{}"
-          }
           HTS_EXP_TOTAL=$(printf '%s' "$HTS_EXP" | jq -r '.expansion.total // (.expansion.contains | length) // 0')
-          TX_EXP_TOTAL=$(printf '%s' "$TX_EXP"  | jq -r '.expansion.total // (.expansion.contains | length) // 0')
-          if [ "$HTS_EXP_TOTAL" = "$TX_EXP_TOTAL" ] && [ "$HTS_EXP_TOTAL" != "0" ]; then
-            pass "expand v3-AdministrativeGender total matches tx (total=$HTS_EXP_TOTAL)"
+          if [ "$HTS_EXP_TOTAL" = "$GOLD_GENDER_EXPAND_TOTAL" ]; then
+            pass "expand v3-AdministrativeGender total=golden (total=$HTS_EXP_TOTAL)"
           else
-            fail "expand v3-AdministrativeGender total matches tx" "$TX_EXP_TOTAL" "$HTS_EXP_TOTAL"
+            fail "expand v3-AdministrativeGender total=golden" "$GOLD_GENDER_EXPAND_TOTAL" "$HTS_EXP_TOTAL"
           fi
 
           # Tests 21–23: expansion must contain codes M, F, UN
@@ -495,22 +481,18 @@ jobs:
             fail "expand v3-AdministrativeGender count=1" "1" "$CODE_COUNT"
           fi
 
-          # Test 26: v3-ActStatus expansion total matches tx.fhir.org
+          # Test 26: v3-ActStatus expansion total — golden value: 10
+          GOLD_ACTSTATUS_EXPAND_TOTAL=10
           ACTSTATUS_BODY='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$VS_ACTSTATUS"'"}]}'
           HTS_ACT=$(hts_post 'ValueSet/$expand' "$ACTSTATUS_BODY") || {
             fail "expand v3-ActStatus" "success" "HTS request failed"
             HTS_ACT="{}"
           }
-          TX_ACT=$(tx_post 'ValueSet/$expand' "$ACTSTATUS_BODY") || {
-            fail "expand v3-ActStatus" "success" "tx.fhir.org request failed"
-            TX_ACT="{}"
-          }
           HTS_ACT_TOTAL=$(printf '%s' "$HTS_ACT" | jq -r '.expansion.total // (.expansion.contains | length) // 0')
-          TX_ACT_TOTAL=$(printf '%s' "$TX_ACT"  | jq -r '.expansion.total // (.expansion.contains | length) // 0')
-          if [ "$HTS_ACT_TOTAL" = "$TX_ACT_TOTAL" ] && [ "$HTS_ACT_TOTAL" != "0" ]; then
-            pass "expand v3-ActStatus total matches tx (total=$HTS_ACT_TOTAL)"
+          if [ "$HTS_ACT_TOTAL" = "$GOLD_ACTSTATUS_EXPAND_TOTAL" ]; then
+            pass "expand v3-ActStatus total=golden (total=$HTS_ACT_TOTAL)"
           else
-            fail "expand v3-ActStatus total matches tx" "$TX_ACT_TOTAL" "$HTS_ACT_TOTAL"
+            fail "expand v3-ActStatus total=golden" "$GOLD_ACTSTATUS_EXPAND_TOTAL" "$HTS_ACT_TOTAL"
           fi
 
           # Test 27: v3-ActStatus filter=active → expansion contains 'active'
@@ -531,19 +513,19 @@ jobs:
           # ═══════════════════════════════════════════════════════════════════
           section "\$subsumes (CodeSystem)"
 
-          # Tests 28–29: same code vs same code → equivalent, matches tx.fhir.org
+          # Tests 28–29: same code vs same code → equivalent (golden)
           for CODE in M F; do
-            compare_str "subsumes v3-AdministrativeGender $CODE/$CODE outcome=equivalent" \
+            expect_str "subsumes v3-AdministrativeGender $CODE/$CODE outcome=equivalent" \
               'CodeSystem/$subsumes' \
               '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"codeA","valueCode":"'"$CODE"'"},{"name":"codeB","valueCode":"'"$CODE"'"}]}' \
-              "outcome"
+              "outcome" "equivalent"
           done
 
-          # Test 30: M vs F in flat hierarchy → not-subsumed, matches tx.fhir.org
-          compare_str "subsumes v3-AdministrativeGender M/F outcome=not-subsumed" \
+          # Test 30: M vs F in flat hierarchy → not-subsumed (golden)
+          expect_str "subsumes v3-AdministrativeGender M/F outcome=not-subsumed" \
             'CodeSystem/$subsumes' \
             '{"resourceType":"Parameters","parameter":[{"name":"system","valueUri":"'"$CS_GENDER"'"},{"name":"codeA","valueCode":"M"},{"name":"codeB","valueCode":"F"}]}' \
-            "outcome"
+            "outcome" "not-subsumed"
 
           # Test 31: codingA / codingB parameter form → equivalent
           RESP=$(hts_post 'CodeSystem/$subsumes' \
@@ -575,77 +557,31 @@ jobs:
           # ═══════════════════════════════════════════════════════════════════
           section "\$translate (ConceptMap)"
 
-          # Probe tx.fhir.org availability for translate — it may be unreachable
-          # from the CI runner (rate-limited, auth required, or transient outage).
-          # When unavailable we skip tx comparisons and test HTS in isolation.
-          TX_TRANSLATE_AVAILABLE=false
-          if tx_post 'ConceptMap/$translate' \
-              '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$CS_V2_0001"'"},{"name":"code","valueCode":"M"}]}' \
-              > /dev/null 2>&1; then
-            TX_TRANSLATE_AVAILABLE=true
-          fi
-          echo "  tx.fhir.org translate available: $TX_TRANSLATE_AVAILABLE"
-
-          # Translate M/F using each of the two known systems. When tx.fhir.org
-          # is available we compare against it as source of truth; when it is
-          # unavailable we only hard-assert that HTS returns a valid boolean.
-          # The seeded ConceptMap maps from v2-0001, so a forward translate with
-          # system=v2-0001 matches while system=v3-AdministrativeGender does not —
-          # both are valid boolean results, hence the boolean-only assertion.
+          # Translate M/F using each of the two known systems. The ConceptMap is
+          # seeded by this workflow (fully deterministic), so results are golden:
+          # it maps FROM v2-0001, so a forward translate with system=v2-0001 is
+          # mapped (result=true) while system=v3-AdministrativeGender has no
+          # forward mapping (result=false).
           for CODE in M F; do
             for SYS in "$CS_V2_0001" "$CS_GENDER"; do
+              if [ "$SYS" = "$CS_V2_0001" ]; then EXP_RESULT="true"; else EXP_RESULT="false"; fi
               TRANS_BODY='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"system","valueUri":"'"$SYS"'"},{"name":"code","valueCode":"'"$CODE"'"}]}'
-              if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
-                compare_bool "translate $CODE (system=$SYS) matches tx" \
-                  'ConceptMap/$translate' "$TRANS_BODY" "result"
-              else
-                HTS_RESP=$(hts_post 'ConceptMap/$translate' "$TRANS_BODY") || {
-                  fail "translate $CODE (system=$SYS)" "success" "HTS request failed"
-                  HTS_RESP="{}"
-                }
-                HTS_BOOL=$(extract_bool "$HTS_RESP" "result")
-                if [ -n "$HTS_BOOL" ]; then
-                  pass "translate $CODE (system=$SYS) returns a boolean result (result=$HTS_BOOL, tx unavailable)"
-                else
-                  fail "translate $CODE (system=$SYS)" "boolean" "empty"
-                fi
-              fi
+              expect_bool "translate $CODE (system=$SYS)" \
+                'ConceptMap/$translate' "$TRANS_BODY" "result" "$EXP_RESULT"
             done
           done
 
-          # Test 36: unknown code must always return result=false (any system)
+          # Test 36: unknown code must return result=false (golden)
           TRANS_BOGUS='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"code","valueCode":"BOGUS_UNMAPPED_XYZ_9999"}]}'
-          if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
-            compare_bool "translate BOGUS_UNMAPPED_XYZ result=false matches tx" \
-              'ConceptMap/$translate' "$TRANS_BOGUS" "result"
-          else
-            HTS_BOGUS=$(hts_post 'ConceptMap/$translate' "$TRANS_BOGUS") || HTS_BOGUS="{}"
-            HTS_BOGUS_RES=$(extract_bool "$HTS_BOGUS" "result")
-            if [ "$HTS_BOGUS_RES" = "false" ]; then
-              pass "translate BOGUS_UNMAPPED_XYZ result=false (tx unavailable, HTS-only)"
-            else
-              fail "translate BOGUS_UNMAPPED_XYZ result" "false" "$HTS_BOGUS_RES"
-            fi
-          fi
+          expect_bool "translate BOGUS_UNMAPPED_XYZ result=false" \
+            'ConceptMap/$translate' "$TRANS_BOGUS" "result" "false"
 
-          # Tests 37–38: reverse translate M/F — same reasoning as above for tx unavailable
+          # Tests 37–38: reverse translate M/F → result=true (golden; targets M and F
+          # both resolve back to their v2-0001 source).
           for CODE in M F; do
             TRANS_REV='{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"'"$CM_GENDER_V2"'"},{"name":"code","valueCode":"'"$CODE"'"},{"name":"reverse","valueBoolean":true}]}'
-            if [ "$TX_TRANSLATE_AVAILABLE" = "true" ]; then
-              compare_bool "translate $CODE reverse matches tx" \
-                'ConceptMap/$translate' "$TRANS_REV" "result"
-            else
-              HTS_REV=$(hts_post 'ConceptMap/$translate' "$TRANS_REV") || {
-                fail "translate $CODE reverse" "success" "HTS request failed"
-                HTS_REV="{}"
-              }
-              HTS_REV_RES=$(extract_bool "$HTS_REV" "result")
-              if [ -n "$HTS_REV_RES" ]; then
-                pass "translate $CODE reverse returns a boolean result (result=$HTS_REV_RES, tx unavailable)"
-              else
-                fail "translate $CODE reverse" "boolean" "empty"
-              fi
-            fi
+            expect_bool "translate $CODE reverse result=true" \
+              'ConceptMap/$translate' "$TRANS_REV" "result" "true"
           done
 
           # ═══════════════════════════════════════════════════════════════════
