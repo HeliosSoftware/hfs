@@ -1,0 +1,485 @@
+name: FHIR Server Benchmark
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Manual trigger only — runs the HealthSamurai FHIR Server Performance Benchmark
+# (https://github.com/HealthSamurai/fhir-server-performance-benchmark) against
+# HFS so we can measure ourselves against Aidbox / HAPI / Medplum and (later)
+# submit comparable numbers for the public report.
+#
+# This is the general-server counterpart to .github/workflows/hts-benchmark.yml
+# (which drives the terminology `tx-benchmark` suite against HTS). It reuses the
+# same self-hosted-runner + remote-Docker plumbing.
+#
+# Topology (mirrors hts-benchmark.yml — HFS and k6 run natively ON the runner;
+# only the stateful dependencies live in containers on the REMOTE Docker daemon):
+#
+#   k6 (runner) ──HTTP──▶ HFS (runner, :8081/:8082)
+#        │                     │
+#        │                     └──SQL──▶ postgres:18 container  (postgres backend only)
+#        └──HTTP──▶ tgz bundle server container  (Synthea import corpus)
+#
+#   • HFS is built once with both storage backends compiled in and the backend
+#     is chosen at runtime via HFS_STORAGE_BACKEND:
+#       - sqlite   — file-backed DB on the runner.
+#       - postgres — ephemeral postgres:18 container, tuned to approximate the
+#         benchmark's infra/postgres/postgres.conf.
+#       - all      — both, as parallel matrix legs (default).
+#   • The `tgz` bundle server (benchmark's infra/tgz) serves the Synthea
+#     `bulk_1k` corpus consumed by the import suite.
+#
+# The upstream suites pin their own k6 `scenarios` blocks (CRUD 300 VUs / 5m,
+# search 30 VUs / 2m, import 20 VUs × 1000 iters) so results stay comparable to
+# the published report. The `vus` / `duration` inputs are therefore ADVISORY:
+# k6 uses the script's scenario when one is present and only honours the CLI
+# overrides for a script that defines none. Change the scenarios upstream (or
+# fork the scripts) if you need a different load shape for a comparable run.
+#
+# Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
+#   • Rust toolchain buildable (clang + lld linker, configured below).
+#   • k6 is auto-installed if not already present.
+#   • Docker reachable via a REMOTE daemon — DOCKER_HOST (TCP endpoint) and
+#     DOCKER_HOST_IP (IP to reach published container ports) secrets wire it up.
+#
+# NOTE: getting numbers that are directly comparable to the public report
+# requires running on hardware matched to the benchmark host (8 vCPU / 30G for
+# the DB, 8 vCPU / 24G for the server). On a smaller self-hosted runner the
+# absolute figures are only meaningful relative to each other; treat them as a
+# smoke test / regression signal until we run on matched hardware.
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: "Storage backend(s) to benchmark"
+        type: choice
+        required: false
+        default: all
+        options:
+          - all
+          - sqlite
+          - postgres
+      tests:
+        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search)"
+        required: false
+        default: "all"
+      vus:
+        description: "Advisory VUs override (only applies to suites without a fixed scenario)"
+        required: false
+        default: ""
+      duration:
+        description: "Advisory duration override (e.g. 30s, 1m — see header note)"
+        required: false
+        default: ""
+      run_id:
+        description: "Run ID tag to group this run's suites (default: GitHub run id)"
+        required: false
+        default: ""
+
+# Self-hosted runner has finite Docker port and disk capacity; superseded
+# runs on the same branch yield to fresh ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  # Remote Docker daemon wiring — postgres + tgz containers run here, and the
+  # runner reaches their published ports via DOCKER_HOST_IP.
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  # Pin the benchmark repo/ref so a run is reproducible.
+  BENCHMARK_REPO: HealthSamurai/fhir-server-performance-benchmark
+  BENCHMARK_REF: main
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Resolve the `backend` input into a job matrix. Each leg carries the HFS
+  # server port — distinct per backend so sqlite (8081) and postgres (8082)
+  # can run concurrently on the same self-hosted runner.
+  # ────────────────────────────────────────────────────────────────────────────
+  setup:
+    name: Resolve backend matrix
+    runs-on: [self-hosted, Linux]
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Resolve matrix from backend input
+        id: matrix
+        run: |
+          case "${{ inputs.backend || 'all' }}" in
+            sqlite)
+              MATRIX='{"include":[{"backend":"sqlite","port":8081}]}' ;;
+            postgres)
+              MATRIX='{"include":[{"backend":"postgres","port":8082}]}' ;;
+            *)
+              MATRIX='{"include":[{"backend":"sqlite","port":8081},{"backend":"postgres","port":8082}]}' ;;
+          esac
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Backend matrix: $MATRIX"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Compile one debug `hfs` binary with BOTH backends linked in — the backend is
+  # selected at runtime via HFS_STORAGE_BACKEND, so a single build serves every
+  # matrix leg. `ui` is dropped so the benchmark exercises the FHIR API only.
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build HFS binary
+    runs-on: [self-hosted, Linux]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust linker (Linux)
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
+            > ~/.cargo/config.toml
+
+      - name: Build debug binary (R4 + sqlite + postgres)
+        run: |
+          cargo build -p helios-hfs \
+            --no-default-features \
+            --features "R4,sqlite,postgres"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-bench-binary-${{ github.run_id }}
+          path: target/debug/hfs
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Run the benchmark suites per backend.
+  # ────────────────────────────────────────────────────────────────────────────
+  benchmark:
+    name: Benchmark (${{ matrix.backend }})
+    needs: [setup, build]
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
+    steps:
+      - name: Checkout HFS
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.BENCHMARK_REPO }}
+          ref: ${{ env.BENCHMARK_REF }}
+          path: fhir-benchmark
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-bench-binary-${{ github.run_id }}
+          path: .
+
+      - name: Make binary executable
+        run: chmod +x ./hfs
+
+      # ── Remote Docker host discovery ─────────────────────────────────────
+      # Containers bind to `-p 0:<port>` so the remote daemon picks a free
+      # host-side port; we read it back via `docker port` and connect through
+      # `$DOCKER_HOST_IP:<port>`. Same pattern as hts-benchmark.yml /
+      # audit-events.yml.
+      - name: Determine runner / Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      # ── tgz bundle server ────────────────────────────────────────────────
+      # The import suite pulls the Synthea `bulk_1k` corpus from this service
+      # (`GET /reset`, `GET /<bundle>.json`). Built from the benchmark repo's
+      # infra/tgz Go server, exactly as the upstream docker-compose does.
+      - name: Build & start tgz bundle server
+        run: |
+          set -euo pipefail
+          TGZ_IMAGE="hfs-bench-tgz:${{ github.run_id }}"
+          TGZ_CONTAINER="hfs-bench-tgz-${{ matrix.backend }}-${{ github.run_id }}"
+          echo "TGZ_CONTAINER=$TGZ_CONTAINER" >> "$GITHUB_ENV"
+
+          docker build -t "$TGZ_IMAGE" fhir-benchmark/infra/tgz
+          docker rm -f "$TGZ_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$TGZ_CONTAINER" -p 0:8080 "$TGZ_IMAGE" \
+            "https://storage.googleapis.com/aidbox-public/synthea/performance/bulk_1k.tar.gz" >/dev/null
+
+          echo "Waiting for tgz bundle server..."
+          TGZ_PORT=""
+          for i in $(seq 1 60); do
+            TGZ_PORT=$(docker port "$TGZ_CONTAINER" 8080 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$TGZ_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$TGZ_PORT/hospitalInformation.json" -o /dev/null 2>/dev/null; then
+              echo "tgz ready on $DOCKER_HOST_IP:$TGZ_PORT after $((i * 2))s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "ERROR: tgz bundle server did not become ready (still downloading corpus?)"
+              docker logs "$TGZ_CONTAINER" | tail -50 || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "BUNDLE_URL=http://$DOCKER_HOST_IP:$TGZ_PORT" >> "$GITHUB_ENV"
+
+      # ── Backend wiring ───────────────────────────────────────────────────
+      - name: Configure backend env
+        run: |
+          echo "HFS_STORAGE_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
+          if [ "${{ matrix.backend }}" = "sqlite" ]; then
+            DB_PATH="$GITHUB_WORKSPACE/fhir-bench.db"
+            rm -f "$DB_PATH"
+            echo "HFS_DATABASE_URL=$DB_PATH" >> "$GITHUB_ENV"
+            echo "SQLite DB: $DB_PATH"
+          else
+            PG_CONTAINER="hfs-bench-pg-${{ github.run_id }}"
+            echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+            echo "Container name: $PG_CONTAINER"
+          fi
+
+      - name: Start ephemeral Postgres
+        if: matrix.backend == 'postgres'
+        run: |
+          set -euo pipefail
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          # Tuning approximates the benchmark's infra/postgres/postgres.conf.
+          # shared_buffers/effective_cache_size are scaled DOWN from the
+          # published values (10G/25G) to fit a typical self-hosted runner;
+          # bump them (and the runner) to match the benchmark host for numbers
+          # that are directly comparable to the public report. `--shm-size`
+          # must exceed shared_buffers.
+          docker run -d \
+            --name "$PG_CONTAINER" \
+            --shm-size=4g \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_DB=postgres \
+            -p 0:5432 \
+            postgres:18 \
+            -c max_connections=1000 \
+            -c shared_buffers=2GB \
+            -c effective_cache_size=6GB \
+            -c work_mem=10MB \
+            -c maintenance_work_mem=256MB \
+            -c max_wal_size=1GB \
+            -c random_page_cost=1.1 \
+            -c effective_io_concurrency=200 \
+            -c max_worker_processes=8 \
+            -c max_parallel_workers=6 \
+            -c max_parallel_workers_per_gather=4 >/dev/null
+
+          echo "Waiting for Postgres to accept connections..."
+          PG_PORT=""
+          for i in $(seq 1 30); do
+            if docker exec "$PG_CONTAINER" pg_isready -U postgres -d postgres >/dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if [ -n "$PG_PORT" ] && timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "Postgres ready on $DOCKER_HOST_IP:$PG_PORT after $((i * 2))s"
+                break
+              fi
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: Postgres did not become reachable within 60s"
+              docker logs "$PG_CONTAINER" | tail -100 || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+          echo "HFS_DATABASE_URL=postgresql://postgres:postgres@$DOCKER_HOST_IP:$PG_PORT/postgres" >> "$GITHUB_ENV"
+
+      # ── Tools (k6) ───────────────────────────────────────────────────────
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+
+      # ── Server ───────────────────────────────────────────────────────────
+      - name: Kill any leftover process on port ${{ matrix.port }}
+        run: fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+
+      - name: Start HFS server
+        run: |
+          # HFS_STORAGE_BACKEND + HFS_DATABASE_URL already exported. init_schema()
+          # runs on startup, so an empty Postgres DB / fresh SQLite file is fine.
+          HFS_SERVER_HOST="127.0.0.1" \
+          HFS_SERVER_PORT="${{ matrix.port }}" \
+          HFS_LOG_LEVEL="info" \
+            ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
+
+          echo "HFS_PID=$!" >> "$GITHUB_ENV"
+
+          echo "Waiting for HFS to become ready..."
+          for i in $(seq 1 60); do
+            if curl -sf "http://localhost:${{ matrix.port }}/metadata" -o /dev/null 2>/dev/null; then
+              echo "HFS ready after $((i * 2))s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "ERROR: HFS did not start within 120s"
+              cat "/tmp/hfs-bench-${{ matrix.backend }}.log"
+              exit 1
+            fi
+            sleep 2
+          done
+
+      # ── Benchmark ────────────────────────────────────────────────────────
+      - name: Run benchmark suites
+        working-directory: fhir-benchmark
+        run: |
+          set -uo pipefail
+          RUN_ID="${{ inputs.run_id }}"
+          [ -z "$RUN_ID" ] && RUN_ID="${{ github.run_id }}"
+
+          RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}"
+          mkdir -p "$RESULTS_DIR"
+
+          # Resolve suite list. 'search' needs data, so 'import' must precede it;
+          # canonical order keeps that invariant for the 'all' case.
+          CANONICAL="prewarm import crud search"
+          INPUT_TESTS="${{ inputs.tests || 'all' }}"
+          if [ "$INPUT_TESTS" = "all" ]; then
+            SUITES="$CANONICAL"
+          else
+            SUITES=$(echo "$INPUT_TESTS" | tr ',' ' ')
+          fi
+
+          # Advisory overrides (see header note — ignored when a script pins a scenario).
+          EXTRA_ARGS=""
+          [ -n "${{ inputs.vus }}" ]      && EXTRA_ARGS="$EXTRA_ARGS --vus ${{ inputs.vus }}"
+          [ -n "${{ inputs.duration }}" ] && EXTRA_ARGS="$EXTRA_ARGS --duration ${{ inputs.duration }}"
+
+          for SUITE in $SUITES; do
+            SUITE="${SUITE// /}"
+            [ -z "$SUITE" ] && continue
+            SCRIPT="k6/${SUITE}.js"
+            if [ ! -f "$SCRIPT" ]; then
+              echo "Skip '$SUITE' — $SCRIPT not found"
+              continue
+            fi
+
+            echo "=================================================="
+            echo "Suite: $SUITE   backend: ${{ matrix.backend }}   run: $RUN_ID"
+            echo "=================================================="
+            k6 run \
+              --no-usage-report \
+              --tag runid="$RUN_ID" \
+              --tag fhirimpl=hfs \
+              --env BASE_URL="http://localhost:${{ matrix.port }}" \
+              --env BUNDLE_URL="$BUNDLE_URL" \
+              --env FHIRIMPL=hfs \
+              --summary-export "$RESULTS_DIR/${SUITE}.json" \
+              $EXTRA_ARGS \
+              "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
+          done
+
+      # ── Summary ──────────────────────────────────────────────────────────
+      - name: Generate step summary
+        if: always()
+        run: |
+          {
+            echo "## FHIR Benchmark — \`${{ github.ref_name }}\` (${{ matrix.backend }})"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Commit**  | \`$(echo '${{ github.sha }}' | cut -c1-7)\` |"
+            echo "| **Backend** | \`${{ matrix.backend }}\` |"
+            echo "| **Suites**  | ${{ inputs.tests || 'all' }} |"
+            echo ""
+
+            python3 - <<'PYEOF'
+          import json, glob, os, sys
+
+          results_dir = os.path.join(os.environ["GITHUB_WORKSPACE"], "bench-results", "${{ matrix.backend }}")
+          files = sorted(glob.glob(f"{results_dir}/*.json"))
+
+          if not files:
+              print("### Results\n\n_No summary files were produced._")
+              sys.exit(0)
+
+          print("### Results\n")
+          print("| Suite | RPS | p50 ms | p95 ms | p99 ms | Err% |")
+          print("|-------|----:|-------:|-------:|-------:|-----:|")
+          for f in files:
+              suite = os.path.basename(f).replace('.json', '')
+              try:
+                  with open(f) as fh:
+                      d = json.load(fh)
+              except Exception as e:
+                  print(f"| {suite} | _parse error: {e}_ | | | | |")
+                  continue
+              m = d.get('metrics', {})
+              rps = m.get('http_reqs', {}).get('rate', 0)
+              dur = m.get('http_req_duration', {})
+              p50 = dur.get('med', 0)
+              p95 = dur.get('p(95)', 0)
+              p99 = dur.get('p(99)', 0)
+              err = m.get('http_req_failed', {}).get('rate', 0) * 100
+              err_fmt = f"**{err:.1f}%**" if err > 1 else f"{err:.1f}%"
+              print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} |")
+          PYEOF
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Artifacts ────────────────────────────────────────────────────────
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-benchmark-${{ matrix.backend }}-${{ github.run_id }}
+          path: bench-results/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-server-log-${{ matrix.backend }}-${{ github.run_id }}
+          path: /tmp/hfs-bench-${{ matrix.backend }}.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ── Cleanup ──────────────────────────────────────────────────────────
+      - name: Stop HFS server
+        if: always()
+        run: |
+          if [ -n "${HFS_PID:-}" ]; then
+            kill "$HFS_PID" 2>/dev/null || true
+          fi
+          fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+
+      - name: Stop tgz bundle server
+        if: always()
+        run: |
+          if [ -n "${TGZ_CONTAINER:-}" ]; then
+            docker rm -f "$TGZ_CONTAINER" 2>/dev/null || true
+          fi
+
+      - name: Stop ephemeral Postgres
+        if: always() && matrix.backend == 'postgres'
+        run: |
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          fi
