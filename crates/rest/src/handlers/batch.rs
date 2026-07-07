@@ -17,7 +17,7 @@ use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, ResourceStorage,
 };
-use helios_persistence::error::TransactionError;
+use helios_persistence::error::{StorageError, TransactionError};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -290,7 +290,11 @@ where
             Ok((StatusCode::OK, Json(response_bundle)).into_response())
         }
         Err(e) => {
-            let rollback_reason = e.to_string();
+            // Derive a sanitized reason so backend detail carried by a
+            // rolled-back/internal transaction error never reaches the client
+            // response, the audit trail, or the entry outcome. The raw detail is
+            // preserved server-side by the `error!` log below.
+            let (_, _, rollback_reason) = transaction_error_response_parts(&e);
             let rollback_result =
                 create_error_result(500, &format!("Transaction rolled back: {rollback_reason}"));
             for (orig_idx, entry, _) in &indexed_entries {
@@ -370,7 +374,10 @@ where
             {
                 Ok(Some(stored)) => BundleEntryResult::ok(stored),
                 Ok(None) => create_error_result(404, "Resource not found"),
-                Err(e) => create_error_result(500, &e.to_string()),
+                Err(e) => {
+                    let (status, message) = entry_error(e);
+                    create_error_result(status, &message)
+                }
             }
         }
         "POST" => {
@@ -394,7 +401,10 @@ where
                 .await
             {
                 Ok(stored) => BundleEntryResult::created(stored),
-                Err(e) => create_error_result(400, &e.to_string()),
+                Err(e) => {
+                    let (status, message) = entry_error(e);
+                    create_error_result(status, &message)
+                }
             }
         }
         "PUT" => {
@@ -428,7 +438,10 @@ where
                         result
                     }
                 }
-                Err(e) => create_error_result(400, &e.to_string()),
+                Err(e) => {
+                    let (status, message) = entry_error(e);
+                    create_error_result(status, &message)
+                }
             }
         }
         "DELETE" => {
@@ -439,7 +452,10 @@ where
                 .await
             {
                 Ok(()) => BundleEntryResult::deleted(),
-                Err(e) => create_error_result(404, &e.to_string()),
+                Err(e) => {
+                    let (status, message) = entry_error(e);
+                    create_error_result(status, &message)
+                }
             }
         }
         _ => {
@@ -686,10 +702,16 @@ fn status_text(code: &str) -> &'static str {
         "201" => "Created",
         "204" => "No Content",
         "400" => "Bad Request",
+        "401" => "Unauthorized",
+        "403" => "Forbidden",
         "404" => "Not Found",
         "405" => "Method Not Allowed",
+        "406" => "Not Acceptable",
         "409" => "Conflict",
+        "410" => "Gone",
         "412" => "Precondition Failed",
+        "415" => "Unsupported Media Type",
+        "422" => "Unprocessable Entity",
         "500" => "Internal Server Error",
         "501" => "Not Implemented",
         _ => "Unknown",
@@ -881,18 +903,37 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
     None
 }
 
-/// Converts a TransactionError to an HTTP response with OperationOutcome.
-fn transaction_error_to_response(err: TransactionError) -> RestResult<Response> {
-    let (status_code, issue_code, message) = match &err {
+/// Derives a sanitized `(status, message)` for a batch/transaction entry
+/// OperationOutcome from a storage error.
+///
+/// Reuses [`RestError`]'s client-facing mapping so backend/internal detail is
+/// never leaked to callers (and is logged server-side) while safe classes keep
+/// their specific, actionable message and correct HTTP status.
+fn entry_error(err: StorageError) -> (u16, String) {
+    let (status, _code, message) = RestError::from(err).client_response();
+    (status.as_u16(), message)
+}
+
+/// Computes the sanitized `(status, issue code, message)` for a failed
+/// transaction.
+///
+/// Status codes and issue codes preserve the FHIR mapping used for the overall
+/// transaction response. Only the rolled-back case is sanitized: its `reason`
+/// can embed raw backend/driver/SQL detail, so it is collapsed to a generic
+/// message (the raw detail is logged separately by the caller). Validation,
+/// conditional-match, timeout, and not-supported errors keep their specific,
+/// non-sensitive message.
+fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'static str, String) {
+    match err {
         TransactionError::BundleError { index, message } => (
             StatusCode::BAD_REQUEST,
             "processing",
             format!("Transaction failed at entry {}: {}", index, message),
         ),
-        TransactionError::RolledBack { reason } => (
+        TransactionError::RolledBack { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "transient",
-            format!("Transaction rolled back: {}", reason),
+            "The transaction could not be completed and was rolled back.".to_string(),
         ),
         TransactionError::Timeout { timeout_ms } => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -919,7 +960,12 @@ fn transaction_error_to_response(err: TransactionError) -> RestResult<Response> 
             "not-supported",
             format!("Isolation level '{}' is not supported", level),
         ),
-    };
+    }
+}
+
+/// Converts a TransactionError to an HTTP response with OperationOutcome.
+fn transaction_error_to_response(err: TransactionError) -> RestResult<Response> {
+    let (status_code, issue_code, message) = transaction_error_response_parts(&err);
 
     let outcome = serde_json::json!({
         "resourceType": "OperationOutcome",
@@ -1048,6 +1094,69 @@ mod tests {
             }
         }
         details
+    }
+
+    #[test]
+    fn test_entry_error_sanitizes_backend_detail() {
+        // A backend/internal storage error whose Display embeds sensitive DB
+        // detail (table/column names, SQL fragments) must be collapsed to the
+        // generic client message with a 5xx status.
+        use helios_persistence::error::BackendError;
+
+        let raw_detail = "query execution failed: table \"resources\" column x does not exist";
+        let err = StorageError::Backend(BackendError::QueryError {
+            message: raw_detail.to_string(),
+        });
+
+        let (status, message) = entry_error(err);
+        assert_eq!(status, 500);
+        assert!(
+            !message.contains("resources"),
+            "entry outcome leaked raw backend detail: {message}"
+        );
+        assert!(
+            !message.contains("column x"),
+            "entry outcome leaked raw backend detail: {message}"
+        );
+        assert_eq!(
+            message,
+            "An internal error occurred while processing the request."
+        );
+    }
+
+    #[test]
+    fn test_entry_error_preserves_not_found() {
+        // Safe error classes keep their specific message and correct status.
+        use helios_persistence::error::ResourceError;
+
+        let err = StorageError::Resource(ResourceError::NotFound {
+            resource_type: "Patient".to_string(),
+            id: "123".to_string(),
+        });
+
+        let (status, message) = entry_error(err);
+        assert_eq!(status, 404);
+        assert!(message.contains("Patient/123"), "message was: {message}");
+    }
+
+    #[test]
+    fn test_transaction_rollback_reason_is_sanitized() {
+        // The rolled-back reason from the persistence layer can carry backend
+        // detail; it must not appear in the transaction response/audit text.
+        let raw_detail = "connection failed to postgres: password authentication failed";
+        let err = TransactionError::RolledBack {
+            reason: raw_detail.to_string(),
+        };
+        let (status, _code, message) = transaction_error_response_parts(&err);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !message.contains("password"),
+            "rollback text leaked raw backend detail: {message}"
+        );
+        assert!(
+            !message.contains("postgres"),
+            "leaked backend name: {message}"
+        );
     }
 
     #[tokio::test]

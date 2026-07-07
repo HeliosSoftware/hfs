@@ -21,6 +21,7 @@ pub mod bulk_export;
 pub mod bulk_submit;
 pub mod capabilities;
 pub mod compartment;
+pub mod console_metrics;
 pub mod create;
 pub mod delete;
 pub mod health;

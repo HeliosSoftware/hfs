@@ -517,6 +517,10 @@ impl ResourceStorage for MongoBackend {
         "mongodb"
     }
 
+    fn is_cluster_shared(&self) -> bool {
+        true
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::mongodb::MongoInDbRunner;
         // Native in-DB runner: compiles the ViewDefinition to an aggregation
@@ -1159,6 +1163,211 @@ impl ResourceStorage for MongoBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))
     }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let since_bson = BsonDateTime::from_millis(since.timestamp_millis());
+
+        // Bucket on the server: `$match` narrows to this tenant/type/window
+        // (covered by the `(tenant_id, last_updated)` index), then `$group`
+        // collapses to one document per UTC calendar day. `$dateToString` with an
+        // explicit UTC timezone keeps day boundaries consistent with the SQL
+        // backends.
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": { "$dateToString": {
+                    "format": "%Y-%m-%d",
+                    "date": "$last_updated",
+                    "timezone": "UTC",
+                }},
+                "n": { "$sum": 1 },
+            }},
+            doc! { "$sort": { "_id": 1 } },
+        ];
+
+        let mut cursor = resources
+            .aggregate(pipeline)
+            .await
+            .map_err(|e| internal_error(format!("Failed to aggregate count_by_day: {}", e)))?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("count_by_day cursor advance: {}", e)))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("count_by_day cursor deserialize: {}", e)))?;
+            let day_str = doc.get_str("_id").unwrap_or_default();
+            // `$sum: 1` yields an int32 unless it overflows into int64.
+            let n = doc
+                .get_i32("n")
+                .map(i64::from)
+                .or_else(|_| doc.get_i64("n"))
+                .unwrap_or(0);
+            if let Ok(day) = chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d") {
+                out.push(crate::core::DailyResourceCount {
+                    day,
+                    count: n.max(0) as u64,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<crate::core::ActivityCell>> {
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let since_bson = BsonDateTime::from_millis(since.timestamp_millis());
+
+        // `$dayOfWeek` returns 1=Sunday..7=Saturday and `$hour` 0..23, both in the
+        // requested timezone. We subtract 1 from the weekday below to land on the
+        // 0=Sunday..6=Saturday convention shared with the SQL backends.
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": {
+                    "wd": { "$dayOfWeek": { "date": "$last_updated", "timezone": "UTC" } },
+                    "hr": { "$hour": { "date": "$last_updated", "timezone": "UTC" } },
+                },
+                "n": { "$sum": 1 },
+            }},
+        ];
+
+        let mut cursor = history.aggregate(pipeline).await.map_err(|e| {
+            internal_error(format!("Failed to aggregate activity histogram: {}", e))
+        })?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("activity cursor advance: {}", e)))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("activity cursor deserialize: {}", e)))?;
+            let id = match doc.get_document("_id") {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let wd = id.get_i32("wd").unwrap_or(1); // 1=Sunday..7=Saturday
+            let hr = id.get_i32("hr").unwrap_or(0);
+            let n = doc
+                .get_i32("n")
+                .map(i64::from)
+                .or_else(|_| doc.get_i64("n"))
+                .unwrap_or(0);
+            out.push(crate::core::ActivityCell {
+                weekday: (wd - 1).clamp(0, 6) as u8,
+                hour: hr.clamp(0, 23) as u8,
+                count: n.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let pipeline = vec![
+            doc! { "$match": { "tenant_id": tenant_id, "is_deleted": false } },
+            doc! { "$group": { "_id": "$resource_type", "n": { "$sum": 1 } } },
+        ];
+        grouped_string_counts(resources, pipeline).await
+    }
+
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        // Nothing to match; avoid an empty `$in` round-trip.
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        // Same filters as `count_all_types` plus a `resource_type IN (...)` restriction.
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "is_deleted": false,
+                "resource_type": { "$in": resource_types.to_vec() },
+            }},
+            doc! { "$group": { "_id": "$resource_type", "n": { "$sum": 1 } } },
+        ];
+        grouped_string_counts(resources, pipeline).await
+    }
+
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let pipeline = vec![
+            doc! { "$match": { "is_deleted": false } },
+            doc! { "$group": { "_id": "$tenant_id", "n": { "$sum": 1 } } },
+        ];
+        grouped_string_counts(resources, pipeline).await
+    }
+}
+
+/// Runs a `$group`-by-string aggregation and collects `(_id, n)` pairs, where
+/// `_id` is a string key and `n` a `$sum` count. Shared by `count_all_types`
+/// and `count_by_tenant`.
+async fn grouped_string_counts(
+    collection: mongodb::Collection<Document>,
+    pipeline: Vec<Document>,
+) -> StorageResult<Vec<(String, u64)>> {
+    let mut cursor = collection
+        .aggregate(pipeline)
+        .await
+        .map_err(|e| internal_error(format!("Failed to aggregate grouped counts: {}", e)))?;
+    let mut out = Vec::new();
+    while cursor
+        .advance()
+        .await
+        .map_err(|e| internal_error(format!("grouped counts cursor advance: {}", e)))?
+    {
+        let doc = cursor
+            .deserialize_current()
+            .map_err(|e| internal_error(format!("grouped counts cursor deserialize: {}", e)))?;
+        let key = doc.get_str("_id").unwrap_or_default().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let n = doc
+            .get_i32("n")
+            .map(i64::from)
+            .or_else(|_| doc.get_i64("n"))
+            .unwrap_or(0);
+        out.push((key, n.max(0) as u64));
+    }
+    Ok(out)
 }
 
 impl MongoBackend {

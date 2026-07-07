@@ -1186,6 +1186,174 @@ mod postgres_integration {
     }
 
     // ========================================================================
+    // Console Dashboard count_* Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn postgres_integration_count_by_types() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-count-by-types");
+
+        // Seed a small deterministic dataset: 2 Patients, 1 Observation.
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let counts = backend
+            .count_by_types(&tenant, &["Patient", "Observation", "Encounter"])
+            .await
+            .unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get("Patient"), Some(&2));
+        assert_eq!(map.get("Observation"), Some(&1));
+        // A type with zero rows is ABSENT from the result, not a 0 row.
+        assert!(!map.contains_key("Encounter"));
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_count_all_types() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-count-all-types");
+
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let counts = backend.count_all_types(&tenant).await.unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get("Patient"), Some(&2));
+        assert_eq!(map.get("Observation"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_count_by_day() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-count-by-day");
+
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // `since` = start of today (UTC midnight), built the same way the handler
+        // does; `today` is derived from the same clock so this stays date-robust.
+        let since = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let today = chrono::Utc::now().date_naive();
+
+        let rows = backend
+            .count_by_day(&tenant, "Patient", since)
+            .await
+            .unwrap();
+        let today_row = rows
+            .iter()
+            .find(|r| r.day == today)
+            .expect("today bucket should be present");
+        assert_eq!(today_row.count, 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_activity_histogram() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-activity-histogram");
+
+        // 3 writes for this tenant -> 3 resource_history rows.
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let since = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+
+        let cells = backend.activity_histogram(&tenant, since).await.unwrap();
+        assert!(!cells.is_empty());
+        // Total across returned cells equals the number of writes seeded.
+        let total: u64 = cells.iter().map(|c| c.count).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_console_count_by_tenant() {
+        let backend = create_backend().await;
+        // Unique tenant IDs isolate this cross-tenant aggregate from every other
+        // test sharing the same PostgreSQL container.
+        let tenant_a = create_tenant("console-count-by-tenant-a");
+        let tenant_b = create_tenant("console-count-by-tenant-b");
+
+        // tenant-a: 3 resources, tenant-b: 2 resources.
+        backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_b, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // Cross-tenant admin aggregate: takes NO TenantContext. Look up by the
+        // actual (uuid-suffixed) tenant IDs so other tests' rows never interfere.
+        let counts = backend.count_by_tenant().await.unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get(tenant_a.tenant_id().as_str()), Some(&3));
+        assert_eq!(map.get(tenant_b.tenant_id().as_str()), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_is_cluster_shared() {
+        let backend = create_backend().await;
+        assert!(backend.is_cluster_shared());
+    }
+
+    // ========================================================================
     // Batch Read Tests
     // ========================================================================
 
