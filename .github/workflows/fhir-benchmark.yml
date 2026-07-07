@@ -75,6 +75,10 @@ on:
         description: "Run ID tag to group this run's suites (default: GitHub run id)"
         required: false
         default: ""
+      log_level:
+        description: "HFS_LOG_LEVEL (use 'debug' to log search query params when diagnosing 500s)"
+        required: false
+        default: "info"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -338,7 +342,7 @@ jobs:
           # Pin it explicitly so coverage never depends on the process CWD.
           HFS_SERVER_HOST="127.0.0.1" \
           HFS_SERVER_PORT="${{ matrix.port }}" \
-          HFS_LOG_LEVEL="info" \
+          HFS_LOG_LEVEL="${{ inputs.log_level || 'info' }}" \
           HFS_MAX_BODY_SIZE="209715200" \
           HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
             ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
@@ -380,6 +384,10 @@ jobs:
           RUN_ID="${{ inputs.run_id }}"
           [ -z "$RUN_ID" ] && RUN_ID="${{ github.run_id }}"
 
+          # Checkout uses clean:false, so wipe any results left by a prior run on
+          # this runner (otherwise a stale sibling backend dir rides along in the
+          # uploaded artifact).
+          rm -rf "$GITHUB_WORKSPACE/bench-results"
           RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}"
           mkdir -p "$RESULTS_DIR"
 
@@ -417,6 +425,7 @@ jobs:
               --env BASE_URL="http://localhost:${{ matrix.port }}" \
               --env BUNDLE_URL="$BUNDLE_URL" \
               --env FHIRIMPL=hfs \
+              --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
               --summary-export "$RESULTS_DIR/${SUITE}.json" \
               $EXTRA_ARGS \
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
@@ -447,15 +456,15 @@ jobs:
               sys.exit(0)
 
           print("### Results\n")
-          print("| Suite | RPS | p50 ms | p95 ms | p99 ms | Err% |")
-          print("|-------|----:|-------:|-------:|-------:|-----:|")
+          print("| Suite | RPS | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |")
+          print("|-------|----:|-------:|-------:|-------:|-----:|-----------:|")
           for f in files:
               suite = os.path.basename(f).replace('.json', '')
               try:
                   with open(f) as fh:
                       d = json.load(fh)
               except Exception as e:
-                  print(f"| {suite} | _parse error: {e}_ | | | | |")
+                  print(f"| {suite} | _parse error: {e}_ | | | | | |")
                   continue
               m = d.get('metrics', {})
               rps = m.get('http_reqs', {}).get('rate', 0)
@@ -463,9 +472,15 @@ jobs:
               p50 = dur.get('med', 0)
               p95 = dur.get('p(95)', 0)
               p99 = dur.get('p(99)', 0)
-              err = m.get('http_req_failed', {}).get('rate', 0) * 100
+              # http_req_failed is a k6 Rate metric: the fraction lives in `value`,
+              # NOT `rate` (which only exists on Counter metrics like http_reqs).
+              err = m.get('http_req_failed', {}).get('value', 0) * 100
               err_fmt = f"**{err:.1f}%**" if err > 1 else f"{err:.1f}%"
-              print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} |")
+              chk = m.get('checks', {})
+              chk_fmt = f"{chk.get('passes', 0):,}/{chk.get('fails', 0):,}"
+              if chk.get('fails', 0) > 0:
+                  chk_fmt = f"**{chk_fmt}**"
+              print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
           PYEOF
           } >> "$GITHUB_STEP_SUMMARY"
 
