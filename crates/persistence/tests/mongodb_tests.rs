@@ -1619,7 +1619,7 @@ async fn mongodb_integration_compartment_search() {
 
 #[tokio::test]
 async fn mongodb_integration_search_token_string_and_offset_pagination() {
-    let Some(backend) = create_backend("search_token_string").await else {
+    let Some(backend) = create_backend_with_full_registry("search_token_string").await else {
         eprintln!(
             "Skipping mongodb_integration_search_token_string_and_offset_pagination (requires Docker or HFS_TEST_MONGODB_URL)"
         );
@@ -1757,7 +1757,7 @@ async fn mongodb_integration_search_cursor_pagination_roundtrip() {
 
 #[tokio::test]
 async fn mongodb_integration_conditional_create_exists() {
-    let Some(backend) = create_backend("conditional_create").await else {
+    let Some(backend) = create_backend_with_full_registry("conditional_create").await else {
         eprintln!(
             "Skipping mongodb_integration_conditional_create_exists (requires Docker or HFS_TEST_MONGODB_URL)"
         );
@@ -1809,7 +1809,7 @@ async fn mongodb_integration_conditional_create_exists() {
 
 #[tokio::test]
 async fn mongodb_integration_conditional_update_delete_and_no_match() {
-    let Some(backend) = create_backend("conditional_update_delete").await else {
+    let Some(backend) = create_backend_with_full_registry("conditional_update_delete").await else {
         eprintln!(
             "Skipping mongodb_integration_conditional_update_delete_and_no_match (requires Docker or HFS_TEST_MONGODB_URL)"
         );
@@ -1887,7 +1887,8 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
 
 #[tokio::test]
 async fn mongodb_integration_conditional_create_multiple_matches() {
-    let Some(backend) = create_backend("conditional_multiple_matches").await else {
+    let Some(backend) = create_backend_with_full_registry("conditional_multiple_matches").await
+    else {
         eprintln!(
             "Skipping mongodb_integration_conditional_create_multiple_matches (requires Docker or HFS_TEST_MONGODB_URL)"
         );
