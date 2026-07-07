@@ -324,9 +324,23 @@ jobs:
         run: |
           # HFS_STORAGE_BACKEND + HFS_DATABASE_URL already exported. init_schema()
           # runs on startup, so an empty Postgres DB / fresh SQLite file is fine.
+          #
+          # HFS_MAX_BODY_SIZE: the Synthea import bundles run to several MB each,
+          # over the 10 MB default (measured post-decompression). Aidbox is
+          # configured for a 200 MB ceiling in the benchmark (BOX_WEB_MAX_BODY),
+          # so match that here — otherwise large bundles 413 and the import suite
+          # fails. There is no per-entry cap in HFS, only this byte limit.
+          #
+          # HFS_DATA_DIR: full search-parameter coverage is loaded at startup from
+          # <data_dir>/search-parameters-r4.json (2.2 MB, checked into the repo).
+          # If that file isn't found, search silently degrades to ~9 global params
+          # (only a warning is logged) and nearly every search scenario breaks.
+          # Pin it explicitly so coverage never depends on the process CWD.
           HFS_SERVER_HOST="127.0.0.1" \
           HFS_SERVER_PORT="${{ matrix.port }}" \
           HFS_LOG_LEVEL="info" \
+          HFS_MAX_BODY_SIZE="209715200" \
+          HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
             ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
 
           echo "HFS_PID=$!" >> "$GITHUB_ENV"
@@ -344,6 +358,19 @@ jobs:
             fi
             sleep 2
           done
+
+      # Guard against the silent search-parameter degrade (see HFS_DATA_DIR note):
+      # if the spec bundle didn't load, HFS logs a "minimal fallback" warning and
+      # nearly every search scenario would return empty/incorrect results. Surface
+      # it loudly rather than let the search suite look mysteriously fast.
+      - name: Assert search parameters loaded
+        run: |
+          if grep -qiE "minimal fallback|Could not load spec SearchParameters" "/tmp/hfs-bench-${{ matrix.backend }}.log"; then
+            echo "::warning::HFS fell back to minimal search parameters — search suite results are NOT representative. Check HFS_DATA_DIR / data/search-parameters-r4.json."
+            grep -iE "minimal fallback|Could not load spec SearchParameters" "/tmp/hfs-bench-${{ matrix.backend }}.log" || true
+          else
+            echo "Search parameters loaded from spec bundle."
+          fi
 
       # ── Benchmark ────────────────────────────────────────────────────────
       - name: Run benchmark suites
