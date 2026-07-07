@@ -25,7 +25,7 @@ use helios_audit::{
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
-use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode, init_logging};
+use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::info;
 
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
@@ -563,8 +563,20 @@ async fn serve(
     config: &ServerConfig,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
+    #[cfg(all(feature = "ui", not(feature = "headless")))]
+    let app = helios_ui::mount(app, env!("CARGO_PKG_VERSION"));
+
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
+
+    // Observability: expose `/metrics` (outside the auth layer, so scrapers
+    // need no token) and instrument every request with metrics + a trace span.
+    let app = app
+        .merge(helios_observability::metrics::router())
+        .layer(axum::middleware::from_fn(
+            helios_observability::middleware::track,
+        ));
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     axum::serve(listener, app)
@@ -575,6 +587,8 @@ async fn serve(
                 lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
                 state.sink.flush().await;
             }
+            // Flush any buffered OTLP spans (no-op without the `otel` feature).
+            helios_observability::telemetry::shutdown();
         })
         .await?;
     Ok(())
@@ -589,6 +603,7 @@ async fn serve(
 /// returns `(config, None)`.
 async fn init_auth_with_audit(
     audit_sink: Arc<dyn AuditSink>,
+    tenant_url_routing: bool,
 ) -> anyhow::Result<(AuthConfig, Option<Arc<AuthMiddlewareState>>)> {
     let auth_config = AuthConfig::from_env();
 
@@ -664,6 +679,7 @@ async fn init_auth_with_audit(
         audit_sink,
         audit_source_observer: audit_config.source_observer.clone(),
         audit_exclusion_filter: ExclusionFilter::new(audit_config.exclusions.clone()),
+        tenant_url_routing,
     });
 
     Ok((auth_config, Some(auth_state)))
@@ -749,7 +765,9 @@ async fn main() -> anyhow::Result<()> {
     // sub-structs — both `#[arg(skip)]` for clap — are populated from
     // their `HFS_*` environment variables.
     let config = ServerConfig::from_env();
-    init_logging(&config.log_level);
+    helios_observability::uptime::init();
+    helios_observability::telemetry::init("hfs", &config.log_level);
+    helios_observability::metrics::init("hfs");
 
     if let Err(errors) = config.validate() {
         for error in &errors {
@@ -781,7 +799,11 @@ async fn main() -> anyhow::Result<()> {
     let (audit_sink, audit_state) = init_audit(&config, backend_mode).await?;
 
     // Initialize authentication (with audit bridge if audit is enabled)
-    let (auth_config, auth_state) = init_auth_with_audit(audit_sink).await?;
+    let (auth_config, auth_state) = init_auth_with_audit(
+        audit_sink,
+        config.multitenancy.routing_mode.supports_url_path(),
+    )
+    .await?;
 
     let audit_config = AuditConfig::from_env();
 

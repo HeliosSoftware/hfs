@@ -64,6 +64,10 @@ impl ResourceStorage for PostgresBackend {
         "postgres"
     }
 
+    fn is_cluster_shared(&self) -> bool {
+        true
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::postgres::PgInDbRunner;
         Some(std::sync::Arc::new(PgInDbRunner::new(self.pool())))
@@ -465,6 +469,172 @@ impl ResourceStorage for PostgresBackend {
         };
 
         Ok(count as u64)
+    }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // `last_updated` is `TIMESTAMPTZ`; normalise to UTC before truncating to a
+        // calendar day so buckets are stable regardless of the session time zone.
+        // The `(tenant_id, last_updated)` index supports the `>= $3` range scan.
+        let rows = client
+            .query(
+                "SELECT (last_updated AT TIME ZONE 'UTC')::date AS day, COUNT(*)::bigint AS n \
+                 FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE \
+                   AND last_updated >= $3 \
+                 GROUP BY day ORDER BY day",
+                &[&tenant_id, &resource_type, &since],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count resources by day: {}", e)))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let day: chrono::NaiveDate = row.get(0);
+            let n: i64 = row.get(1);
+            out.push(crate::core::DailyResourceCount {
+                day,
+                count: n.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<crate::core::ActivityCell>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Normalise to UTC, then EXTRACT weekday (DOW: 0=Sunday..6=Saturday) and
+        // hour (0..23) so the grid matches the SQL/Mongo backends and JS's
+        // `Date.getDay()`. The `(tenant_id, last_updated)` history index backs
+        // the `>= $2` range scan.
+        let rows = client
+            .query(
+                "SELECT EXTRACT(DOW FROM (last_updated AT TIME ZONE 'UTC'))::int AS wd, \
+                        EXTRACT(HOUR FROM (last_updated AT TIME ZONE 'UTC'))::int AS hr, \
+                        COUNT(*)::bigint AS n \
+                 FROM resource_history \
+                 WHERE tenant_id = $1 AND last_updated >= $2 \
+                 GROUP BY wd, hr",
+                &[&tenant_id, &since],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to compute activity histogram: {}", e)))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let wd: i32 = row.get(0);
+            let hr: i32 = row.get(1);
+            let n: i64 = row.get(2);
+            out.push(crate::core::ActivityCell {
+                weekday: wd.clamp(0, 6) as u8,
+                hour: hr.clamp(0, 23) as u8,
+                count: n.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT resource_type, COUNT(*)::bigint FROM resources \
+                 WHERE tenant_id = $1 AND is_deleted = FALSE \
+                 GROUP BY resource_type",
+                &[&tenant_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count all types: {}", e)))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rt: String = row.get(0);
+            let n: i64 = row.get(1);
+            out.push((rt, n.max(0) as u64));
+        }
+        Ok(out)
+    }
+
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        // An empty `IN ()` is invalid SQL; nothing to count.
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Bind tenant_id as $1 and each requested type as $2, $3, ...; the type
+        // names are bound as parameters, never interpolated into the SQL text.
+        let placeholders = (0..resource_types.len())
+            .map(|i| format!("${}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT resource_type, COUNT(*)::bigint FROM resources \
+             WHERE tenant_id = $1 AND is_deleted = FALSE AND resource_type IN ({}) \
+             GROUP BY resource_type",
+            placeholders
+        );
+
+        // Owned bind values in $1..$n order: tenant first, then the requested types.
+        let mut query_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            Vec::with_capacity(resource_types.len() + 1);
+        query_params.push(Box::new(tenant_id.to_string()));
+        for rt in resource_types {
+            query_params.push(Box::new(rt.to_string()));
+        }
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = query_params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        let rows = client
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| internal_error(format!("Failed to count by types: {}", e)))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rt: String = row.get(0);
+            let n: i64 = row.get(1);
+            out.push((rt, n.max(0) as u64));
+        }
+        Ok(out)
+    }
+
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT tenant_id, COUNT(*)::bigint FROM resources \
+                 WHERE is_deleted = FALSE GROUP BY tenant_id",
+                &[],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count by tenant: {}", e)))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tid: String = row.get(0);
+            let n: i64 = row.get(1);
+            out.push((tid, n.max(0) as u64));
+        }
+        Ok(out)
     }
 }
 

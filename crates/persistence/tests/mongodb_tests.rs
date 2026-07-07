@@ -927,6 +927,188 @@ async fn mongodb_integration_count_and_batch() {
     assert_eq!(batch.len(), 3);
 }
 
+// ============================================================================
+// Console Dashboard count_* tests
+// ============================================================================
+
+#[tokio::test]
+async fn mongodb_integration_count_by_types() {
+    let Some(backend) = create_backend("console_count_by_types").await else {
+        eprintln!("Skipping mongodb_integration_count_by_types (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-count-by-types");
+
+    // Seed a small deterministic dataset: 2 Patients, 1 Observation.
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+
+    let counts = backend
+        .count_by_types(&tenant, &["Patient", "Observation", "Encounter"])
+        .await
+        .unwrap();
+    let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+    assert_eq!(map.get("Patient"), Some(&2));
+    assert_eq!(map.get("Observation"), Some(&1));
+    // A type with zero rows is ABSENT from the result, not a 0 row.
+    assert!(!map.contains_key("Encounter"));
+}
+
+#[tokio::test]
+async fn mongodb_integration_count_all_types() {
+    let Some(backend) = create_backend("console_count_all_types").await else {
+        eprintln!("Skipping mongodb_integration_count_all_types (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-count-all-types");
+
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+
+    let counts = backend.count_all_types(&tenant).await.unwrap();
+    let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+    assert_eq!(map.get("Patient"), Some(&2));
+    assert_eq!(map.get("Observation"), Some(&1));
+}
+
+#[tokio::test]
+async fn mongodb_integration_count_by_day() {
+    let Some(backend) = create_backend("console_count_by_day").await else {
+        eprintln!("Skipping mongodb_integration_count_by_day (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-count-by-day");
+
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+
+    // `since` = start of today (UTC midnight), built the same way the handler
+    // does; `today` is derived from the same clock so this stays date-robust.
+    let since = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    let today = chrono::Utc::now().date_naive();
+
+    let rows = backend
+        .count_by_day(&tenant, "Patient", since)
+        .await
+        .unwrap();
+    let today_row = rows
+        .iter()
+        .find(|r| r.day == today)
+        .expect("today bucket should be present");
+    assert_eq!(today_row.count, 2);
+}
+
+#[tokio::test]
+async fn mongodb_integration_activity_histogram() {
+    let Some(backend) = create_backend("console_activity_histogram").await else {
+        eprintln!("Skipping mongodb_integration_activity_histogram (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-activity-histogram");
+
+    // 3 writes for this tenant -> 3 resource_history rows.
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Observation", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+
+    let since = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+
+    let cells = backend.activity_histogram(&tenant, since).await.unwrap();
+    assert!(!cells.is_empty());
+    // Total across returned cells equals the number of writes seeded.
+    let total: u64 = cells.iter().map(|c| c.count).sum();
+    assert_eq!(total, 3);
+}
+
+#[tokio::test]
+async fn mongodb_integration_count_by_tenant() {
+    let Some(backend) = create_backend("console_count_by_tenant").await else {
+        eprintln!("Skipping mongodb_integration_count_by_tenant (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    // Each test runs against a freshly-named database, so fixed tenant IDs are
+    // isolated to this test's cross-tenant aggregate.
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_b = create_tenant("tenant-b");
+
+    // tenant-a: 3 resources, tenant-b: 2 resources.
+    backend
+        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant_b, "Observation", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+
+    // Cross-tenant admin aggregate: takes NO TenantContext.
+    let counts = backend.count_by_tenant().await.unwrap();
+    let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+    assert_eq!(map.get("tenant-a"), Some(&3));
+    assert_eq!(map.get("tenant-b"), Some(&2));
+}
+
+#[tokio::test]
+async fn mongodb_integration_is_cluster_shared() {
+    let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+    assert!(backend.is_cluster_shared());
+}
+
 #[tokio::test]
 async fn mongodb_integration_create_or_update() {
     let Some(backend) = create_backend("create_or_update").await else {

@@ -1,0 +1,48 @@
+[package]
+name = "helios-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/observability"
+rust-version.workspace = true
+description = "Shared observability wiring (uptime, Prometheus /metrics, OTLP traces) for Helios servers"
+keywords = ["helios-software", "observability", "prometheus", "opentelemetry", "metrics"]
+categories = ["web-programming"]
+
+[features]
+default = []
+
+# Opt-in OpenTelemetry: OTLP trace export via tracing-opentelemetry. Kept out of
+# the default build because the OTel SDK + tonic stack noticeably increases build
+# time. The Prometheus `/metrics` endpoint and uptime tracking are always built.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
+[dependencies]
+# Web framework (MatchedPath extractor needs the matched-path feature)
+axum = { version = "0.8", features = ["matched-path"] }
+http = "1.0"
+
+# Metrics facade + maintained Prometheus pull exporter
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Date/time for started_at
+chrono.workspace = true
+
+# OpenTelemetry (feature-gated). Versions pinned to a mutually compatible set:
+# core 0.32 / tracing-opentelemetry 0.33 (runs one minor ahead of core).
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }

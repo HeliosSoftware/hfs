@@ -284,8 +284,29 @@ pub async fn build_concept_closure_pg(
 ) -> Result<(), tokio_postgres::Error> {
     use std::collections::{HashMap, VecDeque};
 
-    // Load all concept codes for this system.
-    let concepts: Vec<String> = client
+    // Do the whole build in ONE transaction that first pins the parent
+    // `code_systems` row with `FOR SHARE`. A concurrent `DELETE FROM
+    // code_systems` (e.g. `delete_normalized` removing a CodeSystem, which
+    // cascades to concepts/hierarchy/closure) then blocks until we commit and
+    // can't drop the row mid-build — which would otherwise make the closure
+    // INSERTs below violate `concept_closure_system_id_fkey`. If the row is
+    // already gone, another writer deleted the system first, so there is
+    // nothing to build.
+    let tx = client.transaction().await?;
+    if tx
+        .query_opt(
+            "SELECT 1 FROM code_systems WHERE id = $1 FOR SHARE",
+            &[&system_id],
+        )
+        .await?
+        .is_none()
+    {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    // Load all concept codes for this system (within the locked snapshot).
+    let concepts: Vec<String> = tx
         .query(
             "SELECT code FROM concepts WHERE system_id = $1",
             &[&system_id],
@@ -296,12 +317,12 @@ pub async fn build_concept_closure_pg(
         .collect();
 
     if concepts.is_empty() {
-        client
-            .execute(
-                "DELETE FROM concept_closure WHERE system_id = $1",
-                &[&system_id],
-            )
-            .await?;
+        tx.execute(
+            "DELETE FROM concept_closure WHERE system_id = $1",
+            &[&system_id],
+        )
+        .await?;
+        tx.commit().await?;
         return Ok(());
     }
 
@@ -315,7 +336,7 @@ pub async fn build_concept_closure_pg(
 
     // Build per-node children lists (index-based).
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); concepts.len()];
-    let rows = client
+    let rows = tx
         .query(
             "SELECT parent_code, child_code FROM concept_hierarchy WHERE system_id = $1",
             &[&system_id],
@@ -336,7 +357,6 @@ pub async fn build_concept_closure_pg(
     let mut anc_batch: Vec<&str> = Vec::with_capacity(BATCH);
     let mut des_batch: Vec<&str> = Vec::with_capacity(BATCH);
 
-    let tx = client.transaction().await?;
     tx.execute(
         "DELETE FROM concept_closure WHERE system_id = $1",
         &[&system_id],

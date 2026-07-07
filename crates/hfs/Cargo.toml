@@ -15,7 +15,7 @@ name = "hfs"
 path = "src/main.rs"
 
 [features]
-default = ["R4", "sqlite"]
+default = ["R4", "sqlite", "ui"]
 
 # FHIR version features
 R4 = ["helios-fhir/R4", "helios-rest/R4", "helios-audit/R4"]
@@ -25,6 +25,8 @@ R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-audit/R6"]
 
 # Build options
 skip-r6-download = []
+ui = ["dep:helios-ui"]
+headless = []
 
 # Database backends
 sqlite = ["helios-rest/sqlite"]
@@ -45,6 +47,9 @@ bulk-submit-jwe = ["helios-rest/bulk-submit-jwe"]
 # Cloud audit backends
 cloudwatch = ["helios-audit/cloudwatch"]
 
+# OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
+otel = ["helios-observability/otel"]
+
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }
 
@@ -56,6 +61,8 @@ helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.1" }
 helios-audit = { path = "../audit", version = "0.2.1", default-features = false }
 helios-subscriptions = { path = "../subscriptions", version = "0.2.1", optional = true, default-features = false }
+helios-ui = { path = "../ui", version = "0.2.1", optional = true }
+helios-observability = { path = "../observability", version = "0.2.1" }
 
 # Export job controller
 dashmap = "6"

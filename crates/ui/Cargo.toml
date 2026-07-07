@@ -1,0 +1,43 @@
+[package]
+name = "helios-ui"
+version.workspace = true
+edition.workspace = true
+description = "Optional server-rendered HTMX web UI for the Helios FHIR Server"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/ui"
+keywords = ["helios-software", "fhir", "ui", "htmx"]
+
+[dependencies]
+# Web framework (matches the version used by helios-hfs / helios-rest)
+axum = "0.8"
+
+# Compile-time, type-checked, auto-escaping templates (Jinja2-like).
+# Markup lives in templates/, never in Rust source.
+askama = "0.16"
+
+# Typed htmx header handling: the infallible `HxRequest` extractor for the
+# fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching
+# (`Vary: HX-Request`) so an htmx fragment is never served for a hard navigation.
+axum-htmx = { version = "0.8", features = ["auto-vary"] }
+
+# Static assets (htmx, CSS) embedded into the binary at compile time so the
+# server has no runtime CDN dependency and works in air-gapped deployments.
+# `axum-embed` serves them with precompressed (br/gzip/deflate) negotiation.
+rust-embed = "8"
+axum-embed = "0.1"
+
+# Fluent message catalogs (locales/<locale>/main.ftl at the workspace root),
+# embedded at compile time — same no-runtime-dependency stance as the assets.
+# See docs/multi-language.md for the i18n rules of the road.
+fluent-templates = "0.13"
+unic-langid = { version = "0.9", features = ["macros"] }
+
+[dev-dependencies]
+# Parses the .ftl sources so tests can enforce key-set parity across locales.
+fluent-syntax = "0.11"
+# Drive the mounted router end-to-end (locale middleware included) in tests.
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
