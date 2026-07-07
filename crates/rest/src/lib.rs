@@ -150,6 +150,7 @@ pub mod bulk_export_auth;
 pub mod bulk_submit_fetcher;
 pub mod bulk_submit_oauth;
 pub mod config;
+mod dashboard;
 pub mod error;
 pub mod export;
 pub mod extractors;
@@ -460,6 +461,14 @@ where
 
     // Storage arrives pre-wrapped in an Arc so we can share it with the SofRunner.
     let storage_arc = storage;
+
+    // Register the process-global dashboard data provider so the web UI can
+    // render real per-type resource counts (default tenant) without depending on
+    // the persistence layer. Storage-agnostic consumers read it via
+    // `helios_observability::dashboard::snapshot()`.
+    helios_observability::dashboard::set_provider(Arc::new(
+        dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config),
+    ));
 
     let (app_audit_sink, app_audit_source_observer) = audit_state
         .as_ref()

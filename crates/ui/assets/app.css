@@ -558,6 +558,49 @@ a.nav-item:hover {
   fill: var(--muted);
 }
 
+/* ---------- Chart legend / series selector ---------- */
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chart-legend__item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--surface-shadow);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.chart-legend__item:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.chart-legend__item--active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.chart-legend__total {
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------- Status footer (htmx read path) ---------- */
 
 .status-footer {

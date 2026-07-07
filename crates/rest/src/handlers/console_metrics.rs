@@ -166,64 +166,32 @@ where
     let now = chrono::Utc::now();
     let today = now.date_naive();
     let start_date = today - chrono::Duration::days(days - 1);
-    let since = start_date
-        .and_hms_opt(0, 0, 0)
-        .unwrap_or_default()
-        .and_utc();
-
-    // Fetch all per-type totals in one batched call (backends may serve this
-    // with a single grouped query), instead of one `count()` round-trip per
-    // type. Build a type -> total lookup; a type with no row counts as 0.
+    // Build the per-type cumulative series via the shared helper (also used by
+    // the web UI dashboard provider, so the bucketing semantics live in one
+    // place), then project each series to JSON.
     let type_refs: Vec<&str> = types.iter().map(|t| t.as_str()).collect();
-    let totals_by_type: HashMap<String, u64> = state
-        .storage()
-        .count_by_types(ctx, &type_refs)
-        .await?
-        .into_iter()
-        .collect();
-
-    let mut series = Vec::with_capacity(types.len());
-    for rt in &types {
-        let total = totals_by_type.get(rt.as_str()).copied().unwrap_or(0);
-
-        let buckets = state
-            .storage()
-            .count_by_day(ctx, rt.as_str(), since)
-            .await?;
-
-        // Collapse buckets into a day -> count map, summing only days inside the
-        // window (defensive against any future-dated `last_updated`).
-        let mut by_day: HashMap<chrono::NaiveDate, u64> = HashMap::new();
-        let mut in_window: u64 = 0;
-        for b in &buckets {
-            if b.day >= start_date && b.day <= today {
-                *by_day.entry(b.day).or_insert(0) += b.count;
-                in_window += b.count;
-            }
-        }
-
-        // Resources last updated before the window form the cumulative baseline.
-        let baseline = total.saturating_sub(in_window);
-
-        let mut points = Vec::with_capacity(days as usize);
-        let mut cumulative = baseline;
-        for i in 0..days {
-            let d = start_date + chrono::Duration::days(i);
-            let count = by_day.get(&d).copied().unwrap_or(0);
-            cumulative += count;
-            points.push(json!({
-                "date": d.format("%Y-%m-%d").to_string(),
-                "count": count,
-                "cumulative": cumulative,
-            }));
-        }
-
-        series.push(json!({
-            "resource_type": rt,
-            "total": total,
-            "points": points,
-        }));
-    }
+    let series: Vec<_> =
+        crate::dashboard::resource_count_series(state.storage(), ctx, &type_refs, days, now)
+            .await?
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "resource_type": s.resource_type,
+                    "total": s.total,
+                    "points": s
+                        .points
+                        .into_iter()
+                        .map(|p| {
+                            json!({
+                                "date": p.date,
+                                "count": p.count,
+                                "cumulative": p.cumulative,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
 
     let total_resources = state.storage().count(ctx, None).await?;
 

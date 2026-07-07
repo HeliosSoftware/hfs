@@ -233,7 +233,7 @@ Devitt's book defines nine key questions organizations must answer before choosi
 | **No `$everything` operation** | Ch. 6 — FHIR-native systems where "all queries are FHIR requests" expect standard patient-centric retrieval. | Not planned |
 | **No interceptor/hook framework** | Ch. 1 "Platform Illusion," Appendix I "Proxy/intercept layer" — organizations need to inject business validation, governance rules, and custom logic into the CRUD pipeline. | Not planned |
 | **No Provenance tracking** | Appendix I "Provenance tracking" — important for audit, trust, and multi-source systems. AuditEvent (who did what) is not the same as Provenance (where data came from). | Not planned |
-| **No performance metrics** | Ch. 8 "Performance" — the book insists on POC benchmarking. No Prometheus/OpenTelemetry integration to support this. | Not planned |
+| **Performance metrics** | Ch. 8 "Performance" — the book insists on POC benchmarking. | **Implemented.** `helios-observability` exposes a Prometheus `GET /metrics` endpoint (request counts/latency histograms, uptime) across all servers, with optional OTLP trace export (`otel` feature). Per-type stored-resource counts (default tenant) back the web UI's "FHIR resources over time" dashboard chart via an authenticated console endpoint; tenant is never a metric label. |
 | **No rate limiting** | Ch. 3 Q5 "Data consumers" — external consumers with SLAs require throttling and burst protection. | Not planned |
 
 #### Minor

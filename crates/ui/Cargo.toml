@@ -34,6 +34,13 @@ axum-embed = "0.1"
 fluent-templates = "0.13"
 unic-langid = { version = "0.9", features = ["macros"] }
 
+# Storage-agnostic dashboard snapshot registry. The server registers a
+# provider (backed by the persistence layer) at startup; this crate reads the
+# latest snapshot to render the "FHIR resources over time" chart without any
+# dependency on the persistence layer itself. Falls back to placeholder data
+# when no provider is registered (e.g. the standalone UI example).
+helios-observability = { path = "../observability", version = "0.2.1" }
+
 [dev-dependencies]
 # Parses the .ftl sources so tests can enforce key-set parity across locales.
 fluent-syntax = "0.11"

@@ -31,12 +31,12 @@
     <div>
       <span class="stat__label">{{ i18n.t("chart-title") }}</span>
       <span class="stat__value">{{ metrics.chart_total }}</span>
-      <span class="stat__sub">{{ i18n.t("chart-unit-patients") }}</span>
+      <span class="stat__sub">{{ chart.selected_type }}</span>
     </div>
     <div class="chart-card__tools">
       <span class="pill">
         <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
-        Patient
+        {{ chart.selected_type }}
         <span class="icon">{% include "icons/chevron-down.svg" %}</span>
       </span>
       <span class="pill pill--square" aria-label="{{ i18n.t("chart-expand") }}">
@@ -46,28 +46,42 @@
   </header>
 
   <!--
-    Sample series matching the design frame; swapped for a real per-resource
-    count read path in follow-up work, together with the metric cards above.
+    Server-rendered from the live per-type cumulative counts (default tenant),
+    supplied via helios_observability::dashboard. Axis geometry is computed in
+    the handler; see crates/ui/src/lib.rs::build_chart.
   -->
   <svg class="chart" viewBox="0 0 1060 300" role="img" aria-hidden="true">
-    <text class="axis-label" x="0" y="13">2.0k</text>
-    <line class="grid-line" x1="40" y1="10" x2="1060" y2="10" />
-    <text class="axis-label" x="0" y="80">1.5k</text>
-    <line class="grid-line" x1="40" y1="77" x2="1060" y2="77" />
-    <text class="axis-label" x="0" y="147">1.0k</text>
-    <line class="grid-line" x1="40" y1="144" x2="1060" y2="144" />
-    <text class="axis-label" x="0" y="214">500</text>
-    <line class="grid-line" x1="40" y1="211" x2="1060" y2="211" />
-    <text class="axis-label" x="0" y="281">0</text>
-    <line class="grid-line" x1="40" y1="278" x2="1060" y2="278" />
-    <polyline class="series" points="40,211 649,146 852,144 1055,77" />
-    <text class="axis-label" x="40" y="298">MAY 3</text>
-    <text class="axis-label" x="243" y="298">MAY 8</text>
-    <text class="axis-label" x="446" y="298">MAY 13</text>
-    <text class="axis-label" x="649" y="298">MAY 18</text>
-    <text class="axis-label" x="852" y="298">MAY 23</text>
-    <text class="axis-label" x="1020" y="298">MAY 28</text>
+    {% for tick in chart.y_ticks %}
+    <line class="grid-line" x1="40" y1="{{ tick.pos }}" x2="1060" y2="{{ tick.pos }}" />
+    <text class="axis-label" x="0" y="{{ tick.label_y }}">{{ tick.label }}</text>
+    {% endfor %}
+    {% if chart.has_data %}
+    <polyline class="series" points="{{ chart.polyline }}" />
+    {% endif %}
+    {% for tick in chart.x_ticks %}
+    <text class="axis-label" x="{{ tick.pos }}" y="{{ tick.label_y }}">{{ tick.label }}</text>
+    {% endfor %}
   </svg>
+
+  <!--
+    Legend doubles as the per-type series selector: each link re-renders the
+    page with that resource type charted (progressive enhancement — works
+    without JavaScript; htmx can swap it in a follow-up).
+  -->
+  <ul class="chart-legend">
+    {% for item in legend %}
+    <li>
+      <a
+        class="chart-legend__item{% if item.active %} chart-legend__item--active{% endif %}"
+        href="{{ item.href }}"
+        {% if item.active %}aria-current="true"{% endif %}
+      >
+        <span class="chart-legend__type">{{ item.resource_type }}</span>
+        <span class="chart-legend__total">{{ item.total }}</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
 </section>
 
 <!--
