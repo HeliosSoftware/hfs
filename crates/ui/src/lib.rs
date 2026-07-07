@@ -686,4 +686,30 @@ mod tests {
         assert_eq!(selected_type_from_query(Some("lang=es")), None);
         assert_eq!(selected_type_from_query(None), None);
     }
+
+    #[test]
+    fn single_point_series_anchors_one_coordinate_at_the_axis() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 5,
+            points: vec![helios_observability::dashboard::DashboardPoint {
+                date: "2026-05-01".to_string(),
+                count: 5,
+                cumulative: 5,
+            }],
+        };
+        let chart = build_chart("Patient", Some(&series));
+
+        assert!(chart.has_data);
+        // A lone point produces a single "x,y" pair pinned to the left axis.
+        assert!(!chart.polyline.contains(' '));
+        assert!(chart.polyline.starts_with("40,"));
+        assert_eq!(chart.x_ticks.len(), 1);
+    }
+
+    #[test]
+    fn short_date_rejects_out_of_range_month() {
+        assert_eq!(short_date("2026-13-09"), "2026-13-09");
+        assert_eq!(short_date("2026-01-09"), "JAN 9");
+    }
 }

@@ -213,3 +213,46 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use helios_persistence::backends::sqlite::SqliteBackend;
+
+    /// The provider builds a well-formed, zeroed snapshot over an empty store:
+    /// one dense per-type series, zero totals, and a non-empty FHIR version.
+    /// Exercises `StorageDashboardProvider::new` and the `snapshot` success path
+    /// (all three backend queries succeed and return "nothing yet").
+    #[tokio::test]
+    async fn snapshot_over_empty_backend_is_zeroed_but_well_formed() {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite backend");
+        backend.init_schema().expect("init schema");
+        let config = ServerConfig {
+            default_tenant: "default".to_string(),
+            ..ServerConfig::for_testing()
+        };
+
+        let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
+        let snapshot = provider.snapshot().await;
+
+        // One series per charted type, each a dense 30-day window of zeros.
+        assert_eq!(snapshot.series.len(), DEFAULT_DASHBOARD_TYPES.len());
+        assert!(snapshot.series.iter().all(|s| s.total == 0));
+        assert!(
+            snapshot
+                .series
+                .iter()
+                .all(|s| s.points.len() == DEFAULT_DASHBOARD_DAYS as usize)
+        );
+        assert!(
+            snapshot
+                .series
+                .iter()
+                .all(|s| s.points.iter().all(|p| p.cumulative == 0))
+        );
+        assert_eq!(snapshot.total_resources, 0);
+        assert_eq!(snapshot.distinct_types, 0);
+        assert!(!snapshot.fhir_version.is_empty());
+    }
+}
