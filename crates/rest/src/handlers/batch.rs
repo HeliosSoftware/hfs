@@ -1213,9 +1213,8 @@ mod tests {
         }
 
         // Detail-bearing variants surface their specifics in the message text.
-        let (_, _, msg) = transaction_error_response_parts(&TransactionError::Timeout {
-            timeout_ms: 1500,
-        });
+        let (_, _, msg) =
+            transaction_error_response_parts(&TransactionError::Timeout { timeout_ms: 1500 });
         assert!(msg.contains("1500"), "timeout message: {msg}");
         let (_, _, msg) =
             transaction_error_response_parts(&TransactionError::UnsupportedIsolationLevel {
