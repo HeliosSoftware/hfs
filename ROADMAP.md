@@ -73,6 +73,7 @@ Work that is currently underway or planned for the near term.
 We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These will be published as GitHub Discussions:
 
 - **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
+- **Clustered / multi-instance deployment** — How HFS should behave when run as multiple instances behind a load balancer, and where the boundary lies between state that can safely stay in process memory and state that must be externalized to shared infrastructure. Considerations include: cluster-aware WebSocket Subscription delivery, where connected clients are tracked in process memory today ([#170](https://github.com/HeliosSoftware/hfs/issues/170)); database-backed SQL-on-FHIR export job state, so status URLs survive restarts and are visible across instances ([#169](https://github.com/HeliosSoftware/hfs/issues/169)); per-instance observability (Prometheus `/metrics`, OTLP traces) with correct tenant isolation when resource data comes from a shared database but traffic metrics are per-instance ([#150](https://github.com/HeliosSoftware/hfs/issues/150)); and the JWT `jti` replay-prevention cache, where the per-instance in-memory backend (`crates/auth/src/jti/memory.rs`) lets a one-time client assertion be replayed against a *different* instance, requiring the shared Redis-backed cache (`crates/auth/src/jti/redis.rs`) for a cluster
 
 ---
 

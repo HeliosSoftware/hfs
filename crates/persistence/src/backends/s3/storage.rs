@@ -466,16 +466,30 @@ impl ResourceStorage for S3Backend {
         "s3"
     }
 
+    fn is_cluster_shared(&self) -> bool {
+        // S3 is a networked object store shared by every instance; `count` (and
+        // thus the console `count_by_types` totals) reads the shared bucket, so
+        // the counts this backend produces are cluster-consistent.
+        true
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
+        use crate::sof::reference_resolver::StorageBackedResolver;
         // S3 is object storage with no query engine, so SQL-on-FHIR runs
         // in-process over the scanned resources via the `helios-sof` engine.
         let scan: std::sync::Arc<dyn ResourceScan> = std::sync::Arc::new(self.clone());
-        Some(std::sync::Arc::new(InProcessSofRunner::new(
-            scan,
-            FhirVersion::default_enabled(),
-            "s3-in-process",
-        )))
+        // Enable storage-backed `resolve()`: the same S3 backend serves as the
+        // tenant-scoped reference resolver, so a view's `reference.resolve()` can
+        // dereference a stored `Type/id` that is not in the scanned set.
+        let resolver = std::sync::Arc::new(StorageBackedResolver::new(
+            std::sync::Arc::new(self.clone()),
+            StorageBackedResolver::DEFAULT_MAX_FANOUT,
+        ));
+        Some(std::sync::Arc::new(
+            InProcessSofRunner::new(scan, FhirVersion::default_enabled(), "s3-in-process")
+                .with_reference_resolver(resolver),
+        ))
     }
 
     async fn create(
