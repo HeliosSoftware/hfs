@@ -466,6 +466,13 @@ impl ResourceStorage for S3Backend {
         "s3"
     }
 
+    fn is_cluster_shared(&self) -> bool {
+        // S3 is a networked object store shared by every instance; `count` (and
+        // thus the console `count_by_types` totals) reads the shared bucket, so
+        // the counts this backend produces are cluster-consistent.
+        true
+    }
+
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
         use crate::sof::reference_resolver::StorageBackedResolver;

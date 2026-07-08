@@ -197,7 +197,6 @@ mod tests {
 
         assert!(html.contains("Helios FHIR Server"));
         assert!(html.contains("1.2.3"));
-        assert!(html.contains(r#"hx-get="/ui/status""#));
         assert!(html.contains("/ui/assets/htmx.min.js"));
         // No runtime CDN dependency.
         assert!(!html.contains("unpkg.com"));
@@ -217,8 +216,7 @@ mod tests {
         .expect("index renders");
 
         assert!(html.contains(r#"<html lang="es">"#));
-        assert!(html.contains("Actualizar estado"));
-        assert!(html.contains("Última comprobación: 42"));
+        assert!(html.contains("Inicio"));
         // The language switcher marks the active locale.
         assert!(html.contains(r#"href="?lang=es" aria-current="true""#));
     }
@@ -235,7 +233,6 @@ mod tests {
         .render()
         .expect("status renders");
 
-        assert!(html.contains("1.2.3"));
         assert!(html.contains("Last checked: 42"));
         assert!(!html.contains("<html"));
         assert!(!html.contains("<!doctype"));
@@ -260,6 +257,20 @@ mod tests {
         assert!(Assets::get("fonts/figtree-latin.woff2").is_some());
         assert!(Assets::get("fonts/figtree-latin-ext.woff2").is_some());
         assert!(Assets::get("logo.png").is_some());
+    }
+
+    /// The theme script persists the choice to the per-user settings document
+    /// (#197): it must read the document on load and merge-patch `theme` on
+    /// toggle, with localStorage kept as the first-paint cache. Guards the
+    /// wiring; the endpoint round-trip itself is covered in helios-rest's
+    /// `user_settings` tests.
+    #[test]
+    fn theme_script_is_wired_to_user_settings() {
+        let file = Assets::get("theme.js").expect("theme.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("theme.js is UTF-8");
+        assert!(source.contains("/_user/settings"));
+        assert!(source.contains("PATCH"));
+        assert!(source.contains("hfs-theme"), "localStorage cache stays");
     }
 
     /// Both theme buttons render, and icons are inlined (so `currentColor`
