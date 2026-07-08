@@ -234,6 +234,18 @@ mod shared_mongo {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 let container = Mongo::default()
                     .with_label("github.run_id", &run_id)
+                    // Cap WiredTiger's cache. By default mongod sizes it to
+                    // ~50% of *host* RAM (ignoring container limits), so on CI
+                    // — where this container runs alongside ES/Postgres plus
+                    // coverage-instrumented test binaries — it balloons and the
+                    // host OOM-kills mongod mid-run (observed as connections
+                    // refused / "unexpected end of file" on the last wave of
+                    // tests). 0.25 GB is WiredTiger's floor and ample for the
+                    // suite's tiny datasets. `--bind_ip_all` matches the stock
+                    // image default and keeps the mapped port reachable once we
+                    // supply our own command.
+                    .with_cmd(["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"])
+                    .with_startup_timeout(std::time::Duration::from_secs(120))
                     .start()
                     .await
                     .ok()?;
