@@ -118,14 +118,22 @@ pub fn mount(
     hfs_version: &'static str,
     tenants: Option<Arc<dyn ResourceStorage>>,
 ) -> Router {
+    // Embedded, pinned htmx + CSS/JS + fonts, served with br/gzip/deflate
+    // negotiation. `Cache-Control: no-cache` forces the browser to revalidate
+    // against the (content-based) ETag on every load: unchanged assets come
+    // back as a cheap `304`, but a rebuilt asset (e.g. app.css after a UI
+    // change) is always re-fetched instead of served stale from cache.
+    let assets = Router::new()
+        .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
+        .layer(middleware::from_fn(revalidate_assets));
+
     Router::new()
         .route("/ui", get(index))
         .route("/ui/status", get(status))
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
-        // Embedded, pinned htmx + CSS, served with br/gzip/deflate negotiation.
-        .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
+        .merge(assets)
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -137,6 +145,18 @@ pub fn mount(
             tenants,
         })
         .fallback_service(fhir_app)
+}
+
+/// Adds `Cache-Control: no-cache` to embedded-asset responses so a rebuilt
+/// asset is never served stale from the browser cache (revalidation is cheap:
+/// unchanged content returns `304` via the ETag `ServeEmbed` already sets).
+async fn revalidate_assets(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 /// Full landing page.
