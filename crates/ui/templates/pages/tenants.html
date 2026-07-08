@@ -1,8 +1,7 @@
 {% extends "layouts/base.html" %}
 
 {% block title %}{{ i18n.t("tenants-title") }} — {{ i18n.t("app-title") }}{% endblock %}
-{# No topbar breadcrumb: the page <h1> already names the view (avoids the
-   duplicate label Steve flagged on the dashboard). #}
+
 {% block breadcrumb %}{% endblock %}
 
 {% block content %}
