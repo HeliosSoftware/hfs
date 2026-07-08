@@ -290,7 +290,12 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: [self-hosted, Unix] # llvm-tools-preview has problems on Windows, so restrict to Unix
-    needs: [lint]
+    # Depend on test-rust (not just lint) so the two container-heavy jobs never
+    # overlap. Both stand up the full ES + Postgres + Mongo testcontainer suite;
+    # run concurrently on the shared remote Docker host they overload it and the
+    # Mongo container gets OOM-killed mid-run (SystemOverloadedError). Serializing
+    # them keeps peak container pressure to a single suite at a time.
+    needs: [lint, test-rust]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
