@@ -233,6 +233,14 @@ where
             get(handlers::smart_discovery::smart_configuration_handler::<S>),
         )
         .route("/_history", get(handlers::history_system_handler::<S>))
+        // Per-user UI settings. The leading `_` keeps these authenticated yet
+        // exempt from FHIR scope checks, and out of the FHIR resource namespace.
+        .route(
+            "/_user/settings",
+            get(handlers::get_user_settings::<S>)
+                .put(handlers::put_user_settings::<S>)
+                .patch(handlers::patch_user_settings::<S>),
+        )
         .route("/", post(handlers::batch_handler::<S>))
         // Bulk Data Export ($export) — operation routes precede the catch-all.
         .route(

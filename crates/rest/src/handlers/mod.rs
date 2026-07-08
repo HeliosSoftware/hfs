@@ -21,6 +21,7 @@ pub mod bulk_export;
 pub mod bulk_submit;
 pub mod capabilities;
 pub mod compartment;
+pub mod console_metrics;
 pub mod create;
 pub mod delete;
 pub mod health;
@@ -35,6 +36,7 @@ pub mod subscription_event;
 #[cfg(feature = "subscriptions")]
 pub mod subscriptions;
 pub mod update;
+pub mod user_settings;
 pub mod versions;
 pub mod vread;
 #[cfg(feature = "subscriptions")]
@@ -77,5 +79,6 @@ pub use patch::patch_handler;
 pub use read::{head_read_handler, read_handler};
 pub use search::{search_get_handler, search_post_handler};
 pub use update::{conditional_update_handler, update_handler};
+pub use user_settings::{get_user_settings, patch_user_settings, put_user_settings};
 pub use versions::versions_handler;
 pub use vread::vread_handler;

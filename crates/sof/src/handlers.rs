@@ -1027,6 +1027,8 @@ pub async fn health_check() -> impl IntoResponse {
         "status": "ok",
         "service": "sof-server",
         "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": helios_observability::uptime::uptime_seconds(),
+        "started_at": helios_observability::uptime::started_at_rfc3339(),
         "timestamp": chrono::Utc::now().to_rfc3339()
     }))
 }

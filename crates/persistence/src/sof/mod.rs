@@ -30,6 +30,7 @@ pub mod dialect;
 pub mod emit;
 pub mod in_process;
 pub mod ir;
+pub mod reference_resolver;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
