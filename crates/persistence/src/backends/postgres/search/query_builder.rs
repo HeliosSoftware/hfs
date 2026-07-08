@@ -672,51 +672,68 @@ impl PostgresQueryBuilder {
 
         let mut conditions = Vec::new();
 
-        for (i, value) in param.values.iter().enumerate() {
-            let base_offset = offset + i * 2;
+        // Each value contributes a variable number of bound params: `system|code`
+        // binds 2, every other form (code-only, `|code`, `system|`) binds 1.
+        // Placeholder numbers must be sequential and gap-free because the caller
+        // advances the global offset by `params.len()` (see build_search_query).
+        // Track a running offset rather than assuming a fixed 2-slot stride per
+        // value — the old `offset + i * 2` over-counted single-param values and
+        // produced a placeholder past the end of the bound params (e.g.
+        // `status=finished,in-progress` referenced $3 with only 2 params bound),
+        // which Postgres rejects.
+        let mut next = offset;
+        for value in param.values.iter() {
             let condition = if let Some((system, code)) = value.value.split_once('|') {
                 if system.is_empty() {
                     // |code - match any system
-                    SqlFragment::with_params(
+                    let frag = SqlFragment::with_params(
                         format!(
                             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_code = ${})",
                             param.name,
-                            base_offset + 1
+                            next + 1
                         ),
                         vec![SqlParam::text(code)],
-                    )
+                    );
+                    next += 1;
+                    frag
                 } else if code.is_empty() {
                     // system| - match any code in system
-                    SqlFragment::with_params(
+                    let frag = SqlFragment::with_params(
                         format!(
                             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_system = ${})",
                             param.name,
-                            base_offset + 1
+                            next + 1
                         ),
                         vec![SqlParam::text(system)],
-                    )
+                    );
+                    next += 1;
+                    frag
                 } else {
                     // system|code - exact match
-                    SqlFragment::with_params(
+                    let frag = SqlFragment::with_params(
                         format!(
                             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_system = ${} AND value_token_code = ${})",
                             param.name,
-                            base_offset + 1,
-                            base_offset + 2
+                            next + 1,
+                            next + 2
                         ),
                         vec![SqlParam::text(system), SqlParam::text(code)],
-                    )
+                    );
+                    next += 2;
+                    frag
                 }
             } else {
                 // code only - match any system
-                SqlFragment::with_params(
+                let frag = SqlFragment::with_params(
                     format!(
                         "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_code = ${})",
                         param.name,
-                        base_offset + 1
+                        next + 1
                     ),
                     vec![SqlParam::text(&value.value)],
-                )
+                );
+                next += 1;
+                frag
             };
             conditions.push(condition);
         }
@@ -1489,6 +1506,64 @@ mod tests {
         assert!(frag.sql.contains("value_quantity_value < $5"));
         // token (system+code) = 2 params, quantity (no unit) = 1 param.
         assert_eq!(frag.params.len(), 3);
+    }
+
+    #[test]
+    fn token_or_list_placeholders_are_gap_free() {
+        // Regression: `status=finished,in-progress` — two code-only token values,
+        // each binding one param. With offset 2 the placeholders must be $3 and $4
+        // with exactly 2 params bound. The old fixed 2-slot stride emitted $3 and
+        // $5 while binding only 2 params, which Postgres rejected at execute time
+        // ("Failed to execute search: db error").
+        let param = SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "finished"),
+                SearchValue::new(SearchPrefix::Eq, "in-progress"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("token OR-list should produce a condition");
+
+        assert_eq!(frag.params.len(), 2, "two code-only values bind two params");
+        assert!(frag.sql.contains("value_token_code = $3"));
+        assert!(frag.sql.contains("value_token_code = $4"));
+        assert!(
+            !frag.sql.contains("$5"),
+            "placeholder numbering must be gap-free: {}",
+            frag.sql
+        );
+    }
+
+    #[test]
+    fn token_or_list_mixed_forms_placeholders_sequential() {
+        // code-only (1 param) then system|code (2 params): placeholders must run
+        // $3, $4, $5 with 3 params bound — no gaps across differing per-value arity.
+        let param = SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "8302-2"),
+                SearchValue::new(SearchPrefix::Eq, "http://loinc.org|29463-7"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("mixed token OR-list should produce a condition");
+
+        assert_eq!(frag.params.len(), 3);
+        assert!(frag.sql.contains("value_token_code = $3"));
+        assert!(frag.sql.contains("value_token_system = $4"));
+        assert!(frag.sql.contains("value_token_code = $5"));
+        assert!(!frag.sql.contains("$6"));
     }
 
     #[test]
