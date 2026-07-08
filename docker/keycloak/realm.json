@@ -1,9 +1,10 @@
 {
   "id": "fhir",
   "realm": "fhir",
-  "displayName": "FHIR Realm",
+  "displayName": "Helios FHIR Server",
   "enabled": true,
   "sslRequired": "none",
+  "loginTheme": "helios",
   "registrationAllowed": false,
   "loginWithEmailAllowed": false,
   "duplicateEmailsAllowed": false,
@@ -56,7 +57,19 @@
       "authorizationServicesEnabled": false,
       "protocol": "openid-connect",
       "defaultClientScopes": ["system/*.cruds"],
-      "optionalClientScopes": ["system/Patient.rs", "system/Observation.r"]
+      "optionalClientScopes": ["system/Patient.rs", "system/Observation.r"],
+      "protocolMappers": [
+        {
+          "name": "hfs-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "hfs-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
     },
     {
       "clientId": "hfs-readonly-client",
@@ -74,7 +87,52 @@
       "authorizationServicesEnabled": false,
       "protocol": "openid-connect",
       "defaultClientScopes": ["system/Patient.rs"],
-      "optionalClientScopes": ["system/Observation.r"]
+      "optionalClientScopes": ["system/Observation.r"],
+      "protocolMappers": [
+        {
+          "name": "hfs-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "hfs-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "hfs-web",
+      "name": "HFS Web UI (interactive login)",
+      "description": "Public client for the browser Authorization Code + PKCE login flow (issue #198). Renders the Helios-themed Keycloak login screen.",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "http://localhost:8080/ui/callback",
+        "http://localhost:8080/*"
+      ],
+      "webOrigins": ["http://localhost:8080"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:8080/*"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "demo",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "User",
+      "email": "demo@example.org",
+      "credentials": [
+        { "type": "password", "value": "demo", "temporary": false }
+      ]
     }
   ]
 }
