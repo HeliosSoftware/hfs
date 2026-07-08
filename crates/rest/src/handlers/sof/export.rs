@@ -1057,7 +1057,7 @@ where
     };
 
     match controller.get_status(tenant.tenant_id(), &job_id) {
-        None | Some(JobStatus::Cancelled) => Ok((
+        None | Some(JobStatus::Cancelled { .. }) => Ok((
             StatusCode::NOT_FOUND,
             axum::Json(json!({
                 "resourceType": "OperationOutcome",
@@ -1240,7 +1240,7 @@ where
         // result URL is only handed out (via the status poll's 303) once the
         // job has finished, so reaching here otherwise means there is nothing
         // to serve.
-        None | Some(JobStatus::Cancelled) | Some(JobStatus::Running { .. }) => Ok((
+        None | Some(JobStatus::Cancelled { .. }) | Some(JobStatus::Running { .. }) => Ok((
             StatusCode::NOT_FOUND,
             axum::Json(json!({
                 "resourceType": "OperationOutcome",

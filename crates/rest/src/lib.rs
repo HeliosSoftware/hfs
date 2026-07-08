@@ -561,10 +561,21 @@ where
         state = state.with_sof_runner(runner);
 
         // Wire the export job controller.
-        use crate::export::{ExportJobController, FilesystemSink, InMemoryController};
+        use crate::export::{
+            CleanupConfig, ExportJobController, FilesystemSink, InMemoryController,
+        };
         let controller: Arc<dyn ExportJobController> = {
             let max_concurrency = Some(config.export_max_concurrency);
             let shard_rows = Some(config.export_shard_rows);
+            // Reaper that reclaims finished jobs' output after the TTL. The
+            // interval is clamped to >= 1s because `tokio::time::interval`
+            // panics on a zero period.
+            let cleanup = Some(CleanupConfig {
+                output_ttl: std::time::Duration::from_secs(config.export_output_ttl_secs),
+                interval: std::time::Duration::from_secs(
+                    config.export_cleanup_interval_secs.max(1),
+                ),
+            });
 
             #[cfg(feature = "s3")]
             if config.export_sink.to_lowercase() == "s3" {
@@ -586,11 +597,12 @@ where
                         ttl,
                     ))
                 }) {
-                    Ok(sink) => Arc::new(InMemoryController::with_shard_rows(
+                    Ok(sink) => Arc::new(InMemoryController::with_options(
                         runner_for_export,
                         sink,
                         max_concurrency,
                         shard_rows,
+                        cleanup,
                     )),
                     Err(e) => {
                         tracing::warn!(
@@ -599,22 +611,24 @@ where
                             "S3 export sink init failed — falling back to FilesystemSink"
                         );
                         let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                        Arc::new(InMemoryController::with_shard_rows(
+                        Arc::new(InMemoryController::with_options(
                             runner_for_export,
                             sink,
                             max_concurrency,
                             shard_rows,
+                            cleanup,
                         ))
                     }
                 }
             } else {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_shard_rows(
+                Arc::new(InMemoryController::with_options(
                     runner_for_export,
                     sink,
                     max_concurrency,
                     shard_rows,
+                    cleanup,
                 ))
             }
 
@@ -622,11 +636,12 @@ where
             {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_shard_rows(
+                Arc::new(InMemoryController::with_options(
                     runner_for_export,
                     sink,
                     max_concurrency,
                     shard_rows,
+                    cleanup,
                 ))
             }
         };
