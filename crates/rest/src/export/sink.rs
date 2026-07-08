@@ -15,11 +15,15 @@ use super::controller::ExportError;
 
 /// Trait for writing and serving export output files.
 pub trait ExportSink: Send + Sync + Clone + 'static {
-    /// Writes `data` as the `shard_index`-th shard for `job_id` and returns
-    /// the public download URL.
+    /// Writes `data` as the `shard_index`-th shard for `job_id` and returns the
+    /// shard's filename (its stable identity within the job, e.g.
+    /// `shard-0.ndjson`).
     ///
-    /// The `ext` parameter is the file extension without the leading dot,
-    /// e.g. `"ndjson"`, `"csv"`, or `"parquet"`.
+    /// The filename — not a public URL — is what the controller stores in
+    /// [`CompletedFile`](super::controller::CompletedFile); the URL is resolved
+    /// later via [`download_url`](Self::download_url). The `ext` parameter is
+    /// the file extension without the leading dot, e.g. `"ndjson"`, `"csv"`, or
+    /// `"parquet"`.
     fn write_shard(
         &self,
         job_id: &str,
@@ -32,6 +36,17 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
     ///
     /// Returns `None` if the shard does not exist.
     fn read_shard(&self, job_id: &str, filename: &str) -> Option<Vec<u8>>;
+
+    /// Resolves a shard `filename` to a public download URL.
+    ///
+    /// Called once per shard each time the completion manifest is rendered, so
+    /// the returned URL should carry a full validity window:
+    /// - server-routed sinks (filesystem / in-memory) return their stable
+    ///   `{base_url}/export/{job_id}/{filename}` route;
+    /// - [`S3Sink`] returns a freshly pre-signed GET URL, so a client polling
+    ///   the manifest hours after completion still receives a usable URL rather
+    ///   than one signed (and counting down) since write time.
+    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError>;
 
     /// Deletes all output shards previously written for `job_id`.
     ///
@@ -87,13 +102,21 @@ impl ExportSink for FilesystemSink {
         std::fs::write(&path, data)
             .map_err(|e| ExportError::Sink(format!("failed to write shard: {e}")))?;
 
-        let url = format!("{base}/export/{job_id}/{filename}", base = self.base_url,);
-        Ok(url)
+        Ok(filename)
     }
 
     fn read_shard(&self, job_id: &str, filename: &str) -> Option<Vec<u8>> {
         let path = self.dir.join(job_id).join(filename);
         std::fs::read(path).ok()
+    }
+
+    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+        // Stable server-routed URL; served back by the download handler. No
+        // expiry, so it is identical on every poll.
+        Ok(format!(
+            "{base}/export/{job_id}/{filename}",
+            base = self.base_url
+        ))
     }
 
     fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
@@ -139,13 +162,20 @@ impl ExportSink for InMemorySink {
         let filename = format!("shard-{shard_index}.{ext}");
         let key = format!("{job_id}/{filename}");
         self.data.insert(key, data);
-        let url = format!("{base}/export/{job_id}/{filename}", base = self.base_url,);
-        Ok(url)
+        Ok(filename)
     }
 
     fn read_shard(&self, job_id: &str, filename: &str) -> Option<Vec<u8>> {
         let key = format!("{job_id}/{filename}");
         self.data.get(&key).map(|v| v.clone())
+    }
+
+    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+        // Mirrors the filesystem sink's stable server route.
+        Ok(format!(
+            "{base}/export/{job_id}/{filename}",
+            base = self.base_url
+        ))
     }
 
     fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
@@ -217,7 +247,9 @@ impl S3Sink {
 
 #[cfg(feature = "s3")]
 impl ExportSink for S3Sink {
-    /// Uploads the shard to S3 and returns a pre-signed GET URL.
+    /// Uploads the shard to S3 and returns its filename. The pre-signed GET URL
+    /// is produced later (per manifest poll) by [`download_url`](Self::download_url),
+    /// not here, so its TTL window starts at poll time rather than write time.
     fn write_shard(
         &self,
         job_id: &str,
@@ -230,11 +262,9 @@ impl ExportSink for S3Sink {
         let bucket = self.bucket.clone();
         let client = Arc::clone(&self.client);
         let data_len = data.len() as i64;
-        let presign_ttl = std::time::Duration::from_secs(self.presign_ttl_secs);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                // Upload bytes to S3.
                 client
                     .put_object()
                     .bucket(&bucket)
@@ -244,8 +274,28 @@ impl ExportSink for S3Sink {
                     .send()
                     .await
                     .map_err(|e| ExportError::Sink(format!("S3 put_object failed: {e}")))?;
+                Ok(())
+            })
+        })?;
 
-                // Build a pre-signed GET URL.
+        Ok(filename)
+    }
+
+    /// Pre-signs a fresh GET URL for the shard, valid for `presign_ttl_secs`
+    /// from now. Presigning is a local signature computation (no network round
+    /// trip), so re-signing on every manifest poll is cheap.
+    ///
+    /// Note: the URL's effective lifetime is also bounded by the signing
+    /// credentials' own validity (e.g. an STS session), which can silently
+    /// undercut `presign_ttl_secs` when running with temporary credentials.
+    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+        let key = self.object_key(job_id, filename);
+        let bucket = self.bucket.clone();
+        let client = Arc::clone(&self.client);
+        let presign_ttl = std::time::Duration::from_secs(self.presign_ttl_secs);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
                 let presigning_config =
                     aws_sdk_s3::presigning::PresigningConfig::expires_in(presign_ttl).map_err(
                         |e| ExportError::Sink(format!("PresigningConfig::expires_in failed: {e}")),
@@ -257,7 +307,6 @@ impl ExportSink for S3Sink {
                     .presigned(presigning_config)
                     .await
                     .map_err(|e| ExportError::Sink(format!("S3 presign failed: {e}")))?;
-
                 Ok(presigned.uri().to_string())
             })
         })
