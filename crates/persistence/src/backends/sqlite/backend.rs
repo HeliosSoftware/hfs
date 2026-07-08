@@ -99,7 +99,14 @@ fn default_connection_timeout_ms() -> u64 {
 }
 
 fn default_busy_timeout_ms() -> u32 {
-    5000
+    // SQLite serialises writers, so under concurrent write load a connection can
+    // wait behind several in-flight write transactions. 5s was too short for the
+    // FHIR benchmark's 20-VU bulk import (writers gave up with "database is
+    // locked" instead of queueing); 30s lets them wait out the backlog. This only
+    // affects how long a *contended* write blocks before erroring — it never slows
+    // uncontended reads or writes, so it's safe for read-heavy workloads (e.g. the
+    // terminology server) too.
+    30_000
 }
 
 fn default_true() -> bool {

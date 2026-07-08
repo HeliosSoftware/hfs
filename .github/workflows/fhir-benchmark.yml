@@ -340,10 +340,18 @@ jobs:
           # If that file isn't found, search silently degrades to ~9 global params
           # (only a warning is logged) and nearly every search scenario breaks.
           # Pin it explicitly so coverage never depends on the process CWD.
+          # HFS_REQUEST_TIMEOUT: the default is 30s, but a 1600-entry Synthea
+          # transaction bundle under the import suite's 20 concurrent VUs routinely
+          # takes longer than that, and the timeout middleware would cut the request
+          # mid-transaction (observed: import p95 pinned at ~30s, ~40% of imports
+          # failing with the handler future cancelled before commit). The benchmark
+          # comparators (Aidbox/HAPI/Medplum) impose no such cap and import.js
+          # allows 900s client-side, so match that here for a fair comparison.
           HFS_SERVER_HOST="127.0.0.1" \
           HFS_SERVER_PORT="${{ matrix.port }}" \
           HFS_LOG_LEVEL="${{ inputs.log_level || 'info' }}" \
           HFS_MAX_BODY_SIZE="209715200" \
+          HFS_REQUEST_TIMEOUT="900" \
           HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
             ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
 
