@@ -437,6 +437,18 @@ jobs:
               --summary-export "$RESULTS_DIR/${SUITE}.json" \
               $EXTRA_ARGS \
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
+
+            # A freshly bulk-loaded Postgres has no table statistics, so the
+            # planner sequential-scans `search_index` (millions of rows) even
+            # though the right indexes exist — search then runs in seconds instead
+            # of milliseconds. Autovacuum would eventually ANALYZE, but the suite
+            # runs search immediately after import. Refresh stats once here so the
+            # search suite measures steady-state performance (what a real
+            # deployment sees once traffic is flowing), not a cold-stats artifact.
+            if [ "$SUITE" = "import" ] && [ "${{ matrix.backend }}" = "postgres" ]; then
+              echo "--- ANALYZE Postgres after import (refresh planner statistics) ---"
+              time docker exec "$PG_CONTAINER" psql -U postgres -d postgres -c 'ANALYZE' || true
+            fi
           done
 
       # ── Summary ──────────────────────────────────────────────────────────
