@@ -23,6 +23,30 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
         migrate_schema(conn, current_version)?;
     }
 
+    // Safety net for the tenant registry (schema v13). A pre-release build could
+    // stamp a database as v13 without creating the `tenants` table (the migration
+    // was completed after the version bump), leaving the version-gated migration
+    // above unable to re-run. The table's DDL is `IF NOT EXISTS` and idempotent,
+    // so ensuring it here every startup self-heals such databases and is a no-op
+    // for correctly-migrated ones.
+    ensure_tenants_table(conn)?;
+
+    Ok(())
+}
+
+/// Idempotently ensures the tenant-registry table exists. Called on every
+/// startup as a self-heal (see [`initialize_schema`]); also the body of the
+/// v12 -> v13 migration.
+fn ensure_tenants_table(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tenants (
+            id TEXT PRIMARY KEY,
+            display_name TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("ensure tenants table: {e}")))?;
     Ok(())
 }
 
@@ -1201,16 +1225,7 @@ fn migrate_v11_to_v12(conn: &Connection) -> StorageResult<()> {
 /// were never registered are still discoverable via a `GROUP BY tenant_id` on
 /// `resources`; the registry adds the metadata that data alone cannot provide.
 fn migrate_v12_to_v13(conn: &Connection) -> StorageResult<()> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS tenants (
-            id TEXT PRIMARY KEY,
-            display_name TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )",
-        [],
-    )
-    .map_err(|e| migration_err(format!("create tenants table: {e}")))?;
-    Ok(())
+    ensure_tenants_table(conn)
 }
 
 fn migration_err(message: String) -> crate::error::StorageError {
@@ -1341,6 +1356,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, 1, "v12 -> v13 upgrade must create the tenants table");
+    }
+
+    #[test]
+    fn test_initialize_schema_self_heals_missing_tenants_table() {
+        // Simulate a database left at v13 by a pre-release build that stamped the
+        // version but never created the table (the version-gated migration then
+        // can't re-run). initialize_schema must restore it.
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute("DROP TABLE tenants", []).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Re-init (as a server restart would) heals it without a version change.
+        initialize_schema(&conn).unwrap();
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tenants'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "initialize_schema must self-heal the tenants table"
+        );
     }
 
     #[test]
