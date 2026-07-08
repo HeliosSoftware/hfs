@@ -275,6 +275,39 @@ async fn create_backend(test_name: &str) -> Option<MongoBackend> {
     create_backend_with_search_offloaded(test_name, false).await
 }
 
+/// Builds a `MongoBackend` and runs schema initialization, retrying transient
+/// connection failures.
+///
+/// The suite shares one standalone Mongo container across ~50 tests, each of
+/// which opens its own client. Under CI load the final burst of connections
+/// occasionally gets a dropped handshake ("unexpected end of file") mid-init;
+/// `initialize()` issues `createCollection`/`createIndexes`, which are not
+/// retryable writes, so the driver surfaces the blip. A short bounded retry
+/// absorbs it without masking real schema-init bugs (those fail every attempt).
+async fn build_backend(config: MongoBackendConfig) -> MongoBackend {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        let backend = MongoBackend::new(config.clone())
+            .expect("failed to create MongoBackend for mongodb integration tests");
+        match backend.initialize().await {
+            Ok(()) => return backend,
+            Err(err) if attempt < MAX_ATTEMPTS => {
+                eprintln!(
+                    "MongoDB schema init attempt {attempt}/{MAX_ATTEMPTS} failed \
+                     ({err}); retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
+                    .await;
+                attempt += 1;
+            }
+            Err(err) => {
+                panic!("failed to initialize MongoDB schema for integration tests: {err:?}")
+            }
+        }
+    }
+}
+
 async fn create_backend_with_search_offloaded(
     test_name: &str,
     search_offloaded: bool,
@@ -288,14 +321,7 @@ async fn create_backend_with_search_offloaded(
         ..Default::default()
     };
 
-    let backend = MongoBackend::new(config)
-        .expect("failed to create MongoBackend for mongodb integration tests");
-    backend
-        .initialize()
-        .await
-        .expect("failed to initialize MongoDB schema for integration tests");
-
-    Some(backend)
+    Some(build_backend(config).await)
 }
 
 /// Creates a backend whose registry is loaded from the repo's spec files, so
@@ -312,12 +338,7 @@ async fn create_backend_with_full_registry(test_name: &str) -> Option<MongoBacke
         data_dir: Some(data_dir),
         ..Default::default()
     };
-    let backend = MongoBackend::new(config).expect("failed to create MongoBackend");
-    backend
-        .initialize()
-        .await
-        .expect("failed to initialize MongoDB schema");
-    Some(backend)
+    Some(build_backend(config).await)
 }
 
 async fn search_index_entry_count(
