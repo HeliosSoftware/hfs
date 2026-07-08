@@ -1,9 +1,10 @@
 {
   "id": "fhir",
   "realm": "fhir",
-  "displayName": "FHIR Realm",
+  "displayName": "Helios FHIR Server",
   "enabled": true,
   "sslRequired": "none",
+  "loginTheme": "helios",
   "registrationAllowed": false,
   "loginWithEmailAllowed": false,
   "duplicateEmailsAllowed": false,
@@ -98,6 +99,39 @@
             "id.token.claim": "false"
           }
         }
+      ]
+    },
+    {
+      "clientId": "hfs-web",
+      "name": "HFS Web UI (interactive login)",
+      "description": "Public client for the browser Authorization Code + PKCE login flow (issue #198). Renders the Helios-themed Keycloak login screen.",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "redirectUris": [
+        "http://localhost:8080/ui/callback",
+        "http://localhost:8080/*"
+      ],
+      "webOrigins": ["http://localhost:8080"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:8080/*"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "demo",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "User",
+      "email": "demo@example.org",
+      "credentials": [
+        { "type": "password", "value": "demo", "temporary": false }
       ]
     }
   ]

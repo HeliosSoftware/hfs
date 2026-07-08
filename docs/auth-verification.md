@@ -180,7 +180,8 @@ Browser                     HFS (crates/ui + new routes)              IdP (Keycl
 - **Realm/client**: a new **public** client with `standardFlowEnabled: true`,
   PKCE required (`S256`), and `redirect_uris` including
   `http://localhost:8080/ui/callback`. Ships in `realm.json` alongside the
-  backend clients.
+  backend clients — **added in this PR** as `hfs-web` (plus a `demo`/`demo` test
+  user), so the browser login screen can already be rendered end to end.
 - **Token refresh + expiry** handling, and reconciling the negotiated
   `RequestLocale` and per-user settings (#151) with the now-known user identity
   (issuer|subject), which is also the settings-store key.
@@ -207,8 +208,12 @@ does not transfer to another.
 
 - **Do IdP-native theming; keep HFS out of the login-screen business.** HFS is
   not the auth server, so owning login markup would mean re-implementing an IdP.
-- **Ship a Helios Keycloak theme** (logo, palette matching the Dashboard V1.1
-  design tokens) as an optional, mountable theme in `docker/keycloak/` — it's the
+- **Ship a Helios Keycloak theme** — **done in this PR**:
+  `docker/keycloak/themes/helios/` is a CSS-only login theme (logo + Figtree +
+  accent `#33b8ff` from the Dashboard V1.1 tokens) mounted into the local
+  Keycloak and selected via the realm's `loginTheme`. Extends the stock
+  `keycloak` theme with no template forks, so it survives Keycloak upgrades.
+  Rendered end to end via the `hfs-web` client (screenshot in the PR). It's the
   one IdP we bundle for dev/self-host and the only one where we control the box.
 - **For Okta/Auth0/Entra, document the branding knobs** (logo + colors + custom
   domain) and stop there. Don't attempt a portable theme — nothing transfers.
@@ -228,8 +233,9 @@ does not transfer to another.
   `client-confidential-asymmetric`. Verifying a real asymmetric-client assertion
   would require adding a `private_key_jwt` client to the realm; recommended as a
   follow-up so the advertised capability is exercised.
-- Interactive **Authorization Code + PKCE** is designed here (§3), not
-  implemented — there is no interactive client in the realm yet and no
-  authorize/callback routes in HFS.
+- Interactive **Authorization Code + PKCE** is designed here (§3); the realm now
+  has the interactive client (`hfs-web`) and a themed login screen, but the
+  HFS-side authorize/callback routes and session handling are **not** implemented
+  — that is the follow-up build.
 - The two defects (#205, #206) are pre-existing in the validation path; this pass
   found and filed them but does not fix them.
