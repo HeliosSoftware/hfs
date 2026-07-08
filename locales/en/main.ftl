@@ -36,9 +36,7 @@ home-lede = Server-rendered, HTMX-first UI. This panel is refreshed as an HTML f
 
 ## Status panel
 
-status-version = hfs version { $version }
 status-last-checked = Last checked: { $timestamp }
-action-refresh-status = Refresh status
 
 ## Dashboard / health
 

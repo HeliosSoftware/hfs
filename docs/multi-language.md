@@ -1,7 +1,7 @@
 # Multi-language support — approach, guidelines, and rules of the road
 
-**Status:** Foundation / discussion (living document)
-**Branch:** `feat/i18n-foundation` (off `main`)
+**Status:** Ratified — 2026-07-06 (living document; changes via PR)
+**Delivered:** merged to `main` (#187 catalogs/doc, #191/#195 runtime wiring in `crates/ui`)
 **Owner:** Angela
 **Relates to:** #186 (HTMX-first web UI foundation), `feat/user-ui-settings`,
 `feat/smart-ui-auth`

@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -23,12 +23,12 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
         migrate_schema(conn, current_version)?;
     }
 
-    // Safety net for the tenant registry (schema v13). A pre-release build could
-    // stamp a database as v13 without creating the `tenants` table (the migration
-    // was completed after the version bump), leaving the version-gated migration
-    // above unable to re-run. The table's DDL is `IF NOT EXISTS` and idempotent,
-    // so ensuring it here every startup self-heals such databases and is a no-op
-    // for correctly-migrated ones.
+    // Safety net for the tenant registry (schema v14). A pre-release build could
+    // stamp a database at the registry's version without creating the `tenants`
+    // table (the migration was completed after the version bump), leaving the
+    // version-gated migration above unable to re-run. The table's DDL is
+    // `IF NOT EXISTS` and idempotent, so ensuring it here every startup
+    // self-heals such databases and is a no-op for correctly-migrated ones.
     ensure_tenants_table(conn)?;
 
     Ok(())
@@ -294,6 +294,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             10 => migrate_v10_to_v11(conn)?,
             11 => migrate_v11_to_v12(conn)?,
             12 => migrate_v12_to_v13(conn)?,
+            13 => migrate_v13_to_v14(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1217,6 +1218,27 @@ fn migrate_v11_to_v12(conn: &Connection) -> StorageResult<()> {
 
 /// Migrate from schema version 12 to version 13.
 ///
+/// Adds the `user_settings` table that backs the per-user UI settings store
+/// (theme, default tenant, active FHIR version, recent queries, …). One opaque
+/// JSON document is stored per user, keyed by `user_key`, with a monotonic
+/// `version` for optimistic locking. This table is intentionally independent of
+/// the FHIR `resources` table so UI preferences never leak into FHIR machinery.
+fn migrate_v12_to_v13(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_settings (
+            user_key   TEXT NOT NULL PRIMARY KEY,
+            data       BLOB NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create user_settings table: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 13 to version 14.
+///
 /// Adds the tenant registry: a canonical list of first-class tenants backing
 /// the admin tenant-maintenance API (list / add / delete). Until now a tenant
 /// was only ever an implicit identifier string; this table records the tenants
@@ -1224,7 +1246,7 @@ fn migrate_v11_to_v12(conn: &Connection) -> StorageResult<()> {
 /// display name and a creation timestamp. Tenants that merely have data but
 /// were never registered are still discoverable via a `GROUP BY tenant_id` on
 /// `resources`; the registry adds the metadata that data alone cannot provide.
-fn migrate_v12_to_v13(conn: &Connection) -> StorageResult<()> {
+fn migrate_v13_to_v14(conn: &Connection) -> StorageResult<()> {
     ensure_tenants_table(conn)
 }
 
@@ -1310,14 +1332,14 @@ mod tests {
         assert!(tables.contains(&"resource_history".to_string()));
         assert!(tables.contains(&"search_index".to_string()));
         assert!(tables.contains(&"schema_version".to_string()));
-        // The tenant registry (schema v13) is created on a fresh init.
+        // The tenant registry (schema v14) is created on a fresh init.
         assert!(tables.contains(&"tenants".to_string()));
     }
 
     #[test]
-    fn test_migration_v12_to_v13_creates_tenants() {
-        // Build a v12-era schema (no `tenants` table) then upgrade it exactly as
-        // `initialize_schema` would for an existing pre-registry database.
+    fn test_migration_creates_tenants_table_on_upgrade() {
+        // Build a pre-registry schema (no `tenants` table) then upgrade it exactly
+        // as `initialize_schema` would for an existing database.
         let conn = Connection::open_in_memory().unwrap();
         create_schema_v1(&conn).unwrap();
         let _ = get_schema_version(&conn).unwrap();
@@ -1332,7 +1354,8 @@ mod tests {
         migrate_v9_to_v10(&conn).unwrap();
         migrate_v10_to_v11(&conn).unwrap();
         migrate_v11_to_v12(&conn).unwrap();
-        set_schema_version(&conn, 12).unwrap();
+        migrate_v12_to_v13(&conn).unwrap();
+        set_schema_version(&conn, 13).unwrap();
 
         // No tenants table before the upgrade.
         let before: i32 = conn
@@ -1355,14 +1378,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(after, 1, "v12 -> v13 upgrade must create the tenants table");
+        assert_eq!(after, 1, "the upgrade must create the tenants table");
     }
 
     #[test]
     fn test_initialize_schema_self_heals_missing_tenants_table() {
-        // Simulate a database left at v13 by a pre-release build that stamped the
-        // version but never created the table (the version-gated migration then
-        // can't re-run). initialize_schema must restore it.
+        // Simulate a database left at the registry's version by a pre-release
+        // build that stamped the version but never created the table (the
+        // version-gated migration then can't re-run). initialize_schema restores it.
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
         conn.execute("DROP TABLE tenants", []).unwrap();
