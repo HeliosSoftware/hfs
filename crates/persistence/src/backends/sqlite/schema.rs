@@ -1295,6 +1295,52 @@ mod tests {
         assert!(tables.contains(&"resource_history".to_string()));
         assert!(tables.contains(&"search_index".to_string()));
         assert!(tables.contains(&"schema_version".to_string()));
+        // The tenant registry (schema v13) is created on a fresh init.
+        assert!(tables.contains(&"tenants".to_string()));
+    }
+
+    #[test]
+    fn test_migration_v12_to_v13_creates_tenants() {
+        // Build a v12-era schema (no `tenants` table) then upgrade it exactly as
+        // `initialize_schema` would for an existing pre-registry database.
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema_v1(&conn).unwrap();
+        let _ = get_schema_version(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        migrate_v3_to_v4(&conn).unwrap();
+        migrate_v4_to_v5(&conn).unwrap();
+        migrate_v5_to_v6(&conn).unwrap();
+        migrate_v6_to_v7(&conn).unwrap();
+        migrate_v7_to_v8(&conn).unwrap();
+        migrate_v8_to_v9(&conn).unwrap();
+        migrate_v9_to_v10(&conn).unwrap();
+        migrate_v10_to_v11(&conn).unwrap();
+        migrate_v11_to_v12(&conn).unwrap();
+        set_schema_version(&conn, 12).unwrap();
+
+        // No tenants table before the upgrade.
+        let before: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tenants'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+
+        // The same entry point the server uses on an existing database.
+        initialize_schema(&conn).unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let after: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tenants'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "v12 -> v13 upgrade must create the tenants table");
     }
 
     #[test]
