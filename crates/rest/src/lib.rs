@@ -340,6 +340,7 @@ where
         audit_state,
         None,
         None,
+        None,
     )
 }
 
@@ -377,6 +378,7 @@ where
         auth_state,
         audit_state,
         Some(bulk_export),
+        None,
         None,
     )
 }
@@ -419,11 +421,58 @@ where
         audit_state,
         bulk_export,
         bulk_submit,
+        None,
     )
 }
 
-/// Internal app builder shared by [`create_app_with_auth`] and
-/// [`create_app_with_auth_and_bulk_export`].
+/// Like [`create_app_with_auth_and_bulk`], but also wires the per-user settings
+/// store (used by the `/_user/settings` endpoints). `bulk_export` and
+/// `bulk_submit` are each optional, so this single entry point covers every
+/// combination for a settings-capable backend (SQLite, PostgreSQL).
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_bulk_and_settings<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
+        settings_store,
+    )
+}
+
+/// Internal app builder shared by [`create_app_with_auth`],
+/// [`create_app_with_auth_and_bulk_export`], [`create_app_with_auth_and_bulk`],
+/// and [`create_app_with_auth_bulk_and_settings`].
+#[allow(clippy::too_many_arguments)]
 fn build_app<S>(
     storage: Arc<S>,
     config: ServerConfig,
@@ -432,6 +481,7 @@ fn build_app<S>(
     audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
     bulk_export: Option<BulkExportBundle>,
     bulk_submit: Option<BulkSubmitBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
 ) -> Router
 where
     S: ResourceStorage
@@ -511,10 +561,21 @@ where
         state = state.with_sof_runner(runner);
 
         // Wire the export job controller.
-        use crate::export::{ExportJobController, FilesystemSink, InMemoryController};
+        use crate::export::{
+            CleanupConfig, ExportJobController, FilesystemSink, InMemoryController,
+        };
         let controller: Arc<dyn ExportJobController> = {
             let max_concurrency = Some(config.export_max_concurrency);
             let shard_rows = Some(config.export_shard_rows);
+            // Reaper that reclaims finished jobs' output after the TTL. The
+            // interval is clamped to >= 1s because `tokio::time::interval`
+            // panics on a zero period.
+            let cleanup = Some(CleanupConfig {
+                output_ttl: std::time::Duration::from_secs(config.export_output_ttl_secs),
+                interval: std::time::Duration::from_secs(
+                    config.export_cleanup_interval_secs.max(1),
+                ),
+            });
 
             #[cfg(feature = "s3")]
             if config.export_sink.to_lowercase() == "s3" {
@@ -536,11 +597,12 @@ where
                         ttl,
                     ))
                 }) {
-                    Ok(sink) => Arc::new(InMemoryController::with_shard_rows(
+                    Ok(sink) => Arc::new(InMemoryController::with_options(
                         runner_for_export,
                         sink,
                         max_concurrency,
                         shard_rows,
+                        cleanup,
                     )),
                     Err(e) => {
                         tracing::warn!(
@@ -549,22 +611,24 @@ where
                             "S3 export sink init failed — falling back to FilesystemSink"
                         );
                         let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                        Arc::new(InMemoryController::with_shard_rows(
+                        Arc::new(InMemoryController::with_options(
                             runner_for_export,
                             sink,
                             max_concurrency,
                             shard_rows,
+                            cleanup,
                         ))
                     }
                 }
             } else {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_shard_rows(
+                Arc::new(InMemoryController::with_options(
                     runner_for_export,
                     sink,
                     max_concurrency,
                     shard_rows,
+                    cleanup,
                 ))
             }
 
@@ -572,11 +636,12 @@ where
             {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_shard_rows(
+                Arc::new(InMemoryController::with_options(
                     runner_for_export,
                     sink,
                     max_concurrency,
                     shard_rows,
+                    cleanup,
                 ))
             }
         };
@@ -592,6 +657,12 @@ where
     // Wire the bulk-submit subsystem if provided.
     let state = match bulk_submit {
         Some(b) => state.with_bulk_submit(b.jobs, b.fetcher, b.output, b.file_auth),
+        None => state,
+    };
+
+    // Wire the per-user settings store if provided.
+    let state = match settings_store {
+        Some(store) => state.with_settings_store(store),
         None => state,
     };
 
@@ -962,4 +1033,56 @@ pub fn init_logging(level: &str) {
         .with(fmt::layer())
         .with(filter)
         .init();
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod builder_tests {
+    use super::*;
+    use helios_persistence::backends::sqlite::SqliteBackend;
+
+    fn backend() -> Arc<SqliteBackend> {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        Arc::new(backend)
+    }
+
+    /// SOF is disabled so `build_app` skips the in-DB runner / export-controller
+    /// path and stays a pure, side-effect-free router build.
+    fn config() -> ServerConfig {
+        let mut config = ServerConfig::default();
+        config.sof_enabled = false;
+        config
+    }
+
+    /// The generic bulk builder wires a router with no bundles (bulk export and
+    /// bulk submit both disabled).
+    #[tokio::test]
+    async fn builds_app_with_bulk_builder_and_no_bundles() {
+        let _app: Router = create_app_with_auth_and_bulk(
+            backend(),
+            config(),
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// The settings-capable builder wires the settings store into the router.
+    #[tokio::test]
+    async fn builds_app_with_settings_store() {
+        let backend = backend();
+        let settings: Arc<dyn helios_persistence::core::SettingsStore> = backend.clone();
+        let _app: Router = create_app_with_auth_bulk_and_settings(
+            backend,
+            config(),
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            Some(settings),
+        );
+    }
 }

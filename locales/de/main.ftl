@@ -34,9 +34,7 @@ home-lede = Serverseitig gerenderte, HTMX-basierte Oberfläche. Dieses Panel wir
 
 ## Statuspanel
 
-status-version = hfs-Version { $version }
 status-last-checked = Zuletzt geprüft: { $timestamp }
-action-refresh-status = Status aktualisieren
 
 ## Übersicht / Status
 

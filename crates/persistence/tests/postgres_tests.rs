@@ -689,9 +689,10 @@ mod postgres_integration {
     use serde_json::json;
 
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+    use helios_persistence::core::SettingsStore;
     use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
     use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
-    use helios_persistence::error::{ResourceError, StorageError};
+    use helios_persistence::error::{ConcurrencyError, ResourceError, StorageError};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
     use testcontainers::ImageExt;
@@ -3844,6 +3845,98 @@ mod postgres_integration {
             .unwrap();
         // Only completed/error/cancelled jobs can expire — these are accepted.
         assert!(expired_now.is_empty());
+    }
+
+    // ========================================================================
+    // Per-user settings store
+    // ========================================================================
+
+    /// A user key unique to each test, so tests sharing the database don't
+    /// collide on the single-row-per-user `user_settings` table.
+    fn unique_user_key(prefix: &str) -> String {
+        format!("{}|{}", prefix, uuid::Uuid::new_v4().simple())
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_settings_get_missing_is_none() {
+        let backend = create_backend().await;
+        let user = unique_user_key("missing");
+        assert!(backend.get_settings(&user).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_settings_put_get_and_version() {
+        let backend = create_backend().await;
+        let user = unique_user_key("round-trip");
+        let doc = json!({"theme": "dark", "recentQueries": {"Patient": ["name=smith"]}});
+
+        let stored = backend
+            .put_settings(&user, doc.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(stored.version, 1);
+
+        let fetched = backend.get_settings(&user).await.unwrap().unwrap();
+        assert_eq!(fetched.document, doc);
+        assert_eq!(fetched.version, 1);
+
+        let second = backend
+            .put_settings(&user, json!({"theme": "light"}), None)
+            .await
+            .unwrap();
+        assert_eq!(second.version, 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_settings_patch_merges_and_deletes() {
+        let backend = create_backend().await;
+        let user = unique_user_key("patch");
+        backend
+            .put_settings(
+                &user,
+                json!({"theme": "dark", "defaultTenant": "acme"}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patched = backend
+            .patch_settings(
+                &user,
+                json!({"theme": "light", "defaultTenant": null}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(patched.document, json!({"theme": "light"}));
+        assert_eq!(patched.version, 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_settings_optimistic_lock() {
+        let backend = create_backend().await;
+        let user = unique_user_key("lock");
+        backend
+            .put_settings(&user, json!({"a": 1}), None)
+            .await
+            .unwrap(); // version 1
+
+        // Stale precondition is rejected.
+        let err = backend
+            .put_settings(&user, json!({"a": 2}), Some(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })
+        ));
+
+        // Matching precondition succeeds.
+        let ok = backend
+            .put_settings(&user, json!({"a": 2}), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(ok.version, 2);
     }
 
     // ========================================================================
