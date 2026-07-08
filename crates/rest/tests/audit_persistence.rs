@@ -18,9 +18,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::Request;
 use axum::http::StatusCode;
+use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::response::Response;
 use axum_test::TestServer;
-use helios_audit::InMemoryAuditSink;
+use chrono::Utc;
+use helios_audit::{ExclusionFilter, InMemoryAuditSink};
+use helios_auth::{AuthConfig, AuthError, AuthProvider, Principal, ScopeSet};
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -35,6 +40,7 @@ use helios_rest::ServerConfig;
 use helios_rest::bulk_export_auth::BearerScopeAuth;
 use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
 use helios_rest::reindex::ReindexController;
+use helios_rest::{AuthMiddlewareState, middleware::auth::authz_middleware};
 use serde_json::json;
 
 /// Source observer reference used by every test fixture.
@@ -565,4 +571,216 @@ async fn reindex_unavailable_when_controller_missing() {
         events_for_operation(&sink, "reindex").is_empty(),
         "no audit event when controller is absent"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `authz_middleware` deferral for `$`-suffixed operation endpoints
+// ---------------------------------------------------------------------------
+
+/// `authz_middleware` reads the [`Principal`] from request extensions and
+/// never calls its provider — this stub only satisfies the type.
+#[derive(Debug)]
+struct UnreachableAuthProvider;
+
+#[async_trait::async_trait]
+impl AuthProvider for UnreachableAuthProvider {
+    async fn authenticate(&self, _authorization_header: &str) -> Result<Principal, AuthError> {
+        unreachable!("authz_middleware never calls the provider");
+    }
+
+    fn name(&self) -> &str {
+        "test-unreachable"
+    }
+}
+
+fn principal_with_scopes(scope_str: &str) -> Principal {
+    Principal {
+        subject: "test-subject".to_string(),
+        issuer: "test-issuer".to_string(),
+        tenant_id: Some("test-tenant".to_string()),
+        scopes: ScopeSet::parse(scope_str),
+        jti: None,
+        expires_at: Utc::now() + chrono::Duration::hours(1),
+        custom_claims: serde_json::Map::new(),
+    }
+}
+
+async fn inject_principal_layer(mut request: Request, next: Next) -> Response {
+    let scopes = request
+        .extensions()
+        .get::<TestScopes>()
+        .cloned()
+        .expect("TestScopes extension must be inserted before injection");
+    request.extensions_mut().insert(principal_with_scopes(&scopes.0));
+    next.run(request).await
+}
+
+#[derive(Clone)]
+struct TestScopes(String);
+
+async fn set_test_scopes_from_header(mut request: Request, next: Next) -> Response {
+    let scopes = request
+        .headers()
+        .get("x-test-scopes")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    if let Some(s) = scopes {
+        request.extensions_mut().insert(TestScopes(s));
+    }
+    next.run(request).await
+}
+
+async fn create_authz_layered_server() -> AuditedServer {
+    let mut env = create_audited_server().await;
+
+    let auth_state = Arc::new(AuthMiddlewareState {
+        provider: Arc::new(UnreachableAuthProvider),
+        config: Arc::new(AuthConfig::default()),
+        audit_sink: env.sink.clone() as Arc<dyn helios_audit::AuditSink>,
+        audit_source_observer: SOURCE_OBSERVER.to_string(),
+        audit_exclusion_filter: ExclusionFilter::new(Vec::new()),
+        tenant_url_routing: false,
+    });
+
+    // `TestServer` owns the router by value, so reconstruct the state instead
+    // of swapping layers on the existing server.
+    let backend = env.backend.clone();
+    let output = env.output.clone();
+    let sink = env.sink.clone();
+    let file_auth = Arc::new(BearerScopeAuth);
+    let config = ServerConfig {
+        multitenancy: MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        },
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "test-tenant".to_string(),
+        ..ServerConfig::for_testing()
+    };
+    let reindex_op = ReindexOperation::new(backend.clone(), backend.search_extractor().clone())
+        .with_audit(
+            sink.clone() as Arc<dyn helios_audit::AuditSink>,
+            SOURCE_OBSERVER,
+        );
+
+    let state = helios_rest::AppState::with_auth_and_audit(
+        Arc::clone(&backend),
+        config,
+        helios_auth::AuthConfig::default(),
+        None,
+        Some(sink.clone() as Arc<dyn helios_audit::AuditSink>),
+        SOURCE_OBSERVER,
+    )
+    .with_bulk_export(
+        backend.clone() as Arc<dyn BulkExportJobStore>,
+        output.clone() as Arc<dyn ExportOutputStore>,
+        file_auth,
+    )
+    .with_purge_provider(backend.clone() as Arc<dyn PurgableStorage>)
+    .with_reindex_controller(Arc::new(reindex_op) as Arc<dyn ReindexController>);
+
+    // Axum applies the last-added `.layer` outermost, giving the flow
+    // header → inject → authz → router — matching production, where
+    // `authz_middleware` runs after `auth_middleware` has populated Principal.
+    let app = helios_rest::routing::fhir_routes::create_routes(state)
+        .layer(from_fn_with_state(auth_state, authz_middleware))
+        .layer(from_fn(inject_principal_layer))
+        .layer(from_fn(set_test_scopes_from_header));
+
+    env.server = TestServer::new(app).expect("create authz-layered test server");
+    env
+}
+
+/// Events emitted by `authz_middleware` itself (its `outcomeDesc` always
+/// starts with `Granted:` or `Forbidden:`), separated from handler events.
+fn middleware_authz_events(sink: &InMemoryAuditSink) -> Vec<AuditEvent> {
+    sink.events()
+        .into_iter()
+        .filter(|e| {
+            e.outcome_desc
+                .as_ref()
+                .and_then(|s| s.value.as_deref())
+                .is_some_and(|desc| desc.starts_with("Granted:") || desc.starts_with("Forbidden:"))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn type_purge_reaches_handler_with_delete_only_scope() {
+    let env = create_authz_layered_server().await;
+    seed_patients(&env.backend, 2).await;
+
+    let resp = env
+        .server
+        .post("/Patient/$purge")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("x-test-scopes", "patient/Patient.d")
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::OK,
+        "least-privilege .d token must reach the $purge handler"
+    );
+
+    let purge_events = events_for_operation(&env.sink, "purge");
+    assert_eq!(purge_events.len(), 1);
+    assert_eq!(action_code(&purge_events[0]).as_deref(), Some("D"));
+    assert_eq!(outcome_code(&purge_events[0]).as_deref(), Some("0"));
+
+    let mw_events = middleware_authz_events(&env.sink);
+    assert!(
+        mw_events.is_empty(),
+        "middleware must defer, got: {:?}",
+        mw_events
+            .iter()
+            .map(|e| e.outcome_desc.as_ref().and_then(|s| s.value.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn instance_purge_reaches_handler_with_delete_only_scope() {
+    let env = create_authz_layered_server().await;
+    seed_patients(&env.backend, 1).await;
+
+    let resp = env
+        .server
+        .delete("/Patient/p0/$purge")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("x-test-scopes", "patient/Patient.d")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
+
+    let purge_events = events_for_operation(&env.sink, "purge");
+    assert_eq!(purge_events.len(), 1);
+    assert_eq!(action_code(&purge_events[0]).as_deref(), Some("D"));
+
+    assert!(middleware_authz_events(&env.sink).is_empty());
+}
+
+#[tokio::test]
+async fn type_reindex_reaches_handler_with_update_only_scope() {
+    let env = create_authz_layered_server().await;
+    seed_patients(&env.backend, 1).await;
+
+    let resp = env
+        .server
+        .post("/Patient/$reindex")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("x-test-scopes", "patient/Patient.u")
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::ACCEPTED,
+        "least-privilege .u token must reach the $reindex handler"
+    );
+
+    let kickoffs: Vec<_> = events_for_operation(&env.sink, "reindex")
+        .into_iter()
+        .filter(|e| detail_value(e, "phase").as_deref() == Some("kickoff"))
+        .collect();
+    assert_eq!(kickoffs.len(), 1);
+    assert_eq!(outcome_code(&kickoffs[0]).as_deref(), Some("0"));
+
+    assert!(middleware_authz_events(&env.sink).is_empty());
 }
