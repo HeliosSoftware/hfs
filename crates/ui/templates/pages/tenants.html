@@ -1,0 +1,87 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("tenants-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+{% block breadcrumb %}{{ i18n.t("tenants-title") }}{% endblock %}
+
+{% block content %}
+<header class="page-head">
+  <h1 class="page-title">{{ i18n.t("tenants-title") }}</h1>
+</header>
+
+{% if !available %}
+<div class="card notice">{{ i18n.t("tenants-unavailable") }}</div>
+{% else %}
+
+<section class="stat-grid stat-grid--2">
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("tenants-stat-total") }}</span>
+    <span class="stat__value">{{ total }}</span>
+    <span class="stat__sub">{{ i18n.t_arg("tenants-stat-total-sub", "count", registered_count as u64) }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("tenants-stat-resources") }}</span>
+    <span class="stat__value">{{ resources_total }}</span>
+    <span class="stat__sub">{{ i18n.t("tenants-stat-resources-sub") }}</span>
+  </article>
+</section>
+
+<section class="card table-card">
+  <div class="toolbar">
+    <label class="toolbar__search">
+      {% include "icons/search.svg" %}
+      <input
+        type="search"
+        name="q"
+        value="{{ q }}"
+        placeholder="{{ i18n.t("tenants-search-placeholder") }}"
+        hx-get="/ui/tenants/rows"
+        hx-trigger="input changed delay:250ms, search"
+        hx-target="#tenant-rows"
+        hx-swap="innerHTML"
+        autocomplete="off"
+      >
+    </label>
+
+    <!--
+      Add-tenant slide-over. A native <details> disclosure so it opens without
+      JavaScript; the form posts through htmx and swaps the refreshed table back
+      into #tenant-rows. On error the same fragment returns with a banner.
+    -->
+    <details class="addbox">
+      <summary class="button button--primary">
+        {% include "icons/plus.svg" %}
+        {{ i18n.t("tenants-add") }}
+      </summary>
+      <div class="addbox__panel">
+        <div class="addbox__title">{{ i18n.t("tenants-add-title") }}</div>
+        <form
+          hx-post="/ui/tenants"
+          hx-target="#tenant-rows"
+          hx-swap="innerHTML"
+        >
+          <label class="field">
+            <span class="field__label">{{ i18n.t("tenants-field-id") }}</span>
+            <input class="field__input" type="text" name="id" required autocomplete="off"
+                   placeholder="acme-health">
+            <span class="field__hint">{{ i18n.t("tenants-field-id-hint") }}</span>
+          </label>
+          <label class="field">
+            <span class="field__label">{{ i18n.t("tenants-field-name") }}</span>
+            <input class="field__input" type="text" name="display_name" autocomplete="off"
+                   placeholder="Acme Health">
+            <span class="field__hint">{{ i18n.t("tenants-field-name-hint") }}</span>
+          </label>
+          <div class="addbox__actions">
+            <button type="submit" class="button button--primary">{{ i18n.t("tenants-add-submit") }}</button>
+          </div>
+        </form>
+      </div>
+    </details>
+  </div>
+
+  <div id="tenant-rows">
+    {% include "partials/tenant_rows.html" %}
+  </div>
+</section>
+{% endif %}
+{% endblock %}

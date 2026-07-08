@@ -12,7 +12,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn app() -> Router {
-    helios_ui::mount(Router::new(), "9.9.9")
+    helios_ui::mount(Router::new(), "9.9.9", None)
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -96,7 +96,7 @@ async fn embedded_assets_are_served() {
 async fn non_ui_paths_fall_through_to_the_fhir_app() {
     // Stand-in for the FHIR REST router: proves /ui never shadows it.
     let fhir_app = Router::new().route("/Patient", get(|| async { "fhir handled" }));
-    let response = helios_ui::mount(fhir_app, "9.9.9")
+    let response = helios_ui::mount(fhir_app, "9.9.9", None)
         .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
         .await
         .unwrap();

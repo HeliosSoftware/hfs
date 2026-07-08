@@ -12,9 +12,28 @@ use helios_fhir::FhirVersion;
 use serde_json::Value;
 
 use crate::core::sof_runner::SofRunner;
-use crate::error::{StorageError, StorageResult};
+use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
+
+/// A registered tenant, as returned by the tenant registry.
+///
+/// A "tenant" is otherwise implicit — any well-formed tenant id is accepted the
+/// first time it is used. The registry makes tenants **first-class** so they can
+/// be listed with a creation date and an optional human-friendly name, and
+/// explicitly provisioned or removed via the admin API. The `id` is the value
+/// used everywhere in the API (the `X-Tenant-ID` header, the URL prefix, or the
+/// JWT tenant claim); `display_name` is purely for presentation and is never
+/// used for routing or scoping. See [`ResourceStorage::list_tenants`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TenantRecord {
+    /// The tenant id — the value used to scope data and route requests.
+    pub id: String,
+    /// Optional human-friendly display name (presentation only).
+    pub display_name: Option<String>,
+    /// RFC 3339 timestamp of when the tenant was registered.
+    pub created_at: String,
+}
 
 /// One UTC-day bucket of stored-resource counts.
 ///
@@ -528,6 +547,74 @@ pub trait ResourceStorage: Send + Sync {
     /// override it with a single `GROUP BY tenant_id`.
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         Ok(Vec::new())
+    }
+
+    // ---- Tenant registry (first-class tenant maintenance) ------------------
+    //
+    // These make tenants explicit, backing the admin `/admin/tenants` API
+    // (list / add / delete). They are administrative and span tenants, so they
+    // take no `TenantContext`. Backends that do not maintain a registry keep the
+    // defaults: `supports_tenant_registry` is `false`, reads are empty, and the
+    // mutating calls report an unsupported-capability error rather than
+    // pretending to succeed.
+
+    /// Whether this backend maintains a first-class tenant registry (the
+    /// `list_tenants` / `register_tenant` / `deregister_tenant` /
+    /// `purge_tenant_data` family). The admin API returns `501 Not Implemented`
+    /// when this is `false`. Default `false`; the SQLite backend overrides it.
+    fn supports_tenant_registry(&self) -> bool {
+        false
+    }
+
+    /// Lists registered tenants (registry rows only — this does **not** include
+    /// tenants that merely have data but were never registered; the admin
+    /// handler merges those in from [`count_by_tenant`](Self::count_by_tenant)).
+    /// Ordered by `created_at` ascending. Default: empty.
+    async fn list_tenants(&self) -> StorageResult<Vec<TenantRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Looks up a single registered tenant by id. Default: `None`.
+    async fn get_tenant(&self, _id: &str) -> StorageResult<Option<TenantRecord>> {
+        Ok(None)
+    }
+
+    /// Registers (provisions) a new tenant, stamping `created_at` with the
+    /// current time. Returns [`StorageError`] if the tenant is already
+    /// registered. Default: unsupported-capability error.
+    async fn register_tenant(
+        &self,
+        _id: &str,
+        _display_name: Option<&str>,
+    ) -> StorageResult<TenantRecord> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Removes a tenant's registration row. Returns `true` if a row was removed,
+    /// `false` if the tenant was not registered. This does **not** delete the
+    /// tenant's stored data — see [`purge_tenant_data`](Self::purge_tenant_data).
+    /// Default: unsupported-capability error.
+    async fn deregister_tenant(&self, _id: &str) -> StorageResult<bool> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Permanently deletes all of a tenant's stored resources (current rows,
+    /// history, and search index). Returns the number of current-version
+    /// resource rows removed. Invoked by the delete path only when the
+    /// teardown policy is enabled. Default: unsupported-capability error.
+    async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Builds the unsupported-capability error used by the tenant-registry
+    /// default methods. Not part of the public surface — a helper for the
+    /// defaults above.
+    #[doc(hidden)]
+    fn tenant_registry_unsupported(&self) -> StorageError {
+        StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: self.backend_name().to_string(),
+            capability: "tenant-registry".to_string(),
+        })
     }
 }
 

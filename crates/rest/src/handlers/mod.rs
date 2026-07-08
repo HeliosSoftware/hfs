@@ -15,6 +15,7 @@
 //! - [`versions`] - Get supported FHIR versions ($versions operation)
 //! - [`health`] - Health check endpoint
 
+pub mod admin_tenants;
 pub mod batch;
 pub mod bulk_common;
 pub mod bulk_export;

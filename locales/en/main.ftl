@@ -92,6 +92,35 @@ nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capability & Conformance
 nav-admin-ops = Admin / Ops
 nav-subscriptions = Subscriptions
+nav-tenants = Tenants
+
+## Tenant maintenance (/ui/tenants)
+
+tenants-title = Tenant Maintenance
+tenants-unavailable = The tenant registry is not available on this storage backend.
+tenants-stat-total = Total tenants
+tenants-stat-total-sub = { $count ->
+    [one] { $count } registered
+   *[other] { $count } registered
+}
+tenants-stat-resources = Resources stored
+tenants-stat-resources-sub = across all tenants
+tenants-search-placeholder = Search by name or tenant id…
+tenants-add = Add tenant
+tenants-add-title = Add a tenant
+tenants-field-id = Tenant id
+tenants-field-id-hint = Used in the API (X-Tenant-ID header, URL prefix, JWT claim).
+tenants-field-name = Display name (optional)
+tenants-field-name-hint = A human-friendly label; not used for routing.
+tenants-add-submit = Provision tenant
+tenants-col-tenant = Tenant
+tenants-col-resources = Resources
+tenants-col-created = Created
+tenants-col-actions = Actions
+tenants-empty = No tenants match.
+tenants-unregistered = unregistered
+tenants-delete = Delete tenant
+tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept unless purged via the API.
 
 tenant-heading = Tenants
 tenant-all = All tenants

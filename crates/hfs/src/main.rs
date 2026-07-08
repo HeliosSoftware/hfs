@@ -25,7 +25,10 @@ use helios_audit::{
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
-use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth};
+use helios_rest::{
+    AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth,
+    create_app_with_auth_arc,
+};
 use tracing::info;
 
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
@@ -516,7 +519,7 @@ async fn start_mongodb(
                 Some(bundle),
                 None,
             );
-            return serve(app, &config, serve_audit_state).await;
+            return serve(app, &config, serve_audit_state, None).await;
         }
     }
 
@@ -529,7 +532,7 @@ async fn start_mongodb(
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, None).await
 }
 
 /// Fallback when mongodb feature is not enabled.
@@ -551,9 +554,12 @@ async fn serve(
     app: axum::Router,
     config: &ServerConfig,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    ui_tenants: Option<Arc<dyn ResourceStorage>>,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "ui", not(feature = "headless")))]
-    let app = helios_ui::mount(app, env!("CARGO_PKG_VERSION"));
+    let app = helios_ui::mount(app, env!("CARGO_PKG_VERSION"), ui_tenants.clone());
+    #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
+    let _ = &ui_tenants;
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -862,6 +868,10 @@ async fn start_sqlite(
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
+    // Second handle to the same backend for the web UI's tenant-maintenance
+    // read/write path (the FHIR app keeps its own). Cheap: the SQLite backend
+    // shares one connection pool behind the Arc.
+    let ui_tenants: Option<Arc<dyn ResourceStorage>> = Some(backend.clone());
 
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
@@ -875,19 +885,18 @@ async fn start_sqlite(
             export_bundle,
             submit_bundle,
         );
-        return serve(app, &config, serve_audit_state).await;
+        return serve(app, &config, serve_audit_state, ui_tenants).await;
     }
 
-    let app = create_app_with_auth(
-        Arc::try_unwrap(backend).unwrap_or_else(|_| {
-            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
-        }),
+    // Pass the Arc directly (no `try_unwrap`) so the UI handle above stays valid.
+    let app = create_app_with_auth_arc(
+        backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, ui_tenants).await
 }
 
 /// Constructs an embedded SQLite job store for backends that can't host job
@@ -1428,7 +1437,7 @@ async fn start_sqlite_elasticsearch(
             export_bundle,
             submit_bundle,
         );
-        return serve(app, &config, serve_audit_state).await;
+        return serve(app, &config, serve_audit_state, None).await;
     }
 
     let app = create_app_with_auth(
@@ -1440,7 +1449,7 @@ async fn start_sqlite_elasticsearch(
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, None).await
 }
 
 /// Fallback when elasticsearch feature is not enabled.
@@ -1496,7 +1505,7 @@ async fn start_postgres(
             export_bundle,
             submit_bundle,
         );
-        return serve(app, &config, serve_audit_state).await;
+        return serve(app, &config, serve_audit_state, None).await;
     }
 
     let app = create_app_with_auth(
@@ -1508,7 +1517,7 @@ async fn start_postgres(
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, None).await
 }
 
 /// Fallback when postgres feature is not enabled.
@@ -1662,7 +1671,7 @@ async fn start_postgres_elasticsearch(
             export_bundle,
             submit_bundle,
         );
-        return serve(app, &config, serve_audit_state).await;
+        return serve(app, &config, serve_audit_state, None).await;
     }
 
     let app = create_app_with_auth(
@@ -1674,7 +1683,7 @@ async fn start_postgres_elasticsearch(
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, None).await
 }
 
 /// Fallback when postgres+elasticsearch features are not both enabled.
@@ -1822,7 +1831,7 @@ async fn start_mongodb_elasticsearch(
                 Some(bundle),
                 None,
             );
-            return serve(app, &config, serve_audit_state).await;
+            return serve(app, &config, serve_audit_state, None).await;
         }
     }
 
@@ -1835,7 +1844,7 @@ async fn start_mongodb_elasticsearch(
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, None).await
 }
 
 /// Fallback when mongodb+elasticsearch features are not both enabled.
@@ -1913,7 +1922,7 @@ async fn start_s3(
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, None).await
 }
 
 /// Fallback when s3 feature is not enabled.
@@ -2111,7 +2120,7 @@ async fn start_s3_elasticsearch(
                 Some(bundle),
                 None,
             );
-            return serve(app, &config, serve_audit_state).await;
+            return serve(app, &config, serve_audit_state, None).await;
         }
     }
 
@@ -2124,7 +2133,7 @@ async fn start_s3_elasticsearch(
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, None).await
 }
 
 /// Fallback when s3+elasticsearch features are not both enabled.

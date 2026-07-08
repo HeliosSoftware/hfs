@@ -34,6 +34,12 @@ axum-embed = "0.1"
 fluent-templates = "0.13"
 unic-langid = { version = "0.9", features = ["macros"] }
 
+# Read path for the tenant-maintenance page: the `ResourceStorage` tenant
+# registry (list/register/deregister) + per-tenant resource counts. The UI
+# depends on the rest of the server, never the reverse.
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
+serde = { version = "1", features = ["derive"] }
+
 [dev-dependencies]
 # Parses the .ftl sources so tests can enforce key-set parity across locales.
 fluent-syntax = "0.11"

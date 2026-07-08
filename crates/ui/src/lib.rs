@@ -20,6 +20,7 @@
 //! (see `docs/multi-language.md`); templates hold catalog keys, not prose.
 
 mod i18n;
+mod tenants;
 
 use askama::Template;
 use axum::{
@@ -32,8 +33,10 @@ use axum::{
 };
 use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
+use helios_persistence::core::ResourceStorage;
 use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Static UI assets (htmx, CSS) embedded into the binary at compile time.
@@ -44,16 +47,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Assets;
 
 /// Shared router state: values that are constant for the process lifetime.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WebState {
     version: &'static str,
+    /// Read/write path for the tenant-maintenance page. `None` when the host did
+    /// not wire storage in (e.g. the UI-only unit tests), in which case the page
+    /// reports the registry as unavailable rather than crashing.
+    tenants: Option<Arc<dyn ResourceStorage>>,
 }
 
 /// A small, self-contained system-status snapshot — the "real read path" the
 /// POC renders. Kept deliberately simple so the crate stays dependency-light;
 /// richer read paths (terminology lookups, resource counts) plug in the same way.
-struct Status {
-    version: &'static str,
+pub(crate) struct Status {
+    pub(crate) version: &'static str,
     checked_at: u64,
 }
 
@@ -102,10 +109,21 @@ struct StatusPartial {
 
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
 /// other path. The UI depends on the rest of the server, never the reverse.
-pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
+///
+/// `tenants` is the storage handle the tenant-maintenance page reads and writes
+/// (the same backend the FHIR API uses); pass `None` to render the UI without a
+/// live registry (the page then reports it as unavailable).
+pub fn mount(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+) -> Router {
     Router::new()
         .route("/ui", get(index))
         .route("/ui/status", get(status))
+        .route("/ui/tenants", get(tenants::page).post(tenants::create))
+        .route("/ui/tenants/rows", get(tenants::rows))
+        .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
         // Embedded, pinned htmx + CSS, served with br/gzip/deflate negotiation.
         .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
@@ -116,6 +134,7 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
         .layer(middleware::from_fn(i18n::negotiate_locale))
         .with_state(WebState {
             version: hfs_version,
+            tenants,
         })
         .fallback_service(fhir_app)
 }
@@ -149,14 +168,14 @@ async fn status(
     }
 }
 
-fn current_status(version: &'static str) -> Status {
+pub(crate) fn current_status(version: &'static str) -> Status {
     Status {
         version,
         checked_at: unix_timestamp_seconds(),
     }
 }
 
-fn render<T: Template>(template: T) -> Response {
+pub(crate) fn render<T: Template>(template: T) -> Response {
     match template.render() {
         Ok(html) => Html(html).into_response(),
         Err(error) => (

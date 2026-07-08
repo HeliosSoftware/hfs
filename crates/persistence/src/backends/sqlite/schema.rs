@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -269,6 +269,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             9 => migrate_v9_to_v10(conn)?,
             10 => migrate_v10_to_v11(conn)?,
             11 => migrate_v11_to_v12(conn)?,
+            12 => migrate_v12_to_v13(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1188,6 +1189,28 @@ fn migrate_v10_to_v11(conn: &Connection) -> StorageResult<()> {
 /// through main before this feature branch was merged.
 fn migrate_v11_to_v12(conn: &Connection) -> StorageResult<()> {
     add_bulk_submit_worker_schema(conn)
+}
+
+/// Migrate from schema version 12 to version 13.
+///
+/// Adds the tenant registry: a canonical list of first-class tenants backing
+/// the admin tenant-maintenance API (list / add / delete). Until now a tenant
+/// was only ever an implicit identifier string; this table records the tenants
+/// that have been explicitly provisioned, with an optional human-friendly
+/// display name and a creation timestamp. Tenants that merely have data but
+/// were never registered are still discoverable via a `GROUP BY tenant_id` on
+/// `resources`; the registry adds the metadata that data alone cannot provide.
+fn migrate_v12_to_v13(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tenants (
+            id TEXT PRIMARY KEY,
+            display_name TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create tenants table: {e}")))?;
+    Ok(())
 }
 
 fn migration_err(message: String) -> crate::error::StorageError {

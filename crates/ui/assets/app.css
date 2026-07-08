@@ -588,6 +588,262 @@ a.nav-item:hover {
   text-decoration: none;
 }
 
+/* ---------- Tenant maintenance (/ui/tenants) ---------- */
+
+.stat-grid--2 {
+  grid-template-columns: repeat(2, 1fr);
+  max-width: 620px;
+}
+
+.notice {
+  padding: 20px 24px;
+  color: var(--muted);
+}
+
+.table-card {
+  padding: 20px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.toolbar__search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  height: 42px;
+  padding: 0 14px;
+  background: var(--input-bg, var(--surface));
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  color: var(--muted);
+}
+
+.toolbar__search input {
+  flex: 1;
+  border: 0;
+  background: none;
+  outline: none;
+  font-size: 15px;
+  color: var(--text);
+}
+
+/* Buttons */
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 42px;
+  padding: 0 16px;
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.button--primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #002438;
+}
+
+.button--primary:hover {
+  background: var(--accent-strong, #1aa5f0);
+}
+
+/* Add-tenant disclosure */
+.addbox {
+  position: relative;
+}
+
+.addbox > summary {
+  list-style: none;
+}
+
+.addbox > summary::-webkit-details-marker {
+  display: none;
+}
+
+.addbox__panel {
+  position: absolute;
+  right: 0;
+  top: 50px;
+  z-index: 20;
+  width: 340px;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 12%);
+}
+
+.addbox__title {
+  font-weight: 600;
+  margin-bottom: 14px;
+}
+
+.field {
+  display: block;
+  margin-bottom: 14px;
+}
+
+.field__label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.field__input {
+  width: 100%;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--input-bg, var(--surface));
+  color: var(--text);
+  font-size: 15px;
+}
+
+.field__input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.field__hint {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.addbox__actions {
+  margin-top: 4px;
+}
+
+.form-error {
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgb(220 38 38 / 10%);
+  color: #dc2626;
+  font-size: 14px;
+}
+
+/* Data table */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.data-table th {
+  text-align: left;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1px solid var(--divider);
+}
+
+.data-table td {
+  padding: 14px 12px;
+  border-bottom: 1px solid var(--divider);
+  color: var(--text);
+  vertical-align: middle;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.data-table__empty td {
+  color: var(--muted);
+  text-align: center;
+  padding: 32px 12px;
+}
+
+.col-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.col-actions {
+  text-align: right;
+  width: 64px;
+}
+
+.col-tenant {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.tenant-id {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tenant-id__name {
+  font-weight: 500;
+}
+
+.tenant-id__slug {
+  font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+
+.tag--muted {
+  background: var(--accent-soft);
+  color: var(--muted);
+}
+
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.icon-button--danger:hover {
+  background: rgb(220 38 38 / 12%);
+  color: #dc2626;
+}
+
 /* ---------- Narrow screens: stack the shell ---------- */
 
 @media (max-width: 900px) {

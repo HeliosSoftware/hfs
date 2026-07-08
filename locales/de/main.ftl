@@ -88,6 +88,35 @@ nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capability & Konformität
 nav-admin-ops = Admin / Betrieb
 nav-subscriptions = Abonnements
+nav-tenants = Mandanten
+
+## Mandantenverwaltung (/ui/tenants)
+
+tenants-title = Mandantenverwaltung
+tenants-unavailable = Die Mandantenregistrierung ist auf diesem Speicher-Backend nicht verfügbar.
+tenants-stat-total = Mandanten gesamt
+tenants-stat-total-sub = { $count ->
+    [one] { $count } registriert
+   *[other] { $count } registriert
+}
+tenants-stat-resources = Gespeicherte Ressourcen
+tenants-stat-resources-sub = über alle Mandanten
+tenants-search-placeholder = Nach Name oder Mandanten-ID suchen…
+tenants-add = Mandant hinzufügen
+tenants-add-title = Einen Mandanten hinzufügen
+tenants-field-id = Mandanten-ID
+tenants-field-id-hint = Wird in der API verwendet (Header X-Tenant-ID, URL-Präfix, JWT-Claim).
+tenants-field-name = Anzeigename (optional)
+tenants-field-name-hint = Eine lesbare Bezeichnung; nicht für das Routing verwendet.
+tenants-add-submit = Mandant bereitstellen
+tenants-col-tenant = Mandant
+tenants-col-resources = Ressourcen
+tenants-col-created = Erstellt
+tenants-col-actions = Aktionen
+tenants-empty = Keine Mandanten gefunden.
+tenants-unregistered = nicht registriert
+tenants-delete = Mandant löschen
+tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
 
 tenant-heading = Tenants
 tenant-all = Alle Tenants

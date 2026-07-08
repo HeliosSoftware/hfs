@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn app() -> Router {
-    helios_ui::mount(Router::new(), "9.9.9")
+    helios_ui::mount(Router::new(), "9.9.9", None)
 }
 
 async fn body_text(response: axum::response::Response) -> String {

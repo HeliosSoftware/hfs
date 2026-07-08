@@ -343,6 +343,45 @@ where
     )
 }
 
+/// Like [`create_app_with_auth`], but takes the storage already wrapped in an
+/// `Arc` so the caller can keep a second handle (e.g. to feed the web UI's
+/// tenant-maintenance read path) without giving up the shared backend. Behaves
+/// identically otherwise.
+pub fn create_app_with_auth_arc<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        None,
+        None,
+    )
+}
+
 /// Like [`create_app_with_auth`], but also wires the bulk-export subsystem
 /// (job store, output store, download authorizer) into the application state.
 pub fn create_app_with_auth_and_bulk_export<S>(
@@ -657,6 +696,7 @@ where
     let console_public_state = state.clone();
     let console_protected_state = state.clone();
     let console_admin_state = state.clone();
+    let admin_tenants_state = state.clone();
 
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
@@ -724,7 +764,10 @@ where
     // ordinary user-/patient-context tokens (even wildcard ones) with `403`. As
     // with the other tiers, when auth is disabled server-wide there is no
     // Principal and the middleware passes through, keeping dev-mode behaviour.
-    let admin_console = routing::console_metrics::admin_routes(console_admin_state);
+    // Tenant-maintenance API (`/admin/tenants`) rides the same cross-tenant admin
+    // tier as `console/metrics/tenants`: system-context scope + authentication.
+    let admin_console = routing::console_metrics::admin_routes(console_admin_state)
+        .merge(routing::admin_tenants::routes(admin_tenants_state));
     let admin_console = if let Some(ref auth) = auth_state {
         admin_console
             .layer(axum::middleware::from_fn_with_state(
