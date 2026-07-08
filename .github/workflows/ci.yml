@@ -74,10 +74,32 @@ jobs:
     runs-on: [self-hosted, Linux]
     needs: [test-rust]
     if: always()
+    env:
+      # Reap any testcontainer older than this many minutes. Must comfortably
+      # exceed the longest CI job runtime so a *concurrent* run's live
+      # containers on the shared docker host are never killed mid-test.
+      MAX_CONTAINER_AGE_MIN: 90
     steps:
-      - name: Remove testcontainers from this run
+      - name: Reap leaked testcontainers
         run: |
-          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -f || true
+          # testcontainers-rs cleans up on clean process exit, but a cancelled,
+          # timed-out, or OOM-killed test run leaks its containers. It stamps
+          # every container with `org.testcontainers.managed-by=testcontainers`
+          # (never github.run_id), so we reap by that label + age: anything
+          # older than MAX_CONTAINER_AGE_MIN is a leak from a dead run and is
+          # safe to remove without affecting a live concurrent job.
+          now=$(date +%s)
+          reaped=0
+          for id in $(docker ps -q --filter "label=org.testcontainers.managed-by=testcontainers"); do
+            started=$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null) || continue
+            age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
+            if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
+              echo "Reaping $id (age ${age_min}m)"
+              docker rm -f "$id" || true
+              reaped=$((reaped + 1))
+            fi
+          done
+          echo "Reaped ${reaped} leaked testcontainer(s)."
 
   test-python:
     name: Test Python
