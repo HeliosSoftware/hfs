@@ -15,7 +15,7 @@ mod sof_export_tests {
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
     use helios_rest::export::{
-        ExportJobController, ExportTask, InMemoryController, InMemorySink, JobStatus,
+        CompletedFile, ExportJobController, ExportTask, InMemoryController, InMemorySink, JobStatus,
     };
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -1318,6 +1318,119 @@ mod sof_export_tests {
                 "diagnostics must surface failure message: {body}"
             );
         }
+    }
+
+    // =========================================================================
+    // 17b. Completed job whose download-URL resolution fails: rendering the
+    //      completion manifest must not emit an `output` with a missing/empty
+    //      `location`. Instead the result URL surfaces a `500` + OperationOutcome
+    //      (e.g. an S3 pre-signing error at poll time). Uses a test-only
+    //      controller that reports `Completed` but whose `download_url` fails.
+    // =========================================================================
+
+    struct UnresolvableUrlController {
+        tenant: String,
+        job_id: String,
+        submitted_at: chrono::DateTime<chrono::Utc>,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    impl ExportJobController for UnresolvableUrlController {
+        fn submit(&self, _task: ExportTask) -> String {
+            self.job_id.clone()
+        }
+        fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
+            if tenant_id != self.tenant || job_id != self.job_id {
+                return None;
+            }
+            Some(JobStatus::Completed {
+                files: vec![CompletedFile {
+                    view_name: "patient_demographics".to_string(),
+                    filename: "shard-0.ndjson".to_string(),
+                    row_count: 1,
+                }],
+                submitted_at: self.submitted_at,
+                completed_at: self.completed_at,
+                format: "ndjson".to_string(),
+                client_tracking_id: None,
+            })
+        }
+        fn cancel(&self, _t: &str, _j: &str) -> bool {
+            false
+        }
+        fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
+            None
+        }
+        fn download_url(&self, _t: &str, _j: &str, _f: &str) -> Option<String> {
+            // Stand in for an S3 pre-signing failure at poll time: the shard
+            // exists but no usable URL can be produced.
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_completed_but_download_url_unresolvable_yields_500() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+
+        let submitted_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+        let completed_at = chrono::Utc::now() - chrono::Duration::seconds(2);
+        let controller = UnresolvableUrlController {
+            tenant: "test-tenant".to_string(),
+            job_id: "resolve-fail-1".to_string(),
+            submitted_at,
+            completed_at,
+        };
+        let config = ServerConfig::for_testing();
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        let server = TestServer::new(app).expect("failed to create test server");
+
+        // A completed job redirects (303) to its result URL.
+        let poll = server
+            .get("/export/resolve-fail-1/status")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            poll.status_code(),
+            StatusCode::SEE_OTHER,
+            "completed job should redirect to the result URL, got: {} {}",
+            poll.status_code(),
+            poll.text()
+        );
+        let result_url = poll
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("303 missing Location header")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // The result URL must surface the unresolved download URL as a 500 with
+        // an OperationOutcome rather than a manifest with an empty `location`.
+        let result = server
+            .get(&result_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            result.status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unresolvable download URL should 500, got: {} {}",
+            result.status_code(),
+            result.text()
+        );
+        let body: Value = result.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        assert!(
+            body["issue"][0]["diagnostics"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Failed to resolve a download URL"),
+            "diagnostics must explain the URL resolution failure: {body}"
+        );
     }
 
     // =========================================================================
