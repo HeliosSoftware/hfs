@@ -50,7 +50,7 @@ impl TenantRow {
     fn initials(&self) -> String {
         let source = self.display_name.as_deref().unwrap_or(&self.id);
         let letters: String = source
-            .split(|c: char| c == ' ' || c == '-' || c == '_' || c == '/')
+            .split([' ', '-', '_', '/'])
             .filter(|w| !w.is_empty())
             .take(2)
             .filter_map(|w| w.chars().next())
