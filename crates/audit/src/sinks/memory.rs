@@ -1,7 +1,9 @@
 //! In-memory audit sink for tests.
 //!
-//! Buffers every recorded [`AuditEvent`] in a `Vec` behind a `Mutex` so test
-//! code can assert on emitted events. Not intended for production use.
+//! Buffers every recorded [`AuditEvent`] in an unbounded `Vec` behind a `Mutex`
+//! so test code can assert on emitted events. Because the buffer never evicts,
+//! this sink is test-only and is deliberately not reachable via
+//! `HFS_AUDIT_BACKEND`; do not wire it into a running server.
 
 use std::sync::{Arc, Mutex};
 
