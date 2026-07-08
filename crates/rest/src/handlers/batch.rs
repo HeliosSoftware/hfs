@@ -1159,6 +1159,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_transaction_error_response_parts_maps_every_variant() {
+        // Exhaustively map each variant to its (status, code) so a future variant
+        // or a re-mapped status is caught. Complements
+        // `test_transaction_rollback_reason_is_sanitized`, which covers RolledBack.
+        let cases: Vec<(TransactionError, StatusCode, &str)> = vec![
+            (
+                TransactionError::BundleError {
+                    index: 2,
+                    message: "boom".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+                "processing",
+            ),
+            (
+                TransactionError::Timeout { timeout_ms: 1500 },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "timeout",
+            ),
+            (
+                TransactionError::MultipleMatches {
+                    operation: "update".to_string(),
+                    count: 3,
+                },
+                StatusCode::PRECONDITION_FAILED,
+                "multiple-matches",
+            ),
+            (
+                TransactionError::InvalidTransaction,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+            (
+                TransactionError::NestedNotSupported,
+                StatusCode::NOT_IMPLEMENTED,
+                "not-supported",
+            ),
+            (
+                TransactionError::UnsupportedIsolationLevel {
+                    level: "serializable".to_string(),
+                },
+                StatusCode::NOT_IMPLEMENTED,
+                "not-supported",
+            ),
+        ];
+
+        for (err, want_status, want_code) in cases {
+            let (status, code, message) = transaction_error_response_parts(&err);
+            assert_eq!(status, want_status, "status for {err:?}");
+            assert_eq!(code, want_code, "code for {err:?}");
+            assert!(!message.is_empty(), "message for {err:?} must be non-empty");
+        }
+
+        // Detail-bearing variants surface their specifics in the message text.
+        let (_, _, msg) =
+            transaction_error_response_parts(&TransactionError::Timeout { timeout_ms: 1500 });
+        assert!(msg.contains("1500"), "timeout message: {msg}");
+        let (_, _, msg) =
+            transaction_error_response_parts(&TransactionError::UnsupportedIsolationLevel {
+                level: "serializable".to_string(),
+            });
+        assert!(msg.contains("serializable"), "isolation message: {msg}");
+    }
+
+    #[test]
+    fn test_status_text_covers_known_and_unknown_codes() {
+        // The batch response builder renders a reason phrase per entry status; the
+        // full table is only exercised when entries produce these codes.
+        let known = [
+            ("200", "OK"),
+            ("201", "Created"),
+            ("204", "No Content"),
+            ("400", "Bad Request"),
+            ("401", "Unauthorized"),
+            ("403", "Forbidden"),
+            ("404", "Not Found"),
+            ("405", "Method Not Allowed"),
+            ("406", "Not Acceptable"),
+            ("409", "Conflict"),
+            ("410", "Gone"),
+            ("412", "Precondition Failed"),
+            ("415", "Unsupported Media Type"),
+            ("422", "Unprocessable Entity"),
+            ("500", "Internal Server Error"),
+            ("501", "Not Implemented"),
+        ];
+        for (code, phrase) in known {
+            assert_eq!(status_text(code), phrase, "reason phrase for {code}");
+        }
+        // Any unmapped code falls through to the catch-all.
+        assert_eq!(status_text("418"), "Unknown");
+        assert_eq!(status_text(""), "Unknown");
+    }
+
     #[tokio::test]
     async fn test_emit_batch_entry_audit_records_per_entry() {
         let sink = Arc::new(CollectorSink {

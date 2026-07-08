@@ -162,6 +162,58 @@ async fn non_object_body_is_rejected_with_400() {
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
 }
 
+/// The exact sequence the web UI's theme toggle performs (#197): a merge-patch
+/// of `{"theme": ...}` as the *first* write (no prior PUT — the document is
+/// created on the fly), a reload's GET seeing the roamed value, and the
+/// toggle back — all without touching any other settings key.
+#[tokio::test]
+async fn theme_toggle_round_trips_like_the_web_ui() {
+    let server = create_test_server();
+    // A pre-existing unrelated key, as another device may have written one.
+    server
+        .put("/_user/settings")
+        .json(&json!({"defaultTenant": "acme"}))
+        .await;
+
+    // Toggle to dark: what theme.js sends on click.
+    let patch = server
+        .patch("/_user/settings")
+        .json(&json!({"theme": "dark"}))
+        .await;
+    assert_eq!(patch.status_code(), StatusCode::OK);
+
+    // Next page load: GET reconciles the cache with the server value.
+    let get = server.get("/_user/settings").await;
+    assert_eq!(
+        get.json::<Value>(),
+        json!({"theme": "dark", "defaultTenant": "acme"})
+    );
+
+    // Toggle back to light.
+    server
+        .patch("/_user/settings")
+        .json(&json!({"theme": "light"}))
+        .await;
+    let get = server.get("/_user/settings").await;
+    assert_eq!(get.json::<Value>()["theme"], json!("light"));
+}
+
+/// Same round-trip when no document exists at all yet: the very first
+/// interaction a brand-new user has with the toggle must not 404/412.
+#[tokio::test]
+async fn theme_patch_creates_the_document_when_missing() {
+    let server = create_test_server();
+
+    let patch = server
+        .patch("/_user/settings")
+        .json(&json!({"theme": "dark"}))
+        .await;
+    assert_eq!(patch.status_code(), StatusCode::OK);
+
+    let get = server.get("/_user/settings").await;
+    assert_eq!(get.json::<Value>(), json!({"theme": "dark"}));
+}
+
 #[tokio::test]
 async fn if_none_match_returns_304_for_unchanged_document() {
     let server = create_test_server();

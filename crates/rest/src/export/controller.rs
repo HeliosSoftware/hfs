@@ -144,8 +144,27 @@ pub enum JobStatus {
         /// report a stable `exportEndTime` / `exportDuration`.
         failed_at: DateTime<Utc>,
     },
-    /// Job was cancelled by the caller.
-    Cancelled,
+    /// Job was cancelled, or deleted via `DELETE` on the status URL. Carries
+    /// the time of the transition so the cleanup reaper can age it out like the
+    /// other terminal states.
+    Cancelled {
+        /// Time the job was cancelled / deleted.
+        cancelled_at: DateTime<Utc>,
+    },
+}
+
+impl JobStatus {
+    /// Returns the time the job entered a terminal state (completed, failed, or
+    /// cancelled), or `None` while it is still `Running`. The cleanup reaper
+    /// uses this to decide when a finished job's output may be reclaimed.
+    pub fn terminal_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            JobStatus::Running { .. } => None,
+            JobStatus::Completed { completed_at, .. } => Some(*completed_at),
+            JobStatus::Failed { failed_at, .. } => Some(*failed_at),
+            JobStatus::Cancelled { cancelled_at } => Some(*cancelled_at),
+        }
+    }
 }
 
 /// Errors returned by export operations.
