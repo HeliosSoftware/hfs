@@ -10,7 +10,8 @@ use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
 use helios_persistence::core::sof_runner::SofRunner;
 use helios_persistence::core::{
-    BulkExportJobStore, BulkSubmitJobStore, ExportOutputStore, ResourceStorage, SubmitInputFetcher,
+    BulkExportJobStore, BulkSubmitJobStore, ExportOutputStore, ResourceStorage, SettingsStore,
+    SubmitInputFetcher,
 };
 
 use crate::bulk_export_auth::ExportFileAuth;
@@ -79,6 +80,12 @@ pub struct AppState<S> {
     /// Bulk export configuration.
     bulk_export_config: Arc<BulkExportConfig>,
 
+    /// Optional per-user UI settings store (theme, default tenant, recent
+    /// queries, …). Present only for backends that provide one (SQLite,
+    /// PostgreSQL); `None` otherwise, in which case the settings endpoints
+    /// report the feature as unavailable.
+    user_settings: Option<Arc<dyn SettingsStore>>,
+
     /// Bulk submit job-state store (claim + worker storage + lifecycle).
     bulk_submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
 
@@ -113,6 +120,7 @@ impl<S> Clone for AppState<S> {
             bulk_export_output: self.bulk_export_output.clone(),
             bulk_export_file_auth: self.bulk_export_file_auth.clone(),
             bulk_export_config: Arc::clone(&self.bulk_export_config),
+            user_settings: self.user_settings.clone(),
             bulk_submit_jobs: self.bulk_submit_jobs.clone(),
             bulk_submit_fetcher: self.bulk_submit_fetcher.clone(),
             bulk_submit_output: self.bulk_submit_output.clone(),
@@ -147,6 +155,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_export_output: None,
             bulk_export_file_auth: None,
             bulk_export_config,
+            user_settings: None,
             bulk_submit_jobs: None,
             bulk_submit_fetcher: None,
             bulk_submit_output: None,
@@ -191,6 +200,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_export_output: None,
             bulk_export_file_auth: None,
             bulk_export_config,
+            user_settings: None,
             bulk_submit_jobs: None,
             bulk_submit_fetcher: None,
             bulk_submit_output: None,
@@ -257,6 +267,17 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns the bulk-export configuration.
     pub fn bulk_export_config(&self) -> &BulkExportConfig {
         &self.bulk_export_config
+    }
+
+    /// Wires the per-user UI settings store.
+    pub fn with_settings_store(mut self, store: Arc<dyn SettingsStore>) -> Self {
+        self.user_settings = Some(store);
+        self
+    }
+
+    /// Returns the per-user settings store, if configured.
+    pub fn settings_store(&self) -> Option<&Arc<dyn SettingsStore>> {
+        self.user_settings.as_ref()
     }
 
     /// Wires the bulk-submit job store, input fetcher, output store, and file authorizer.
