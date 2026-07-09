@@ -225,9 +225,9 @@ a.nav-item:hover {
 }
 
 /*
- * The toggle uses Brett's directional "Sidebar-Expand" icon (a panel + chevron).
- * The base glyph points right (= expand), which is correct for the collapsed
- * rail; while expanded, mirror it so the chevron points left (= collapse).
+ * The toggle icon is directional (a panel + chevron). The base glyph points
+ * right (= expand), which is correct for the collapsed rail; while expanded,
+ * mirror it so the chevron points left (= collapse).
  */
 .nav-toggle .icon {
   transform: scaleX(-1);
@@ -356,8 +356,7 @@ html[data-nav="collapsed"] .brand__version {
   transform: rotate(180deg);
 }
 
-/* Outline-only variant: the FHIR version selector (kept in its original
-   position per Brett, with an outline to make it pop). */
+/* Outline-only variant: the FHIR version selector (outline-only so it pops). */
 .selector--outline {
   background: none;
   border-color: var(--outline);
