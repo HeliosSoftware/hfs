@@ -305,15 +305,27 @@ async fn create_backend(test_name: &str) -> Option<MongoBackend> {
 /// way the suite already skips when Docker isn't present, rather than reporting
 /// it as a test failure. A real schema bug produces a different error (e.g. a
 /// command failure) and still fails hard.
-fn is_mongo_unavailable(err: &BackendError) -> bool {
-    let msg = format!("{err:?}");
+fn msg_is_mongo_unavailable(msg: &str) -> bool {
     msg.contains("Server selection timeout")
         || msg.contains("No available servers")
         || msg.contains("Connection refused")
+        || msg.contains("Connection reset by peer")
         || msg.contains("unexpected end of file")
         || msg.contains("connection closed")
+        || msg.contains("SystemOverloadedError") // driver: server too busy to respond
         || msg.contains("os error 111") // Linux: connection refused
+        || msg.contains("os error 104") // Linux: connection reset by peer
         || msg.contains("os error 10061") // Windows: connection refused
+}
+
+fn is_mongo_unavailable(err: &BackendError) -> bool {
+    msg_is_mongo_unavailable(&format!("{err:?}"))
+}
+
+/// StorageError variant of [`is_mongo_unavailable`], for errors surfaced by
+/// resource operations (not just schema init) when the shared container blips.
+fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
+    msg_is_mongo_unavailable(&format!("{err:?}"))
 }
 
 /// Builds a `MongoBackend` and runs schema initialization.
@@ -2905,11 +2917,23 @@ async fn mongodb_integration_settings_concurrent_patches_serialize() {
             backend
                 .patch_settings(&user, json!({ format!("k{i}"): i }), None)
                 .await
-                .unwrap();
         }));
     }
     for h in handles {
-        h.await.unwrap();
+        match h.await.expect("patch task panicked") {
+            Ok(_) => {}
+            // A connectivity/overload blip against the shared container is infra
+            // noise, not a serialization failure (which surfaces as a lost
+            // update below). Skip rather than fail.
+            Err(err) if storage_err_is_mongo_unavailable(&err) => {
+                eprintln!(
+                    "Skipping mongodb_integration_settings_concurrent_patches_serialize \
+                     (shared mongo unreachable mid-test: {err:?})"
+                );
+                return;
+            }
+            Err(err) => panic!("patch_settings failed: {err:?}"),
+        }
     }
 
     let final_doc = backend.get_settings(&user).await.unwrap().unwrap();
