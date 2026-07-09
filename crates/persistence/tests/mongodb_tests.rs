@@ -42,6 +42,33 @@ use serde_json::json;
 const MONGODB_MAX_DATABASE_NAME_LEN: usize = 63;
 const MONGODB_TEST_DB_PREFIX: &str = "hfs_phase2_mongo_";
 
+/// Connection-pool caps for the integration suite.
+///
+/// mongod is thread-per-connection, so its resident memory scales with the
+/// number of open connections. The whole suite shares one standalone container,
+/// and ~40 integration tests run in parallel, each holding a backend pool plus
+/// occasional raw admin/assertion clients. Left at their defaults (backend
+/// pool = 10, driver default raw-client pool = 100) the peak connection count
+/// balloons and — on the shared, memory-pressured CI docker host — the host
+/// OOM-kills mongod mid-run (seen as "unexpected end of file" then "connection
+/// refused" on the last wave of tests). Capping both pools keeps the suite's
+/// footprint small; the datasets are tiny so a handful of connections suffice.
+const TEST_BACKEND_MAX_POOL: u32 = 4;
+const TEST_RAW_CLIENT_MAX_POOL: u32 = 2;
+
+/// Bounds how many backends run schema init (`createCollection`/`createIndexes`)
+/// at once, staggering the connection burst that otherwise coincides with the
+/// container's death under load.
+static INIT_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+
+/// Builds a raw `mongodb::Client` with a small pool for test-only assertions and
+/// fixture writes, instead of the driver's default `max_pool_size` of 100.
+async fn raw_test_client(uri: &str) -> mongodb::error::Result<Client> {
+    let mut options = mongodb::options::ClientOptions::parse(uri).await?;
+    options.max_pool_size = Some(TEST_RAW_CLIENT_MAX_POOL);
+    Client::with_options(options)
+}
+
 fn build_test_database_name(test_name: &str) -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let reserved_len = MONGODB_TEST_DB_PREFIX.len() + 1 + suffix.len();
@@ -284,8 +311,15 @@ async fn create_backend(test_name: &str) -> Option<MongoBackend> {
 /// `initialize()` issues `createCollection`/`createIndexes`, which are not
 /// retryable writes, so the driver surfaces the blip. A short bounded retry
 /// absorbs it without masking real schema-init bugs (those fail every attempt).
-async fn build_backend(config: MongoBackendConfig) -> MongoBackend {
+async fn build_backend(mut config: MongoBackendConfig) -> MongoBackend {
     const MAX_ATTEMPTS: u32 = 5;
+    config.max_connections = config.max_connections.min(TEST_BACKEND_MAX_POOL);
+    // Stagger concurrent schema-init so the parallel suite doesn't hit mongod
+    // with one big connection burst; released as soon as init succeeds.
+    let _permit = INIT_GATE
+        .acquire()
+        .await
+        .expect("INIT_GATE semaphore closed");
     let mut attempt = 1;
     loop {
         let backend = MongoBackend::new(config.clone())
@@ -347,7 +381,7 @@ async fn search_index_entry_count(
     resource_type: &str,
     resource_id: &str,
 ) -> u64 {
-    let client = Client::with_uri_str(&backend.config().connection_string)
+    let client = raw_test_client(&backend.config().connection_string)
         .await
         .expect("failed to connect MongoDB client for search_index assertions");
     let database = client.database(&backend.config().database_name);
@@ -364,7 +398,7 @@ async fn search_index_entry_count(
 }
 
 async fn mongodb_total_created_connections(connection_string: &str) -> Option<i64> {
-    let client = Client::with_uri_str(connection_string).await.ok()?;
+    let client = raw_test_client(connection_string).await.ok()?;
     let status = client
         .database("admin")
         .run_command(doc! { "serverStatus": 1_i32 })
@@ -2579,12 +2613,7 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
         data_dir: Some(workspace_data_dir),
         ..Default::default()
     };
-    let backend = MongoBackend::new(config)
-        .expect("failed to create MongoBackend for include/revinclude test");
-    backend
-        .initialize()
-        .await
-        .expect("failed to initialize MongoDB schema for include/revinclude test");
+    let backend = build_backend(config).await;
 
     let tenant = create_tenant("tenant-includes");
 
@@ -2687,76 +2716,22 @@ fn unique_user_key(prefix: &str) -> String {
 
 /// Backend provisioning for the settings-store tests.
 ///
-/// Unlike the rest of this suite — which only runs against an externally
-/// supplied mongo (`HFS_TEST_MONGODB_URL`) — these tests also start an ephemeral
-/// standalone Mongo testcontainer when no URL is set, so they run (and cover the
-/// [`SettingsStore`] impl) in CI where Docker is available, mirroring how the
-/// PostgreSQL suite is provisioned. The settings store uses version-conditioned
-/// writes rather than multi-document transactions, so a standalone (non
-/// replica-set) Mongo is sufficient. When neither a URL nor Docker is available
-/// the tests skip.
+/// Delegates to the suite-wide [`super::create_backend`] so these tests share
+/// the single, memory-capped Mongo container (and its pool cap + init gate)
+/// rather than starting a *second* standalone container in the same test
+/// binary. Two containers doubled the footprint on the shared CI docker host —
+/// and this one was uncapped, so its WiredTiger cache sized to ~50% of host RAM
+/// — which contributed to mongod being OOM-killed mid-run. The settings store
+/// uses version-conditioned writes rather than multi-document transactions, so
+/// a standalone (non replica-set) Mongo is sufficient. When neither a URL nor
+/// Docker is available the tests skip.
 mod settings_mongo {
-    use super::{MongoBackend, MongoBackendConfig, build_test_database_name, test_mongo_url};
-    use helios_persistence::core::Backend; // brings `initialize` into scope
-    use testcontainers::ImageExt;
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::mongo::Mongo;
-    use tokio::sync::OnceCell;
-
-    /// Mongo endpoint shared across the settings tests. Holds the container so it
-    /// stays alive for the test binary; reaped by the testcontainers watchdog and
-    /// the CI cleanup step (by `github.run_id` label), matching the PG suite.
-    struct SharedMongo {
-        connection_string: String,
-        _container: Option<testcontainers::ContainerAsync<Mongo>>,
-    }
-
-    static SHARED: OnceCell<Option<SharedMongo>> = OnceCell::const_new();
-
-    async fn shared() -> Option<&'static SharedMongo> {
-        SHARED
-            .get_or_init(|| async {
-                // Prefer an explicitly provided mongo (fast local runs).
-                if let Some(url) = test_mongo_url() {
-                    return Some(SharedMongo {
-                        connection_string: url,
-                        _container: None,
-                    });
-                }
-                // Otherwise start an ephemeral standalone Mongo container; if
-                // Docker is unavailable, `start()` errors and the tests skip.
-                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Mongo::default()
-                    .with_label("github.run_id", &run_id)
-                    .start()
-                    .await
-                    .ok()?;
-                let host = container.get_host().await.ok()?;
-                let port = container.get_host_port_ipv4(27017).await.ok()?;
-                Some(SharedMongo {
-                    connection_string: format!("mongodb://{host}:{port}/"),
-                    _container: Some(container),
-                })
-            })
-            .await
-            .as_ref()
-    }
+    use super::MongoBackend;
 
     /// Returns a schema-initialised backend against the shared mongo, or `None`
     /// when no mongo is available (skip).
     pub(super) async fn backend(test_name: &str) -> Option<MongoBackend> {
-        let shared = shared().await?;
-        let config = MongoBackendConfig {
-            connection_string: shared.connection_string.clone(),
-            database_name: build_test_database_name(test_name),
-            ..Default::default()
-        };
-        let backend = MongoBackend::new(config).expect("failed to create MongoBackend");
-        backend
-            .initialize()
-            .await
-            .expect("failed to initialize MongoDB schema");
-        Some(backend)
+        super::create_backend(test_name).await
     }
 }
 
@@ -2944,7 +2919,7 @@ async fn mongodb_integration_settings_get_surfaces_decode_error() {
     let user = unique_user_key("corrupt");
 
     // Write a row whose `data` blob is not valid JSON, bypassing the store.
-    let client = Client::with_uri_str(&backend.config().connection_string)
+    let client = raw_test_client(&backend.config().connection_string)
         .await
         .expect("connect raw mongo client");
     let db = client.database(&backend.config().database_name);
