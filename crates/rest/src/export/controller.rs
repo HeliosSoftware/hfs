@@ -103,8 +103,14 @@ pub struct ExportTask {
 pub struct CompletedFile {
     /// Logical view name this file belongs to (matches `view.name`).
     pub view_name: String,
-    /// Public URL that can be fetched via the export download route.
-    pub url: String,
+    /// The shard's stable filename within the job (e.g. `shard-0.ndjson`).
+    ///
+    /// The public download URL is *not* stored here: it is resolved on demand
+    /// via [`ExportSink::download_url`](super::sink::ExportSink::download_url)
+    /// each time the manifest is rendered. This matters for S3-backed exports,
+    /// whose pre-signed URLs would otherwise expire relative to a single
+    /// write-time signing instead of each poll.
+    pub filename: String,
     /// Number of data rows written.
     pub row_count: usize,
 }
@@ -144,8 +150,27 @@ pub enum JobStatus {
         /// report a stable `exportEndTime` / `exportDuration`.
         failed_at: DateTime<Utc>,
     },
-    /// Job was cancelled by the caller.
-    Cancelled,
+    /// Job was cancelled, or deleted via `DELETE` on the status URL. Carries
+    /// the time of the transition so the cleanup reaper can age it out like the
+    /// other terminal states.
+    Cancelled {
+        /// Time the job was cancelled / deleted.
+        cancelled_at: DateTime<Utc>,
+    },
+}
+
+impl JobStatus {
+    /// Returns the time the job entered a terminal state (completed, failed, or
+    /// cancelled), or `None` while it is still `Running`. The cleanup reaper
+    /// uses this to decide when a finished job's output may be reclaimed.
+    pub fn terminal_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            JobStatus::Running { .. } => None,
+            JobStatus::Completed { completed_at, .. } => Some(*completed_at),
+            JobStatus::Failed { failed_at, .. } => Some(*failed_at),
+            JobStatus::Cancelled { cancelled_at } => Some(*cancelled_at),
+        }
+    }
 }
 
 /// Errors returned by export operations.
@@ -200,4 +225,16 @@ pub trait ExportJobController: Send + Sync + 'static {
     /// Returns `None` if the job or shard does not exist OR if `tenant_id`
     /// does not match the tenant that submitted the job.
     fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>>;
+
+    /// Resolves a completed shard's [`CompletedFile::filename`] to a public
+    /// download URL, freshly each call.
+    ///
+    /// Called while rendering the completion manifest so every status poll
+    /// hands out a URL with a full validity window — for S3-backed exports this
+    /// re-signs the GET URL on each poll rather than reusing one signed at write
+    /// time. For server-routed sinks (filesystem / in-memory) the URL is stable.
+    ///
+    /// Returns `None` if `tenant_id` does not match the submitting tenant, or if
+    /// the sink fails to produce a URL (e.g. an S3 pre-signing error).
+    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String>;
 }

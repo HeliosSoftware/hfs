@@ -33,6 +33,8 @@ where
             "service": "hts",
             "version": env!("CARGO_PKG_VERSION"),
             "backend": state.backend().backend_name(),
+            "uptime_seconds": helios_observability::uptime::uptime_seconds(),
+            "started_at": helios_observability::uptime::started_at_rfc3339(),
             "timestamp": chrono::Utc::now().to_rfc3339(),
         })),
     )

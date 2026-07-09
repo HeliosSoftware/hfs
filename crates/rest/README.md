@@ -140,6 +140,33 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 A runnable multi-instance stack (HFS + PostgreSQL + MinIO + Keycloak) is provided
 as a compose example in [`docker/bulk-export/`](../../docker/bulk-export/README.md).
 
+### SQL-on-FHIR Async Export
+
+Separate from Bulk Data Export, the SQL-on-FHIR `$viewdefinition-export` and
+`$sqlquery-export` operations run asynchronously and write their tabular output
+to a dedicated *export sink*, configured via `HFS_EXPORT_*`. The whole subsystem
+is gated by `HFS_SOF_ENABLED` (which also enables `$viewdefinition-run`); when
+enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
+`postgres`).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$viewdefinition-run`/`-export`, `$sqlquery-*`). |
+| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
+| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
+| `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). |
+| `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. |
+| `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
+| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`. Aligns with the manifest's advertised 24h `Expires`. |
+| `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
+
+Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
+job's already-written partial shards immediately; the reaper above reclaims
+*completed* jobs once they age past `HFS_EXPORT_OUTPUT_TTL`.
+
 ## Multi-Tenancy
 
 The server supports multiple methods for tenant identification, configurable via the `HFS_TENANT_ROUTING_MODE` environment variable.

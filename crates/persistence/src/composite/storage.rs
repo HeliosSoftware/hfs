@@ -715,6 +715,10 @@ impl ResourceStorage for CompositeStorage {
         "composite"
     }
 
+    fn is_cluster_shared(&self) -> bool {
+        self.primary.is_cluster_shared()
+    }
+
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
         // SQL-on-FHIR runs as in-DB SQL against the primary store (where all
         // writes land), so delegate to the primary backend. Composites whose
@@ -909,6 +913,38 @@ impl ResourceStorage for CompositeStorage {
         resource_type: Option<&str>,
     ) -> StorageResult<u64> {
         self.primary.count(tenant, resource_type).await
+    }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
+        // Counts are an authoritative-store concern; the search secondary may
+        // lag or omit soft-deletes. Delegate to the primary backend, which owns
+        // the canonical `resources` table. (`count_by_types` uses the default
+        // impl, which routes through `count` — also primary-backed above.)
+        self.primary
+            .count_by_day(tenant, resource_type, since)
+            .await
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<crate::core::ActivityCell>> {
+        // History/activity is owned by the authoritative primary store.
+        self.primary.activity_histogram(tenant, since).await
+    }
+
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        self.primary.count_all_types(tenant).await
+    }
+
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        self.primary.count_by_tenant().await
     }
 }
 

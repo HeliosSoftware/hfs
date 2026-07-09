@@ -26,6 +26,11 @@ const RESERVED_SYSTEM_PATHS: &[&str] = &[
     "v1",
     "v2",
     "fhir",
+    // Management-console namespace (`/console/metrics/*`). Kept in sync with
+    // `middleware::tenant_prefix::RESERVED_SYSTEM_PATHS` so a tenant can never be
+    // named `console` and strict-validation never mis-resolves the console path
+    // to a `console` tenant under URL-path routing.
+    "console",
 ];
 
 /// Result of resolving a tenant from a request.

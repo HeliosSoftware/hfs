@@ -270,9 +270,19 @@ impl fmt::Display for RestError {
 
 impl std::error::Error for RestError {}
 
-impl IntoResponse for RestError {
-    fn into_response(self) -> Response {
-        let (status, code, details) = match &self {
+impl RestError {
+    /// Computes the client-facing `(status, issue code, message)` triple for
+    /// this error.
+    ///
+    /// This is the single source of truth for how a [`RestError`] is surfaced
+    /// to callers, shared by [`IntoResponse`] and the batch/transaction handler
+    /// so both sanitize identically. Internal/backend errors are collapsed to a
+    /// generic message here (and their raw detail is logged server-side) so
+    /// backend/driver/SQL detail — table and column names, connection strings,
+    /// query fragments — never leaks; safe classes (not-found, conflict,
+    /// validation, gone, …) keep their specific, actionable message.
+    pub(crate) fn client_response(&self) -> (StatusCode, &'static str, String) {
+        match self {
             RestError::NotFound { resource_type, id } => (
                 StatusCode::NOT_FOUND,
                 "not-found",
@@ -326,16 +336,7 @@ impl IntoResponse for RestError {
                 message.clone(),
             ),
             RestError::Unauthorized { message } => {
-                let operation_outcome = create_operation_outcome("error", "login", message);
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    [(
-                        axum::http::header::WWW_AUTHENTICATE,
-                        axum::http::HeaderValue::from_static("Bearer"),
-                    )],
-                    Json(operation_outcome),
-                )
-                    .into_response();
+                (StatusCode::UNAUTHORIZED, "login", message.clone())
             }
             RestError::Forbidden { message } => {
                 (StatusCode::FORBIDDEN, "forbidden", message.clone())
@@ -360,11 +361,17 @@ impl IntoResponse for RestError {
             RestError::NotSupported { feature } => {
                 (StatusCode::BAD_REQUEST, "not-supported", feature.clone())
             }
-            RestError::InternalError { message } => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "exception",
-                message.clone(),
-            ),
+            RestError::InternalError { message } => {
+                // Log the full underlying detail server-side so operators keep it,
+                // but never leak backend/driver/SQL detail (table and column names,
+                // connection strings, query fragments) to the HTTP client.
+                tracing::error!(error.detail = %message, "internal error while processing request");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "exception",
+                    "An internal error occurred while processing the request.".to_string(),
+                )
+            }
             RestError::NotAcceptable { message } => {
                 (StatusCode::NOT_ACCEPTABLE, "not-supported", message.clone())
             }
@@ -373,9 +380,29 @@ impl IntoResponse for RestError {
                 "invalid",
                 format!("Invalid parameter '{}': {}", param, message),
             ),
-        };
+        }
+    }
+}
 
+impl IntoResponse for RestError {
+    fn into_response(self) -> Response {
+        let (status, code, details) = self.client_response();
         let operation_outcome = create_operation_outcome("error", code, &details);
+
+        // Unauthorized additionally carries a Bearer challenge in the
+        // WWW-Authenticate header.
+        if matches!(self, RestError::Unauthorized { .. }) {
+            return (
+                status,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    axum::http::HeaderValue::from_static("Bearer"),
+                )],
+                Json(operation_outcome),
+            )
+                .into_response();
+        }
+
         (status, Json(operation_outcome)).into_response()
     }
 }
@@ -718,6 +745,92 @@ mod tests {
         assert_eq!(outcome["resourceType"], "OperationOutcome");
         assert_eq!(outcome["issue"][0]["severity"], "error");
         assert_eq!(outcome["issue"][0]["code"], "not-found");
+    }
+
+    #[tokio::test]
+    async fn test_internal_error_does_not_leak_backend_detail() {
+        // A backend/internal error whose message embeds sensitive DB detail
+        // (table/column names, SQL fragments) must NOT reach the client body.
+        let raw_detail = "query execution failed: table \"resources\" column x does not exist";
+        let err = RestError::InternalError {
+            message: raw_detail.to_string(),
+        };
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // The raw backend detail must be absent from the client-facing body.
+        assert!(
+            !body.contains("resources"),
+            "response leaked raw backend detail: {body}"
+        );
+        assert!(
+            !body.contains("column x"),
+            "response leaked raw backend detail: {body}"
+        );
+        // The generic, non-revealing message must be present, and the shape
+        // must remain a valid OperationOutcome with the exception issue code.
+        assert!(body.contains("An internal error occurred while processing the request."));
+        let outcome: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["severity"], "error");
+        assert_eq!(outcome["issue"][0]["code"], "exception");
+    }
+
+    #[tokio::test]
+    async fn test_bad_request_preserves_specific_message() {
+        // Safe error classes (400/404/etc.) must keep their actionable detail.
+        let err = RestError::BadRequest {
+            message: "missing required field: name".to_string(),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("missing required field: name"));
+    }
+
+    #[test]
+    fn test_client_response_sanitizes_internal() {
+        // The shared helper (also used by the batch/transaction handler) must
+        // collapse internal errors to the generic message with a 5xx status.
+        let err = RestError::InternalError {
+            message: "table \"resources\" column x does not exist".to_string(),
+        };
+        let (status, code, message) = err.client_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "exception");
+        assert!(!message.contains("resources"), "leaked detail: {message}");
+        assert_eq!(
+            message,
+            "An internal error occurred while processing the request."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_still_sets_www_authenticate() {
+        // Routing IntoResponse through client_response must not drop the
+        // Bearer challenge header for Unauthorized.
+        let err = RestError::Unauthorized {
+            message: "missing token".to_string(),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
     }
 
     #[test]

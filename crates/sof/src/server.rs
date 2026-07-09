@@ -168,16 +168,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments first to get log level
     let config = parse_args();
 
-    // Initialize tracing subscriber for logging with configured level
-    let filter = format!(
-        "sof_server={},tower_http={}",
-        config.log_level, config.log_level
-    );
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
-        )
-        .init();
+    // Initialize observability: logging/tracing (+ optional OTLP), uptime, and
+    // the Prometheus metrics recorder.
+    helios_observability::uptime::init();
+    helios_observability::telemetry::init("sof-server", &config.log_level);
+    helios_observability::metrics::init("sof-server");
 
     // Propagate SOF_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
     // FHIRPath evaluation (memberOf, subsumes, etc.) delegates terminology
@@ -401,6 +396,13 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
 
     // Add tracing
     app = app.layer(TraceLayer::new_for_http());
+
+    // Observability: `/metrics` (state-free) + per-request metrics/trace span.
+    app = app
+        .merge(helios_observability::metrics::router())
+        .layer(axum::middleware::from_fn(
+            helios_observability::middleware::track,
+        ));
 
     app
 }

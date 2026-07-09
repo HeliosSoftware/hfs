@@ -10,7 +10,7 @@ It can also be used standalone as a general-purpose FHIR terminology service, in
 
 An open test server will soon be available at https://hts.heliossoftware.com/ for experimentation and evaluation.
 
-HTS currently uses SQLite as its database backend. PostgreSQL support is planned for a future release - see [Storage Backends](#storage-backends) for details.
+HTS supports both SQLite (the zero-config default) and PostgreSQL database backends, with full feature parity between them - see [Storage Backends](#storage-backends) for details.
 
 ### Terminology Data
 
@@ -422,10 +422,17 @@ On top of the SQL layer, the SQLite backend keeps small bounded in-memory caches
 
 ### PostgreSQL
 
-PostgreSQL backend support is planned for a future release. The schema, query patterns, and persistence trait surface have been designed with multi-backend portability in mind, and the integration is being staged behind feature work tracked separately. Until it lands, all production deployments should use the SQLite backend documented above.
+HTS fully supports PostgreSQL as an alternative backend, with feature parity with SQLite across all terminology operations, CRUD, search, and import formats. The schema mirrors the SQLite layout and is applied automatically on first connection, so no manual migration step is required.
+
+Build with the `postgres` feature, then select the backend with `--storage-backend postgres` (or `HTS_STORAGE_BACKEND=postgres`) and a `postgresql://` connection string:
 
 ```bash
-# Coming soon
+# Build with PostgreSQL support
+cargo build --release -p helios-hts --features postgres
+
+# Run against PostgreSQL
+hts run --storage-backend postgres \
+  --database-url "postgresql://user:pass@localhost/hts"
 ```
 
 ## API Endpoints

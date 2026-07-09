@@ -17,13 +17,13 @@ default-members = [
 	"crates/ui",
 	"crates/persistence",
 	"crates/rest",
-	"crates/web",
 	"crates/sof",
 	"crates/cds-hooks",
 	"crates/hts",
 	"crates/auth",
 	"crates/audit",
 	"crates/subscriptions",
+	"crates/observability",
 ]
 resolver = "2"
 

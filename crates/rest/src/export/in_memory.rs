@@ -33,6 +33,20 @@ use super::sink::ExportSink;
 /// Default maximum number of concurrent export jobs.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 
+/// Configuration for the background task that reclaims finished export jobs.
+///
+/// Without this, terminal jobs (and their output shards) live for the lifetime
+/// of the process: the `jobs` map grows unbounded and completed output never
+/// frees, even though the completion manifest advertises a 24h `Expires`.
+#[derive(Debug, Clone, Copy)]
+pub struct CleanupConfig {
+    /// How long after a job reaches a terminal state its output and bookkeeping
+    /// are retained before the reaper removes them.
+    pub output_ttl: Duration,
+    /// How often the reaper scans for expired jobs.
+    pub interval: Duration,
+}
+
 /// In-memory export job controller.
 ///
 /// Jobs are tracked in a `DashMap` and execute in background `tokio` tasks,
@@ -61,22 +75,59 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
         Self::with_shard_rows(runner, sink, max_concurrency, None)
     }
 
-    /// Like [`new`](Self::new) but with an explicit shard row limit.
+    /// Like [`new`](Self::new) but with an explicit shard row limit. No cleanup
+    /// reaper is started; finished jobs are retained until the process exits.
     pub fn with_shard_rows(
         runner: Arc<dyn SofRunner>,
         sink: Sink,
         max_concurrency: Option<usize>,
         shard_rows: Option<usize>,
     ) -> Self {
+        Self::with_options(runner, sink, max_concurrency, shard_rows, None)
+    }
+
+    /// Full constructor. When `cleanup` is `Some`, a background task is spawned
+    /// that periodically reclaims terminal jobs older than the configured TTL —
+    /// deleting their output via the sink and dropping their bookkeeping. Must
+    /// be called from within a Tokio runtime when `cleanup` is `Some`.
+    pub fn with_options(
+        runner: Arc<dyn SofRunner>,
+        sink: Sink,
+        max_concurrency: Option<usize>,
+        shard_rows: Option<usize>,
+        cleanup: Option<CleanupConfig>,
+    ) -> Self {
         let concurrency = max_concurrency.unwrap_or(DEFAULT_MAX_CONCURRENCY);
-        Self {
+        let controller = Self {
             jobs: Arc::new(DashMap::new()),
             job_tenants: Arc::new(DashMap::new()),
             runner,
             sink,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             shard_rows: shard_rows.unwrap_or(planner::DEFAULT_SHARD_ROWS),
+        };
+        if let Some(cfg) = cleanup {
+            controller.spawn_cleanup(cfg);
         }
+        controller
+    }
+
+    /// Spawns the background reaper. Holds only `Arc`/`Clone` handles so it is
+    /// independent of the controller's own lifetime.
+    fn spawn_cleanup(&self, cfg: CleanupConfig) {
+        let jobs = Arc::clone(&self.jobs);
+        let job_tenants = Arc::clone(&self.job_tenants);
+        let sink = self.sink.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(cfg.interval);
+            // The immediate first tick is a no-op (no jobs yet); skip waiting on
+            // it so the cadence starts at `interval`.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                reap_expired(&jobs, &job_tenants, &sink, cfg.output_ttl);
+            }
+        });
     }
 
     /// Returns `true` if `tenant_id` matches the tenant that submitted
@@ -181,6 +232,21 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                     );
                 }
             }
+
+            // Clean up output for any job that won't serve it:
+            // - Cancelled: a concurrent DELETE set this state; shards this task
+            //   wrote before observing it are orphaned (the cancel handler
+            //   cleaned up whatever existed at DELETE time — this covers the race).
+            // - Failed: the result URL returns 500 with no manifest, so the
+            //   partial shards are unreachable and just waste storage.
+            if matches!(
+                jobs.get(&jid).as_deref(),
+                Some(JobStatus::Cancelled { .. }) | Some(JobStatus::Failed { .. })
+            ) {
+                if let Err(e) = sink.delete_job(&jid) {
+                    warn!(job_id = %jid, error = %e, "failed to delete partial export output of unfinished job");
+                }
+            }
         });
 
         job_id
@@ -197,25 +263,105 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         if !self.tenant_matches(tenant_id, job_id) {
             return false;
         }
-        if let Some(mut entry) = self.jobs.get_mut(job_id) {
+        // Only an in-progress job is cancellable. A DELETE on an already-finished
+        // job is a no-op that still reports "found" (the handler 202s), but it
+        // must NOT overwrite the terminal state: a completed job's status URL
+        // keeps redirecting to its result manifest. Completed output is reclaimed
+        // later by the cleanup reaper, not here.
+        //
+        // The lock is held only for the state change; deletion happens after.
+        let now_cancelled = if let Some(mut entry) = self.jobs.get_mut(job_id) {
             match &*entry {
                 JobStatus::Running { .. } => {
-                    *entry = JobStatus::Cancelled;
+                    *entry = JobStatus::Cancelled {
+                        cancelled_at: Utc::now(),
+                    };
                     true
                 }
-                // Already done/failed/cancelled — return true (found it)
-                _ => true,
+                // Already done/failed/cancelled — found, but left untouched.
+                _ => false,
             }
         } else {
-            false
+            return false;
+        };
+
+        // Spec (operations-common, HL7/sql-on-fhir#365): SHOULD clean up partial
+        // results on cancel. Drop any shards written so far. A background task
+        // still draining cleans up whatever it writes after this point when it
+        // observes the Cancelled state (see `submit`).
+        if now_cancelled {
+            if let Err(e) = self.sink.delete_job(job_id) {
+                warn!(%job_id, error = %e, "failed to delete partial export output on cancel");
+            }
         }
+        true
     }
 
     fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>> {
         if !self.tenant_matches(tenant_id, job_id) {
             return None;
         }
+        // A cancelled or failed job's shards must 404 even if deletion is still
+        // draining, so a poll racing the cleanup never serves stale output.
+        if matches!(
+            self.jobs.get(job_id).as_deref(),
+            Some(JobStatus::Cancelled { .. }) | Some(JobStatus::Failed { .. })
+        ) {
+            return None;
+        }
         self.sink.read_shard(job_id, filename)
+    }
+
+    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String> {
+        if !self.tenant_matches(tenant_id, job_id) {
+            return None;
+        }
+        match self.sink.download_url(job_id, filename) {
+            Ok(url) => Some(url),
+            Err(e) => {
+                warn!(%job_id, %filename, error = %e, "failed to resolve export download URL");
+                None
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Cleanup reaper
+// ============================================================================
+
+/// Removes terminal jobs whose age exceeds `output_ttl`: deletes their output
+/// via the sink and drops their status / tenant bookkeeping. `Running` jobs are
+/// never touched ([`JobStatus::terminal_at`] returns `None` for them).
+fn reap_expired<Sink: ExportSink>(
+    jobs: &DashMap<String, JobStatus>,
+    job_tenants: &DashMap<String, String>,
+    sink: &Sink,
+    output_ttl: Duration,
+) {
+    let ttl = match chrono::Duration::from_std(output_ttl) {
+        Ok(d) => d,
+        // A TTL too large to represent as a chrono::Duration means "effectively
+        // never expire" — nothing to reap this pass.
+        Err(_) => return,
+    };
+    let now = Utc::now();
+
+    // Collect keys first: holding DashMap iterator guards while calling
+    // `remove` on the same map would deadlock.
+    let expired: Vec<String> = jobs
+        .iter()
+        .filter(|e| e.value().terminal_at().is_some_and(|t| now - t > ttl))
+        .map(|e| e.key().clone())
+        .collect();
+
+    for jid in expired {
+        if let Err(e) = sink.delete_job(&jid) {
+            warn!(job_id = %jid, error = %e, "cleanup: failed to delete expired export output");
+        }
+        jobs.remove(&jid);
+        job_tenants.remove(&jid);
+        debug!(job_id = %jid, "cleanup: reclaimed expired export job");
     }
 }
 
@@ -328,14 +474,14 @@ async fn run_views_job<Sink: ExportSink>(
             // single-view case this matches the historical `shard-{N}`
             // numbering exactly.
             let shard_key = completed_files.len();
-            let url = sink
+            let filename = sink
                 .write_shard(jid, shard_key, data, ext)
                 .map_err(|e| format!("view '{}': {e}", named.name))?;
 
-            debug!(job_id = %jid, view = %named.name, shard = shard_key, rows = row_count, url = %url, "shard written");
+            debug!(job_id = %jid, view = %named.name, shard = shard_key, rows = row_count, file = %filename, "shard written");
             completed_files.push(CompletedFile {
                 view_name: named.name.clone(),
-                url,
+                filename,
                 row_count,
             });
         }
@@ -381,14 +527,14 @@ async fn run_sqlquery_job<Sink: ExportSink>(
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
 
             let shard_key = completed_files.len();
-            let url = sink
+            let filename = sink
                 .write_shard(jid, shard_key, data, ext)
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
 
-            debug!(job_id = %jid, query = %query.name, shard = shard_key, rows = row_count, url = %url, "shard written");
+            debug!(job_id = %jid, query = %query.name, shard = shard_key, rows = row_count, file = %filename, "shard written");
             completed_files.push(CompletedFile {
                 view_name: query.name.clone(),
-                url,
+                filename,
                 row_count,
             });
         }
@@ -699,7 +845,7 @@ mod tests {
         assert!(controller.cancel("t1", &job_id));
         assert!(matches!(
             controller.get_status("t1", &job_id),
-            Some(JobStatus::Cancelled)
+            Some(JobStatus::Cancelled { .. })
         ));
 
         // Unblock the background task and give it time to run to completion.
@@ -708,9 +854,223 @@ mod tests {
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             match controller.get_status("t1", &job_id) {
-                Some(JobStatus::Cancelled) => {}
+                Some(JobStatus::Cancelled { .. }) => {}
                 other => panic!("cancelled job must stay Cancelled, got {other:?}"),
             }
         }
+    }
+
+    /// Spec (operations-common, HL7/sql-on-fhir#365): cancelling a job SHOULD
+    /// clean up partial results. The shards written before the DELETE must be
+    /// removed from the sink, and the download route must 404 afterwards.
+    #[tokio::test]
+    async fn cancel_deletes_partial_output_and_download_404s() {
+        let release = Arc::new(Notify::new());
+        let runner = Arc::new(BlockingRunner {
+            release: Arc::clone(&release),
+        });
+        // Keep a handle on the sink (shares the inner Arc<DashMap>) so the test
+        // can both seed a partial shard and assert it was deleted.
+        let sink = InMemorySink::new("http://localhost");
+        let controller = InMemoryController::new(runner, sink.clone(), None);
+
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork::Views(vec![NamedView {
+                name: "patients".to_string(),
+                view: serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }),
+            }]),
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+
+        // Simulate a shard the running job had already streamed out.
+        sink.write_shard(&job_id, 0, b"{\"id\":\"a\"}\n".to_vec(), "ndjson")
+            .unwrap();
+        assert!(
+            controller
+                .read_shard("t1", &job_id, "shard-0.ndjson")
+                .is_some(),
+            "shard should be downloadable while the job is running"
+        );
+
+        // Cancel: partial output is dropped and the download route 404s.
+        assert!(controller.cancel("t1", &job_id));
+        assert!(
+            sink.read_shard(&job_id, "shard-0.ndjson").is_none(),
+            "cancel must delete partial shards from the sink"
+        );
+        assert!(
+            controller
+                .read_shard("t1", &job_id, "shard-0.ndjson")
+                .is_none(),
+            "download route must 404 for a cancelled job"
+        );
+
+        release.notify_one();
+    }
+
+    /// The cleanup reaper deletes terminal jobs older than the TTL (output +
+    /// bookkeeping) while leaving running jobs untouched.
+    #[test]
+    fn reap_expired_reclaims_terminal_jobs_only() {
+        let sink = InMemorySink::new("http://localhost");
+        let jobs: DashMap<String, JobStatus> = DashMap::new();
+        let job_tenants: DashMap<String, String> = DashMap::new();
+
+        // An old completed job with written output — should be reclaimed.
+        let old = "old-completed".to_string();
+        let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+        jobs.insert(
+            old.clone(),
+            JobStatus::Completed {
+                files: Vec::new(),
+                submitted_at: two_hours_ago,
+                completed_at: two_hours_ago,
+                format: "ndjson".to_string(),
+                client_tracking_id: None,
+            },
+        );
+        job_tenants.insert(old.clone(), "t1".to_string());
+        sink.write_shard(&old, 0, b"old\n".to_vec(), "ndjson")
+            .unwrap();
+
+        // A freshly completed job — newer than the TTL, should survive.
+        let fresh = "fresh-completed".to_string();
+        jobs.insert(
+            fresh.clone(),
+            JobStatus::Completed {
+                files: Vec::new(),
+                submitted_at: Utc::now(),
+                completed_at: Utc::now(),
+                format: "ndjson".to_string(),
+                client_tracking_id: None,
+            },
+        );
+        job_tenants.insert(fresh.clone(), "t1".to_string());
+
+        // A running job — never reclaimed regardless of age.
+        let running = "still-running".to_string();
+        jobs.insert(
+            running.clone(),
+            JobStatus::Running {
+                percent: 10,
+                submitted_at: two_hours_ago,
+            },
+        );
+        job_tenants.insert(running.clone(), "t1".to_string());
+
+        // Reap anything terminal for longer than one hour.
+        reap_expired(&jobs, &job_tenants, &sink, Duration::from_secs(3600));
+
+        // Old completed job and its output are gone.
+        assert!(jobs.get(&old).is_none(), "expired job should be removed");
+        assert!(
+            job_tenants.get(&old).is_none(),
+            "tenant entry should be removed"
+        );
+        assert!(
+            sink.read_shard(&old, "shard-0.ndjson").is_none(),
+            "expired job's output should be deleted"
+        );
+
+        // Fresh completed job and the running job survive.
+        assert!(jobs.get(&fresh).is_some(), "fresh job must survive");
+        assert!(
+            jobs.get(&running).is_some(),
+            "running job must never be reaped"
+        );
+    }
+
+    /// `write_shard` returns the shard's filename (not a URL), and the sink
+    /// resolves that filename to a stable server-routed URL on demand.
+    #[test]
+    fn in_memory_sink_writes_filename_and_resolves_url() {
+        let sink = InMemorySink::new("http://localhost/");
+        let filename = sink
+            .write_shard("job-1", 0, b"{}\n".to_vec(), "ndjson")
+            .unwrap();
+        assert_eq!(filename, "shard-0.ndjson");
+        assert_eq!(
+            sink.download_url("job-1", &filename).unwrap(),
+            "http://localhost/export/job-1/shard-0.ndjson"
+        );
+    }
+
+    /// An `ExportSink` whose `download_url` returns a different URL on every
+    /// call, standing in for S3's per-poll re-signing.
+    #[derive(Clone)]
+    struct ResigningSink {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ExportSink for ResigningSink {
+        fn write_shard(
+            &self,
+            _job_id: &str,
+            shard_index: usize,
+            _data: Vec<u8>,
+            ext: &str,
+        ) -> Result<String, ExportError> {
+            Ok(format!("shard-{shard_index}.{ext}"))
+        }
+        fn read_shard(&self, _job_id: &str, _filename: &str) -> Option<Vec<u8>> {
+            None
+        }
+        fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+            // Each call advances the nonce, mimicking a fresh pre-signature.
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(format!(
+                "https://signed.example/{job_id}/{filename}?sig={n}"
+            ))
+        }
+        fn delete_job(&self, _job_id: &str) -> Result<(), ExportError> {
+            Ok(())
+        }
+    }
+
+    /// The controller re-resolves a shard's URL on every call (so each manifest
+    /// poll hands out a freshly signed URL), and gates resolution by tenant.
+    #[tokio::test]
+    async fn controller_download_url_is_fresh_and_tenant_gated() {
+        let sink = ResigningSink {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let runner = Arc::new(BlockingRunner {
+            release: Arc::new(Notify::new()),
+        });
+        let controller = InMemoryController::new(runner, sink, None);
+
+        // Register a job for tenant t1 (download_url only checks ownership).
+        let job_id = "job-1".to_string();
+        controller
+            .job_tenants
+            .insert(job_id.clone(), "t1".to_string());
+
+        // Two polls yield two distinct URLs — proof the URL is resolved fresh
+        // rather than reused from write time.
+        let first = controller
+            .download_url("t1", &job_id, "shard-0.ndjson")
+            .expect("owner should resolve a URL");
+        let second = controller
+            .download_url("t1", &job_id, "shard-0.ndjson")
+            .expect("owner should resolve a URL");
+        assert_ne!(first, second, "each poll must re-resolve the download URL");
+
+        // A different tenant cannot resolve URLs for this job.
+        assert!(
+            controller
+                .download_url("other", &job_id, "shard-0.ndjson")
+                .is_none(),
+            "cross-tenant resolution must be denied"
+        );
     }
 }

@@ -805,6 +805,18 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CONTROLLER", default_value = "memory")]
     pub export_controller: String,
 
+    /// Retention (seconds) for a finished export job's output and bookkeeping.
+    ///
+    /// Defaults to 24 hours, matching the `Expires` header on the completion
+    /// poll. After this period the cleanup reaper deletes the output shards and
+    /// drops the job, so subsequent polls/downloads return 404.
+    #[arg(long, env = "HFS_EXPORT_OUTPUT_TTL", default_value = "86400")]
+    pub export_output_ttl_secs: u64,
+
+    /// How often (seconds) the cleanup reaper scans for expired export jobs.
+    #[arg(long, env = "HFS_EXPORT_CLEANUP_INTERVAL", default_value = "300")]
+    pub export_cleanup_interval_secs: u64,
+
     /// Maximum rows returned by `$sqlquery-run`.
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sqlquery_max_rows: usize,
@@ -895,6 +907,8 @@ impl Default for ServerConfig {
             export_max_concurrency: 4,
             export_shard_rows: 500_000,
             export_controller: "memory".to_string(),
+            export_output_ttl_secs: 86_400,
+            export_cleanup_interval_secs: 300,
             sof_sqlquery_max_rows: 100_000,
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
@@ -1013,6 +1027,8 @@ impl ServerConfig {
             export_max_concurrency: 4,
             export_shard_rows: 500_000,
             export_controller: "memory".to_string(),
+            export_output_ttl_secs: 86_400,
+            export_cleanup_interval_secs: 300,
             sof_sqlquery_max_rows: 100_000,
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
