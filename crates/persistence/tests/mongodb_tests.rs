@@ -322,12 +322,6 @@ fn is_mongo_unavailable(err: &BackendError) -> bool {
     msg_is_mongo_unavailable(&format!("{err:?}"))
 }
 
-/// StorageError variant of [`is_mongo_unavailable`], for errors surfaced by
-/// resource operations (not just schema init) when the shared container blips.
-fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
-    msg_is_mongo_unavailable(&format!("{err:?}"))
-}
-
 /// Builds a `MongoBackend` and runs schema initialization.
 ///
 /// Returns `None` when the shared mongo has become unreachable, so callers skip
@@ -2917,23 +2911,11 @@ async fn mongodb_integration_settings_concurrent_patches_serialize() {
             backend
                 .patch_settings(&user, json!({ format!("k{i}"): i }), None)
                 .await
+                .unwrap();
         }));
     }
     for h in handles {
-        match h.await.expect("patch task panicked") {
-            Ok(_) => {}
-            // A connectivity/overload blip against the shared container is infra
-            // noise, not a serialization failure (which surfaces as a lost
-            // update below). Skip rather than fail.
-            Err(err) if storage_err_is_mongo_unavailable(&err) => {
-                eprintln!(
-                    "Skipping mongodb_integration_settings_concurrent_patches_serialize \
-                     (shared mongo unreachable mid-test: {err:?})"
-                );
-                return;
-            }
-            Err(err) => panic!("patch_settings failed: {err:?}"),
-        }
+        h.await.unwrap();
     }
 
     let final_doc = backend.get_settings(&user).await.unwrap().unwrap();
