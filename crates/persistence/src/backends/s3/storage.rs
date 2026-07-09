@@ -17,7 +17,7 @@ use crate::core::{ResourceStorage, VersionedStorage, normalize_etag};
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, StorageResult,
 };
-use crate::tenant::TenantContext;
+use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, Pagination, PaginationMode, ResourceMethod,
     StoredResource,
@@ -760,6 +760,123 @@ impl ResourceStorage for S3Backend {
         }
 
         Ok(count)
+    }
+
+    // ---- Tenant registry ----------------------------------------------------
+    //
+    // One JSON object per registered tenant at `[prefix/]tenants/<id>.json`,
+    // outside any tenant prefix (see `S3Backend::registry_location`). In
+    // bucket-per-tenant mode without a default system bucket there is nowhere
+    // cross-tenant to keep the records, so the registry is unsupported there.
+
+    fn supports_tenant_registry(&self) -> bool {
+        self.registry_location().is_some()
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        let Some(location) = self.registry_location() else {
+            return Ok(Vec::new());
+        };
+        let prefix = location.keyspace.tenant_registry_prefix();
+        let items = self.list_objects_all(&location.bucket, &prefix).await?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            if !item.key.ends_with(".json") {
+                continue;
+            }
+            if let Some((record, _)) = self
+                .get_json_object::<crate::core::TenantRecord>(&location.bucket, &item.key)
+                .await?
+            {
+                out.push(record);
+            }
+        }
+        out.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        let Some(location) = self.registry_location() else {
+            return Ok(None);
+        };
+        let key = location.keyspace.tenant_registry_key(id);
+        Ok(self
+            .get_json_object::<crate::core::TenantRecord>(&location.bucket, &key)
+            .await?
+            .map(|(record, _)| record))
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        let location = self
+            .registry_location()
+            .ok_or_else(|| self.tenant_registry_unsupported())?;
+        let record = crate::core::TenantRecord {
+            id: id.to_string(),
+            display_name: display_name.map(str::to_string),
+            // RFC 3339, matching the SQL registries' `created_at` format.
+            created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        };
+        let key = location.keyspace.tenant_registry_key(id);
+        let bytes = self.serialize_json(&record)?;
+        // `If-None-Match: *` so a concurrent double-register surfaces as a
+        // precondition failure; the admin handler pre-checks existence and
+        // returns 409, so reaching here with a duplicate is a race and a 500
+        // is acceptable.
+        self.put_json_object(&location.bucket, &key, &bytes, None, Some("*"))
+            .await?;
+        Ok(record)
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        let location = self
+            .registry_location()
+            .ok_or_else(|| self.tenant_registry_unsupported())?;
+        let key = location.keyspace.tenant_registry_key(id);
+        // S3 deletes are silently idempotent; probe first so the caller can
+        // distinguish "removed" from "was never registered".
+        if self
+            .get_json_object::<crate::core::TenantRecord>(&location.bucket, &key)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.client
+            .delete_object(&location.bucket, &key)
+            .await
+            .map_err(|e| self.map_client_error(e))?;
+        Ok(true)
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        // Resolve the tenant's data location exactly as request handling does.
+        let tenant = TenantContext::new(TenantId::new(id), TenantPermissions::full_access());
+        let location = self.tenant_location(&tenant)?;
+        // Count current-version pointers first (tombstones included, mirroring
+        // the SQLite purge) so we can report what was removed.
+        let removed = self.list_current_keys(&location, None).await?.len() as u64;
+        // Sweep resources and history, mirroring the SQLite purge — bulk
+        // export/submit artifacts are left alone there too.
+        for prefix in [
+            location.keyspace.resources_prefix(),
+            location.keyspace.history_root_prefix(),
+        ] {
+            for item in self.list_objects_all(&location.bucket, &prefix).await? {
+                self.client
+                    .delete_object(&location.bucket, &item.key)
+                    .await
+                    .map_err(|e| self.map_client_error(e))?;
+            }
+        }
+        Ok(removed)
     }
 }
 

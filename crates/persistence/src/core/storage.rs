@@ -25,7 +25,7 @@ use crate::types::StoredResource;
 /// used everywhere in the API (the `X-Tenant-ID` header, the URL prefix, or the
 /// JWT tenant claim); `display_name` is purely for presentation and is never
 /// used for routing or scoping. See [`ResourceStorage::list_tenants`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TenantRecord {
     /// The tenant id — the value used to scope data and route requests.
     pub id: String,
@@ -561,7 +561,9 @@ pub trait ResourceStorage: Send + Sync {
     /// Whether this backend maintains a first-class tenant registry (the
     /// `list_tenants` / `register_tenant` / `deregister_tenant` /
     /// `purge_tenant_data` family). The admin API returns `501 Not Implemented`
-    /// when this is `false`. Default `false`; the SQLite backend overrides it.
+    /// when this is `false`. Default `false`; the primary backends (SQLite,
+    /// PostgreSQL, MongoDB, S3) override it, and composite storage forwards the
+    /// primary's answer.
     fn supports_tenant_registry(&self) -> bool {
         false
     }
