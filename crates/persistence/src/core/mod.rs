@@ -102,6 +102,7 @@ pub mod search;
 pub mod sof_runner;
 pub mod storage;
 pub mod transaction;
+pub mod user_settings;
 pub mod versioned;
 
 // Re-export main types
@@ -148,11 +149,13 @@ pub use search::{
 };
 pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
-    ConditionalUpdateResult, PatchFormat, PurgableStorage, ResourceStorage,
+    ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult,
+    ConditionalStorage, ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage,
+    ResourceStorage,
 };
 pub use transaction::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     IsolationLevel, LockingStrategy, Transaction, TransactionOptions, TransactionProvider,
 };
+pub use user_settings::{SettingsStore, StoredUserSettings, apply_merge_patch};
 pub use versioned::{VersionConflictInfo, VersionedStorage, check_version_match, normalize_etag};

@@ -1,7 +1,7 @@
 # Multi-language support — approach, guidelines, and rules of the road
 
-**Status:** Foundation / discussion (living document)
-**Branch:** `feat/i18n-foundation` (off `main`)
+**Status:** Ratified — 2026-07-06 (living document; changes via PR)
+**Delivered:** merged to `main` (#187 catalogs/doc, #191/#195 runtime wiring in `crates/ui`)
 **Owner:** Angela
 **Relates to:** #186 (HTMX-first web UI foundation), `feat/user-ui-settings`,
 `feat/smart-ui-auth`
@@ -56,7 +56,7 @@ Browser ──Accept-Language: de-DE, de;q=0.9, en;q=0.7──▶  hfs (Axum)
    │                                                        │
    │                        ┌───────────────────────────────┼───────────────┐
    │                        ▼                               ▼               ▼
-   │                 helios-web (UI)               helios-rest (API)   helios-hts
+   │                 helios-ui (UI)                helios-rest (API)   helios-hts
    │                 renders Askama template        OperationOutcome    $expand/$lookup
    │                 + Fluent catalog (Layer 1)     text (Layer 3)      displayLanguage
    │                                                                    (Layer 5)
@@ -282,7 +282,9 @@ rules of the road in §3.3 have been violated.
 Structure that lands with the UI crate (#186), not here: the negotiation
 middleware, the Askama/Fluent template helper, and the `Cargo.toml` wiring — this
 branch establishes the **shape and the rules**; the runtime wiring rides on the
-`helios-web` foundation so the two don't conflict.
+`helios-ui` foundation so the two don't conflict. That wiring now lives in
+`crates/ui/src/i18n.rs` (the `RequestLocale` middleware, the `hfs_lang`
+switcher cookie, and the Fluent lookup helper the templates use).
 
 ---
 

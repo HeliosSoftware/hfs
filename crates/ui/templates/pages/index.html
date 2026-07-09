@@ -1,0 +1,72 @@
+{% extends "layouts/base.html" %}
+
+{% block content %}
+<h1 class="page-title">{{ i18n.t("nav-home") }}</h1>
+
+<section class="stat-grid">
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("card-resource-types") }}</span>
+    <span class="stat__value">{{ metrics.resource_types }}</span>
+    <span class="stat__sub">{{ i18n.t_arg("card-resource-types-sub", "version", metrics.fhir_version.to_string()) }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("card-stored-resources") }}</span>
+    <span class="stat__value">{{ metrics.stored_resources }}</span>
+    <span class="stat__sub">{{ i18n.t("card-stored-resources-sub") }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("card-export-jobs") }}</span>
+    <span class="stat__value">{{ metrics.export_jobs }}</span>
+    <span class="stat__sub">{{ i18n.t_arg("card-export-jobs-sub", "queued", metrics.export_jobs_queued) }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label">{{ i18n.t("card-uptime") }}</span>
+    <span class="stat__value">{{ metrics.uptime_percent }}<span class="stat__unit">%</span></span>
+    <span class="stat__sub">{{ i18n.t("card-uptime-sub") }}</span>
+  </article>
+</section>
+
+<section class="card chart-card">
+  <header class="chart-card__head">
+    <div>
+      <span class="stat__label">{{ i18n.t("chart-title") }}</span>
+      <span class="stat__value">{{ metrics.chart_total }}</span>
+      <span class="stat__sub">{{ i18n.t("chart-unit-patients") }}</span>
+    </div>
+    <div class="chart-card__tools">
+      <span class="pill">
+        <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
+        Patient
+        <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+      </span>
+      <span class="pill pill--square" aria-label="{{ i18n.t("chart-expand") }}">
+        <span class="icon">{% include "icons/expand.svg" %}</span>
+      </span>
+    </div>
+  </header>
+
+  <!--
+    Sample series matching the design frame; swapped for a real per-resource
+    count read path in follow-up work, together with the metric cards above.
+  -->
+  <svg class="chart" viewBox="0 0 1060 300" role="img" aria-hidden="true">
+    <text class="axis-label" x="0" y="13">2.0k</text>
+    <line class="grid-line" x1="40" y1="10" x2="1060" y2="10" />
+    <text class="axis-label" x="0" y="80">1.5k</text>
+    <line class="grid-line" x1="40" y1="77" x2="1060" y2="77" />
+    <text class="axis-label" x="0" y="147">1.0k</text>
+    <line class="grid-line" x1="40" y1="144" x2="1060" y2="144" />
+    <text class="axis-label" x="0" y="214">500</text>
+    <line class="grid-line" x1="40" y1="211" x2="1060" y2="211" />
+    <text class="axis-label" x="0" y="281">0</text>
+    <line class="grid-line" x1="40" y1="278" x2="1060" y2="278" />
+    <polyline class="series" points="40,211 649,146 852,144 1055,77" />
+    <text class="axis-label" x="40" y="298">MAY 3</text>
+    <text class="axis-label" x="243" y="298">MAY 8</text>
+    <text class="axis-label" x="446" y="298">MAY 13</text>
+    <text class="axis-label" x="649" y="298">MAY 18</text>
+    <text class="axis-label" x="852" y="298">MAY 23</text>
+    <text class="axis-label" x="1020" y="298">MAY 28</text>
+  </svg>
+</section>
+{% endblock %}

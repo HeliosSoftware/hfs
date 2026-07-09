@@ -33,9 +33,13 @@ R4B = ["helios-fhir/R4B", "helios-persistence/R4B"]
 R5 = ["helios-fhir/R5", "helios-persistence/R5"]
 R6 = ["helios-fhir/R6", "helios-persistence/R6"]
 
+# OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
+otel = ["helios-observability/otel"]
+
 [dependencies]
 helios-fhir = { workspace = true }
 helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["sqlite"] }
+helios-observability = { path = "../observability", version = "0.2.1" }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "query"] }

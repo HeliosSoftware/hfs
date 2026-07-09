@@ -49,6 +49,26 @@ impl ScopeSet {
             .any(|scope| scope.permits(resource_type, permission))
     }
 
+    /// Check whether this set holds a **system-context, all-resource** scope
+    /// (`system/*.<perm>`) granting the given permission.
+    ///
+    /// Unlike [`is_permitted`](Self::is_permitted), this requires the scope's
+    /// context to be [`ScopeContext::System`] **and** its resource specifier to
+    /// be [`ResourceTypeSpec::Wildcard`] — a `user/*` or `patient/*` token, or a
+    /// system token scoped to a single resource type (`system/Patient.rs`), never
+    /// satisfies it.
+    ///
+    /// This is the gate for backend-service / administrative endpoints that span
+    /// every tenant (e.g. the cross-tenant console metrics), which no per-user or
+    /// per-patient app — however broad its wildcard — should be able to reach.
+    pub fn has_system_scope(&self, permission: SmartPermissions) -> bool {
+        self.scopes.iter().any(|scope| {
+            scope.context == ScopeContext::System
+                && matches!(scope.resource_type, ResourceTypeSpec::Wildcard)
+                && scope.permissions.contains(permission)
+        })
+    }
+
     /// Returns the parsed scopes.
     pub fn scopes(&self) -> &[SmartScope] {
         &self.scopes
@@ -167,5 +187,34 @@ mod tests {
     fn test_raw_retained() {
         let set = ScopeSet::parse("system/Patient.rs system/bulk-submit");
         assert_eq!(set.raw().len(), 2);
+    }
+
+    #[test]
+    fn test_has_system_scope_grants_for_system_wildcard() {
+        assert!(ScopeSet::parse("system/*.r").has_system_scope(SmartPermissions::READ));
+        assert!(ScopeSet::parse("system/*.rs").has_system_scope(SmartPermissions::READ));
+        assert!(ScopeSet::parse("system/*.cruds").has_system_scope(SmartPermissions::READ));
+        // The permission bit must actually be present.
+        assert!(!ScopeSet::parse("system/*.cud").has_system_scope(SmartPermissions::READ));
+    }
+
+    #[test]
+    fn test_has_system_scope_rejects_non_system_context() {
+        // This is the exact class of token that leaks today: a broad, wildcard,
+        // read-capable scope that is NOT system-context. It must be rejected.
+        assert!(!ScopeSet::parse("patient/*.rs").has_system_scope(SmartPermissions::READ));
+        assert!(!ScopeSet::parse("user/*.cruds").has_system_scope(SmartPermissions::READ));
+    }
+
+    #[test]
+    fn test_has_system_scope_rejects_non_wildcard_system() {
+        // System context but scoped to a single resource type is not system-wide.
+        assert!(!ScopeSet::parse("system/Patient.rs").has_system_scope(SmartPermissions::READ));
+    }
+
+    #[test]
+    fn test_has_system_scope_finds_grant_among_many() {
+        let set = ScopeSet::parse("patient/Patient.rs user/Observation.r system/*.r");
+        assert!(set.has_system_scope(SmartPermissions::READ));
     }
 }

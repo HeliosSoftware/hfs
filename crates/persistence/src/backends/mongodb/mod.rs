@@ -20,5 +20,6 @@ mod bulk_export;
 pub(crate) mod schema;
 mod search_impl;
 mod storage;
+mod user_settings;
 
 pub use backend::{MongoBackend, MongoBackendConfig};

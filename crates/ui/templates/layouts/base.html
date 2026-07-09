@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="{{ i18n.lang() }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ i18n.t("app-title") }}{% endblock %}</title>
+  <link rel="stylesheet" href="/ui/assets/app.css">
+  <!-- No `defer`: the theme attribute must land before first paint (see theme.js). -->
+  <script src="/ui/assets/theme.js"></script>
+  <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
+  <script src="/ui/assets/htmx.min.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <img class="brand__logo" src="/ui/assets/logo.png" alt="">
+      <div>
+        <span class="brand__name">{{ i18n.t("app-title") }}</span>
+        <span class="brand__version">hfs v{{ status.version }}</span>
+      </div>
+    </div>
+
+    <!--
+      Tenant selector. A <details> disclosure so the dropdown works without
+      JavaScript. The tenant list is sample data until the handler grows a
+      read path into helios-persistence (README: "Left for follow-up work").
+    -->
+    <details class="menu">
+      <summary class="selector">
+        <span class="avatar">AH</span>
+        <span class="selector__label">Acme Health</span>
+        <span class="selector__chevrons">
+          <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
+          <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+        </span>
+      </summary>
+      <div class="menu__panel">
+        <label class="menu__search">
+          {% include "icons/search.svg" %}
+          <input type="search" placeholder="{{ i18n.t("tenant-search-placeholder") }}">
+        </label>
+        <div class="menu__heading">{{ i18n.t("tenant-heading") }}</div>
+        <a class="menu__option" href="#">
+          <span class="avatar">{% include "icons/building.svg" %}</span>
+          {{ i18n.t("tenant-all") }}
+        </a>
+        <a class="menu__option" href="#" aria-current="true">
+          <span class="avatar">AH</span>
+          Acme Health
+          <span class="check">{% include "icons/check.svg" %}</span>
+        </a>
+        <a class="menu__option" href="#">
+          <span class="avatar">MM</span>
+          Mercy Medical
+        </a>
+      </div>
+    </details>
+
+    <hr class="divider">
+
+    <nav class="nav">
+      <div class="nav__section">{{ i18n.t("nav-section-work") }}</div>
+      <a class="nav-item" href="/ui" aria-current="page">
+        <span class="icon">{% include "icons/home.svg" %}</span>
+        {{ i18n.t("nav-home") }}
+      </a>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/search.svg" %}</span>
+        {{ i18n.t("nav-search") }}
+      </span>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/pencil.svg" %}</span>
+        {{ i18n.t("nav-resource-editor") }}
+      </span>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/history.svg" %}</span>
+        {{ i18n.t("nav-history-versions") }}
+      </span>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/compartments.svg" %}</span>
+        {{ i18n.t("nav-compartments") }}
+      </span>
+
+      <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/layers.svg" %}</span>
+        {{ i18n.t("nav-batch-transaction") }}
+      </span>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/export.svg" %}</span>
+        {{ i18n.t("nav-bulk-export") }}
+      </span>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/grid.svg" %}</span>
+        {{ i18n.t("nav-sql-on-fhir") }}
+      </span>
+
+      <div class="nav__section">{{ i18n.t("nav-section-server") }}</div>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/shield.svg" %}</span>
+        {{ i18n.t("nav-capability-conformance") }}
+      </span>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/sliders.svg" %}</span>
+        {{ i18n.t("nav-admin-ops") }}
+      </span>
+
+      <div class="nav__section">{{ i18n.t("nav-section-conditional") }}</div>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/book.svg" %}</span>
+        {{ i18n.t("nav-terminology") }}
+      </span>
+      <span class="nav-item nav-item--soon">
+        <span class="icon">{% include "icons/sync.svg" %}</span>
+        {{ i18n.t("nav-subscriptions") }}
+      </span>
+    </nav>
+
+    <!--
+      FHIR version selector — back in its original spot, outline-only so it
+      still pops (Brett, Figma node 34:2). Static until version switching has
+      a server-side read path.
+    -->
+    <div class="sidebar__foot">
+      <div class="selector selector--outline">
+        <span class="icon">{% include "icons/hierarchy.svg" %}</span>
+        <span class="selector__label">{{ i18n.t_arg("fhir-version", "version", "R4".to_string()) }}</span>
+        <span class="selector__chevrons">
+          <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
+          <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+        </span>
+      </div>
+    </div>
+  </aside>
+
+  <div class="pane">
+    <header class="topbar">
+      <div class="topbar__tools">
+        <!--
+          Language switcher: real links, so it works without JavaScript. ?lang=
+          overrides the negotiated locale and the middleware persists the choice
+          in the hfs_lang cookie (see crates/ui/src/i18n.rs).
+        -->
+        <nav class="lang-switcher" aria-label="{{ i18n.t("language-label") }}">
+          <a href="?lang=en"{% if i18n.lang() == "en" %} aria-current="true"{% endif %}>{{ i18n.t("language-en") }}</a>
+          <a href="?lang=es"{% if i18n.lang() == "es" %} aria-current="true"{% endif %}>{{ i18n.t("language-es") }}</a>
+          <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %}>{{ i18n.t("language-de") }}</a>
+        </nav>
+        <div class="theme-toggle" role="group" aria-label="{{ i18n.t("theme-label") }}">
+          <button type="button" data-set-theme="light" aria-label="{{ i18n.t("theme-light") }}">
+            {% include "icons/sun.svg" %}
+          </button>
+          <button type="button" data-set-theme="dark" aria-label="{{ i18n.t("theme-dark") }}">
+            {% include "icons/moon.svg" %}
+          </button>
+        </div>
+        <span class="topbar__avatar">K</span>
+      </div>
+    </header>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

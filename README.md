@@ -321,6 +321,20 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
 
+**SQL-on-FHIR async export**
+
+The `$viewdefinition-export` / `$sqlquery-export` operations write tabular output
+asynchronously to an export sink. See the [rest crate README](crates/rest/README.md#sql-on-fhir-async-export)
+for the full `HFS_EXPORT_*` table.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$viewdefinition-run`/`-export`, `$sqlquery-*`); requires a `sqlite`/`postgres` backend |
+| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3` |
+| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` export sink |
+| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output and bookkeeping; the cleanup reaper deletes shards and drops the job afterward |
+| `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval (seconds; clamped to ≥ 1) |
+
 **Authentication & SMART-on-FHIR**
 
 JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HFS_AUTH_ISSUER`, `HFS_AUTH_AUDIENCE`) and SMART configuration endpoints (`HFS_SMART_*`) plus `HFS_OUTBOUND_BEARER_TOKEN` are documented in the [helios-auth README](crates/auth/README.md).

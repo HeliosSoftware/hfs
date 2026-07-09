@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -269,6 +269,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             9 => migrate_v9_to_v10(conn)?,
             10 => migrate_v10_to_v11(conn)?,
             11 => migrate_v11_to_v12(conn)?,
+            12 => migrate_v12_to_v13(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1188,6 +1189,27 @@ fn migrate_v10_to_v11(conn: &Connection) -> StorageResult<()> {
 /// through main before this feature branch was merged.
 fn migrate_v11_to_v12(conn: &Connection) -> StorageResult<()> {
     add_bulk_submit_worker_schema(conn)
+}
+
+/// Migrate from schema version 12 to version 13.
+///
+/// Adds the `user_settings` table that backs the per-user UI settings store
+/// (theme, default tenant, active FHIR version, recent queries, …). One opaque
+/// JSON document is stored per user, keyed by `user_key`, with a monotonic
+/// `version` for optimistic locking. This table is intentionally independent of
+/// the FHIR `resources` table so UI preferences never leak into FHIR machinery.
+fn migrate_v12_to_v13(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_settings (
+            user_key   TEXT NOT NULL PRIMARY KEY,
+            data       BLOB NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create user_settings table: {e}")))?;
+    Ok(())
 }
 
 fn migration_err(message: String) -> crate::error::StorageError {

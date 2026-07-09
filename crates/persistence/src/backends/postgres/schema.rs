@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Initialize the database schema.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -275,6 +275,7 @@ async fn migrate_schema(
             9 => migrate_v9_to_v10(client).await?,
             10 => migrate_v10_to_v11(client).await?,
             11 => migrate_v11_to_v12(client).await?,
+            12 => migrate_v12_to_v13(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -765,6 +766,28 @@ async fn migrate_v10_to_v11(client: &deadpool_postgres::Client) -> StorageResult
 /// reached v11 through main before this feature branch was merged.
 async fn migrate_v11_to_v12(client: &deadpool_postgres::Client) -> StorageResult<()> {
     add_bulk_submit_worker_schema(client, "Migration v11->v12").await
+}
+
+/// v12 -> v13: Add the `user_settings` table backing the per-user UI settings
+/// store (theme, default tenant, active FHIR version, recent queries, …).
+///
+/// One opaque JSONB document is stored per user, keyed by `user_key`, with a
+/// monotonic `version` for optimistic locking. This table is independent of the
+/// FHIR `resources` table so UI preferences never leak into FHIR machinery.
+async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS user_settings (
+                user_key   TEXT PRIMARY KEY,
+                data       JSONB NOT NULL,
+                version    BIGINT NOT NULL DEFAULT 1,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v12->v13 failed: {}", e)))?;
+    Ok(())
 }
 
 fn pg_error(message: String) -> crate::error::StorageError {

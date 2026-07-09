@@ -16,6 +16,7 @@ pub(crate) mod query_pairs;
 mod search_params;
 pub mod search_query_builder;
 mod tenant;
+mod user;
 
 pub use fhir_resource::FhirResource;
 pub use fhir_version::FhirVersionExtractor;
@@ -26,3 +27,4 @@ pub use search_query_builder::{
     unknown_search_params,
 };
 pub use tenant::TenantExtractor;
+pub use user::UserKey;

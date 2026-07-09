@@ -25,10 +25,14 @@ R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B"]
 R5 = ["helios-fhir/R5", "helios-fhirpath/R5"]
 R6 = ["helios-fhir/R6", "helios-fhirpath/R6"]
 
+# OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
+otel = ["helios-observability/otel"]
+
 [dependencies]
 clap = { version = "4.0", features = ["derive", "env"] }
 tokio = { version = "1.0", features = ["full"] }
 helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
+helios-observability = { path = "../observability", version = "0.2.1" }
 helios-fhirpath = { path = "../fhirpath", version = "0.2.1", default-features = false }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.1" }
 serde = { workspace = true }
