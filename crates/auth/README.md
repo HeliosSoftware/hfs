@@ -117,7 +117,7 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_AUTH_JTI_BACKEND` | `memory` | JTI cache backend (`memory`, `redis`, or `disabled`) |
+| `HFS_AUTH_JTI_BACKEND` | `disabled` | JTI replay cache (`disabled`, `memory`, or `redis`). Off by default: single-use `jti` replay protection is for `private_key_jwt` client assertions, not the reusable bearer access tokens a resource server receives — enabling it rejects the second use of any access token carrying a `jti`. |
 | `HFS_AUTH_REDIS_URL` | *(none)* | Redis URL (required for `redis` backend) |
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Min seconds between JWKS refreshes |
 

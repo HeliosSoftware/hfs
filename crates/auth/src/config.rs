@@ -23,7 +23,16 @@ pub struct AuthConfig {
     pub tenant_claim: String,
     /// Comma-separated list of allowed JWT signing algorithms.
     pub allowed_algorithms: Vec<String>,
-    /// JTI cache backend: `"memory"` or `"redis"`.
+    /// JTI replay-cache backend: `"disabled"` (default), `"memory"`, or
+    /// `"redis"`.
+    ///
+    /// Single-use `jti` replay protection is for `private_key_jwt` **client
+    /// assertions** (RFC 7523 §3), which the IdP's token endpoint enforces — not
+    /// for the reusable **bearer access tokens** a resource server like HFS
+    /// receives. Enabling it here rejects the second use of any access token that
+    /// carries a `jti` (which most IdPs, including Keycloak, always emit), so it
+    /// defaults to `"disabled"`. Turn it on only if your IdP issues genuinely
+    /// single-use access tokens.
     pub jti_backend: String,
     /// Redis connection URL (required when `jti_backend` is `"redis"`).
     pub redis_url: Option<String>,
@@ -70,7 +79,8 @@ impl AuthConfig {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
-            jti_backend: env::var("HFS_AUTH_JTI_BACKEND").unwrap_or_else(|_| "memory".to_string()),
+            jti_backend: env::var("HFS_AUTH_JTI_BACKEND")
+                .unwrap_or_else(|_| "disabled".to_string()),
             redis_url: env::var("HFS_AUTH_REDIS_URL").ok(),
             jwks_min_refresh_interval: env::var("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL")
                 .ok()
@@ -111,7 +121,7 @@ impl Default for AuthConfig {
                 "ES256".to_string(),
                 "ES384".to_string(),
             ],
-            jti_backend: "memory".to_string(),
+            jti_backend: "disabled".to_string(),
             redis_url: None,
             jwks_min_refresh_interval: 10,
             smart_token_endpoint: None,
@@ -135,7 +145,9 @@ mod tests {
         let config = AuthConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.tenant_claim, "tenant_id");
-        assert_eq!(config.jti_backend, "memory");
+        // JTI replay protection is off by default (#205): it belongs to
+        // single-use client assertions, not reusable bearer access tokens.
+        assert_eq!(config.jti_backend, "disabled");
         assert_eq!(config.jwks_min_refresh_interval, 10);
         assert_eq!(config.allowed_algorithms.len(), 4);
     }

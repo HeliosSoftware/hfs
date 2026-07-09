@@ -26,7 +26,7 @@ Use this when working in `helios-auth` or HFS auth behavior. The crate validates
 | `HFS_AUTH_AUDIENCE` | none | Expected `aud` |
 | `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Allowed signing algorithms |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim used to resolve the tenant |
-| `HFS_AUTH_JTI_BACKEND` | `memory` | JTI replay cache: `memory` or `redis` |
+| `HFS_AUTH_JTI_BACKEND` | `disabled` | JTI replay cache: `disabled`, `memory`, or `redis` |
 | `HFS_AUTH_REDIS_URL` | none | Redis URL when JTI backend is `redis` |
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds between JWKS refreshes |
 
@@ -34,7 +34,16 @@ SMART discovery passthrough (advertised in `/.well-known/smart-configuration`): 
 
 ## JTI replay cache
 
-`HFS_AUTH_JTI_BACKEND=memory` (default, per-process) or `redis`. The Redis backend needs `HFS_AUTH_REDIS_URL` and the crate built with `--features redis`, giving a replay cache shared across instances.
+**Disabled by default.** Single-use `jti` replay protection is meant for
+`private_key_jwt` **client assertions** (RFC 7523 §3), enforced by the IdP's
+token endpoint — not for the reusable **bearer access tokens** HFS validates as
+a resource server. Enabling it rejects the second use of any access token that
+carries a `jti` (which Keycloak and most IdPs always emit), so it is off unless
+your IdP issues genuinely single-use access tokens.
+
+When enabled: `HFS_AUTH_JTI_BACKEND=memory` (per-process) or `redis`. The Redis
+backend needs `HFS_AUTH_REDIS_URL` and the crate built with `--features redis`,
+giving a replay cache shared across instances.
 
 ## Key API
 

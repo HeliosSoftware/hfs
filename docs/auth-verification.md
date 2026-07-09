@@ -97,12 +97,12 @@ docker compose -f docker/keycloak/docker-compose.yml up -d
 export TOKEN=$(docker/keycloak/get-token.sh)                     # hfs-backend-client
 export RO=$(docker/keycloak/get-token.sh hfs-readonly-client)    # hfs-readonly-client
 
-# 3. Run HFS pointed at the realm. NOTE the JTI override (see #205) so a token
-#    can be reused for its full lifetime, as every OAuth2 client expects.
+# 3. Run HFS pointed at the realm. (Since #205, JTI replay protection is off by
+#    default, so a token is reusable for its full lifetime as OAuth2 expects —
+#    no override needed.)
 export HFS_AUTH_ENABLED=true
 export HFS_AUTH_JWKS_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/certs
 export HFS_AUTH_ISSUER=http://localhost:8180/realms/fhir
-export HFS_AUTH_JTI_BACKEND=disabled
 export HFS_SMART_TOKEN_ENDPOINT=http://localhost:8180/realms/fhir/protocol/openid-connect/token
 export HFS_SMART_AUTHORIZE_ENDPOINT=http://localhost:8180/realms/fhir/protocol/openid-connect/auth
 cargo run --bin hfs
