@@ -139,6 +139,65 @@ impl Default for AuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    const AUTH_ENV_KEYS: &[&str] = &[
+        "HFS_AUTH_ENABLED",
+        "HFS_AUTH_JWKS_URL",
+        "HFS_AUTH_ISSUER",
+        "HFS_AUTH_AUDIENCE",
+        "HFS_AUTH_TENANT_CLAIM",
+        "HFS_AUTH_ALGORITHMS",
+        "HFS_AUTH_JTI_BACKEND",
+        "HFS_AUTH_REDIS_URL",
+        "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL",
+        "HFS_SMART_TOKEN_ENDPOINT",
+        "HFS_SMART_AUTHORIZE_ENDPOINT",
+        "HFS_SMART_JWKS_URL",
+        "HFS_SMART_INTROSPECTION_ENDPOINT",
+        "HFS_SMART_MANAGEMENT_ENDPOINT",
+        "HFS_SMART_REGISTRATION_ENDPOINT",
+        "HFS_SMART_REVOCATION_ENDPOINT",
+        "HFS_OUTBOUND_BEARER_TOKEN",
+    ];
+
+    fn clear_auth_env() {
+        for key in AUTH_ENV_KEYS {
+            unsafe { env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    fn test_from_env_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+
+        let config = AuthConfig::from_env();
+        assert!(!config.enabled);
+        assert_eq!(config.tenant_claim, "tenant_id");
+        // JTI replay protection is off by default (#205): it belongs to
+        // single-use client assertions, not reusable bearer access tokens.
+        assert_eq!(config.jti_backend, "disabled");
+        assert_eq!(config.jwks_min_refresh_interval, 10);
+        assert_eq!(
+            config.allowed_algorithms,
+            vec!["RS256", "RS384", "ES256", "ES384"]
+        );
+    }
+
+    #[test]
+    fn test_from_env_jti_backend_opt_in() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+        unsafe { env::set_var("HFS_AUTH_JTI_BACKEND", "memory") };
+
+        let config = AuthConfig::from_env();
+        assert_eq!(config.jti_backend, "memory");
+
+        unsafe { env::remove_var("HFS_AUTH_JTI_BACKEND") };
+    }
 
     #[test]
     fn test_default_config() {
