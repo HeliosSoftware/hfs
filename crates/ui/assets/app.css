@@ -225,6 +225,19 @@ a.nav-item:hover {
 }
 
 /*
+ * The toggle uses Brett's directional "Sidebar-Expand" icon (a panel + chevron).
+ * The base glyph points right (= expand), which is correct for the collapsed
+ * rail; while expanded, mirror it so the chevron points left (= collapse).
+ */
+.nav-toggle .icon {
+  transform: scaleX(-1);
+}
+
+html[data-nav="collapsed"] .nav-toggle .icon {
+  transform: none;
+}
+
+/*
  * Collapsed rail: driven by `data-nav="collapsed"` on <html> (set by nav.js
  * before first paint), and forced on narrow viewports (see the media query
  * below). Labels are visually hidden but kept in the accessibility tree so
