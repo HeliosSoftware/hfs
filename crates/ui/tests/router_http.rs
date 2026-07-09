@@ -34,6 +34,26 @@ async fn index_serves_the_full_landing_page() {
 }
 
 #[tokio::test]
+async fn page_wires_the_collapsible_nav() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    // The first-paint script is loaded (non-deferred, in <head>).
+    assert!(html.contains(r#"src="/ui/assets/nav.js""#));
+    // The toggle is a real, accessible button controlling the sidebar.
+    assert!(html.contains("data-toggle-nav"));
+    assert!(html.contains(r#"aria-controls="sidebar""#));
+    assert!(html.contains("aria-expanded"));
+    // Labels are wrapped so the collapsed rail can hide them (a11y-safe).
+    assert!(html.contains("nav-item__label"));
+    // The sidebar is addressable by the toggle's aria-controls.
+    assert!(html.contains(r#"id="sidebar""#));
+}
+
+#[tokio::test]
 async fn status_is_a_full_page_on_hard_navigation() {
     let response = app()
         .oneshot(Request::get("/ui/status").body(Body::empty()).unwrap())

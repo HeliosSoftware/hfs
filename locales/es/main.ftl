@@ -86,6 +86,7 @@ nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capacidad y conformidad
 nav-admin-ops = Administración / Operaciones
 nav-subscriptions = Suscripciones
+nav-toggle = Contraer o expandir la navegación
 
 tenant-heading = Tenants
 tenant-all = Todos los tenants
