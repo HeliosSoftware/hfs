@@ -322,6 +322,16 @@ fn is_mongo_unavailable(err: &BackendError) -> bool {
     msg_is_mongo_unavailable(&format!("{err:?}"))
 }
 
+/// `StorageError` variant of [`is_mongo_unavailable`], for errors surfaced by a
+/// resource/settings operation (not just schema init) once the shared container
+/// has died mid-test. The backend already retries *transient* blips internally
+/// (see the settings-store `retry_transient`), so an unavailability error that
+/// still reaches a test means the container is genuinely gone — a legitimate
+/// skip, not a masked bug (a real logic bug surfaces as a wrong value/assertion).
+fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
+    msg_is_mongo_unavailable(&format!("{err:?}"))
+}
+
 /// Builds a `MongoBackend` and runs schema initialization.
 ///
 /// Returns `None` when the shared mongo has become unreachable, so callers skip
@@ -2978,14 +2988,37 @@ async fn mongodb_integration_settings_concurrent_patches_serialize() {
             backend
                 .patch_settings(&user, json!({ format!("k{i}"): i }), None)
                 .await
-                .unwrap();
         }));
     }
     for h in handles {
-        h.await.unwrap();
+        match h.await.expect("patch task panicked") {
+            Ok(_) => {}
+            // The container died mid-test (it survived the backend's transient
+            // retry). That is infra, not a serialization bug — which would show
+            // up as a lost update in the assertions below — so skip.
+            Err(err) if storage_err_is_mongo_unavailable(&err) => {
+                eprintln!(
+                    "Skipping mongodb_integration_settings_concurrent_patches_serialize \
+                     (shared mongo died mid-test: {err:?})"
+                );
+                return;
+            }
+            Err(err) => panic!("patch_settings failed: {err:?}"),
+        }
     }
 
-    let final_doc = backend.get_settings(&user).await.unwrap().unwrap();
+    let final_doc = match backend.get_settings(&user).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => panic!("settings document missing after 12 successful patches"),
+        Err(err) if storage_err_is_mongo_unavailable(&err) => {
+            eprintln!(
+                "Skipping mongodb_integration_settings_concurrent_patches_serialize \
+                 (shared mongo died mid-test: {err:?})"
+            );
+            return;
+        }
+        Err(err) => panic!("get_settings failed: {err:?}"),
+    };
     let obj = final_doc.document.as_object().unwrap();
     for i in 0..12 {
         assert_eq!(
