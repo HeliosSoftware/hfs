@@ -113,3 +113,25 @@ chart-expand = Ampliar el gráfico
 ## Pie de página
 
 footer-copyright = © { $year } { -org-name }
+
+## Saved queries (#234)
+
+nav-saved-queries = Consultas guardadas
+
+queries-heading = Consultas guardadas
+queries-lede = Guarda consultas de búsqueda FHIR por tipo de recurso, ordenadas por su última ejecución. Se guardan en tu configuración de usuario y te siguen entre dispositivos.
+queries-add-heading = Guardar una consulta
+queries-type-label = Tipo de recurso
+queries-type-placeholder = p. ej. Patient
+queries-name-label = Nombre
+queries-name-placeholder = p. ej. Smith en Boston
+queries-query-label = Cadena de consulta
+queries-query-placeholder = p. ej. name=smith&address-city=Boston
+queries-empty = Aún no hay consultas guardadas. Guarda una arriba para empezar.
+queries-never-run = Nunca ejecutada
+queries-run = Ejecutar
+queries-rename = Renombrar
+queries-delete = Eliminar
+queries-rename-prompt = Nuevo nombre
+queries-confirm-delete = ¿Eliminar «{ $name }»?
+queries-unavailable = Las consultas guardadas no están disponibles: el backend de almacenamiento de este servidor no admite configuración por usuario.

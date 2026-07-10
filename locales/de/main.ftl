@@ -113,3 +113,25 @@ chart-expand = Diagramm vergrößern
 ## Fußzeile
 
 footer-copyright = © { $year } { -org-name }
+
+## Saved queries (#234)
+
+nav-saved-queries = Gespeicherte Abfragen
+
+queries-heading = Gespeicherte Abfragen
+queries-lede = FHIR-Suchabfragen je Ressourcentyp aufbewahren, sortiert nach der letzten Ausführung. Sie werden in deinen Benutzereinstellungen gespeichert und stehen auf allen Geräten bereit.
+queries-add-heading = Abfrage speichern
+queries-type-label = Ressourcentyp
+queries-type-placeholder = z. B. Patient
+queries-name-label = Name
+queries-name-placeholder = z. B. Smiths in Boston
+queries-query-label = Abfrage
+queries-query-placeholder = z. B. name=smith&address-city=Boston
+queries-empty = Noch keine gespeicherten Abfragen. Speichere oben eine, um loszulegen.
+queries-never-run = Nie ausgeführt
+queries-run = Ausführen
+queries-rename = Umbenennen
+queries-delete = Löschen
+queries-rename-prompt = Neuer Name
+queries-confirm-delete = „{ $name }“ löschen?
+queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-Backend dieses Servers unterstützt keine Benutzereinstellungen.

@@ -1,0 +1,50 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("queries-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("queries-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("queries-lede") }}</p>
+</section>
+
+<section class="card query-form-card">
+  <h2 class="query-group__type">{{ i18n.t("queries-add-heading") }}</h2>
+  <form id="saved-query-form" class="query-form" autocomplete="off">
+    <label class="query-form__field">
+      <span>{{ i18n.t("queries-type-label") }}</span>
+      <input name="type" required placeholder="{{ i18n.t("queries-type-placeholder") }}">
+    </label>
+    <label class="query-form__field">
+      <span>{{ i18n.t("queries-name-label") }}</span>
+      <input name="name" required placeholder="{{ i18n.t("queries-name-placeholder") }}">
+    </label>
+    <label class="query-form__field query-form__field--wide">
+      <span>{{ i18n.t("queries-query-label") }}</span>
+      <input name="query" required placeholder="{{ i18n.t("queries-query-placeholder") }}">
+    </label>
+    <button class="btn btn--primary" type="submit">{{ i18n.t("action-save") }}</button>
+  </form>
+</section>
+
+<!--
+  The saved-query list is rendered client-side from /_user/settings — the
+  document is per-user state the browser already has credentials for, exactly
+  like the theme (see saved-queries.js for the ETag/If-Match cycle). The
+  data-msg-* attributes carry the negotiated-locale strings into the script,
+  which never embeds prose of its own.
+-->
+<div id="saved-queries"
+     data-msg-empty="{{ i18n.t("queries-empty") }}"
+     data-msg-never-run="{{ i18n.t("queries-never-run") }}"
+     data-msg-run="{{ i18n.t("queries-run") }}"
+     data-msg-rename="{{ i18n.t("queries-rename") }}"
+     data-msg-delete="{{ i18n.t("queries-delete") }}"
+     data-msg-rename-prompt="{{ i18n.t("queries-rename-prompt") }}"
+     data-msg-confirm-delete="{{ i18n.t_arg("queries-confirm-delete", "name", "{name}".to_string()) }}"
+     data-msg-unavailable="{{ i18n.t("queries-unavailable") }}"
+     data-msg-error="{{ i18n.t("error-generic") }}">
+</div>
+
+<script src="/ui/assets/saved-queries.js" defer></script>
+{% endblock %}

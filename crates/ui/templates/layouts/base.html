@@ -60,9 +60,13 @@
 
     <nav class="nav">
       <div class="nav__section">{{ i18n.t("nav-section-work") }}</div>
-      <a class="nav-item" href="/ui" aria-current="page">
+      <a class="nav-item" href="/ui"{% if active_page == "home" %} aria-current="page"{% endif %}>
         <span class="icon">{% include "icons/home.svg" %}</span>
         {{ i18n.t("nav-home") }}
+      </a>
+      <a class="nav-item" href="/ui/queries"{% if active_page == "queries" %} aria-current="page"{% endif %}>
+        <span class="icon">{% include "icons/bookmark.svg" %}</span>
+        {{ i18n.t("nav-saved-queries") }}
       </a>
       <span class="nav-item nav-item--soon">
         <span class="icon">{% include "icons/search.svg" %}</span>

@@ -91,6 +91,19 @@ struct IndexPage {
     status: Status,
     metrics: DashboardMetrics,
     i18n: I18n,
+    /// Which sidebar entry carries `aria-current="page"` (see base.html).
+    active_page: &'static str,
+}
+
+/// Saved FHIR queries page (#234). The shell is server-rendered; the list is
+/// hydrated client-side from `/_user/settings` by `assets/saved-queries.js`,
+/// the same per-user document (and fetch pattern) the theme toggle uses.
+#[derive(Template)]
+#[template(path = "pages/queries.html")]
+struct QueriesPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
 }
 
 #[derive(Template)]
@@ -105,6 +118,7 @@ struct StatusPartial {
 pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
     Router::new()
         .route("/ui", get(index))
+        .route("/ui/queries", get(queries))
         .route("/ui/status", get(status))
         // Embedded, pinned htmx + CSS, served with br/gzip/deflate negotiation.
         .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
@@ -126,6 +140,16 @@ async fn index(State(state): State<WebState>, locale: RequestLocale) -> Response
         status: current_status(state.version),
         metrics: DashboardMetrics::sample(),
         i18n: I18n::new(locale),
+        active_page: "home",
+    })
+}
+
+/// Saved FHIR queries page.
+async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    render(QueriesPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "queries",
     })
 }
 
@@ -145,6 +169,7 @@ async fn status(
             status,
             metrics: DashboardMetrics::sample(),
             i18n,
+            active_page: "home",
         })
     }
 }
@@ -191,6 +216,7 @@ mod tests {
             },
             metrics: DashboardMetrics::sample(),
             i18n: i18n("en"),
+            active_page: "home",
         }
         .render()
         .expect("index renders");
@@ -211,6 +237,7 @@ mod tests {
             },
             metrics: DashboardMetrics::sample(),
             i18n: i18n("es"),
+            active_page: "home",
         }
         .render()
         .expect("index renders");
@@ -273,6 +300,64 @@ mod tests {
         assert!(source.contains("hfs-theme"), "localStorage cache stays");
     }
 
+    #[test]
+    fn queries_page_renders_shell_and_marks_nav_current() {
+        let html = QueriesPage {
+            status: Status {
+                version: "1.2.3",
+                checked_at: 42,
+            },
+            i18n: i18n("en"),
+            active_page: "queries",
+        }
+        .render()
+        .expect("queries page renders");
+
+        assert!(html.contains(r#"id="saved-query-form""#));
+        assert!(html.contains(r#"id="saved-queries""#));
+        assert!(html.contains("/ui/assets/saved-queries.js"));
+        // This page, not Home, carries aria-current in the sidebar.
+        assert!(html.contains(r#"href="/ui/queries" aria-current="page""#));
+        assert!(!html.contains(r#"href="/ui" aria-current="page""#));
+        // The delete-confirm string reaches the script with its {name} slot.
+        assert!(html.contains("{name}"));
+    }
+
+    #[test]
+    fn queries_page_renders_in_the_negotiated_locale() {
+        let html = QueriesPage {
+            status: Status {
+                version: "1.2.3",
+                checked_at: 42,
+            },
+            i18n: i18n("es"),
+            active_page: "queries",
+        }
+        .render()
+        .expect("queries page renders");
+
+        assert!(html.contains("Consultas guardadas"));
+    }
+
+    /// The saved-queries script owns a structural read-modify-write against
+    /// the shared settings document, so — unlike theme.js — it must use the
+    /// conditional-request cycle: capture the ETag, send If-Match, and absorb
+    /// a 412 by re-reading. Guards the wiring; the endpoint semantics are
+    /// covered in helios-rest's `user_settings` tests.
+    #[test]
+    fn saved_queries_script_is_wired_to_user_settings() {
+        let file = Assets::get("saved-queries.js").expect("saved-queries.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("saved-queries.js is UTF-8");
+        assert!(source.contains("/_user/settings"));
+        assert!(source.contains("savedQueries"));
+        assert!(source.contains("If-Match"));
+        assert!(
+            source.contains("412"),
+            "recovers from optimistic-lock races"
+        );
+        assert!(source.contains("lastAccessedAt"));
+    }
+
     /// Both theme buttons render, and icons are inlined (so `currentColor`
     /// theming applies) rather than referenced as external images.
     #[test]
@@ -284,6 +369,7 @@ mod tests {
             },
             metrics: DashboardMetrics::sample(),
             i18n: i18n("en"),
+            active_page: "home",
         }
         .render()
         .expect("index renders");

@@ -23,6 +23,39 @@
 //!   that increments on every write and is surfaced to clients as a weak ETag
 //!   (`W/"{version}"`). Callers may pass `if_match_version` to make a write
 //!   conditional and avoid lost updates.
+//!
+//! # Document conventions
+//!
+//! The document is schema-less, but keys shared between clients follow agreed
+//! conventions. The established ones:
+//!
+//! - `theme` — `"light"` / `"dark"` (the web UI theme toggle).
+//! - `savedQueries` — per-user saved FHIR queries, grouped by resource type
+//!   and **keyed by query id** so a JSON merge patch can create, update, or
+//!   delete a single entry without clobbering its siblings (RFC 7386 replaces
+//!   arrays wholesale, hence objects, not arrays):
+//!
+//!   ```json
+//!   {
+//!     "savedQueries": {
+//!       "Patient": {
+//!         "01J8ZQ3F9V": {
+//!           "name": "Smiths in Boston",
+//!           "query": "name=smith&address-city=Boston",
+//!           "createdAt": "2026-07-01T12:00:00Z",
+//!           "lastAccessedAt": "2026-07-09T09:14:22Z",
+//!           "accessCount": 12
+//!         }
+//!       }
+//!     }
+//!   }
+//!   ```
+//!
+//!   Clients bump `lastAccessedAt` / `accessCount` with a merge patch when the
+//!   query is run, and sort by `lastAccessedAt` descending, falling back to
+//!   `createdAt` for never-run entries. The REST layer enforces structural
+//!   bounds on this key (entries-per-type and whole-document size caps); see
+//!   `helios-rest`'s user-settings handlers.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

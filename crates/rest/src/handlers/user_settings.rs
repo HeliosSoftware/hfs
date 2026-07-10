@@ -27,13 +27,25 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ResourceStorage, SettingsStore, StoredUserSettings};
+use helios_persistence::core::{
+    ResourceStorage, SettingsStore, StoredUserSettings, apply_merge_patch,
+};
+use helios_persistence::error::{ConcurrencyError, StorageError};
 use serde_json::Value;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::UserKey;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::state::AppState;
+
+/// Upper bound on the serialized settings document, applied to every write.
+/// The document lives in a single row/document on every backend, so an
+/// unbounded blob degrades reads of *all* of a user's settings at once.
+const MAX_SETTINGS_DOCUMENT_BYTES: usize = 256 * 1024;
+
+/// Upper bound on saved queries per resource type under the `savedQueries`
+/// convention (see `helios_persistence::core::user_settings` module docs).
+const MAX_SAVED_QUERIES_PER_TYPE: usize = 100;
 
 /// Handler for `GET /_user/settings`.
 ///
@@ -82,6 +94,7 @@ where
 {
     let store = settings_store(&state)?;
     let document = parse_object_body(&body)?;
+    validate_settings_document(&document)?;
     let if_match = parse_if_match_version(&conditional);
     let stored = store
         .put_settings(user.as_str(), document, if_match)
@@ -107,11 +120,93 @@ where
 {
     let store = settings_store(&state)?;
     let merge_patch = parse_object_body(&body)?;
-    let if_match = parse_if_match_version(&conditional);
-    let stored = store
-        .patch_settings(user.as_str(), merge_patch, if_match)
-        .await?;
-    Ok(settings_response(stored))
+    let caller_if_match = parse_if_match_version(&conditional);
+
+    // The bounds below apply to the *post-merge* document, which only the
+    // backend sees. Compute the merge here against the version we read, pin the
+    // write to that version so what was validated is exactly what lands, and —
+    // only when the caller sent no precondition of their own — absorb a benign
+    // concurrent-writer race with a couple of retries.
+    let mut attempts = 0;
+    loop {
+        let (current, version) = match store.get_settings(user.as_str()).await? {
+            Some(stored) => (stored.document, stored.version),
+            None => (Value::Object(Default::default()), 0),
+        };
+        if let Some(expected) = caller_if_match
+            && expected != version
+        {
+            return Err(RestError::PreconditionFailed {
+                message: format!("Expected settings version {expected}, but found {version}"),
+            });
+        }
+        let merged = apply_merge_patch(current, &merge_patch);
+        validate_settings_document(&merged)?;
+
+        match store
+            .patch_settings(user.as_str(), merge_patch.clone(), Some(version))
+            .await
+        {
+            Ok(stored) => return Ok(settings_response(stored)),
+            Err(e) if is_lock_failure(&e) && caller_if_match.is_none() && attempts < 2 => {
+                attempts += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Whether a storage error is an optimistic-lock (version) conflict.
+fn is_lock_failure(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })
+            | StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+    )
+}
+
+/// Enforces the structural bounds the server guarantees on the otherwise
+/// opaque settings document: a whole-document size cap, and — when the
+/// [`savedQueries` convention](helios_persistence::core::user_settings) is
+/// present — that it is an object keyed by resource type, each holding an
+/// object of at most [`MAX_SAVED_QUERIES_PER_TYPE`] entries keyed by query id.
+fn validate_settings_document(document: &Value) -> RestResult<()> {
+    let size = serde_json::to_vec(document).map(|v| v.len()).unwrap_or(0);
+    if size > MAX_SETTINGS_DOCUMENT_BYTES {
+        return Err(RestError::PayloadTooLarge {
+            message: format!(
+                "Settings document is {size} bytes; the limit is {MAX_SETTINGS_DOCUMENT_BYTES}"
+            ),
+        });
+    }
+
+    let Some(saved_queries) = document.get("savedQueries") else {
+        return Ok(());
+    };
+    let Some(by_type) = saved_queries.as_object() else {
+        return Err(RestError::UnprocessableEntity {
+            message: "savedQueries must be an object keyed by FHIR resource type".to_string(),
+        });
+    };
+    for (resource_type, entries) in by_type {
+        let Some(entries) = entries.as_object() else {
+            return Err(RestError::UnprocessableEntity {
+                message: format!(
+                    "savedQueries.{resource_type} must be an object keyed by query id"
+                ),
+            });
+        };
+        if entries.len() > MAX_SAVED_QUERIES_PER_TYPE {
+            return Err(RestError::UnprocessableEntity {
+                message: format!(
+                    "savedQueries.{resource_type} has {} entries; the limit is {}",
+                    entries.len(),
+                    MAX_SAVED_QUERIES_PER_TYPE
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Returns the configured settings store, or a `501 Not Implemented` error when
