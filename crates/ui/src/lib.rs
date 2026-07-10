@@ -19,12 +19,14 @@
 //! against the locale negotiated per request by [`i18n::negotiate_locale`]
 //! (see `docs/multi-language.md`); templates hold catalog keys, not prose.
 
+mod compartments;
 mod i18n;
+mod search_params;
 
 use askama::Template;
 use axum::{
     Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
@@ -34,6 +36,9 @@ use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
 use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
+use serde::Deserialize;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Static UI assets (htmx, CSS) embedded into the binary at compile time.
@@ -44,9 +49,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Assets;
 
 /// Shared router state: values that are constant for the process lifetime.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WebState {
     version: &'static str,
+    /// Lazily-loaded SearchParameter snapshot per FHIR version (#238).
+    sp_catalog: Arc<search_params::SpCatalog>,
 }
 
 /// A small, self-contained system-status snapshot — the "real read path" the
@@ -106,6 +113,30 @@ struct QueriesPage {
     active_page: &'static str,
 }
 
+/// SearchParameter viewer (#238). Read-only against the same snapshot the
+/// storage backends seed their registries from; the write half lands
+/// behind #235.
+#[derive(Template)]
+#[template(path = "pages/search-parameters.html")]
+struct SearchParametersPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    view: search_params::SpView,
+}
+
+/// Compartment viewer & route tester (#237). Read-only: the base definitions
+/// are codegen'd into the binary; a tenant-scoped override layer is open
+/// question 1 on the issue.
+#[derive(Template)]
+#[template(path = "pages/compartments.html")]
+struct CompartmentsPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    view: compartments::CmpView,
+}
+
 #[derive(Template)]
 #[template(path = "partials/status.html")]
 struct StatusPartial {
@@ -115,10 +146,16 @@ struct StatusPartial {
 
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
 /// other path. The UI depends on the rest of the server, never the reverse.
-pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
+///
+/// `data_dir` is the server's data directory (`HFS_DATA_DIR`), where the
+/// SearchParameter spec bundles live; `None` falls back to `./data`, matching
+/// the storage backends.
+pub fn mount(fhir_app: Router, hfs_version: &'static str, data_dir: Option<PathBuf>) -> Router {
     Router::new()
         .route("/ui", get(index))
         .route("/ui/queries", get(queries))
+        .route("/ui/search-parameters", get(search_parameters))
+        .route("/ui/compartments", get(compartments_page))
         .route("/ui/status", get(status))
         // Embedded, pinned htmx + CSS, served with br/gzip/deflate negotiation.
         .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
@@ -130,6 +167,7 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
         .layer(middleware::from_fn(i18n::negotiate_locale))
         .with_state(WebState {
             version: hfs_version,
+            sp_catalog: Arc::new(search_params::SpCatalog::new(data_dir)),
         })
         .fallback_service(fhir_app)
 }
@@ -151,6 +189,83 @@ async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Respon
         i18n: I18n::new(locale),
         active_page: "queries",
     })
+}
+
+/// Query string for the SearchParameter viewer. Every filter is a link and
+/// the search box is a GET form, so the page works without JavaScript.
+#[derive(Deserialize, Default)]
+struct SearchParametersQuery {
+    version: Option<String>,
+    base: Option<String>,
+    #[serde(rename = "type")]
+    ptype: Option<String>,
+    source: Option<String>,
+    #[serde(default)]
+    q: String,
+    page: Option<usize>,
+    sel: Option<String>,
+}
+
+/// SearchParameter viewer page.
+async fn search_parameters(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    Query(raw): Query<SearchParametersQuery>,
+) -> Response {
+    let query = search_params::SpQuery {
+        version: raw.version,
+        base: raw.base.filter(|b| !b.is_empty()),
+        ptype: raw.ptype.filter(|t| !t.is_empty()),
+        source: raw.source.filter(|s| !s.is_empty()),
+        q: raw.q,
+        page: raw.page.unwrap_or(1),
+        sel: raw.sel.filter(|s| !s.is_empty()),
+    };
+    let snapshot = state.sp_catalog.snapshot(query.fhir_version());
+    render(SearchParametersPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "search-parameters",
+        view: search_params::build_view(&snapshot, &query),
+    })
+}
+
+/// Query string for the compartment viewer & tester.
+#[derive(Deserialize, Default)]
+struct CompartmentsQuery {
+    version: Option<String>,
+    def: Option<String>,
+    tab: Option<String>,
+    filter: Option<String>,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    target: String,
+}
+
+/// Compartment viewer & tester page.
+async fn compartments_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    Query(raw): Query<CompartmentsQuery>,
+) -> Response {
+    let query = compartments::CmpQuery {
+        version: raw.version,
+        def: raw.def,
+        tab: raw.tab,
+        filter: raw.filter,
+        id: raw.id,
+        target: raw.target,
+    };
+    match compartments::build_view(&query) {
+        Some(view) => render(CompartmentsPage {
+            status: current_status(state.version),
+            i18n: I18n::new(locale),
+            active_page: "compartments",
+            view,
+        }),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Status read path. Returns a fragment to htmx (`HX-Request`) and a full page
