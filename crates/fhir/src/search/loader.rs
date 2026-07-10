@@ -159,6 +159,75 @@ impl SearchParameterLoader {
         Ok(params)
     }
 
+    /// Returns the raw SearchParameter resources from the FHIR spec bundle,
+    /// as stored-shape JSON.
+    ///
+    /// This is the seeding companion to
+    /// [`load_from_spec_file`](Self::load_from_spec_file): the registry wants
+    /// parsed definitions, but seeding storage wants the original resource
+    /// JSON (ids, metadata, and fields the definition model drops). Only
+    /// entries that also parse as definitions are returned, so storage never
+    /// holds a parameter the registry would reject.
+    pub fn load_spec_resources(&self, data_dir: &Path) -> Result<Vec<Value>, LoaderError> {
+        let path = data_dir.join(self.spec_filename());
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| LoaderError::ConfigLoadFailed {
+                path: path.display().to_string(),
+                message: e.to_string(),
+            })?;
+        let json: Value =
+            serde_json::from_str(&content).map_err(|e| LoaderError::ConfigLoadFailed {
+                path: path.display().to_string(),
+                message: format!("Invalid JSON: {}", e),
+            })?;
+
+        let mut resources = Vec::new();
+        if let Some(entries) = json.get("entry").and_then(|e| e.as_array()) {
+            for entry in entries {
+                if let Some(resource) = entry.get("resource")
+                    && resource.get("resourceType").and_then(|t| t.as_str())
+                        == Some("SearchParameter")
+                    && self.parse_resource(resource).is_ok()
+                {
+                    resources.push(resource.clone());
+                }
+            }
+        }
+        Ok(resources)
+    }
+
+    /// Renders a definition as a minimal FHIR SearchParameter resource.
+    ///
+    /// Used to seed storage with the embedded fallback parameters, which are
+    /// constructed programmatically and have no source JSON. The resource id
+    /// is the last segment of the canonical URL (`.../Resource-id` → id
+    /// `Resource-id`), matching the spec bundle's convention.
+    pub fn definition_to_fhir_resource(def: &SearchParameterDefinition) -> Value {
+        let id = def.url.rsplit('/').next().unwrap_or(&def.code);
+        let mut resource = serde_json::json!({
+            "resourceType": "SearchParameter",
+            "id": id,
+            "url": def.url,
+            "name": def.name.clone().unwrap_or_else(|| def.code.clone()),
+            "status": def.status.to_fhir_status(),
+            "code": def.code,
+            "base": def.base,
+            "type": def.param_type.to_string(),
+            "expression": def.expression,
+        });
+        let fields = resource.as_object_mut().expect("literal object");
+        if let Some(description) = &def.description {
+            fields.insert("description".into(), Value::String(description.clone()));
+        }
+        if let Some(target) = &def.target {
+            fields.insert(
+                "target".into(),
+                Value::Array(target.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        resource
+    }
+
     /// Loads custom SearchParameter files from the data directory.
     ///
     /// Scans the data directory for JSON files that are not the standard

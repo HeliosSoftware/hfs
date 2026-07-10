@@ -70,6 +70,7 @@ pub mod loader;
 pub mod range;
 pub mod registry;
 pub mod reindex;
+pub mod seeder;
 pub mod text_fold;
 pub mod writer;
 
@@ -89,5 +90,6 @@ pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexStatus, ReindexableStorage,
     ResourcePage,
 };
+pub use seeder::{SeedOutcome, seed_spec_search_parameters};
 pub use text_fold::fold_text;
 pub use writer::SearchIndexWriter;
