@@ -12,10 +12,7 @@ pub const MIMETYPES_VS_URL: &str = "http://hl7.org/fhir/ValueSet/mimetypes";
 
 /// True when `url` is the FHIR core MimeType value set (optional `|version` suffix).
 pub fn is_mimetypes_valueset_url(url: &str) -> bool {
-    url.split_once('|')
-        .map(|(u, _)| u)
-        .unwrap_or(url)
-        == MIMETYPES_VS_URL
+    url.split_once('|').map(|(u, _)| u).unwrap_or(url) == MIMETYPES_VS_URL
 }
 
 /// Best-effort RFC 2045 `type/subtype` syntax check (no IANA registry lookup).
@@ -32,9 +29,9 @@ pub fn is_valid_mime_type(code: &str) -> bool {
     }
     fn valid_token(token: &str) -> bool {
         !token.is_empty()
-            && token
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '!' | '#' | '$' | '&' | '-' | '^' | '_'))
+            && token.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '!' | '#' | '$' | '&' | '-' | '^' | '_')
+            })
     }
     valid_token(ty) && sub.split('+').all(valid_token)
 }
@@ -42,7 +39,10 @@ pub fn is_valid_mime_type(code: &str) -> bool {
 /// When `url` is the mimetypes ValueSet, validate `req.code` by BCP-13 syntax.
 ///
 /// Returns `Some(response)` when this special-case applies; `None` otherwise.
-pub fn validate_mimetypes_code(url: &str, req: &ValidateCodeRequest) -> Option<ValidateCodeResponse> {
+pub fn validate_mimetypes_code(
+    url: &str,
+    req: &ValidateCodeRequest,
+) -> Option<ValidateCodeResponse> {
     if !is_mimetypes_valueset_url(url) {
         return None;
     }
@@ -141,7 +141,12 @@ mod tests {
 
     #[test]
     fn accepts_common_ig_mime_types() {
-        for code in ["text/cql", "application/elm+json", "application/xml", "application/fhir+json"] {
+        for code in [
+            "text/cql",
+            "application/elm+json",
+            "application/xml",
+            "application/fhir+json",
+        ] {
             assert!(is_valid_mime_type(code), "{code}");
         }
     }

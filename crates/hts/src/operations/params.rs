@@ -620,7 +620,10 @@ mod tests {
         })];
         let codings = extract_codeable_concept(&params, "codeableConcept").unwrap();
         assert_eq!(codings.len(), 1);
-        assert_eq!(codings[0], ("http://snomed.info/sct".into(), "371530004".into()));
+        assert_eq!(
+            codings[0],
+            ("http://snomed.info/sct".into(), "371530004".into())
+        );
         let cc = find_codeable_concept_param(&params).unwrap();
         assert!(coding_entries_from_codeable_concept(&cc).is_some());
     }

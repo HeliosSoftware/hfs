@@ -34,10 +34,10 @@ use crate::types::{ValidateCodeRequest, ValidateCodeResponse, ValidationIssue};
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    collect_canonical_params, collect_resource_params, coding_entries_from_codeable_concept,
+    coding_entries_from_codeable_concept, collect_canonical_params, collect_resource_params,
     extract_codeable_concept, extract_coding_full, extract_parameter_array,
-    find_codeable_concept_param, find_resource_param, find_str_param,
-    parse_query_string, query_params_to_fhir_params,
+    find_codeable_concept_param, find_resource_param, find_str_param, parse_query_string,
+    query_params_to_fhir_params,
 };
 
 /// Identifies which FHIR `$validate-code` input form the operations layer is
@@ -2282,11 +2282,10 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
         let system = find_str_param(&params, "url")
             .or_else(|| find_str_param(&params, "system"))
             .ok_or_else(|| {
-            HtsError::InvalidRequest(
-                "Missing required parameter: url or system (CodeSystem canonical URL)."
-                    .into(),
-            )
-        })?;
+                HtsError::InvalidRequest(
+                    "Missing required parameter: url or system (CodeSystem canonical URL).".into(),
+                )
+            })?;
         // Reject when the `url` resolves to a supplement (FHIR R5 §4.7.10):
         // supplements aren't a valid Coding.system value. Matches the IG
         // `extensions/validate-coding-bad-supplement-url` fixture.
@@ -3584,7 +3583,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
             )]
         } else if let Some(entries) = cc_value
             .as_ref()
-            .and_then(|cc| coding_entries_from_codeable_concept(cc))
+            .and_then(coding_entries_from_codeable_concept)
         {
             if entries.is_empty() {
                 return Err(HtsError::InvalidRequest(
@@ -3626,14 +3625,13 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
 
     // Inline mimetypes ValueSet (from IG Publisher / core package): BCP-13 is
     // unbounded — validate MIME syntax instead of expanding an empty compose.
-    let mimetypes_url = crate::bcp13::mimetypes_url_from_resource(&vs_resource)
-        .or_else(|| {
-            if crate::bcp13::compose_is_bcp13_only(&vs_resource) {
-                Some(crate::bcp13::MIMETYPES_VS_URL.to_string())
-            } else {
-                None
-            }
-        });
+    let mimetypes_url = crate::bcp13::mimetypes_url_from_resource(&vs_resource).or_else(|| {
+        if crate::bcp13::compose_is_bcp13_only(&vs_resource) {
+            Some(crate::bcp13::MIMETYPES_VS_URL.to_string())
+        } else {
+            None
+        }
+    });
     if let Some(ref url) = mimetypes_url {
         for (in_system, in_code, in_display, path) in &coding_attempts {
             let req = ValidateCodeRequest {
@@ -3755,10 +3753,8 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
     {
         // Membership check: match by (system, code) when system is supplied,
         // else by code alone (and infer the system from the matched entry).
-        let matched: Option<&crate::types::ExpansionContains> = expansion
-            .contains
-            .iter()
-            .find(|c| {
+        let matched: Option<&crate::types::ExpansionContains> =
+            expansion.contains.iter().find(|c| {
                 c.code == in_code && in_system.as_deref().map(|s| c.system == s).unwrap_or(true)
             });
 
@@ -3767,73 +3763,73 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
             .or_else(|| in_system.clone());
 
         if let Some(concept) = matched {
-        // Look up canonical display + CodeSystem version via the CS
-        // validate-code path. The expansion entry's `display` is sufficient
-        // for the membership echo, but the CS path also computes
-        // `cs_version` and triggers display-mismatch detection.
-        let cs_req = ValidateCodeRequest {
-            url: None,
-            value_set_version: None,
-            system: Some(concept.system.clone()),
-            code: in_code.clone(),
-            version: None,
-            display: in_display.clone(),
-            date: None,
-            include_abstract: None,
-            input_form: Some(match req_path {
-                RequestPath::BareCode => "code".into(),
-                RequestPath::Coding => "coding".into(),
-                RequestPath::CodeableConcept => "codeableConcept".into(),
-            }),
-            lenient_display_validation: None,
-            default_value_set_versions: std::collections::HashMap::new(),
-        };
-        let mut cs_resp = CodeSystemOperations::validate_code(state.backend(), &ctx, cs_req)
+            // Look up canonical display + CodeSystem version via the CS
+            // validate-code path. The expansion entry's `display` is sufficient
+            // for the membership echo, but the CS path also computes
+            // `cs_version` and triggers display-mismatch detection.
+            let cs_req = ValidateCodeRequest {
+                url: None,
+                value_set_version: None,
+                system: Some(concept.system.clone()),
+                code: in_code.clone(),
+                version: None,
+                display: in_display.clone(),
+                date: None,
+                include_abstract: None,
+                input_form: Some(match req_path {
+                    RequestPath::BareCode => "code".into(),
+                    RequestPath::Coding => "coding".into(),
+                    RequestPath::CodeableConcept => "codeableConcept".into(),
+                }),
+                lenient_display_validation: None,
+                default_value_set_versions: std::collections::HashMap::new(),
+            };
+            let mut cs_resp = CodeSystemOperations::validate_code(state.backend(), &ctx, cs_req)
+                .await
+                .unwrap_or_else(|_| ValidateCodeResponse {
+                    result: true,
+                    display: concept.display.clone(),
+                    ..Default::default()
+                });
+            // Prefer the expansion-supplied display (already language-resolved
+            // by the backend) when the CS lookup didn't return one.
+            if cs_resp.display.is_none() {
+                cs_resp.display = concept.display.clone();
+            }
+            // The CS path may set `system` to None; surface the resolved one so
+            // the response echoes it back per the IG fixtures.
+            if cs_resp.system.is_none() {
+                cs_resp.system = resolved_system.clone();
+            }
+            // Look up inactive flag for the matched concept; the IG
+            // `validate-contained-good` fixture expects an `inactive=true`
+            // top-level parameter and a pair of INACTIVE_CONCEPT_FOUND warnings
+            // (one for the generic `inactive` status, one for the specific
+            // status `retired`/`deprecated`/`withdrawn` from the
+            // structuredefinition-standards-status extension).
+            let flags_map = CodeSystemOperations::concept_expansion_flags(
+                state.backend(),
+                &ctx,
+                &concept.system,
+                std::slice::from_ref(&in_code),
+            )
             .await
-            .unwrap_or_else(|_| ValidateCodeResponse {
-                result: true,
-                display: concept.display.clone(),
-                ..Default::default()
-            });
-        // Prefer the expansion-supplied display (already language-resolved
-        // by the backend) when the CS lookup didn't return one.
-        if cs_resp.display.is_none() {
-            cs_resp.display = concept.display.clone();
-        }
-        // The CS path may set `system` to None; surface the resolved one so
-        // the response echoes it back per the IG fixtures.
-        if cs_resp.system.is_none() {
-            cs_resp.system = resolved_system.clone();
-        }
-        // Look up inactive flag for the matched concept; the IG
-        // `validate-contained-good` fixture expects an `inactive=true`
-        // top-level parameter and a pair of INACTIVE_CONCEPT_FOUND warnings
-        // (one for the generic `inactive` status, one for the specific
-        // status `retired`/`deprecated`/`withdrawn` from the
-        // structuredefinition-standards-status extension).
-        let flags_map = CodeSystemOperations::concept_expansion_flags(
-            state.backend(),
-            &ctx,
-            &concept.system,
-            std::slice::from_ref(&in_code),
-        )
-        .await
-        .ok()
-        .unwrap_or_default();
-        let is_inactive = flags_map.get(&in_code).map(|f| f.inactive).unwrap_or(false);
-        if is_inactive {
-            cs_resp.inactive = Some(true);
-            // Generic INACTIVE_CONCEPT_FOUND warning. Mirrors the SQLite
-            // backend's VS path so the operations layer's
-            // `lookup_concept_status` follow-up (in
-            // `build_validate_response_async`) can surface a second issue
-            // when the specific status is retired/deprecated/withdrawn.
-            let already = cs_resp.issues.iter().any(|i| {
-                i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
-                    && i.text.contains("has a status of inactive")
-            });
-            if !already {
-                cs_resp.issues.push(ValidationIssue {
+            .ok()
+            .unwrap_or_default();
+            let is_inactive = flags_map.get(&in_code).map(|f| f.inactive).unwrap_or(false);
+            if is_inactive {
+                cs_resp.inactive = Some(true);
+                // Generic INACTIVE_CONCEPT_FOUND warning. Mirrors the SQLite
+                // backend's VS path so the operations layer's
+                // `lookup_concept_status` follow-up (in
+                // `build_validate_response_async`) can surface a second issue
+                // when the specific status is retired/deprecated/withdrawn.
+                let already = cs_resp.issues.iter().any(|i| {
+                    i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
+                        && i.text.contains("has a status of inactive")
+                });
+                if !already {
+                    cs_resp.issues.push(ValidationIssue {
                     severity: "warning".into(),
                     fhir_code: "business-rule".into(),
                     tx_code: "code-comment".into(),
@@ -3849,40 +3845,34 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
                     location: None,
                     message_id: Some("INACTIVE_CONCEPT_FOUND".into()),
                 });
+                }
             }
-        }
-        // Force result=true for membership-only success — display mismatches
-        // surface as issues, not as a hard membership failure.
-        let has_error = cs_resp.issues.iter().any(|i| i.severity == "error");
-        cs_resp.result = !has_error;
-        let value = build_validate_response_async(
-            state.backend(),
-            &ctx,
-            cs_resp,
-            Some(&in_code),
-            resolved_system.as_deref(),
-            cc_value.as_ref(),
-            req_path,
-            None, // no VS canonical URL to surface
-            find_str_param(&params, "displayLanguage").as_deref(),
-            in_display.as_deref(),
-            &[],
-            lenient_display_validation,
-        )
-        .await;
-        return Ok(value);
+            // Force result=true for membership-only success — display mismatches
+            // surface as issues, not as a hard membership failure.
+            let has_error = cs_resp.issues.iter().any(|i| i.severity == "error");
+            cs_resp.result = !has_error;
+            let value = build_validate_response_async(
+                state.backend(),
+                &ctx,
+                cs_resp,
+                Some(&in_code),
+                resolved_system.as_deref(),
+                cc_value.as_ref(),
+                req_path,
+                None, // no VS canonical URL to surface
+                find_str_param(&params, "displayLanguage").as_deref(),
+                in_display.as_deref(),
+                &[],
+                lenient_display_validation,
+            )
+            .await;
+            return Ok(value);
         }
 
         last_miss = Some((in_system, in_code, in_display));
     }
 
-    let (in_system, in_code, in_display) = last_miss.unwrap_or_else(|| {
-        (
-            None,
-            String::new(),
-            None,
-        )
-    });
+    let (in_system, in_code, in_display) = last_miss.unwrap_or_else(|| (None, String::new(), None));
     let resolved_system = in_system.clone();
 
     // Membership miss for every coding — emit the IG `not-in-vs` issue text.
@@ -4323,20 +4313,19 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // Synthesised `?fhir_vs` URLs have no stored compose at all (they're
     // built from the CodeSystem at validate time), so `detect_bad_vs_import`
     // is a no-op for them — skip the search (iter6 VC03 fast path).
-    let bad_vs_import: Option<String> = if url_is_implicit_fhir_vs
-        || crate::bcp13::is_mimetypes_valueset_url(&url)
-    {
-        None
-    } else {
-        detect_bad_vs_import(
-            state.backend(),
-            &ctx,
-            &url,
-            vs_version.as_deref(),
-            &default_value_set_versions_early,
-        )
-        .await
-    };
+    let bad_vs_import: Option<String> =
+        if url_is_implicit_fhir_vs || crate::bcp13::is_mimetypes_valueset_url(&url) {
+            None
+        } else {
+            detect_bad_vs_import(
+                state.backend(),
+                &ctx,
+                &url,
+                vs_version.as_deref(),
+                &default_value_set_versions_early,
+            )
+            .await
+        };
     if let Some(unresolved_vs_url) = bad_vs_import {
         let cc_value = params
             .iter()
@@ -5148,7 +5137,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         // fires correctly (the coding's version is NOT a top-level parameter).
         let coding_entries = cc_value
             .as_ref()
-            .and_then(|cc| coding_entries_from_codeable_concept(cc));
+            .and_then(coding_entries_from_codeable_concept);
         let coding_displays: std::collections::HashMap<(String, String), String> = coding_entries
             .as_ref()
             .map(|arr| {

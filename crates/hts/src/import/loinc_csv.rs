@@ -436,10 +436,7 @@ fn loinc_release_version_from_entry(entry_path: &str) -> Option<String> {
         let lower = segment.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("loinc_") {
             let ver = rest.trim();
-            if !ver.is_empty()
-                && ver.chars()
-                    .all(|c| c.is_ascii_digit() || c == '.')
-            {
+            if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
                 return Some(ver.to_string());
             }
         }

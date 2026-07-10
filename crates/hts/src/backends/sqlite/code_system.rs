@@ -1810,10 +1810,9 @@ fn resolve_code_system_uncached(
                 .find(|(id, _, _)| id == &matched_id)
                 .expect("matched id was sourced from candidates")
         }
-        Some(ver) if crate::backends::code_system_version_is_current(ver) => candidates
-            .into_iter()
-            .next()
-            .expect("non-empty checked"),
+        Some(ver) if crate::backends::code_system_version_is_current(ver) => {
+            candidates.into_iter().next().expect("non-empty checked")
+        }
         Some(ver) => candidates
             .iter()
             .find(|(_, _, v)| v.as_deref() == Some(ver))
@@ -2377,7 +2376,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(resp.result, "expected ACS code to validate with version=current");
+        assert!(
+            resp.result,
+            "expected ACS code to validate with version=current"
+        );
         assert_eq!(resp.display.as_deref(), Some("Acute coronary syndrome"));
         assert_eq!(resp.cs_version.as_deref(), Some("20260501"));
     }
