@@ -704,7 +704,10 @@ mod postgres_integration {
     struct SharedPg {
         host: String,
         port: u16,
-        /// Kept alive for the duration of the test binary; dropped at process exit.
+        /// Kept alive for the duration of the test binary. NOTE: a `static` is
+        /// never dropped, so `Drop for ContainerAsync` — testcontainers' only
+        /// container-removal path — never runs. The container outlives the test
+        /// process and is reaped in CI by its `github.run_id` label.
         _container: testcontainers::ContainerAsync<Postgres>,
     }
 
