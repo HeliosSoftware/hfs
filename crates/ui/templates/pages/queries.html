@@ -8,22 +8,43 @@
   <p class="page-head__lede">{{ i18n.t("queries-lede") }}</p>
 </section>
 
+<!--
+  Search Builder (hi-fi console design): a featured, editable GET URL is the
+  primary control — Run opens the search and records it under Recent; naming
+  it saves it to the per-user document. The Recent dropdown is a <details>
+  disclosure (same primitive as the tenant selector) so it opens without
+  JavaScript; its list, like everything else on the page, hydrates from
+  /_user/settings.
+-->
 <section class="card query-form-card">
-  <h2 class="query-group__type">{{ i18n.t("queries-add-heading") }}</h2>
-  <form id="saved-query-form" class="query-form" autocomplete="off">
-    <label class="query-form__field">
-      <span>{{ i18n.t("queries-type-label") }}</span>
-      <input name="type" required placeholder="{{ i18n.t("queries-type-placeholder") }}">
-    </label>
-    <label class="query-form__field">
-      <span>{{ i18n.t("queries-name-label") }}</span>
-      <input name="name" required placeholder="{{ i18n.t("queries-name-placeholder") }}">
-    </label>
-    <label class="query-form__field query-form__field--wide">
-      <span>{{ i18n.t("queries-query-label") }}</span>
-      <input name="query" required placeholder="{{ i18n.t("queries-query-placeholder") }}">
-    </label>
-    <button class="btn btn--primary" type="submit">{{ i18n.t("action-save") }}</button>
+  <h2 class="query-group__type">{{ i18n.t("queries-builder-heading") }}</h2>
+  <form id="saved-query-form" class="query-builder" autocomplete="off">
+    <div class="query-builder__row">
+      <input class="query-builder__url" name="url" required spellcheck="false"
+             placeholder="{{ i18n.t("queries-url-placeholder") }}"
+             aria-label="{{ i18n.t("queries-url-label") }}">
+      <details class="menu query-recent">
+        <summary class="btn query-recent__toggle">
+          <span class="icon">{% include "icons/history.svg" %}</span>
+          {{ i18n.t("queries-recent") }}
+        </summary>
+        <div class="menu__panel menu__panel--right">
+          <div class="menu__heading">{{ i18n.t("queries-recent-heading") }}</div>
+          <div id="recent-searches"
+               data-msg-empty="{{ i18n.t("queries-recent-empty") }}"
+               data-msg-delete="{{ i18n.t("queries-delete") }}"></div>
+        </div>
+      </details>
+      <button class="btn btn--primary" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
+    </div>
+    <div class="query-builder__save">
+      <label class="query-form__field query-builder__name">
+        <span>{{ i18n.t("queries-name-label") }}</span>
+        <input name="name" placeholder="{{ i18n.t("queries-name-placeholder") }}">
+      </label>
+      <button class="btn" type="submit" data-intent="save">{{ i18n.t("action-save") }}</button>
+      <p class="query-builder__hint">{{ i18n.t("queries-builder-hint") }}</p>
+    </div>
   </form>
 </section>
 
@@ -42,6 +63,7 @@
      data-msg-delete="{{ i18n.t("queries-delete") }}"
      data-msg-rename-prompt="{{ i18n.t("queries-rename-prompt") }}"
      data-msg-confirm-delete="{{ i18n.t_arg("queries-confirm-delete", "name", "{name}".to_string()) }}"
+     data-msg-invalid-url="{{ i18n.t("queries-invalid-url") }}"
      data-msg-unavailable="{{ i18n.t("queries-unavailable") }}"
      data-msg-error="{{ i18n.t("error-generic") }}">
 </div>

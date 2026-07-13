@@ -135,3 +135,12 @@ queries-delete = Eliminar
 queries-rename-prompt = Nuevo nombre
 queries-confirm-delete = ¿Eliminar «{ $name }»?
 queries-unavailable = Las consultas guardadas no están disponibles: el backend de almacenamiento de este servidor no admite configuración por usuario.
+
+queries-builder-heading = Constructor de búsquedas
+queries-url-label = URL de búsqueda FHIR
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Edita la URL GET directamente. Ejecutar abre la búsqueda en una pestaña nueva y la registra en Recientes; ponle un nombre para conservarla en la lista de abajo.
+queries-recent = Recientes
+queries-recent-heading = Búsquedas recientes
+queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
+queries-invalid-url = Escribe una búsqueda como GET /Patient?name=smith — el tipo de recurso sale de la ruta.

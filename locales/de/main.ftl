@@ -135,3 +135,12 @@ queries-delete = Löschen
 queries-rename-prompt = Neuer Name
 queries-confirm-delete = „{ $name }“ löschen?
 queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-Backend dieses Servers unterstützt keine Benutzereinstellungen.
+
+queries-builder-heading = Such-Builder
+queries-url-label = FHIR-Such-URL
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Bearbeite die GET-URL direkt. Ausführen öffnet die Suche in einem neuen Tab und trägt sie unter „Zuletzt" ein; mit einem Namen bleibt sie in der Liste unten gespeichert.
+queries-recent = Zuletzt
+queries-recent-heading = Letzte Suchen
+queries-recent-empty = Noch keine letzten Suchen — führe eine aus, um sie hier einzutragen.
+queries-invalid-url = Gib eine Suche wie GET /Patient?name=smith ein — der Ressourcentyp kommt aus dem Pfad.

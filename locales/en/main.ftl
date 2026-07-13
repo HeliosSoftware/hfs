@@ -139,3 +139,12 @@ queries-delete = Delete
 queries-rename-prompt = New name
 queries-confirm-delete = Delete "{ $name }"?
 queries-unavailable = Saved queries are unavailable: this server's storage backend does not support per-user settings.
+
+queries-builder-heading = Search builder
+queries-url-label = FHIR search URL
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Edit the GET URL directly. Run opens the search in a new tab and records it under Recent; give it a name to keep it in the saved list below.
+queries-recent = Recent
+queries-recent-heading = Recent searches
+queries-recent-empty = No recent searches yet — Run one to record it here.
+queries-invalid-url = Enter a search like GET /Patient?name=smith — the resource type comes from the path.
