@@ -258,3 +258,6 @@ queries-open-tab = Open in new tab
 queries-col-updated = Updated
 queries-prev = Previous
 queries-next = Next
+
+queries-rail-heading = Resource types
+queries-rail-filter = Filter types

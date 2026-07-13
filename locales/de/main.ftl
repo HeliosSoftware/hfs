@@ -254,3 +254,6 @@ queries-open-tab = In neuem Tab öffnen
 queries-col-updated = Aktualisiert
 queries-prev = Zurück
 queries-next = Weiter
+
+queries-rail-heading = Ressourcentypen
+queries-rail-filter = Typen filtern

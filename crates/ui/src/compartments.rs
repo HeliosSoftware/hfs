@@ -108,6 +108,16 @@ impl CompartmentDef {
     }
 }
 
+/// Every resource type of the version, from the spec CompartmentDefinitions
+/// (each enumerates the full set — 145 in R4). Used by the queries page's
+/// resource picker rail.
+pub(crate) fn resource_type_names(version: FhirVersion) -> Vec<String> {
+    definitions(version)
+        .first()
+        .map(|def| def.resource.iter().map(|r| r.code.clone()).collect())
+        .unwrap_or_default()
+}
+
 /// The codegen'd linking parameters the compartment handler consults.
 pub(crate) fn runtime_params(
     version: FhirVersion,

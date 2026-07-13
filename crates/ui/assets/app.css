@@ -1645,3 +1645,32 @@ a.nav-item:hover {
     flex-wrap: wrap;
   }
 }
+
+/* Queries page: resource picker rail + main column (hi-fi Search layout) */
+
+.queries-layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.queries-main {
+  min-width: 0;
+}
+
+/* The picker rail reuses .filter-rail with <button> items. */
+button.filter-rail__item {
+  border: 0;
+  background-color: transparent;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+@media (max-width: 1100px) {
+  .queries-layout {
+    grid-template-columns: 1fr;
+  }
+}

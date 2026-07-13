@@ -42,6 +42,7 @@
 
   var messages = root.dataset;
   var etag = null;
+  var lang = document.documentElement.lang || undefined;
 
   function fetchDocument() {
     return fetch(SETTINGS, {
@@ -278,16 +279,29 @@
     };
   }
 
+  /* Marks the picker rail's active type. */
+  function markRailType(type) {
+    document.querySelectorAll("[data-rail-type]").forEach(function (item) {
+      if (item.dataset.railType === type) {
+        item.setAttribute("aria-current", "true");
+      } else {
+        item.removeAttribute("aria-current");
+      }
+    });
+  }
+
   /* URL → rows. */
   function renderBuilder() {
     if (!sections || !urlInput) return;
     var parsed = parseSearchUrl(urlInput.value);
     if (!parsed) {
       sections.hidden = true;
+      markRailType(null);
       return;
     }
     sections.hidden = false;
     sections.dataset.type = parsed.type;
+    markRailType(parsed.type);
     loadCatalog(parsed.type);
 
     var hosts = builderHosts();
@@ -341,6 +355,72 @@
         builderHosts()[kind].appendChild(row);
         row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value").focus();
       }
+    });
+  }
+
+  /* ---- Resource picker rail --------------------------------------------
+   * The type list is server-rendered from the spec; counts hydrate here
+   * via the standard `_summary=count` search (Bundle.total only, no
+   * entries), a few at a time so 145 types don't stampede the server. */
+
+  var railList = document.getElementById("type-rail-list");
+  var railFilter = document.getElementById("type-rail-filter");
+  var countFormat = new Intl.NumberFormat(lang);
+
+  function hydrateCounts() {
+    if (!railList) return;
+    var pending = Array.prototype.slice.call(
+      railList.querySelectorAll("[data-count-for]")
+    );
+    var CONCURRENCY = 4;
+
+    function next() {
+      var slot = pending.shift();
+      if (!slot) return;
+      /* _total=accurate as well: this server only computes Bundle.total
+       * when asked explicitly, even under _summary=count. */
+      fetch(
+        "/" +
+          encodeURIComponent(slot.dataset.countFor) +
+          "?_summary=count&_total=accurate",
+        {
+          headers: { Accept: "application/fhir+json" },
+          credentials: "same-origin",
+        }
+      )
+        .then(function (response) {
+          return response.ok ? response.json() : null;
+        })
+        .then(function (bundle) {
+          if (bundle && typeof bundle.total === "number") {
+            slot.textContent = countFormat.format(bundle.total);
+          }
+        })
+        .catch(function () {
+          /* count stays blank */
+        })
+        .then(next);
+    }
+    for (var i = 0; i < CONCURRENCY; i++) next();
+  }
+
+  if (railList) {
+    railList.addEventListener("click", function (event) {
+      var item = event.target.closest("[data-rail-type]");
+      if (!item || !urlInput) return;
+      urlInput.value = "GET /" + item.dataset.railType;
+      renderBuilder();
+      runSearch("/" + encodeURIComponent(item.dataset.railType), false);
+    });
+  }
+  if (railFilter && railList) {
+    railFilter.addEventListener("input", function () {
+      var needle = railFilter.value.trim().toLowerCase();
+      railList.querySelectorAll("[data-rail-type]").forEach(function (item) {
+        item.hidden =
+          !!needle &&
+          item.dataset.railType.toLowerCase().indexOf(needle) < 0;
+      });
     });
   }
 
@@ -555,8 +635,6 @@
     if (aCreated !== bCreated) return aCreated > bCreated ? -1 : 1;
     return a.id < b.id ? -1 : 1;
   }
-
-  var lang = document.documentElement.lang || undefined;
 
   function whenText(iso) {
     var when = new Date(iso);
@@ -878,6 +956,7 @@
   }
 
   reload();
+  window.setTimeout(hydrateCounts, 50);
 
   /* Deep link: /ui/queries?url=/Patient?name=smith loads the builder and
    * runs immediately — also what saved/recent entries could link to. */

@@ -111,6 +111,10 @@ struct QueriesPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The version's resource types for the picker rail, from the spec
+    /// CompartmentDefinitions already vendored for the compartment viewer.
+    /// Counts hydrate client-side via `_summary=count`.
+    resource_types: Vec<String>,
 }
 
 /// SearchParameter viewer (#238). Read-only against the same snapshot the
@@ -205,6 +209,7 @@ async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Respon
         status: current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "queries",
+        resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
     })
 }
 
@@ -472,6 +477,9 @@ mod tests {
             },
             i18n: i18n("en"),
             active_page: "queries",
+            resource_types: compartments::resource_type_names(
+                helios_fhir::FhirVersion::default(),
+            ),
         }
         .render()
         .expect("queries page renders");
@@ -485,6 +493,11 @@ mod tests {
         assert!(html.contains(r#"data-intent="run""#));
         assert!(html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
+        // Resource picker rail: the version's full type list, with count
+        // slots the script hydrates via _summary=count.
+        assert!(html.contains(r#"data-rail-type="Patient""#));
+        assert!(html.contains(r#"data-rail-type="Observation""#));
+        assert!(html.contains(r#"data-count-for="Patient""#));
         // This page, not Home, carries aria-current in the sidebar.
         assert!(html.contains(r#"href="/ui/queries" aria-current="page""#));
         assert!(!html.contains(r#"href="/ui" aria-current="page""#));
@@ -501,6 +514,7 @@ mod tests {
             },
             i18n: i18n("es"),
             active_page: "queries",
+            resource_types: vec!["Patient".to_string()],
         }
         .render()
         .expect("queries page renders");
