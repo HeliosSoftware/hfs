@@ -431,6 +431,12 @@ mod tests {
         assert!(html.contains(r#"id="saved-query-form""#));
         assert!(html.contains(r#"id="saved-queries""#));
         assert!(html.contains("/ui/assets/saved-queries.js"));
+        // Search Builder: the featured GET URL input, both submit intents,
+        // and the Recent dropdown shell the script hydrates.
+        assert!(html.contains(r#"name="url""#));
+        assert!(html.contains(r#"data-intent="run""#));
+        assert!(html.contains(r#"data-intent="save""#));
+        assert!(html.contains(r#"id="recent-searches""#));
         // This page, not Home, carries aria-current in the sidebar.
         assert!(html.contains(r#"href="/ui/queries" aria-current="page""#));
         assert!(!html.contains(r#"href="/ui" aria-current="page""#));
@@ -471,6 +477,8 @@ mod tests {
             "recovers from optimistic-lock races"
         );
         assert!(source.contains("lastAccessedAt"));
+        // Every run is recorded to the roaming recent-searches list.
+        assert!(source.contains("recentSearches"));
     }
 
     /// Both theme buttons render, and icons are inlined (so `currentColor`

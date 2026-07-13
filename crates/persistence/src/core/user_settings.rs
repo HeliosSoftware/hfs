@@ -56,6 +56,21 @@
 //!   `createdAt` for never-run entries. The REST layer enforces structural
 //!   bounds on this key (entries-per-type and whole-document size caps); see
 //!   `helios-rest`'s user-settings handlers.
+//!
+//! - `recentSearches` — the search-builder's run history, newest first,
+//!   deduped by query and capped by the client (currently 10):
+//!
+//!   ```json
+//!   {
+//!     "recentSearches": [
+//!       { "query": "/Patient?name=smith", "at": "2026-07-11T09:14:22Z" }
+//!     ]
+//!   }
+//!   ```
+//!
+//!   Unlike `savedQueries`, this is an array on purpose: it is a small
+//!   bounded cache rewritten wholesale on every run, not sibling-keyed
+//!   state, so RFC 7386's replace-the-array semantics are exactly right.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

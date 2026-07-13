@@ -230,3 +230,11 @@ cmp-result-notmember = ✕ { $type } no es miembro de este compartment
 cmp-result-notmember-note = El servidor devuelve 404 con un OperationOutcome para tipos que no son miembros del compartment.
 cmp-result-fanout = Se expande a { $count } tipos miembro
 cmp-result-fanout-note = Los tipos excluidos se omiten, no fallan — el fan-out descarta los tipos no miembro en lugar de dar error.
+queries-builder-heading = Constructor de búsquedas
+queries-url-label = URL de búsqueda FHIR
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Edita la URL GET directamente. Ejecutar abre la búsqueda en una pestaña nueva y la registra en Recientes; ponle un nombre para conservarla en la lista de abajo.
+queries-recent = Recientes
+queries-recent-heading = Búsquedas recientes
+queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
+queries-invalid-url = Escribe una búsqueda como GET /Patient?name=smith — el tipo de recurso sale de la ruta.

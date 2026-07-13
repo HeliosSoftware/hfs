@@ -234,3 +234,11 @@ cmp-result-notmember = ✕ { $type } is not a member of this compartment
 cmp-result-notmember-note = The server returns 404 with an OperationOutcome for types that are not compartment members.
 cmp-result-fanout = Fans out to { $count } member types
 cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out drops non-member types rather than erroring.
+queries-builder-heading = Search builder
+queries-url-label = FHIR search URL
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Edit the GET URL directly. Run opens the search in a new tab and records it under Recent; give it a name to keep it in the saved list below.
+queries-recent = Recent
+queries-recent-heading = Recent searches
+queries-recent-empty = No recent searches yet — Run one to record it here.
+queries-invalid-url = Enter a search like GET /Patient?name=smith — the resource type comes from the path.
