@@ -237,8 +237,24 @@ cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out 
 queries-builder-heading = Search builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edit the GET URL directly. Run opens the search in a new tab and records it under Recent; give it a name to keep it in the saved list below.
+queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
 queries-recent-heading = Recent searches
 queries-recent-empty = No recent searches yet — Run one to record it here.
 queries-invalid-url = Enter a search like GET /Patient?name=smith — the resource type comes from the path.
+
+queries-conditions = Conditions
+queries-add-condition = Add condition
+queries-includes = Includes
+queries-result-controls = Result controls
+queries-remove = Remove
+queries-param-placeholder = parameter
+queries-value-placeholder = value
+queries-results = Results
+queries-results-total = { $count } results
+queries-results-included = { $count } included
+queries-results-empty = No results.
+queries-open-tab = Open in new tab
+queries-col-updated = Updated
+queries-prev = Previous
+queries-next = Next

@@ -194,3 +194,25 @@ async fn compartment_tester_reports_non_members_as_404() {
     assert!(html.contains("404 Not Found"));
     assert!(html.contains("OperationOutcome"));
 }
+
+#[tokio::test]
+async fn queries_param_catalog_is_a_registry_fed_fragment() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/queries/params?type=Patient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"<datalist id="param-options">"#));
+    // Real registry data: Patient's own params plus Resource-level ones.
+    assert!(html.contains(r#"value="birthdate""#));
+    assert!(html.contains(r#"value="_id""#));
+    // Not applicable to Patient.
+    assert!(!html.contains(r#"value="clinical-status""#));
+    assert!(!html.contains("<html"), "fragment, not a page");
+}

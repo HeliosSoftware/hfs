@@ -233,8 +233,24 @@ cmp-result-fanout-note = Los tipos excluidos se omiten, no fallan — el fan-out
 queries-builder-heading = Constructor de búsquedas
 queries-url-label = URL de búsqueda FHIR
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edita la URL GET directamente. Ejecutar abre la búsqueda en una pestaña nueva y la registra en Recientes; ponle un nombre para conservarla en la lista de abajo.
+queries-builder-hint = Edita la URL GET directamente o mediante las filas de abajo — se mantienen sincronizadas. Ejecutar corre la búsqueda aquí mismo y la registra en Recientes; ponle un nombre para conservarla en la lista.
 queries-recent = Recientes
 queries-recent-heading = Búsquedas recientes
 queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
 queries-invalid-url = Escribe una búsqueda como GET /Patient?name=smith — el tipo de recurso sale de la ruta.
+
+queries-conditions = Condiciones
+queries-add-condition = Añadir condición
+queries-includes = Includes
+queries-result-controls = Controles de resultado
+queries-remove = Quitar
+queries-param-placeholder = parámetro
+queries-value-placeholder = valor
+queries-results = Resultados
+queries-results-total = { $count } resultados
+queries-results-included = { $count } incluidos
+queries-results-empty = Sin resultados.
+queries-open-tab = Abrir en pestaña nueva
+queries-col-updated = Actualizado
+queries-prev = Anterior
+queries-next = Siguiente

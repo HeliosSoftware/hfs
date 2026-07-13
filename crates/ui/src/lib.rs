@@ -144,6 +144,22 @@ struct StatusPartial {
     i18n: I18n,
 }
 
+/// One `<option>` in the search-builder's parameter datalist.
+struct ParamOption {
+    code: String,
+    type_label: String,
+}
+
+/// Parameter suggestions for the search builder (`/ui/queries/params`),
+/// rendered from the same registry snapshot the SearchParameter viewer
+/// reads. An HTML fragment the page swaps per resource type — hypermedia,
+/// not a UI-facing JSON API.
+#[derive(Template)]
+#[template(path = "partials/param-options.html")]
+struct ParamOptionsPartial {
+    params: Vec<ParamOption>,
+}
+
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
 /// other path. The UI depends on the rest of the server, never the reverse.
 ///
@@ -154,6 +170,7 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str, data_dir: Option<PathB
     Router::new()
         .route("/ui", get(index))
         .route("/ui/queries", get(queries))
+        .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/compartments", get(compartments_page))
         .route("/ui/status", get(status))
@@ -189,6 +206,37 @@ async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Respon
         i18n: I18n::new(locale),
         active_page: "queries",
     })
+}
+
+#[derive(Deserialize, Default)]
+struct ParamsCatalogQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
+}
+
+/// Parameter datalist for the search builder: the active parameters that
+/// apply to the given resource type (including `Resource` /
+/// `DomainResource`-level ones), from the default-version snapshot.
+async fn query_params_catalog(
+    State(state): State<WebState>,
+    Query(raw): Query<ParamsCatalogQuery>,
+) -> Response {
+    let snapshot = state
+        .sp_catalog
+        .snapshot(helios_fhir::FhirVersion::default());
+    let resource_type = raw.resource_type.unwrap_or_default();
+    let mut params: Vec<ParamOption> = snapshot
+        .params
+        .iter()
+        .filter(|p| p.applies_to(&resource_type))
+        .map(|p| ParamOption {
+            code: p.code.clone(),
+            type_label: p.param_type.to_string(),
+        })
+        .collect();
+    params.sort_by(|a, b| a.code.cmp(&b.code));
+    params.dedup_by(|a, b| a.code == b.code);
+    render(ParamOptionsPartial { params })
 }
 
 /// Query string for the SearchParameter viewer. Every filter is a link and
@@ -479,6 +527,34 @@ mod tests {
         assert!(source.contains("lastAccessedAt"));
         // Every run is recorded to the roaming recent-searches list.
         assert!(source.contains("recentSearches"));
+        // Results render in-page from the FHIR API itself, and the builder's
+        // parameter suggestions come from the server-rendered datalist.
+        assert!(source.contains("application/fhir+json"));
+        assert!(source.contains("/ui/queries/params"));
+    }
+
+    /// The builder's datalist fragment is fed by the SearchParameter
+    /// registry and scoped to the requested resource type.
+    #[test]
+    fn param_options_partial_renders_datalist() {
+        let html = ParamOptionsPartial {
+            params: vec![
+                ParamOption {
+                    code: "birthdate".into(),
+                    type_label: "date".into(),
+                },
+                ParamOption {
+                    code: "name".into(),
+                    type_label: "string".into(),
+                },
+            ],
+        }
+        .render()
+        .expect("partial renders");
+
+        assert!(html.contains(r#"<datalist id="param-options">"#));
+        assert!(html.contains(r#"<option value="birthdate" label="date">"#));
+        assert!(!html.contains("<html"), "fragment, not a page");
     }
 
     /// Both theme buttons render, and icons are inlined (so `currentColor`

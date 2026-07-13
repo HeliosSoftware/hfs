@@ -96,6 +96,12 @@ svg {
   display: block;
 }
 
+/* Class display values (flex, inline-flex) must not defeat the hidden
+   attribute on script-toggled regions. */
+[hidden] {
+  display: none !important;
+}
+
 /* ---------- Sidebar ---------- */
 
 .sidebar {
@@ -1509,5 +1515,133 @@ a.nav-item:hover {
 
   .kv-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+/* Visual builder rows (conditions / includes / result controls) */
+
+.builder-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 4px;
+}
+
+.builder-section__title {
+  margin: 0 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.builder-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px 18px;
+}
+
+.builder-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.builder-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.builder-row__key,
+.builder-row__modifier,
+.builder-row__value {
+  height: 32px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  outline: none;
+}
+
+.builder-row__key {
+  width: 190px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.builder-row__modifier {
+  width: 110px;
+  color: var(--muted);
+}
+
+.builder-row__value {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.builder-row__key:focus,
+.builder-row__modifier:focus,
+.builder-row__value:focus {
+  border-color: var(--accent);
+}
+
+.builder-row__remove {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.builder-row__remove:hover {
+  background: var(--accent-soft);
+  color: var(--text-strong);
+}
+
+.builder-add {
+  align-self: flex-start;
+}
+
+/* In-page results card */
+
+.query-results {
+  margin-bottom: 24px;
+}
+
+.query-results__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px 4px;
+}
+
+.query-results__meta {
+  flex: 1;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 900px) {
+  .builder-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .builder-row {
+    flex-wrap: wrap;
   }
 }
