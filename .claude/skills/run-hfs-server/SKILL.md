@@ -118,6 +118,15 @@ curl -H "X-Tenant-ID: clinic-a" http://localhost:8080/Patient
 curl http://localhost:8080/clinic-a/Patient
 ```
 
+## Clustering
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_CLUSTER` | `false` | Declares this process one of N instances: flips cluster-safe defaults and fails fast on unsafe combinations |
+| `HFS_JOB_STORE_BACKEND` | `memory` (`database` under `HFS_CLUSTER`) | Unified async-job store selector (SoF export, reindex); parsed today, wired as the phases land |
+
+`HFS_CLUSTER=true` refuses to boot on: a SQLite primary (F1), `HFS_AUTH_JTI_BACKEND=memory` with auth enabled (C1), `local-fs` bulk export/submit output (F2), `HFS_AUDIT_BACKEND=file` (F4), or an explicit `memory` job store. Design and status: `docs/cluster-capable-state-design.md`; operator guide: book chapter "Running HFS in a Cluster" (`book/src/ch15-cluster-deployment.md`).
+
 ## Behavior
 
 | Variable | Default | Description |

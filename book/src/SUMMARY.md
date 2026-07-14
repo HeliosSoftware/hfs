@@ -14,6 +14,7 @@
 - [Embedding HFS as a Library](ch12-embedding.md)
 - [Development Setup](ch13-dev-setup.md)
 - [Contributing Guidelines](ch14-contributing.md)
+- [Running HFS in a Cluster](ch15-cluster-deployment.md)
 
 ---
 
