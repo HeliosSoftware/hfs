@@ -369,7 +369,8 @@ impl SqliteTerminologyBackend {
                 let _ = conn.execute_batch(
                     "DELETE FROM concepts_fts;
                      DELETE FROM concepts_fts_built;
-                     DELETE FROM concepts_word_fts;",
+                     DELETE FROM concepts_word_fts;
+                     DELETE FROM concepts_search_fts;",
                 );
 
                 // Update query-planner statistics for large tables.
@@ -461,7 +462,8 @@ impl SqliteTerminologyBackend {
         let _ = conn.execute_batch(
             "DELETE FROM concepts_fts;
              DELETE FROM concepts_fts_built;
-             DELETE FROM concepts_word_fts;",
+             DELETE FROM concepts_word_fts;
+             DELETE FROM concepts_search_fts;",
         );
         let _ = conn.execute_batch(
             "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
