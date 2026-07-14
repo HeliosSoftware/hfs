@@ -465,7 +465,7 @@ mod tests {
             header.set_cksum();
             tar.append_data(
                 &mut header,
-                &format!("package/{rt}-{i}.json"),
+                format!("package/{rt}-{i}.json"),
                 bytes.as_slice(),
             )
             .unwrap();

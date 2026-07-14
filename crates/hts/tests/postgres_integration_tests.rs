@@ -2237,7 +2237,7 @@ fn pkg_tgz(
         header.set_cksum();
         tar.append_data(
             &mut header,
-            &format!("package/CodeSystem-{i}.json"),
+            format!("package/CodeSystem-{i}.json"),
             bytes.as_slice(),
         )
         .unwrap();
