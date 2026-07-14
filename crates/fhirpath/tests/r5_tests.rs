@@ -59,10 +59,84 @@ fn load_test_resource_r5(json_filename: &str) -> Result<EvaluationContext, Strin
     Ok(context)
 }
 
+/// Starts an in-process terminology server serving canned responses for the
+/// `mode="tx"` conformance tests, and returns its base URL.
+///
+/// These tests used to reach the public `tx.fhir.org` because the evaluator
+/// defaulted to it, which made `cargo test` fail whenever that server was down or
+/// rate-limiting. The evaluator has no default any more (issue #217), so the suite
+/// supplies its own server. The responses mirror the shapes a real terminology
+/// server returns for these two operations; the expected values (4 gender codes,
+/// `result = true`) are fixed by the FHIR specification, not by any one server.
+///
+/// The server is leaked rather than dropped: `Drop for MockServer` signals shutdown,
+/// and the stub has to keep serving for the whole suite. The runtime that started it
+/// is leaked alongside it, which costs a few idle threads in a process that is about
+/// to exit.
+#[cfg(feature = "R5")]
+fn start_tx_stub() -> String {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let runtime = tokio::runtime::Runtime::new().expect("failed to build stub runtime");
+
+    let uri = runtime.block_on(async {
+        let server = MockServer::start().await;
+
+        // txTest01: expand(administrative-gender).expansion.contains.count() = 4
+        let gender_system = "http://hl7.org/fhir/administrative-gender";
+        Mock::given(method("GET"))
+            .and(path("/ValueSet/$expand"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resourceType": "ValueSet",
+                "id": "administrative-gender",
+                "url": "http://hl7.org/fhir/ValueSet/administrative-gender",
+                "status": "active",
+                "expansion": {
+                    "identifier": "urn:uuid:00000000-0000-0000-0000-000000000001",
+                    "timestamp": "2024-01-01T00:00:00Z",
+                    "total": 4,
+                    "contains": [
+                        { "system": gender_system, "code": "male", "display": "Male" },
+                        { "system": gender_system, "code": "female", "display": "Female" },
+                        { "system": gender_system, "code": "other", "display": "Other" },
+                        { "system": gender_system, "code": "unknown", "display": "Unknown" }
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        // txTest02: validateVS(administrative-gender, Patient.gender) -> result = true
+        Mock::given(method("POST"))
+            .and(path("/ValueSet/$validate-code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resourceType": "Parameters",
+                "parameter": [
+                    { "name": "result", "valueBoolean": true },
+                    { "name": "code", "valueCode": "male" },
+                    { "name": "system", "valueUri": gender_system }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        std::mem::forget(server);
+        uri
+    });
+
+    std::mem::forget(runtime);
+    uri
+}
+
 #[test]
 #[cfg(feature = "R5")]
 fn test_r5_test_suite() {
     println!("Running FHIRPath R5 test suite");
+
+    let tx_stub_uri = start_tx_stub();
+    println!("Terminology stub for mode=\"tx\" tests: {}", tx_stub_uri);
 
     // Get the path to the test file
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -166,6 +240,15 @@ fn test_r5_test_suite() {
             // Set up common variables
             setup_common_variables(&mut context);
 
+            // mode="tx" tests exercise %terminologies, which needs a server. The
+            // evaluator no longer defaults to one (issue #217), and the suite must not
+            // depend on a public server being reachable, so point these at the
+            // in-process stub. FHIRPATH_TERMINOLOGY_SERVER still wins when set, which is
+            // how these expectations get re-validated against a real server.
+            if test.mode == "tx" && std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
+                context.set_terminology_server(tx_stub_uri.clone());
+            }
+
             // Special handling for extension tests
             if test.name.starts_with("testExtension") || test.expression.contains("extension(") {
                 setup_extension_variables(&mut context);
@@ -204,20 +287,11 @@ fn test_r5_test_suite() {
                 continue;
             }
 
-            // Skip specific translate test - ConceptMap not available on test server
-            if test.name == "txTest02" && test.expression.contains("translate(") {
+            // Skip translate-based tx tests - the stub does not serve $translate, and
+            // ConceptMap cm-address-use-v2 is not reliably available on public servers.
+            if test.mode == "tx" && test.expression.contains("translate(") {
                 println!(
-                    "  SKIP: {} - '{}' - ConceptMap cm-address-use-v2 not available on test terminology server",
-                    test.name, test.expression
-                );
-                skipped_tests += 1;
-                continue;
-            }
-
-            // Skip txTest03 - ConceptMap translate returns incorrect result from test server
-            if test.name == "txTest03" && test.expression.contains("translate(") {
-                println!(
-                    "  SKIP: {} - '{}' - ConceptMap cm-address-use-v2 translate returns incorrect result from test terminology server",
+                    "  SKIP: {} - '{}' - ConceptMap $translate not covered by the terminology stub",
                     test.name, test.expression
                 );
                 skipped_tests += 1;

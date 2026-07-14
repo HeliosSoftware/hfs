@@ -7,9 +7,16 @@
 use reqwest::Client;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::error::{FhirPathError, FhirPathResult};
 use helios_fhir::FhirVersion;
+
+/// Request timeout for terminology server calls.
+///
+/// Without this, an unresponsive server hangs the evaluating thread indefinitely
+/// (`Client::new()` applies no timeout).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Terminology client for making requests to a FHIR terminology server
 #[derive(Clone)]
@@ -28,8 +35,13 @@ impl TerminologyClient {
     /// * `base_url` - The base URL of the terminology server
     /// * `fhir_version` - The FHIR version to use for requests
     pub fn new(base_url: String, fhir_version: FhirVersion) -> Self {
+        let client = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to build terminology HTTP client");
+
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
             fhir_version,
         }

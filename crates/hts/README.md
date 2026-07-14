@@ -743,7 +743,7 @@ HFS propagates the URL to its embedded FHIRPath engine as `FHIRPATH_TERMINOLOGY_
 | FHIRPath `memberOf()` | `POST /ValueSet/$validate-code` |
 | FHIRPath `subsumes()` | `POST /CodeSystem/$subsumes` |
 
-Without `HFS_TERMINOLOGY_SERVER`, these features fall back to empty results or `false`.
+Without `HFS_TERMINOLOGY_SERVER`, these features fail with a clear error naming the variable to set — the search modifiers return `501 Not Implemented`, and the FHIRPath functions raise an evaluation error. They deliberately do not fall back to a public terminology server or to a silent `false`, because both would send codes to a server the operator never chose, or quietly produce wrong answers.
 
 ## Terminology Support
 
