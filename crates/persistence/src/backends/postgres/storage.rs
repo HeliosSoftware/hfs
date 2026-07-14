@@ -695,6 +695,113 @@ impl ResourceStorage for PostgresBackend {
         }
         Ok(out)
     }
+
+    fn supports_tenant_registry(&self) -> bool {
+        true
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT id, display_name, created_at FROM tenants \
+                 ORDER BY created_at ASC, id ASC",
+                &[],
+            )
+            .await
+            .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| crate::core::TenantRecord {
+                id: row.get(0),
+                display_name: row.get(1),
+                created_at: row.get(2),
+            })
+            .collect())
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT id, display_name, created_at FROM tenants WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("query get_tenant: {e}")))?;
+        Ok(row.map(|row| crate::core::TenantRecord {
+            id: row.get(0),
+            display_name: row.get(1),
+            created_at: row.get(2),
+        }))
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        let client = self.get_client().await?;
+        // Plain INSERT so a duplicate id surfaces as a constraint error; the
+        // admin handler pre-checks existence and returns 409, so reaching here
+        // with a duplicate is a race and a 500 is acceptable.
+        let row = client
+            .query_one(
+                "INSERT INTO tenants (id, display_name) VALUES ($1, $2) \
+                 RETURNING id, display_name, created_at",
+                &[&id, &display_name],
+            )
+            .await
+            .map_err(|e| internal_error(format!("register_tenant: {e}")))?;
+        Ok(crate::core::TenantRecord {
+            id: row.get(0),
+            display_name: row.get(1),
+            created_at: row.get(2),
+        })
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        let client = self.get_client().await?;
+        let changed = client
+            .execute("DELETE FROM tenants WHERE id = $1", &[&id])
+            .await
+            .map_err(|e| internal_error(format!("deregister_tenant: {e}")))?;
+        Ok(changed > 0)
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("purge begin: {e}")))?;
+        // Count current-version rows first (soft-deleted included) so we can
+        // report what was removed.
+        let removed: i64 = tx
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM resources WHERE tenant_id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("purge count: {e}")))?
+            .get(0);
+        // search_index and resource_fts cascade from resources, but delete them
+        // explicitly too, mirroring the purge/purge_all deletion order.
+        for sql in [
+            "DELETE FROM search_index WHERE tenant_id = $1",
+            "DELETE FROM resource_fts WHERE tenant_id = $1",
+            "DELETE FROM resource_history WHERE tenant_id = $1",
+            "DELETE FROM resources WHERE tenant_id = $1",
+        ] {
+            tx.execute(sql, &[&id])
+                .await
+                .map_err(|e| internal_error(format!("purge delete: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        Ok(removed.max(0) as u64)
+    }
 }
 
 // ============================================================================

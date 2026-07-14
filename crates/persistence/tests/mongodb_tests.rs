@@ -1328,6 +1328,108 @@ async fn mongodb_integration_count_by_tenant() {
 }
 
 #[tokio::test]
+async fn mongodb_integration_tenant_registry_crud() {
+    let Some(backend) = create_backend("tenant_registry_crud").await else {
+        eprintln!("Skipping mongodb_integration_tenant_registry_crud (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    assert!(backend.supports_tenant_registry());
+
+    // Register in id order so the (created_at, id) sort is deterministic even
+    // when both inserts land in the same second.
+    let alpha = backend
+        .register_tenant("tenant-alpha", Some("Acme Corp"))
+        .await
+        .unwrap();
+    assert_eq!(alpha.id, "tenant-alpha");
+    assert_eq!(alpha.display_name.as_deref(), Some("Acme Corp"));
+    assert!(!alpha.created_at.is_empty());
+
+    let beta = backend.register_tenant("tenant-beta", None).await.unwrap();
+    assert_eq!(beta.id, "tenant-beta");
+    assert_eq!(beta.display_name, None);
+    assert!(!beta.created_at.is_empty());
+
+    // get_tenant round-trips the registered records.
+    let fetched_alpha = backend.get_tenant("tenant-alpha").await.unwrap().unwrap();
+    assert_eq!(fetched_alpha, alpha);
+    let fetched_beta = backend.get_tenant("tenant-beta").await.unwrap().unwrap();
+    assert_eq!(fetched_beta, beta);
+    assert_eq!(backend.get_tenant("tenant-missing").await.unwrap(), None);
+
+    // Each test gets a fresh database, so the listing is exhaustive.
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(listed, vec![alpha.clone(), beta.clone()]);
+
+    // Duplicate id hits the unique index on `id`.
+    let duplicate = backend.register_tenant("tenant-alpha", None).await;
+    assert!(duplicate.is_err());
+
+    // Deregister removes the row once; repeating reports nothing deleted.
+    assert!(backend.deregister_tenant("tenant-alpha").await.unwrap());
+    assert!(!backend.deregister_tenant("tenant-alpha").await.unwrap());
+    assert_eq!(backend.get_tenant("tenant-alpha").await.unwrap(), None);
+
+    let remaining = backend.list_tenants().await.unwrap();
+    assert_eq!(remaining, vec![beta]);
+}
+
+#[tokio::test]
+async fn mongodb_integration_purge_tenant_data() {
+    let Some(backend) = create_backend("purge_tenant_data").await else {
+        eprintln!("Skipping mongodb_integration_purge_tenant_data (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let tenant_a = create_tenant("tenant-purge-a");
+    let tenant_b = create_tenant("tenant-purge-b");
+
+    let a1 = backend
+        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let a2 = backend
+        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let b1 = backend
+        .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+
+    let removed = backend.purge_tenant_data("tenant-purge-a").await.unwrap();
+    assert_eq!(removed, 2);
+
+    // Tenant A's resources are hard-deleted (not merely soft-deleted).
+    assert!(
+        backend
+            .read(&tenant_a, "Patient", a1.id())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .read(&tenant_a, "Patient", a2.id())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 0);
+
+    // Tenant B is untouched.
+    assert!(
+        backend
+            .read(&tenant_b, "Patient", b1.id())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 1);
+}
+
+#[tokio::test]
 async fn mongodb_integration_is_cluster_shared() {
     let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
     assert!(backend.is_cluster_shared());

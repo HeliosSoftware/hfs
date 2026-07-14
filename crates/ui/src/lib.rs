@@ -37,6 +37,7 @@
 //! without JavaScript.
 
 mod i18n;
+mod tenants;
 
 use askama::Template;
 use axum::{
@@ -53,8 +54,10 @@ use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow,
 };
+use helios_persistence::core::ResourceStorage;
 use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Static UI assets (htmx, CSS) embedded into the binary at compile time.
@@ -65,16 +68,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Assets;
 
 /// Shared router state: values that are constant for the process lifetime.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WebState {
     version: &'static str,
+    /// Read/write path for the tenant-maintenance page. `None` when the host did
+    /// not wire storage in (e.g. the UI-only unit tests), in which case the page
+    /// reports the registry as unavailable rather than crashing.
+    tenants: Option<Arc<dyn ResourceStorage>>,
 }
 
 /// A small, self-contained system-status snapshot — the "real read path" the
 /// POC renders. Kept deliberately simple so the crate stays dependency-light;
 /// richer read paths (terminology lookups, resource counts) plug in the same way.
-struct Status {
-    version: &'static str,
+pub(crate) struct Status {
+    pub(crate) version: &'static str,
     checked_at: u64,
 }
 
@@ -160,12 +167,31 @@ struct StatusPartial {
 
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
 /// other path. The UI depends on the rest of the server, never the reverse.
-pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
+///
+/// `tenants` is the storage handle the tenant-maintenance page reads and writes
+/// (the same backend the FHIR API uses); pass `None` to render the UI without a
+/// live registry (the page then reports it as unavailable).
+pub fn mount(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+) -> Router {
+    // Embedded, pinned htmx + CSS/JS + fonts, served with br/gzip/deflate
+    // negotiation. `Cache-Control: no-cache` forces the browser to revalidate
+    // against the (content-based) ETag on every load: unchanged assets come
+    // back as a cheap `304`, but a rebuilt asset (e.g. app.css after a UI
+    // change) is always re-fetched instead of served stale from cache.
+    let assets = Router::new()
+        .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
+        .layer(middleware::from_fn(revalidate_assets));
+
     Router::new()
         .route("/ui", get(index))
         .route("/ui/status", get(status))
-        // Embedded, pinned htmx + CSS, served with br/gzip/deflate negotiation.
-        .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
+        .route("/ui/tenants", get(tenants::page).post(tenants::create))
+        .route("/ui/tenants/rows", get(tenants::rows))
+        .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
+        .merge(assets)
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -174,8 +200,21 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
         .layer(middleware::from_fn(i18n::negotiate_locale))
         .with_state(WebState {
             version: hfs_version,
+            tenants,
         })
         .fallback_service(fhir_app)
+}
+
+/// Adds `Cache-Control: no-cache` to embedded-asset responses so a rebuilt
+/// asset is never served stale from the browser cache (revalidation is cheap:
+/// unchanged content returns `304` via the ETag `ServeEmbed` already sets).
+async fn revalidate_assets(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 /// Full landing page. `?type=<ResourceType>` selects which resource type's series
@@ -538,14 +577,14 @@ fn bucket_floor_utc(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(floored, 0).unwrap_or(ts)
 }
 
-fn current_status(version: &'static str) -> Status {
+pub(crate) fn current_status(version: &'static str) -> Status {
     Status {
         version,
         checked_at: unix_timestamp_seconds(),
     }
 }
 
-fn render<T: Template>(template: T) -> Response {
+pub(crate) fn render<T: Template>(template: T) -> Response {
     match template.render() {
         Ok(html) => Html(html).into_response(),
         Err(error) => (

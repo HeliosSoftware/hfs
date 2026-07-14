@@ -1414,6 +1414,119 @@ impl ResourceStorage for MongoBackend {
         ];
         grouped_string_counts(resources, pipeline).await
     }
+
+    fn supports_tenant_registry(&self) -> bool {
+        true
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        let db = self.get_database().await?;
+        let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
+        let mut cursor = tenants
+            .find(doc! {})
+            .sort(doc! { "created_at": 1, "id": 1 })
+            .await
+            .map_err(|e| internal_error(format!("query list_tenants: {}", e)))?;
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("list_tenants cursor advance: {}", e)))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("list_tenants cursor deserialize: {}", e)))?;
+            out.push(tenant_record_from_doc(&doc)?);
+        }
+        Ok(out)
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        let db = self.get_database().await?;
+        let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
+        let doc = tenants
+            .find_one(doc! { "id": id })
+            .await
+            .map_err(|e| internal_error(format!("query get_tenant: {}", e)))?;
+        doc.map(|d| tenant_record_from_doc(&d)).transpose()
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        let db = self.get_database().await?;
+        let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
+        // RFC 3339 string, matching the SQLite registry's `created_at` format so
+        // the admin API is byte-identical across backends.
+        let created_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        // Plain insert so a duplicate id surfaces as a unique-index error; the
+        // admin handler pre-checks existence and returns 409, so reaching here
+        // with a duplicate is a race and a 500 is acceptable.
+        tenants
+            .insert_one(doc! {
+                "id": id,
+                "display_name": display_name,
+                "created_at": &created_at,
+            })
+            .await
+            .map_err(|e| internal_error(format!("register_tenant: {}", e)))?;
+        Ok(crate::core::TenantRecord {
+            id: id.to_string(),
+            display_name: display_name.map(str::to_string),
+            created_at,
+        })
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        let db = self.get_database().await?;
+        let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
+        let result = tenants
+            .delete_one(doc! { "id": id })
+            .await
+            .map_err(|e| internal_error(format!("deregister_tenant: {}", e)))?;
+        Ok(result.deleted_count > 0)
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        // Count current-version docs first (soft-deleted included, mirroring the
+        // SQLite purge) so we can report what was removed.
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let removed = resources
+            .count_documents(doc! { "tenant_id": id })
+            .await
+            .map_err(|e| internal_error(format!("purge count: {}", e)))?;
+        for collection in [
+            MongoBackend::SEARCH_INDEX_COLLECTION,
+            MongoBackend::RESOURCE_HISTORY_COLLECTION,
+            MongoBackend::RESOURCES_COLLECTION,
+        ] {
+            db.collection::<Document>(collection)
+                .delete_many(doc! { "tenant_id": id })
+                .await
+                .map_err(|e| internal_error(format!("purge delete ({}): {}", collection, e)))?;
+        }
+        Ok(removed)
+    }
+}
+
+/// Reads a registry document into a [`TenantRecord`](crate::core::TenantRecord).
+fn tenant_record_from_doc(doc: &Document) -> StorageResult<crate::core::TenantRecord> {
+    let id = doc
+        .get_str("id")
+        .map_err(|e| internal_error(format!("tenant record missing id: {}", e)))?
+        .to_string();
+    let created_at = doc
+        .get_str("created_at")
+        .map_err(|e| internal_error(format!("tenant record missing created_at: {}", e)))?
+        .to_string();
+    Ok(crate::core::TenantRecord {
+        id,
+        display_name: doc.get_str("display_name").ok().map(str::to_string),
+        created_at,
+    })
 }
 
 /// Runs a `$group`-by-string aggregation and collects `(_id, n)` pairs, where
