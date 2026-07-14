@@ -168,30 +168,38 @@ where
     let start_date = today - chrono::Duration::days(days - 1);
     // Build the per-type cumulative series via the shared helper (also used by
     // the web UI dashboard provider, so the bucketing semantics live in one
-    // place), then project each series to JSON.
+    // place), then project each series to JSON. Day-width buckets are epoch-
+    // aligned, so `date` remains the UTC calendar day it has always been; `count`
+    // is now the day's *net* change (creations minus deletions, from the history
+    // log), so it may be negative.
     let type_refs: Vec<&str> = types.iter().map(|t| t.as_str()).collect();
-    let series: Vec<_> =
-        crate::dashboard::resource_count_series(state.storage(), ctx, &type_refs, days, now)
-            .await?
-            .into_iter()
-            .map(|s| {
-                json!({
-                    "resource_type": s.resource_type,
-                    "total": s.total,
-                    "points": s
-                        .points
-                        .into_iter()
-                        .map(|p| {
-                            json!({
-                                "date": p.date,
-                                "count": p.count,
-                                "cumulative": p.cumulative,
-                            })
-                        })
-                        .collect::<Vec<_>>(),
+    let series: Vec<_> = crate::dashboard::resource_count_series(
+        state.storage(),
+        ctx,
+        &type_refs,
+        crate::dashboard::SeriesWindow::days(days),
+        now,
+    )
+    .await?
+    .into_iter()
+    .map(|s| {
+        json!({
+            "resource_type": s.resource_type,
+            "total": s.total,
+            "points": s
+                .points
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "date": p.bucket_start.format("%Y-%m-%d").to_string(),
+                        "count": p.delta,
+                        "cumulative": p.cumulative,
+                    })
                 })
-            })
-            .collect();
+                .collect::<Vec<_>>(),
+        })
+    })
+    .collect();
 
     let total_resources = state.storage().count(ctx, None).await?;
 

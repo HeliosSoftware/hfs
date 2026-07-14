@@ -930,6 +930,20 @@ impl ResourceStorage for CompositeStorage {
             .await
     }
 
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        // The history log lives with the authoritative primary store, same as the
+        // counts above and `activity_histogram` below.
+        self.primary
+            .count_deltas_by_bucket(tenant, resource_type, since, bucket_seconds)
+            .await
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,

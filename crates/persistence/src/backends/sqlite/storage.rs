@@ -538,6 +538,76 @@ impl ResourceStorage for SqliteBackend {
         Ok(out)
     }
 
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Bound the scan by the raw `last_updated` column so the
+        // `(tenant_id, last_updated)` history index prunes the range (wrapping the
+        // column in `strftime(...)` would force a full scan). The bound is floored
+        // to a bucket boundary, and formatted the same RFC3339 way the rows are
+        // written; because it lands exactly on a whole second it carries no
+        // fractional part, and any stored value in that same second sorts after it
+        // (`.` = 0x2E > `+` = 0x2B), so no row in the first bucket is missed.
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds).to_rfc3339();
+
+        // `strftime('%s', ...)` parses the stored RFC3339 UTC string to epoch
+        // seconds; integer-dividing by the bucket width and multiplying back floors
+        // each version to its epoch-aligned bucket start. The delta rule mirrors the
+        // trait doc: creation `+1`, delete `-1`, plain update `0`.
+        let mut stmt = conn
+            .prepare(
+                "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
+                        SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
+                 GROUP BY bucket HAVING delta != 0 ORDER BY bucket",
+            )
+            .map_err(|e| {
+                internal_error(format!("Failed to prepare count_deltas_by_bucket: {}", e))
+            })?;
+
+        let rows = stmt
+            .query_map(
+                params![tenant_id, resource_type, since_bound, bucket_seconds],
+                |row| {
+                    let bucket: i64 = row.get(0)?;
+                    let delta: i64 = row.get(1)?;
+                    Ok((bucket, delta))
+                },
+            )
+            .map_err(|e| {
+                internal_error(format!("Failed to query count_deltas_by_bucket: {}", e))
+            })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (bucket, delta) = row.map_err(|e| {
+                internal_error(format!("Failed to read count_deltas_by_bucket row: {}", e))
+            })?;
+            if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
+                out.push(crate::core::ResourceCountDelta {
+                    bucket_start,
+                    delta,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -3748,6 +3818,66 @@ mod tests {
             .find(|r| r.day == today)
             .expect("today bucket should be present");
         assert_eq!(today_row.count, 2);
+    }
+
+    /// The delta rule, straight from SQL: a create is `+1`, an update is `0` (it
+    /// must not move the resource into a newer bucket — the whole point of reading
+    /// history rather than `resources.last_updated`), and a delete is `-1`.
+    #[tokio::test]
+    async fn test_count_deltas_by_bucket() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let first = backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        // An update writes a v2 history row, which must contribute nothing.
+        backend
+            .update(&tenant, &first, json!({"active": true}))
+            .await
+            .unwrap();
+
+        // A one-minute bucket, so the writes above all land in the same one.
+        let since = Utc::now() - chrono::Duration::minutes(5);
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|r| r.delta).sum::<i64>(),
+            2,
+            "two creates and one update net to +2"
+        );
+        assert!(
+            rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+            "buckets are epoch-aligned to their width"
+        );
+
+        // Deleting one nets it back out.
+        backend
+            .delete(&tenant, "Patient", first.id())
+            .await
+            .unwrap();
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
+
+        // Buckets narrower than the window still cover it, and a bogus width is
+        // rejected rather than silently dividing by zero.
+        assert!(
+            backend
+                .count_deltas_by_bucket(&tenant, "Patient", since, 0)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

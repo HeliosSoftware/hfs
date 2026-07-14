@@ -13,6 +13,10 @@ keywords = ["helios-software", "fhir", "ui", "htmx"]
 # Web framework (matches the version used by helios-hfs / helios-rest)
 axum = "0.8"
 
+# Chart bucket timestamps: formatting x-axis labels, and shaping the placeholder
+# series rendered when no dashboard provider is registered.
+chrono.workspace = true
+
 # Compile-time, type-checked, auto-escaping templates (Jinja2-like).
 # Markup lives in templates/, never in Rust source.
 askama = "0.16"

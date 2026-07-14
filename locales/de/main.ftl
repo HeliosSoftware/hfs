@@ -108,6 +108,7 @@ card-uptime-sub = letzte 30 Tage
 
 chart-title = FHIR-Ressourcen im Zeitverlauf
 chart-expand = Diagramm vergrößern
+chart-window = Zeitfenster des Diagramms
 
 ## Fußzeile
 

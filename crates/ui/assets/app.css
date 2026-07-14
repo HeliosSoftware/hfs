@@ -556,6 +556,42 @@ a.nav-item:hover {
   fill: var(--muted);
 }
 
+/* ---------- Chart time-window selector ---------- */
+
+.window-picker {
+  display: inline-flex;
+  align-items: center;
+  height: 42px;
+  padding: 4px;
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  box-shadow: var(--surface-shadow);
+}
+
+.window-picker__option {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  text-decoration: none;
+}
+
+.window-picker__option:hover {
+  color: var(--text);
+}
+
+.window-picker__option--active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
 /* ---------- Chart legend / series selector ---------- */
 
 .chart-legend {

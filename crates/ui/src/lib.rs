@@ -30,6 +30,11 @@
 //! placeholder figures instead. Counts reflect the server's **default tenant**
 //! only — this is an operator view, and per-tenant counts are never exported to
 //! the public Prometheus `/metrics` endpoint.
+//!
+//! The chart is sampled over a [`DashboardWindow`], selected per request with
+//! `?window=` (`1h`, `24h`, or the default `30d`) alongside the `?type=` series
+//! selector. Both selectors are plain links, so the dashboard stays navigable
+//! without JavaScript.
 
 mod i18n;
 
@@ -44,7 +49,10 @@ use axum::{
 };
 use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
-use helios_observability::dashboard::{DashboardSeries, DashboardSnapshot};
+use chrono::{DateTime, Datelike, Duration, Utc};
+use helios_observability::dashboard::{
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow,
+};
 use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -123,6 +131,15 @@ struct LegendEntry {
     active: bool,
 }
 
+/// One entry in the time-window selector (`1h` / `24h` / `30d`): a link that
+/// re-renders the page with the chart sampled over that window, keeping the
+/// currently charted resource type.
+struct WindowEntry {
+    label: String,
+    href: String,
+    active: bool,
+}
+
 #[derive(Template)]
 #[template(path = "pages/index.html")]
 struct IndexPage {
@@ -130,6 +147,7 @@ struct IndexPage {
     metrics: DashboardMetrics,
     chart: ChartView,
     legend: Vec<LegendEntry>,
+    windows: Vec<WindowEntry>,
     i18n: I18n,
 }
 
@@ -163,13 +181,18 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str) -> Router {
 /// Full landing page. `?type=<ResourceType>` selects which resource type's series
 /// the chart plots (defaults to the first charted type); the value is validated
 /// against the snapshot, so an unknown type harmlessly falls back to the default.
+/// `?window=<1h|24h|30d>` selects the time window the chart is sampled over,
+/// falling back to [`DashboardWindow::default`] for anything unrecognised.
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let selected = selected_type_from_query(query.as_deref());
-    render(build_index_page(state.version, locale, selected).await)
+    let selected = query_value(query.as_deref(), "type");
+    let window = query_value(query.as_deref(), "window")
+        .and_then(|slug| DashboardWindow::from_slug(&slug))
+        .unwrap_or_default();
+    render(build_index_page(state.version, locale, selected, window).await)
 }
 
 /// Status read path. Returns a fragment to htmx (`HX-Request`) and a full page
@@ -184,7 +207,7 @@ async fn status(
     if is_htmx {
         render(StatusPartial { status, i18n })
     } else {
-        render(build_index_page(state.version, locale, None).await)
+        render(build_index_page(state.version, locale, None, DashboardWindow::default()).await)
     }
 }
 
@@ -194,28 +217,35 @@ async fn build_index_page(
     version: &'static str,
     locale: RequestLocale,
     selected: Option<String>,
+    window: DashboardWindow,
 ) -> IndexPage {
     let status = current_status(version);
     let i18n = I18n::new(locale);
-    let snapshot = helios_observability::dashboard::snapshot()
+    let snapshot = helios_observability::dashboard::snapshot(window)
         .await
-        .unwrap_or_else(sample_snapshot);
-    let (metrics, chart, legend) = build_dashboard(&snapshot, selected.as_deref());
+        .unwrap_or_else(|| sample_snapshot(window));
+    let (metrics, chart, legend, windows) = build_dashboard(&snapshot, selected.as_deref());
     IndexPage {
         status,
         metrics,
         chart,
         legend,
+        windows,
         i18n,
     }
 }
 
 /// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
-/// and legend/selector the template renders.
+/// and the two selectors (resource type, time window) the template renders.
 fn build_dashboard(
     snapshot: &DashboardSnapshot,
     selected: Option<&str>,
-) -> (DashboardMetrics, ChartView, Vec<LegendEntry>) {
+) -> (
+    DashboardMetrics,
+    ChartView,
+    Vec<LegendEntry>,
+    Vec<WindowEntry>,
+) {
     // Resolve the charted type: the requested one if it exists, else the first
     // series. `selected_type` is therefore always a real, server-controlled type
     // name (or empty when there are no series at all).
@@ -235,16 +265,31 @@ fn build_dashboard(
         .iter()
         .find(|s| s.resource_type == selected_type);
 
-    let chart = build_chart(&selected_type, selected_series);
+    let chart = build_chart(&selected_type, selected_series, snapshot.window);
 
+    // Both selectors carry the other's current value, so switching type keeps the
+    // window and vice versa.
     let legend = snapshot
         .series
         .iter()
         .map(|s| LegendEntry {
             resource_type: s.resource_type.clone(),
             total: grouped(s.total),
-            href: format!("/ui?type={}", s.resource_type),
+            href: format!(
+                "/ui?type={}&window={}",
+                s.resource_type,
+                snapshot.window.as_str()
+            ),
             active: s.resource_type == selected_type,
+        })
+        .collect();
+
+    let windows = DashboardWindow::ALL
+        .into_iter()
+        .map(|w| WindowEntry {
+            label: w.as_str().to_string(),
+            href: format!("/ui?type={}&window={}", selected_type, w.as_str()),
+            active: w == snapshot.window,
         })
         .collect();
 
@@ -262,7 +307,7 @@ fn build_dashboard(
             .unwrap_or_else(|| "0".to_string()),
     };
 
-    (metrics, chart, legend)
+    (metrics, chart, legend, windows)
 }
 
 // Chart plot area within the `0 0 1060 300` viewBox: the value axis occupies the
@@ -272,8 +317,14 @@ const PLOT_RIGHT: i64 = 1060;
 const PLOT_TOP: i64 = 10;
 const PLOT_BOTTOM: i64 = 278;
 
-/// Computes the SVG geometry for one resource type's cumulative series.
-fn build_chart(selected_type: &str, series: Option<&DashboardSeries>) -> ChartView {
+/// Computes the SVG geometry for one resource type's cumulative series. `window`
+/// decides only the x-axis label format — a calendar date over daily buckets, a
+/// UTC clock time over intraday ones.
+fn build_chart(
+    selected_type: &str,
+    series: Option<&DashboardSeries>,
+    window: DashboardWindow,
+) -> ChartView {
     let points = match series {
         Some(s) if !s.points.is_empty() => &s.points,
         _ => {
@@ -323,7 +374,7 @@ fn build_chart(selected_type: &str, series: Option<&DashboardSeries>) -> ChartVi
         };
         if let Some(point) = points.get(idx as usize) {
             x_ticks.push(AxisTick {
-                label: short_date(&point.date),
+                label: axis_time_label(point.bucket_start, window),
                 pos: x_at(idx),
                 // Date labels sit on the fixed bottom row of the viewBox.
                 label_y: 298,
@@ -396,46 +447,29 @@ fn grouped(n: u64) -> String {
     out
 }
 
-/// Formats an ISO `YYYY-MM-DD` date as a compact axis label like `"JUL 7"`,
-/// falling back to the raw string if it is not in the expected shape.
-fn short_date(iso: &str) -> String {
-    let mut parts = iso.split('-');
-    let (_year, month, day) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(y), Some(m), Some(d)) => (y, m, d),
-        _ => return iso.to_string(),
-    };
-    let month_abbr = match month {
-        "01" => "JAN",
-        "02" => "FEB",
-        "03" => "MAR",
-        "04" => "APR",
-        "05" => "MAY",
-        "06" => "JUN",
-        "07" => "JUL",
-        "08" => "AUG",
-        "09" => "SEP",
-        "10" => "OCT",
-        "11" => "NOV",
-        "12" => "DEC",
-        _ => return iso.to_string(),
-    };
-    let day_trimmed = day.trim_start_matches('0');
-    let day_trimmed = if day_trimmed.is_empty() {
-        "0"
-    } else {
-        day_trimmed
-    };
-    format!("{month_abbr} {day_trimmed}")
+/// A compact x-axis label for a bucket: a UTC clock time (`"14:30"`) when the
+/// window's buckets are finer than a day, otherwise a calendar date (`"JUL 7"`).
+/// Both are UTC, matching the buckets themselves.
+fn axis_time_label(bucket_start: DateTime<Utc>, window: DashboardWindow) -> String {
+    if window.is_intraday() {
+        return bucket_start.format("%H:%M").to_string();
+    }
+    const MONTHS: [&str; 12] = [
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ];
+    let month = MONTHS[(bucket_start.month0() as usize).min(11)];
+    format!("{month} {}", bucket_start.day())
 }
 
-/// Extracts a `type=<value>` selection from the raw query string, if present and
-/// non-empty. Resource type names are alphanumeric, so no percent-decoding is
-/// needed; the value is validated against the snapshot before use.
-fn selected_type_from_query(query: Option<&str>) -> Option<String> {
+/// Extracts `key=<value>` from the raw query string, if present and non-empty.
+/// Both values we read this way (a FHIR resource type, a window slug) are
+/// alphanumeric, so no percent-decoding is needed; each is validated — against
+/// the snapshot's series, or `DashboardWindow::from_slug` — before use.
+fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     let query = query?;
     query.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        if key == "type" && !value.is_empty() {
+        let (k, value) = pair.split_once('=')?;
+        if k == key && !value.is_empty() {
             Some(value.to_string())
         } else {
             None
@@ -446,18 +480,25 @@ fn selected_type_from_query(query: Option<&str>) -> Option<String> {
 /// A representative snapshot used when no dashboard provider is registered, so
 /// the design renders with plausible sample data (design frame: Patient growth
 /// toward ~1.2k over 30 days).
-fn sample_snapshot() -> DashboardSnapshot {
-    use helios_observability::dashboard::DashboardPoint;
+fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
+    // Dense buckets for the requested window, ending now — the same shape a real
+    // provider returns, so the placeholder exercises the same rendering path. The
+    // per-bucket growth is scaled down for the shorter windows so the sample curve
+    // stays plausible at every zoom.
+    let bucket = Duration::seconds(window.bucket_seconds());
+    let scale = window.span_seconds() as f64 / DashboardWindow::LastMonth.span_seconds() as f64;
+    let last_bucket = bucket_floor_utc(Utc::now(), window.bucket_seconds());
+    let first_bucket = last_bucket - bucket * (window.points().saturating_sub(1) as i32);
 
-    fn series(resource_type: &str, per_day: u64, base: u64) -> DashboardSeries {
-        let mut points = Vec::with_capacity(30);
+    let series = |resource_type: &str, per_day: u64, base: u64| -> DashboardSeries {
+        let per_bucket = ((per_day as f64 * scale) / window.points() as f64).round() as i64;
+        let mut points = Vec::with_capacity(window.points());
         let mut cumulative = base;
-        for day in 1..=30u32 {
-            let count = per_day;
-            cumulative += count;
+        for i in 0..window.points() {
+            cumulative += per_bucket.max(0) as u64;
             points.push(DashboardPoint {
-                date: format!("2026-05-{day:02}"),
-                count,
+                bucket_start: first_bucket + bucket * (i as i32),
+                delta: per_bucket,
                 cumulative,
             });
         }
@@ -466,13 +507,13 @@ fn sample_snapshot() -> DashboardSnapshot {
             total: cumulative,
             points,
         }
-    }
+    };
 
     let series = vec![
-        series("Patient", 32, 240),
-        series("Observation", 1180, 3400),
-        series("Encounter", 260, 1500),
-        series("Condition", 90, 700),
+        series("Patient", 960, 240),
+        series("Observation", 35_400, 3_400),
+        series("Encounter", 7_800, 1_500),
+        series("Condition", 2_700, 700),
     ];
     let total_resources = series.iter().map(|s| s.total).sum();
 
@@ -480,8 +521,21 @@ fn sample_snapshot() -> DashboardSnapshot {
         fhir_version: "R4".to_string(),
         total_resources,
         distinct_types: 142,
+        window,
         series,
     }
+}
+
+/// Floors `ts` to the start of the epoch-aligned bucket containing it. Mirrors
+/// `helios_persistence::core::bucket_floor`, which this crate cannot call — it
+/// deliberately does not depend on persistence — and is used only to shape the
+/// placeholder series.
+fn bucket_floor_utc(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
+    if bucket_seconds <= 0 {
+        return ts;
+    }
+    let floored = ts.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
+    DateTime::from_timestamp(floored, 0).unwrap_or(ts)
 }
 
 fn current_status(version: &'static str) -> Status {
@@ -519,7 +573,8 @@ mod tests {
 
     /// Builds an `IndexPage` from the sample snapshot for template-rendering tests.
     fn sample_index_page(version: &'static str, checked_at: u64, i18n: I18n) -> IndexPage {
-        let (metrics, chart, legend) = build_dashboard(&sample_snapshot(), None);
+        let (metrics, chart, legend, windows) =
+            build_dashboard(&sample_snapshot(DashboardWindow::default()), None);
         IndexPage {
             status: Status {
                 version,
@@ -528,7 +583,17 @@ mod tests {
             metrics,
             chart,
             legend,
+            windows,
             i18n,
+        }
+    }
+
+    /// A point at a fixed instant, for geometry tests that don't care when.
+    fn point_at(epoch_secs: i64, delta: i64, cumulative: u64) -> DashboardPoint {
+        DashboardPoint {
+            bucket_start: DateTime::from_timestamp(epoch_secs, 0).expect("valid instant"),
+            delta,
+            cumulative,
         }
     }
 
@@ -625,7 +690,10 @@ mod tests {
 
     #[test]
     fn dashboard_projects_snapshot_counts_and_chart() {
-        let (metrics, chart, legend) = build_dashboard(&sample_snapshot(), Some("Observation"));
+        let (metrics, chart, legend, _windows) = build_dashboard(
+            &sample_snapshot(DashboardWindow::default()),
+            Some("Observation"),
+        );
 
         // Selected type drives the chart + headline total.
         assert_eq!(chart.selected_type, "Observation");
@@ -633,22 +701,99 @@ mod tests {
         assert!(!chart.polyline.is_empty());
         assert_eq!(chart.y_ticks.len(), 5);
 
-        // Legend lists every series, with the selected one marked active.
+        // Legend lists every series, with the selected one marked active. Each
+        // href carries the current window, so switching type does not reset it.
         assert_eq!(legend.len(), 4);
         let observation = legend
             .iter()
             .find(|e| e.resource_type == "Observation")
             .expect("Observation in legend");
         assert!(observation.active);
-        assert_eq!(observation.href, "/ui?type=Observation");
+        assert_eq!(observation.href, "/ui?type=Observation&window=30d");
         assert_eq!(legend.iter().filter(|e| e.active).count(), 1);
 
         assert_eq!(metrics.resource_types, "142");
     }
 
+    /// The window selector offers every window, marks the snapshot's own as
+    /// active, and carries the charted type across a window switch.
+    #[test]
+    fn window_selector_marks_the_active_window_and_keeps_the_charted_type() {
+        let (_metrics, _chart, _legend, windows) = build_dashboard(
+            &sample_snapshot(DashboardWindow::LastHour),
+            Some("Encounter"),
+        );
+
+        assert_eq!(windows.len(), DashboardWindow::ALL.len());
+        assert_eq!(windows.iter().filter(|w| w.active).count(), 1);
+        let active = windows.iter().find(|w| w.active).expect("an active window");
+        assert_eq!(active.label, "1h");
+        assert!(
+            windows
+                .iter()
+                .all(|w| w.href.starts_with("/ui?type=Encounter&window=")),
+            "every window link keeps the charted type"
+        );
+        assert_eq!(active.href, "/ui?type=Encounter&window=1h");
+    }
+
+    /// Intraday windows label the x-axis with clock times; the 30-day window
+    /// keeps calendar dates. Same series, different axis vocabulary.
+    #[test]
+    fn axis_labels_follow_the_window_resolution() {
+        let (_m, hour_chart, _l, _w) =
+            build_dashboard(&sample_snapshot(DashboardWindow::LastHour), None);
+        assert!(
+            hour_chart
+                .x_ticks
+                .iter()
+                .all(|t| t.label.contains(':') && t.label.len() == 5),
+            "1h axis should read as HH:MM, got {:?}",
+            hour_chart
+                .x_ticks
+                .iter()
+                .map(|t| &t.label)
+                .collect::<Vec<_>>()
+        );
+
+        let (_m, month_chart, _l, _w) =
+            build_dashboard(&sample_snapshot(DashboardWindow::LastMonth), None);
+        assert!(
+            month_chart.x_ticks.iter().all(|t| !t.label.contains(':')),
+            "30d axis should read as a calendar date, got {:?}",
+            month_chart
+                .x_ticks
+                .iter()
+                .map(|t| &t.label)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Every window produces a chart the SVG can actually draw: a dense series of
+    /// the window's own length, and at most six x-axis labels however many
+    /// buckets it holds.
+    #[test]
+    fn every_window_renders_a_bounded_chart() {
+        for window in DashboardWindow::ALL {
+            let snapshot = sample_snapshot(window);
+            let (_m, chart, _l, _w) = build_dashboard(&snapshot, None);
+            assert!(chart.has_data, "{}", window.as_str());
+            assert_eq!(snapshot.series[0].points.len(), window.points());
+            assert!(
+                chart.x_ticks.len() <= 6,
+                "{} produced {} x labels",
+                window.as_str(),
+                chart.x_ticks.len()
+            );
+        }
+    }
+
     #[test]
     fn unknown_selected_type_falls_back_to_first_series() {
-        let (_metrics, chart, _legend) = build_dashboard(&sample_snapshot(), Some("<script>"));
+        let (_metrics, chart, _legend, _windows) = build_dashboard(
+            &sample_snapshot(DashboardWindow::default()),
+            Some("<script>"),
+        );
         assert_eq!(chart.selected_type, "Patient");
     }
 
@@ -658,13 +803,16 @@ mod tests {
             fhir_version: "R4".to_string(),
             total_resources: 0,
             distinct_types: 0,
+            window: DashboardWindow::default(),
             series: Vec::new(),
         };
-        let (metrics, chart, legend) = build_dashboard(&empty, None);
+        let (metrics, chart, legend, windows) = build_dashboard(&empty, None);
         assert!(!chart.has_data);
         assert!(chart.polyline.is_empty());
         assert!(legend.is_empty());
         assert_eq!(metrics.chart_total, "0");
+        // The window selector still renders, so an empty server is not a dead end.
+        assert_eq!(windows.len(), DashboardWindow::ALL.len());
     }
 
     #[test]
@@ -679,23 +827,49 @@ mod tests {
         assert_eq!(nice_ceil(1_204), 2_000);
         assert_eq!(nice_ceil(38_910), 40_000);
         assert_eq!(nice_ceil(0), 0);
-        assert_eq!(short_date("2026-07-07"), "JUL 7");
-        assert_eq!(short_date("bogus"), "bogus");
+    }
+
+    /// `2026-07-07T14:30:00Z`, formatted for each window's axis.
+    #[test]
+    fn axis_time_label_formats_per_window() {
+        let at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        assert_eq!(axis_time_label(at, DashboardWindow::LastHour), "14:30");
+        assert_eq!(axis_time_label(at, DashboardWindow::LastDay), "14:30");
+        assert_eq!(axis_time_label(at, DashboardWindow::LastMonth), "JUL 14");
     }
 
     #[test]
-    fn selected_type_parsing() {
+    fn query_value_parsing() {
         assert_eq!(
-            selected_type_from_query(Some("type=Observation")).as_deref(),
+            query_value(Some("type=Observation"), "type").as_deref(),
             Some("Observation")
         );
         assert_eq!(
-            selected_type_from_query(Some("lang=es&type=Encounter")).as_deref(),
+            query_value(Some("lang=es&type=Encounter"), "type").as_deref(),
             Some("Encounter")
         );
-        assert_eq!(selected_type_from_query(Some("type=")), None);
-        assert_eq!(selected_type_from_query(Some("lang=es")), None);
-        assert_eq!(selected_type_from_query(None), None);
+        assert_eq!(query_value(Some("type="), "type"), None);
+        assert_eq!(query_value(Some("lang=es"), "type"), None);
+        assert_eq!(query_value(None, "type"), None);
+
+        // The window slug is read the same way, and validated by `from_slug`.
+        assert_eq!(
+            query_value(Some("type=Patient&window=24h"), "window").as_deref(),
+            Some("24h")
+        );
+        assert_eq!(
+            query_value(Some("window=24h"), "window")
+                .as_deref()
+                .and_then(DashboardWindow::from_slug),
+            Some(DashboardWindow::LastDay)
+        );
+        // An unrecognised window is dropped, and the caller falls back to default.
+        assert_eq!(
+            query_value(Some("window=7d"), "window")
+                .as_deref()
+                .and_then(DashboardWindow::from_slug),
+            None
+        );
     }
 
     #[test]
@@ -703,13 +877,9 @@ mod tests {
         let series = DashboardSeries {
             resource_type: "Patient".to_string(),
             total: 5,
-            points: vec![helios_observability::dashboard::DashboardPoint {
-                date: "2026-05-01".to_string(),
-                count: 5,
-                cumulative: 5,
-            }],
+            points: vec![point_at(1_752_503_400, 5, 5)],
         };
-        let chart = build_chart("Patient", Some(&series));
+        let chart = build_chart("Patient", Some(&series), DashboardWindow::default());
 
         assert!(chart.has_data);
         // A lone point produces a single "x,y" pair pinned to the left axis.
@@ -718,9 +888,34 @@ mod tests {
         assert_eq!(chart.x_ticks.len(), 1);
     }
 
+    /// A bucket where deletions outweigh creations dips the curve. The y-axis is
+    /// scaled from the cumulative peak, so a dip must not push a point off-canvas.
     #[test]
-    fn short_date_rejects_out_of_range_month() {
-        assert_eq!(short_date("2026-13-09"), "2026-13-09");
-        assert_eq!(short_date("2026-01-09"), "JAN 9");
+    fn a_net_negative_bucket_dips_the_curve_without_escaping_the_plot() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 4,
+            points: vec![
+                point_at(1_752_503_400, 10, 10),
+                point_at(1_752_503_460, -6, 4),
+                point_at(1_752_503_520, 0, 4),
+            ],
+        };
+        let chart = build_chart("Patient", Some(&series), DashboardWindow::LastHour);
+
+        assert!(chart.has_data);
+        // Every plotted y sits inside the plot area (10..=278 in the viewBox).
+        for pair in chart.polyline.split(' ') {
+            let y: i64 = pair
+                .split_once(',')
+                .expect("x,y pair")
+                .1
+                .parse()
+                .expect("integer y");
+            assert!(
+                (PLOT_TOP..=PLOT_BOTTOM).contains(&y),
+                "y {y} escaped the plot"
+            );
+        }
     }
 }

@@ -3641,6 +3641,7 @@ dependencies = [
  "axum",
  "axum-embed",
  "axum-htmx",
+ "chrono",
  "fluent-syntax 0.11.1",
  "fluent-templates",
  "helios-observability",

@@ -34,6 +34,21 @@
       <span class="stat__sub">{{ chart.selected_type }}</span>
     </div>
     <div class="chart-card__tools">
+      <!--
+        Time-window selector. Each option is a plain link that re-renders the page
+        with the chart sampled over that window (keeping the charted type), so it
+        works without JavaScript. Window spans and bucket widths are paired in
+        helios_observability::dashboard::DashboardWindow.
+      -->
+      <nav class="window-picker" aria-label="{{ i18n.t("chart-window") }}">
+        {% for w in windows %}
+        <a
+          class="window-picker__option{% if w.active %} window-picker__option--active{% endif %}"
+          href="{{ w.href }}"
+          {% if w.active %}aria-current="true"{% endif %}
+        >{{ w.label }}</a>
+        {% endfor %}
+      </nav>
       <span class="pill">
         <span class="icon">{% include "icons/layers-platforms.svg" %}</span>
         {{ chart.selected_type }}

@@ -18,19 +18,104 @@
 //! counts are deliberately never exported to the public Prometheus `/metrics`
 //! endpoint (see [`crate::metrics`]); this snapshot is a separate, operator-facing
 //! surface.
+//!
+//! ## Time resolution
+//!
+//! The chart is sampled over a [`DashboardWindow`], which pairs a span with the
+//! bucket width used to sample it (1h/1min, 24h/30min, 30d/1day). Span and bucket
+//! are coupled rather than independent, and the underlying series is built from
+//! the immutable history log — see [`DashboardWindow`] for why both of those
+//! matter.
 
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
-/// One daily point of a single resource type's cumulative growth curve.
+/// A window the dashboard chart can be viewed over, pairing a span with the
+/// bucket width that samples it.
+///
+/// The two are deliberately coupled: bucket width is not a free "precision"
+/// knob, because a fine bucket over a long span produces a point count no chart
+/// (or response body) can carry — a 30-day span at one-minute buckets is 43 200
+/// points *per resource type*. Each variant below is therefore chosen to land in
+/// the 30–60 point range, so every zoom level stays legible and cheap.
+///
+/// The series behind these is built from the immutable history log
+/// (`count_deltas_by_bucket`), not from the current rows' `last_updated`, so
+/// buckets do not shift when a resource is edited. That is what makes the
+/// sub-day windows meaningful rather than merely finer-grained.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DashboardWindow {
+    /// Last hour, in one-minute buckets (60 points).
+    LastHour,
+    /// Last 24 hours, in half-hour buckets (48 points).
+    LastDay,
+    /// Last 30 days, in daily buckets (30 points). The default view.
+    #[default]
+    LastMonth,
+}
+
+impl DashboardWindow {
+    /// All windows, in the order the UI offers them (finest first).
+    pub const ALL: [DashboardWindow; 3] = [Self::LastHour, Self::LastDay, Self::LastMonth];
+
+    /// Stable slug used in the `?window=` query parameter and as the selector
+    /// label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LastHour => "1h",
+            Self::LastDay => "24h",
+            Self::LastMonth => "30d",
+        }
+    }
+
+    /// Parses a `?window=` slug, returning `None` for anything unrecognised so
+    /// callers can fall back to the default rather than erroring.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|w| w.as_str() == slug)
+    }
+
+    /// Total span covered by the window, in seconds.
+    pub fn span_seconds(self) -> i64 {
+        self.bucket_seconds() * self.points() as i64
+    }
+
+    /// Width of one bucket, in seconds.
+    pub fn bucket_seconds(self) -> i64 {
+        match self {
+            Self::LastHour => 60,
+            Self::LastDay => 1_800,
+            Self::LastMonth => 86_400,
+        }
+    }
+
+    /// Number of buckets plotted across the span.
+    pub fn points(self) -> usize {
+        match self {
+            Self::LastHour => 60,
+            Self::LastDay => 48,
+            Self::LastMonth => 30,
+        }
+    }
+
+    /// Whether buckets are finer than a day, which is what decides between a
+    /// clock-time and a calendar-date axis label.
+    pub fn is_intraday(self) -> bool {
+        self.bucket_seconds() < 86_400
+    }
+}
+
+/// One bucket of a single resource type's cumulative growth curve.
 #[derive(Clone, Debug)]
 pub struct DashboardPoint {
-    /// `YYYY-MM-DD` (UTC) label for the bucket.
-    pub date: String,
-    /// Resources whose most-recent version landed on this day.
-    pub count: u64,
-    /// Running total through this day (converges to the series `total`).
+    /// Inclusive start of the bucket (UTC), aligned to the Unix epoch.
+    pub bucket_start: DateTime<Utc>,
+    /// Net stored-resource change recorded in this bucket: creations minus
+    /// deletions. May be negative.
+    pub delta: i64,
+    /// Running total through the end of this bucket (converges to the series
+    /// `total` on the final point).
     pub cumulative: u64,
 }
 
@@ -55,6 +140,8 @@ pub struct DashboardSnapshot {
     pub total_resources: u64,
     /// Number of distinct resource types with at least one stored resource.
     pub distinct_types: usize,
+    /// The window the `series` were sampled over.
+    pub window: DashboardWindow,
     /// Per-type series for the charted resource types, in display order.
     pub series: Vec<DashboardSeries>,
 }
@@ -63,10 +150,10 @@ pub struct DashboardSnapshot {
 /// the live storage backend and registered via [`set_provider`] at startup.
 #[async_trait]
 pub trait DashboardProvider: Send + Sync {
-    /// Compute a fresh snapshot. Called per dashboard page load, so
+    /// Compute a fresh snapshot over `window`. Called per dashboard page load, so
     /// implementations keep the query fan-out bounded (a handful of resource
     /// types) and degrade gracefully — returning zeros — rather than erroring.
-    async fn snapshot(&self) -> DashboardSnapshot;
+    async fn snapshot(&self, window: DashboardWindow) -> DashboardSnapshot;
 }
 
 static PROVIDER: RwLock<Option<Arc<dyn DashboardProvider>>> = RwLock::new(None);
@@ -85,49 +172,88 @@ fn provider() -> Option<Arc<dyn DashboardProvider>> {
     PROVIDER.read().ok().and_then(|guard| guard.clone())
 }
 
-/// Fetch a fresh dashboard snapshot, or `None` when no provider is registered
-/// (e.g. a server build without persistence, or the standalone UI example). The
-/// UI falls back to placeholder figures in that case.
-pub async fn snapshot() -> Option<DashboardSnapshot> {
+/// Fetch a fresh dashboard snapshot over `window`, or `None` when no provider is
+/// registered (e.g. a server build without persistence, or the standalone UI
+/// example). The UI falls back to placeholder figures in that case.
+pub async fn snapshot(window: DashboardWindow) -> Option<DashboardSnapshot> {
     let provider = provider()?;
-    Some(provider.snapshot().await)
+    Some(provider.snapshot(window).await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct Fixed(DashboardSnapshot);
+    /// Echoes back the window it was asked for, so the test can assert the
+    /// requested window reaches the provider.
+    struct Fixed;
 
     #[async_trait]
     impl DashboardProvider for Fixed {
-        async fn snapshot(&self) -> DashboardSnapshot {
-            self.0.clone()
+        async fn snapshot(&self, window: DashboardWindow) -> DashboardSnapshot {
+            DashboardSnapshot {
+                fhir_version: "R4".to_string(),
+                total_resources: 42,
+                distinct_types: 3,
+                window,
+                series: vec![DashboardSeries {
+                    resource_type: "Patient".to_string(),
+                    total: 7,
+                    points: vec![DashboardPoint {
+                        bucket_start: DateTime::from_timestamp(1_752_451_200, 0).unwrap(),
+                        delta: 7,
+                        cumulative: 7,
+                    }],
+                }],
+            }
         }
     }
 
     #[tokio::test]
     async fn registered_provider_snapshot_round_trips() {
-        set_provider(Arc::new(Fixed(DashboardSnapshot {
-            fhir_version: "R4".to_string(),
-            total_resources: 42,
-            distinct_types: 3,
-            series: vec![DashboardSeries {
-                resource_type: "Patient".to_string(),
-                total: 7,
-                points: vec![DashboardPoint {
-                    date: "2026-07-07".to_string(),
-                    count: 7,
-                    cumulative: 7,
-                }],
-            }],
-        })));
+        set_provider(Arc::new(Fixed));
 
-        let snap = snapshot().await.expect("provider registered");
+        let snap = snapshot(DashboardWindow::LastHour)
+            .await
+            .expect("provider registered");
         assert_eq!(snap.total_resources, 42);
         assert_eq!(snap.distinct_types, 3);
+        // The requested window reaches the provider and is echoed on the snapshot,
+        // so the UI can render its selector from the snapshot alone.
+        assert_eq!(snap.window, DashboardWindow::LastHour);
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.series[0].resource_type, "Patient");
         assert_eq!(snap.series[0].points.last().unwrap().cumulative, 7);
+    }
+
+    /// Every window stays inside a legible point budget, and its span is exactly
+    /// the buckets it plots — the invariant the chart's x-axis relies on.
+    #[test]
+    fn windows_pair_span_with_a_bounded_point_count() {
+        for window in DashboardWindow::ALL {
+            assert!(
+                (30..=60).contains(&window.points()),
+                "{} plots {} points, outside the legible range",
+                window.as_str(),
+                window.points()
+            );
+            assert_eq!(
+                window.span_seconds(),
+                window.bucket_seconds() * window.points() as i64
+            );
+            assert_eq!(DashboardWindow::from_slug(window.as_str()), Some(window));
+        }
+
+        assert_eq!(DashboardWindow::LastHour.span_seconds(), 3_600);
+        assert_eq!(DashboardWindow::LastDay.span_seconds(), 86_400);
+        assert_eq!(DashboardWindow::LastMonth.span_seconds(), 30 * 86_400);
+
+        assert!(DashboardWindow::LastHour.is_intraday());
+        assert!(DashboardWindow::LastDay.is_intraday());
+        assert!(!DashboardWindow::LastMonth.is_intraday());
+
+        // Unknown slugs fall back rather than erroring.
+        assert_eq!(DashboardWindow::from_slug("7d"), None);
+        assert_eq!(DashboardWindow::default(), DashboardWindow::LastMonth);
     }
 }
