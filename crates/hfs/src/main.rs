@@ -29,7 +29,6 @@ use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::info;
 
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_persistence::core::SettingsStore;
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, DefaultExportWorker, DefaultSubmitWorker,
@@ -37,20 +36,12 @@ use helios_persistence::core::{
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_rest::bulk_export_auth::BearerScopeAuth;
-// The S3+Elasticsearch composite is the only remaining caller of the plain
-// bulk builder: S3 has no settings store, and its bulk-export job state rides
-// on an embedded SQLite sidecar.
-#[cfg(all(feature = "s3", feature = "elasticsearch", feature = "sqlite"))]
-use helios_rest::create_app_with_auth_and_bulk;
-// Settings-capable standalone/composite backends (SQLite, PostgreSQL, MongoDB)
-// host the per-user settings store, wired alongside bulk export/submit.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+// Every standalone primary backend (SQLite, PostgreSQL, MongoDB, S3) hosts the
+// per-user settings store, so all startup paths use the settings-capable builder
+// and wire it alongside bulk export/submit. Both symbols are unconditional: the
+// `compile_error!` at the bottom of this file guarantees at least one of those
+// backends is enabled, and each brings a `start_*` that uses them.
 use helios_rest::create_app_with_auth_bulk_and_settings;
-// S3 does not host a settings store (tracked follow-up #199), so its startup
-// paths use the plain app builder. Every other standalone/composite backend now
-// wires the per-user settings store via `create_app_with_auth_bulk_and_settings`.
-#[cfg(feature = "s3")]
-use helios_rest::create_app_with_auth;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -1889,13 +1880,24 @@ async fn start_s3(
         )
     })?;
 
+    let backend = Arc::new(backend);
     let serve_audit_state = audit_state.clone();
-    let app = create_app_with_auth(
+
+    // The S3 backend also hosts the per-user settings store (a compare-and-swap
+    // over conditional PutObject), so it keeps ownership of the backend Arc and
+    // uses the settings-capable builder. Bulk export/submit are not wired on a
+    // standalone S3 primary, which has no job store.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
+
+    let app = create_app_with_auth_bulk_and_settings(
         backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        None,
+        None,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }
@@ -2081,32 +2083,33 @@ async fn start_s3_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
-    // S3 primary; embedded SQLite sidecar for job state.
-    #[cfg(feature = "sqlite")]
-    {
-        let jobs = build_embedded_job_store(&config)?;
-        if let Some(bundle) = build_bulk_export(&config, s3.clone(), jobs).await? {
-            let app = create_app_with_auth_and_bulk(
-                composite,
-                config.clone(),
-                auth_config,
-                auth_state,
-                audit_state,
-                Some(bundle),
-                None,
-            );
-            return serve(app, &config, serve_audit_state).await;
-        }
-    }
+    // The per-user settings store lives on the S3 primary (Elasticsearch is
+    // search-only), so it is wired from the underlying `s3` backend even though
+    // the app is served over the composite storage.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(s3.clone());
 
-    let app = create_app_with_auth(
-        Arc::try_unwrap(composite).unwrap_or_else(|_| {
-            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
-        }),
+    // S3 primary; embedded SQLite sidecar for bulk-export job state.
+    let bulk_export = {
+        #[cfg(feature = "sqlite")]
+        {
+            let jobs = build_embedded_job_store(&config)?;
+            build_bulk_export(&config, s3.clone(), jobs).await?
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            None
+        }
+    };
+
+    let app = create_app_with_auth_bulk_and_settings(
+        composite,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        bulk_export,
+        None,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }

@@ -414,7 +414,13 @@ where
                 .unwrap_or_default();
             match code {
                 "NoSuchKey" | "NotFound" | "NoSuchBucket" => S3ClientError::NotFound,
-                "PreconditionFailed" => S3ClientError::PreconditionFailed,
+                // `ConditionalRequestConflict` (HTTP 409) is returned when two
+                // conditional writes to the same key race. Like a 412 it means
+                // "you lost the compare-and-swap"; without this arm it would fall
+                // through to `Internal` and surface as a 500.
+                "PreconditionFailed" | "ConditionalRequestConflict" => {
+                    S3ClientError::PreconditionFailed
+                }
                 "SlowDown" | "Throttling" | "ThrottlingException" => {
                     S3ClientError::Throttled(message)
                 }
@@ -433,6 +439,15 @@ where
                                 .to_string(),
                         ),
                         404 => S3ClientError::NotFound,
+                        // 412 unambiguously means a failed precondition. A bare
+                        // 409 deliberately does *not* map here: it is shared by
+                        // transient conflicts such as `OperationAborted`, and the
+                        // resource paths turn `PreconditionFailed` into
+                        // `AlreadyExists`/`VersionConflict` — so mis-classifying a
+                        // 409 would report a false fact about stored state. The
+                        // one 409 that really is a lost compare-and-swap,
+                        // `ConditionalRequestConflict`, is matched by code above.
+                        412 => S3ClientError::PreconditionFailed,
                         _ => {
                             let detail = if message.is_empty() {
                                 format!("{:?}", service_err.err())

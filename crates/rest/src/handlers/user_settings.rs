@@ -118,13 +118,13 @@ where
 /// the active backend does not provide one.
 ///
 /// The per-user settings store is implemented by every standalone *primary*
-/// backend that offers the required read-modify-write + monotonic-version
-/// primitives: SQLite, PostgreSQL, and MongoDB. It is intentionally unavailable
-/// on backends that are not a transactional primary FHIR store — notably the
-/// S3 object store (whose recommended role is archival and whose concurrency /
-/// version story differs; tracked in issue #199) and Elasticsearch (search-only,
-/// never a standalone primary). The message names the supported backends so an
-/// operator on an unsupported one gets an explained `501` rather than a bare one.
+/// backend: SQLite, PostgreSQL, and MongoDB provide the read-modify-write +
+/// monotonic-version primitives directly (a transaction or a version-conditioned
+/// update), and S3 reaches the same semantics with a compare-and-swap over
+/// conditional `PutObject`. It is intentionally unavailable only on
+/// Elasticsearch, which is search-only and never a standalone primary. The
+/// message names the supported backends so an operator on an unsupported one gets
+/// an explained `501` rather than a bare one.
 fn settings_store<S>(state: &AppState<S>) -> RestResult<&Arc<dyn SettingsStore>>
 where
     S: ResourceStorage + Send + Sync,
@@ -132,8 +132,9 @@ where
     state
         .settings_store()
         .ok_or_else(|| RestError::NotImplemented {
-            feature: "per-user settings (supported on the SQLite, PostgreSQL, and MongoDB \
-                      backends; not available on the S3 or Elasticsearch backends)"
+            feature: "per-user settings (supported on the SQLite, PostgreSQL, MongoDB, and S3 \
+                      backends; not available on Elasticsearch, which is search-only and never \
+                      a standalone primary store)"
                 .to_string(),
         })
 }

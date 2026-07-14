@@ -47,7 +47,9 @@ pub struct StoredUserSettings {
 
 /// Storage abstraction for opaque, per-user JSON settings documents.
 ///
-/// Implemented by the SQLite and PostgreSQL backends. The trait is intentionally
+/// Implemented by every standalone primary backend: SQLite, PostgreSQL, and
+/// MongoDB, and S3 (where the read-modify-write is a compare-and-swap over
+/// conditional `PutObject` rather than a transaction). The trait is intentionally
 /// minimal — get the whole document, replace it, or merge-patch it — because the
 /// document body is opaque to the server.
 #[async_trait]
