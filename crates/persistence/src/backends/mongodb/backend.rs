@@ -40,7 +40,8 @@ pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult
     // Fail fast when no healthy server can be selected. `connect_timeout`
     // only covers new TCP handshakes; this caps requests once server
     // monitoring has marked the server unavailable.
-    client_options.server_selection_timeout = Some(SERVER_SELECTION_TIMEOUT);
+    client_options.server_selection_timeout =
+        Some(Duration::from_millis(config.server_selection_timeout_ms));
     // Recycle idle connections so stale ones (e.g. silently dropped by a
     // NAT/firewall on a long-lived network path) are not handed out.
     client_options.max_idle_time = Some(MAX_CONNECTION_IDLE_TIME);
@@ -53,9 +54,6 @@ pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult
         })
     })
 }
-
-/// Upper bound for selecting a usable server before an operation gives up.
-const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Connections idle longer than this are closed rather than reused, so a
 /// connection silently dropped by a NAT/firewall is never handed to a request.
@@ -107,8 +105,22 @@ pub struct MongoBackendConfig {
     pub max_connections: u32,
 
     /// Connection timeout in milliseconds.
+    ///
+    /// This bounds a new TCP handshake only. It does NOT bound how long an
+    /// operation waits for a usable server to be selected — see
+    /// [`Self::server_selection_timeout_ms`].
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+
+    /// Upper bound, in milliseconds, for selecting a usable server before an
+    /// operation gives up.
+    ///
+    /// This — not `connect_timeout_ms` — is what determines how long an
+    /// operation against an unreachable server takes to fail, because the driver
+    /// keeps re-attempting server selection while its monitor reports no healthy
+    /// server. Tests that point a backend at a dead address should lower it.
+    #[serde(default = "default_server_selection_timeout_ms")]
+    pub server_selection_timeout_ms: u64,
 
     /// FHIR version for this backend instance.
     #[serde(default = "crate::default_fhir_version")]
@@ -139,6 +151,10 @@ fn default_connect_timeout_ms() -> u64 {
     5000
 }
 
+fn default_server_selection_timeout_ms() -> u64 {
+    15_000
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -146,6 +162,7 @@ impl Default for MongoBackendConfig {
             database_name: default_database_name(),
             max_connections: default_max_connections(),
             connect_timeout_ms: default_connect_timeout_ms(),
+            server_selection_timeout_ms: default_server_selection_timeout_ms(),
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,

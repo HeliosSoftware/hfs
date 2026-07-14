@@ -148,12 +148,19 @@ where
     let connect_timeout_ms = env("HFS_MONGODB_CONNECT_TIMEOUT_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(5000);
+    // Bounds how long an operation waits for a usable server. `connect_timeout_ms`
+    // only bounds a TCP handshake, so this is what actually decides how quickly an
+    // unreachable MongoDB surfaces an error.
+    let server_selection_timeout_ms = env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15_000);
 
     MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
         connect_timeout_ms,
+        server_selection_timeout_ms,
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
         search_offloaded,
@@ -364,12 +371,17 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5000);
+        let server_selection_timeout_ms = std::env::var("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15_000);
 
         let config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
             connect_timeout_ms,
+            server_selection_timeout_ms,
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,

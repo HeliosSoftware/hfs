@@ -89,6 +89,9 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.database_name, "helios");
     assert_eq!(config.max_connections, 10);
     assert_eq!(config.connect_timeout_ms, 5000);
+    // Unchanged from when this was a hardcoded constant — making it configurable
+    // must not change the default behaviour of an existing deployment.
+    assert_eq!(config.server_selection_timeout_ms, 15_000);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
 }
@@ -100,6 +103,7 @@ fn test_mongodb_config_serialization() {
         database_name: "phase2".to_string(),
         max_connections: 24,
         connect_timeout_ms: 7000,
+        server_selection_timeout_ms: 9000,
         ..Default::default()
     };
 
@@ -110,6 +114,7 @@ fn test_mongodb_config_serialization() {
     assert_eq!(decoded.database_name, "phase2");
     assert_eq!(decoded.max_connections, 24);
     assert_eq!(decoded.connect_timeout_ms, 7000);
+    assert_eq!(decoded.server_selection_timeout_ms, 9000);
 }
 
 #[test]
