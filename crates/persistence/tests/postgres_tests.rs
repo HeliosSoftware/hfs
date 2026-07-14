@@ -23,7 +23,14 @@ fn test_postgres_config_defaults() {
     assert_eq!(config.dbname, "helios");
     assert_eq!(config.user, "helios");
     assert!(config.password.is_none());
-    assert_eq!(config.max_connections, 10);
+    // Derived from the core count (cores * 4, clamped) rather than a fixed 10, which
+    // throttled search badly under concurrent load — see #224. Assert the contract
+    // (the clamp bounds), not the machine-dependent value.
+    assert!(
+        (16..=64).contains(&config.max_connections),
+        "pool size {} outside the 16..=64 clamp",
+        config.max_connections
+    );
     assert_eq!(config.connect_timeout_secs, 5);
     assert_eq!(config.statement_timeout_ms, 30000);
     assert!(!config.search_offloaded);
@@ -151,8 +158,18 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Default string search is starts-with (case-insensitive via ILIKE)
-        assert!(fragment.sql.contains("ILIKE"));
+        // Default string search is starts-with. `LIKE`, not `ILIKE`: both the stored
+        // column and the bound pattern are already case-folded by `fold_text`, and
+        // `ILIKE` cannot use a btree index (#224). The raw-column fallback is wrapped
+        // in `lower()` so un-backfilled rows keep matching case-insensitively.
+        assert!(
+            fragment
+                .sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE"),
+            "string search must target the indexed folded expression: {}",
+            fragment.sql
+        );
+        assert!(!fragment.sql.contains("ILIKE"));
         assert!(fragment.sql.contains("param_name = 'name'"));
         // Parameter should be "Smith%"
         match &fragment.params[0] {
@@ -197,7 +214,12 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        assert!(fragment.sql.contains("ILIKE"));
+        assert!(
+            fragment
+                .sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE")
+        );
+        assert!(!fragment.sql.contains("ILIKE"));
         // Parameter should be "%mit%"
         match &fragment.params[0] {
             SqlParam::Text(s) => {
@@ -278,9 +300,14 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Accent-folded substring match: COALESCE(folded, raw) ILIKE %mit%
+        // Accent-folded substring match against the indexed folded expression.
         assert!(fragment.sql.contains("value_string_folded"));
-        assert!(fragment.sql.contains("ILIKE"));
+        assert!(
+            fragment
+                .sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE")
+        );
+        assert!(!fragment.sql.contains("ILIKE"));
         // Substring match: param wrapped as %mit%
         match &fragment.params[0] {
             SqlParam::Text(s) => {
@@ -2164,8 +2191,11 @@ mod postgres_integration {
         };
 
         let backend = create_backend().await;
-        let tenant_id = "unbackfilled-tenant";
-        let tenant = create_tenant(tenant_id);
+        let tenant = create_tenant("unbackfilled");
+        // `create_tenant` suffixes a UUID for isolation, so the effective tenant id
+        // must be read back off the context — the literal passed in is only a prefix.
+        // Seeding `search_index` with the bare literal violates the FK to `resources`.
+        let tenant_id = tenant.tenant_id().as_str();
 
         // No `name` element, so the writer indexes no `name` row for this Patient —
         // leaving the field clear for the hand-written legacy row below.
