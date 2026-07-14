@@ -87,6 +87,7 @@ nav-capability-conformance = Capability & Konformität
 nav-admin-ops = Admin / Betrieb
 nav-subscriptions = Abonnements
 nav-tenants = Mandanten
+nav-toggle = Navigation ein- oder ausklappen
 
 ## Mandantenverwaltung (/ui/tenants)
 
@@ -136,8 +137,8 @@ card-uptime = Verfügbarkeit
 card-uptime-sub = letzte 30 Tage
 
 chart-title = FHIR-Ressourcen im Zeitverlauf
-chart-unit-patients = Patienten
 chart-expand = Diagramm vergrößern
+chart-window = Zeitfenster des Diagramms
 
 ## Fußzeile
 

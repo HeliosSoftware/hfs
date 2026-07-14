@@ -48,6 +48,35 @@ pub struct DailyResourceCount {
     pub count: u64,
 }
 
+/// One fixed-width time bucket of net stored-resource growth.
+///
+/// Returned by [`ResourceStorage::count_deltas_by_bucket`] to back
+/// creation-time-accurate "FHIR resources over time" charts. See that method for
+/// the precise counting semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceCountDelta {
+    /// Inclusive start of the bucket (UTC), aligned to the Unix epoch.
+    pub bucket_start: DateTime<Utc>,
+    /// Creations minus deletions recorded in this bucket. May be negative.
+    pub delta: i64,
+}
+
+/// Floors `ts` to the start of the epoch-aligned bucket of width
+/// `bucket_seconds` that contains it. Shared by the backends (to compute the
+/// query's lower bound) and by callers densifying a returned series, so both
+/// agree on where bucket boundaries fall. A non-positive `bucket_seconds`
+/// returns `ts` unchanged.
+pub fn bucket_floor(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
+    if bucket_seconds <= 0 {
+        return ts;
+    }
+    let secs = ts.timestamp();
+    // `div_euclid` floors toward negative infinity, so pre-1970 instants (which
+    // have negative epoch seconds) still land on the bucket that contains them.
+    let floored = secs.div_euclid(bucket_seconds) * bucket_seconds;
+    DateTime::from_timestamp(floored, 0).unwrap_or(ts)
+}
+
 /// One `(weekday, hour)` cell of write-activity, used by
 /// [`ResourceStorage::activity_histogram`] to back the dashboard's "Activity"
 /// heatmap.
@@ -63,11 +92,18 @@ pub struct ActivityCell {
 }
 
 /// Audit event helpers for purge operations.
-#[cfg(feature = "audit")]
 pub mod audit {
     use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
 
     /// Record an audit event for a purge (permanent deletion) operation.
+    ///
+    /// `outcome` is a FHIR `AuditEvent.outcome` code — `"0"` on success, `"8"`
+    /// on failure. A purge that fails partway across a composite deployment
+    /// (say, the search secondary rejects the delete) must still be recorded,
+    /// so failures are audited with `outcome = "8"` and an `outcome_desc`
+    /// naming the backend that failed. There is no partial-success code: a
+    /// purge either removed the resource everywhere or it did not.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_purge_event(
         sink: &dyn AuditSink,
         source_observer: &str,
@@ -76,6 +112,8 @@ pub mod audit {
         resource_id: Option<&str>,
         count: u64,
         patient_ref: Option<&str>,
+        outcome: &str,
+        outcome_desc: Option<&str>,
     ) {
         let mut builder = AuditEventBuilder::new(source_observer)
             .event_type(
@@ -83,7 +121,7 @@ pub mod audit {
                 "object",
             )
             .action(AuditAction::Delete)
-            .outcome("0")
+            .outcome(outcome)
             .detail("audit-operation", "purge")
             .detail("count", count.to_string());
         if let Some(id) = resource_id {
@@ -97,61 +135,131 @@ pub mod audit {
         if let Some(p) = patient_ref {
             builder = builder.patient(p);
         }
+        if let Some(d) = outcome_desc {
+            builder = builder.outcome_desc(d);
+        }
         sink.record(builder.build()).await;
     }
 
     #[cfg(test)]
     mod tests {
-        use helios_audit::{AuditAction, AuditEventBuilder};
+        use super::*;
+        use crate::test_audit::{CollectorSink, detail_map};
 
-        #[test]
-        fn test_purge_event_action_is_delete() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .event_type(
-                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "object",
-                )
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .detail("audit-operation", "purge")
-                .resource("Patient", "123")
-                .detail("count", "1")
-                .build();
+        /// Purge is a destructive operation, so the event must carry the `D`
+        /// action code — that is what a BALP consumer filters on.
+        #[tokio::test]
+        async fn test_purge_event_action_is_delete() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "Patient",
+                Some("123"),
+                1,
+                None,
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(events.len(), 1);
             assert_eq!(
-                event.action.as_ref().and_then(|a| a.value.as_deref()),
+                events[0].action.as_ref().and_then(|a| a.value.as_deref()),
                 Some("D")
+            );
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("audit-operation").map(String::as_str),
+                Some("purge")
+            );
+            assert_eq!(details.get("count").map(String::as_str), Some("1"));
+        }
+
+        /// A type-level `purge_all` has no single resource id, so the type must
+        /// still be recoverable from the event.
+        #[tokio::test]
+        async fn test_purge_all_event_records_resource_type_and_count() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                None,
+                "Observation",
+                None,
+                15,
+                None,
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("resource-type").map(String::as_str),
+                Some("Observation")
+            );
+            assert_eq!(details.get("count").map(String::as_str), Some("15"));
+        }
+
+        /// A purge that fails on one backend of a composite deployment must
+        /// still be audited, with a failure outcome and the backend named.
+        /// Before `outcome` was a parameter this was impossible — the helper
+        /// hardcoded `"0"`, so a failed purge looked exactly like a successful
+        /// one in the audit log.
+        #[tokio::test]
+        async fn test_purge_failure_is_audited_with_outcome_8() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "Patient",
+                Some("123"),
+                0,
+                None,
+                "8",
+                Some("purge failed on secondary 'es'"),
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(
+                events[0].outcome.as_ref().and_then(|o| o.value.as_deref()),
+                Some("8")
+            );
+            assert_eq!(
+                events[0]
+                    .outcome_desc
+                    .as_ref()
+                    .and_then(|d| d.value.as_deref()),
+                Some("purge failed on secondary 'es'")
             );
         }
 
-        #[test]
-        fn test_purge_event_includes_count() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .event_type(
-                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "object",
-                )
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .detail("audit-operation", "purge")
-                .resource("Observation", "obs-1")
-                .detail("count", "15")
-                .build();
-            let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
-            let count_detail = details
-                .iter()
-                .find(|d| d.r#type.value.as_deref() == Some("count"));
-            assert!(count_detail.is_some());
-        }
+        /// Purging a patient-compartment resource must attach the patient
+        /// entity, which is what the BALP patient-oriented profiles key on.
+        #[tokio::test]
+        async fn test_purge_with_patient_has_patient_entity() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                None,
+                "Observation",
+                Some("obs-1"),
+                1,
+                Some("Patient/456"),
+                "0",
+                None,
+            )
+            .await;
 
-        #[test]
-        fn test_purge_with_patient_has_patient_entity() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .resource("Observation", "obs-1")
-                .patient("Patient/456")
-                .build();
-            let entities = event.entity.as_ref().unwrap();
+            let events = sink.events();
+            let entities = events[0].entity.as_ref().unwrap();
             assert_eq!(entities.len(), 2);
             assert_eq!(
                 entities[1]
@@ -491,6 +599,53 @@ pub trait ResourceStorage: Send + Sync {
         _resource_type: &str,
         _since: DateTime<Utc>,
     ) -> StorageResult<Vec<DailyResourceCount>> {
+        Ok(Vec::new())
+    }
+
+    /// Buckets net stored-resource growth of `resource_type` into fixed-width
+    /// time buckets, from the immutable `resource_history` log.
+    ///
+    /// This is the creation-time-accurate counterpart to
+    /// [`count_by_day`](Self::count_by_day). Where that method buckets the
+    /// *current* row by its `last_updated` — so a resource silently moves to a
+    /// newer bucket every time it is edited — this one buckets the write events
+    /// themselves, which never change once written. That makes the resulting
+    /// curve stable under later edits and therefore meaningful at sub-day
+    /// resolution, where the retroactive drift of `count_by_day` would dominate.
+    ///
+    /// # Semantics
+    ///
+    /// Each history version contributes a delta to the bucket its `last_updated`
+    /// falls in: a creation (`version_id = "1"`, not deleted) is `+1`, a delete
+    /// is `-1`, and a plain update is `0`. A bucket's `delta` is the sum, so it
+    /// may be negative. Only non-empty buckets are returned, in ascending order.
+    ///
+    /// Callers reconstruct the curve by summing deltas forward from a baseline of
+    /// `count() - sum(deltas in window)`, which pins the final point to the live
+    /// total from [`count`](Self::count). Any drift — a resurrecting `PUT` after
+    /// a delete, which re-adds a resource under a non-`1` version and so is not
+    /// counted as `+1`, or history predating this table — is absorbed into that
+    /// baseline rather than showing up as a wrong endpoint.
+    ///
+    /// The default implementation returns an empty series for backends with no
+    /// history log; callers should treat that as "no time resolution available"
+    /// and fall back to the current total.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_type` - The FHIR resource type to bucket
+    /// * `since` - Inclusive lower bound on version `last_updated`
+    /// * `bucket_seconds` - Bucket width in seconds (e.g. `60` for one-minute
+    ///   buckets, `86_400` for daily). Buckets are aligned to the Unix epoch, so
+    ///   day-width buckets line up with UTC calendar days. Must be positive.
+    async fn count_deltas_by_bucket(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _since: DateTime<Utc>,
+        _bucket_seconds: i64,
+    ) -> StorageResult<Vec<ResourceCountDelta>> {
         Ok(Vec::new())
     }
 

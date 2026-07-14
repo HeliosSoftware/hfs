@@ -10,10 +10,11 @@ use elasticsearch::{DeleteByQueryParts, DeleteParts, GetParts, IndexParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
-use crate::core::ResourceStorage;
+use crate::core::{PurgableStorage, ResourceStorage};
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
@@ -960,4 +961,359 @@ fn parse_stored_resource(
         None,
         fhir_version,
     )))
+}
+
+// ============================================================================
+// PurgableStorage
+//
+// Elasticsearch keeps no history — a document is the current version and
+// nothing else — so `purge` and `delete` collapse to the same operation here.
+// `delete` is already a hard delete (see above), so purge reuses it.
+//
+// Elasticsearch is never a standalone backend; it is always a search secondary
+// in front of a SQL, MongoDB, or S3 primary. Purging it is therefore always
+// part of a composite fan-out, and losing a document here is recoverable by
+// reindexing from the primary.
+// ============================================================================
+
+#[async_trait]
+impl PurgableStorage for ElasticsearchBackend {
+    async fn purge(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<()> {
+        // ResourceStorage::delete already removes the document outright and
+        // sweeps its contained-resource docs, which is exactly purge semantics
+        // for a backend with no history.
+        match ResourceStorage::delete(self, tenant, resource_type, id).await {
+            // A purge whose document is already absent has nothing to undo. The
+            // composite fan-out retries a failed purge, so this must be
+            // idempotent or the retry would fail on the backend that succeeded.
+            Err(StorageError::Resource(ResourceError::NotFound { .. })) => Ok(()),
+            other => other,
+        }
+    }
+
+    async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, resource_type);
+
+        let deleted = delete_by_query_scoped(
+            self,
+            &[&index],
+            json!({ "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } }
+            ]}}}),
+        )
+        .await?;
+
+        // Contained-resource docs derived from this type live in *other* type
+        // indices, so they need a second, tenant-scoped sweep.
+        let pattern = tenant_index_pattern(self, tenant_id);
+        delete_by_query_scoped(
+            self,
+            &[&pattern],
+            json!({ "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "term": { "is_contained": true } },
+                { "term": { "container_type": resource_type } }
+            ]}}}),
+        )
+        .await?;
+
+        Ok(deleted)
+    }
+}
+
+// ============================================================================
+// ReindexSource / ReindexTarget
+//
+// Elasticsearch has no separate search-index structure: the indexed document
+// *is* the search entry. That makes it a legitimate ReindexTarget but means the
+// two write methods behave differently from a SQL backend's — see each below.
+// ============================================================================
+
+#[async_trait]
+impl ReindexTarget for ElasticsearchBackend {
+    /// A no-op, deliberately.
+    ///
+    /// For a SQL backend, search entries are rows that must be cleared before
+    /// being rewritten or stale ones survive. For Elasticsearch the entries are
+    /// *fields of the resource document*, and `write_search_entries` re-indexes
+    /// that whole document under the same `_id`, which replaces it wholesale —
+    /// no stale field can survive. Actually deleting here would remove the
+    /// resource itself between the delete and the write, so the reindex would
+    /// briefly (and, if it then failed, permanently) drop it from search.
+    async fn delete_search_entries(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _resource_id: &str,
+    ) -> StorageResult<u64> {
+        Ok(0)
+    }
+
+    async fn write_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
+        let fhir_version = resource.fhir_version();
+
+        let extracted_values = self
+            .search_extractor()
+            .extract(content, resource_type)
+            .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
+
+        // The document carries version_id and fhir_version, neither of which is
+        // recoverable from the resource JSON — which is why ReindexTarget hands
+        // over the whole StoredResource rather than just its content.
+        let doc = build_es_document(
+            tenant_id,
+            resource_type,
+            resource_id,
+            resource.version_id(),
+            content,
+            fhir_version,
+            &extracted_values,
+        );
+
+        schema::ensure_index(self, tenant_id, resource_type).await?;
+
+        let index = self.index_name(tenant_id, resource_type);
+        let doc_id = Self::document_id(resource_type, resource_id);
+
+        let response = self
+            .client()
+            .index(IndexParts::IndexId(&index, &doc_id))
+            .body(doc)
+            .send()
+            .await
+            .map_err(|e| internal_error(format!("Failed to index document: {e}")))?;
+
+        let status = response.status_code();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(internal_error(format!(
+                "Failed to index document (status {status}): {body}"
+            )));
+        }
+
+        self.index_contained_docs(
+            tenant_id,
+            resource_type,
+            resource_id,
+            content,
+            fhir_version,
+            resource.version_id(),
+            true,
+        )
+        .await?;
+
+        Ok(extracted_values.len())
+    }
+
+    async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // MUST be a delete-by-query with a `tenant_id` term filter, never a
+        // delete of the indices matching the tenant's index pattern. The
+        // pattern `{prefix}_{tenant}_*` is a prefix glob, so tenant "a" matches
+        // tenant "ab"'s indices — deleting by pattern would destroy a
+        // prefix-sharing tenant's data. The term filter is what actually bounds
+        // this to one tenant; the pattern only narrows which indices to scan.
+        let pattern = tenant_index_pattern(self, tenant_id);
+        delete_by_query_scoped(
+            self,
+            &[&pattern],
+            json!({ "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } }
+            ]}}}),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl ReindexSource for ElasticsearchBackend {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+
+        let response = self
+            .client()
+            .search(elasticsearch::SearchParts::Index(&[&pattern]))
+            .body(json!({
+                "size": 0,
+                "query": { "bool": { "filter": [
+                    { "term": { "tenant_id": tenant_id } },
+                    { "term": { "is_deleted": false } }
+                ]}},
+                "aggs": { "types": { "terms": { "field": "resource_type", "size": 1000 } } }
+            }))
+            .allow_no_indices(true)
+            .ignore_unavailable(true)
+            .send()
+            .await
+            .map_err(|e| internal_error(format!("Failed to list resource types: {e}")))?;
+
+        if !response.status_code().is_success() {
+            return Ok(Vec::new());
+        }
+
+        let body: Value = response.json().await.unwrap_or_default();
+        Ok(body
+            .pointer("/aggregations/types/buckets")
+            .and_then(|b| b.as_array())
+            .map(|buckets| {
+                buckets
+                    .iter()
+                    .filter_map(|b| b.get("key").and_then(|k| k.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        ResourceStorage::count(self, tenant, Some(resource_type)).await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, resource_type);
+
+        // `search_after` keyset pagination over a total sort order. Excludes
+        // contained docs, which are synthetic and get rebuilt from their
+        // container rather than being reindexed in their own right.
+        let mut body = json!({
+            "size": limit,
+            "query": { "bool": {
+                "filter": [
+                    { "term": { "tenant_id": tenant_id } },
+                    { "term": { "is_deleted": false } }
+                ],
+                "must_not": [ { "term": { "is_contained": true } } ]
+            }},
+            "sort": [
+                { "last_updated": "asc" },
+                { "resource_id": "asc" }
+            ]
+        });
+
+        if let Some(raw) = cursor {
+            let after: Value = serde_json::from_str(raw)
+                .map_err(|e| internal_error(format!("Malformed reindex cursor: {e}")))?;
+            body["search_after"] = after;
+        }
+
+        let response = self
+            .client()
+            .search(elasticsearch::SearchParts::Index(&[&index]))
+            .body(body)
+            .allow_no_indices(true)
+            .ignore_unavailable(true)
+            .send()
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+
+        if !response.status_code().is_success() {
+            return Ok(ResourcePage {
+                resources: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        let payload: Value = response.json().await.unwrap_or_default();
+        let hits = payload
+            .pointer("/hits/hits")
+            .and_then(|h| h.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut resources = Vec::new();
+        for hit in &hits {
+            if let Some(source) = hit.get("_source")
+                && let Some(stored) = parse_stored_resource(source, tenant)?
+            {
+                resources.push(stored);
+            }
+        }
+
+        // Only a full page can have a successor; the sort values of the last hit
+        // become the next `search_after`.
+        let next_cursor = match (hits.len() as u32 == limit, hits.last()) {
+            (true, Some(last)) => last
+                .get("sort")
+                .map(|s| s.to_string())
+                .filter(|_| !resources.is_empty()),
+            _ => None,
+        };
+
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+        })
+    }
+}
+
+/// The index glob covering every one of a tenant's type indices.
+///
+/// This is a *prefix* glob: tenant "a" also matches tenant "ab"'s indices.
+/// Every query built on it MUST also carry a `tenant_id` term filter — the
+/// pattern narrows which indices are scanned, the filter is what enforces
+/// tenant isolation.
+fn tenant_index_pattern(backend: &ElasticsearchBackend, tenant_id: &str) -> String {
+    format!(
+        "{}_{}_*",
+        backend.config().index_prefix,
+        tenant_id.to_lowercase()
+    )
+}
+
+/// Runs a delete-by-query and returns how many documents it removed.
+///
+/// Missing indices are not an error — a tenant that has never been written to
+/// simply has nothing to delete.
+async fn delete_by_query_scoped(
+    backend: &ElasticsearchBackend,
+    indices: &[&str],
+    body: Value,
+) -> StorageResult<u64> {
+    let response = backend
+        .client()
+        .delete_by_query(DeleteByQueryParts::Index(indices))
+        .ignore_unavailable(true)
+        .refresh(true)
+        .conflicts(elasticsearch::params::Conflicts::Proceed)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| internal_error(format!("Failed to delete by query: {e}")))?;
+
+    if !response.status_code().is_success() {
+        let status = response.status_code();
+        let text = response.text().await.unwrap_or_default();
+        return Err(internal_error(format!(
+            "Failed to delete by query (status {status}): {text}"
+        )));
+    }
+
+    let payload: Value = response.json().await.unwrap_or_default();
+    Ok(payload.get("deleted").and_then(|d| d.as_u64()).unwrap_or(0))
 }

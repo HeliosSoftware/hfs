@@ -50,7 +50,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 /// Audit event helpers for bulk export operations.
-#[cfg(feature = "audit")]
 pub mod audit {
     use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
 
@@ -58,13 +57,18 @@ pub mod audit {
 
     /// Record an audit event for a bulk export lifecycle event.
     ///
-    /// Call this at export start, completion, cancellation, or failure.
+    /// `phase` names the lifecycle transition being recorded — `"kickoff"`,
+    /// `"status"`, `"cancel"`, `"download"` from the REST surface, and
+    /// `"complete"` / `"cancelled"` / `"failed"` from the export worker — and
+    /// is emitted as the `bulk-export-operation` detail. Without it a completed
+    /// export and a cancelled one produce indistinguishable events.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_export_event(
         sink: &dyn AuditSink,
         source_observer: &str,
         agent: Option<&str>,
         job_id: &str,
+        phase: &str,
         level: &ExportLevel,
         resource_types: &[String],
         outcome: &str,
@@ -78,6 +82,7 @@ pub mod audit {
             .action(AuditAction::Execute)
             .outcome(outcome)
             .detail("audit-operation", "bulk-export")
+            .detail("bulk-export-operation", phase)
             .detail("job-id", job_id)
             .detail("export-level", level.to_string());
         if !resource_types.is_empty() {
@@ -94,44 +99,71 @@ pub mod audit {
 
     #[cfg(test)]
     mod tests {
-        use helios_audit::sinks::NullSink;
-
         use super::*;
         use crate::core::bulk_export::ExportLevel;
+        use crate::test_audit::{CollectorSink, detail_map};
 
         #[tokio::test]
-        async fn test_export_event_has_job_id() {
-            let sink = NullSink;
+        async fn test_export_event_records_job_id_and_type() {
+            let sink = CollectorSink::new();
             record_export_event(
                 &sink,
                 "Device/hfs",
                 Some("Practitioner/dr-1"),
                 "job-abc",
+                "kickoff",
                 &ExportLevel::System,
                 &["Patient".to_string()],
                 "0",
                 None,
             )
             .await;
-            // NullSink discards; we verify it doesn't panic and compiles correctly
-        }
 
-        #[test]
-        fn test_export_event_type_is_object_for_bulk_export() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .event_type(
-                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "object",
-                )
-                .action(AuditAction::Execute)
-                .outcome("0")
-                .detail("audit-operation", "bulk-export")
-                .detail("job-id", "j1")
-                .build();
+            let events = sink.events();
+            assert_eq!(events.len(), 1);
             assert_eq!(
-                event.r#type.code.as_ref().and_then(|c| c.value.as_deref()),
+                events[0]
+                    .r#type
+                    .code
+                    .as_ref()
+                    .and_then(|c| c.value.as_deref()),
                 Some("object")
             );
+            let details = detail_map(&events[0]);
+            assert_eq!(details.get("job-id").map(String::as_str), Some("job-abc"));
+            assert_eq!(
+                details.get("resource-types").map(String::as_str),
+                Some("Patient")
+            );
+        }
+
+        /// The `phase` (`bulk-export-operation`) detail is what distinguishes a
+        /// completed export from a cancelled or failed one. Without it every
+        /// lifecycle event for a job is indistinguishable in the audit log.
+        #[tokio::test]
+        async fn test_export_phase_distinguishes_lifecycle_events() {
+            let sink = CollectorSink::new();
+            for (phase, outcome) in [("kickoff", "0"), ("complete", "0"), ("failed", "8")] {
+                record_export_event(
+                    &sink,
+                    "Device/hfs",
+                    Some("Practitioner/dr-1"),
+                    "job-abc",
+                    phase,
+                    &ExportLevel::System,
+                    &[],
+                    outcome,
+                    None,
+                )
+                .await;
+            }
+
+            let phases: Vec<String> = sink
+                .events()
+                .iter()
+                .filter_map(|e| detail_map(e).get("bulk-export-operation").cloned())
+                .collect();
+            assert_eq!(phases, ["kickoff", "complete", "failed"]);
         }
     }
 }

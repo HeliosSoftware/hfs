@@ -91,6 +91,7 @@ nav-capability-conformance = Capability & Conformance
 nav-admin-ops = Admin / Ops
 nav-subscriptions = Subscriptions
 nav-tenants = Tenants
+nav-toggle = Collapse or expand the navigation
 
 ## Tenant maintenance (/ui/tenants)
 
@@ -140,8 +141,8 @@ card-uptime = Uptime
 card-uptime-sub = last 30 days
 
 chart-title = FHIR resources over time
-chart-unit-patients = patients
 chart-expand = Expand chart
+chart-window = Chart time window
 
 ## Footer
 

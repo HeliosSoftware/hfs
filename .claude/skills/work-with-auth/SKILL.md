@@ -42,4 +42,29 @@ SMART discovery passthrough (advertised in `/.well-known/smart-configuration`): 
 
 ## Code map
 
-`config.rs`, `provider/`, `jwks/` (cache, coordinator, fetcher), `jti/` (memory, redis), `scope/` (smart_v2, permissions), `policy/`, `principal.rs`, `discovery.rs`, `outbound.rs`. Auth scopes are consumed by Bulk Data Submit (`system/bulk-submit`). Unit tests are inline in `src/`; integration tests live under `crates/auth/tests/` where present.
+`config.rs`, `provider/`, `jwks/` (cache, coordinator, fetcher), `jti/` (memory, redis), `scope/` (smart_v2, permissions), `policy/`, `principal.rs`, `discovery.rs`, `outbound.rs`. Unit tests are inline in `src/`; integration tests live under `crates/auth/tests/` where present.
+
+## Named operation scopes
+
+Some operations are gated on a named scope of their own rather than on resource
+permissions, via `ScopeSet::grants_operation(name)` — which matches a literal
+`system/{name}` **or** any `system/*.<perm>` wildcard:
+
+| Scope | Grants |
+|---|---|
+| `system/bulk-submit` | `$bulk-submit` ingestion |
+| `system/purge` | `$purge` — permanent, irreversible deletion of a resource and its history |
+| `system/reindex` | `$reindex` — rebuilding a tenant's entire search index |
+
+These deliberately do **not** fall out of ordinary resource scopes: a token that
+may soft-delete a Patient (`system/Patient.d`) must not thereby be able to
+obliterate it, and a token that may write resources must not be able to rebuild
+the search index.
+
+The auth middleware's `extract_operation` returns `None` for `$purge`,
+`$reindex`, and `$reindex-status` so their handlers can enforce the above — it
+would otherwise classify `POST /Patient/$purge` as a *Create* on Patient. That
+deferral list is a **narrow allowlist** (`HANDLER_AUTHORIZED_OPS` in
+`crates/rest/src/middleware/auth.rs`), not a blanket rule for `$`-paths:
+SQL-on-FHIR operations have no handler-level scope check, so exempting every
+`$`-path from middleware classification would leave them entirely unauthorized.

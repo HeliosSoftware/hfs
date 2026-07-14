@@ -150,6 +150,7 @@ pub mod bulk_export_auth;
 pub mod bulk_submit_fetcher;
 pub mod bulk_submit_oauth;
 pub mod config;
+mod dashboard;
 pub mod error;
 pub mod export;
 pub mod extractors;
@@ -288,6 +289,25 @@ pub struct BulkExportBundle {
     pub file_auth: Arc<dyn bulk_export_auth::ExportFileAuth>,
 }
 
+/// The persistence-layer operations (`$purge`, `$reindex`) a deployment can
+/// serve, wired into [`AppState`] by [`create_app_with_auth_bulk_settings_and_ops`].
+///
+/// Both are `Option` because not every deployment can serve both: `s3`
+/// standalone has no search index, so it has nothing to reindex. Absent
+/// capabilities make the corresponding endpoint report 501 rather than
+/// pretending to have done the work.
+///
+/// On a composite deployment, `purge` MUST be the *composite* storage rather
+/// than the primary, so the purge reaches the search secondary — see
+/// [`AppState::with_purge`].
+#[derive(Default)]
+pub struct OperationsBundle {
+    /// Target for `$purge`.
+    pub purge: Option<Arc<dyn helios_persistence::core::PurgableStorage>>,
+    /// Driver for `$reindex`.
+    pub reindex: Option<Arc<helios_persistence::search::ReindexOperation>>,
+}
+
 /// The bulk-submit job store, input fetcher, output store, and download
 /// authorizer, wired into [`AppState`] by [`create_app_with_auth_and_bulk_export`].
 pub struct BulkSubmitBundle {
@@ -341,6 +361,7 @@ where
         None,
         None,
         None,
+        OperationsBundle::default(),
     )
 }
 
@@ -380,6 +401,7 @@ where
         Some(bulk_export),
         None,
         None,
+        OperationsBundle::default(),
     )
 }
 
@@ -422,6 +444,7 @@ where
         bulk_export,
         bulk_submit,
         None,
+        OperationsBundle::default(),
     )
 }
 
@@ -466,6 +489,54 @@ where
         bulk_export,
         bulk_submit,
         settings_store,
+        OperationsBundle::default(),
+    )
+}
+
+/// Like [`create_app_with_auth_bulk_and_settings`], but also wires the
+/// persistence-layer operations (`$purge`, `$reindex`).
+///
+/// Every deployment can serve `$purge`; only deployments with a search index
+/// can serve `$reindex`. See [`OperationsBundle`].
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_auth_bulk_settings_and_ops<S>(
+    storage: Arc<S>,
+    config: ServerConfig,
+    auth_config: helios_auth::AuthConfig,
+    auth_state: Option<Arc<middleware::auth::AuthMiddlewareState>>,
+    audit_state: Option<Arc<helios_audit::AuditMiddlewareState>>,
+    bulk_export: Option<BulkExportBundle>,
+    bulk_submit: Option<BulkSubmitBundle>,
+    settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+    ops: OperationsBundle,
+) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    build_app(
+        storage,
+        config,
+        auth_config,
+        auth_state,
+        audit_state,
+        bulk_export,
+        bulk_submit,
+        settings_store,
+        ops,
     )
 }
 
@@ -482,6 +553,7 @@ fn build_app<S>(
     bulk_export: Option<BulkExportBundle>,
     bulk_submit: Option<BulkSubmitBundle>,
     settings_store: Option<Arc<dyn helios_persistence::core::SettingsStore>>,
+    ops: OperationsBundle,
 ) -> Router
 where
     S: ResourceStorage
@@ -511,6 +583,14 @@ where
     // Storage arrives pre-wrapped in an Arc so we can share it with the SofRunner.
     let storage_arc = storage;
 
+    // Register the process-global dashboard data provider so the web UI can
+    // render real per-type resource counts (default tenant) without depending on
+    // the persistence layer. Storage-agnostic consumers read it via
+    // `helios_observability::dashboard::snapshot()`.
+    helios_observability::dashboard::set_provider(Arc::new(
+        dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config),
+    ));
+
     let (app_audit_sink, app_audit_source_observer) = audit_state
         .as_ref()
         .map(|audit| {
@@ -535,6 +615,16 @@ where
         app_audit_sink,
         app_audit_source_observer,
     );
+
+    // Persistence-layer operations. Absent capabilities leave the handler to
+    // report 501 rather than the route to 404 — the endpoint exists on every
+    // deployment, it just cannot always be served.
+    if let Some(purge) = ops.purge {
+        state = state.with_purge(purge);
+    }
+    if let Some(reindex) = ops.reindex {
+        state = state.with_reindex(reindex);
+    }
 
     // Wire SQL-on-FHIR runner and export controller. The SOF runtime path is
     // in-DB SQL only — backends without a SOF runner can't serve

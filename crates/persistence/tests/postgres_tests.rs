@@ -1281,6 +1281,54 @@ mod postgres_integration {
         assert_eq!(today_row.count, 2);
     }
 
+    /// The history-backed delta rule on real Postgres: create `+1`, update `0`,
+    /// delete `-1`, on epoch-aligned buckets. Mirrors the SQLite unit test, so the
+    /// two backends are held to the same bucketing contract.
+    #[tokio::test]
+    async fn postgres_integration_count_deltas_by_bucket() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-count-deltas");
+
+        let first = backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .update(&tenant, &first, json!({"active": true}))
+            .await
+            .unwrap();
+
+        let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|r| r.delta).sum::<i64>(),
+            2,
+            "two creates and one update net to +2"
+        );
+        assert!(
+            rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+            "buckets are epoch-aligned to their width"
+        );
+
+        backend
+            .delete(&tenant, "Patient", first.id())
+            .await
+            .unwrap();
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
+    }
+
     #[tokio::test]
     async fn postgres_integration_activity_histogram() {
         let backend = create_backend().await;
@@ -3466,7 +3514,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_list_types() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
@@ -3509,7 +3557,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_count() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
@@ -3541,7 +3589,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_fetch_page() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
