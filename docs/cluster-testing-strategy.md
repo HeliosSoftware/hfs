@@ -3,7 +3,8 @@
 **Status:** Testing plan (draft) for [discussion #223](https://github.com/HeliosSoftware/hfs/discussions/223)
 **Branch:** `feat/cluster-capable-state` (off `main`)
 **Companions:** [`docs/cluster-testing-methodology.md`](./cluster-testing-methodology.md) — *how to use* this strategy and the reasoning behind it;
-[`docs/cluster-capable-state-design.md`](./cluster-capable-state-design.md) — the in-repo copy of the #223 design.
+[`docs/cluster-capable-state-design.md`](./cluster-capable-state-design.md) — the in-repo copy of the #223 design;
+[`docs/cluster-capable-state-roadmap.md`](./cluster-capable-state-roadmap.md) — implementation status & what's next.
 **Scope:** how we test every phase of the "Cluster-capable state" work — the
 tiers of test, the harness contract, the per-subsystem definition-of-done, CI
 integration, and the phase-by-phase test plan (Phases 0–4).

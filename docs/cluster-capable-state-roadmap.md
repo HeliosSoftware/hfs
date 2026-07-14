@@ -1,0 +1,118 @@
+# Cluster-capable state — implementation roadmap & status
+
+**Status:** living tracker — update as each phase/PR lands
+**Branch:** `feat/cluster-capable-state` (off `main`)
+**Last updated:** 2026-07-14 (Phase 0 complete)
+**Companions:**
+[`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
+[`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
+[`cluster-testing-methodology.md`](./cluster-testing-methodology.md) (how to apply the strategy per PR)
+
+**Detailed execution plan:** the approved implementation plan (full per-phase
+design decisions, PR breakdown, file-level detail) lives at
+`~/.claude/plans/read-docs-cluster-testing-strategy-md-do-smooth-hamster.md`
+on the development machine (Claude Code plan file; also summarized in the
+project memory under `cluster-testing-strategy`). This roadmap carries enough
+context to resume without it; the plan file adds file:line-level detail.
+
+---
+
+## Where things stand
+
+### ✅ Done — pre-Phase 0 (T3 calibration, 2026-07-14)
+
+| What | Where | Commit |
+|------|-------|--------|
+| T3 two-instance smoke harness (two `hfs` + shared Postgres + nginx round-robin front, `X-Hfs-Upstream` proves distribution) | `.github/workflows/cluster-smoke.yml` + `crates/hfs/tests/cluster/run_external_cluster_smoke.sh` | PR #256 (merged to `main`; dispatch with `ref=feat/cluster-capable-state`) |
+| **D3** Postgres schema-init race fix (`pg_advisory_lock`, key `0x4846_5353_4348_454D` "HFSSCHEM") — found by the harness's first dispatch | `crates/persistence/src/backends/postgres/schema.rs` | `2bb443d6` |
+| D3 T2 regression suite (4 fresh handles, barrier-raced cold start) | `postgres_integration_cluster_concurrent_cold_start_schema_init` in `crates/persistence/tests/postgres_tests.rs` | `b89c6fe9` |
+| Harness fix: nginx readiness probe must not proxy through not-yet-started upstreams (`/nginx-health` + `max_fails=0`) | workflow nginx config | `608842c6` |
+
+### ✅ Done — Phase 0: framing & guardrails (2026-07-14)
+
+| What | Where | Commit |
+|------|-------|--------|
+| The three governing docs committed; design §6 amended (`HFS_AUDIT_BACKEND`, not `HFS_AUDIT_SINK`) | `docs/cluster-*.md` | `d0b5eecc` |
+| **T2 `cluster_harness` scaffold** — `two_handles` (fresh constructions, never a cloned `Arc`), `race2` (barrier-synchronized), DoD assertions (`assert_exactly_one` / `assert_visible` / `assert_wrong_tenant_hidden`) | `crates/persistence/tests/common/cluster_harness.rs`, included from `postgres_tests.rs` via `#[path]` (nothing else includes `tests/common/`; a wholesale `mod common;` trips dead-code under `-D warnings`) | `1a876e3f` |
+| **Calibration suite** against the already-cluster-safe bulk-export job store — green on first run: visibility, wrong-tenant isolation, claim exclusivity (drain queue first!), fencing (deterministic release→reclaim→stale-token `LeaseLost`, no sleeps), durability (handle drop) | `postgres_integration_cluster_bulk_export_*` in `postgres_tests.rs` | `1a876e3f` |
+| **`HFS_CLUSTER`** master switch + **`HFS_JOB_STORE_BACKEND`** selector (`JobStoreBackend { Memory, Database }`; unset → `Database` under cluster; parsed + validated, **not consumed yet**) | `crates/rest/src/config.rs` (+ re-export in `lib.rs`) | `8932b9b5` |
+| **Fail-fast validator** — refuses under `HFS_CLUSTER=true`: SQLite primary (F1), `HFS_AUTH_JTI_BACKEND=memory` with auth on (C1), `local-fs` bulk export/submit output with the subsystem on (F2), `HFS_AUDIT_BACKEND=file` (F4), explicit `memory` job store. Pure fn over `ClusterConfigView` (T1 table needs no env mutation); lives in `hfs` because rest+auth+audit config only meet in the binary. Verified end-to-end (boot refusal with named env vars). | `crates/hfs/src/cluster.rs`, wired in `main()` after `storage_backend_mode()` | `8932b9b5` |
+| Operator doc: book chapter *Running HFS in a Cluster* + `run-hfs-server` skill Clustering section | `book/src/ch15-cluster-deployment.md`, `book/src/SUMMARY.md`, `.claude/skills/run-hfs-server/SKILL.md` | `08fe9c08` |
+
+**Phase 0 gate (strategy §8): met.** Validation table green (6 T1 tests),
+calibration suite green on first run (4 T2 tests), full CI-style clippy and
+`cargo fmt` clean.
+
+---
+
+## What's next
+
+Confirmed design decisions (do not re-litigate): **(1)** `ExportJobController`
+converts to `#[async_trait]`; **(2)** DB-backed jti + JWKS coordination
+variants are built (a DB-only cluster needs no Redis); **(3)** C3 uses a
+shared **epoch** table, not LISTEN/NOTIFY (amend design §6 when it lands).
+
+### ▶ Phase 1 — unified job store + SoF export (#169) + reindex (A2) + F5
+
+PR-by-PR (each independently shippable, feature + DoD tests together):
+
+1. **PR 1.1 — F5 version-id race fix** *(start here; first product-code use of the harness)*
+   - `crates/persistence/src/backends/postgres/storage.rs` `update` (~:251) and `delete` (~:363): replace the non-transactional SELECT→parse+1→UPDATE→history-INSERT with **one transaction** using `UPDATE … SET version_id = (version_id::bigint + 1)::text … RETURNING version_id`, history insert with the returned version.
+   - Mongo is already a version-guarded CAS (`mongodb/storage.rs` ~:842) — add the T2 test only.
+   - T2: `race2` two unconditional updates from two fresh backends → distinct version_ids, both history rows.
+2. **PR 1.2 — `ClusterJobStore`** — new trait in `crates/persistence/src/core/cluster_job_store.rs` (`enqueue`/`claim_next`/`heartbeat`/`get_status`/`cancel`/`cancel_requested`/`update_progress`/`complete`/`fail`/`delete_terminal_before`; `JobKind { SofExport, Reindex }`; payloads as JSON; reuse `WorkerId`). New `cluster_jobs` table, migration v13→v14 in `postgres/schema.rs`; Postgres impl clones the claim shape from `bulk_export.rs:533-602` (`FOR UPDATE SKIP LOCKED` + fencing token). Do **not** generalize the bulk-export traits — bulk stays as-is (F3 decision). T1 in-memory fake + full T2 DoD suite via the harness.
+3. **PR 1.3 — SoF export on it** — `ExportJobController` → `#[async_trait]`; new `DatabaseExportJobController` (`crates/rest/src/export/database.rs`); per-instance worker loop modeled on `spawn_export_workers` (`hfs/main.rs` ~:1048); wire in the `sof_enabled` block (`rest/src/lib.rs` ~:543-648) selected by `job_store_backend_mode()`, finally reading `HFS_EXPORT_CONTROLLER`; extend the cluster validation table (cluster + SoF needs `database` controller + non-fs `HFS_EXPORT_SINK`). T2 two-controller suite + **T3 smoke check 4** (`$export` on A → poll via front → download via B).
+4. **PR 1.4 — reindex (A2)** onto the same table (store-backed mode for `ReindexOperation`, `persistence/src/search/reindex.rs` ~:357). T2 DoD suite for `JobKind::Reindex`.
+5. **PR 1.5 — nightly kill-9 (A1)** — `on: schedule` for `cluster-smoke.yml` + `NIGHTLY`-gated check: kill -9 instance A mid-export, B claims the orphaned lease and completes.
+
+### Phase 2 — auth hardening (C1, C2)
+
+- `HFS_AUTH_JTI_BACKEND=database`: migration v15 `jti_replay` table, atomic `INSERT … ON CONFLICT … WHERE expires_at < now() RETURNING`; adapter `DatabaseJtiCache` in **hfs** (auth must not depend on persistence). Fix `InMemoryJtiCache` ignoring `expires_at` (flat 1h TTL, `memory.rs:26/:43`). Cluster default flips memory→database.
+- `JwksCoordination` trait in auth; impls: existing Redis `JwksCoordinator` (currently dead code, `jwks/coordinator.rs`) + Postgres advisory-lock impl; wire into `JwksCache`'s two refresh seams (`cache.rs` ~:55-73, ~:112).
+- T2 C1 on DB + the **memory unsafe contract** (two `InMemoryJtiCache`s do NOT see each other) + identical suite vs `RedisJtiCache` behind `RUN_REDIS_CLUSTER_TESTS=1` (first Redis testcontainer in the tree). T2 C2 via `wiremock` mock-IdP hit counter (already an auth dev-dep, but only used for outbound today).
+- CI: new `redis-cluster-tests.yml` (paths filter `crates/auth/**` + nightly + dispatch).
+
+### Phase 3 — subscriptions cluster delivery (#170)
+
+- `EventFanout` trait; `PgNotifyFanout` on a **dedicated non-pooled** `tokio_postgres` connection with reconnect/re-LISTEN loop; NOTIFY payload ≈8KB cap ⇒ envelopes `(tenant, subscription_id, event_id)`, receivers rehydrate from DB. `HFS_SUBSCRIPTIONS_FANOUT = memory | pg-notify`.
+- B3 startup hydration (there is **zero** startup load of Subscription/SubscriptionTopic today — engine built empty at `rest/src/lib.rs` ~:713); B4 shared counters (`subscription_state` table, `UPDATE … event_number = event_number + 1 RETURNING`); B2 DB redeem-once binding tokens (`DELETE … RETURNING`); B5 durable delivery outbox (jobs-shaped lease columns), replacing the on-stack retry in `dispatch_with_retry` (`engine/mod.rs` ~:722). All migration v16.
+- **T3 B1 is the one mandatory two-process test**: WS client on B, POST matching resource to A, socket receives; plus sticky-session negative. Reuse the FIFO WS client from `run_external_subscriptions_smoke.sh`.
+
+### Phase 4 — HTS coherency (C3) + bootstrap lock (D1) + composite outbox (E1)
+
+- C3: one-row `terminology_epoch` table; every terminology write bumps it; an `EpochGuard` (memoized ~1s, 0 in tests) checks before serving from cache and calls the two existing clear seams (`hts/src/state.rs:280`, `backends/postgres/mod.rs:172`, incl. the `OnceLock` closure statics). `HFS_TERMINOLOGY_CACHE_INVALIDATION = local | epoch`.
+- D1: `pg_advisory_lock` around `bootstrap_sync` (new key, e.g. "HFSBSTRP"), ledger re-check after acquisition, dedicated connection (HTS owns its own deadpool pool).
+- E1: `composite_sync_outbox` (migration v17); `sync_asynchronous` writes the row, mpsc becomes a wake-up hint, workers claim with SKIP LOCKED + fencing. T3 nightly kill-9 drain case.
+
+---
+
+## How to resume (checklist for a fresh session)
+
+1. Read the three companion docs, then this file; the approved plan file (path
+   above) has the full file:line detail if present.
+2. `git log origin/main..HEAD --oneline` — confirm where the branch is vs this
+   file's tables.
+3. The per-PR bar is methodology §6: DoD rows at T2 on the DB backend, two
+   independently constructed handles, wrong-tenant isolation row always,
+   deterministic (no sleeps) in `cargo test`, memory backend asserted as the
+   *unsafe* contract where relevant, Redis twin behind
+   `RUN_REDIS_CLUSTER_TESTS=1` where a Redis backend exists.
+4. Reuse the harness: `crates/persistence/tests/common/cluster_harness.rs`
+   (`#[path]`-included from `postgres_tests.rs`; do the same from other test
+   binaries). Fresh-handle factory for Postgres is `create_backend()` in
+   `postgres_tests.rs`.
+5. T3: dispatch `cluster-smoke.yml` with `ref=feat/cluster-capable-state`
+   (`gh workflow run cluster-smoke.yml --ref feat/cluster-capable-state`).
+6. Local-toolchain gotcha: run clippy with **CI's exact flag set** (see
+   `.github/workflows/ci.yml`, "Run clippy") — plain `-D warnings` reports
+   `collapsible_if`/doc lints that CI deliberately allows; do not "fix" those.
+7. Project hooks gate completion on `cargo fmt --all`, CI-style clippy, and an
+   affected `cargo test`.
+
+## Update discipline
+
+When a PR lands: move its row into the ✅ tables above with its commit hash,
+tick the phase gate when the strategy §8 gate criteria are met, and update the
+per-subsystem matrix in `book/src/ch15-cluster-deployment.md` (it promises to
+track phase progress). Keep design-doc changes as inline `[amended <date>]`
+markers.

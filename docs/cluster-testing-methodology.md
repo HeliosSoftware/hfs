@@ -3,7 +3,8 @@
 **Status:** Working methodology (draft) for [discussion #223](https://github.com/HeliosSoftware/hfs/discussions/223)
 **Branch:** `feat/cluster-capable-state` (off `main`)
 **Companion to:** [`docs/cluster-testing-strategy.md`](./cluster-testing-strategy.md);
-design mirror: [`docs/cluster-capable-state-design.md`](./cluster-capable-state-design.md)
+design mirror: [`docs/cluster-capable-state-design.md`](./cluster-capable-state-design.md);
+status tracker: [`docs/cluster-capable-state-roadmap.md`](./cluster-capable-state-roadmap.md)
 **Scope:** *how to use* the cluster testing strategy day to day, and the
 reasoning behind it — the decision procedure for picking a test tier, how to
 write the tests, how the work should be sequenced, and what a reviewer demands

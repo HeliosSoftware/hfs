@@ -4,7 +4,8 @@
 (authored by @smunini, 2026-07-08; mirrored 2026-07-14). Maintained here from
 now on — in-repo amendments are marked **[amended <date>]** inline.
 **Companions:** [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (how we prove it),
-[`cluster-testing-methodology.md`](./cluster-testing-methodology.md) (how to apply the strategy).
+[`cluster-testing-methodology.md`](./cluster-testing-methodology.md) (how to apply the strategy),
+[`cluster-capable-state-roadmap.md`](./cluster-capable-state-roadmap.md) (implementation status & what's next).
 **Source:** [PR #180 review comment](https://github.com/HeliosSoftware/hfs/pull/180#issuecomment-4849199024),
 which asks for a document describing the areas of `hfs` that must be modified —
 behind an environment-variable config switch — to use a **unified,
