@@ -172,23 +172,44 @@ impl ResourceStorage for PostgresBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        // Check if exists
-        let existing = self.read(tenant, resource_type, id).await?;
+        // Unconditional PUT is last-writer-wins: a concurrent writer can make
+        // the version-guarded `update` lose its CAS (or flip the row's
+        // existence under `create`), so those transient outcomes are retried
+        // with a fresh read instead of surfacing to the caller.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        loop {
+            // Check if exists
+            let existing = self.read(tenant, resource_type, id).await?;
 
-        if let Some(current) = existing {
-            // Update existing (preserves original FHIR version)
-            let updated = self.update(tenant, &current, resource).await?;
-            Ok((updated, false))
-        } else {
-            // Create new with specific ID
-            let mut resource = resource;
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert("id".to_string(), Value::String(id.to_string()));
+            let result = if let Some(current) = existing {
+                // Update existing (preserves original FHIR version)
+                self.update(tenant, &current, resource.clone())
+                    .await
+                    .map(|updated| (updated, false))
+            } else {
+                // Create new with specific ID
+                let mut resource = resource.clone();
+                if let Some(obj) = resource.as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.to_string()));
+                }
+                self.create(tenant, resource_type, resource, fhir_version)
+                    .await
+                    .map(|created| (created, true))
+            };
+
+            match result {
+                Err(
+                    StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+                    | StorageError::Resource(
+                        ResourceError::NotFound { .. } | ResourceError::AlreadyExists { .. },
+                    ),
+                ) if attempts < MAX_CAS_RETRIES => {
+                    attempts += 1;
+                    continue;
+                }
+                other => return other,
             }
-            let created = self
-                .create(tenant, resource_type, resource, fhir_version)
-                .await?;
-            Ok((created, true))
         }
     }
 
@@ -254,45 +275,16 @@ impl ResourceStorage for PostgresBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let client = self.get_client().await?;
+        let mut client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = current.resource_type();
         let id = current.id();
 
-        // Check that the resource still exists with the expected version
-        let row = client
-            .query_opt(
-                "SELECT version_id FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
-
-        let actual_version = match row {
-            Some(row) => row.get::<_, String>(0),
-            None => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-        };
-
-        // Check version match
-        if actual_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version,
-                },
-            ));
-        }
-
-        // Calculate new version
-        let new_version: u64 = actual_version.parse().unwrap_or(0) + 1;
+        // The new version is derived from the version the caller read; the
+        // version-guarded UPDATE below only succeeds if the row is still at
+        // that version, so two racing writers can never both write N+1.
+        let expected_version = current.version_id();
+        let new_version: u64 = expected_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
         // Ensure the resource has correct type and id
@@ -309,11 +301,19 @@ impl ResourceStorage for PostgresBackend {
         let fhir_version_str = current.fhir_version().as_mime_param();
         let is_deleted = false;
 
-        // Update the resource
-        client
+        // One transaction covers the version bump and its history row, so a
+        // crash between them cannot leave a version without history.
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin transaction: {}", e)))?;
+
+        // Version-guarded update (CAS)
+        let updated = txn
             .execute(
                 "UPDATE resources SET version_id = $1, data = $2, last_updated = $3
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
+                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                   AND is_deleted = FALSE AND version_id = $7",
                 &[
                     &new_version_str,
                     &resource,
@@ -321,13 +321,40 @@ impl ResourceStorage for PostgresBackend {
                     &tenant_id,
                     &resource_type,
                     &id,
+                    &expected_version,
                 ],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
 
+        if updated == 0 {
+            // Disambiguate: the row is gone (or deleted) vs. the version moved.
+            let row = txn
+                .query_opt(
+                    "SELECT version_id FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+            return match row {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: expected_version.to_string(),
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
+
         // Insert into history (preserve the original FHIR version)
-        client
+        txn
             .execute(
                 "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -335,6 +362,10 @@ impl ResourceStorage for PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+
+        txn.commit()
+            .await
+            .map_err(|e| internal_error(format!("Failed to commit update: {}", e)))?;
 
         // Re-index the resource (delete old entries, add new)
         self.delete_search_index(&client, tenant_id, resource_type, id)
@@ -366,60 +397,115 @@ impl ResourceStorage for PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        let client = self.get_client().await?;
+        let mut client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        // Check if resource exists and get its fhir_version
-        let row = client
-            .query_opt(
-                "SELECT version_id, data, fhir_version FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-                &[&tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to check resource: {}", e)))?;
+        // Unconditional delete: a concurrent version bump loses the CAS below
+        // and is retried from a fresh read; a concurrent delete winning
+        // surfaces as NotFound, matching the sequential double-delete outcome.
+        const MAX_CAS_RETRIES: usize = 3;
+        let mut attempts = 0;
+        let data = loop {
+            // Check if resource exists and get its fhir_version
+            let row = client
+                .query_opt(
+                    "SELECT version_id, data, fhir_version FROM resources
+                     WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                    &[&tenant_id, &resource_type, &id],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to check resource: {}", e)))?;
 
-        let (current_version, data, fhir_version_str) = match row {
-            Some(row) => {
-                let v: String = row.get(0);
-                let d: Value = row.get(1);
-                let f: String = row.get(2);
-                (v, d, f)
+            let (current_version, data, fhir_version_str) = match row {
+                Some(row) => {
+                    let v: String = row.get(0);
+                    let d: Value = row.get(1);
+                    let f: String = row.get(2);
+                    (v, d, f)
+                }
+                None => {
+                    return Err(StorageError::Resource(ResourceError::NotFound {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                    }));
+                }
+            };
+
+            let now = Utc::now();
+
+            // Calculate new version for the deletion record
+            let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
+            let new_version_str = new_version.to_string();
+            let is_deleted = true;
+
+            // One transaction covers the version bump and its history row.
+            let txn = client
+                .transaction()
+                .await
+                .map_err(|e| internal_error(format!("Failed to begin transaction: {}", e)))?;
+
+            // Soft delete the resource, guarded by the version we just read
+            // (CAS) so racing writers cannot both assign the same version.
+            let updated = txn
+                .execute(
+                    "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
+                     WHERE tenant_id = $3 AND resource_type = $4 AND id = $5
+                       AND is_deleted = FALSE AND version_id = $6",
+                    &[&now, &new_version_str, &tenant_id, &resource_type, &id, &current_version],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+
+            if updated == 0 {
+                let row = txn
+                    .query_opt(
+                        "SELECT version_id FROM resources
+                         WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                        &[&tenant_id, &resource_type, &id],
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+                match row {
+                    // A concurrent delete won.
+                    None => {
+                        return Err(StorageError::Resource(ResourceError::NotFound {
+                            resource_type: resource_type.to_string(),
+                            id: id.to_string(),
+                        }));
+                    }
+                    Some(row) => {
+                        if attempts < MAX_CAS_RETRIES {
+                            attempts += 1;
+                            continue;
+                        }
+                        return Err(StorageError::Concurrency(
+                            ConcurrencyError::VersionConflict {
+                                resource_type: resource_type.to_string(),
+                                id: id.to_string(),
+                                expected_version: current_version,
+                                actual_version: row.get::<_, String>(0),
+                            },
+                        ));
+                    }
+                }
             }
-            None => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
+
+            // Insert deletion record into history (preserve fhir_version)
+            txn
+                .execute(
+                    "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                    &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
+
+            txn.commit()
+                .await
+                .map_err(|e| internal_error(format!("Failed to commit delete: {}", e)))?;
+
+            break data;
         };
-
-        let now = Utc::now();
-
-        // Calculate new version for the deletion record
-        let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
-        let new_version_str = new_version.to_string();
-        let is_deleted = true;
-
-        // Soft delete the resource
-        client
-            .execute(
-                "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
-                 WHERE tenant_id = $3 AND resource_type = $4 AND id = $5",
-                &[&now, &new_version_str, &tenant_id, &resource_type, &id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
-
-        // Insert deletion record into history (preserve fhir_version)
-        client
-            .execute(
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
 
         // Delete search index entries (skip when search is offloaded)
         if !self.is_search_offloaded() {

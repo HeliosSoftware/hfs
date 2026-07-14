@@ -39,6 +39,12 @@ use mongodb::Client;
 use mongodb::bson::{Document, doc};
 use serde_json::json;
 
+// T2 cluster-harness helpers shared by the cluster suites
+// (docs/cluster-testing-methodology.md §4). Included by `#[path]` rather than
+// via `mod common;` so this test binary compiles only the harness it uses.
+#[path = "common/cluster_harness.rs"]
+mod cluster_harness;
+
 const MONGODB_MAX_DATABASE_NAME_LEN: usize = 63;
 const MONGODB_TEST_DB_PREFIX: &str = "hfs_phase2_mongo_";
 
@@ -382,6 +388,21 @@ async fn create_backend_with_search_offloaded(
         connection_string,
         database_name: build_test_database_name(test_name),
         search_offloaded,
+        ..Default::default()
+    };
+
+    build_backend(config).await
+}
+
+/// Builds a backend against a *fixed* database name. The cluster suites need
+/// two independently constructed handles over one shared database, whereas
+/// `create_backend` isolates each call in its own database.
+async fn create_backend_in_db(database_name: &str) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: database_name.to_string(),
         ..Default::default()
     };
 
@@ -3061,4 +3082,142 @@ async fn mongodb_integration_settings_get_surfaces_decode_error() {
 
     let err = backend.get_settings(&user).await.unwrap_err();
     assert!(matches!(err, StorageError::Backend(_)));
+}
+
+// ============================================================================
+// T2 cluster suite — F5 resource version-id race
+// (docs/cluster-testing-strategy.md §8 Phase 1).
+//
+// The Mongo backend was already a version-guarded CAS (`update_one` filters
+// on the version the caller read), so this suite asserts that existing
+// contract across two independently constructed handles — no product change
+// (the Postgres twin in `postgres_tests.rs` carries the F5 fix).
+// ============================================================================
+
+/// DoD rows (F5): exclusivity + isolation — two handles race unconditional
+/// `update`s from the same version-1 snapshot. The CAS lets exactly one
+/// through; the loser gets `VersionConflict` instead of silently losing an
+/// update, and a fresh read-then-retry converges with a complete history.
+#[tokio::test]
+async fn mongodb_integration_cluster_resource_update_race_no_lost_version() {
+    let db_name = build_test_database_name("cluster_f5_update_race");
+    let handles = cluster_harness::two_handles(|| create_backend_in_db(&db_name)).await;
+    let (Some(a), Some(b)) = (handles.a, handles.b) else {
+        eprintln!(
+            "Skipping mongodb_integration_cluster_resource_update_race_no_lost_version (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-cluster-f5");
+
+    let created = a
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-cluster-f5",
+                "name": [{"family": "V1"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let id = created.id().to_string();
+
+    let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+    let (snapshot_a, snapshot_b) = (created.clone(), created);
+    let (res_a, res_b) = cluster_harness::race2(
+        async move {
+            a.update(
+                &tenant_a,
+                &snapshot_a,
+                json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+            )
+            .await
+        },
+        async move {
+            b.update(
+                &tenant_b,
+                &snapshot_b,
+                json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+            )
+            .await
+        },
+    )
+    .await;
+
+    let (ok_a, err_a) = match res_a {
+        Ok(r) => (Some(r), None),
+        Err(e) => (None, Some(e)),
+    };
+    let (ok_b, err_b) = match res_b {
+        Ok(r) => (Some(r), None),
+        Err(e) => (None, Some(e)),
+    };
+    cluster_harness::assert_exactly_one(&ok_a, &ok_b, "the version-guarded update");
+    let winner = ok_a.or(ok_b).unwrap();
+    assert_eq!(winner.version_id(), "2");
+    let loser = err_a.or(err_b).unwrap();
+    assert!(
+        matches!(
+            loser,
+            StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+        ),
+        "loser must see VersionConflict, got {loser:?}"
+    );
+
+    // A fresh read-then-retry from a third handle converges.
+    let Some(verifier) = create_backend_in_db(&db_name).await else {
+        eprintln!(
+            "Skipping mongodb_integration_cluster_resource_update_race_no_lost_version verifier (mongo became unavailable)"
+        );
+        return;
+    };
+    let current = cluster_harness::assert_visible(
+        verifier.read(&tenant, "Patient", &id).await.unwrap(),
+        "patient updated via the racing handles",
+    );
+    assert_eq!(current.version_id(), "2");
+    let retried = verifier
+        .update(
+            &tenant,
+            &current,
+            json!({"resourceType": "Patient", "name": [{"family": "Retry"}]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.version_id(), "3");
+
+    // History holds every version exactly once — no duplicates, none lost.
+    let history = verifier
+        .history_instance(
+            &tenant,
+            "Patient",
+            &id,
+            &HistoryParams::new().include_deleted(true),
+        )
+        .await
+        .unwrap();
+    let mut versions: Vec<u64> = history
+        .items
+        .iter()
+        .map(|e| e.resource.version_id().parse().unwrap())
+        .collect();
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        vec![1, 2, 3],
+        "history must hold every version exactly once"
+    );
+
+    // Isolation: the resource does not exist for another tenant.
+    cluster_harness::assert_wrong_tenant_hidden(
+        verifier
+            .read(&create_tenant("tenant-cluster-f5-other"), "Patient", &id)
+            .await
+            .unwrap(),
+        "patient",
+    );
 }

@@ -4414,4 +4414,275 @@ mod postgres_integration {
         );
         assert_eq!(progress.status, ExportStatus::Accepted);
     }
+
+    // ========================================================================
+    // T2 cluster suite — F5 resource version-id race
+    // (docs/cluster-testing-strategy.md §8 Phase 1).
+    //
+    // `update`/`delete` are version-guarded (CAS) and bump the version inside
+    // one transaction with the history insert, so two instances racing
+    // unconditional writes can never both assign the same version_id or lose
+    // a history row. `create_or_update` retries transient CAS losses, keeping
+    // unconditional PUT last-writer-wins at the API surface.
+    // ========================================================================
+
+    /// Asserts a resource's history holds every version exactly once,
+    /// contiguous from 1 — no duplicate version_ids, no lost history rows.
+    async fn assert_history_versions(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_len: u64,
+    ) {
+        let history = backend
+            .history_instance(
+                tenant,
+                resource_type,
+                id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        let mut versions: Vec<u64> = history
+            .items
+            .iter()
+            .map(|e| e.resource.version_id().parse().unwrap())
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            (1..=expected_len).collect::<Vec<_>>(),
+            "history must hold every version exactly once"
+        );
+    }
+
+    /// DoD rows (F5): exclusivity + isolation — two instances race
+    /// unconditional `update`s from the same version-1 snapshot. The CAS lets
+    /// exactly one through; the loser gets `VersionConflict` instead of
+    /// silently losing an update or 500ing on a duplicate history row, and a
+    /// fresh read-then-retry converges on version 3.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_update_race_no_lost_version() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-upd");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (snapshot_a, snapshot_b) = (created.clone(), created);
+        let (res_a, res_b) = harness::race2(
+            async move {
+                a.update(
+                    &tenant_a,
+                    &snapshot_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                )
+                .await
+            },
+            async move {
+                b.update(
+                    &tenant_b,
+                    &snapshot_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (ok_a, err_a) = match res_a {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        let (ok_b, err_b) = match res_b {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        harness::assert_exactly_one(&ok_a, &ok_b, "the version-guarded update");
+        let winner = ok_a.or(ok_b).unwrap();
+        assert_eq!(winner.version_id(), "2");
+        let loser = err_a.or(err_b).unwrap();
+        assert!(
+            matches!(
+                loser,
+                StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+            ),
+            "loser must see VersionConflict, got {loser:?}"
+        );
+
+        // A fresh read-then-retry from a third instance converges.
+        let verifier = create_backend().await;
+        let current = verifier
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version_id(), "2");
+        let retried = verifier
+            .update(
+                &tenant,
+                &current,
+                json!({"resourceType": "Patient", "name": [{"family": "Retry"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.version_id(), "3");
+
+        assert_history_versions(&verifier, &tenant, "Patient", &id, 3).await;
+
+        // Isolation: the resource does not exist for another tenant.
+        harness::assert_wrong_tenant_hidden(
+            verifier
+                .read(&create_tenant("cluster-f5-other"), "Patient", &id)
+                .await
+                .unwrap(),
+            "patient",
+        );
+    }
+
+    /// DoD row (F5): unconditional PUT stays last-writer-wins — two instances
+    /// race `create_or_update` on one existing resource; the bounded CAS
+    /// retry absorbs the losing race so both callers succeed, with distinct
+    /// version_ids and a complete history.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_create_or_update_race_both_succeed() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-put");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let (id_a, id_b) = (id.clone(), id.clone());
+        let (res_a, res_b) = harness::race2(
+            async move {
+                a.create_or_update(
+                    &tenant_a,
+                    "Patient",
+                    &id_a,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+            async move {
+                b.create_or_update(
+                    &tenant_b,
+                    "Patient",
+                    &id_b,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromB"}]}),
+                    FhirVersion::default(),
+                )
+                .await
+            },
+        )
+        .await;
+
+        let (stored_a, created_a) = res_a.expect("create_or_update must absorb CAS races");
+        let (stored_b, created_b) = res_b.expect("create_or_update must absorb CAS races");
+        assert!(
+            !created_a && !created_b,
+            "both racers must take the update arm"
+        );
+        assert_ne!(
+            stored_a.version_id(),
+            stored_b.version_id(),
+            "racing writers must never assign the same version"
+        );
+
+        let verifier = create_backend().await;
+        let current = verifier
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version_id(), "3");
+        assert_history_versions(&verifier, &tenant, "Patient", &id, 3).await;
+    }
+
+    /// DoD row (F5): an unconditional `update` racing an unconditional
+    /// `delete` can interleave either way, but the CAS keeps the invariants:
+    /// the delete always lands, no duplicate version_id, no lost history row,
+    /// and the resource ends deleted.
+    #[tokio::test]
+    async fn postgres_integration_cluster_resource_update_delete_race_keeps_history_coherent() {
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-f5-del");
+
+        let created = handles
+            .a
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "V1"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+
+        let (a, b) = (handles.a, handles.b);
+        let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+        let id_b = id.clone();
+        let (res_update, res_delete) = harness::race2(
+            async move {
+                a.update(
+                    &tenant_a,
+                    &created,
+                    json!({"resourceType": "Patient", "name": [{"family": "FromA"}]}),
+                )
+                .await
+            },
+            async move { b.delete(&tenant_b, "Patient", &id_b).await },
+        )
+        .await;
+
+        // The delete retries CAS losses internally, so it always lands.
+        res_delete.expect("racing delete must succeed");
+
+        // The update either beat the delete (then the delete re-read and
+        // bumped again) or found the row gone.
+        let expected_versions = match res_update {
+            Ok(stored) => {
+                assert_eq!(stored.version_id(), "2");
+                3
+            }
+            Err(err) => {
+                assert!(
+                    matches!(err, StorageError::Resource(ResourceError::NotFound { .. })),
+                    "update racing a delete must see NotFound, got {err:?}"
+                );
+                2
+            }
+        };
+
+        let verifier = create_backend().await;
+        match verifier.read(&tenant, "Patient", &id).await {
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+            other => panic!("resource must end deleted, got {other:?}"),
+        }
+        assert_history_versions(&verifier, &tenant, "Patient", &id, expected_versions).await;
+    }
 }
