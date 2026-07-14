@@ -48,6 +48,35 @@ pub struct DailyResourceCount {
     pub count: u64,
 }
 
+/// One fixed-width time bucket of net stored-resource growth.
+///
+/// Returned by [`ResourceStorage::count_deltas_by_bucket`] to back
+/// creation-time-accurate "FHIR resources over time" charts. See that method for
+/// the precise counting semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceCountDelta {
+    /// Inclusive start of the bucket (UTC), aligned to the Unix epoch.
+    pub bucket_start: DateTime<Utc>,
+    /// Creations minus deletions recorded in this bucket. May be negative.
+    pub delta: i64,
+}
+
+/// Floors `ts` to the start of the epoch-aligned bucket of width
+/// `bucket_seconds` that contains it. Shared by the backends (to compute the
+/// query's lower bound) and by callers densifying a returned series, so both
+/// agree on where bucket boundaries fall. A non-positive `bucket_seconds`
+/// returns `ts` unchanged.
+pub fn bucket_floor(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
+    if bucket_seconds <= 0 {
+        return ts;
+    }
+    let secs = ts.timestamp();
+    // `div_euclid` floors toward negative infinity, so pre-1970 instants (which
+    // have negative epoch seconds) still land on the bucket that contains them.
+    let floored = secs.div_euclid(bucket_seconds) * bucket_seconds;
+    DateTime::from_timestamp(floored, 0).unwrap_or(ts)
+}
+
 /// One `(weekday, hour)` cell of write-activity, used by
 /// [`ResourceStorage::activity_histogram`] to back the dashboard's "Activity"
 /// heatmap.
@@ -491,6 +520,53 @@ pub trait ResourceStorage: Send + Sync {
         _resource_type: &str,
         _since: DateTime<Utc>,
     ) -> StorageResult<Vec<DailyResourceCount>> {
+        Ok(Vec::new())
+    }
+
+    /// Buckets net stored-resource growth of `resource_type` into fixed-width
+    /// time buckets, from the immutable `resource_history` log.
+    ///
+    /// This is the creation-time-accurate counterpart to
+    /// [`count_by_day`](Self::count_by_day). Where that method buckets the
+    /// *current* row by its `last_updated` — so a resource silently moves to a
+    /// newer bucket every time it is edited — this one buckets the write events
+    /// themselves, which never change once written. That makes the resulting
+    /// curve stable under later edits and therefore meaningful at sub-day
+    /// resolution, where the retroactive drift of `count_by_day` would dominate.
+    ///
+    /// # Semantics
+    ///
+    /// Each history version contributes a delta to the bucket its `last_updated`
+    /// falls in: a creation (`version_id = "1"`, not deleted) is `+1`, a delete
+    /// is `-1`, and a plain update is `0`. A bucket's `delta` is the sum, so it
+    /// may be negative. Only non-empty buckets are returned, in ascending order.
+    ///
+    /// Callers reconstruct the curve by summing deltas forward from a baseline of
+    /// `count() - sum(deltas in window)`, which pins the final point to the live
+    /// total from [`count`](Self::count). Any drift — a resurrecting `PUT` after
+    /// a delete, which re-adds a resource under a non-`1` version and so is not
+    /// counted as `+1`, or history predating this table — is absorbed into that
+    /// baseline rather than showing up as a wrong endpoint.
+    ///
+    /// The default implementation returns an empty series for backends with no
+    /// history log; callers should treat that as "no time resolution available"
+    /// and fall back to the current total.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_type` - The FHIR resource type to bucket
+    /// * `since` - Inclusive lower bound on version `last_updated`
+    /// * `bucket_seconds` - Bucket width in seconds (e.g. `60` for one-minute
+    ///   buckets, `86_400` for daily). Buckets are aligned to the Unix epoch, so
+    ///   day-width buckets line up with UTC calendar days. Must be positive.
+    async fn count_deltas_by_bucket(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _since: DateTime<Utc>,
+        _bucket_seconds: i64,
+    ) -> StorageResult<Vec<ResourceCountDelta>> {
         Ok(Vec::new())
     }
 

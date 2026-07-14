@@ -1229,6 +1229,86 @@ impl ResourceStorage for MongoBackend {
         Ok(out)
     }
 
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let bucket_ms = bucket_seconds * 1000;
+        let since_bson = BsonDateTime::from_millis(
+            crate::core::bucket_floor(since, bucket_seconds).timestamp_millis(),
+        );
+
+        // Bucket on the server: `$match` narrows to this tenant/type/window (covered
+        // by the `(tenant_id, last_updated)` history index), then `$group` floors each
+        // version to its epoch-aligned bucket by subtracting the remainder of its
+        // epoch-millis modulo the bucket width — the same arithmetic the SQL backends
+        // do, so bucket boundaries agree across backends. Delta rule per the trait
+        // doc: creation `+1`, delete `-1`, plain update `0`.
+        let epoch_ms = doc! { "$toLong": "$last_updated" };
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": { "$subtract": [
+                    epoch_ms.clone(),
+                    { "$mod": [epoch_ms, bucket_ms] },
+                ]},
+                "delta": { "$sum": { "$switch": {
+                    "branches": [
+                        { "case": { "$eq": ["$is_deleted", true] }, "then": -1 },
+                        { "case": { "$eq": ["$version_id", "1"] }, "then": 1 },
+                    ],
+                    "default": 0,
+                }}},
+            }},
+            doc! { "$match": { "delta": { "$ne": 0 } } },
+            doc! { "$sort": { "_id": 1 } },
+        ];
+
+        let mut cursor = history.aggregate(pipeline).await.map_err(|e| {
+            internal_error(format!("Failed to aggregate count_deltas_by_bucket: {}", e))
+        })?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("count_deltas cursor advance: {}", e)))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("count_deltas cursor deserialize: {}", e)))?;
+            let bucket_ms_start = doc.get_i64("_id").unwrap_or_default();
+            // `$sum` yields an int32 for small totals and an int64 once it overflows,
+            // so accept either width rather than assuming one.
+            let delta = doc
+                .get_i64("delta")
+                .or_else(|_| doc.get_i32("delta").map(i64::from))
+                .unwrap_or_default();
+            if let Some(bucket_start) = DateTime::from_timestamp_millis(bucket_ms_start) {
+                out.push(crate::core::ResourceCountDelta {
+                    bucket_start,
+                    delta,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,

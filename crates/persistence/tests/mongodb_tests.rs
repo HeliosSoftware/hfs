@@ -1203,6 +1203,56 @@ async fn mongodb_integration_count_by_day() {
 }
 
 #[tokio::test]
+async fn mongodb_integration_count_deltas_by_bucket() {
+    let Some(backend) = create_backend("console_count_deltas").await else {
+        eprintln!("Skipping mongodb_integration_count_deltas_by_bucket (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-count-deltas");
+
+    let first = backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    // An update writes a v2 history row, which must contribute no delta — the
+    // aggregation pipeline's `$switch` has to agree with the SQL backends' CASE.
+    backend
+        .update(&tenant, &first, json!({"active": true}))
+        .await
+        .unwrap();
+
+    let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let rows = backend
+        .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.iter().map(|r| r.delta).sum::<i64>(),
+        2,
+        "two creates and one update net to +2"
+    );
+    assert!(
+        rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+        "buckets are epoch-aligned to their width"
+    );
+
+    backend
+        .delete(&tenant, "Patient", first.id())
+        .await
+        .unwrap();
+    let rows = backend
+        .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
+}
+
+#[tokio::test]
 async fn mongodb_integration_activity_histogram() {
     let Some(backend) = create_backend("console_activity_histogram").await else {
         eprintln!("Skipping mongodb_integration_activity_histogram (set HFS_TEST_MONGODB_URL)");

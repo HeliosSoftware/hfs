@@ -660,6 +660,85 @@ html[data-nav="collapsed"] .brand__version {
   fill: var(--muted);
 }
 
+/* ---------- Chart time-window selector ---------- */
+
+.window-picker {
+  display: inline-flex;
+  align-items: center;
+  height: 42px;
+  padding: 4px;
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+  box-shadow: var(--surface-shadow);
+}
+
+.window-picker__option {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  text-decoration: none;
+}
+
+.window-picker__option:hover {
+  color: var(--text);
+}
+
+.window-picker__option--active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* ---------- Chart legend / series selector ---------- */
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chart-legend__item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--surface-shadow);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.chart-legend__item:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.chart-legend__item--active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.chart-legend__total {
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------- Tenant maintenance (/ui/tenants) ---------- */
 
 .stat-grid--2 {

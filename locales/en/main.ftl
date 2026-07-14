@@ -141,8 +141,8 @@ card-uptime = Uptime
 card-uptime-sub = last 30 days
 
 chart-title = FHIR resources over time
-chart-unit-patients = patients
 chart-expand = Expand chart
+chart-window = Chart time window
 
 ## Footer
 

@@ -137,8 +137,8 @@ card-uptime = Verfügbarkeit
 card-uptime-sub = letzte 30 Tage
 
 chart-title = FHIR-Ressourcen im Zeitverlauf
-chart-unit-patients = Patienten
 chart-expand = Diagramm vergrößern
+chart-window = Zeitfenster des Diagramms
 
 ## Fußzeile
 
