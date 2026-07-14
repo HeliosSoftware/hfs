@@ -604,7 +604,10 @@ MongoDB runtime configuration also supports:
 - `HFS_MONGODB_URL` or `HFS_MONGODB_URI` as preferred connection-string inputs
 - `HFS_MONGODB_DATABASE` to select the database name (default: `helios`)
 - `HFS_MONGODB_MAX_CONNECTIONS` to control the driver pool size (default: `10`)
-- `HFS_MONGODB_CONNECT_TIMEOUT_MS` to control the connection timeout (default: `5000`)
+- `HFS_MONGODB_CONNECT_TIMEOUT_MS` to control the TCP handshake timeout (default: `5000`)
+- `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` to control how long an operation waits for a
+  usable server before failing (default: `15000`). This — not the connect timeout — is what
+  bounds how quickly an unreachable MongoDB surfaces an error.
 
 ### MongoDB + Elasticsearch
 

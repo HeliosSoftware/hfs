@@ -65,10 +65,14 @@ mod contract {
     /// test here is wrapped in this deadline so that "hangs forever" is reported
     /// as a loud, diagnosable test failure instead of a stalled job.
     ///
-    /// This is generous on purpose: each backend is *also* configured with its own
-    /// short internal timeout, so the deadline should never be the thing that
-    /// fires. If it does, that is itself the bug.
-    pub const DEADLINE: Duration = Duration::from_secs(15);
+    /// This is generous on purpose. Every backend here is *also* configured with
+    /// its own short internal timeout, so the deadline should never be the thing
+    /// that fires; if it does, that is itself the finding. It must stay well clear
+    /// of the backends' own timeouts, or it stops being a backstop and starts being
+    /// a race — an earlier revision set it to 15s, exactly MongoDB's default
+    /// server-selection timeout, and duly flagged the driver's normal (if slow)
+    /// failure as a hang.
+    pub const DEADLINE: Duration = Duration::from_secs(60);
 
     pub fn tenant(id: &str) -> TenantContext {
         TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
@@ -309,13 +313,21 @@ mod mongodb_backend {
 
     /// The driver's client is initialised lazily, so `new` succeeds without ever
     /// contacting a server; the error appears when an operation actually tries to
-    /// reach one. `connect_timeout_ms` keeps server selection short.
+    /// reach one.
+    ///
+    /// `server_selection_timeout_ms` — not `connect_timeout_ms` — is what bounds
+    /// this. The driver keeps re-attempting server selection while its monitor
+    /// reports no healthy server, so an operation against a dead address takes the
+    /// *server-selection* timeout to fail; the connect timeout only bounds an
+    /// individual TCP handshake. Left at its 15s default this test would sit for
+    /// 15 seconds.
     #[tokio::test]
     async fn unreachable_server_surfaces_backend_error() {
         let backend = MongoBackend::new(MongoBackendConfig {
             connection_string: "mongodb://127.0.0.1:1/".to_string(),
             database_name: "hfs_contract_unreachable".to_string(),
             connect_timeout_ms: 500,
+            server_selection_timeout_ms: 500,
             ..Default::default()
         })
         .expect("mongo client construction is lazy and must not connect");

@@ -307,7 +307,8 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_URL` / `HFS_MONGODB_URI` | *(none)* | MongoDB connection string |
 | `HFS_MONGODB_DATABASE` | `helios` | Database name |
 | `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
-| `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | Connection timeout (ms) |
+| `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | TCP handshake timeout (ms) |
+| `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | `15000` | How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
 
 **S3**
 
