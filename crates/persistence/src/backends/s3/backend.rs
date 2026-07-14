@@ -212,6 +212,15 @@ impl S3Backend {
                 backend_name: "s3".to_string(),
                 message: "resource not found in S3".to_string(),
             }),
+            // The bucket is missing or invisible: the store is misconfigured. This
+            // must always be an error — never an empty read — so a typo'd or
+            // deleted bucket can't masquerade as a store with no data in it.
+            S3ClientError::BucketNotFound(message) => {
+                StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "s3".to_string(),
+                    message: format!("S3 bucket not found or not accessible: {message}"),
+                })
+            }
             S3ClientError::PreconditionFailed => StorageError::Backend(BackendError::QueryError {
                 message: "S3 precondition failed".to_string(),
             }),
