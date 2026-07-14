@@ -308,16 +308,13 @@ impl TerminologyMetadata for PostgresTerminologyBackend {
                                 return Some(row.get::<_, String>(0));
                             }
                         }
-                        let rows = client
-                            .query(
-                                "SELECT url FROM code_systems \
-                                 WHERE (resource_json->>'id') = $1 \
-                                 ORDER BY COALESCE(version, '') DESC \
-                                 LIMIT 1",
-                                &[&id],
-                            )
-                            .await
-                            .ok()?;
+                        let sql = format!(
+                            "SELECT url FROM code_systems \
+                             WHERE (resource_json->>'id') = $1 \
+                             ORDER BY {} LIMIT 1",
+                            crate::backends::cs_precedence_order_by("code_systems")
+                        );
+                        let rows = client.query(&sql, &[&id]).await.ok()?;
                         rows.into_iter().next().map(|r| r.get::<_, String>(0))
                     }
                     "ValueSet" => {
@@ -629,8 +626,9 @@ async fn write_code_system(
     client
         .execute(
             "INSERT INTO code_systems
-             (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+             (id, url, version, name, title, status, content, resource_json, created_at, updated_at,
+              authority_rank)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10)
              ON CONFLICT DO NOTHING",
             &[
                 &storage_id,
@@ -642,20 +640,26 @@ async fn write_code_system(
                 &cs.content,
                 &resource_json,
                 &now,
+                &cs.authority_rank,
             ],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    // authority_rank keeps the strongest claim ever asserted for this row; the
+    // COALESCE sentinel (9 — above any real rank) means a row that predates the
+    // column ("never claimed") is overwritten by the first source to claim it.
+    // See the SQLite twin in `import/fhir_bundle.rs::write_code_system`.
     let cs_rows = client
         .query(
             "UPDATE code_systems SET
-               name          = $1,
-               title         = $2,
-               status        = $3,
-               content       = $4,
-               resource_json = $5,
-               updated_at    = $6
+               name           = $1,
+               title          = $2,
+               status         = $3,
+               content        = $4,
+               resource_json  = $5,
+               updated_at     = $6,
+               authority_rank = LEAST(COALESCE(authority_rank, 9), $9)
              WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')
              RETURNING id",
             &[
@@ -667,6 +671,7 @@ async fn write_code_system(
                 &now,
                 &cs.url,
                 &cs.version,
+                &cs.authority_rank,
             ],
         )
         .await
@@ -880,8 +885,9 @@ async fn write_value_set(
     client
         .execute(
             "INSERT INTO value_sets
-             (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+             (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at,
+              authority_rank)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10)
              ON CONFLICT DO NOTHING",
             &[
                 &storage_id,
@@ -893,20 +899,23 @@ async fn write_value_set(
                 &vs.compose_json,
                 &resource_json,
                 &now,
+                &vs.authority_rank,
             ],
         )
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
+    // See `write_code_system` for the LEAST/COALESCE-sentinel rationale.
     client
         .execute(
             "UPDATE value_sets SET
-               name          = $1,
-               title         = $2,
-               status        = $3,
-               compose_json  = $4,
-               resource_json = $5,
-               updated_at    = $6
+               name           = $1,
+               title          = $2,
+               status         = $3,
+               compose_json   = $4,
+               resource_json  = $5,
+               updated_at     = $6,
+               authority_rank = LEAST(COALESCE(authority_rank, 9), $9)
              WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')",
             &[
                 &vs.name,
@@ -917,6 +926,7 @@ async fn write_value_set(
                 &now,
                 &vs.url,
                 &vs.version,
+                &vs.authority_rank,
             ],
         )
         .await

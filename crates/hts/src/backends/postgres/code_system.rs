@@ -349,14 +349,15 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                 // Echo the code's display from any stored version of the CS,
                 // so consumers can see the concept exists (only the version is
                 // wrong). Matches `postgres/value_set.rs:506-517`.
+                let sql = format!(
+                    "SELECT c.display FROM concepts c \
+                     JOIN code_systems s ON s.id = c.system_id \
+                     WHERE s.url = $1 AND c.code = $2 \
+                     ORDER BY {} LIMIT 1",
+                    crate::backends::cs_precedence_order_by("s")
+                );
                 let display = client
-                    .query_opt(
-                        "SELECT c.display FROM concepts c
-                         JOIN code_systems s ON s.id = c.system_id
-                         WHERE s.url = $1 AND c.code = $2
-                         ORDER BY COALESCE(s.version, '') DESC LIMIT 1",
-                        &[&system, &req.code],
-                    )
+                    .query_opt(&sql, &[&system, &req.code])
                     .await
                     .ok()
                     .flatten()
@@ -722,12 +723,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let sql = format!(
+            "SELECT version FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
         let row = client
             .query_opt(
-                "SELECT version FROM code_systems
-                  WHERE url = $1
-                  ORDER BY COALESCE(version, '') DESC
-                  LIMIT 1",
+                &sql,
                 &[&url],
             )
             .await
@@ -1067,13 +1069,14 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // Read the base CodeSystem's resource_json (highest version), then
         // walk concept[] picking entries whose code is in the requested set.
         // Mirrors sqlite/code_system.rs:1436-1475.
+        let sql = format!(
+            "SELECT resource_json FROM code_systems \
+             WHERE url = $1 AND content != 'supplement' \
+             ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
         let row = client
-            .query_opt(
-                "SELECT resource_json FROM code_systems
-                 WHERE url = $1 AND content != 'supplement'
-                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                &[&system_url],
-            )
+            .query_opt(&sql, &[&system_url])
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -1331,26 +1334,18 @@ async fn resolve_code_system(
     version: Option<&str>,
     date: Option<&str>,
 ) -> Result<(String, String, Option<String>), HtsError> {
+    // Ordering is the shared `cs_precedence_order_by` — identical text to the
+    // SQLite resolver, so the two backends cannot disagree about which row wins.
+    let sql = format!(
+        "SELECT id, COALESCE(name, url), version
+         FROM code_systems
+         WHERE url = $1
+           AND ($2::text IS NULL OR (resource_json->>'date') <= $2)
+         ORDER BY {}",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let rows = client
-        .query(
-            "SELECT id, COALESCE(name, url), version
-             FROM code_systems
-             WHERE url = $1
-               AND ($2::text IS NULL OR (resource_json->>'date') <= $2)
-             ORDER BY (CASE COALESCE(content, 'complete')
-                            WHEN 'complete'   THEN 0
-                            WHEN 'supplement' THEN 0
-                            WHEN 'fragment'   THEN 1
-                            WHEN 'example'    THEN 1
-                            WHEN 'not-present' THEN 2
-                            ELSE 1 END),
-                      (CASE WHEN EXISTS (
-                          SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id
-                      ) THEN 0 ELSE 1 END),
-                      COALESCE(version, '') DESC,
-                      id",
-            &[&url, &date],
-        )
+        .query(&sql, &[&url, &date])
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -1472,14 +1467,15 @@ async fn find_concept_by_url(
     system_url: &str,
     code: &str,
 ) -> Option<ValidateConcept> {
+    let sql = format!(
+        "SELECT c.code, c.display FROM concepts c \
+         JOIN code_systems s ON s.id = c.system_id \
+         WHERE s.url = $1 AND c.code = $2 \
+         ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("s")
+    );
     let row = client
-        .query_opt(
-            "SELECT c.code, c.display FROM concepts c
-             JOIN code_systems s ON s.id = c.system_id
-             WHERE s.url = $1 AND c.code = $2
-             ORDER BY COALESCE(s.version, '') DESC LIMIT 1",
-            &[&system_url, &code],
-        )
+        .query_opt(&sql, &[&system_url, &code])
         .await
         .ok()
         .flatten()?;
@@ -1498,14 +1494,15 @@ async fn find_concept_by_url_ci(
     system_url: &str,
     code: &str,
 ) -> Option<ValidateConcept> {
+    let sql = format!(
+        "SELECT c.code, c.display FROM concepts c \
+         JOIN code_systems s ON s.id = c.system_id \
+         WHERE s.url = $1 AND LOWER(c.code) = LOWER($2) \
+         ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("s")
+    );
     let row = client
-        .query_opt(
-            "SELECT c.code, c.display FROM concepts c
-             JOIN code_systems s ON s.id = c.system_id
-             WHERE s.url = $1 AND LOWER(c.code) = LOWER($2)
-             ORDER BY COALESCE(s.version, '') DESC LIMIT 1",
-            &[&system_url, &code],
-        )
+        .query_opt(&sql, &[&system_url, &code])
         .await
         .ok()
         .flatten()?;
@@ -1700,16 +1697,17 @@ async fn fetch_designations_cross_version(
     exclude_system_id: &str,
     lang: &str,
 ) -> Result<Vec<DesignationValue>, HtsError> {
+    let sql = format!(
+        "SELECT cd.language, cd.use_system, cd.use_code, cd.value, COALESCE(s.version, '') \
+         FROM concept_designations cd \
+         JOIN concepts c ON c.id = cd.concept_id \
+         JOIN code_systems s ON s.id = c.system_id \
+         WHERE s.url = $1 AND c.code = $2 AND s.id <> $3 \
+         ORDER BY {}, cd.id",
+        crate::backends::cs_precedence_order_by("s")
+    );
     let rows = client
-        .query(
-            "SELECT cd.language, cd.use_system, cd.use_code, cd.value, COALESCE(s.version, '')
-             FROM concept_designations cd
-             JOIN concepts c ON c.id = cd.concept_id
-             JOIN code_systems s ON s.id = c.system_id
-             WHERE s.url = $1 AND c.code = $2 AND s.id <> $3
-             ORDER BY COALESCE(s.version, '') DESC, cd.id",
-            &[&url, &code, &exclude_system_id],
-        )
+        .query(&sql, &[&url, &code, &exclude_system_id])
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 

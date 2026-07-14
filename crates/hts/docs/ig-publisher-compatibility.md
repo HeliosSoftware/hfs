@@ -123,18 +123,76 @@ with `version: "current"` and `content: not-present` (no concepts).
 
 When `$validate-code` (or backend `validate_code`) receives `version=current`:
 
-1. **`fetch_versions` / Postgres resolve query** orders candidates so that:
+1. **`cs_precedence_order_by`** (`src/backends/mod.rs`) is the single definition of
+   same-URL precedence. Both backends embed its text verbatim, so they cannot drift.
+   It orders candidates so that:
    - `content = complete` or `supplement` ranks before `fragment`, `example`, `not-present`
    - rows **with concepts** rank before empty stubs
+   - rows from the package that **owns** the canonical URL rank before re-published
+     copies (`authority_rank` — see §2a)
    - then highest `version` string, then stable `id`
 2. **`resolve_code_system*`** treats `current` as “pick the first candidate after
    ordering” instead of literal string equality.
 
+The first two tiers are load-bearing for this behaviour and must stay ahead of the
+version tier: the stub's version string is literally `"current"`, and `'c' > '2'`,
+so `"current"` text-sorts **above** a real edition like `"20260501"`. Only the
+content and has-concepts tiers keep the real import winning.
+
 ### Code changes
 
-- `src/backends/mod.rs` — `code_system_version_is_current()`
+- `src/backends/mod.rs` — `code_system_version_is_current()`, `cs_precedence_order_by()`
 - `src/backends/sqlite/code_system.rs` — `fetch_versions`, `resolve_code_system_uncached`
 - `src/backends/postgres/code_system.rs` — `resolve_code_system` ORDER BY + `current` arm
+
+---
+
+## 2a. Provenance precedence: original vs re-published copy (issue #200)
+
+`hl7.fhir.r4.core` declares canonical `http://hl7.org/fhir` but re-ships **746
+CodeSystems and 603 ValueSets** owned by `http://terminology.hl7.org`. Those copies
+are stamped with the *FHIR release* version (`4.0.1`) rather than the code system's
+own version (`1.0.0`), and many are truncated — `audit-event-type` carries 1 of its
+5 concepts.
+
+Both rows are `content: complete` and both have concepts, so no tier above could
+separate them, and `4.0.1` outsorts `1.0.0` under **any** version ordering
+(lexicographic or semver). Before this fix, 208 CodeSystems resolved to the stale
+core copy and 1,297 concepts were unreachable via a bare `$validate-code`.
+
+### The rule
+
+Nothing intrinsic to the rows distinguishes them — only where they came from. Every
+FHIR NPM package declares a `canonical` base in its `package.json`; a package
+publishing a URL **outside** its own base is re-publishing someone else's resource.
+That is recorded at import time in `code_systems.authority_rank` /
+`value_sets.authority_rank` (`0` = owner or non-package source, `2` = foreign copy;
+see `import::bundle_parser::authority_rank_for`).
+
+This needs no hardcoded URL list and no hand-maintained package-priority table: it
+self-maintains as packages are added. Resources arriving outside any package (REST
+writes, `$import-bundle`, the native SNOMED/LOINC importers) are authoritative, so an
+operator-supplied resource outranks any vendored copy.
+
+The tier sits **below** content and has-concepts deliberately: a populated copy still
+beats an empty stub from the owning package — being authoritative is worthless if the
+row has no concepts to validate against.
+
+### Upgrading an existing database
+
+`authority_rank` cannot be backfilled — nothing already stored on a row says which
+package supplied it. The column is therefore **nullable**, `NULL` meaning "never
+claimed", and readers `COALESCE` it to `0`, so an un-re-imported database behaves
+exactly as it did before. Adding the column is the signal that the database predates
+provenance, and the migration clears the `.tgz` rows from the `bootstrap_imports`
+ledger so the next startup re-imports those packages and records the truth.
+Without that, the ledger (which skips files whose size and mtime are unchanged) would
+leave every row at its default and the fix would be a silent no-op in production.
+Only `.tgz` entries are cleared — the multi-GB SNOMED/LOINC/RxNorm archives are not
+re-imported.
+
+The copies are **ranked, not discarded**: an explicit `version=4.0.1` still resolves
+to the core row, and `resource_json` stays byte-faithful to what the package shipped.
 
 ### Tests
 

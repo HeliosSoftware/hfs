@@ -38,7 +38,19 @@ CREATE TABLE IF NOT EXISTS code_systems (
     content       TEXT NOT NULL DEFAULT 'complete',
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    resource_json TEXT
+    resource_json TEXT,
+    -- Provenance precedence among rows sharing `url`; lower wins. 0 = the
+    -- source owns this canonical URL (or came from outside any package);
+    -- 2 = a package re-published someone else's canonical (e.g. hl7.fhir.r4.core
+    -- shipping a truncated copy of a terminology.hl7.org CodeSystem).
+    --
+    -- Deliberately NULLABLE with no default: NULL means 'no source has claimed
+    -- this row yet', which is what every pre-existing row looks like immediately
+    -- after the column is added. Readers COALESCE it to 0, so an un-re-imported
+    -- database behaves exactly as it did before. Had this defaulted to 0 the
+    -- upsert below could not distinguish 'asserted authoritative' from 'never
+    -- asserted', and a re-imported copy could not demote itself.
+    authority_rank INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
     ON code_systems(url, COALESCE(version, ''));
@@ -120,7 +132,9 @@ CREATE TABLE IF NOT EXISTS value_sets (
     compose_json  TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    resource_json TEXT
+    resource_json TEXT,
+    -- See code_systems.authority_rank.
+    authority_rank INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
     ON value_sets(url, COALESCE(version, ''));
@@ -480,6 +494,56 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
          CREATE INDEX IF NOT EXISTS idx_value_sets_meta
              ON value_sets(created_at, id, url, version, name, title, status);",
     )?;
+
+    Ok(())
+}
+
+/// Add the `authority_rank` provenance column to `code_systems` / `value_sets`,
+/// and force a re-import of packaged terminology when the column is newly added.
+///
+/// `authority_rank` records whether the package that shipped a row actually owns
+/// the canonical URL it claims (see
+/// [`crate::import::bundle_parser::authority_rank_for`]). It cannot be derived
+/// after the fact — nothing already in the row says which package supplied it —
+/// so an existing database has to re-import its packages to learn the truth.
+///
+/// The `ALTER TABLE` returning `Ok` is precisely the signal that this database
+/// predates provenance. In that case we drop the `.tgz` entries from the
+/// `bootstrap_imports` ledger so the next startup re-imports those packages and
+/// stamps the ranks. Without this the column would sit at its `DEFAULT 0` on
+/// every existing row and the fix would be a silent no-op in production, since
+/// the ledger skips files whose size and mtime are unchanged.
+///
+/// Only `.tgz` rows are cleared. The multi-GB SNOMED/LOINC/RxNorm archives keep
+/// their ledger entries and are not re-imported — they arrive through native
+/// importers that are authoritative by construction, so they have nothing to
+/// learn from a re-import.
+pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut column_added = false;
+    for sql in &[
+        "ALTER TABLE code_systems ADD COLUMN authority_rank INTEGER",
+        "ALTER TABLE value_sets ADD COLUMN authority_rank INTEGER",
+    ] {
+        match conn.execute_batch(sql) {
+            Ok(_) => column_added = true,
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    if column_added {
+        let cleared = conn.execute(
+            "DELETE FROM bootstrap_imports WHERE path LIKE '%.tgz'",
+            [],
+        )?;
+        if cleared > 0 {
+            tracing::info!(
+                cleared_ledger_entries = cleared,
+                "Added authority_rank; cleared .tgz bootstrap ledger entries so packages \
+                 re-import and record which canonical URLs they own"
+            );
+        }
+    }
 
     Ok(())
 }

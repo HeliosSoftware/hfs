@@ -46,6 +46,45 @@ pub struct ParsedBundle {
     pub fresh_load: bool,
 }
 
+/// Bundle-wrapper key carrying the source package's declared canonical base.
+///
+/// Set by the `.tgz` importer on the transient Bundle it builds around each
+/// batch; read back here. It is deliberately *not* a FHIR element — the wrapper
+/// is never persisted, so nothing in it reaches `resource_json`, and stored
+/// resources stay byte-faithful to what the package shipped.
+pub const SOURCE_CANONICAL_KEY: &str = "_htsSourceCanonical";
+
+/// Authority rank for a resource whose canonical URL is owned by the package
+/// that shipped it — or that arrived outside any package (REST write, native
+/// SNOMED/LOINC importer, `$import-bundle`). Lower wins.
+pub const AUTHORITY_OWNER: i32 = 0;
+
+/// Authority rank for a resource shipped by a package that does **not** own its
+/// canonical URL — i.e. a re-published *copy* of someone else's definition.
+///
+/// The archetype is `hl7.fhir.r4.core`, which declares canonical
+/// `http://hl7.org/fhir` yet re-ships 798 `http://terminology.hl7.org/…`
+/// CodeSystems, each stamped with the *FHIR release* version (`4.0.1`) rather
+/// than the code system's own version. Those copies are frequently truncated
+/// (`audit-event-type` carries 1 of its 5 concepts), so when they collide with
+/// the owning package's row they must lose.
+pub const AUTHORITY_FOREIGN_COPY: i32 = 2;
+
+/// Classify a resource against the canonical base declared by the package that
+/// shipped it (`package.json` → `canonical`).
+///
+/// A package that publishes a URL outside its own canonical base is republishing
+/// someone else's resource, so the row is a copy rather than the original. When
+/// the source declares no canonical base (a bare `$import-bundle`, a REST write,
+/// or a native importer) the resource is treated as authoritative: an operator
+/// putting a resource here outranks any vendored package copy.
+pub fn authority_rank_for(url: &str, package_canonical: Option<&str>) -> i32 {
+    match package_canonical {
+        Some(base) if !base.is_empty() && !url.starts_with(base) => AUTHORITY_FOREIGN_COPY,
+        _ => AUTHORITY_OWNER,
+    }
+}
+
 /// A single FHIR CodeSystem resource extracted from a Bundle entry.
 #[derive(Debug)]
 pub struct ParsedCodeSystem {
@@ -61,6 +100,9 @@ pub struct ParsedCodeSystem {
     pub concepts: Vec<ParsedConcept>,
     /// The full original JSON resource (stored in `resource_json` column).
     pub resource_json: Value,
+    /// Provenance precedence among rows sharing this canonical URL.
+    /// See [`authority_rank_for`]. Defaults to [`AUTHORITY_OWNER`].
+    pub authority_rank: i32,
 }
 
 /// One concept row, already flattened from the potentially nested FHIR tree.
@@ -112,6 +154,9 @@ pub struct ParsedValueSet {
     /// lazy expansion.  `None` when the ValueSet has no `compose`.
     pub compose_json: Option<String>,
     pub resource_json: Value,
+    /// Provenance precedence among rows sharing this canonical URL.
+    /// See [`authority_rank_for`]. Defaults to [`AUTHORITY_OWNER`].
+    pub authority_rank: i32,
 }
 
 /// A single FHIR ConceptMap resource extracted from a Bundle entry.
@@ -166,6 +211,13 @@ pub fn parse_bundle(data: &[u8]) -> Result<ParsedBundle, HtsError> {
 
     let mut bundle = ParsedBundle::default();
 
+    // Provenance stamped by the package importer on the Bundle *wrapper* (see
+    // `import::tgz::make_bundle_bytes`). The wrapper is transient — only the
+    // entry resources are persisted — so this never leaks into `resource_json`.
+    // Absent for REST writes and bare `$import-bundle` payloads, which are then
+    // treated as authoritative.
+    let package_canonical = root[SOURCE_CANONICAL_KEY].as_str();
+
     let entries = root["entry"].as_array().cloned().unwrap_or_default();
     for entry in &entries {
         let resource = &entry["resource"];
@@ -175,13 +227,19 @@ pub fn parse_bundle(data: &[u8]) -> Result<ParsedBundle, HtsError> {
         let rid = resource["id"].as_str().unwrap_or("<no-id>");
         match resource["resourceType"].as_str() {
             Some("CodeSystem") => match parse_code_system(resource) {
-                Some(cs) => bundle.code_systems.push(cs),
+                Some(mut cs) => {
+                    cs.authority_rank = authority_rank_for(&cs.url, package_canonical);
+                    bundle.code_systems.push(cs);
+                }
                 None => bundle.parse_errors.push(format!(
                     "CodeSystem '{rid}' skipped: missing required field 'url'"
                 )),
             },
             Some("ValueSet") => match parse_value_set(resource) {
-                Some(vs) => bundle.value_sets.push(vs),
+                Some(mut vs) => {
+                    vs.authority_rank = authority_rank_for(&vs.url, package_canonical);
+                    bundle.value_sets.push(vs);
+                }
                 None => bundle.parse_errors.push(format!(
                     "ValueSet '{rid}' skipped: missing required field 'url'"
                 )),
@@ -248,6 +306,7 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
         content: cs["content"].as_str().unwrap_or("complete").to_owned(),
         concepts,
         resource_json: cs.clone(),
+        authority_rank: AUTHORITY_OWNER,
     })
 }
 
@@ -402,6 +461,7 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
         status: vs["status"].as_str().unwrap_or("active").to_owned(),
         compose_json,
         resource_json: vs.clone(),
+        authority_rank: AUTHORITY_OWNER,
     })
 }
 

@@ -25,6 +25,12 @@ pub(crate) struct CollectedResources {
     pub value_sets: Vec<Value>,
     pub concept_maps: Vec<Value>,
     pub parse_errors: Vec<String>,
+    /// The `canonical` base declared in the package's `package.json`, e.g.
+    /// `http://terminology.hl7.org` for `hl7.terminology`. Drives the
+    /// owner-vs-copy classification in [`crate::import::bundle_parser::authority_rank_for`].
+    /// `None` when the package omits it (then every resource is authoritative —
+    /// fail-open, never worse than today).
+    pub package_canonical: Option<String>,
 }
 
 /// Open a `.tgz` FHIR NPM package and collect all CodeSystem, ValueSet, and
@@ -40,6 +46,7 @@ pub(crate) fn collect_tgz_resources(path: &Path) -> Result<CollectedResources, H
     let mut value_sets: Vec<Value> = Vec::new();
     let mut concept_maps: Vec<Value> = Vec::new();
     let mut parse_errors: Vec<String> = Vec::new();
+    let mut package_canonical: Option<String> = None;
 
     let entries = archive
         .entries()
@@ -67,13 +74,33 @@ pub(crate) fn collect_tgz_resources(path: &Path) -> Result<CollectedResources, H
         if !name.ends_with(".json") {
             continue;
         }
-        if name == "package.json" || name == ".index.json" {
+        if name == ".index.json" {
             continue;
         }
 
         let mut buf = Vec::new();
         if let Err(e) = entry.read_to_end(&mut buf) {
             parse_errors.push(format!("Cannot read {}: {e}", entry_path.display()));
+            continue;
+        }
+
+        // `package/package.json` is the package manifest, not a FHIR resource.
+        // It carries the `canonical` base that tells us which URLs this package
+        // actually owns — the signal that separates an authoritative definition
+        // from a re-published copy. Read it, then move on without importing it.
+        if name == "package.json" {
+            if let Ok(manifest) = serde_json::from_slice::<Value>(&buf)
+                && let Some(canonical) = manifest["canonical"].as_str()
+                && !canonical.is_empty()
+            {
+                // Prefer the top-level `package/package.json`; an example or
+                // nested manifest must not override it.
+                let is_root = entry_path.parent().and_then(|p| p.file_name())
+                    == Some(std::ffi::OsStr::new("package"));
+                if is_root || package_canonical.is_none() {
+                    package_canonical = Some(canonical.trim_end_matches('/').to_owned());
+                }
+            }
             continue;
         }
 
@@ -105,6 +132,7 @@ pub(crate) fn collect_tgz_resources(path: &Path) -> Result<CollectedResources, H
         value_sets,
         concept_maps,
         parse_errors,
+        package_canonical,
     })
 }
 
@@ -131,8 +159,11 @@ pub async fn import_tgz(
         value_sets = collected.value_sets.len(),
         concept_maps = collected.concept_maps.len(),
         parse_errors = collected.parse_errors.len(),
+        package_canonical = collected.package_canonical.as_deref().unwrap_or("<none>"),
         "Extracted resources from package; starting import"
     );
+
+    let package_canonical = collected.package_canonical.clone();
 
     let mut total = ImportStats::default();
     total.errors = collected.parse_errors;
@@ -159,7 +190,7 @@ pub async fn import_tgz(
                 total.concept_maps += batch.concept_maps;
                 total.concepts += batch.concepts;
             } else {
-                let bundle_bytes = make_bundle_bytes(chunk);
+                let bundle_bytes = make_bundle_bytes(chunk, package_canonical.as_deref());
                 let stats = backend
                     .import_bundle(ctx, &bundle_bytes)
                     .await
@@ -205,13 +236,17 @@ fn count_batch(resources: &[Value]) -> ImportStats {
 }
 
 /// Wrap a slice of resource `Value`s in a synthetic FHIR Bundle and serialize to JSON bytes.
-fn make_bundle_bytes(resources: &[Value]) -> Vec<u8> {
+fn make_bundle_bytes(resources: &[Value], package_canonical: Option<&str>) -> Vec<u8> {
     let entries: Vec<Value> = resources.iter().map(|r| json!({ "resource": r })).collect();
-    let bundle = json!({
+    let mut bundle = json!({
         "resourceType": "Bundle",
         "type": "collection",
         "entry": entries
     });
+    // Transient provenance on the wrapper only — see `SOURCE_CANONICAL_KEY`.
+    if let Some(canonical) = package_canonical {
+        bundle[crate::import::bundle_parser::SOURCE_CANONICAL_KEY] = json!(canonical);
+    }
     serde_json::to_vec(&bundle).expect("in-memory bundle serialization cannot fail")
 }
 
@@ -398,6 +433,272 @@ mod tests {
             .unwrap();
         assert_eq!(stats.code_systems, 1);
         assert_eq!(stats.errors.len(), 0);
+    }
+
+    /// Build a `.tgz` carrying a `package/package.json` that declares `canonical`,
+    /// exactly as a real FHIR NPM package does.
+    fn make_test_tgz_with_canonical(
+        resources: &[Value],
+        name: &str,
+        canonical: &str,
+    ) -> NamedTempFile {
+        let tmp = NamedTempFile::with_suffix(".tgz").unwrap();
+        let enc = GzEncoder::new(tmp.reopen().unwrap(), Compression::fast());
+        let mut tar = Builder::new(enc);
+
+        let manifest =
+            serde_json::to_vec(&json!({"name": name, "version": "1.0.0", "canonical": canonical}))
+                .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/package.json", manifest.as_slice())
+            .unwrap();
+
+        for (i, resource) in resources.iter().enumerate() {
+            let rt = resource["resourceType"].as_str().unwrap_or("Unknown");
+            let bytes = serde_json::to_vec(resource).unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, &format!("package/{rt}-{i}.json"), bytes.as_slice())
+                .unwrap();
+        }
+        tar.finish().unwrap();
+        tmp
+    }
+
+    #[test]
+    fn authority_rank_marks_foreign_canonicals_as_copies() {
+        use crate::import::bundle_parser::{
+            AUTHORITY_FOREIGN_COPY, AUTHORITY_OWNER, authority_rank_for,
+        };
+
+        // The package owns the URL it publishes.
+        assert_eq!(
+            authority_rank_for(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                Some("http://terminology.hl7.org")
+            ),
+            AUTHORITY_OWNER
+        );
+        // hl7.fhir.r4.core re-publishing a THO canonical: a copy.
+        assert_eq!(
+            authority_rank_for(
+                "http://terminology.hl7.org/CodeSystem/audit-event-type",
+                Some("http://hl7.org/fhir")
+            ),
+            AUTHORITY_FOREIGN_COPY
+        );
+        // ...but it IS authoritative for its own canonical base.
+        assert_eq!(
+            authority_rank_for(
+                "http://hl7.org/fhir/CodeSystem/example",
+                Some("http://hl7.org/fhir")
+            ),
+            AUTHORITY_OWNER
+        );
+        // No package (REST write, $import-bundle, native importer): authoritative.
+        assert_eq!(
+            authority_rank_for("http://terminology.hl7.org/CodeSystem/x", None),
+            AUTHORITY_OWNER
+        );
+        // A package that declares no canonical fails open, never worse than before.
+        assert_eq!(
+            authority_rank_for("http://anything/at/all", Some("")),
+            AUTHORITY_OWNER
+        );
+    }
+
+    /// Regression test for issue #200.
+    ///
+    /// `hl7.fhir.r4.core` re-ships THO CodeSystems stamped with the *FHIR release*
+    /// version (`4.0.1`) and truncated to a single concept, while the THO package
+    /// publishes the complete definition as version `1.0.0`. Both rows are
+    /// `content: complete` and both carry concepts, so no intrinsic property of
+    /// the rows separates them — and `4.0.1` outsorts `1.0.0` under any version
+    /// ordering, lexicographic or semver. Only provenance can decide, and the
+    /// bare (no-version) call must land on the complete THO row.
+    ///
+    /// Imports the *core-like* package first, mirroring the real bootstrap order
+    /// (the directory is walked alphabetically, so `hl7.fhir.r4.core-*.tgz` lands
+    /// before `hl7.terminology-*.tgz`) — the outcome must not depend on it.
+    #[tokio::test]
+    async fn bare_validate_code_prefers_owning_package_over_republished_copy() {
+        use crate::traits::CodeSystemOperations;
+        use crate::types::ValidateCodeRequest;
+
+        const URL: &str = "http://terminology.hl7.org/CodeSystem/audit-event-type";
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+
+        let core_copy = json!({
+            "resourceType": "CodeSystem", "id": "audit-event-type", "url": URL,
+            "version": "4.0.1", "name": "AuditEventID", "status": "active",
+            "content": "complete",
+            "concept": [{"code": "rest", "display": "RESTful Operation"}]
+        });
+        let tho_original = json!({
+            "resourceType": "CodeSystem", "id": "audit-event-type", "url": URL,
+            "version": "1.0.0", "name": "AuditEventID", "status": "active",
+            "content": "complete",
+            "concept": [
+                {"code": "rest", "display": "RESTful Operation"},
+                {"code": "hl7-v2", "display": "HL7v2 Message"},
+                {"code": "hl7-v3", "display": "HL7v3 Message"},
+                {"code": "document", "display": "Document"},
+                {"code": "object", "display": "Object"}
+            ]
+        });
+
+        let core = make_test_tgz_with_canonical(
+            std::slice::from_ref(&core_copy),
+            "hl7.fhir.r4.core",
+            "http://hl7.org/fhir",
+        );
+        let tho = make_test_tgz_with_canonical(
+            std::slice::from_ref(&tho_original),
+            "hl7.terminology",
+            "http://terminology.hl7.org",
+        );
+
+        import_tgz(&backend, &ctx, core.path(), 500, false)
+            .await
+            .expect("core package import should succeed");
+        import_tgz(&backend, &ctx, tho.path(), 500, false)
+            .await
+            .expect("THO package import should succeed");
+
+        // Both versions coexist — the copy is ranked, not discarded, so an
+        // explicit `version=4.0.1` request can still reach it.
+        assert_eq!(count_rows(&backend, "code_systems"), 2);
+
+        // The bug: `object` exists only in the complete THO 1.0.0 definition.
+        let resp = CodeSystemOperations::validate_code(
+            &backend,
+            &ctx,
+            ValidateCodeRequest {
+                system: Some(URL.into()),
+                code: "object".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            resp.result,
+            "bare $validate-code must resolve to the complete THO definition, \
+             not the truncated hl7.fhir.r4.core copy; got: {:?}",
+            resp.message
+        );
+        assert_eq!(resp.cs_version.as_deref(), Some("1.0.0"));
+
+        // A genuine miss must name the version it ACTUALLY validated against.
+        // The diagnostic used to re-query by URL with its own ordering, so it
+        // reported whichever version string sorted highest ("4.0.1") even though
+        // validation had run against a different row.
+        let miss = CodeSystemOperations::validate_code(
+            &backend,
+            &ctx,
+            ValidateCodeRequest {
+                system: Some(URL.into()),
+                code: "no-such-code".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!miss.result);
+        let msg = miss.message.unwrap_or_default();
+        assert!(
+            msg.contains("1.0.0") && !msg.contains("4.0.1"),
+            "a miss must report the resolved version (1.0.0), not the highest \
+             version string on the URL (4.0.1); got: {msg}"
+        );
+
+        // An explicit pin to the copy still resolves to the copy, and correctly
+        // reports that `object` is not in it. The copy is ranked, not hidden.
+        let pinned = CodeSystemOperations::validate_code(
+            &backend,
+            &ctx,
+            ValidateCodeRequest {
+                system: Some(URL.into()),
+                code: "object".into(),
+                version: Some("4.0.1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!pinned.result, "version=4.0.1 pins the truncated copy");
+        assert!(
+            pinned.message.unwrap_or_default().contains("4.0.1"),
+            "a miss must report the version it actually validated against"
+        );
+    }
+
+    /// Import order must not decide the winner. The real bootstrap walks the
+    /// terminology directory alphabetically, which is what let the copy win in
+    /// the first place; reversing the order must change nothing.
+    #[tokio::test]
+    async fn owning_package_wins_regardless_of_import_order() {
+        use crate::traits::CodeSystemOperations;
+        use crate::types::ValidateCodeRequest;
+
+        const URL: &str = "http://terminology.hl7.org/CodeSystem/audit-event-type";
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+
+        let core_copy = json!({
+            "resourceType": "CodeSystem", "id": "audit-event-type", "url": URL,
+            "version": "4.0.1", "status": "active", "content": "complete",
+            "concept": [{"code": "rest"}]
+        });
+        let tho_original = json!({
+            "resourceType": "CodeSystem", "id": "audit-event-type", "url": URL,
+            "version": "1.0.0", "status": "active", "content": "complete",
+            "concept": [{"code": "rest"}, {"code": "object"}]
+        });
+
+        let core = make_test_tgz_with_canonical(
+            std::slice::from_ref(&core_copy),
+            "hl7.fhir.r4.core",
+            "http://hl7.org/fhir",
+        );
+        let tho = make_test_tgz_with_canonical(
+            std::slice::from_ref(&tho_original),
+            "hl7.terminology",
+            "http://terminology.hl7.org",
+        );
+
+        // THO first, core second — the reverse of the alphabetical bootstrap order.
+        import_tgz(&backend, &ctx, tho.path(), 500, false)
+            .await
+            .unwrap();
+        import_tgz(&backend, &ctx, core.path(), 500, false)
+            .await
+            .unwrap();
+
+        let resp = CodeSystemOperations::validate_code(
+            &backend,
+            &ctx,
+            ValidateCodeRequest {
+                system: Some(URL.into()),
+                code: "object".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp.result,
+            "the owning package must win no matter which package was imported last"
+        );
     }
 
     #[tokio::test]

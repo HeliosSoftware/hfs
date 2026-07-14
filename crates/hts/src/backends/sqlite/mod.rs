@@ -350,6 +350,12 @@ impl SqliteTerminologyBackend {
                     "Failed to apply bootstrap_imports column migration: {e}"
                 ))
             })?;
+            // MUST run after the drop_url_unique rebuilds above: those recreate
+            // code_systems / value_sets from a fixed column list and would drop
+            // `authority_rank` if it had been added first.
+            schema::migrate_authority_rank(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
+            })?;
 
             // FTS prebuild + index pre-warm. Skipped when `prebuild_fts` is
             // false (server startup path): bootstrap re-imports run first and
@@ -515,6 +521,10 @@ impl SqliteTerminologyBackend {
             schema::migrate_value_sets_drop_url_unique(&mut conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to drop legacy value_sets.url UNIQUE: {e}"))
             })?;
+            // See the on-disk path: must follow the drop_url_unique rebuilds.
+            schema::migrate_authority_rank(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
+            })?;
         }
 
         Ok(Self {
@@ -593,15 +603,14 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
                 ) {
                     return Some(url);
                 }
-                conn.query_row(
+                let sql = format!(
                     "SELECT url FROM code_systems \
                      WHERE json_extract(resource_json, '$.id') = ?1 \
-                     ORDER BY COALESCE(version, '') DESC \
-                     LIMIT 1",
-                    rusqlite::params![id],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
+                     ORDER BY {} LIMIT 1",
+                    crate::backends::cs_precedence_order_by("code_systems")
+                );
+                conn.query_row(&sql, rusqlite::params![id], |row| row.get::<_, String>(0))
+                    .ok()
             }
             "ValueSet" => {
                 if let Ok(url) = conn.query_row(
@@ -615,15 +624,14 @@ impl TerminologyMetadata for SqliteTerminologyBackend {
                 // so when the URL-path id is the bare FHIR id, fall back to a
                 // resource_json scan and pick the latest version (matches how
                 // CodeSystem reads handle the same case).
-                conn.query_row(
+                let sql = format!(
                     "SELECT url FROM value_sets \
                      WHERE json_extract(resource_json, '$.id') = ?1 \
-                     ORDER BY COALESCE(version, '') DESC \
-                     LIMIT 1",
-                    rusqlite::params![id],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
+                     ORDER BY {} LIMIT 1",
+                    crate::backends::vs_precedence_order_by("value_sets")
+                );
+                conn.query_row(&sql, rusqlite::params![id], |row| row.get::<_, String>(0))
+                    .ok()
             }
             "ConceptMap" => conn
                 .query_row(

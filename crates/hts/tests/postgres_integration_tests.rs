@@ -2200,3 +2200,126 @@ async fn importer_dicom_runs_against_postgres() {
         .await
         .unwrap();
 }
+
+// ── Issue #200: provenance precedence among same-URL rows ─────────────────────
+
+/// Build a FHIR NPM `.tgz` whose `package/package.json` declares `canonical`,
+/// so the importer can tell whether the package owns the URLs it publishes.
+fn pkg_tgz(resources: &[serde_json::Value], name: &str, canonical: &str) -> tempfile::NamedTempFile {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use tar::Builder;
+
+    let tmp = tempfile::NamedTempFile::with_suffix(".tgz").unwrap();
+    let enc = GzEncoder::new(tmp.reopen().unwrap(), Compression::fast());
+    let mut tar = Builder::new(enc);
+
+    let manifest = serde_json::to_vec(
+        &serde_json::json!({"name": name, "version": "1.0.0", "canonical": canonical}),
+    )
+    .unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "package/package.json", manifest.as_slice())
+        .unwrap();
+
+    for (i, resource) in resources.iter().enumerate() {
+        let bytes = serde_json::to_vec(resource).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, &format!("package/CodeSystem-{i}.json"), bytes.as_slice())
+            .unwrap();
+    }
+    tar.finish().unwrap();
+    tmp
+}
+
+/// Postgres twin of `bare_validate_code_prefers_owning_package_over_republished_copy`
+/// (see `src/import/tgz.rs`). Issue #200 reproduces identically on both backends —
+/// the precedence ordering is shared text, and this pins the Postgres side of it.
+#[tokio::test]
+async fn bare_validate_code_prefers_owning_package_over_republished_copy_pg() {
+    use helios_hts::import::tgz::import_tgz;
+
+    let backend = fresh_backend().await;
+    // Namespaced per-run so the shared container stays isolated between tests.
+    // The owning package's canonical base is this namespace, mirroring how THO
+    // owns `http://terminology.hl7.org`; the copying package declares a
+    // different base, mirroring `hl7.fhir.r4.core` re-shipping a THO canonical.
+    let base = base_url!("prov");
+    let owner_canonical = base.trim_end_matches('/').to_string();
+    let url = format!("{base}CodeSystem/audit-event-type");
+
+    let core_copy = serde_json::json!({
+        "resourceType": "CodeSystem", "id": "aet-core", "url": url,
+        "version": "4.0.1", "status": "active", "content": "complete",
+        "concept": [{"code": "rest", "display": "RESTful Operation"}]
+    });
+    let tho_original = serde_json::json!({
+        "resourceType": "CodeSystem", "id": "aet-tho", "url": url,
+        "version": "1.0.0", "status": "active", "content": "complete",
+        "concept": [
+            {"code": "rest", "display": "RESTful Operation"},
+            {"code": "object", "display": "Object"}
+        ]
+    });
+
+    // Copying package first, matching the alphabetical bootstrap order that let
+    // the truncated copy win in the first place.
+    let core = pkg_tgz(
+        std::slice::from_ref(&core_copy),
+        "hl7.fhir.r4.core",
+        "http://hl7.org/fhir",
+    );
+    let tho = pkg_tgz(
+        std::slice::from_ref(&tho_original),
+        "hl7.terminology",
+        &owner_canonical,
+    );
+    import_tgz(&backend, &ctx(), core.path(), 500, false)
+        .await
+        .expect("core package import");
+    import_tgz(&backend, &ctx(), tho.path(), 500, false)
+        .await
+        .expect("THO package import");
+
+    // `object` exists only in the complete THO definition. Under the old
+    // ordering the truncated 4.0.1 copy won on the version text sort.
+    let resp = CodeSystemOperations::validate_code(
+        &backend,
+        &ctx(),
+        ValidateCodeRequest {
+            system: Some(url.clone()),
+            code: "object".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        resp.result,
+        "bare $validate-code must resolve to the owning package's complete row; got: {:?}",
+        resp.message
+    );
+    assert_eq!(resp.cs_version.as_deref(), Some("1.0.0"));
+
+    // The copy is ranked, not discarded: an explicit pin still reaches it.
+    let pinned = CodeSystemOperations::validate_code(
+        &backend,
+        &ctx(),
+        ValidateCodeRequest {
+            system: Some(url),
+            code: "object".into(),
+            version: Some("4.0.1".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!pinned.result, "version=4.0.1 pins the truncated copy");
+}
