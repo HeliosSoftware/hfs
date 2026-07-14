@@ -148,6 +148,13 @@ pub enum RestError {
         message: String,
     },
 
+    /// Backend temporarily over capacity — e.g. the database connection pool is
+    /// exhausted (HTTP 503). Retryable: the server is healthy, just saturated.
+    ServiceUnavailable {
+        /// Error message.
+        message: String,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
@@ -248,6 +255,9 @@ impl fmt::Display for RestError {
             }
             RestError::TooManyRequests { message } => {
                 write!(f, "Too many requests: {}", message)
+            }
+            RestError::ServiceUnavailable { message } => {
+                write!(f, "Service unavailable: {}", message)
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
@@ -353,6 +363,11 @@ impl RestError {
             RestError::TooManyRequests { message } => {
                 (StatusCode::TOO_MANY_REQUESTS, "throttled", message.clone())
             }
+            RestError::ServiceUnavailable { message } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient",
+                message.clone(),
+            ),
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
@@ -679,6 +694,9 @@ impl From<BackendError> for RestError {
             BackendError::UnsupportedCapability { capability, .. } => RestError::NotImplemented {
                 feature: capability,
             },
+            // Over capacity, not broken — the client should retry rather than treat
+            // this as a server fault.
+            BackendError::Unavailable { message, .. } => RestError::ServiceUnavailable { message },
             _ => RestError::InternalError {
                 message: err.to_string(),
             },

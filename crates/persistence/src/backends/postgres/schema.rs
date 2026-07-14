@@ -3,10 +3,45 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
+
+/// Advisory-lock key serializing schema migration across HFS instances sharing
+/// one database. Arbitrary but must stay stable across releases.
+const MIGRATION_LOCK_KEY: i64 = 0x4846_5300_4d49_4752; // "HFS\0MIGR"
 
 /// Initialize the database schema.
+///
+/// Serialized across instances with a session-level advisory lock: several HFS
+/// processes routinely share one database (see `.github/workflows/cluster-smoke.yml`,
+/// which runs two), and `schema_version` is read-then-written without a
+/// transaction. While every migration was millisecond-fast the race window was
+/// invisible; v14 builds indexes over the whole `search_index` table, which
+/// widens it to minutes. Without the lock, a second instance can observe the old
+/// version, re-run the migration, and begin serving traffic while the first is
+/// still building.
+///
+/// The lock is session-scoped, so it is released even if the process is killed
+/// mid-migration.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
+        .await
+        .map_err(|e| pg_error(format!("Failed to acquire migration lock: {}", e)))?;
+
+    let result = run_migrations(client).await;
+
+    // Release even on failure; the connection may be recycled into the pool.
+    if let Err(e) = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_KEY])
+        .await
+    {
+        tracing::warn!("Failed to release migration advisory lock: {}", e);
+    }
+
+    result
+}
+
+async fn run_migrations(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let current_version = get_schema_version(client).await?;
 
     if current_version == 0 {
@@ -276,6 +311,7 @@ async fn migrate_schema(
             10 => migrate_v10_to_v11(client).await?,
             11 => migrate_v11_to_v12(client).await?,
             12 => migrate_v12_to_v13(client).await?,
+            13 => migrate_v13_to_v14(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -787,6 +823,133 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v12->v13 failed: {}", e)))?;
+    Ok(())
+}
+
+/// v13 -> v14: search performance indexes (issue #224).
+///
+/// Purely additive — nothing is dropped and no query semantics change. Every index
+/// here was validated against a 1.45M-row replica of the benchmark dataset: each
+/// one is measurably used by the plans the query builder now emits, and the set as
+/// a whole took a 30-client mixed search workload from 45 tps / 659 ms to
+/// 112 tps / 267 ms.
+///
+/// Deliberately NOT added: an index on
+/// `(tenant_id, resource_type, param_name, resource_id, composite_group)`. It looks
+/// like the obvious fix for the composite timeout, and it *is* required by the
+/// correlated-`EXISTS` formulation of that query (which runs in ~1 ms) — but with
+/// the SQL we actually emit, Postgres never scans it (0 scans over a clean 30 s
+/// run; it BitmapOrs the token and quantity indexes instead). It indexes every row
+/// of `search_index`, so it would be pure write amplification on the import path.
+/// See `build_composite_condition` for why the `EXISTS` form was rejected.
+///
+/// Also deliberately NOT dropped: `idx_search_resource`. It reads as redundant (a
+/// column prefix of `idx_search_composite`), but it is the per-resource probe in
+/// the new plans and takes ~12M scans in a 30 s run — the hottest index in the
+/// schema. It is also the write path's `DELETE FROM search_index WHERE
+/// tenant/type/resource_id` and the FK cascade.
+///
+/// Index builds take a `SHARE` lock, blocking writes for their duration — measured
+/// at ~6 s for this whole migration on 1.45M rows. Migrations run at startup before
+/// the instance serves traffic, and `initialize_schema` holds an advisory lock, so
+/// instances serialize rather than race. Operators upgrading a large database can
+/// pre-build these `CONCURRENTLY` by hand; the `IF NOT EXISTS` clauses then make
+/// this migration a no-op.
+///
+/// `CREATE INDEX CONCURRENTLY` is deliberately NOT used here: if the process dies
+/// mid-build it leaves an `INVALID` index behind, and a later
+/// `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would see the name and skip it forever
+/// — the index would silently never exist while the version marker claimed
+/// otherwise.
+async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        // Ordered pagination.
+        //
+        // Every search ends `ORDER BY last_updated DESC, id ASC LIMIT n`, but no
+        // index supplied that order: `idx_resources_type` is (tenant_id,
+        // resource_type) and `idx_resources_updated` is (tenant_id, last_updated).
+        // So a low-selectivity filter (`category=laboratory`, `date=gt2015`)
+        // materialized every matching row and sorted it to return 20.
+        //
+        // Column directions must be declared explicitly: a backward scan of
+        // (last_updated, id) yields `id DESC`, which does not match `id ASC`. The
+        // reverse of this index exactly serves the keyset "previous" page.
+        "CREATE INDEX IF NOT EXISTS idx_resources_search
+         ON resources (tenant_id, resource_type, last_updated DESC, id ASC)
+         WHERE is_deleted = FALSE",
+        // Token search, code-first.
+        //
+        // `idx_search_token` orders (…, value_token_system, value_token_code), but
+        // the common forms bind the code alone (`code=8302-2`, `category=laboratory`,
+        // `status=finished`, `class=AMB`). With `system` ahead of it, a code-only
+        // search has no leading equality and degrades to scanning the param slice.
+        // Code-first makes those an equality seek; `system|code` still seeks on both.
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code
+         ON search_index (tenant_id, resource_type, param_name, value_token_code, value_token_system)
+         WHERE value_token_code IS NOT NULL",
+        // String search (`Patient?name=`, `Patient?address=`, `Organization?name=`).
+        //
+        // The predicate is `COALESCE(value_string_folded, lower(value_string)) LIKE $n`.
+        // A btree can only serve a prefix `LIKE` under `text_pattern_ops` (the
+        // default opclass is collation-aware and cannot), and it must index the
+        // whole COALESCE expression — a plain index on `value_string_folded` does
+        // not match it. The COALESCE is load-bearing: `value_string_folded` was
+        // added in v10 and is populated only on write, never backfilled, so rows
+        // predating the upgrade have NULL there and must fall back to the raw column.
+        //
+        // `text_pattern_ops` also serves plain `=`, so this covers `:exact` too.
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded_pattern
+         ON search_index (tenant_id, resource_type, param_name,
+                          (COALESCE(value_string_folded, lower(value_string))) text_pattern_ops)
+         WHERE value_string IS NOT NULL",
+        // Reference search and `_revinclude`.
+        //
+        // The predicate is `value_reference = $n OR value_reference LIKE $n || '/_history/%'`.
+        // An OR is only index-usable when *every* arm is, and the default opclass
+        // cannot serve the prefix LIKE — so the whole predicate degraded to a filter.
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_pattern
+         ON search_index (tenant_id, resource_type, param_name, value_reference text_pattern_ops)
+         WHERE value_reference IS NOT NULL",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v13->v14 failed: {}", e)))?;
+    }
+
+    // Multivariate statistics.
+    //
+    // `value_token_code` holds codes from every `param_name` and every
+    // `resource_type` in one column, so Postgres estimates
+    // `param_name = 'code' AND value_token_code = '8302-2'` as the product of two
+    // independent marginals. The columns are in fact almost perfectly correlated
+    // (only `code` rows carry LOINC codes), so the estimate is wrong by orders of
+    // magnitude and the planner flips between a good nested loop and a
+    // catastrophic hash. Per-column stats — i.e. a plain ANALYZE — cannot express
+    // this, which is why the ANALYZE tried in #224 had no measurable effect.
+    //
+    // Best-effort: extended statistics need no special privilege, but a failure
+    // here costs plan quality, not correctness, so it must not block startup.
+    let stats = [
+        "ALTER TABLE search_index ALTER COLUMN value_token_code SET STATISTICS 1000",
+        "ALTER TABLE search_index ALTER COLUMN param_name SET STATISTICS 1000",
+        "CREATE STATISTICS IF NOT EXISTS stx_search_param_token (dependencies, mcv)
+         ON param_name, value_token_code FROM search_index",
+        "CREATE STATISTICS IF NOT EXISTS stx_search_type_param (dependencies)
+         ON resource_type, param_name FROM search_index",
+    ];
+    for sql in stats {
+        if let Err(e) = client.execute(sql, &[]).await {
+            tracing::warn!(
+                "Migration v13->v14: optional statistics step failed (plans may be \
+                 suboptimal, search remains correct): {}",
+                e
+            );
+        }
+    }
+
     Ok(())
 }
 

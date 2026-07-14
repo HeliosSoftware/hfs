@@ -1977,6 +1977,241 @@ mod postgres_integration {
         assert!(result.resources.items.is_empty(), "code mismatch → no hit");
     }
 
+    /// A composite must match only when every component is satisfied *within the
+    /// same* `composite_group`.
+    ///
+    /// `Observation.component` yields one composite group per component entry, so
+    /// a blood-pressure panel indexes systolic (8480-6, 120) as group 0 and
+    /// diastolic (8462-4, 80) as group 1 — each with its own code row and value
+    /// row. A query for "diastolic > 100" must NOT match: the resource has a code
+    /// row for 8462-4 (group 1) and a value row > 100 (group 0, the systolic 120),
+    /// but never both in one group.
+    ///
+    /// Any rewrite that pushes the component predicates into the WHERE clause
+    /// without correlating on `composite_group` returns this resource — a silent
+    /// false positive that ships as a 100x speedup and returns the wrong patients.
+    /// The single-group fixture in the test above cannot detect that class of bug.
+    #[tokio::test]
+    async fn postgres_integration_composite_components_must_share_a_group() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Blood-pressure panel: systolic 120, diastolic 80 — two composite groups.
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "obs-bp-panel",
+            "status": "final",
+            "code": { "coding": [{ "system": "http://loinc.org", "code": "85354-9" }] },
+            "component": [
+                {
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+                    "valueQuantity": { "value": 120, "unit": "mm[Hg]", "system": "http://unitsofmeasure.org" }
+                },
+                {
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8462-4" }] },
+                    "valueQuantity": { "value": 80, "unit": "mm[Hg]", "system": "http://unitsofmeasure.org" }
+                }
+            ]
+        });
+        backend
+            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .await
+            .unwrap();
+
+        let query = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "component-code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "component-code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "component-value-quantity".to_string(),
+                    },
+                ],
+            })
+        };
+
+        // The cross-group false positive: diastolic's code (group 1) + systolic's
+        // value (group 0). Must NOT match.
+        let result = backend
+            .search(&tenant, &query("8462-4$gt100"))
+            .await
+            .unwrap();
+        assert!(
+            result.resources.items.is_empty(),
+            "diastolic is 80, not >100 — a match here means component predicates \
+             leaked across composite groups (systolic's 120 satisfied the value \
+             while diastolic satisfied the code)"
+        );
+
+        // Both components satisfied within group 0 (systolic 120 > 100) → match.
+        let result = backend
+            .search(&tenant, &query("8480-6$gt100"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "systolic 8480-6 = 120 > 100, both components in group 0 → 1 hit"
+        );
+        assert_eq!(result.resources.items[0].id(), "obs-bp-panel");
+
+        // Both components satisfied within group 1 (diastolic 80 < 100) → match.
+        let result = backend
+            .search(&tenant, &query("8462-4$lt100"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "diastolic 8462-4 = 80 < 100, both components in group 1 → 1 hit"
+        );
+    }
+
+    /// Each value of a composite OR-list must be satisfied on its own; components
+    /// must not pair up *across* values.
+    ///
+    /// The fixture's only component is (8480-6, 250). For
+    /// `8480-6$lt60,8462-4$gt200`: value 1 needs code 8480-6 AND value < 60 (it is
+    /// 250 — no); value 2 needs code 8462-4 (absent — no). Collapsing both values
+    /// into one subquery with a merged HAVING lets value 1's code satisfy the token
+    /// leg while value 2's `>200` is satisfied by the same row's 250 → false positive.
+    #[tokio::test]
+    async fn postgres_integration_composite_or_list_values_are_isolated() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "obs-single-high",
+            "status": "final",
+            "code": { "coding": [{ "system": "http://loinc.org", "code": "85354-9" }] },
+            "component": [{
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+                "valueQuantity": { "value": 250, "unit": "mm[Hg]", "system": "http://unitsofmeasure.org" }
+            }]
+        });
+        backend
+            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .await
+            .unwrap();
+
+        let multi_value = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "component-code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("8480-6$lt60"),
+                SearchValue::eq("8462-4$gt200"),
+            ],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "component-code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "component-value-quantity".to_string(),
+                },
+            ],
+        });
+
+        let result = backend.search(&tenant, &multi_value).await.unwrap();
+        assert!(
+            result.resources.items.is_empty(),
+            "neither OR-value is satisfied on its own (8480-6 is 250 not <60; there \
+             is no 8462-4) — a match means components paired across OR-values"
+        );
+    }
+
+    /// String search must still match rows whose `value_string_folded` is NULL.
+    ///
+    /// That column arrived in schema v10 and is populated **only on write** — the
+    /// migration never backfilled it (there is no `UPDATE search_index` anywhere),
+    /// so every row indexed before the upgrade has NULL there. The search predicate
+    /// therefore falls back to the raw `value_string`, and that fallback must stay
+    /// case-insensitive.
+    ///
+    /// This is a tripwire, not a feature test: it is green today and must stay
+    /// green. It fails the moment someone "optimizes" the predicate to
+    /// `value_string_folded LIKE $n` (NULL never matches → patients silently vanish
+    /// from results) or to `COALESCE(value_string_folded, value_string) LIKE $n`
+    /// (the raw branch loses its case-folding → `name=smith` stops finding "Smith").
+    /// Both are silent wrong-results bugs, not errors.
+    #[tokio::test]
+    async fn postgres_integration_string_search_matches_unbackfilled_rows() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant_id = "unbackfilled-tenant";
+        let tenant = create_tenant(tenant_id);
+
+        // No `name` element, so the writer indexes no `name` row for this Patient —
+        // leaving the field clear for the hand-written legacy row below.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "id": "legacy-p1", "gender": "female" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // A pre-v10 row: raw value only, `value_string_folded` left NULL.
+        insert_search_index(
+            tenant_id,
+            "Patient",
+            "legacy-p1",
+            "name",
+            "value_string",
+            "Smith",
+        )
+        .await;
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            // Lowercase query against a capitalized stored value: only the
+            // case-insensitive fallback can match this.
+            values: vec![SearchValue::eq("smith")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "a row with value_string='Smith' and value_string_folded=NULL (i.e. \
+             written before the v10 migration) must still match name=smith — the \
+             COALESCE fallback and its case-folding are load-bearing"
+        );
+        assert_eq!(result.resources.items[0].id(), "legacy-p1");
+    }
+
     // ========================================================================
     // Backend Health Check Tests
     // ========================================================================
