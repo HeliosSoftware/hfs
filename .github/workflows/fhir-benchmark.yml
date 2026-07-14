@@ -460,6 +460,23 @@ jobs:
                 -c 'VACUUM (ANALYZE) resources;' \
                 -c 'VACUUM (ANALYZE) search_index;' || \
                 echo "::warning::VACUUM failed — index-only scans will fall back to heap fetches"
+
+              # Capture EXPLAIN (ANALYZE, BUFFERS) for the shapes that are still slow,
+              # against the real imported data and before the load starts.
+              #
+              # The composite shapes measured ~70ms on a synthetic replica but run at
+              # 12-13s here, so the replica's distribution is not representative and
+              # local A/B is not trustworthy for them. This reads the actual plans
+              # instead, and A/Bs the correlated-EXISTS candidate in the same pass.
+              if [ -f "$GITHUB_WORKSPACE/.github/scripts/pg-search-plans.sql" ]; then
+                echo "── Capturing query plans for the slow shapes ──"
+                docker cp "$GITHUB_WORKSPACE/.github/scripts/pg-search-plans.sql" \
+                  "$PG_CONTAINER:/tmp/plans.sql" 2>/dev/null || true
+                docker exec "$PG_CONTAINER" psql -U postgres -d postgres -f /tmp/plans.sql \
+                  > "$RESULTS_DIR/search-plans.txt" 2>&1 || \
+                  echo "::warning::plan capture failed (see search-plans.txt)"
+                echo "Captured $(wc -l < "$RESULTS_DIR/search-plans.txt") lines of plan output"
+              fi
             fi
 
             echo "=================================================="
