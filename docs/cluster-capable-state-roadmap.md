@@ -43,6 +43,25 @@ context to resume without it; the plan file adds file:line-level detail.
 calibration suite green on first run (4 T2 tests), full CI-style clippy and
 `cargo fmt` clean.
 
+**CI baseline (2026-07-14): all green.**
+- Branch pushed; **draft PR [#269](https://github.com/HeliosSoftware/hfs/pull/269)**
+  is the long-running CI vehicle for the effort — every push gets the full
+  suite; phases get marked ready / peeled out when merge-worthy.
+- Full CI on the Phase 0 head ([run 29363363507](https://github.com/HeliosSoftware/hfs/actions/runs/29363363507)):
+  Test Rust ✅ (**all five T2 cluster suites ran green on the CI Docker
+  host** — 4 calibration + D3 cold-start), Code Coverage ✅ (T2 suites now
+  feed the metric per strategy §7), Linting / Security Audit / FHIRPath /
+  Python / codecov-patch ✅. One transient failure along the way: the known
+  `SystemOverloadedError` MongoDB flake on the shared Docker host
+  (unrelated; passed on re-run of the failed job).
+- T3 cluster-smoke re-dispatched on the Phase 0 head: ✅
+  ([run 29361875226](https://github.com/HeliosSoftware/hfs/actions/runs/29361875226)).
+- **Gotcha (cost two dead pushes):** GitHub skips `pull_request` workflows
+  when the skip-CI directive appears *anywhere in the head commit message —
+  including quoted in the body*. On this branch, never quote it in a commit
+  that should trigger CI; after a docs-only skip-tagged head, the PR shows
+  "no checks" until the next clean-message push.
+
 ---
 
 ## What's next
