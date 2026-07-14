@@ -532,10 +532,7 @@ pub fn migrate_authority_rank(conn: &rusqlite::Connection) -> rusqlite::Result<(
     }
 
     if column_added {
-        let cleared = conn.execute(
-            "DELETE FROM bootstrap_imports WHERE path LIKE '%.tgz'",
-            [],
-        )?;
+        let cleared = conn.execute("DELETE FROM bootstrap_imports WHERE path LIKE '%.tgz'", [])?;
         if cleared > 0 {
             tracing::info!(
                 cleared_ledger_entries = cleared,

@@ -63,7 +63,7 @@ pub use postgres::PostgresTerminologyBackend;
 /// let this bug class persist.
 pub(crate) fn cs_precedence_order_by(alias: &str) -> String {
     format!(
-        "(CASE COALESCE({a}.content, 'complete') \
+        "(CASE COALESCE({alias}.content, 'complete') \
               WHEN 'complete'    THEN 0 \
               WHEN 'supplement'  THEN 0 \
               WHEN 'fragment'    THEN 1 \
@@ -71,12 +71,11 @@ pub(crate) fn cs_precedence_order_by(alias: &str) -> String {
               WHEN 'not-present' THEN 2 \
               ELSE 1 END), \
          (CASE WHEN EXISTS \
-             (SELECT 1 FROM concepts hc WHERE hc.system_id = {a}.id) \
+             (SELECT 1 FROM concepts hc WHERE hc.system_id = {alias}.id) \
              THEN 0 ELSE 1 END), \
-         COALESCE({a}.authority_rank, 0), \
-         COALESCE({a}.version, '') DESC, \
-         {a}.id",
-        a = alias
+         COALESCE({alias}.authority_rank, 0), \
+         COALESCE({alias}.version, '') DESC, \
+         {alias}.id",
     )
 }
 
@@ -91,10 +90,9 @@ pub(crate) fn cs_precedence_order_by(alias: &str) -> String {
 /// ValueSets under canonical URLs it does not own.
 pub(crate) fn vs_precedence_order_by(alias: &str) -> String {
     format!(
-        "COALESCE({a}.authority_rank, 0), \
-         COALESCE({a}.version, '') DESC, \
-         {a}.id",
-        a = alias
+        "COALESCE({alias}.authority_rank, 0), \
+         COALESCE({alias}.version, '') DESC, \
+         {alias}.id",
     )
 }
 

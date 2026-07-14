@@ -3831,10 +3831,7 @@ pub(super) async fn cs_is_case_insensitive(
          WHERE url = $1 ORDER BY {} LIMIT 1",
         crate::backends::cs_precedence_order_by("code_systems")
     );
-    let row = match client
-        .query_opt(&sql, &[&system_url])
-        .await
-    {
+    let row = match client.query_opt(&sql, &[&system_url]).await {
         Ok(r) => r,
         Err(_) => return false,
     };
@@ -3916,10 +3913,7 @@ pub(super) async fn cs_property_local_codes(
         "SELECT resource_json FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
         crate::backends::cs_precedence_order_by("code_systems")
     );
-    let row = match client
-        .query_opt(&sql, &[&system_url])
-        .await
-    {
+    let row = match client.query_opt(&sql, &[&system_url]).await {
         Ok(Some(r)) => r,
         _ => return codes,
     };
@@ -4216,10 +4210,7 @@ pub(super) async fn detect_cs_version_mismatch(
         "SELECT id, version FROM code_systems WHERE url = $1 ORDER BY {}",
         crate::backends::cs_precedence_order_by("code_systems")
     );
-    let rows = client
-        .query(&sql, &[&system_url])
-        .await
-        .ok()?;
+    let rows = client.query(&sql, &[&system_url]).await.ok()?;
     let candidates: Vec<(String, Option<String>)> = rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
@@ -4491,10 +4482,7 @@ async fn detect_vs_pin_unknown(
         "SELECT id, version FROM code_systems WHERE url = $1 ORDER BY {}",
         crate::backends::cs_precedence_order_by("code_systems")
     );
-    let rows = client
-        .query(&sql, &[&system_url])
-        .await
-        .ok()?;
+    let rows = client.query(&sql, &[&system_url]).await.ok()?;
     let candidates: Vec<(String, Option<String>)> = rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))

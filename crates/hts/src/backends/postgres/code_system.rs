@@ -728,10 +728,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             crate::backends::cs_precedence_order_by("code_systems")
         );
         let row = client
-            .query_opt(
-                &sql,
-                &[&url],
-            )
+            .query_opt(&sql, &[&url])
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))

@@ -6073,11 +6073,7 @@ fn build_hierarchical_expansion(
             crate::backends::cs_precedence_order_by("code_systems")
         );
         if let Some(id) = conn
-            .query_row(
-                &sql,
-                [sys_url],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row(&sql, [sys_url], |row| row.get::<_, String>(0))
             .optional()
             .map_err(|e| HtsError::StorageError(e.to_string()))?
         {

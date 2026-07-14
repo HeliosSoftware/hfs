@@ -2205,7 +2205,11 @@ async fn importer_dicom_runs_against_postgres() {
 
 /// Build a FHIR NPM `.tgz` whose `package/package.json` declares `canonical`,
 /// so the importer can tell whether the package owns the URLs it publishes.
-fn pkg_tgz(resources: &[serde_json::Value], name: &str, canonical: &str) -> tempfile::NamedTempFile {
+fn pkg_tgz(
+    resources: &[serde_json::Value],
+    name: &str,
+    canonical: &str,
+) -> tempfile::NamedTempFile {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use tar::Builder;
@@ -2231,8 +2235,12 @@ fn pkg_tgz(resources: &[serde_json::Value], name: &str, canonical: &str) -> temp
         header.set_size(bytes.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar.append_data(&mut header, &format!("package/CodeSystem-{i}.json"), bytes.as_slice())
-            .unwrap();
+        tar.append_data(
+            &mut header,
+            &format!("package/CodeSystem-{i}.json"),
+            bytes.as_slice(),
+        )
+        .unwrap();
     }
     tar.finish().unwrap();
     tmp

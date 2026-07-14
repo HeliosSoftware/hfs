@@ -463,8 +463,12 @@ mod tests {
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            tar.append_data(&mut header, &format!("package/{rt}-{i}.json"), bytes.as_slice())
-                .unwrap();
+            tar.append_data(
+                &mut header,
+                &format!("package/{rt}-{i}.json"),
+                bytes.as_slice(),
+            )
+            .unwrap();
         }
         tar.finish().unwrap();
         tmp
