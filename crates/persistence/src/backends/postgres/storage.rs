@@ -20,7 +20,7 @@ use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::search::loader::SearchParameterLoader;
 use crate::search::registry::SearchParameterStatus;
-use crate::search::reindex::{ReindexableStorage, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -855,20 +855,22 @@ impl PostgresBackend {
     }
 
     /// Delete search index entries for a resource.
+    /// Removes a resource's search entries, returning how many `search_index`
+    /// rows were deleted.
     pub(crate) async fn delete_search_index(
         &self,
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Delete from main search index
-        client
+        let deleted = client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                 &[&tenant_id, &resource_type, &resource_id],
@@ -884,7 +886,7 @@ impl PostgresBackend {
             )
             .await;
 
-        Ok(())
+        Ok(deleted)
     }
 }
 
@@ -2827,11 +2829,12 @@ fn resolve_bundle_references(
 }
 
 // ============================================================================
-// ReindexableStorage Implementation
+// ReindexSource Implementation — PostgreSQL is a primary, so it is where
+// resources are read from during a reindex.
 // ============================================================================
 
 #[async_trait]
-impl ReindexableStorage for PostgresBackend {
+impl ReindexSource for PostgresBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
@@ -2949,13 +2952,21 @@ impl ReindexableStorage for PostgresBackend {
             next_cursor,
         })
     }
+}
 
+// ============================================================================
+// ReindexTarget Implementation — PostgreSQL keeps search entries in its own
+// `search_index` table, so it is also a writer and can reindex itself.
+// ============================================================================
+
+#[async_trait]
+impl ReindexTarget for PostgresBackend {
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         let client = self.get_client().await?;
         self.delete_search_index(
             &client,
@@ -2969,17 +2980,18 @@ impl ReindexableStorage for PostgresBackend {
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
+        resource: &StoredResource,
     ) -> StorageResult<usize> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
 
         // Use the dynamic extraction
         let values = self
             .search_extractor()
-            .extract(resource, resource_type)
+            .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
         let mut count = 0;
@@ -2998,7 +3010,7 @@ impl ReindexableStorage for PostgresBackend {
         // Re-index contained resources too, so `$reindex` rebuilds `_contained`
         // search entries.
         count += self
-            .index_contained_resources(&client, tenant_id, resource_type, resource_id, resource)
+            .index_contained_resources(&client, tenant_id, resource_type, resource_id, content)
             .await?;
 
         Ok(count)

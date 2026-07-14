@@ -9,7 +9,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -95,12 +94,16 @@ pub struct ResourcePage {
     pub next_cursor: Option<String>,
 }
 
-/// Trait for storage backends that support reindexing.
+/// A backend that can enumerate stored resources so they can be reindexed.
 ///
-/// This trait provides the methods needed to iterate through resources
-/// for the $reindex operation.
+/// This is the *read* half of reindexing: where the resources come from. It is
+/// split from [`ReindexTarget`] because the two capabilities do not line up
+/// across our backends. S3 holds resources but has no search index of its own
+/// (it is always paired with Elasticsearch), so it can be a source but never a
+/// writer. Welding the two together is what previously forced `$reindex` to be
+/// a SQL-only operation.
 #[async_trait]
-pub trait ReindexableStorage: Send + Sync {
+pub trait ReindexSource: Send + Sync {
     /// Lists all resource types that have resources in the tenant.
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>>;
 
@@ -113,16 +116,9 @@ pub trait ReindexableStorage: Send + Sync {
 
     /// Fetches a page of resources for reindexing.
     ///
-    /// # Arguments
-    ///
-    /// * `tenant` - The tenant context
-    /// * `resource_type` - The resource type to fetch
-    /// * `cursor` - Optional cursor from a previous page
-    /// * `limit` - Maximum number of resources to return
-    ///
-    /// # Returns
-    ///
-    /// A page of resources with an optional cursor for the next page.
+    /// `cursor` is an opaque, backend-defined continuation token from the
+    /// previous page; `None` starts from the beginning. The returned
+    /// [`ResourcePage::next_cursor`] is `None` on the last page.
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,
@@ -130,27 +126,59 @@ pub trait ReindexableStorage: Send + Sync {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage>;
+}
 
-    /// Deletes search index entries for a resource.
+/// A backend that maintains a search index which can be rebuilt.
+///
+/// This is the *write* half of reindexing: where the extracted search-parameter
+/// values go. A composite deployment has more than one — the SQL primary's
+/// `search_index` table *and* the Elasticsearch index — which is why
+/// [`ReindexOperation`] holds a `Vec` of these rather than a single storage
+/// handle. Rebuilding only the primary's index on a deployment where
+/// Elasticsearch serves search would leave search untouched by `$reindex`.
+#[async_trait]
+pub trait ReindexTarget: Send + Sync {
+    /// Deletes this writer's search index entries for a single resource.
+    ///
+    /// Backends whose [`write_search_entries`](Self::write_search_entries) is a
+    /// full replace (Elasticsearch, where the indexed document *is* the search
+    /// entry) have nothing to do here and return `Ok(0)`.
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()>;
+    ) -> StorageResult<u64>;
 
-    /// Writes search index entries for a resource.
+    /// Writes this writer's search index entries for a single resource, and
+    /// returns how many entries were written.
+    ///
+    /// Takes the whole [`StoredResource`] rather than just the JSON body
+    /// because Elasticsearch's indexed document carries `version_id` and
+    /// `fhir_version`, neither of which is reliably recoverable from the raw
+    /// resource JSON.
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
+        resource: &StoredResource,
     ) -> StorageResult<usize>;
 
-    /// Clears all search index entries for a tenant.
+    /// Clears every search index entry this writer holds for a tenant, and
+    /// returns how many were removed.
+    ///
+    /// Implementations MUST scope the deletion to `tenant` and nothing else.
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64>;
 }
+
+/// A backend that is both a [`ReindexSource`] and a [`ReindexTarget`] —
+/// i.e. one that can reindex itself standalone (SQLite, PostgreSQL, MongoDB).
+///
+/// Blanket-implemented, so backends implement the two halves and get this for
+/// free. It exists so `ReindexOperation::new` can take a single handle for the
+/// common standalone case.
+pub trait ReindexableStorage: ReindexSource + ReindexTarget {}
+
+impl<T: ReindexSource + ReindexTarget> ReindexableStorage for T {}
 
 /// Request to start a reindex operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,36 +380,108 @@ impl ReindexProgress {
     }
 }
 
+/// Where reindex lifecycle `AuditEvent`s are sent.
+#[derive(Clone)]
+struct ReindexAudit {
+    sink: Arc<dyn helios_audit::AuditSink>,
+    source_observer: String,
+}
+
 /// Manages reindex operations.
-pub struct ReindexOperation<S: ReindexableStorage> {
-    /// The storage backend.
-    storage: Arc<S>,
+///
+/// Deliberately **not** generic over a storage type. A composite deployment
+/// reads resources from one backend (the primary) and must rewrite search
+/// entries into several (the primary's index table *and* the Elasticsearch
+/// index), so the source and the writers are separate, dynamically-dispatched
+/// handles. A type parameter could only ever name one writer.
+///
+/// # Job state is per-process
+///
+/// Jobs live in an in-memory map, so `$reindex-status` for a job started on one
+/// node is not visible from another. In a multi-node deployment, poll the node
+/// that accepted the kick-off.
+pub struct ReindexOperation {
+    /// Where resources are read from — the primary.
+    source: Arc<dyn ReindexSource>,
+    /// Every search index that must be rebuilt. More than one on a composite.
+    writers: Vec<Arc<dyn ReindexTarget>>,
     /// The search parameter extractor.
     extractor: Arc<SearchParameterExtractor>,
     /// Active jobs.
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     /// Cancellation channels.
     cancel_channels: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>,
+    /// Optional audit sink for reindex lifecycle events.
+    audit: Option<ReindexAudit>,
 }
 
-impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
-    /// Creates a new reindex operation manager.
-    pub fn new(storage: Arc<S>, extractor: Arc<SearchParameterExtractor>) -> Self {
+impl ReindexOperation {
+    /// Creates a reindex manager for a backend that indexes itself — the
+    /// standalone case (SQLite, PostgreSQL, MongoDB), where the resources and
+    /// the search index live in the same place.
+    pub fn new<S: ReindexableStorage + 'static>(
+        storage: Arc<S>,
+        extractor: Arc<SearchParameterExtractor>,
+    ) -> Self {
+        Self::with_parts(storage.clone(), vec![storage], extractor)
+    }
+
+    /// Creates a reindex manager that reads from `source` and rebuilds every
+    /// index in `writers`.
+    ///
+    /// This is the composite case: `source` is the primary (SQLite, PostgreSQL,
+    /// MongoDB, or S3) and `writers` holds both the primary's own index — when
+    /// it has one — and the Elasticsearch secondary that actually serves search.
+    /// Passing only the primary here is the bug this split exists to prevent:
+    /// `$reindex` would rebuild an index nothing queries.
+    pub fn with_parts(
+        source: Arc<dyn ReindexSource>,
+        writers: Vec<Arc<dyn ReindexTarget>>,
+        extractor: Arc<SearchParameterExtractor>,
+    ) -> Self {
         Self {
-            storage,
+            source,
+            writers,
             extractor,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             cancel_channels: Arc::new(RwLock::new(HashMap::new())),
+            audit: None,
         }
+    }
+
+    /// Emits a BALP `AuditEvent` at each reindex lifecycle transition.
+    pub fn with_audit(
+        mut self,
+        sink: Arc<dyn helios_audit::AuditSink>,
+        source_observer: impl Into<String>,
+    ) -> Self {
+        self.audit = Some(ReindexAudit {
+            sink,
+            source_observer: source_observer.into(),
+        });
+        self
+    }
+
+    /// Returns true when this manager has at least one search index to rebuild.
+    ///
+    /// False for an S3-standalone deployment, which stores resources but has no
+    /// search index of any kind; `$reindex` there has nothing to do and the
+    /// REST layer reports that rather than pretending to have done work.
+    pub fn has_writers(&self) -> bool {
+        !self.writers.is_empty()
     }
 
     /// Starts a reindex operation.
     ///
-    /// Returns immediately with a job ID. The reindex runs in the background.
+    /// Returns immediately with a job ID; the reindex runs in the background.
+    /// `agent` is the authenticated principal that requested it and is carried
+    /// into the audit events — a destructive index rebuild that cannot be
+    /// attributed to anyone is not much of an audit trail.
     pub async fn start(
         &self,
         tenant: TenantContext,
         request: ReindexRequest,
+        agent: Option<String>,
     ) -> Result<String, ReindexError> {
         let job_id = Uuid::new_v4().to_string();
         let progress = ReindexProgress::new(&job_id);
@@ -395,254 +495,82 @@ impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
             .write()
             .insert(job_id.clone(), cancel_tx);
 
+        let requested_types = request.resource_types.clone().unwrap_or_default();
+
+        // Emitted before the spawn so the start event can never be ordered
+        // after a terminal event from the background task.
+        if let Some(audit) = &self.audit {
+            audit::record_reindex_event(
+                audit.sink.as_ref(),
+                &audit.source_observer,
+                agent.as_deref(),
+                &job_id,
+                "start",
+                &requested_types,
+                0,
+                "0",
+            )
+            .await;
+        }
+
         // Clone references for the background task
-        let storage = self.storage.clone();
+        let source = self.source.clone();
+        let writers = self.writers.clone();
         let extractor = self.extractor.clone();
         let jobs = self.jobs.clone();
+        let audit = self.audit.clone();
         let job_id_clone = job_id.clone();
 
         // Spawn background task
         tokio::spawn(async move {
-            Self::run_reindex(
-                job_id_clone,
+            run_reindex(
+                job_id_clone.clone(),
                 tenant,
                 request,
-                storage,
+                source,
+                writers,
                 extractor,
-                jobs,
+                jobs.clone(),
                 cancel_rx,
             )
             .await;
+
+            // Terminal audit event, read back from whatever state the run left
+            // the job in.
+            if let Some(audit) = audit {
+                let (status, processed) = {
+                    let guard = jobs.read();
+                    let progress = guard.get(&job_id_clone);
+                    (
+                        progress.map(|p| p.status).unwrap_or(ReindexStatus::Failed),
+                        progress.map(|p| p.processed_resources).unwrap_or(0),
+                    )
+                };
+                let (phase, outcome) = match status {
+                    ReindexStatus::Completed => ("complete", "0"),
+                    ReindexStatus::Cancelled => ("cancel", "4"),
+                    // Queued/InProgress are not reachable once the driver has
+                    // returned; record them as failures rather than dropping
+                    // the event entirely.
+                    ReindexStatus::Failed | ReindexStatus::Queued | ReindexStatus::InProgress => {
+                        ("fail", "8")
+                    }
+                };
+                audit::record_reindex_event(
+                    audit.sink.as_ref(),
+                    &audit.source_observer,
+                    agent.as_deref(),
+                    &job_id_clone,
+                    phase,
+                    &requested_types,
+                    processed,
+                    outcome,
+                )
+                .await;
+            }
         });
 
         Ok(job_id)
-    }
-
-    /// Runs the reindex operation in the background.
-    async fn run_reindex(
-        job_id: String,
-        tenant: TenantContext,
-        request: ReindexRequest,
-        storage: Arc<S>,
-        extractor: Arc<SearchParameterExtractor>,
-        jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
-        mut cancel_rx: mpsc::Receiver<()>,
-    ) {
-        // Mark as started
-        {
-            let mut jobs_guard = jobs.write();
-            if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                progress.status = ReindexStatus::InProgress;
-                progress.started_at = Some(chrono::Utc::now().to_rfc3339());
-            }
-        }
-
-        // Determine resource types to process
-        let resource_types = match request.resource_types {
-            Some(types) => types,
-            None => match storage.list_resource_types(&tenant).await {
-                Ok(types) => types,
-                Err(e) => {
-                    Self::mark_failed(
-                        &jobs,
-                        &job_id,
-                        format!("Failed to list resource types: {}", e),
-                    );
-                    return;
-                }
-            },
-        };
-
-        // Count total resources
-        let mut total_resources: u64 = 0;
-        for resource_type in &resource_types {
-            match storage.count_resources(&tenant, resource_type).await {
-                Ok(count) => total_resources += count,
-                Err(e) => {
-                    Self::mark_failed(
-                        &jobs,
-                        &job_id,
-                        format!("Failed to count {}: {}", resource_type, e),
-                    );
-                    return;
-                }
-            }
-        }
-
-        // Update total
-        {
-            let mut jobs_guard = jobs.write();
-            if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                progress.total_resources = total_resources;
-            }
-        }
-
-        // Clear existing indexes if requested
-        if request.clear_existing
-            && let Err(e) = storage.clear_search_index(&tenant).await
-        {
-            Self::mark_failed(
-                &jobs,
-                &job_id,
-                format!("Failed to clear search index: {}", e),
-            );
-            return;
-        }
-
-        // Process each resource type
-        for resource_type in &resource_types {
-            // Check for cancellation
-            if cancel_rx.try_recv().is_ok() {
-                Self::mark_cancelled(&jobs, &job_id);
-                return;
-            }
-
-            // Update current resource type
-            {
-                let mut jobs_guard = jobs.write();
-                if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                    progress.current_resource_type = Some(resource_type.clone());
-                }
-            }
-
-            // Process resources in batches
-            let mut cursor: Option<String> = None;
-            loop {
-                // Check for cancellation
-                if cancel_rx.try_recv().is_ok() {
-                    Self::mark_cancelled(&jobs, &job_id);
-                    return;
-                }
-
-                // Fetch a page of resources
-                let page = match storage
-                    .fetch_resources_page(
-                        &tenant,
-                        resource_type,
-                        cursor.as_deref(),
-                        request.batch_size,
-                    )
-                    .await
-                {
-                    Ok(page) => page,
-                    Err(e) => {
-                        Self::mark_failed(
-                            &jobs,
-                            &job_id,
-                            format!("Failed to fetch resources: {}", e),
-                        );
-                        return;
-                    }
-                };
-
-                // Process each resource
-                for resource in &page.resources {
-                    // Delete existing index entries
-                    if let Err(e) = storage
-                        .delete_search_entries(&tenant, resource_type, resource.id())
-                        .await
-                    {
-                        // Log error but continue
-                        let mut jobs_guard = jobs.write();
-                        if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                            progress.errors.push(ReindexProgressError {
-                                resource_type: resource_type.clone(),
-                                resource_id: resource.id().to_string(),
-                                error: format!("Failed to delete index entries: {}", e),
-                            });
-                        }
-                        continue;
-                    }
-
-                    // Extract and write new index entries
-                    match extractor.extract(resource.content(), resource_type) {
-                        Ok(values) => {
-                            let entry_count = values.len();
-
-                            // Write new index entries
-                            match storage
-                                .write_search_entries(
-                                    &tenant,
-                                    resource_type,
-                                    resource.id(),
-                                    resource.content(),
-                                )
-                                .await
-                            {
-                                Ok(_written) => {
-                                    let mut jobs_guard = jobs.write();
-                                    if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                                        progress.processed_resources += 1;
-                                        progress.entries_created += entry_count as u64;
-                                    }
-                                }
-                                Err(e) => {
-                                    let mut jobs_guard = jobs.write();
-                                    if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                                        progress.processed_resources += 1;
-                                        progress.errors.push(ReindexProgressError {
-                                            resource_type: resource_type.clone(),
-                                            resource_id: resource.id().to_string(),
-                                            error: format!("Failed to write index entries: {}", e),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let mut jobs_guard = jobs.write();
-                            if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                                progress.processed_resources += 1;
-                                progress.errors.push(ReindexProgressError {
-                                    resource_type: resource_type.clone(),
-                                    resource_id: resource.id().to_string(),
-                                    error: format!("Extraction failed: {}", e),
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // Check if there are more pages
-                match page.next_cursor {
-                    Some(next) => cursor = Some(next),
-                    None => break,
-                }
-            }
-        }
-
-        // Mark as completed
-        {
-            let mut jobs_guard = jobs.write();
-            if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                progress.status = ReindexStatus::Completed;
-                progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                progress.current_resource_type = None;
-            }
-        }
-    }
-
-    /// Marks a job as failed.
-    fn mark_failed(
-        jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
-        job_id: &str,
-        error: String,
-    ) {
-        let mut jobs_guard = jobs.write();
-        if let Some(progress) = jobs_guard.get_mut(job_id) {
-            progress.status = ReindexStatus::Failed;
-            progress.error_message = Some(error);
-            progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
-        }
-    }
-
-    /// Marks a job as cancelled.
-    fn mark_cancelled(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: &str) {
-        let mut jobs_guard = jobs.write();
-        if let Some(progress) = jobs_guard.get_mut(job_id) {
-            progress.status = ReindexStatus::Cancelled;
-            progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
-        }
     }
 
     /// Gets the progress of a reindex job.
@@ -708,11 +636,247 @@ impl<S: ReindexableStorage + 'static> ReindexOperation<S> {
     }
 }
 
-impl<S: ReindexableStorage> std::fmt::Debug for ReindexOperation<S> {
+impl std::fmt::Debug for ReindexOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReindexOperation")
             .field("active_jobs", &self.jobs.read().len())
+            .field("writers", &self.writers.len())
             .finish()
+    }
+}
+
+/// Marks a job as failed.
+fn mark_failed(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: &str, error: String) {
+    let mut jobs_guard = jobs.write();
+    if let Some(progress) = jobs_guard.get_mut(job_id) {
+        progress.status = ReindexStatus::Failed;
+        progress.error_message = Some(error);
+        progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+}
+
+/// Marks a job as cancelled.
+fn mark_cancelled(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: &str) {
+    let mut jobs_guard = jobs.write();
+    if let Some(progress) = jobs_guard.get_mut(job_id) {
+        progress.status = ReindexStatus::Cancelled;
+        progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+}
+
+/// Records a per-resource error against the job without aborting the run.
+fn push_error(
+    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    job_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    error: String,
+) {
+    let mut jobs_guard = jobs.write();
+    if let Some(progress) = jobs_guard.get_mut(job_id) {
+        progress.errors.push(ReindexProgressError {
+            resource_type: resource_type.to_string(),
+            resource_id: resource_id.to_string(),
+            error,
+        });
+    }
+}
+
+/// Drives a reindex job to completion in the background.
+///
+/// Reads resources from `source` and rewrites the search entries for each one
+/// into **every** writer. On a composite deployment that means both the SQL
+/// primary's index table and the Elasticsearch index — rebuilding only one of
+/// them leaves search inconsistent with the resources.
+#[allow(clippy::too_many_arguments)]
+async fn run_reindex(
+    job_id: String,
+    tenant: TenantContext,
+    request: ReindexRequest,
+    source: Arc<dyn ReindexSource>,
+    writers: Vec<Arc<dyn ReindexTarget>>,
+    extractor: Arc<SearchParameterExtractor>,
+    jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    mut cancel_rx: mpsc::Receiver<()>,
+) {
+    // Mark as started
+    {
+        let mut jobs_guard = jobs.write();
+        if let Some(progress) = jobs_guard.get_mut(&job_id) {
+            progress.status = ReindexStatus::InProgress;
+            progress.started_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+    }
+
+    // Determine resource types to process
+    let resource_types = match request.resource_types {
+        Some(types) => types,
+        None => match source.list_resource_types(&tenant).await {
+            Ok(types) => types,
+            Err(e) => {
+                mark_failed(
+                    &jobs,
+                    &job_id,
+                    format!("Failed to list resource types: {e}"),
+                );
+                return;
+            }
+        },
+    };
+
+    // Count total resources
+    let mut total_resources: u64 = 0;
+    for resource_type in &resource_types {
+        match source.count_resources(&tenant, resource_type).await {
+            Ok(count) => total_resources += count,
+            Err(e) => {
+                mark_failed(
+                    &jobs,
+                    &job_id,
+                    format!("Failed to count {resource_type}: {e}"),
+                );
+                return;
+            }
+        }
+    }
+
+    // Update total
+    {
+        let mut jobs_guard = jobs.write();
+        if let Some(progress) = jobs_guard.get_mut(&job_id) {
+            progress.total_resources = total_resources;
+        }
+    }
+
+    // Clear existing indexes if requested — in every writer, not just the first.
+    if request.clear_existing {
+        for writer in &writers {
+            if let Err(e) = writer.clear_search_index(&tenant).await {
+                mark_failed(&jobs, &job_id, format!("Failed to clear search index: {e}"));
+                return;
+            }
+        }
+    }
+
+    // Process each resource type
+    for resource_type in &resource_types {
+        // Check for cancellation
+        if cancel_rx.try_recv().is_ok() {
+            mark_cancelled(&jobs, &job_id);
+            return;
+        }
+
+        // Update current resource type
+        {
+            let mut jobs_guard = jobs.write();
+            if let Some(progress) = jobs_guard.get_mut(&job_id) {
+                progress.current_resource_type = Some(resource_type.clone());
+            }
+        }
+
+        // Process resources in batches
+        let mut cursor: Option<String> = None;
+        loop {
+            // Check for cancellation
+            if cancel_rx.try_recv().is_ok() {
+                mark_cancelled(&jobs, &job_id);
+                return;
+            }
+
+            // Fetch a page of resources
+            let page = match source
+                .fetch_resources_page(
+                    &tenant,
+                    resource_type,
+                    cursor.as_deref(),
+                    request.batch_size,
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(e) => {
+                    mark_failed(&jobs, &job_id, format!("Failed to fetch resources: {e}"));
+                    return;
+                }
+            };
+
+            // Process each resource
+            for resource in &page.resources {
+                // How many entries this resource yields, for the progress
+                // counter. A failure here means the resource cannot be indexed
+                // at all, so skip it rather than half-writing it.
+                let entry_count = match extractor.extract(resource.content(), resource_type) {
+                    Ok(values) => values.len() as u64,
+                    Err(e) => {
+                        let mut jobs_guard = jobs.write();
+                        if let Some(progress) = jobs_guard.get_mut(&job_id) {
+                            progress.processed_resources += 1;
+                        }
+                        drop(jobs_guard);
+                        push_error(
+                            &jobs,
+                            &job_id,
+                            resource_type,
+                            resource.id(),
+                            format!("Extraction failed: {e}"),
+                        );
+                        continue;
+                    }
+                };
+
+                let mut wrote_any = false;
+                for writer in &writers {
+                    if let Err(e) = writer
+                        .delete_search_entries(&tenant, resource_type, resource.id())
+                        .await
+                    {
+                        push_error(
+                            &jobs,
+                            &job_id,
+                            resource_type,
+                            resource.id(),
+                            format!("Failed to delete index entries: {e}"),
+                        );
+                        continue;
+                    }
+
+                    match writer.write_search_entries(&tenant, resource).await {
+                        Ok(_written) => wrote_any = true,
+                        Err(e) => push_error(
+                            &jobs,
+                            &job_id,
+                            resource_type,
+                            resource.id(),
+                            format!("Failed to write index entries: {e}"),
+                        ),
+                    }
+                }
+
+                let mut jobs_guard = jobs.write();
+                if let Some(progress) = jobs_guard.get_mut(&job_id) {
+                    progress.processed_resources += 1;
+                    if wrote_any {
+                        progress.entries_created += entry_count;
+                    }
+                }
+            }
+
+            // Check if there are more pages
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+    }
+
+    // Mark as completed
+    {
+        let mut jobs_guard = jobs.write();
+        if let Some(progress) = jobs_guard.get_mut(&job_id) {
+            progress.status = ReindexStatus::Completed;
+            progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            progress.current_resource_type = None;
+        }
     }
 }
 

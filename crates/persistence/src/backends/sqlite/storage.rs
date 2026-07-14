@@ -22,7 +22,7 @@ use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, 
 use crate::search::extractor::ExtractedValue;
 use crate::search::loader::SearchParameterLoader;
 use crate::search::registry::SearchParameterStatus;
-use crate::search::reindex::{ReindexableStorage, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -992,20 +992,22 @@ impl SqliteBackend {
     }
 
     /// Delete search index entries for a resource.
+    /// Removes a resource's search entries, returning how many `search_index`
+    /// rows were deleted.
     pub(crate) fn delete_search_index(
         &self,
         conn: &rusqlite::Connection,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Delete from main search index
-        conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
             params![tenant_id, resource_type, resource_id],
         )
@@ -1017,7 +1019,7 @@ impl SqliteBackend {
             params![tenant_id, resource_type, resource_id],
         );
 
-        Ok(())
+        Ok(deleted as u64)
     }
 
     /// Index minimal fallback search parameters.
@@ -3175,9 +3177,9 @@ fn resolve_bundle_references(
     }
 }
 
-// ReindexableStorage implementation for SQLite backend.
+// ReindexSource: SQLite is a primary, so it is where resources are read from.
 #[async_trait]
-impl ReindexableStorage for SqliteBackend {
+impl ReindexSource for SqliteBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
@@ -3311,14 +3313,21 @@ impl ReindexableStorage for SqliteBackend {
             next_cursor,
         })
     }
+}
 
+// ReindexTarget: SQLite keeps search entries in its own `search_index`
+// table, so it is also a writer and can reindex itself standalone.
+#[async_trait]
+impl ReindexTarget for SqliteBackend {
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         let conn = self.get_connection()?;
+        // Reuses the delete path the CRUD layer uses, so the FTS table is
+        // cleaned up too and the `is_search_offloaded` guard is honored.
         self.delete_search_index(
             &conn,
             tenant.tenant_id().as_str(),
@@ -3330,16 +3339,17 @@ impl ReindexableStorage for SqliteBackend {
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
+        resource: &StoredResource,
     ) -> StorageResult<usize> {
         let conn = self.get_connection()?;
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
 
         // Use the dynamic extraction
         let values = self
             .search_extractor()
-            .extract(resource, resource_type)
+            .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
         let mut count = 0;
@@ -3361,7 +3371,7 @@ impl ReindexableStorage for SqliteBackend {
             tenant.tenant_id().as_str(),
             resource_type,
             resource_id,
-            resource,
+            content,
         )?;
 
         Ok(count)
