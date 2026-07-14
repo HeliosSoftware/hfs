@@ -225,6 +225,21 @@ Three things fall out of that table.
 
 **The best schema in the world has no editor on it.** Health Samurai authored FHIR Schema — the IR we are building on — and their own forms product (Formbox) is built on **SDC/Questionnaire**, not on their schema. Aidbox edits arbitrary resources as **raw JSON**. Firely, the most mature commercial vendor in FHIR, ships a **tree editor for definitions and a text editor for instances**. That is a signal, not an accident: everyone who got close to this decided the general case was not worth it and shipped a text box.
 
+Simplifier is worth pinning down precisely, because it is the tool a reasonable person would assume already does this. It does not. Firely's own documentation describes the entire instance-editing surface as:
+
+> *"**Edit**: Update by editing the last version (opens a **XML-editor** in a small window where you can directly edit the XML code of your resource)"*
+> *"**Editor**: … opens a stand-alone full screen **XML-editor** in a different tab …"*
+> — [docs.fire.ly, Resources](https://docs.fire.ly/projects/Simplifier/simplifierResources.html)
+
+And their 2024 online-editor launch, the most recent word on it, is explicitly a *code* editor:
+
+> *"all file types, with special capabilities for editing **XML and JSON resources** (with code highlighting and live validation) and **FHIR Shorthand** files (with code highlighting, live validation and live rendering)"*
+> — [Forge or FSH? Introducing the online resource editor](https://simplifier.net/organization/firely/news/176)
+
+**Forge**, the tool people conflate with this, edits **profiles**, not instances — its `Extend` button attaches an extension to an element of a *StructureDefinition*, and it does filter the offered extensions by `context` ([docs](https://docs.simplifier.net/projects/Forge/features/DefineExtensions.html)). That context filtering is the one idea worth taking (see below); the editing target is not ours.
+
+**The one thing Simplifier does that we should steal:** *live validation and live rendering on every keystroke*. Their own framing is that this is what makes the blank page less intimidating. We can go further than they can — their validation is a server round-trip, and our `validate_sync` is a pure ~300 µs function call (§6).
+
 **The one team that did build it hit the wall at extensions.** Medplum's form is genuinely schema-driven and profile-aware, and its `getElementsToRender` **skips any `extension` element that has no slices** — their own comment says *"an extension property without slices has no nested extensions."* The consequence: **on an unprofiled resource, Medplum's form cannot add an extension at all.** Since most resources carry no `meta.profile`, that is most of the time.
 
 **So the state of the art is a fork**, and both prongs are bad:
@@ -238,7 +253,8 @@ Three things fall out of that table.
 
 - **Medplum's conceptual pipeline**: an internal, pre-resolved schema model (theirs is a hand-rolled FHIR Schema — same shape as ours), a per-type input dispatch, recursion into complex types, and **`applyDefaultValuesToResource`** — pre-fill `fixed`/`pattern` values from the profile so nobody types `system: http://loinc.org` by hand.
 - **clinFHIR's stance, which is the correct one**: *"extensions are normal in FHIR, remember"* — render them **inline with ordinary elements, tinted differently**, not in a separate "Extensions" panel.
-- **Forge's `context` filtering** when offering extensions at a node. It is the only thing that makes an extension picker usable rather than a list of 400 URLs.
+- **Forge's `context` filtering** when offering extensions at a node — an extension declares which elements it may attach to, and honouring that is the only thing that makes an extension picker usable rather than a list of 400 URLs. (Note this needs the extension catalogue from §5 before it can work at all.)
+- **Simplifier's keystroke-level validation feedback** — and we can beat it, because theirs is a server round-trip and ours is a pure function call.
 - **The three-pane layout** — tree navigator / node editor / live JSON + validate. clinFHIR and FRED converged on it independently, a decade apart.
 
 ### What we should not copy
