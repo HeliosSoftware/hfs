@@ -206,44 +206,62 @@ impl S3Backend {
             .filter(|p| !p.is_empty())
     }
 
+    /// Resolves the bucket and (un-tenanted) keyspace for state that spans
+    /// tenants — the tenant registry and the per-user settings store.
+    ///
+    /// Such state lives outside any tenant prefix: in `PrefixPerTenant` mode it
+    /// sits under `[prefix/]` in the shared bucket, alongside the per-tenant
+    /// directories; in `BucketPerTenant` mode there is no single natural bucket,
+    /// so the tenant-independent `default_system_bucket` is used. Returns `None`
+    /// when no such location exists (bucket-per-tenant without a system bucket),
+    /// in which case cross-tenant state cannot be stored at all.
+    ///
+    /// Note the keyspace is deliberately *not* passed through
+    /// [`with_tenant_prefix`](S3Keyspace::with_tenant_prefix): callers own the
+    /// segment that distinguishes their namespace.
+    pub(crate) fn shared_location(&self) -> Option<TenantLocation> {
+        let bucket = match &self.config.tenancy_mode {
+            S3TenancyMode::PrefixPerTenant { bucket } => bucket.clone(),
+            S3TenancyMode::BucketPerTenant {
+                default_system_bucket,
+                ..
+            } => default_system_bucket.clone()?,
+        };
+        Some(TenantLocation {
+            bucket,
+            keyspace: S3Keyspace::new(self.global_prefix()),
+        })
+    }
+
+    /// Resolves the bucket and keyspace holding the tenant registry, which spans
+    /// tenants and so lives under `[prefix/]tenants/`. `None` means the registry
+    /// is unsupported for this configuration.
+    pub(crate) fn registry_location(&self) -> Option<TenantLocation> {
+        self.shared_location()
+    }
+
     /// Resolves the bucket and keyspace holding the per-user settings objects.
     ///
     /// Unlike [`tenant_location`](Self::tenant_location) this takes no
     /// [`TenantContext`]: per-user settings are *user-global*, not per-tenant (a
     /// "default tenant" preference is inherently cross-tenant), and the
     /// [`SettingsStore`](crate::core::SettingsStore) trait accordingly has no
-    /// tenant argument. The keyspace is therefore built from the global prefix
-    /// alone, with **no** tenant segment.
+    /// tenant argument.
     ///
-    /// In `PrefixPerTenant` mode all tenants already share one bucket, so that
-    /// bucket holds the settings. In `BucketPerTenant` mode there is no single
-    /// natural bucket, so the tenant-independent `default_system_bucket` is used;
-    /// when an operator has not configured one, per-user settings cannot be
-    /// stored and this returns an actionable configuration error.
+    /// When no tenant-independent bucket is configured (bucket-per-tenant with no
+    /// `default_system_bucket`) per-user settings cannot be stored, and this
+    /// returns an actionable configuration error rather than silently writing
+    /// into some arbitrary tenant's bucket.
     pub(crate) fn settings_location(&self) -> StorageResult<TenantLocation> {
-        let keyspace = S3Keyspace::new(self.global_prefix());
-
-        match &self.config.tenancy_mode {
-            S3TenancyMode::PrefixPerTenant { bucket } => Ok(TenantLocation {
-                bucket: bucket.clone(),
-                keyspace,
-            }),
-            S3TenancyMode::BucketPerTenant {
-                default_system_bucket,
-                ..
-            } => {
-                let bucket = default_system_bucket.clone().ok_or_else(|| {
-                    StorageError::Backend(BackendError::Internal {
-                        backend_name: "s3".to_string(),
-                        message: "per-user settings require a tenant-independent bucket: set \
-                                  `default_system_bucket` in bucket-per-tenant mode"
-                            .to_string(),
-                        source: None,
-                    })
-                })?;
-                Ok(TenantLocation { bucket, keyspace })
-            }
-        }
+        self.shared_location().ok_or_else(|| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "s3".to_string(),
+                message: "per-user settings require a tenant-independent bucket: set \
+                          `default_system_bucket` in bucket-per-tenant mode"
+                    .to_string(),
+                source: None,
+            })
+        })
     }
 
     /// Maps a low-level `S3ClientError` to the shared `StorageError` taxonomy.

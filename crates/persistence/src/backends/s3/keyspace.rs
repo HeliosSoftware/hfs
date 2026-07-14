@@ -75,6 +75,23 @@ impl S3Keyspace {
         self.join(&["resources", resource_type, "/"])
     }
 
+    /// Key for a tenant's registry record — one JSON object per registered
+    /// tenant. The registry spans tenants, so this is only meaningful on an
+    /// un-tenanted keyspace (no `with_tenant_prefix`).
+    pub fn tenant_registry_key(&self, tenant_id: &str) -> String {
+        self.join(&["tenants", &format!("{}.json", sanitize(tenant_id))])
+    }
+
+    /// Prefix covering all tenant registry records.
+    pub fn tenant_registry_prefix(&self) -> String {
+        self.join(&["tenants/"])
+    }
+
+    /// Prefix covering all history index events (type- and system-level).
+    pub fn history_root_prefix(&self) -> String {
+        self.join(&["history/"])
+    }
+
     /// Key for a type-level history index event.
     ///
     /// The filename encodes the event timestamp in milliseconds, resource ID,
