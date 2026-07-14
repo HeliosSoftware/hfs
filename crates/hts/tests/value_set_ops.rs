@@ -168,6 +168,140 @@ async fn expand_is_a_codesystem_flat_with_exclude_nested() {
     );
 }
 
+/// An include carrying an `is-a` filter designates a hierarchy subtree, so an
+/// unpaged expansion of it nests by default (IG `search/search-filter-yes`).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_filter_nests_by_default() {
+    let app = TestApp::new();
+    app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", isa_filter_expand(&[]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    let top_codes: Vec<&str> = top.iter().filter_map(|c| c["code"].as_str()).collect();
+    assert_eq!(
+        top_codes,
+        vec!["parent"],
+        "an is-a filter should nest its matches under the filter root, got {body}"
+    );
+
+    let children: Vec<&str> = top[0]["contains"]
+        .as_array()
+        .expect("parent should nest its children")
+        .iter()
+        .filter_map(|c| c["code"].as_str())
+        .collect();
+    assert_eq!(children, vec!["child1", "child2"]);
+}
+
+/// Paging suppresses the is-a-filter default nesting. Tree mode returns the whole
+/// subtree and ignores `count`/`offset`, so a paged request must stay flat and
+/// honour `count` — otherwise `count=10` over a SNOMED root reads ~10^5 concepts
+/// and returns all of them (regression guard for issue #227).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_filter_stays_flat_when_paged() {
+    let app = TestApp::new();
+    app.import_bundle_ok(ISA_HIERARCHY_BUNDLE).await;
+
+    let req = isa_filter_expand(&[r#"{"name":"count","valueInteger":2}"#]);
+    let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    assert_eq!(top.len(), 2, "count=2 must cap the expansion, got {body}");
+    assert!(
+        top.iter().all(|c| c.get("contains").is_none()),
+        "a paged expansion must stay flat: {body}"
+    );
+}
+
+/// Unlike paging, a text `filter` does NOT suppress the default nesting: the IG
+/// `search/search-filter-yes` fixture filters on `"data"` and still expects the
+/// matches nested under `data-exchange`. Mirrors that fixture locally.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn expand_is_a_filter_with_text_filter_still_nests() {
+    let app = TestApp::new();
+    app.import_bundle_ok(DATA_EXCHANGE_BUNDLE).await;
+
+    let req = r#"{"resourceType":"Parameters","parameter":[
+      {"name":"filter","valueString":"data"},
+      {"name":"valueSet","resource":{"resourceType":"ValueSet","url":"http://hts.test/vs/de-filter","status":"active",
+        "compose":{"include":[{"system":"http://hts.test/search",
+          "filter":[{"property":"code","op":"is-a","value":"data-exchange"}]}]}}}
+    ]}"#;
+    let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let top = body["expansion"]["contains"].as_array().unwrap();
+    let top_codes: Vec<&str> = top.iter().filter_map(|c| c["code"].as_str()).collect();
+    assert_eq!(
+        top_codes,
+        vec!["data-exchange"],
+        "a text-filtered subsumption expansion should still nest, got {body}"
+    );
+
+    let children: Vec<&str> = top[0]["contains"]
+        .as_array()
+        .expect("data-exchange should nest its children")
+        .iter()
+        .filter_map(|c| c["code"].as_str())
+        .collect();
+    assert_eq!(
+        children,
+        vec!["data-exchange1", "data-exchange2", "data-exchange3"]
+    );
+}
+
+/// Mirrors the IG `search` CodeSystem: a `data-exchange` root whose three
+/// children all match the text filter `"data"`.
+#[cfg(feature = "sqlite")]
+const DATA_EXCHANGE_BUNDLE: &str = r#"{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    { "resource": {
+        "resourceType": "CodeSystem",
+        "id": "search-cs",
+        "url": "http://hts.test/search",
+        "version": "1.0",
+        "status": "active",
+        "content": "complete",
+        "hierarchyMeaning": "is-a",
+        "concept": [
+          { "code": "data-exchange", "display": "Data Exchange",
+            "concept": [
+              { "code": "data-exchange1", "display": "Data Exchange1" },
+              { "code": "data-exchange2", "display": "Data Exchange2" },
+              { "code": "data-exchange3", "display": "Data Exchange3" }
+            ]
+          }
+        ]
+    }}
+  ]
+}"#;
+
+/// `$expand` of an inline compose whose only include carries `is-a parent` over
+/// [`ISA_HIERARCHY_BUNDLE`], plus any `extra` Parameters entries.
+#[cfg(feature = "sqlite")]
+fn isa_filter_expand(extra: &[&str]) -> String {
+    let mut parameter = extra.to_vec();
+    parameter.push(
+        r#"{"name":"valueSet","resource":{"resourceType":"ValueSet","url":"http://hts.test/vs/isa-filter","status":"active",
+             "compose":{"include":[{"system":"http://hts.test/isa",
+               "filter":[{"property":"concept","op":"is-a","value":"parent"}]}]}}}"#,
+    );
+    format!(
+        r#"{{"resourceType":"Parameters","parameter":[{}]}}"#,
+        parameter.join(",")
+    )
+}
+
 // ── $validate-code (ValueSet) ─────────────────────────────────────────────────
 
 #[cfg(feature = "sqlite")]
