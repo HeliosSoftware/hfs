@@ -285,3 +285,41 @@ search-setup-body = Verwandelt Beschreibungen in Alltagssprache in FHIR-Suchabfr
 search-setup-key-placeholder = Ihr API-Schlüssel
 search-setup-disable = Um die Funktion vollständig zu entfernen — Endpunkt, Seite und diesen Hinweis — setzen Sie HFS_NL_SEARCH_ENABLED=false.
 search-setup-docs = Anleitung lesen
+
+## Ressourcen-Editor (#264)
+
+editor-heading = Ressourcen-Editor
+editor-lede = Bearbeiten Sie eine Ressource anhand ihres Schemas: fügen Sie jedes vom Schema erlaubte Element in beliebiger Tiefe hinzu — auch Extensions, an jedem Knoten, der sie zulässt.
+editor-title = Ressource bearbeiten
+editor-view-label = Bearbeitungsmodus
+editor-view-form = Geführtes Formular
+editor-view-json = JSON
+editor-save = Änderungen speichern
+editor-delete = Löschen
+editor-remove = Diesen Knoten entfernen
+editor-saved = Gespeichert.
+editor-load-error = Diese Ressource konnte nicht geladen werden.
+editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
+editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
+editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
+
+editor-add = Element hinzufügen
+editor-add-filter = Elemente filtern
+editor-add-another = weiteres hinzufügen
+editor-pick-type = Typ wählen…
+editor-extension-url = Extension-URL
+editor-add-extension = Extension hinzufügen
+
+editor-valid = Keine Probleme.
+editor-issues = { $count ->
+    [one] { $count } Problem
+   *[other] { $count } Probleme
+}
+
+editor-modifier-badge = Modifier
+editor-modifier-warning = Eine Modifier-Extension ändert die Bedeutung der Ressource. Ein System, das sie nicht kennt, muss die Verarbeitung verweigern.
+editor-unknown-badge = nicht im Schema
+editor-unknown-hint = Das Schema beschreibt dieses Element nicht. Es wird angezeigt, damit es nicht stillschweigend verloren geht, und beim Speichern erhalten.
+
+editor-primitive-extension-badge = + Extension
+editor-primitive-extension-hint = Dieser Wert trägt eigene Extensions (ein `_`-Geschwister im JSON). Sie bleiben beim Speichern erhalten.

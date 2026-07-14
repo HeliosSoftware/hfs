@@ -1,0 +1,66 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("editor-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content_class %} content--wide{% endblock %}
+
+{% block content %}
+<!--
+  Resource editor (#264), following the Figma "Resources - Edit" frame: the
+  Guided form / JSON toggle, the version rail, Save & Delete. The shell is
+  Brett's; what fills the Guided form is not a fixed list of friendly fields but
+  the resource's actual schema, so it can add a second address, an extension on
+  a name, or a value[x] the designer never thought of.
+
+  The resource is fetched by the browser from the ordinary FHIR API and posted
+  to /ui/editor/render — the UI crate never touches storage.
+-->
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("editor-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("editor-lede") }}</p>
+</section>
+
+<div class="editor" id="editor"
+     data-type="{{ resource_type }}"
+     data-id="{{ resource_id }}"
+     data-msg-load-error="{{ i18n.t("editor-load-error") }}"
+     data-msg-saved="{{ i18n.t("editor-saved") }}"
+     data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}">
+
+  <div class="editor__bar">
+    <div class="editor__title">
+      <h2>{{ i18n.t("editor-title") }}</h2>
+      <span class="editor__subject" id="editor-subject"></span>
+    </div>
+
+    <!-- Two views of one document, exactly as designed. -->
+    <div class="seg" role="group" aria-label="{{ i18n.t("editor-view-label") }}">
+      <button type="button" class="seg__btn" data-view-btn="form" aria-pressed="true">
+        <span class="icon">{% include "icons/sliders.svg" %}</span>
+        {{ i18n.t("editor-view-form") }}
+      </button>
+      <button type="button" class="seg__btn" data-view-btn="json" aria-pressed="false">
+        <span class="icon">{% include "icons/code.svg" %}</span>
+        {{ i18n.t("editor-view-json") }}
+      </button>
+    </div>
+
+    <div class="editor__actions">
+      <button type="button" class="btn" id="editor-delete">{{ i18n.t("editor-delete") }}</button>
+      <button type="button" class="btn btn--primary" id="editor-save">{{ i18n.t("editor-save") }}</button>
+    </div>
+  </div>
+
+  <div class="editor__status" id="editor-status" role="status"></div>
+
+  <!--
+    The whole editor body — tree, source, validation — is server-rendered and
+    swapped as one fragment on every structural mutation. The in-flight document
+    rides inside it in a hidden field: it is the state, and there is nowhere
+    else it lives.
+  -->
+  <div class="editor__body" id="editor-body"></div>
+</div>
+
+<script src="/ui/assets/editor.js" defer></script>
+{% endblock %}

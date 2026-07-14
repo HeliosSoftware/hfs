@@ -85,10 +85,10 @@
         {{ i18n.t("nav-search") }}
       </span>
       {% endif %}
-      <span class="nav-item nav-item--soon">
+      <a class="nav-item" href="/ui/editor"{% if active_page == "editor" %} aria-current="page"{% endif %}>
         <span class="icon">{% include "icons/pencil.svg" %}</span>
         {{ i18n.t("nav-resource-editor") }}
-      </span>
+      </a>
       <span class="nav-item nav-item--soon">
         <span class="icon">{% include "icons/history.svg" %}</span>
         {{ i18n.t("nav-history-versions") }}

@@ -1926,3 +1926,378 @@ button.filter-rail__item {
     display: none;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Resource editor (#264, Figma "Resources - Edit").
+
+   Brett's shell — the Guided form / JSON toggle, Save & Delete — with a tree
+   that is generated from the resource's schema rather than from a fixed list of
+   friendly fields. Extensions are tinted, not exiled: they are ordinary
+   elements and they render inline with everything else.
+   --------------------------------------------------------------------------- */
+
+.editor__bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 18px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  box-shadow: var(--surface-shadow);
+}
+
+.editor__title h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.editor__subject {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.editor__actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.editor__status {
+  min-height: 20px;
+  margin: 10px 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.editor__status--ok {
+  color: var(--accent);
+}
+
+.editor__status--error {
+  color: var(--text);
+}
+
+.editor__panes {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 16px;
+  align-items: start;
+}
+
+.editor__pane {
+  min-width: 0;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  box-shadow: var(--surface-shadow);
+}
+
+.editor__parse-error {
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  background: var(--input-bg);
+  border: 1px solid var(--muted);
+  border-radius: 10px;
+}
+
+.editor__parse-error code {
+  display: block;
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ---- the tree ---- */
+
+.editor-row {
+  padding: 3px 0;
+  border-left: 1px solid transparent;
+}
+
+.editor-row__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.editor-row__label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.editor-row__type {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.editor-row__input {
+  flex: 1;
+  min-width: 0;
+  max-width: 420px;
+  height: 28px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+.editor-row__input:focus {
+  border-color: var(--accent);
+}
+
+.editor-row__del {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.editor-row__del:hover {
+  color: var(--text);
+  border-color: var(--surface-border);
+}
+
+/* Extensions are normal FHIR. Tinted, not exiled. */
+.editor-row--extension > .editor-row__head .editor-row__label {
+  color: var(--accent);
+}
+
+/* A modifier extension changes the meaning of the resource: an unrecognised
+   one must stop processing. It gets an outline, not a tint. */
+.editor-row--modifier {
+  border-left: 2px solid var(--muted);
+  padding-left: 6px;
+}
+
+.editor-row__warn {
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-strong);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  cursor: help;
+}
+
+.editor-row__warn--muted {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--surface-border);
+}
+
+.editor-row--error .editor-row__input {
+  border-color: var(--accent);
+}
+
+.editor-row__error {
+  margin: 2px 0 4px 0;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* ---- "what can I add here?" ---- */
+
+.editor-add {
+  margin: 2px 0 6px;
+}
+
+.editor-add__toggle {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px dashed var(--surface-border);
+  border-radius: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.editor-add__toggle::-webkit-details-marker {
+  display: none;
+}
+
+.editor-add__toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.editor-add__panel {
+  max-width: 520px;
+  margin-top: 6px;
+  padding: 10px;
+  background: var(--bg-content);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+}
+
+.editor-add__filter {
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  margin-bottom: 8px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+.editor-add__list {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.editor-add__item,
+.editor-add__choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.editor-add__item:hover {
+  background: var(--accent-soft);
+}
+
+.editor-add__name em {
+  color: var(--accent);
+  font-style: normal;
+}
+
+.editor-add__type,
+.editor-add__again {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.editor-add__choice select {
+  margin-left: auto;
+  height: 26px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+}
+
+/* The ad-hoc extension: any URL, at any node. The thing the surveyed editors
+   cannot do without a profile. */
+.editor-add__ext {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--surface-border);
+}
+
+.editor-add__ext label {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.editor-add__ext-url {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+/* ---- source view & validity rail ---- */
+
+.editor__source {
+  width: 100%;
+  min-height: 460px;
+  padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  outline: none;
+  resize: vertical;
+}
+
+.editor__source-hint {
+  margin: 8px 2px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.editor__side {
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  box-shadow: var(--surface-shadow);
+}
+
+.editor__validity {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.editor__validity--ok {
+  color: var(--accent);
+}
+
+.editor__orphan {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+@media (max-width: 1100px) {
+  .editor__panes {
+    grid-template-columns: 1fr;
+  }
+}

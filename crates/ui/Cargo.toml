@@ -14,10 +14,10 @@ keywords = ["helios-software", "fhir", "ui", "htmx"]
 # (SearchParameter registry snapshot, compartment definitions) cover exactly
 # the versions the server is built with. R4 is the workspace default.
 default = ["R4"]
-R4 = ["helios-fhir/R4"]
-R4B = ["helios-fhir/R4B"]
-R5 = ["helios-fhir/R5"]
-R6 = ["helios-fhir/R6"]
+R4 = ["helios-fhir/R4", "helios-fhir-validator/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhir-validator/R5"]
+R6 = ["helios-fhir/R6", "helios-fhir-validator/R6"]
 
 [dependencies]
 # Read paths into the rest of the workspace: the SearchParameter spec loader
@@ -25,6 +25,12 @@ R6 = ["helios-fhir/R6"]
 # (#237). Data flows one way — the UI depends on the workspace, never the
 # reverse.
 helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
+
+# The FHIR Schema IR and the editor projection (#264, on top of #232). The
+# resolver is a synchronous hashmap lookup, and FHIRPath is an optional feature
+# we deliberately do not take: the live editing loop needs the cheap structural
+# pass, not the async effects pass.
+helios-fhir-validator = { path = "../fhir-validator", version = "0.2.1", default-features = false }
 
 # Parses the vendored CompartmentDefinition spec JSONs (data/compartments/)
 # at first use, and derives the query-string extractors. Both already in the

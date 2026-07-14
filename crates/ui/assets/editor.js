@@ -1,0 +1,275 @@
+/*
+ * Resource editor (#264).
+ *
+ * This script is deliberately thin, and that is the whole architectural point.
+ * It does not model the resource, it does not know what a choice type is, it
+ * has never heard of cardinality, and it cannot tell an extension from a family
+ * name. All of that lives in Rust, behind /ui/editor/render, where it is tested.
+ *
+ * What the script does:
+ *   1. fetches the resource from the ordinary FHIR API,
+ *   2. hands the document to the server with whatever the user just did,
+ *   3. swaps in the HTML the server hands back,
+ *   4. saves it again through the ordinary FHIR API.
+ *
+ * The document lives in a hidden field inside the fragment the server renders.
+ * It is the single copy. Nothing here derives from it, so nothing here can lose
+ * a key it did not understand -- which is the failure mode of every schema-driven
+ * editor we surveyed for #264.
+ */
+(function () {
+  "use strict";
+
+  var root = document.getElementById("editor");
+  if (!root || !window.fetch) return;
+
+  var body = document.getElementById("editor-body");
+  var status = document.getElementById("editor-status");
+  var subject = document.getElementById("editor-subject");
+  var messages = root.dataset;
+
+  var resourceType = messages.type;
+  var resourceId = messages.id;
+
+  function say(text, kind) {
+    status.textContent = text || "";
+    status.className = "editor__status" + (kind ? " editor__status--" + kind : "");
+  }
+
+  /* ---- the round trip -------------------------------------------------- */
+
+  /* Posts the document plus one mutation, and swaps in the re-rendered body.
+   * `op` is empty for a plain re-render (first load, or after a source edit). */
+  function send(op, fields) {
+    /* URLSearchParams, not FormData: fetch sends FormData as multipart, and the
+     * server takes an urlencoded form. */
+    var form = new URLSearchParams();
+    form.set("doc", currentDocument());
+    form.set("op", op || "");
+    Object.keys(fields || {}).forEach(function (key) {
+      form.set(key, fields[key]);
+    });
+
+    return fetch("/ui/editor/render", { method: "POST", body: form })
+      .then(function (response) {
+        return response.text();
+      })
+      .then(function (html) {
+        body.innerHTML = html;
+        applyView();
+      });
+  }
+
+  /* The in-flight document. It only ever comes from the server's fragment. */
+  function currentDocument() {
+    var field = document.getElementById("editor-doc");
+    return field ? field.value : "{}";
+  }
+
+  /* ---- loading --------------------------------------------------------- */
+
+  function load() {
+    if (!resourceId) {
+      // A new, empty resource of the requested type. Seed the hidden field the
+      // fragment will replace, then render it.
+      var seed = new URLSearchParams();
+      seed.set("doc", JSON.stringify({ resourceType: resourceType }));
+      seed.set("op", "");
+      return fetch("/ui/editor/render", { method: "POST", body: seed })
+        .then(function (r) { return r.text(); })
+        .then(function (html) { body.innerHTML = html; applyView(); });
+    }
+    return fetch("/" + resourceType + "/" + resourceId, {
+      headers: { Accept: "application/fhir+json" },
+    })
+      .then(function (response) {
+        if (!response.ok) throw new Error(String(response.status));
+        return response.json();
+      })
+      .then(function (resource) {
+        subject.textContent =
+          resourceType +
+          "/" +
+          (resource.id || "") +
+          (resource.meta && resource.meta.lastUpdated
+            ? " · " + new Date(resource.meta.lastUpdated).toLocaleString()
+            : "");
+        var form = new URLSearchParams();
+        form.set("doc", JSON.stringify(resource));
+        form.set("op", "");
+        return fetch("/ui/editor/render", { method: "POST", body: form })
+          .then(function (r) {
+            return r.text();
+          })
+          .then(function (html) {
+            body.innerHTML = html;
+            applyView();
+          });
+      })
+      .catch(function () {
+        say(messages.msgLoadError, "error");
+      });
+  }
+
+  /* ---- the two views --------------------------------------------------- */
+
+  var view = "form";
+  function applyView() {
+    root.querySelectorAll("[data-view]").forEach(function (pane) {
+      pane.hidden = pane.dataset.view !== view;
+    });
+    root.querySelectorAll("[data-view-btn]").forEach(function (button) {
+      button.setAttribute(
+        "aria-pressed",
+        button.dataset.viewBtn === view ? "true" : "false"
+      );
+    });
+  }
+
+  root.addEventListener("click", function (event) {
+    var toggle = event.target.closest("[data-view-btn]");
+    if (toggle) {
+      // Leaving the source view: the text the user typed becomes the document.
+      if (view === "json" && toggle.dataset.viewBtn === "form") {
+        var source = document.getElementById("editor-source");
+        if (source) {
+          var field = document.getElementById("editor-doc");
+          if (field) field.value = source.value;
+          view = "form";
+          send("");
+          return;
+        }
+      }
+      view = toggle.dataset.viewBtn;
+      applyView();
+      return;
+    }
+
+    /* ---- structural mutations: each is one round trip ------------------ */
+
+    var add = event.target.closest("[data-add]");
+    if (add) {
+      send("add", { path: add.dataset.add, name: add.dataset.name });
+      return;
+    }
+
+    var remove = event.target.closest("[data-remove]");
+    if (remove) {
+      send("remove", { path: remove.dataset.remove });
+      return;
+    }
+
+    var extension = event.target.closest("[data-extension]");
+    if (extension) {
+      var panel = extension.closest(".editor-add__ext");
+      var url = panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "";
+      send("extension", { path: extension.dataset.extension, url: url });
+      return;
+    }
+
+    if (event.target.id === "editor-save") save();
+    if (event.target.id === "editor-delete") remove_resource();
+  });
+
+  /* A value[x]: the user picks the type, the server creates the branch. */
+  root.addEventListener("change", function (event) {
+    var choose = event.target.closest("[data-choose]");
+    if (choose && choose.value) {
+      send("choose", {
+        path: choose.dataset.choose,
+        name: choose.dataset.declarer,
+        arm: choose.value,
+      });
+    }
+  });
+
+  /* Primitive edits do not round-trip per keystroke -- only on blur, when the
+   * value is settled. The server re-validates, so the error appears where the
+   * mistake is. */
+  root.addEventListener(
+    "blur",
+    function (event) {
+      var input = event.target.closest("[data-set]");
+      if (!input) return;
+      send("set", { path: input.dataset.set, value: input.value });
+    },
+    true
+  );
+
+  /* Typeahead over the "add" list -- the only thing here that is purely
+   * cosmetic, and the only thing that would be silly to round-trip. */
+  root.addEventListener("input", function (event) {
+    var filter = event.target.closest(".editor-add__filter");
+    if (!filter) return;
+    var needle = filter.value.trim().toLowerCase();
+    var panel = filter.closest(".editor-add__panel");
+    panel.querySelectorAll("[data-add-name]").forEach(function (item) {
+      item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) === -1;
+    });
+  });
+
+  /* ---- saving ---------------------------------------------------------- */
+
+  function save() {
+    var doc = currentDocument();
+    var parsed;
+    try {
+      parsed = JSON.parse(doc);
+    } catch (error) {
+      say(String(error), "error");
+      return;
+    }
+
+    var isNew = !parsed.id;
+    var url = "/" + resourceType + (isNew ? "" : "/" + parsed.id);
+
+    fetch(url, {
+      method: isNew ? "POST" : "PUT",
+      headers: {
+        "Content-Type": "application/fhir+json",
+        Accept: "application/fhir+json",
+      },
+      body: doc,
+    })
+      .then(function (response) {
+        return response.json().then(function (payload) {
+          return { ok: response.ok, payload: payload };
+        });
+      })
+      .then(function (result) {
+        if (!result.ok) {
+          // The server refused it. Show its OperationOutcome, not our guess.
+          var issue = result.payload && result.payload.issue && result.payload.issue[0];
+          say(
+            (issue && (issue.diagnostics || (issue.details && issue.details.text))) ||
+              "",
+            "error"
+          );
+          return;
+        }
+        say(messages.msgSaved, "ok");
+        if (result.payload && result.payload.id && !parsed.id) {
+          resourceId = result.payload.id;
+        }
+      })
+      .catch(function (error) {
+        say(String(error), "error");
+      });
+  }
+
+  function remove_resource() {
+    var parsed = JSON.parse(currentDocument() || "{}");
+    if (!parsed.id) return;
+    if (!window.confirm(messages.msgConfirmDelete)) return;
+
+    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE" })
+      .then(function (response) {
+        if (response.ok) window.location.href = "/ui/queries";
+      })
+      .catch(function (error) {
+        say(String(error), "error");
+      });
+  }
+
+  load();
+})();

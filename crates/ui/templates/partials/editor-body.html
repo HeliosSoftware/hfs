@@ -1,0 +1,172 @@
+<!--
+  The editor body. Re-rendered whole on every structural mutation: the server
+  applies the edit, re-validates, and hands back this fragment.
+
+  `doc` is the state. Every control below posts it back with the mutation, and
+  the server hands back a new one. Nothing about the resource lives in the
+  browser, which is why a key we never render is also a key we never destroy.
+-->
+<form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML">
+  <input type="hidden" name="doc" id="editor-doc" value="{{ document }}">
+  <input type="hidden" name="op" id="editor-op" value="">
+  <input type="hidden" name="path" id="editor-path" value="">
+  <input type="hidden" name="name" id="editor-name" value="">
+  <input type="hidden" name="arm" id="editor-arm" value="">
+  <input type="hidden" name="url" id="editor-url" value="">
+  <input type="hidden" name="value" id="editor-value" value="">
+  <input type="hidden" name="modifier" id="editor-modifier" value="">
+</form>
+
+{% if let Some(message) = parse_error %}
+<div class="editor__parse-error" role="alert">
+  <strong>{{ i18n.t("editor-invalid-json") }}</strong>
+  <code>{{ message }}</code>
+</div>
+{% else %}
+
+<div class="editor__panes">
+  <!-- Guided form: the schema, made editable. -->
+  <div class="editor__pane editor__pane--form" data-view="form">
+    <div class="editor-tree">
+      {% for row in rows %}
+      <div class="editor-row{% if row.is_extension %} editor-row--extension{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
+           style="padding-left: {{ row.indent }}px"
+           data-path="{{ row.path }}">
+
+        <div class="editor-row__head">
+          <span class="editor-row__label">{{ row.label }}</span>
+
+          {% if !row.type_label.is_empty() %}
+          <span class="editor-row__type">{{ row.type_label }}</span>
+          {% endif %}
+
+          {% if row.is_modifier %}
+          <!-- An unrecognised modifier extension means: do not process this
+               resource. It is the one element in FHIR that is dangerous by
+               omission, and no editor we surveyed says so. -->
+          <span class="editor-row__warn" title="{{ i18n.t("editor-modifier-warning") }}">
+            {{ i18n.t("editor-modifier-badge") }}
+          </span>
+          {% endif %}
+
+          {% if row.is_unknown %}
+          <span class="editor-row__warn editor-row__warn--muted" title="{{ i18n.t("editor-unknown-hint") }}">
+            {{ i18n.t("editor-unknown-badge") }}
+          </span>
+          {% endif %}
+
+          {% if row.has_primitive_extension %}
+          <!-- An extended primitive lives in two keys (birthDate + _birthDate).
+               Marked, and carried through untouched — the quiet data-loss bug
+               every editor surveyed for #264 has. -->
+          <span class="editor-row__warn editor-row__warn--muted" title="{{ i18n.t("editor-primitive-extension-hint") }}">
+            {{ i18n.t("editor-primitive-extension-badge") }}
+          </span>
+          {% endif %}
+
+          {% if row.is_primitive %}
+          <input class="editor-row__input" type="text" value="{{ row.value }}"
+                 data-set="{{ row.path }}"
+                 {% if let Some(vs) = row.binding %}list="vs-{{ vs }}" placeholder="{{ vs }}"{% endif %}>
+          {% endif %}
+
+          {% if row.can_remove %}
+          <button type="button" class="editor-row__del" data-remove="{{ row.path }}"
+                  aria-label="{{ i18n.t("editor-remove") }}" title="{{ i18n.t("editor-remove") }}">×</button>
+          {% endif %}
+        </div>
+
+        {% for message in row.errors %}
+        <p class="editor-row__error">{{ message }}</p>
+        {% endfor %}
+
+        {% if !row.addable.is_empty() %}
+        <!--
+          "What can I add here?" — answered from the schema, per node: spec
+          order, cardinality already spent excluded, value[x] offered as a type
+          pick. This is the affordance the whole editor exists for.
+        -->
+        <details class="editor-add">
+          <summary class="editor-add__toggle">+ {{ i18n.t("editor-add") }}</summary>
+          <div class="editor-add__panel">
+            <input type="search" class="editor-add__filter"
+                   placeholder="{{ i18n.t("editor-add-filter") }}"
+                   aria-label="{{ i18n.t("editor-add-filter") }}">
+            <div class="editor-add__list">
+              {% for option in row.addable %}
+              {% if option.kind == "choice" %}
+              <div class="editor-add__choice" data-add-name="{{ option.name }}">
+                <span class="editor-add__name">{{ option.name }}[x]{% if option.required %} <em>*</em>{% endif %}</span>
+                <select data-choose="{{ row.path }}" data-declarer="{{ option.name }}">
+                  <option value="">{{ i18n.t("editor-pick-type") }}</option>
+                  {% for arm in option.arms %}
+                  <option value="{{ arm }}">{{ arm }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              {% else %}
+              <button type="button" class="editor-add__item" data-add-name="{{ option.name }}"
+                      data-add="{{ row.path }}" data-name="{{ option.name }}">
+                <span class="editor-add__name">{{ option.name }}{% if option.required %} <em>*</em>{% endif %}</span>
+                <span class="editor-add__type">{{ option.type_label }}</span>
+                {% if option.kind == "another" %}
+                <span class="editor-add__again">{{ i18n.t("editor-add-another") }}</span>
+                {% endif %}
+              </button>
+              {% endif %}
+              {% endfor %}
+            </div>
+
+            <!--
+              The ad-hoc extension path. Any node that accepts an extension
+              accepts *any* extension: type a URL and the base Extension type
+              gives us url, a recursive extension, and every value[x] arm. This
+              is what the surveyed editors cannot do without a profile.
+            -->
+            {% if row.accepts_extension %}
+            <div class="editor-add__ext">
+              <label>{{ i18n.t("editor-extension-url") }}</label>
+              <input type="url" class="editor-add__ext-url"
+                     placeholder="http://example.org/fhir/StructureDefinition/…">
+              <button type="button" class="btn" data-extension="{{ row.path }}">
+                {{ i18n.t("editor-add-extension") }}
+              </button>
+            </div>
+            {% endif %}
+          </div>
+        </details>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- The same document, as source. Kept in sync because it is the same object. -->
+  <div class="editor__pane editor__pane--json" data-view="json" hidden>
+    <textarea class="editor__source" id="editor-source" spellcheck="false">{{ pretty }}</textarea>
+    <p class="editor__source-hint">{{ i18n.t("editor-source-hint") }}</p>
+  </div>
+
+  <!-- Validation, live. Errors are anchored to their row above; these are the
+       ones whose path no row owns, surfaced rather than swallowed. -->
+  <aside class="editor__side">
+    <div class="editor__validity{% if error_count == 0 %} editor__validity--ok{% endif %}">
+      {% if error_count == 0 %}
+      {{ i18n.t("editor-valid") }}
+      {% else %}
+      {{ i18n.t_arg("editor-issues", "count", error_count.to_string()) }}
+      {% endif %}
+    </div>
+    {% for message in orphan_errors %}
+    <p class="editor__orphan">{{ message }}</p>
+    {% endfor %}
+  </aside>
+</div>
+
+<!-- Required bindings become closed lists; the codes come from the schema. -->
+{% for row in rows %}
+{% if let Some(vs) = row.binding %}
+<datalist id="vs-{{ vs }}"></datalist>
+{% endif %}
+{% endfor %}
+{% endif %}

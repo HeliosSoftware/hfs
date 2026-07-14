@@ -20,6 +20,7 @@
 //! (see `docs/multi-language.md`); templates hold catalog keys, not prose.
 
 mod compartments;
+mod editor;
 mod i18n;
 mod search_params;
 
@@ -236,6 +237,13 @@ pub fn mount(
         .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/compartments", get(compartments_page))
+        // Schema-driven resource editor (#264). One POST endpoint applies every
+        // structural mutation and re-renders: the document rides with it.
+        .route("/ui/editor", get(editor::page))
+        .route(
+            "/ui/editor/render",
+            axum::routing::post(editor::render_body),
+        )
         .route("/ui/status", get(status));
 
     if nl_enabled {
