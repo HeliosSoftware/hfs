@@ -1,6 +1,6 @@
 ---
 name: work-with-auth
-description: Work on HFS authentication & authorization. Use for SMART-on-FHIR/OAuth2, JWT bearer validation, JWKS, scopes/permissions, the JTI replay cache, SMART discovery, and HFS_AUTH_* configuration.
+description: Work on HFS authentication & authorization. Use for SMART-on-FHIR/OAuth2, JWT bearer validation, JWKS, scopes/permissions, token replay semantics, SMART discovery, and HFS_AUTH_* configuration.
 ---
 
 # Authentication & Authorization
@@ -13,8 +13,8 @@ Use this when working in `helios-auth` or HFS auth behavior. The crate validates
 - Validates JWTs against a JWKS endpoint (`HFS_AUTH_JWKS_URL`), checking issuer, audience, and signing algorithm.
 - Enforces SMART v2 scopes (e.g. `system/Patient.rs`) via `SmartScopePolicy` / `ScopeSet` / `SmartPermissions`.
 - Derives the tenant from a JWT claim (`HFS_AUTH_TENANT_CLAIM`, default `tenant_id`).
-- Replay protection via a JTI cache (in-memory or Redis).
 - Serves `/.well-known/smart-configuration` (SMART discovery), populated from the `HFS_SMART_*` endpoints.
+- Holds no cross-instance state: validation is local, so instances behind a load balancer need no shared infrastructure.
 
 ## Environment
 
@@ -26,29 +26,30 @@ Use this when working in `helios-auth` or HFS auth behavior. The crate validates
 | `HFS_AUTH_AUDIENCE` | none | Expected `aud` |
 | `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Allowed signing algorithms |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim used to resolve the tenant |
-| `HFS_AUTH_JTI_BACKEND` | `disabled` | JTI replay cache: `disabled`, `memory`, or `redis` |
-| `HFS_AUTH_REDIS_URL` | none | Redis URL when JTI backend is `redis` |
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds between JWKS refreshes |
 
 SMART discovery passthrough (advertised in `/.well-known/smart-configuration`): `HFS_SMART_TOKEN_ENDPOINT`, `HFS_SMART_AUTHORIZE_ENDPOINT`, `HFS_SMART_JWKS_URL`, `HFS_SMART_INTROSPECTION_ENDPOINT`, `HFS_SMART_MANAGEMENT_ENDPOINT`, `HFS_SMART_REGISTRATION_ENDPOINT`, `HFS_SMART_REVOCATION_ENDPOINT`. Outbound calls can carry `HFS_OUTBOUND_BEARER_TOKEN`.
 
-## JTI replay cache
+## Token replay
 
-**Disabled by default.** Single-use `jti` replay protection is meant for
-`private_key_jwt` **client assertions** (RFC 7523 §3), enforced by the IdP's
-token endpoint — not for the reusable **bearer access tokens** HFS validates as
-a resource server. Enabling it rejects the second use of any access token that
-carries a `jti` (which Keycloak and most IdPs always emit), so it is off unless
-your IdP issues genuinely single-use access tokens.
+There is **no `jti` replay cache** — bearer access tokens are accepted as many
+times as the client presents them until they expire. Do not reintroduce one
+(#205): single-use `jti` semantics belong to `private_key_jwt` client assertions
+(RFC 7523 §3), which the authorization server's token endpoint enforces. HFS is
+a resource server with no token endpoint, so every `jti` it sees belongs to a
+*reusable* access token (Keycloak and most IdPs emit one on all of them), and
+replay-checking it rejects the second and every later use of a perfectly valid
+token.
 
-When enabled: `HFS_AUTH_JTI_BACKEND=memory` (per-process) or `redis`. The Redis
-backend needs `HFS_AUTH_REDIS_URL` and the crate built with `--features redis`,
-giving a replay cache shared across instances.
+A replay cache cannot defend a bearer token anyway: a replayed one is
+byte-identical to a legitimate one. Real anti-replay needs sender-constrained
+tokens (DPoP/mTLS), where a fresh per-request proof — not the access token — is
+what gets checked. `crates/auth/tests/bearer_token_reuse.rs` pins this behavior.
 
 ## Key API
 
-`AuthConfig`, `AuthProvider` / `JwksBearerAuthProvider`, `Principal`, `ScopeSet` / `SmartPermissions`, `SmartScopePolicy`, `JtiCache` (`InMemoryJtiCache` / `RedisJtiCache`), `JwksCache`, `SmartConfiguration`.
+`AuthConfig`, `AuthProvider` / `JwksBearerAuthProvider`, `Principal`, `ScopeSet` / `SmartPermissions`, `SmartScopePolicy`, `JwksCache`, `SmartConfiguration`.
 
 ## Code map
 
-`config.rs`, `provider/`, `jwks/` (cache, coordinator, fetcher), `jti/` (memory, redis), `scope/` (smart_v2, permissions), `policy/`, `principal.rs`, `discovery.rs`, `outbound.rs`. Auth scopes are consumed by Bulk Data Submit (`system/bulk-submit`). Unit tests are inline in `src/`; integration tests live under `crates/auth/tests/` where present.
+`config.rs`, `provider/`, `jwks/` (cache, fetcher), `scope/` (smart_v2, permissions), `policy/`, `principal.rs`, `discovery.rs`, `outbound.rs`. Auth scopes are consumed by Bulk Data Submit (`system/bulk-submit`). Unit tests are inline in `src/`; integration tests live under `crates/auth/tests/`.
