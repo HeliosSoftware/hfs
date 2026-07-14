@@ -5,8 +5,37 @@ use crate::error::{BackendError, StorageResult};
 /// Current schema version.
 pub const SCHEMA_VERSION: i32 = 13;
 
+/// Advisory lock key serializing schema initialization across instances
+/// sharing one database (ASCII "HFSSCHEM").
+const SCHEMA_INIT_LOCK_KEY: i64 = 0x4846_5353_4348_454d;
+
 /// Initialize the database schema.
+///
+/// Serialized cluster-wide via a Postgres advisory lock: `CREATE TABLE IF NOT
+/// EXISTS` is not concurrency-safe at the catalog level, so two instances
+/// cold-starting against one empty database race the pg_type insert and the
+/// loser aborts with a duplicate-key error.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_INIT_LOCK_KEY])
+        .await
+        .map_err(|e| pg_error(format!("Failed to acquire schema init lock: {}", e)))?;
+
+    let result = initialize_schema_locked(client).await;
+
+    // The session-level lock outlives this call with the pooled connection —
+    // release it even when init fails, or other instances block on boot.
+    let unlock = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_INIT_LOCK_KEY])
+        .await
+        .map_err(|e| pg_error(format!("Failed to release schema init lock: {}", e)));
+
+    result?;
+    unlock?;
+    Ok(())
+}
+
+async fn initialize_schema_locked(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let current_version = get_schema_version(client).await?;
 
     if current_version == 0 {
