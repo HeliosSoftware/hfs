@@ -916,33 +916,42 @@ impl PostgresQueryBuilder {
             // HAVING, so it can never turn a 0 into a 1, and a group left empty by
             // the prefilter could not have satisfied the HAVING anyway.
             //
-            // Measured on a 1.45M-row replica: the subquery goes from reading all
-            // 180k rows of the parameter's slice to BitmapOr-ing the token and
-            // quantity indexes for 44k, and the query drops from ~120 ms to ~70 ms
-            // solo. The bigger win is under load — the aggregate now fits in
-            // `work_mem` instead of spilling 30 ways, which is what turned this
-            // query into a 40 s timeout in the first place.
+            // Measured on the real benchmark dataset (656,737 Observations,
+            // 1.8M `code-value-quantity` index rows), which is what these numbers
+            // refer to — an earlier, smaller replica gave badly misleading answers
+            // here and every alternative below was ranked wrong by it.
             //
-            // Two more aggressive rewrites were tried and REJECTED on measurement:
+            // Three alternatives were tried and REJECTED against real data:
             //
-            //   • A flat self-join of the components correlated on `composite_group`
-            //     (drive from the token, probe the other component). Slower — ~90 ms
-            //     and 4x the buffers, because the join fans out before it filters.
+            //   • Dropping the prefilter entirely (the pre-#224 form) and reading the
+            //     whole parameter slice index-only from a covering index: 16.5 s. The
+            //     prefilter is load-bearing, not incidental.
+            //
+            //   • A flat self-join of the components correlated on `composite_group`,
+            //     driving from the token. Postgres flattens it, then drives from an
+            //     ordered scan of `resources` and probes — see below for why that is
+            //     fatal here.
             //
             //   • A correlated `EXISTS` (`s.resource_id = resources.id`, grouped per
-            //     resource). This is dramatically better on paper and in isolation —
-            //     it lets Postgres walk `resources` in `last_updated` order and stop
-            //     at the page limit, giving ~1 ms instead of ~120 ms. But it has a
-            //     cliff: when the composite matches *nothing* (the benchmark fires a
-            //     `non-existent$gt0` value in every composite list) the ordered scan
-            //     has no way to know, so it walks every resource of the type — 440 ms,
-            //     6x worse than today. Under 30 concurrent clients the cliff cost
-            //     more than the fast path saved: 90 tps vs 112 tps for the form below.
+            //     resource). Only 222 of 656,737 Observations match this composite, so
+            //     an ordered scan that probes per row must walk ~190k resources to
+            //     collect 21 hits: 8.9 s, and 20 s when nothing matches at all.
             //
-            // If composite ever becomes the bottleneck again, the `EXISTS` form plus
-            // an index on (tenant_id, resource_type, param_name, resource_id,
-            // composite_group) is the measured next step — but it needs an answer to
-            // the zero-match case first.
+            // The common thread: the composite is extremely *sparse*, so the plan must
+            // build the small candidate set first and probe `resources` by primary key
+            // — never walk `resources` and test each row. The grouped subquery below
+            // cannot be flattened or parameterized, which forces exactly that shape.
+            // Its unflattenability is a feature; do not "optimize" it into an EXISTS.
+            //
+            // What remains: this shape still costs ~1 s cold because the Bitmap Heap
+            // Scan fetches ~113k rows in ~112k buffer reads — close to one random page
+            // per row, since a parameter's rows are scattered across a ~10M-row table.
+            // That is I/O, not CPU, and it is why the shape is still ~12 s at 30 VUs.
+            // A covering index does not fix it (the OR-prefilter forces heap access by
+            // construction). The real fix is a storage change: write one row per
+            // composite group with every component's value column populated, so a
+            // single index answers "code = X AND value > Y within one group" directly.
+            // Tracked separately — it needs a writer change, a migration and a backfill.
             let havings = predicates
                 .iter()
                 .map(|p| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", p))

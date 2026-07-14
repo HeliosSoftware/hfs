@@ -921,24 +921,47 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
 
     // Multivariate statistics.
     //
-    // `value_token_code` holds codes from every `param_name` and every
-    // `resource_type` in one column, so Postgres estimates
-    // `param_name = 'code' AND value_token_code = '8302-2'` as the product of two
-    // independent marginals. The columns are in fact almost perfectly correlated
-    // (only `code` rows carry LOINC codes), so the estimate is wrong by orders of
-    // magnitude and the planner flips between a good nested loop and a
-    // catastrophic hash. Per-column stats — i.e. a plain ANALYZE — cannot express
-    // this, which is why the ANALYZE tried in #224 had no measurable effect.
+    // `search_index` is one wide table holding every parameter of every resource
+    // type, so `value_token_code` mixes LOINC codes, Encounter statuses, ActCodes
+    // and so on in a single column. Every token search binds all three of
+    // `resource_type`, `param_name` and `value_token_code`, and the three are
+    // near-perfectly correlated — only Encounter rows have `param_name = 'status'`,
+    // and only those carry `'finished'`. Postgres has no way to know that, so it
+    // multiplies the three independent marginals and lands orders of magnitude low.
+    //
+    // Measured on the benchmark dataset: `Encounter?status=finished` matches ALL
+    // 65,659 Encounters, but was estimated at 1,832 rows — a 36x under-estimate.
+    // On that estimate the planner materializes every matching id, heap-fetches all
+    // 65k rows to sort them, and returns 21: 5,261 ms. With the correlation
+    // captured it instead walks `idx_resources_search` in `last_updated` order and
+    // stops after ~21 rows: 10.4 ms, 4 buffers. A zero-match value
+    // (`status=missing-status`, 0.05 ms) and a high-match control
+    // (`category=laboratory`, 11.8 ms) are unaffected.
+    //
+    // This is why the plain ANALYZE tried in #224 had no measurable effect: no
+    // amount of per-column statistics can express a cross-column correlation, and
+    // the planner was already picking the only plan its estimate justified.
+    //
+    // The MCV list must span all three columns. A two-column
+    // (param_name, value_token_code) object — which is what this migration
+    // originally shipped — still leaves `resource_type` to be multiplied in
+    // independently, and the estimate stays wrong.
     //
     // Best-effort: extended statistics need no special privilege, but a failure
     // here costs plan quality, not correctness, so it must not block startup.
     let stats = [
-        "ALTER TABLE search_index ALTER COLUMN value_token_code SET STATISTICS 1000",
+        // A wide MCV list: the table holds many (type, param, code) combinations and
+        // the ones we must get right — ('Encounter','status','finished'),
+        // ('Observation','category','laboratory') — have to survive in it.
+        "ALTER TABLE search_index ALTER COLUMN value_token_code SET STATISTICS 2000",
         "ALTER TABLE search_index ALTER COLUMN param_name SET STATISTICS 1000",
-        "CREATE STATISTICS IF NOT EXISTS stx_search_param_token (dependencies, mcv)
-         ON param_name, value_token_code FROM search_index",
+        "CREATE STATISTICS IF NOT EXISTS stx_search_type_param_token (mcv, dependencies)
+         ON resource_type, param_name, value_token_code FROM search_index",
         "CREATE STATISTICS IF NOT EXISTS stx_search_type_param (dependencies)
          ON resource_type, param_name FROM search_index",
+        // Superseded by the three-column object above; harmless if it was never
+        // created, and dropped so ANALYZE does not pay for it twice.
+        "DROP STATISTICS IF EXISTS stx_search_param_token",
     ];
     for sql in stats {
         if let Err(e) = client.execute(sql, &[]).await {
