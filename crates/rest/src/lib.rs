@@ -163,7 +163,9 @@ pub mod tenant;
 pub mod terminology;
 
 // Re-export commonly used types
-pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
+pub use config::{
+    JobStoreBackend, MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode,
+};
 pub use error::{RestError, RestResult};
 pub use middleware::auth::AuthMiddlewareState;
 pub use state::AppState;
