@@ -166,13 +166,31 @@ Nothing intrinsic to the rows distinguishes them — only where they came from. 
 FHIR NPM package declares a `canonical` base in its `package.json`; a package
 publishing a URL **outside** its own base is re-publishing someone else's resource.
 That is recorded at import time in `code_systems.authority_rank` /
-`value_sets.authority_rank` (`0` = owner or non-package source, `2` = foreign copy;
-see `import::bundle_parser::authority_rank_for`).
+`value_sets.authority_rank` (see `import::bundle_parser::authority_rank_for`):
+
+| rank | meaning |
+|------|---------|
+| `0` `AUTHORITY_OWNER` | Positive evidence: the package declares a `canonical` base covering this URL, or a native importer loaded the publisher's own distribution (SNOMED RF2, LOINC, …). |
+| `1` `AUTHORITY_UNKNOWN` | Everything else — no package context (REST write, `$import-bundle`), or the package does not declare a base covering the URL. |
+
+**We only promote on positive evidence; we never demote on the absence of it.** That
+asymmetry is load-bearing, and getting it wrong breaks the fix in two ways:
+
+* **A package manifest may not describe its content's authority.** `us.nlm.vsac`
+  declares the fhir.org *registry* base `http://fhir.org/packages/us.nlm.vsac` yet
+  ships 14,850 ValueSets under `http://cts.nlm.nih.gov/...`. Those are genuine
+  originals. Branding them "foreign copies" would be a claim we have not established
+  — and since `vs_precedence_order_by` has no content/has-concepts tier beneath the
+  provenance tier, it would let any REST upload outrank the real VSAC definition
+  outright. Marking them merely *unknown* costs them nothing: rank is only ever a
+  tiebreak among rows sharing a URL, and no one else ships those URLs.
+* **An unattributed write must not claim ownership.** If `$import-bundle` defaulted to
+  `OWNER`, replaying `hl7.fhir.r4.core`'s truncated copy would stamp it rank 0 — and
+  because the upsert's `MIN` only ever *lowers* a rank, that copy would outrank THO's
+  original permanently, reinstating this bug with no way back.
 
 This needs no hardcoded URL list and no hand-maintained package-priority table: it
-self-maintains as packages are added. Resources arriving outside any package (REST
-writes, `$import-bundle`, the native SNOMED/LOINC importers) are authoritative, so an
-operator-supplied resource outranks any vendored copy.
+self-maintains as packages are added.
 
 The tier sits **below** content and has-concepts deliberately: a populated copy still
 beats an empty stub from the owning package — being authoritative is worthless if the

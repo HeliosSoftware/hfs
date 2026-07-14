@@ -259,8 +259,9 @@ ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS languages TEXT NOT NULL D
 -- Adding the column is therefore the signal to invalidate the `.tgz` entries in
 -- the bootstrap ledger, so the next startup re-imports those packages and stamps
 -- the ranks. Without this the column would sit at its DEFAULT 0 on every existing
--- row and the fix would be a silent no-op on an already-populated server: the
--- ledger skips any file whose size and mtime are unchanged.
+-- row (readers coalesce NULL to 0) and the fix would be a silent no-op on any
+-- server with a persistent database: the ledger skips any file whose size and
+-- mtime are unchanged, so packages would never re-import and never stamp a rank.
 --
 -- Only `.tgz` rows are cleared. The multi-GB SNOMED/LOINC/RxNorm archives keep
 -- their ledger entries and are not re-imported — they come from native importers

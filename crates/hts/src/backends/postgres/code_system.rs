@@ -445,11 +445,25 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             Some(c) => c,
             None => {
                 // Match the IG `validation/cs-code-bad-code` text format exactly.
-                let cs_version_str = cs_version_for_msg(&client, &system).await;
-                let cs_content = cs_content_for_url(&client, &system).await;
+                //
+                // Report the row we ACTUALLY validated against. These used to
+                // re-query by URL (`cs_version_for_msg` / `cs_content_for_url`),
+                // which picks the best-ranked row for the canonical — NOT
+                // necessarily the row `resolve_code_system` chose. With a version
+                // pin (now honoured, per issue #200) the two diverge, so the
+                // message could cite a version the code was never checked against
+                // and, worse, `content` gates the fragment→warning vs
+                // complete→error branch below: reading `content` off a different
+                // row can silently downgrade a genuine error to a warning.
+                // Mirrors the SQLite fix in `sqlite/code_system.rs`.
+                let cs_version_str = resolved_cs_version.clone();
+                let cs_content = match resolved_system_id.as_deref() {
+                    Some(id) => cs_content_for_system_id(&client, id).await,
+                    // URL unknown entirely — no resolved row to read from.
+                    None => cs_content_for_url(&client, &system).await,
+                };
 
                 // Fragment CodeSystems: unknown code is a *warning*, not an error.
-                // Mirrors `sqlite/code_system.rs:454-485`.
                 if cs_content.as_deref() == Some("fragment") {
                     let text = match cs_version_str.as_deref() {
                         Some(v) => format!(
@@ -767,11 +781,13 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .get()
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        let sql = format!(
+            "SELECT resource_json->>'language' FROM code_systems \
+             WHERE url = $1 ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
         let row = client
-            .query_opt(
-                "SELECT resource_json->>'language' FROM code_systems WHERE url = $1 LIMIT 1",
-                &[&url],
-            )
+            .query_opt(&sql, &[&url])
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
@@ -1142,14 +1158,15 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
             .await
             .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
 
+        let sql = format!(
+            "SELECT content, version, resource_json->>'supplements' \
+             FROM code_systems \
+             WHERE url = $1 \
+             ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
         let row = client
-            .query_opt(
-                "SELECT content, version, resource_json->>'supplements'
-                 FROM code_systems
-                 WHERE url = $1
-                 LIMIT 1",
-                &[&supplement_url],
-            )
+            .query_opt(&sql, &[&supplement_url])
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         let Some(r) = row else { return Ok(None) };
@@ -1325,6 +1342,26 @@ fn walk_concepts(
 /// most recent (textual COALESCE-DESC), an explicit version with `.x` segments
 /// (or a bare numeric prefix like `"1"`) matches the highest version that
 /// shares the literal segments, and an exact version requires an exact match.
+/// Read `content` for the row we actually resolved, keyed on its storage id.
+///
+/// Keyed on `id`, never on `url`: a canonical URL can have several rows, and the
+/// caller has already chosen one. Re-deriving it from the URL is how the two
+/// backends drifted apart.
+async fn cs_content_for_system_id(
+    client: &tokio_postgres::Client,
+    system_id: &str,
+) -> Option<String> {
+    client
+        .query_opt(
+            "SELECT content FROM code_systems WHERE id = $1",
+            &[&system_id],
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.get::<_, Option<String>>(0))
+}
+
 async fn resolve_code_system(
     client: &tokio_postgres::Client,
     url: &str,

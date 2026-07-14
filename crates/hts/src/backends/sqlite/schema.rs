@@ -510,9 +510,10 @@ pub fn migrate_search_columns(conn: &rusqlite::Connection) -> rusqlite::Result<(
 /// The `ALTER TABLE` returning `Ok` is precisely the signal that this database
 /// predates provenance. In that case we drop the `.tgz` entries from the
 /// `bootstrap_imports` ledger so the next startup re-imports those packages and
-/// stamps the ranks. Without this the column would sit at its `DEFAULT 0` on
-/// every existing row and the fix would be a silent no-op in production, since
-/// the ledger skips files whose size and mtime are unchanged.
+/// stamps the ranks. Without this the column would stay NULL on every existing
+/// row, readers would coalesce it to 0, and the fix would be a silent no-op on any
+/// server with a persistent database — the ledger skips files whose size and mtime
+/// are unchanged, so the packages would never re-import and never stamp provenance.
 ///
 /// Only `.tgz` rows are cleared. The multi-GB SNOMED/LOINC/RxNorm archives keep
 /// their ledger entries and are not re-imported — they arrive through native

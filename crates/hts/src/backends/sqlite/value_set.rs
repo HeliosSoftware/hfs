@@ -1257,6 +1257,24 @@ impl ValueSetOperations for SqliteTerminologyBackend {
     /// Triggers expansion if needed, then checks set membership.
     /// Returns `result = false` (not an error) when the value set or code is
     /// not found.
+    async fn value_set_version_for_url(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let backend = self.clone();
+        let url = url.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = backend
+                .pool()
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            Ok(lookup_value_set_version(&backend, &conn, &url))
+        })
+        .await
+        .map_err(|e| HtsError::StorageError(format!("Task panicked: {e}")))?
+    }
+
     async fn validate_code(
         &self,
         _ctx: &TenantContext,
@@ -6750,8 +6768,9 @@ fn detect_cs_version_mismatch(
     Option<String>,
     Option<String>,
 )> {
-    // Build (id, version) candidate list sorted desc so the first entry is the
-    // highest version — used for both resolution and picking the "actual" ver.
+    // Candidate (id, version) list in precedence order, so the first entry is the
+    // row the server would RESOLVE — not merely the highest version string. The
+    // reported version must name the row validation actually ran against.
     let sql = format!(
         "SELECT id, version FROM code_systems WHERE url = ?1 ORDER BY {}",
         crate::backends::cs_precedence_order_by("code_systems")

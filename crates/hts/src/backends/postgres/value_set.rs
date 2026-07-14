@@ -1026,6 +1026,19 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         })
     }
 
+    async fn value_set_version_for_url(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        Ok(lookup_value_set_version(&client, url).await)
+    }
+
     async fn validate_code(
         &self,
         _ctx: &TenantContext,
@@ -4204,8 +4217,9 @@ pub(super) async fn detect_cs_version_mismatch(
     Option<String>,
     Option<String>,
 )> {
-    // Build (id, version) candidate list sorted desc so the first entry is the
-    // highest version — used for both resolution and picking the "actual" ver.
+    // Candidate (id, version) list in precedence order, so the first entry is the
+    // row the server would RESOLVE — not merely the highest version string. The
+    // reported version must name the row validation actually ran against.
     let sql = format!(
         "SELECT id, version FROM code_systems WHERE url = $1 ORDER BY {}",
         crate::backends::cs_precedence_order_by("code_systems")

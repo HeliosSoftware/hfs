@@ -46,42 +46,79 @@ pub struct ParsedBundle {
     pub fresh_load: bool,
 }
 
-/// Bundle-wrapper key carrying the source package's declared canonical base.
-///
-/// Set by the `.tgz` importer on the transient Bundle it builds around each
-/// batch; read back here. It is deliberately *not* a FHIR element — the wrapper
-/// is never persisted, so nothing in it reaches `resource_json`, and stored
-/// resources stay byte-faithful to what the package shipped.
-pub const SOURCE_CANONICAL_KEY: &str = "_htsSourceCanonical";
-
-/// Authority rank for a resource whose canonical URL is owned by the package
-/// that shipped it — or that arrived outside any package (REST write, native
-/// SNOMED/LOINC importer, `$import-bundle`). Lower wins.
+/// Authority rank for a resource we have POSITIVE evidence is authoritative:
+/// the package that shipped it declares a `canonical` base that covers the
+/// resource's URL, or it came from a native importer loading a publisher's own
+/// distribution (SNOMED RF2, LOINC, RxNorm, …). Lower wins.
 pub const AUTHORITY_OWNER: i32 = 0;
 
-/// Authority rank for a resource shipped by a package that does **not** own its
-/// canonical URL — i.e. a re-published *copy* of someone else's definition.
+/// Authority rank for a resource whose provenance we cannot vouch for.
 ///
-/// The archetype is `hl7.fhir.r4.core`, which declares canonical
-/// `http://hl7.org/fhir` yet re-ships 798 `http://terminology.hl7.org/…`
-/// CodeSystems, each stamped with the *FHIR release* version (`4.0.1`) rather
-/// than the code system's own version. Those copies are frequently truncated
-/// (`audit-event-type` carries 1 of its 5 concepts), so when they collide with
-/// the owning package's row they must lose.
-pub const AUTHORITY_FOREIGN_COPY: i32 = 2;
+/// This is the DEFAULT, and the distinction from [`AUTHORITY_OWNER`] is the
+/// whole point: we only ever *promote* on positive evidence, never *demote* on
+/// the absence of it. A row is `UNKNOWN` when it arrived outside any package
+/// (REST write, `$import-bundle`, CLI bundle) or when the package that shipped
+/// it does not declare a canonical base covering the URL.
+///
+/// That second case deliberately conflates two situations we cannot tell apart:
+///
+/// * `hl7.fhir.r4.core` re-publishing `http://terminology.hl7.org/...` — a
+///   genuine stale copy, which must lose to THO's original. This is issue #200.
+/// * `us.nlm.vsac` shipping `http://cts.nlm.nih.gov/...` while declaring the
+///   fhir.org *registry* base `http://fhir.org/packages/us.nlm.vsac` — a genuine
+///   ORIGINAL whose manifest simply doesn't describe its content's authority.
+///   14,850 of its ValueSets look identical to a "copy" under this rule.
+///
+/// Conflating them is safe precisely because rank is only ever a TIEBREAK among
+/// rows sharing one canonical URL. Being `UNKNOWN` costs a row nothing unless a
+/// demonstrable owner of the same URL exists — VSAC's rows have no rival, so they
+/// still win their URLs outright. An earlier draft ranked these as a definite
+/// "foreign copy" (2) and treated non-package writes as owners (0); that was
+/// wrong twice over. It asserted a fact about VSAC we had not established, and —
+/// because `vs_precedence_order_by` has no content/has-concepts tier to absorb
+/// the error — it let any REST upload outrank the real VSAC definition outright.
+pub const AUTHORITY_UNKNOWN: i32 = 1;
+
+/// Sentinel meaning "no source has claimed this row yet", used by the import
+/// upsert's `MIN(COALESCE(authority_rank, …), ?)` / `LEAST(...)` so that a row
+/// which predates the column (NULL) is overwritten by the first source to claim
+/// it, rather than reading as an authoritative 0 and pinning a stale copy.
+///
+/// It must stay strictly greater than every real rank. Note the deliberate
+/// asymmetry: on WRITE, NULL is the *weakest* value (this sentinel); on READ it
+/// coalesces to 0, the *strongest*, so that a database which has not yet
+/// re-imported behaves exactly as it did before the column existed.
+pub const AUTHORITY_UNCLAIMED: i32 = 9;
 
 /// Classify a resource against the canonical base declared by the package that
 /// shipped it (`package.json` → `canonical`).
 ///
-/// A package that publishes a URL outside its own canonical base is republishing
-/// someone else's resource, so the row is a copy rather than the original. When
-/// the source declares no canonical base (a bare `$import-bundle`, a REST write,
-/// or a native importer) the resource is treated as authoritative: an operator
-/// putting a resource here outranks any vendored package copy.
+/// Returns [`AUTHORITY_OWNER`] only on positive evidence — the package declares a
+/// canonical base and the resource's URL sits under it. Everything else, including
+/// a resource that arrived with no package context at all, is [`AUTHORITY_UNKNOWN`].
+///
+/// The asymmetry is deliberate and load-bearing. Defaulting an unattributed write
+/// to OWNER would mean an operator (or, on a server without auth, anyone) replaying
+/// `hl7.fhir.r4.core`'s truncated copy through `$import-bundle` would stamp it rank
+/// 0 — and since the upsert's `MIN` only ever lowers a rank, that copy would
+/// outrank THO's original permanently and reinstate issue #200 with no way back.
 pub fn authority_rank_for(url: &str, package_canonical: Option<&str>) -> i32 {
     match package_canonical {
-        Some(base) if !base.is_empty() && !url.starts_with(base) => AUTHORITY_FOREIGN_COPY,
-        _ => AUTHORITY_OWNER,
+        Some(base) if !base.is_empty() && url_is_under(url, base) => AUTHORITY_OWNER,
+        _ => AUTHORITY_UNKNOWN,
+    }
+}
+
+/// `true` when `url` sits under the canonical `base`, respecting path
+/// boundaries: `http://hl7.org/fhir` owns `http://hl7.org/fhir/CodeSystem/x`
+/// but NOT `http://hl7.org/fhirpath/x`. A bare `starts_with` would claim the
+/// latter and wrongly mark a genuine original as unattributed.
+fn url_is_under(url: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    match url.strip_prefix(base) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -101,7 +138,7 @@ pub struct ParsedCodeSystem {
     /// The full original JSON resource (stored in `resource_json` column).
     pub resource_json: Value,
     /// Provenance precedence among rows sharing this canonical URL.
-    /// See [`authority_rank_for`]. Defaults to [`AUTHORITY_OWNER`].
+    /// See [`authority_rank_for`].
     pub authority_rank: i32,
 }
 
@@ -155,7 +192,7 @@ pub struct ParsedValueSet {
     pub compose_json: Option<String>,
     pub resource_json: Value,
     /// Provenance precedence among rows sharing this canonical URL.
-    /// See [`authority_rank_for`]. Defaults to [`AUTHORITY_OWNER`].
+    /// See [`authority_rank_for`].
     pub authority_rank: i32,
 }
 
@@ -199,6 +236,23 @@ pub struct ParsedMapElement {
 /// Returns [`HtsError::InvalidRequest`] when the bytes are not valid JSON or
 /// the root resource is not a Bundle.
 pub fn parse_bundle(data: &[u8]) -> Result<ParsedBundle, HtsError> {
+    // No package context: REST writes, `$import-bundle`, and CLI bundles are
+    // treated as authoritative for whatever canonical they declare.
+    parse_bundle_from_package(data, None)
+}
+
+/// Parse a Bundle that arrived inside a FHIR NPM package, whose `package.json`
+/// declared `package_canonical` as the canonical base it owns.
+///
+/// Provenance is an explicit parameter, NOT a field on the payload. An earlier
+/// draft smuggled it through a non-FHIR `_htsSourceCanonical` key on the Bundle
+/// wrapper, which meant an untrusted `POST /import` body could set the value
+/// that decides which definition of a canonical URL is authoritative. Trust
+/// input must come from the caller, never from the bytes being parsed.
+pub fn parse_bundle_from_package(
+    data: &[u8],
+    package_canonical: Option<&str>,
+) -> Result<ParsedBundle, HtsError> {
     let root: Value = serde_json::from_slice(data)
         .map_err(|e| HtsError::InvalidRequest(format!("Invalid JSON: {e}")))?;
 
@@ -210,13 +264,6 @@ pub fn parse_bundle(data: &[u8]) -> Result<ParsedBundle, HtsError> {
     }
 
     let mut bundle = ParsedBundle::default();
-
-    // Provenance stamped by the package importer on the Bundle *wrapper* (see
-    // `import::tgz::make_bundle_bytes`). The wrapper is transient — only the
-    // entry resources are persisted — so this never leaks into `resource_json`.
-    // Absent for REST writes and bare `$import-bundle` payloads, which are then
-    // treated as authoritative.
-    let package_canonical = root[SOURCE_CANONICAL_KEY].as_str();
 
     let entries = root["entry"].as_array().cloned().unwrap_or_default();
     for entry in &entries {
@@ -306,7 +353,7 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
         content: cs["content"].as_str().unwrap_or("complete").to_owned(),
         concepts,
         resource_json: cs.clone(),
-        authority_rank: AUTHORITY_OWNER,
+        authority_rank: AUTHORITY_UNKNOWN,
     })
 }
 
@@ -461,7 +508,7 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
         status: vs["status"].as_str().unwrap_or("active").to_owned(),
         compose_json,
         resource_json: vs.clone(),
-        authority_rank: AUTHORITY_OWNER,
+        authority_rank: AUTHORITY_UNKNOWN,
     })
 }
 

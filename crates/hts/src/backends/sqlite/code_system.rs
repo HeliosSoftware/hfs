@@ -781,19 +781,17 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // by terminology packages), then highest version, then lowest id.
             // `json_extract` returns NULL when the column or path is absent,
             // which becomes Option::None in Rust.
+            let sql = format!(
+                "SELECT json_extract(resource_json, '$.language') \
+                 FROM code_systems \
+                 WHERE url = ?1 \
+                 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
             let lang: Option<String> = conn
-                .query_row(
-                    "SELECT json_extract(resource_json, '$.language') \
-                     FROM code_systems \
-                     WHERE url = ?1 \
-                     ORDER BY (CASE WHEN EXISTS \
-                         (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
-                         THEN 0 ELSE 1 END), \
-                         COALESCE(version, '') DESC, id \
-                     LIMIT 1",
-                    rusqlite::params![url_owned],
-                    |row| row.get::<_, Option<String>>(0),
-                )
+                .query_row(&sql, rusqlite::params![url_owned], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
                 .optional()
                 .map_err(|e| HtsError::StorageError(e.to_string()))?
                 .flatten();
@@ -1301,21 +1299,21 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
             // Read content + resource_json + version in one query so we can
             // confirm the row really is a supplement before returning.
+            let sql = format!(
+                "SELECT content, version, json_extract(resource_json, '$.supplements') \
+                 FROM code_systems \
+                 WHERE url = ?1 \
+                 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
             let row: Option<(String, Option<String>, Option<String>)> = conn
-                .query_row(
-                    "SELECT content, version, json_extract(resource_json, '$.supplements')
-                     FROM code_systems
-                     WHERE url = ?1
-                     LIMIT 1",
-                    rusqlite::params![supplement_url],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
+                .query_row(&sql, rusqlite::params![supplement_url], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
                 .optional()
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             let Some((content, version, target)) = row else {

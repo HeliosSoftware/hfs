@@ -2640,9 +2640,6 @@ fn vs_include_pin_for_system(vs: &Value, system_url: &str) -> Option<Option<Stri
     None
 }
 
-/// Resolve a (possibly wildcard) version pattern against the set of stored
-/// versions for a CodeSystem URL. Picks the highest matching version.
-/// Returns `None` when no stored version matches (or the CS is unknown).
 /// Resolve the effective CodeSystem version for a `CodeSystem/$validate-code`
 /// call, honouring the tx.fhir.org version-pin parameters.
 ///
@@ -2698,6 +2695,9 @@ async fn resolve_cs_effective_version<B: TerminologyBackend>(
     None
 }
 
+/// Resolve a (possibly wildcard) version pattern against the set of stored
+/// versions for a CodeSystem URL. Picks the highest matching version.
+/// Returns `None` when no stored version matches (or the CS is unknown).
 async fn resolve_cs_version_pattern<B: TerminologyBackend>(
     backend: &B,
     ctx: &TenantContext,

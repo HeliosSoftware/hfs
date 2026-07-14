@@ -190,13 +190,19 @@ pub async fn import_tgz(
                 total.concept_maps += batch.concept_maps;
                 total.concepts += batch.concepts;
             } else {
-                let bundle_bytes = make_bundle_bytes(chunk, package_canonical.as_deref());
-                let stats = backend
-                    .import_bundle(ctx, &bundle_bytes)
-                    .await
-                    .map_err(|e| {
-                        HtsError::StorageError(format!("{type_label} batch import failed: {e}"))
-                    })?;
+                // Provenance is passed to the parser as an argument rather than
+                // being written into the payload, so the value that decides which
+                // definition of a canonical URL is authoritative can only come
+                // from the package manifest we just read — never from bytes an
+                // untrusted caller could supply to `POST /import`.
+                let bundle_bytes = make_bundle_bytes(chunk);
+                let parsed = crate::import::bundle_parser::parse_bundle_from_package(
+                    &bundle_bytes,
+                    package_canonical.as_deref(),
+                )?;
+                let stats = backend.import_parsed(ctx, parsed).await.map_err(|e| {
+                    HtsError::StorageError(format!("{type_label} batch import failed: {e}"))
+                })?;
                 total.code_systems += stats.code_systems;
                 total.value_sets += stats.value_sets;
                 total.concept_maps += stats.concept_maps;
@@ -236,17 +242,13 @@ fn count_batch(resources: &[Value]) -> ImportStats {
 }
 
 /// Wrap a slice of resource `Value`s in a synthetic FHIR Bundle and serialize to JSON bytes.
-fn make_bundle_bytes(resources: &[Value], package_canonical: Option<&str>) -> Vec<u8> {
+fn make_bundle_bytes(resources: &[Value]) -> Vec<u8> {
     let entries: Vec<Value> = resources.iter().map(|r| json!({ "resource": r })).collect();
-    let mut bundle = json!({
+    let bundle = json!({
         "resourceType": "Bundle",
         "type": "collection",
         "entry": entries
     });
-    // Transient provenance on the wrapper only — see `SOURCE_CANONICAL_KEY`.
-    if let Some(canonical) = package_canonical {
-        bundle[crate::import::bundle_parser::SOURCE_CANONICAL_KEY] = json!(canonical);
-    }
     serde_json::to_vec(&bundle).expect("in-memory bundle serialization cannot fail")
 }
 
@@ -477,7 +479,7 @@ mod tests {
     #[test]
     fn authority_rank_marks_foreign_canonicals_as_copies() {
         use crate::import::bundle_parser::{
-            AUTHORITY_FOREIGN_COPY, AUTHORITY_OWNER, authority_rank_for,
+            AUTHORITY_OWNER, AUTHORITY_UNKNOWN, authority_rank_for,
         };
 
         // The package owns the URL it publishes.
@@ -488,13 +490,13 @@ mod tests {
             ),
             AUTHORITY_OWNER
         );
-        // hl7.fhir.r4.core re-publishing a THO canonical: a copy.
+        // hl7.fhir.r4.core re-publishing a THO canonical: not attributable to it.
         assert_eq!(
             authority_rank_for(
                 "http://terminology.hl7.org/CodeSystem/audit-event-type",
                 Some("http://hl7.org/fhir")
             ),
-            AUTHORITY_FOREIGN_COPY
+            AUTHORITY_UNKNOWN
         );
         // ...but it IS authoritative for its own canonical base.
         assert_eq!(
@@ -504,15 +506,37 @@ mod tests {
             ),
             AUTHORITY_OWNER
         );
-        // No package (REST write, $import-bundle, native importer): authoritative.
+        // No package context (REST write, $import-bundle): we cannot vouch for it,
+        // so it must NOT claim ownership. Defaulting these to OWNER is what would
+        // let a replayed r4.core bundle permanently outrank THO's original.
         assert_eq!(
             authority_rank_for("http://terminology.hl7.org/CodeSystem/x", None),
-            AUTHORITY_OWNER
+            AUTHORITY_UNKNOWN
         );
-        // A package that declares no canonical fails open, never worse than before.
+        // A package that declares no canonical: no evidence, so UNKNOWN.
         assert_eq!(
             authority_rank_for("http://anything/at/all", Some("")),
-            AUTHORITY_OWNER
+            AUTHORITY_UNKNOWN
+        );
+        // Path boundary: `http://hl7.org/fhir` must not claim `/fhirpath/...`.
+        assert_eq!(
+            authority_rank_for(
+                "http://hl7.org/fhirpath/CodeSystem/x",
+                Some("http://hl7.org/fhir")
+            ),
+            AUTHORITY_UNKNOWN
+        );
+        // us.nlm.vsac declares the fhir.org REGISTRY base but ships cts.nlm.nih.gov
+        // ValueSets. Those are genuine originals; they are merely unattributable.
+        // They must not be branded copies — `vs_precedence_order_by` has no
+        // content/has-concepts tier to absorb that error, so a mislabel there would
+        // let any REST upload outrank the real VSAC definition.
+        assert_eq!(
+            authority_rank_for(
+                "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113762.1.4.1",
+                Some("http://fhir.org/packages/us.nlm.vsac")
+            ),
+            AUTHORITY_UNKNOWN
         );
     }
 
@@ -762,6 +786,207 @@ mod tests {
         assert!(
             got.code_systems.is_empty() && got.parse_errors.is_empty(),
             "manifests are metadata, never resources, and never parse errors"
+        );
+    }
+
+    /// ValueSets are half the shipped surface of this fix — `hl7.fhir.r4.core`
+    /// re-publishes 603 THO ValueSets it does not own — but every other test here
+    /// imports CodeSystems only, so `vs_precedence_order_by` and the ValueSet
+    /// upsert would ship unproven. An inverted VS tier, or a VS upsert that never
+    /// binds the rank, passes the rest of this suite green.
+    #[tokio::test]
+    async fn value_set_resolution_prefers_owning_package_over_republished_copy() {
+        const VS_URL: &str = "http://terminology.hl7.org/ValueSet/audit-event-type";
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+
+        let mk = |version: &str, title: &str| {
+            json!({
+                "resourceType": "ValueSet", "id": format!("aet-vs-{version}"),
+                "url": VS_URL, "version": version, "status": "active", "title": title,
+                "compose": {"include": [{"system": "http://example.org/cs"}]}
+            })
+        };
+        // Same shape as the CodeSystem bug: the copy carries the FHIR *release*
+        // version, which out-sorts the ValueSet's own version under any ordering.
+        let core = make_test_tgz_with_canonical(
+            &[mk("4.0.1", "core copy")],
+            "hl7.fhir.r4.core",
+            "http://hl7.org/fhir",
+        );
+        let tho = make_test_tgz_with_canonical(
+            &[mk("1.0.0", "THO original")],
+            "hl7.terminology",
+            "http://terminology.hl7.org",
+        );
+        import_tgz(&backend, &ctx, core.path(), 500, false)
+            .await
+            .unwrap();
+        import_tgz(&backend, &ctx, tho.path(), 500, false)
+            .await
+            .unwrap();
+
+        let conn = backend.pool().get().unwrap();
+        let (rank_copy, rank_owner): (Option<i32>, Option<i32>) = (
+            conn.query_row(
+                "SELECT authority_rank FROM value_sets WHERE url = ?1 AND version = '4.0.1'",
+                rusqlite::params![VS_URL],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT authority_rank FROM value_sets WHERE url = ?1 AND version = '1.0.0'",
+                rusqlite::params![VS_URL],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rank_copy,
+            Some(crate::import::bundle_parser::AUTHORITY_UNKNOWN)
+        );
+        assert_eq!(
+            rank_owner,
+            Some(crate::import::bundle_parser::AUTHORITY_OWNER)
+        );
+
+        // And the shared VS ordering must actually pick the owner's row.
+        let sql = format!(
+            "SELECT version FROM value_sets WHERE url = ?1 ORDER BY {} LIMIT 1",
+            crate::backends::vs_precedence_order_by("value_sets")
+        );
+        let winner: String = conn
+            .query_row(&sql, rusqlite::params![VS_URL], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            winner, "1.0.0",
+            "versionless ValueSet resolution must land on the owning package's row"
+        );
+    }
+
+    /// The upsert's `MIN(COALESCE(authority_rank, AUTHORITY_UNCLAIMED), ?)` is what
+    /// makes the rank order-independent *at the row level* and what lets a legacy
+    /// NULL row demote itself to a copy. The other tests import DIFFERENT versions,
+    /// which produce two distinct rows under `idx_code_systems_url_version` and so
+    /// never touch the conflict path at all. This one collides the SAME (url,
+    /// version) deliberately.
+    #[tokio::test]
+    async fn upsert_keeps_the_strongest_claim_regardless_of_import_order() {
+        const URL: &str = "http://terminology.hl7.org/CodeSystem/collide";
+
+        // Identical (url, version) shipped by an owning package and by a package
+        // that merely re-publishes it → ONE row, whose rank must end up 0 (owner)
+        // no matter which package is imported last.
+        let cs = json!({
+            "resourceType": "CodeSystem", "id": "collide", "url": URL,
+            "version": "1.0.0", "status": "active", "content": "complete",
+            "concept": [{"code": "a"}]
+        });
+        let owner_pkg = || {
+            make_test_tgz_with_canonical(
+                std::slice::from_ref(&cs),
+                "hl7.terminology",
+                "http://terminology.hl7.org",
+            )
+        };
+        let copy_pkg = || {
+            make_test_tgz_with_canonical(
+                std::slice::from_ref(&cs),
+                "hl7.fhir.r4.core",
+                "http://hl7.org/fhir",
+            )
+        };
+
+        for (label, first, second) in [
+            ("owner then copy", owner_pkg(), copy_pkg()),
+            ("copy then owner", copy_pkg(), owner_pkg()),
+        ] {
+            let backend = SqliteTerminologyBackend::in_memory().unwrap();
+            let ctx = TenantContext::system();
+            import_tgz(&backend, &ctx, first.path(), 500, false)
+                .await
+                .unwrap();
+            import_tgz(&backend, &ctx, second.path(), 500, false)
+                .await
+                .unwrap();
+
+            let conn = backend.pool().get().unwrap();
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM code_systems WHERE url = ?1",
+                    rusqlite::params![URL],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                rows, 1,
+                "{label}: same (url, version) must collapse to one row"
+            );
+
+            let rank: Option<i32> = conn
+                .query_row(
+                    "SELECT authority_rank FROM code_systems WHERE url = ?1",
+                    rusqlite::params![URL],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                rank,
+                Some(crate::import::bundle_parser::AUTHORITY_OWNER),
+                "{label}: the strongest claim must survive — a later copy import \
+                 must not demote a row an owning package already claimed"
+            );
+        }
+    }
+
+    /// A row that predates the column is NULL ("never claimed"), and the sentinel
+    /// is what lets the first claimant overwrite it. A plain `MIN(rank, ?)` would
+    /// read the legacy row as 0 and pin the stale copy authoritative forever —
+    /// silently defeating the migration on exactly the databases it exists for.
+    #[tokio::test]
+    async fn legacy_null_row_is_demoted_when_a_copy_reclaims_it() {
+        const URL: &str = "http://terminology.hl7.org/CodeSystem/legacy";
+
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        let ctx = TenantContext::system();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute(
+                "INSERT INTO code_systems (id, url, version, status, content, created_at, updated_at, authority_rank)
+                 VALUES ('legacy|4.0.1', ?1, '4.0.1', 'active', 'complete', 'x', 'x', NULL)",
+                rusqlite::params![URL],
+            )
+            .unwrap();
+        }
+
+        // The core package re-imports that exact row and declares itself a copy.
+        let cs = json!({
+            "resourceType": "CodeSystem", "id": "legacy", "url": URL,
+            "version": "4.0.1", "status": "active", "content": "complete",
+            "concept": [{"code": "rest"}]
+        });
+        let core = make_test_tgz_with_canonical(
+            std::slice::from_ref(&cs),
+            "hl7.fhir.r4.core",
+            "http://hl7.org/fhir",
+        );
+        import_tgz(&backend, &ctx, core.path(), 500, false)
+            .await
+            .unwrap();
+
+        let conn = backend.pool().get().unwrap();
+        let rank: Option<i32> = conn
+            .query_row(
+                "SELECT authority_rank FROM code_systems WHERE url = ?1",
+                rusqlite::params![URL],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rank,
+            Some(crate::import::bundle_parser::AUTHORITY_UNKNOWN),
+            "an unclaimed (NULL) legacy row must be demotable by a re-importing copy"
         );
     }
 

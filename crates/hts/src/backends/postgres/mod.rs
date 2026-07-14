@@ -650,18 +650,22 @@ async fn write_code_system(
     // COALESCE sentinel (9 — above any real rank) means a row that predates the
     // column ("never claimed") is overwritten by the first source to claim it.
     // See the SQLite twin in `import/fhir_bundle.rs::write_code_system`.
+    let cs_update = format!(
+        "UPDATE code_systems SET
+           name           = $1,
+           title          = $2,
+           status         = $3,
+           content        = $4,
+           resource_json  = $5,
+           updated_at     = $6,
+           authority_rank = LEAST(COALESCE(authority_rank, {unclaimed}), $9)
+         WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')
+         RETURNING id",
+        unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
+    );
     let cs_rows = client
         .query(
-            "UPDATE code_systems SET
-               name           = $1,
-               title          = $2,
-               status         = $3,
-               content        = $4,
-               resource_json  = $5,
-               updated_at     = $6,
-               authority_rank = LEAST(COALESCE(authority_rank, 9), $9)
-             WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')
-             RETURNING id",
+            &cs_update,
             &[
                 &cs.name,
                 &cs.title,
@@ -906,17 +910,21 @@ async fn write_value_set(
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     // See `write_code_system` for the LEAST/COALESCE-sentinel rationale.
+    let vs_update = format!(
+        "UPDATE value_sets SET
+           name           = $1,
+           title          = $2,
+           status         = $3,
+           compose_json   = $4,
+           resource_json  = $5,
+           updated_at     = $6,
+           authority_rank = LEAST(COALESCE(authority_rank, {unclaimed}), $9)
+         WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')",
+        unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
+    );
     client
         .execute(
-            "UPDATE value_sets SET
-               name           = $1,
-               title          = $2,
-               status         = $3,
-               compose_json   = $4,
-               resource_json  = $5,
-               updated_at     = $6,
-               authority_rank = LEAST(COALESCE(authority_rank, 9), $9)
-             WHERE url = $7 AND COALESCE(version, '') = COALESCE($8, '')",
+            &vs_update,
             &[
                 &vs.name,
                 &vs.title,
