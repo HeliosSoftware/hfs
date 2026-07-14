@@ -87,6 +87,7 @@ nav-capability-conformance = Capacidad y conformidad
 nav-admin-ops = Administración / Operaciones
 nav-subscriptions = Suscripciones
 nav-tenants = Tenants
+nav-toggle = Contraer o expandir la navegación
 
 ## Mantenimiento de tenants (/ui/tenants)
 

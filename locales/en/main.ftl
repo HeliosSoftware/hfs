@@ -91,6 +91,7 @@ nav-capability-conformance = Capability & Conformance
 nav-admin-ops = Admin / Ops
 nav-subscriptions = Subscriptions
 nav-tenants = Tenants
+nav-toggle = Collapse or expand the navigation
 
 ## Tenant maintenance (/ui/tenants)
 
