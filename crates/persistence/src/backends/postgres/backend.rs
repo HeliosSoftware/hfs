@@ -3,6 +3,7 @@
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config, Pool, Runtime, SslMode};
@@ -242,6 +243,14 @@ impl PostgresBackend {
             PostgresSslMode::Require => SslMode::Require,
         });
 
+        let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+
+        // Bound the TCP handshake. NOTE: tokio-postgres applies `connect_timeout`
+        // to `TcpStream::connect` and nothing else — DNS resolution, the TLS
+        // handshake and the Postgres startup/auth exchange are all awaited
+        // unbounded. So this alone does NOT bound connection establishment.
+        cfg.connect_timeout = Some(connect_timeout);
+
         let pool = cfg
             .builder(NoTls)
             .map_err(|e| {
@@ -252,6 +261,19 @@ impl PostgresBackend {
                 })
             })?
             .max_size(config.max_connections)
+            // ...which is why we also bound the whole of `Manager::create` (DNS +
+            // TCP + TLS + auth). Without this, a peer that completes the TCP
+            // handshake and then never answers — a hung server, or a load balancer
+            // accepting into a blackhole — hangs the caller forever. Deadpool's
+            // timeouts all default to `None`, so before this the only thing
+            // stopping an unreachable database from blocking a request
+            // indefinitely was the kernel's SYN-retry, and only for the subset of
+            // failures that never complete the handshake.
+            //
+            // `wait` and `recycle` are deliberately left unbounded: they govern
+            // behaviour under load (queueing for a free slot), not reachability,
+            // and capping them would change how a saturated pool sheds traffic.
+            .create_timeout(Some(connect_timeout))
             .runtime(Runtime::Tokio1)
             .build()
             .map_err(|e| {
