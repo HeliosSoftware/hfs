@@ -756,4 +756,152 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 0, "cascade delete should remove child concepts");
     }
+    // ── authority_rank migration (issue #200) ─────────────────────────────────
+
+    /// Build a database in the *pre-provenance* shape: the resource tables have
+    /// no `authority_rank` column, and the bootstrap ledger already records the
+    /// packages that were imported. This is what a deployed server looks like
+    /// before the upgrade — and it is the only shape in which the interesting
+    /// branch of `migrate_authority_rank` runs at all, since `SCHEMA` creates
+    /// fresh tables with the column already present.
+    fn legacy_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE code_systems (
+                 id TEXT PRIMARY KEY, url TEXT NOT NULL, version TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 content TEXT NOT NULL DEFAULT 'complete',
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE value_sets (
+                 id TEXT PRIMARY KEY, url TEXT NOT NULL, version TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE bootstrap_imports (
+                 path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                 size_bytes INTEGER NOT NULL, mtime_unix INTEGER,
+                 languages TEXT NOT NULL DEFAULT '',
+                 imported_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+
+             INSERT INTO code_systems (id, url, version, created_at, updated_at)
+             VALUES ('cs1', 'http://example.org/cs', '1.0.0', 'x', 'x');
+
+             -- Packages carry provenance and must be re-imported; the bulk
+             -- terminology archives do not and must be left alone.
+             INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+             VALUES ('/app/terminology-data/hl7.terminology-7.1.0.tgz', 'h1', 1),
+                    ('/app/terminology-data/hl7.fhir.r4.core-4.0.1.tgz', 'h2', 2),
+                    ('/app/terminology-data/icd10cm-table-and-index-2026.zip', 'h3', 3),
+                    ('/app/terminology-data/ucum-essence-v2.2.xml', 'h4', 4);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn ledger_paths(conn: &rusqlite::Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT path FROM bootstrap_imports ORDER BY path")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+
+    fn has_authority_rank(conn: &rusqlite::Connection, table: &str) -> bool {
+        conn.prepare(&format!("SELECT authority_rank FROM {table} LIMIT 1"))
+            .is_ok()
+    }
+
+    #[test]
+    fn authority_rank_migration_adds_columns_and_forces_package_reimport() {
+        let conn = legacy_db();
+        assert!(!has_authority_rank(&conn, "code_systems"));
+        assert!(!has_authority_rank(&conn, "value_sets"));
+
+        migrate_authority_rank(&conn).expect("migration should succeed");
+
+        assert!(has_authority_rank(&conn, "code_systems"));
+        assert!(has_authority_rank(&conn, "value_sets"));
+
+        // The .tgz ledger entries are dropped so the next startup re-imports
+        // those packages and stamps provenance. Without this the column would
+        // stay NULL on every existing row and the fix would be a silent no-op:
+        // the ledger skips any file whose size and mtime are unchanged.
+        assert_eq!(
+            ledger_paths(&conn),
+            vec![
+                "/app/terminology-data/icd10cm-table-and-index-2026.zip".to_string(),
+                "/app/terminology-data/ucum-essence-v2.2.xml".to_string(),
+            ],
+            "only .tgz packages may be cleared; the bulk archives carry no \
+             package provenance and re-importing them would cost hours"
+        );
+    }
+
+    #[test]
+    fn authority_rank_migration_leaves_existing_rows_unclaimed() {
+        let conn = legacy_db();
+        migrate_authority_rank(&conn).unwrap();
+
+        // A pre-existing row is NULL, not 0: "no source has claimed this row".
+        // Readers COALESCE it to 0, so behaviour is unchanged until the packages
+        // re-import — and because it is NULL rather than 0, the upsert's
+        // MIN(COALESCE(authority_rank, 9), ?) can still demote a copy.
+        let rank: Option<i32> = conn
+            .query_row("SELECT authority_rank FROM code_systems", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rank, None,
+            "existing rows must be unclaimed, not authoritative"
+        );
+    }
+
+    #[test]
+    fn authority_rank_migration_is_idempotent_and_spares_the_ledger() {
+        let conn = legacy_db();
+        migrate_authority_rank(&conn).unwrap();
+
+        // Re-import happened; the ledger is repopulated as packages load.
+        conn.execute(
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+             VALUES ('/app/terminology-data/hl7.terminology-7.1.0.tgz', 'h1', 1)",
+            [],
+        )
+        .unwrap();
+
+        // A second run must NOT clear the ledger again — the ALTER now fails with
+        // "duplicate column name", so `column_added` stays false. If this branch
+        // regressed, every restart would re-import every package.
+        migrate_authority_rank(&conn).expect("migration must be idempotent");
+        assert!(
+            ledger_paths(&conn)
+                .iter()
+                .any(|p| p.ends_with("hl7.terminology-7.1.0.tgz")),
+            "an already-migrated database must not re-clear the ledger on restart"
+        );
+    }
+
+    #[test]
+    fn authority_rank_migration_on_fresh_schema_is_a_noop() {
+        // SCHEMA already declares the column, so the migration must be a no-op
+        // and must not touch the ledger of a brand-new database.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO bootstrap_imports (path, content_hash, size_bytes)
+             VALUES ('/app/terminology-data/hl7.terminology-7.1.0.tgz', 'h1', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate_authority_rank(&conn).unwrap();
+
+        assert_eq!(ledger_paths(&conn).len(), 1);
+        assert!(has_authority_rank(&conn, "code_systems"));
+    }
 }

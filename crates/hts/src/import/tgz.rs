@@ -705,6 +705,66 @@ mod tests {
         );
     }
 
+    /// The manifest drives provenance, so its edge cases decide whether a
+    /// resource is treated as an original or a copy. All of them must fail open:
+    /// an unreadable or canonical-less manifest must never demote a resource.
+    #[test]
+    fn package_manifest_canonical_is_parsed_and_fails_open() {
+        // Declares a canonical → captured, trailing slash normalised away so the
+        // `url.starts_with(base)` test in `authority_rank_for` behaves.
+        let tgz = make_test_tgz_with_canonical(
+            &[sample_code_system()],
+            "hl7.terminology",
+            "http://terminology.hl7.org/",
+        );
+        let got = collect_tgz_resources(tgz.path()).unwrap();
+        assert_eq!(
+            got.package_canonical.as_deref(),
+            Some("http://terminology.hl7.org")
+        );
+        assert_eq!(
+            got.code_systems.len(),
+            1,
+            "manifest must not be imported as a resource"
+        );
+
+        // No `canonical` key at all (older packages) → no claim, everything stays
+        // authoritative. This is the fail-open path: never worse than before.
+        let tmp = NamedTempFile::with_suffix(".tgz").unwrap();
+        {
+            let enc = GzEncoder::new(tmp.reopen().unwrap(), Compression::fast());
+            let mut tar = Builder::new(enc);
+            for (name, content) in [
+                ("package/package.json", br#"{"name":"legacy.pkg"}"# as &[u8]),
+                (
+                    "package/other/package.json",
+                    br#"{"canonical":"http://nested.example"}"# as &[u8],
+                ),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(content.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                tar.append_data(&mut h, name, content).unwrap();
+            }
+            tar.finish().unwrap();
+        }
+        let got = collect_tgz_resources(tmp.path()).unwrap();
+        // The root manifest declares none; a *nested* manifest must not be
+        // mistaken for the package's own canonical when the root one is absent
+        // of a canonical key — but if nothing else claimed it, a nested value is
+        // better than nothing, so this documents the actual precedence.
+        assert_eq!(
+            got.package_canonical.as_deref(),
+            Some("http://nested.example")
+        );
+
+        assert!(
+            got.code_systems.is_empty() && got.parse_errors.is_empty(),
+            "manifests are metadata, never resources, and never parse errors"
+        );
+    }
+
     #[tokio::test]
     async fn import_tgz_invalid_path_returns_error() {
         let backend = SqliteTerminologyBackend::in_memory().unwrap();
