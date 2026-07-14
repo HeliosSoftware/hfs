@@ -56,6 +56,9 @@ pub use evaluator::ResolvedConcept;
 pub use parser::{ConceptOperator, EclExpr, FocusConcept};
 
 #[cfg(feature = "sqlite")]
+use std::collections::HashSet;
+
+#[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 
 #[cfg(feature = "sqlite")]
@@ -78,4 +81,34 @@ pub fn parse_and_evaluate(
     let expr = parser::parse(ecl)
         .map_err(|e| HtsError::InvalidRequest(format!("Invalid ECL expression: {e}")))?;
     evaluator::evaluate(conn, system_id, &expr)
+}
+
+/// Return the subset of `candidates` that are members of the ECL constraint.
+///
+/// Evaluates `ecl` against `system_id` and intersects the resulting concept
+/// codes with `candidates`, so only the codes that satisfy the constraint are
+/// returned. An empty `candidates` slice short-circuits to an empty set without
+/// evaluating the expression.
+///
+/// # Errors
+///
+/// - Returns `HtsError::InvalidRequest` if the ECL expression cannot be parsed.
+/// - Returns `HtsError::StorageError` if a database query fails.
+#[cfg(feature = "sqlite")]
+pub fn filter_candidates(
+    conn: &Connection,
+    system_id: &str,
+    ecl: &str,
+    candidates: &[String],
+) -> Result<HashSet<String>, HtsError> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let members = parse_and_evaluate(conn, system_id, ecl)?;
+    let member_codes: HashSet<&str> = members.iter().map(|c| c.code.as_str()).collect();
+    Ok(candidates
+        .iter()
+        .filter(|c| member_codes.contains(c.as_str()))
+        .cloned()
+        .collect())
 }

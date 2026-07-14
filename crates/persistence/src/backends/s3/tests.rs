@@ -30,8 +30,8 @@ use crate::core::history::{
 use crate::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
 use crate::core::{ResourceStorage, VersionedStorage};
 use crate::error::{
-    BulkSubmitError, ConcurrencyError, ResourceError, SearchError, StorageError, TenantError,
-    TransactionError,
+    BackendError, BulkSubmitError, ConcurrencyError, ResourceError, SearchError, StorageError,
+    TenantError, TransactionError,
 };
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::{CursorValue, PageCursor, Pagination, PaginationMode};
@@ -1076,4 +1076,154 @@ async fn tenancy_prefix_and_bucket_modes() {
         missing,
         Err(StorageError::Tenant(TenantError::InvalidTenant { .. }))
     ));
+}
+
+#[tokio::test]
+async fn tenant_registry_crud_prefix_mode() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    assert!(backend.supports_tenant_registry());
+
+    let a = backend
+        .register_tenant("tenant-a", Some("Tenant A"))
+        .await
+        .unwrap();
+    assert_eq!(a.id, "tenant-a");
+    assert_eq!(a.display_name.as_deref(), Some("Tenant A"));
+    assert!(DateTime::parse_from_rfc3339(&a.created_at).is_ok());
+
+    let b = backend.register_tenant("tenant-b", None).await.unwrap();
+    assert_eq!(b.id, "tenant-b");
+    assert!(b.display_name.is_none());
+
+    let fetched = backend.get_tenant("tenant-a").await.unwrap().unwrap();
+    assert_eq!(fetched, a);
+
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(listed, vec![a, b.clone()]);
+
+    assert!(backend.deregister_tenant("tenant-a").await.unwrap());
+    assert!(!backend.deregister_tenant("tenant-a").await.unwrap());
+    assert!(backend.get_tenant("tenant-a").await.unwrap().is_none());
+    assert_eq!(backend.list_tenants().await.unwrap(), vec![b]);
+}
+
+#[tokio::test]
+async fn tenant_registry_register_duplicate_fails() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    backend.register_tenant("tenant-a", None).await.unwrap();
+
+    let duplicate = backend.register_tenant("tenant-a", Some("Again")).await;
+    assert!(matches!(
+        duplicate,
+        Err(StorageError::Backend(BackendError::QueryError { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn tenant_registry_unsupported_without_system_bucket() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["bucket-a"]));
+    let mut tenant_bucket_map = HashMap::new();
+    tenant_bucket_map.insert("tenant-a".to_string(), "bucket-a".to_string());
+
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map,
+            default_system_bucket: None,
+        },
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend = S3Backend::with_client(config, mock).expect("backend");
+
+    assert!(!backend.supports_tenant_registry());
+    assert!(matches!(
+        backend.register_tenant("tenant-a", None).await,
+        Err(StorageError::Backend(
+            BackendError::UnsupportedCapability { .. }
+        ))
+    ));
+    assert!(backend.list_tenants().await.unwrap().is_empty());
+    assert!(backend.get_tenant("tenant-a").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn tenant_registry_bucket_mode_uses_system_bucket() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+
+    assert!(backend.supports_tenant_registry());
+
+    let record = backend
+        .register_tenant("tenant-a", Some("Tenant A"))
+        .await
+        .unwrap();
+    assert_eq!(backend.get_tenant("tenant-a").await.unwrap(), Some(record));
+    assert!(mock.bucket_object_count("system-bucket") > 0);
+}
+
+#[tokio::test]
+async fn purge_tenant_data_sweeps_resources_and_history() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let ta = tenant("tenant-a");
+    let tb = tenant("tenant-b");
+
+    backend
+        .create(
+            &ta,
+            "Patient",
+            json!({"resourceType":"Patient","id":"p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &ta,
+            "Observation",
+            json!({"resourceType":"Observation","id":"o1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tb,
+            "Patient",
+            json!({"resourceType":"Patient","id":"p2"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let removed = backend.purge_tenant_data("tenant-a").await.unwrap();
+    assert_eq!(removed, 2);
+
+    assert!(backend.read(&ta, "Patient", "p1").await.unwrap().is_none());
+    assert!(
+        backend
+            .read(&ta, "Observation", "o1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .vread(&ta, "Patient", "p1", "1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(backend.count(&ta, None).await.unwrap(), 0);
+
+    assert!(backend.read(&tb, "Patient", "p2").await.unwrap().is_some());
+    assert_eq!(backend.count(&tb, None).await.unwrap(), 1);
 }

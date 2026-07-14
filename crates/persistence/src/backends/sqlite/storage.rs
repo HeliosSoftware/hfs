@@ -685,6 +685,122 @@ impl ResourceStorage for SqliteBackend {
         }
         Ok(out)
     }
+
+    fn supports_tenant_registry(&self) -> bool {
+        true
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, display_name, created_at FROM tenants \
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| internal_error(format!("prepare list_tenants: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::core::TenantRecord {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })
+            .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("list_tenants row: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare("SELECT id, display_name, created_at FROM tenants WHERE id = ?1")
+            .map_err(|e| internal_error(format!("prepare get_tenant: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                Ok(crate::core::TenantRecord {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })
+            .map_err(|e| internal_error(format!("query get_tenant: {e}")))?;
+        match rows.next() {
+            Some(row) => {
+                Ok(Some(row.map_err(|e| {
+                    internal_error(format!("get_tenant row: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        let conn = self.get_connection()?;
+        // Plain INSERT so a duplicate id surfaces as a constraint error; the
+        // admin handler pre-checks existence and returns 409, so reaching here
+        // with a duplicate is a race and a 500 is acceptable.
+        conn.execute(
+            "INSERT INTO tenants (id, display_name, created_at) \
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+            params![id, display_name],
+        )
+        .map_err(|e| internal_error(format!("register_tenant: {e}")))?;
+        let mut stmt = conn
+            .prepare("SELECT id, display_name, created_at FROM tenants WHERE id = ?1")
+            .map_err(|e| internal_error(format!("prepare register read-back: {e}")))?;
+        stmt.query_row(params![id], |row| {
+            Ok(crate::core::TenantRecord {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })
+        .map_err(|e| internal_error(format!("register read-back: {e}")))
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        let conn = self.get_connection()?;
+        let changed = conn
+            .execute("DELETE FROM tenants WHERE id = ?1", params![id])
+            .map_err(|e| internal_error(format!("deregister_tenant: {e}")))?;
+        Ok(changed > 0)
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        let mut conn = self.get_connection()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| internal_error(format!("purge begin: {e}")))?;
+        // Count current-version rows first so we can report what was removed.
+        let removed: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| internal_error(format!("purge count: {e}")))?;
+        // search_index has ON DELETE CASCADE from resources, but delete it
+        // explicitly too in case foreign keys are not enforced on this handle.
+        for sql in [
+            "DELETE FROM search_index WHERE tenant_id = ?1",
+            "DELETE FROM resource_history WHERE tenant_id = ?1",
+            "DELETE FROM resources WHERE tenant_id = ?1",
+        ] {
+            tx.execute(sql, params![id])
+                .map_err(|e| internal_error(format!("purge delete: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        Ok(removed.max(0) as u64)
+    }
 }
 
 // Search Index Helpers
@@ -3823,6 +3939,69 @@ mod tests {
     fn test_is_cluster_shared() {
         let backend = create_test_backend();
         assert!(!backend.is_cluster_shared());
+    }
+
+    #[tokio::test]
+    async fn test_tenant_registry_crud() {
+        let backend = create_test_backend();
+        assert!(backend.supports_tenant_registry());
+
+        // Empty to start.
+        assert!(backend.list_tenants().await.unwrap().is_empty());
+        assert!(backend.get_tenant("acme").await.unwrap().is_none());
+
+        // Register two tenants, one with a display name.
+        let acme = backend
+            .register_tenant("acme", Some("Acme Health"))
+            .await
+            .unwrap();
+        assert_eq!(acme.id, "acme");
+        assert_eq!(acme.display_name.as_deref(), Some("Acme Health"));
+        assert!(!acme.created_at.is_empty());
+        backend.register_tenant("beta", None).await.unwrap();
+
+        let all = backend.list_tenants().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(backend.get_tenant("acme").await.unwrap(), Some(acme));
+
+        // Duplicate registration is an error (handler pre-checks for 409).
+        assert!(backend.register_tenant("acme", None).await.is_err());
+
+        // Deregister removes the row; second call reports nothing removed.
+        assert!(backend.deregister_tenant("beta").await.unwrap());
+        assert!(!backend.deregister_tenant("beta").await.unwrap());
+        assert_eq!(backend.list_tenants().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_purge_tenant_data() {
+        let backend = create_test_backend();
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let other = TenantContext::new(TenantId::new("other"), TenantPermissions::full_access());
+
+        for _ in 0..3 {
+            backend
+                .create(&acme, "Patient", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        backend
+            .create(&other, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // Purge removes acme's data only, reporting the row count.
+        let removed = backend.purge_tenant_data("acme").await.unwrap();
+        assert_eq!(removed, 3);
+
+        let counts: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(counts.get("acme"), None);
+        assert_eq!(counts.get("other"), Some(&1));
     }
 
     #[tokio::test]

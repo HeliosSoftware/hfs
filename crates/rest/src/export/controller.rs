@@ -103,8 +103,14 @@ pub struct ExportTask {
 pub struct CompletedFile {
     /// Logical view name this file belongs to (matches `view.name`).
     pub view_name: String,
-    /// Public URL that can be fetched via the export download route.
-    pub url: String,
+    /// The shard's stable filename within the job (e.g. `shard-0.ndjson`).
+    ///
+    /// The public download URL is *not* stored here: it is resolved on demand
+    /// via [`ExportSink::download_url`](super::sink::ExportSink::download_url)
+    /// each time the manifest is rendered. This matters for S3-backed exports,
+    /// whose pre-signed URLs would otherwise expire relative to a single
+    /// write-time signing instead of each poll.
+    pub filename: String,
     /// Number of data rows written.
     pub row_count: usize,
 }
@@ -219,4 +225,16 @@ pub trait ExportJobController: Send + Sync + 'static {
     /// Returns `None` if the job or shard does not exist OR if `tenant_id`
     /// does not match the tenant that submitted the job.
     fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>>;
+
+    /// Resolves a completed shard's [`CompletedFile::filename`] to a public
+    /// download URL, freshly each call.
+    ///
+    /// Called while rendering the completion manifest so every status poll
+    /// hands out a URL with a full validity window — for S3-backed exports this
+    /// re-signs the GET URL on each poll rather than reusing one signed at write
+    /// time. For server-routed sinks (filesystem / in-memory) the URL is stable.
+    ///
+    /// Returns `None` if `tenant_id` does not match the submitting tenant, or if
+    /// the sink fails to produce a URL (e.g. an S3 pre-signing error).
+    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String>;
 }

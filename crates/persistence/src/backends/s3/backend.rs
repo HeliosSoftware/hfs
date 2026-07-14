@@ -201,6 +201,36 @@ impl S3Backend {
         }
     }
 
+    /// Resolves the bucket and (un-tenanted) keyspace holding the tenant
+    /// registry.
+    ///
+    /// The registry spans tenants, so it lives outside any tenant prefix: in
+    /// `PrefixPerTenant` mode under `[prefix/]tenants/` in the shared bucket,
+    /// alongside the per-tenant directories; in `BucketPerTenant` mode in the
+    /// default system bucket. Returns `None` when no such location exists
+    /// (bucket-per-tenant without a system bucket), in which case the registry
+    /// is unsupported.
+    pub(crate) fn registry_location(&self) -> Option<TenantLocation> {
+        let global_prefix = self
+            .config
+            .prefix
+            .as_ref()
+            .map(|p| p.trim_matches('/').to_string())
+            .filter(|p| !p.is_empty());
+
+        let bucket = match &self.config.tenancy_mode {
+            S3TenancyMode::PrefixPerTenant { bucket } => bucket.clone(),
+            S3TenancyMode::BucketPerTenant {
+                default_system_bucket,
+                ..
+            } => default_system_bucket.clone()?,
+        };
+        Some(TenantLocation {
+            bucket,
+            keyspace: S3Keyspace::new(global_prefix),
+        })
+    }
+
     /// Maps a low-level `S3ClientError` to the shared `StorageError` taxonomy.
     ///
     /// This is the error boundary between the S3 SDK layer and the storage
