@@ -92,11 +92,18 @@ pub struct ActivityCell {
 }
 
 /// Audit event helpers for purge operations.
-#[cfg(feature = "audit")]
 pub mod audit {
     use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
 
     /// Record an audit event for a purge (permanent deletion) operation.
+    ///
+    /// `outcome` is a FHIR `AuditEvent.outcome` code — `"0"` on success, `"8"`
+    /// on failure. A purge that fails partway across a composite deployment
+    /// (say, the search secondary rejects the delete) must still be recorded,
+    /// so failures are audited with `outcome = "8"` and an `outcome_desc`
+    /// naming the backend that failed. There is no partial-success code: a
+    /// purge either removed the resource everywhere or it did not.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_purge_event(
         sink: &dyn AuditSink,
         source_observer: &str,
@@ -105,6 +112,8 @@ pub mod audit {
         resource_id: Option<&str>,
         count: u64,
         patient_ref: Option<&str>,
+        outcome: &str,
+        outcome_desc: Option<&str>,
     ) {
         let mut builder = AuditEventBuilder::new(source_observer)
             .event_type(
@@ -112,7 +121,7 @@ pub mod audit {
                 "object",
             )
             .action(AuditAction::Delete)
-            .outcome("0")
+            .outcome(outcome)
             .detail("audit-operation", "purge")
             .detail("count", count.to_string());
         if let Some(id) = resource_id {
@@ -126,61 +135,131 @@ pub mod audit {
         if let Some(p) = patient_ref {
             builder = builder.patient(p);
         }
+        if let Some(d) = outcome_desc {
+            builder = builder.outcome_desc(d);
+        }
         sink.record(builder.build()).await;
     }
 
     #[cfg(test)]
     mod tests {
-        use helios_audit::{AuditAction, AuditEventBuilder};
+        use super::*;
+        use crate::test_audit::{CollectorSink, detail_map};
 
-        #[test]
-        fn test_purge_event_action_is_delete() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .event_type(
-                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "object",
-                )
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .detail("audit-operation", "purge")
-                .resource("Patient", "123")
-                .detail("count", "1")
-                .build();
+        /// Purge is a destructive operation, so the event must carry the `D`
+        /// action code — that is what a BALP consumer filters on.
+        #[tokio::test]
+        async fn test_purge_event_action_is_delete() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "Patient",
+                Some("123"),
+                1,
+                None,
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(events.len(), 1);
             assert_eq!(
-                event.action.as_ref().and_then(|a| a.value.as_deref()),
+                events[0].action.as_ref().and_then(|a| a.value.as_deref()),
                 Some("D")
+            );
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("audit-operation").map(String::as_str),
+                Some("purge")
+            );
+            assert_eq!(details.get("count").map(String::as_str), Some("1"));
+        }
+
+        /// A type-level `purge_all` has no single resource id, so the type must
+        /// still be recoverable from the event.
+        #[tokio::test]
+        async fn test_purge_all_event_records_resource_type_and_count() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                None,
+                "Observation",
+                None,
+                15,
+                None,
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("resource-type").map(String::as_str),
+                Some("Observation")
+            );
+            assert_eq!(details.get("count").map(String::as_str), Some("15"));
+        }
+
+        /// A purge that fails on one backend of a composite deployment must
+        /// still be audited, with a failure outcome and the backend named.
+        /// Before `outcome` was a parameter this was impossible — the helper
+        /// hardcoded `"0"`, so a failed purge looked exactly like a successful
+        /// one in the audit log.
+        #[tokio::test]
+        async fn test_purge_failure_is_audited_with_outcome_8() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "Patient",
+                Some("123"),
+                0,
+                None,
+                "8",
+                Some("purge failed on secondary 'es'"),
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(
+                events[0].outcome.as_ref().and_then(|o| o.value.as_deref()),
+                Some("8")
+            );
+            assert_eq!(
+                events[0]
+                    .outcome_desc
+                    .as_ref()
+                    .and_then(|d| d.value.as_deref()),
+                Some("purge failed on secondary 'es'")
             );
         }
 
-        #[test]
-        fn test_purge_event_includes_count() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .event_type(
-                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "object",
-                )
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .detail("audit-operation", "purge")
-                .resource("Observation", "obs-1")
-                .detail("count", "15")
-                .build();
-            let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
-            let count_detail = details
-                .iter()
-                .find(|d| d.r#type.value.as_deref() == Some("count"));
-            assert!(count_detail.is_some());
-        }
+        /// Purging a patient-compartment resource must attach the patient
+        /// entity, which is what the BALP patient-oriented profiles key on.
+        #[tokio::test]
+        async fn test_purge_with_patient_has_patient_entity() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                None,
+                "Observation",
+                Some("obs-1"),
+                1,
+                Some("Patient/456"),
+                "0",
+                None,
+            )
+            .await;
 
-        #[test]
-        fn test_purge_with_patient_has_patient_entity() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .resource("Observation", "obs-1")
-                .patient("Patient/456")
-                .build();
-            let entities = event.entity.as_ref().unwrap();
+            let events = sink.events();
+            let entities = events[0].entity.as_ref().unwrap();
             assert_eq!(entities.len(), 2);
             assert_eq!(
                 entities[1]

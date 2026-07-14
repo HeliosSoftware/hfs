@@ -731,15 +731,16 @@ impl ExportWorkerStorage for SqliteBackend {
         let conn = self.get_connection().map_err(LeaseError::Storage)?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let (request_json, level_str, group_id, transaction_time, fhir_version): (
+        let (request_json, level_str, group_id, transaction_time, fhir_version, owner_subject): (
             String,
             String,
             Option<String>,
             String,
             String,
+            Option<String>,
         ) = conn
             .query_row(
-                "SELECT request_json, level, group_id, transaction_time, fhir_version
+                "SELECT request_json, level, group_id, transaction_time, fhir_version, owner_subject
                  FROM bulk_export_jobs
                  WHERE id = ?1 AND tenant_id = ?2 AND worker_id = ?3 AND fencing_token = ?4",
                 params![
@@ -755,6 +756,7 @@ impl ExportWorkerStorage for SqliteBackend {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -813,6 +815,7 @@ impl ExportWorkerStorage for SqliteBackend {
             transaction_time,
             fhir_version,
             type_progress,
+            owner_subject,
         })
     }
 

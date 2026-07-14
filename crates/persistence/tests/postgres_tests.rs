@@ -3514,7 +3514,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_list_types() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
@@ -3557,7 +3557,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_count() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
@@ -3589,7 +3589,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_fetch_page() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
