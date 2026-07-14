@@ -1102,7 +1102,7 @@ async fn test_minio_settings_concurrent_patches_never_lose_an_update() {
     let stored = harness.backend.get_settings(&user).await.unwrap().unwrap();
     for i in 0..writers {
         assert_eq!(
-            stored.document.get(&format!("key{i}")),
+            stored.document.get(format!("key{i}")),
             Some(&json!(i)),
             "writer {i}'s update was lost: {:?}",
             stored.document
