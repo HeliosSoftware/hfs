@@ -142,11 +142,20 @@ jobs:
               ''      close;
             }
             upstream hfs_cluster {
-              server $RUNNER_IP:$HFS_PORT_A;
-              server $RUNNER_IP:$HFS_PORT_B;
+              # max_fails=0: never blacklist an upstream. The default
+              # (max_fails=1 fail_timeout=10s) turns one refused connect into
+              # a 10s "no live upstreams" window — a probe that races instance
+              # startup would poison every request that follows it.
+              server $RUNNER_IP:$HFS_PORT_A max_fails=0;
+              server $RUNNER_IP:$HFS_PORT_B max_fails=0;
             }
             server {
               listen 80;
+              # Answered by nginx itself — readiness probes must not go
+              # through the upstreams, which may not be started yet.
+              location = /nginx-health {
+                return 200 "ok\n";
+              }
               location / {
                 proxy_pass http://hfs_cluster;
                 proxy_http_version 1.1;
@@ -166,12 +175,12 @@ jobs:
           docker start "$NGINX_CONTAINER"
           echo "NGINX_CONTAINER=$NGINX_CONTAINER" >> "$GITHUB_ENV"
 
-          # hfs is not up yet, so accept any HTTP answer (502 included) as
-          # proof that nginx itself is serving.
+          # Probe the nginx-local endpoint: hfs is not up yet, and a proxied
+          # request would count as an upstream failure.
           for i in {1..30}; do
             NGINX_PORT=$(docker port "$NGINX_CONTAINER" 80 2>/dev/null | head -1 | sed 's/.*://')
             if [ -n "$NGINX_PORT" ] \
-                && curl -s -o /dev/null "http://$DOCKER_HOST_IP:$NGINX_PORT/health"; then
+                && curl -sf -o /dev/null "http://$DOCKER_HOST_IP:$NGINX_PORT/nginx-health"; then
               echo "NGINX_PORT=$NGINX_PORT" >> "$GITHUB_ENV"
               echo "FRONT_URL=http://$DOCKER_HOST_IP:$NGINX_PORT" >> "$GITHUB_ENV"
               echo "nginx front is ready on port $NGINX_PORT"
