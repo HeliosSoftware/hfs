@@ -26,7 +26,7 @@ use helios_audit::{
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
-use tracing::info;
+use tracing::{info, warn};
 
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -628,6 +628,17 @@ async fn init_auth_with_audit(
     // Require issuer validation to prevent cross-service token reuse
     if auth_config.expected_issuer.is_none() {
         anyhow::bail!("HFS_AUTH_ISSUER is required when HFS_AUTH_ENABLED=true");
+    }
+
+    // Audience stays optional so an open demo deployment can accept any token
+    // from its issuer, but that also means a token minted for a *different*
+    // client of the same issuer is accepted here. Make it noisy rather than silent.
+    if auth_config.expected_audience.is_none() {
+        warn!(
+            "HFS_AUTH_AUDIENCE is not set: every token from this issuer will be accepted, \
+             including tokens minted for other clients of the same issuer. \
+             Set HFS_AUTH_AUDIENCE to restrict tokens to this server."
+        );
     }
 
     // Create JTI cache
