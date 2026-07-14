@@ -14,6 +14,38 @@ Use this when working in `helios-audit`. The crate emits FHIR `AuditEvent` recor
 - Paths can be excluded (e.g. `/health`, `/metadata`) via `HFS_AUDIT_EXCLUDE_PATHS`.
 - `AuditEvent.source.observer` defaults to `Device/hfs` (`HFS_AUDIT_SOURCE_OBSERVER`).
 
+## Persistence-layer operation events
+
+Beyond the request/response events the middleware records, three long-running or
+destructive operations emit their own lifecycle events through helpers in
+`helios-persistence` (`core::bulk_export::audit::record_export_event`,
+`core::storage::audit::record_purge_event`,
+`search::reindex::audit::record_reindex_event`). Every event carries an
+`audit-operation` detail naming the operation:
+
+| `audit-operation` | Emitted at | Outcome codes | Other details |
+|---|---|---|---|
+| `bulk-export` | REST kick-off, and the worker's terminal transition (complete / cancel / fail) | `0` / `4` / `8` | `bulk-export-operation` (the phase), `job-id`, `export-level`, `resource-types` |
+| `purge` | handler, on success **and** on failure | `0` / `8` | `count`, `resource-type` |
+| `reindex` | job start, and its terminal state (complete / cancel / fail) | `0` / `4` / `8` | `phase`, `job-id`, `resources-processed`, `resource-types` |
+
+Note the phase detail is keyed `bulk-export-operation` for export but `phase`
+for reindex — the former predates the shared helper and is kept for consumers
+already parsing it.
+
+Two things to know when touching these:
+
+- `helios-audit` is a **required** (non-optional) dependency of
+  `helios-persistence`. It used to sit behind an `audit` cargo feature, which
+  made the shared helpers unreachable from `helios-rest` — so REST hand-rolled a
+  duplicate export-event emitter, and the coverage CI job (which does not enable
+  the feature) built a different crate than CI did.
+- The test double for asserting on emitted events is a `CollectorSink` defined
+  **in test code** (`crates/rest/tests/persistence_operations.rs`, and inline in
+  the persistence unit tests). Do not add an in-memory sink to `sinks/`: CI
+  builds `--all-features --release`, so a feature-gated test sink ships in the
+  release binary.
+
 ## Backends (`HFS_AUDIT_BACKEND`)
 
 | Value | Sink |
