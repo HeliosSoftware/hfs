@@ -5006,9 +5006,16 @@ fn fts_candidates_ranked_for_system(
     let ranked_codes: Vec<(String, f64)> = if search_populated {
         let mut stmt = conn
             .prepare_cached(
-                "SELECT code, MIN(bm25(concepts_search_fts)) AS rank
-                 FROM concepts_search_fts
-                 WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
+                // MATERIALIZED stops SQLite flattening the CTE into the
+                // aggregate query — FTS5 aux functions like bm25() cannot run
+                // in an aggregate context ("unable to use function bm25 in
+                // the requested context").
+                "WITH ranked AS MATERIALIZED (
+                     SELECT code, bm25(concepts_search_fts) AS rank
+                     FROM concepts_search_fts
+                     WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
+                 )
+                 SELECT code, MIN(rank) AS rank FROM ranked
                  GROUP BY code
                  ORDER BY rank ASC
                  LIMIT ?3",
