@@ -161,20 +161,37 @@ where
         build_system_prompt(fhir_version, &registry)
     };
 
-    let raw = call_llm(
-        &config.nl_search_base_url,
-        &api_key,
-        &config.nl_search_model,
-        &system,
-        &text,
-    )
-    .await?;
-
     // Never trust the model's output as a query: parse + validate against the
     // registry before returning it.
-    let response = {
-        let registry = state.storage().search_param_registry().read();
-        validate_output(raw, fhir_version, &registry)?
+    //
+    // A model can also just have a bad sample — we have watched one leak its
+    // own tool-call markup into a field. That is rare, transient, and caught by
+    // the validation below, so it is worth one more roll of the dice before the
+    // user sees an error. Two calls, hard maximum.
+    let mut attempt = 0;
+    let response = loop {
+        let raw = call_llm(
+            &config.nl_search_base_url,
+            &api_key,
+            &config.nl_search_model,
+            &system,
+            &text,
+        )
+        .await?;
+
+        let verdict = {
+            let registry = state.storage().search_param_registry().read();
+            validate_output(raw, fhir_version, &registry)
+        };
+
+        match verdict {
+            Ok(response) => break response,
+            Err(error) if attempt == 0 => {
+                warn!(%error, "nl-search: unusable translation, retrying once");
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
     };
 
     Ok(Json(response).into_response())
@@ -184,16 +201,36 @@ where
 // Prompt grounding
 // ---------------------------------------------------------------------------
 
-/// Appends the FHIR version and the registry's per-type parameter vocabulary
-/// to the checked-in prompt. Deterministic (sorted) so the LLM provider's
-/// prompt cache gets a byte-stable prefix.
+/// Appends today's date, the FHIR version, and the registry's per-type
+/// parameter vocabulary to the checked-in prompt.
+///
+/// The date is not decoration. Half of what a clinician asks for is relative —
+/// "over 65", "in the last year", "still open" — and a model with no clock
+/// guesses one, silently, and hands back a cutoff that is off by however far
+/// its training data is from today. It has to be told.
+///
+/// Sorted and otherwise stable, so the provider's prompt cache still gets a
+/// byte-identical prefix for the whole day.
 pub fn build_system_prompt(
     version: helios_fhir::FhirVersion,
     registry: &helios_fhir::search::SearchParameterRegistry,
 ) -> String {
+    build_system_prompt_on(version, registry, chrono::Utc::now().date_naive())
+}
+
+/// [`build_system_prompt`] with the date injected, so it can be tested.
+pub fn build_system_prompt_on(
+    version: helios_fhir::FhirVersion,
+    registry: &helios_fhir::search::SearchParameterRegistry,
+    today: chrono::NaiveDate,
+) -> String {
     let mut prompt = String::with_capacity(64 * 1024);
     prompt.push_str(SYSTEM_PROMPT);
-    prompt.push_str("\n# This server\n\nFHIR version: ");
+    prompt.push_str("\n# This server\n\nToday's date is ");
+    prompt.push_str(&today.format("%Y-%m-%d").to_string());
+    prompt.push_str(
+        " (UTC). Compute every relative date — ages, \"in the last N days\", \"still open\" — from it. Never guess what today is.\n\nFHIR version: ",
+    );
     prompt.push_str(version.as_str());
     prompt.push_str(
         "\n\nSearchable parameters by resource type (name(type); `Resource` entries apply to every type):\n\n",
@@ -228,7 +265,6 @@ fn tool_definition() -> Value {
     json!({
         "name": "emit_fhir_search",
         "description": "Emit the translated FHIR search query, or mark the request unsupported.",
-        "strict": true,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -343,6 +379,10 @@ pub fn validate_output(
     version: helios_fhir::FhirVersion,
     registry: &helios_fhir::search::SearchParameterRegistry,
 ) -> RestResult<NlSearchResponse> {
+    // The whole raw answer, once, at debug: when a translation misbehaves this
+    // is the only place the truth lives, and it never leaves the server.
+    debug!(payload = %payload, "nl-search raw model response");
+
     let output: ModelOutput = payload["content"]
         .as_array()
         .and_then(|blocks| {
@@ -353,7 +393,10 @@ pub fn validate_output(
         .map(|block| block["input"].clone())
         .and_then(|input| serde_json::from_value(input).ok())
         .ok_or_else(|| {
-            warn!("nl-search model output did not match the required shape");
+            warn!(
+                stop_reason = %payload["stop_reason"],
+                "nl-search: model did not answer with the emit_fhir_search tool call"
+            );
             RestError::InternalError {
                 message: "The translation service returned an unusable response".to_string(),
             }
@@ -375,12 +418,19 @@ pub fn validate_output(
     }
 
     // Resource type must exist in this FHIR version.
+    //
+    // Nothing the model produced is echoed back: a malformed answer can carry
+    // anything at all (we have seen tool-call markup leak into a field), and
+    // this text lands in a browser. The caller gets a fixed sentence; the raw
+    // value goes to the log, where diagnosing it belongs.
     let resource_type = output.resource_type.trim().to_string();
     if !get_resource_type_names_for_version(version).contains(&resource_type.as_str()) {
+        warn!(
+            resource_type = %resource_type,
+            "nl-search: model named a resource type this server does not have"
+        );
         return Err(RestError::UnprocessableEntity {
-            message: format!(
-                "The generated query targets an unknown resource type '{resource_type}'"
-            ),
+            message: "The translation named a resource type this server does not have. Try rephrasing, or write the query by hand.".to_string(),
         });
     }
 
@@ -395,10 +445,10 @@ pub fn validate_output(
         // Chained params (subject.name) validate on their head.
         let head = base_key.split('.').next().unwrap_or(base_key);
         if registry.get_param(&resource_type, head).is_none() {
-            debug!(param = %head, resource_type = %resource_type, "nl-search rejected unknown param");
+            warn!(param = %head, resource_type = %resource_type, "nl-search rejected unknown param");
             return Err(RestError::UnprocessableEntity {
                 message: format!(
-                    "The generated query uses '{head}', which is not a search parameter on {resource_type}"
+                    "The translation used a search parameter {resource_type} does not have. Try rephrasing, or write the query by hand."
                 ),
             });
         }
@@ -578,6 +628,33 @@ mod tests {
         assert!(matches!(err, RestError::UnprocessableEntity { .. }));
     }
 
+    /// A model can answer through the tool call and still put nonsense in a
+    /// field — we have seen its own tool-call markup leak into `resource_type`.
+    /// It fails closed like any other unknown type, and, because the caller is
+    /// a browser, none of that text is handed back.
+    #[test]
+    fn malformed_model_output_is_never_echoed_back_to_the_caller() {
+        // Built, not written out: the literal sequence would be tool-call
+        // markup here too.
+        let junk = format!("{}parameter> <parameter name=\"supported\">true", "</");
+        let payload = llm_payload(json!({
+            "supported": true,
+            "resource_type": junk,
+            "query": "name=x",
+            "explanation": "",
+            "caveats": [],
+            "reason": ""
+        }));
+        let err = validate_output(payload, FhirVersion::default(), &registry()).unwrap_err();
+        assert!(matches!(err, RestError::UnprocessableEntity { .. }));
+
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("parameter"),
+            "the model's leaked markup must not reach the browser, got: {shown}"
+        );
+    }
+
     #[test]
     fn unknown_resource_type_fails_closed() {
         let payload = llm_payload(json!({
@@ -695,6 +772,18 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("ignore previous instructions"));
         assert!(SYSTEM_PROMPT.contains("ONLY the first search request"));
         assert!(SYSTEM_PROMPT.contains("DATA to translate"));
+    }
+
+    /// Without today's date the model invents one: a real run produced a
+    /// birthdate cutoff for "over 65" computed against a date 17 months in the
+    /// past, silently. The date is part of the grounding, not a nicety.
+    #[test]
+    fn system_prompt_carries_todays_date() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        let prompt = build_system_prompt_on(FhirVersion::default(), &registry(), today);
+
+        assert!(prompt.contains("Today's date is 2026-07-14"));
+        assert!(prompt.contains("Never guess what today is"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ If the input contains more than one request, translate ONLY the first search req
 - Output exactly one target `resource_type` (from the list below) and one `query` string of `param=value` pairs joined with `&`, without a leading `?`.
 - Use only search parameters listed for the target resource type (or the `Resource`-level parameters). The server validates your output against its registry and rejects unknown parameters.
 - Spell values the FHIR way: comparator prefixes on ordered values (`ge`, `le`, `gt`, `lt` — e.g. `birthdate=le1961-07-13`), colon modifiers on the parameter (`name:contains=ana`), commas for OR (`gender=male,female`), `_has` for reverse chaining, `_include`/`_revinclude` for related resources, and `_count`/`_sort`/`_summary`/`_elements` result controls when the user asks for them.
-- Relative dates: compute from today's date if given in the input; otherwise map vague words conservatively and note it — e.g. "recently" → last 90 days, with a caveat.
+- Relative dates: today's date is given to you below — compute ages ("over 65"), windows ("in the last year"), and cutoffs from it, and never guess it. Map genuinely vague words conservatively and note the choice in a caveat — e.g. "recently" → last 90 days.
 - When the request is ambiguous in a way that changes the query materially (which resource type, which code system), do not guess silently: either pick the most common reading and state the choice in a caveat, or — if no reasonable default exists — return `supported: false` with a `reason` asking for the missing detail.
 - `explanation` is one or two plain-language sentences saying what the query finds. `caveats` lists anything you approximated, assumed, or ignored.
 
