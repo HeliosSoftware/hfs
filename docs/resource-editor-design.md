@@ -238,7 +238,22 @@ And their 2024 online-editor launch, the most recent word on it, is explicitly a
 
 **Forge**, the tool people conflate with this, edits **profiles**, not instances — its `Extend` button attaches an extension to an element of a *StructureDefinition*, and it does filter the offered extensions by `context` ([docs](https://docs.simplifier.net/projects/Forge/features/DefineExtensions.html)). That context filtering is the one idea worth taking (see below); the editing target is not ours.
 
-**The one thing Simplifier does that we should steal:** *live validation and live rendering on every keystroke*. Their own framing is that this is what makes the blank page less intimidating. We can go further than they can — their validation is a server round-trip, and our `validate_sync` is a pure ~300 µs function call (§6).
+**We then went and used it**, rather than trusting the docs — a free account, an R4 project, and a Patient carrying two extensions: `patient-birthPlace` at the root and `humanname-own-name` hanging off `name`, the "extension on a name" case Steve flagged as the hard one. What the tool does, in its own words and behaviour:
+
+- The **`Update` menu offers exactly three things**: `Upload`, `FHIR Read`, and — labelled by Firely themselves — **`Edit: use online text editor`**. That is the entire instance-editing surface. It opens a **JSON text editor with syntax highlighting and line numbers**. To add an extension you type the JSON block by hand.
+- The resource *viewer* renders a collapsible **tree**, so Simplifier can clearly do it — it just does not let you **edit** there. And the tree shows extensions **raw**: `url: …/patient-birthPlace` and `value → city: Duckburg`. It never resolves the extension definition, never says "Birth Place", never says the value is an `Address`. **Even their viewer has no semantic help for extensions.** (Credit where due: it does collapse `valueAddress` to `value`, so it knows what a `value[x]` is.)
+- Editing `"gender": "male"` into `"gender": "masculino"` — a violation of a *required* binding — **saved silently**. "Your file was saved." No validation at the point of editing.
+- Validation is a **separate tool at a separate URL** (`/validator?scope=…`), which you go and run. Errors appear as a **list in a side panel**; the offending line in the code pane is not marked.
+- Their instance model is telling: the resource is tagged **`type: Example of Patient`**, and the project page says *"Any resource instance … will become an **example** resource in your project."* Instances are illustrations for profiles, not first-class objects.
+
+**Two things they do better than most, and we should take both:**
+
+1. Their validator reports **`At Patient.gender, line 18, position 24`** — a FHIRPath *and* a source position. That is a better anchor than the prior art manages (Medplum has to *guess* the field by fuzzy-matching FHIRPath strings). It is the same anchoring our `validate_sync` hands us for free (§6), and it confirms the shape is right.
+2. Their paid editor promises **live validation on every keystroke**, and their own framing is that this is what makes the blank page less intimidating. We can go further than they can: theirs is a server round-trip, ours is a pure ~300 µs function call.
+
+**And one thing to avoid:** the error surfaced as `Exception: CodedValidationException: Value 'masculino' is not a correct code for valueset 'AdministrativeGender'`. Leaking a .NET exception class name at a clinical user is a message written for the programmer, not the person. Our `OperationOutcome` mapping should be held to a higher bar.
+
+**Limits of this evidence, stated plainly:** we exercised the **free tier**. Simplifier advertises a paid *"full online editor"* we did not use. Firely's own launch post describes that one as *"XML and JSON resources (with code highlighting and live validation) and FHIR Shorthand files"* — a better **code** editor, not a schema-driven form. The conclusion holds, but it rests on their description, not our hands.
 
 **The one team that did build it hit the wall at extensions.** Medplum's form is genuinely schema-driven and profile-aware, and its `getElementsToRender` **skips any `extension` element that has no slices** — their own comment says *"an extension property without slices has no nested extensions."* The consequence: **on an unprofiled resource, Medplum's form cannot add an extension at all.** Since most resources carry no `meta.profile`, that is most of the time.
 
