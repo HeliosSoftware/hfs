@@ -881,6 +881,36 @@ impl ResourceStorage for ElasticsearchBackend {
             _ => Ok(0),
         }
     }
+
+    // `supports_tenant_registry` stays `false`: ES is a search secondary, never
+    // the registry of record. Only the data purge is implemented, so that
+    // composite storage can clear a purged tenant's offloaded search documents
+    // (in `*-elasticsearch` modes the primary's own search index is empty).
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        // Documents are matched by an exact `tenant_id` term, not by the index
+        // pattern alone: index names lowercase the tenant id, so the pattern
+        // for tenant `acme` would also sweep `acme_corp`'s indices.
+        let pattern = format!("{}_{}_*", self.config().index_prefix, id.to_lowercase());
+        let body = json!({
+            "query": { "bool": { "filter": [
+                { "term": { "tenant_id": id } }
+            ]}}
+        });
+        // Missing indices are fine (nothing to delete).
+        let response = self
+            .client()
+            .delete_by_query(DeleteByQueryParts::Index(&[&pattern]))
+            .ignore_unavailable(true)
+            .refresh(true)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| internal_error(format!("purge_tenant_data: {}", e)))?;
+        let body: Value = response.json().await.unwrap_or_default();
+        // Deleted-doc count (includes contained/tombstone docs) — informational;
+        // the composite reports the primary's count to the admin API.
+        Ok(body.get("deleted").and_then(|d| d.as_u64()).unwrap_or(0))
+    }
 }
 
 /// Parses a StoredResource from an ES `_source` document.

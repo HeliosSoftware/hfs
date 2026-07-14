@@ -809,6 +809,7 @@ where
     let console_public_state = state.clone();
     let console_protected_state = state.clone();
     let console_admin_state = state.clone();
+    let admin_tenants_state = state.clone();
 
     // Build the router with all FHIR routes
     let router = routing::fhir_routes::create_routes(state);
@@ -876,7 +877,10 @@ where
     // ordinary user-/patient-context tokens (even wildcard ones) with `403`. As
     // with the other tiers, when auth is disabled server-wide there is no
     // Principal and the middleware passes through, keeping dev-mode behaviour.
-    let admin_console = routing::console_metrics::admin_routes(console_admin_state);
+    // Tenant-maintenance API (`/admin/tenants`) rides the same cross-tenant admin
+    // tier as `console/metrics/tenants`: system-context scope + authentication.
+    let admin_console = routing::console_metrics::admin_routes(console_admin_state)
+        .merge(routing::admin_tenants::routes(admin_tenants_state));
     let admin_console = if let Some(ref auth) = auth_state {
         admin_console
             .layer(axum::middleware::from_fn_with_state(

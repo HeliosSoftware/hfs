@@ -85,19 +85,11 @@ impl AuthProvider for JwksBearerAuthProvider {
         let decoding_key = self.jwks_cache.get_key(&kid).await?;
 
         // 5. Build validation
-        let mut validation = Validation::new(alg);
-
-        if let Some(ref aud) = self.expected_audience {
-            validation.set_audience(&[aud]);
-        } else {
-            validation.validate_aud = false;
-        }
-
-        if let Some(ref iss) = self.expected_issuer {
-            validation.set_issuer(&[iss]);
-        }
-
-        validation.validate_exp = true;
+        let validation = build_validation(
+            alg,
+            self.expected_audience.as_deref(),
+            self.expected_issuer.as_deref(),
+        );
 
         // 6. Decode and validate
         let token_data =
@@ -111,6 +103,9 @@ impl AuthProvider for JwksBearerAuthProvider {
                 }
                 jsonwebtoken::errors::ErrorKind::InvalidIssuer => {
                     AuthError::ValidationError("Invalid issuer".to_string())
+                }
+                jsonwebtoken::errors::ErrorKind::MissingRequiredClaim(claim) => {
+                    AuthError::ValidationError(format!("Missing required claim: {claim}"))
                 }
                 _ => AuthError::ValidationError(format!("Token validation failed: {}", e)),
             })?;
@@ -215,5 +210,67 @@ fn parse_algorithm(alg: &str) -> Option<Algorithm> {
             warn!(algorithm = alg, "Unknown JWT algorithm, ignoring");
             None
         }
+    }
+}
+
+/// Builds the JWT [`Validation`] for `alg`, requiring the audience and issuer
+/// claims when they are configured.
+///
+/// `set_audience` / `set_issuer` only validate their claim when it is *present*
+/// in the token, and `Validation::required_spec_claims` defaults to just
+/// `{"exp"}`. A token that omits `aud` (or `iss`) would therefore slip past a
+/// configured restriction — the bug in issue #206. Adding the claim to
+/// `required_spec_claims` makes a missing one fail validation.
+fn build_validation(
+    alg: Algorithm,
+    expected_audience: Option<&str>,
+    expected_issuer: Option<&str>,
+) -> Validation {
+    let mut validation = Validation::new(alg);
+
+    if let Some(aud) = expected_audience {
+        validation.set_audience(&[aud]);
+        validation.required_spec_claims.insert("aud".to_string());
+    } else {
+        validation.validate_aud = false;
+    }
+
+    if let Some(iss) = expected_issuer {
+        validation.set_issuer(&[iss]);
+        validation.required_spec_claims.insert("iss".to_string());
+    }
+
+    validation.validate_exp = true;
+    validation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audience_and_issuer_become_required_claims() {
+        // Regression for #206: a configured audience/issuer must be *required*,
+        // not merely checked-when-present, or a token omitting the claim bypasses
+        // the restriction.
+        let v = build_validation(Algorithm::RS256, Some("hfs-api"), Some("https://idp"));
+        assert!(v.required_spec_claims.contains("aud"));
+        assert!(v.required_spec_claims.contains("iss"));
+        assert!(v.validate_aud);
+    }
+
+    #[test]
+    fn no_audience_disables_aud_validation() {
+        let v = build_validation(Algorithm::RS256, None, Some("https://idp"));
+        assert!(!v.validate_aud);
+        assert!(!v.required_spec_claims.contains("aud"));
+        assert!(v.required_spec_claims.contains("iss"));
+    }
+
+    #[test]
+    fn no_issuer_leaves_iss_unrequired() {
+        let v = build_validation(Algorithm::RS256, Some("hfs-api"), None);
+        assert!(v.required_spec_claims.contains("aud"));
+        assert!(!v.required_spec_claims.contains("iss"));
     }
 }
