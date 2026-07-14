@@ -62,6 +62,12 @@ struct RecordedPut {
     if_none_match: Option<String>,
 }
 
+/// A one-shot "thief" run at the start of a `put_object` call, *before* its
+/// preconditions are evaluated, simulating a concurrent writer that lands between
+/// a caller's read and its write. This is what makes the compare-and-swap retry
+/// paths deterministically testable.
+type StealHook = Box<dyn FnOnce(&mut MockState) + Send>;
+
 /// Shared mutable state backing `MockS3Client`.
 #[derive(Default)]
 struct MockState {
@@ -82,11 +88,9 @@ struct MockState {
     fail_all_puts_with_precondition: bool,
     /// Preconditions carried by each `put_object` call, in order.
     recorded_puts: Vec<RecordedPut>,
-    /// A one-shot "thief": invoked at the start of the next `put_object` call,
-    /// *before* its preconditions are evaluated, simulating a concurrent writer
-    /// that lands between a caller's read and its write. This is what makes the
-    /// compare-and-swap retry paths deterministically testable.
-    steal_hook: Option<Box<dyn FnOnce(&mut MockState) + Send>>,
+    /// A [`StealHook`] to run before the next `put_object` evaluates its
+    /// preconditions, if one has been armed.
+    steal_hook: Option<StealHook>,
 }
 
 // `steal_hook` holds a boxed closure, which has no `Debug`, so `MockState` is
