@@ -59,7 +59,6 @@ use crate::error::StorageResult;
 use crate::tenant::TenantContext;
 
 /// Audit event helpers for bulk submit operations.
-#[cfg(feature = "audit")]
 pub mod audit {
     use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
 

@@ -21,7 +21,6 @@ use super::errors::ReindexError;
 use super::extractor::SearchParameterExtractor;
 
 /// Audit event helpers for reindex operations.
-#[cfg(feature = "audit")]
 pub mod audit {
     use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
 
