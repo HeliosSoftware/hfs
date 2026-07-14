@@ -9,7 +9,29 @@ repository.workspace = true
 homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/ui"
 keywords = ["helios-software", "fhir", "ui", "htmx"]
 
+[features]
+# FHIR version features forward to helios-fhir so the viewer read paths
+# (SearchParameter registry snapshot, compartment definitions) cover exactly
+# the versions the server is built with. R4 is the workspace default.
+default = ["R4"]
+R4 = ["helios-fhir/R4"]
+R4B = ["helios-fhir/R4B"]
+R5 = ["helios-fhir/R5"]
+R6 = ["helios-fhir/R6"]
+
 [dependencies]
+# Read paths into the rest of the workspace: the SearchParameter spec loader
+# and registry types (#238) and the per-version compartment-params table
+# (#237). Data flows one way — the UI depends on the workspace, never the
+# reverse.
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
+
+# Parses the vendored CompartmentDefinition spec JSONs (data/compartments/)
+# at first use, and derives the query-string extractors. Both already in the
+# workspace dependency graph via helios-fhir.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Web framework (matches the version used by helios-hfs / helios-rest)
 axum = "0.8"
 

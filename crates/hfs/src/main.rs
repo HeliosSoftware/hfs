@@ -568,7 +568,16 @@ async fn serve(
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "ui", not(feature = "headless")))]
-    let app = helios_ui::mount(app, env!("CARGO_PKG_VERSION"));
+    let app = helios_ui::mount(
+        app,
+        env!("CARGO_PKG_VERSION"),
+        config.data_dir.clone(),
+        helios_ui::NlSearch {
+            enabled: config.nl_search_enabled,
+            configured: config.nl_search_api_key.is_some(),
+            model: config.nl_search_model.clone(),
+        },
+    );
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -583,18 +592,24 @@ async fn serve(
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Shutdown signal received, draining connections");
-            if let Some(state) = audit_state {
-                lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
-                state.sink.flush().await;
-            }
-            // Flush any buffered OTLP spans (no-op without the `otel` feature).
-            helios_observability::telemetry::shutdown();
-        })
-        .await?;
+    // Peer address in request extensions: the natural-language search rate
+    // limiter falls back to it when auth is disabled and there is no principal
+    // to bill a request to.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Shutdown signal received, draining connections");
+        if let Some(state) = audit_state {
+            lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
+            state.sink.flush().await;
+        }
+        // Flush any buffered OTLP spans (no-op without the `otel` feature).
+        helios_observability::telemetry::shutdown();
+    })
+    .await?;
     Ok(())
 }
 

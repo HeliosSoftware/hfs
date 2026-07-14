@@ -60,14 +60,31 @@
 
     <nav class="nav">
       <div class="nav__section">{{ i18n.t("nav-section-work") }}</div>
-      <a class="nav-item" href="/ui" aria-current="page">
+      <a class="nav-item" href="/ui"{% if active_page == "home" %} aria-current="page"{% endif %}>
         <span class="icon">{% include "icons/home.svg" %}</span>
         {{ i18n.t("nav-home") }}
       </a>
+      <a class="nav-item" href="/ui/queries"{% if active_page == "queries" %} aria-current="page"{% endif %}>
+        <span class="icon">{% include "icons/bookmark.svg" %}</span>
+        {{ i18n.t("nav-saved-queries") }}
+      </a>
+      <!--
+        Search is a real page only when natural-language search is enabled
+        (#255). With HFS_NL_SEARCH_ENABLED=false the route is not mounted and
+        the entry stays as it was: a coming-soon placeholder that says nothing
+        about the feature.
+      -->
+      {% if nl_enabled %}
+      <a class="nav-item" href="/ui/search"{% if active_page == "search" %} aria-current="page"{% endif %}>
+        <span class="icon">{% include "icons/search.svg" %}</span>
+        {{ i18n.t("nav-search") }}
+      </a>
+      {% else %}
       <span class="nav-item nav-item--soon">
         <span class="icon">{% include "icons/search.svg" %}</span>
         {{ i18n.t("nav-search") }}
       </span>
+      {% endif %}
       <span class="nav-item nav-item--soon">
         <span class="icon">{% include "icons/pencil.svg" %}</span>
         {{ i18n.t("nav-resource-editor") }}
@@ -76,10 +93,10 @@
         <span class="icon">{% include "icons/history.svg" %}</span>
         {{ i18n.t("nav-history-versions") }}
       </span>
-      <span class="nav-item nav-item--soon">
+      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %}>
         <span class="icon">{% include "icons/compartments.svg" %}</span>
         {{ i18n.t("nav-compartments") }}
-      </span>
+      </a>
 
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
       <span class="nav-item nav-item--soon">
@@ -100,6 +117,10 @@
         <span class="icon">{% include "icons/shield.svg" %}</span>
         {{ i18n.t("nav-capability-conformance") }}
       </span>
+      <a class="nav-item" href="/ui/search-parameters"{% if active_page == "search-parameters" %} aria-current="page"{% endif %}>
+        <span class="icon">{% include "icons/search.svg" %}</span>
+        {{ i18n.t("nav-search-parameters") }}
+      </a>
       <span class="nav-item nav-item--soon">
         <span class="icon">{% include "icons/sliders.svg" %}</span>
         {{ i18n.t("nav-admin-ops") }}
@@ -157,7 +178,7 @@
         <span class="topbar__avatar">K</span>
       </div>
     </header>
-    <main class="content">
+    <main class="content{% block content_class %}{% endblock %}">
       {% block content %}{% endblock %}
     </main>
   </div>
