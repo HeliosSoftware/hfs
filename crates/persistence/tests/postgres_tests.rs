@@ -11,6 +11,12 @@
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::{BackendCapability, BackendKind};
 
+// T2 cluster-harness helpers shared by the cluster suites
+// (docs/cluster-testing-methodology.md §4). Included by `#[path]` rather than
+// via `mod common;` so this test binary compiles only the harness it uses.
+#[path = "common/cluster_harness.rs"]
+mod cluster_harness;
+
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -4212,5 +4218,200 @@ mod postgres_integration {
             .await
             .unwrap();
         assert!(read_other.is_none());
+    }
+
+    // ========================================================================
+    // T2 cluster calibration suite — bulk-export job store
+    // (docs/cluster-testing-strategy.md §8 Phase 0).
+    //
+    // The bulk-export job store is already cluster-safe (design §2a); these
+    // tests calibrate the `cluster_harness` helpers against it, so every row
+    // must pass green immediately. If a row is red, either the harness is
+    // unfaithful or the "already safe" boundary is drawn wrong — both are
+    // exactly what calibration exists to flush out (methodology §5).
+    // ========================================================================
+
+    use crate::cluster_harness as harness;
+    use helios_persistence::core::bulk_export::{ExportJobId, ExportProgress};
+    use helios_persistence::error::BulkExportError;
+
+    /// Maps `get_export_status` to the harness's `Option` shape: a job that
+    /// doesn't exist *for this tenant* is `None`; any other error is a bug.
+    async fn export_status_across(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+    ) -> Option<ExportProgress> {
+        match backend.get_export_status(tenant, job_id).await {
+            Ok(progress) => Some(progress),
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => None,
+            Err(other) => panic!("unexpected error reading export status: {other:?}"),
+        }
+    }
+
+    /// Claims and finishes every eligible job so an exclusivity race starts
+    /// from an empty queue. Leftover `accepted` jobs from other suites
+    /// sharing the container would otherwise let both racers win on
+    /// different jobs.
+    async fn drain_export_queue(backend: &PostgresBackend) {
+        let reaper = WorkerId::new(format!("cluster-drain-{}", uuid::Uuid::new_v4()));
+        while let Some(lease) = backend
+            .claim_next(&reaper, StdDuration::from_secs(60))
+            .await
+            .unwrap()
+        {
+            backend
+                .finish_export_job(
+                    &lease.tenant,
+                    &lease.job_id,
+                    &lease.worker_id,
+                    lease.fencing_token,
+                )
+                .await
+                .expect("draining a leftover export job");
+        }
+    }
+
+    /// DoD rows: visibility + isolation (strategy §4).
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_visible_and_isolated_across_handles() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-vis");
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Visibility: created via instance A, observable via instance B.
+        let progress = harness::assert_visible(
+            export_status_across(&handles.b, &tenant, &job_id).await,
+            "export job created via instance A",
+        );
+        assert_eq!(progress.status, ExportStatus::Accepted);
+
+        // Isolation: another tenant on instance B sees nothing.
+        let other_tenant = create_tenant("cluster-vis-other");
+        harness::assert_wrong_tenant_hidden(
+            export_status_across(&handles.b, &other_tenant, &job_id).await,
+            "export job",
+        );
+    }
+
+    /// DoD row: exclusivity — two instances race `claim_next` on one queued
+    /// job and exactly one wins (`FOR UPDATE SKIP LOCKED`).
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_claim_exclusive_across_handles() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-claim");
+
+        drain_export_queue(&handles.a).await;
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new(format!("cluster-claim-a-{}", uuid::Uuid::new_v4()));
+        let worker_b = WorkerId::new(format!("cluster-claim-b-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (handles.a, handles.b);
+        let (lease_a, lease_b) = harness::race2(
+            async move {
+                a.claim_next(&worker_a, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+            },
+            async move {
+                b.claim_next(&worker_b, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+
+        harness::assert_exactly_one(&lease_a, &lease_b, "the claim on one queued job");
+        let winner = lease_a.or(lease_b).unwrap();
+        assert_eq!(winner.job_id, job_id);
+        assert_eq!(
+            winner.tenant.tenant_id().as_str(),
+            tenant.tenant_id().as_str()
+        );
+    }
+
+    /// DoD row: fencing — after a release/reclaim moves the lease to another
+    /// instance, the stale holder's heartbeat and guarded writes are refused.
+    /// Deterministic: the reclaim uses `release`, not lease expiry, so there
+    /// are no sleeps (methodology §4, coverage-safe).
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_stale_handle_fenced_after_release() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let handles = harness::two_handles(create_backend).await;
+        let tenant = create_tenant("cluster-fence");
+
+        let job_id = handles
+            .a
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Instance A claims, then releases (graceful shutdown).
+        let worker_a = WorkerId::new(format!("cluster-fence-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&handles.a, &worker_a, &job_id, StdDuration::from_secs(60)).await;
+        ExportClaimStrategy::release(&handles.a, lease_a.clone())
+            .await
+            .unwrap();
+
+        // Instance B reclaims; the fencing token moves past A's.
+        let worker_b = WorkerId::new(format!("cluster-fence-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&handles.b, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+
+        // The stale handle is fenced out of heartbeat and guarded writes.
+        assert!(matches!(
+            handles.a.heartbeat(&lease_a).await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        assert!(matches!(
+            handles
+                .a
+                .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        // The current holder is unaffected.
+        handles
+            .b
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// DoD row: durability — dropping the creating handle (simulated
+    /// redeploy) must not lose the job; a fresh handle still sees it.
+    #[tokio::test]
+    async fn postgres_integration_cluster_bulk_export_survives_handle_drop() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let tenant = create_tenant("cluster-durable");
+
+        let first = create_backend().await;
+        let job_id = first
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        drop(first);
+
+        let replacement = create_backend().await;
+        let progress = harness::assert_visible(
+            export_status_across(&replacement, &tenant, &job_id).await,
+            "export job after its creating handle was dropped",
+        );
+        assert_eq!(progress.status, ExportStatus::Accepted);
     }
 }
