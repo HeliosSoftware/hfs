@@ -252,13 +252,6 @@ pub struct DefaultExportWorker<Js: ?Sized, Dp: ?Sized, Os: ?Sized> {
     /// before `_since` for patients added to the Group after `_since`
     /// (using `Group.member.period.start`).
     pub exclude_since_newly_added: bool,
-    /// Optional audit sink for emitting worker-level `AuditEvent` records
-    /// at job completion / failure / cancellation.
-    #[cfg(feature = "audit")]
-    pub audit_sink: Option<std::sync::Arc<dyn helios_audit::AuditSink>>,
-    /// `AuditEvent.source.observer` reference used for worker-emitted events.
-    #[cfg(feature = "audit")]
-    pub audit_source_observer: String,
 }
 
 impl<Js, Dp, Os> DefaultExportWorker<Js, Dp, Os>
@@ -275,10 +268,6 @@ where
             output,
             worker_id,
             exclude_since_newly_added: false,
-            #[cfg(feature = "audit")]
-            audit_sink: None,
-            #[cfg(feature = "audit")]
-            audit_source_observer: "Device/hfs".to_string(),
         }
     }
 
@@ -288,104 +277,16 @@ where
         self
     }
 
-    /// Wires an audit sink so the worker emits a BALP `AuditEvent` at job
-    /// completion, failure, and cancellation.
-    #[cfg(feature = "audit")]
-    pub fn with_audit(
-        mut self,
-        sink: std::sync::Arc<dyn helios_audit::AuditSink>,
-        source_observer: impl Into<String>,
-    ) -> Self {
-        self.audit_sink = Some(sink);
-        self.audit_source_observer = source_observer.into();
-        self
-    }
-
-    /// Emits a worker-level bulk-export `AuditEvent` when an audit sink is
-    /// configured. No-op otherwise.
-    #[cfg(feature = "audit")]
-    async fn emit_worker_audit(
-        &self,
-        operation: &str,
-        job_id: &ExportJobId,
-        level: Option<&ExportLevel>,
-        agent: Option<&str>,
-        outcome: &str,
-        outcome_desc: Option<&str>,
-    ) {
-        let Some(sink) = self.audit_sink.as_ref() else {
-            return;
-        };
-        let mut builder = helios_audit::AuditEventBuilder::new(&self.audit_source_observer)
-            .event_type(
-                "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                "object",
-            )
-            .action(helios_audit::AuditAction::Execute)
-            .outcome(outcome)
-            .detail("audit-operation", "bulk-export")
-            .detail("bulk-export-operation", operation)
-            .detail("job-id", job_id.as_str());
-        if let Some(l) = level {
-            builder = builder.detail("export-level", l.to_string());
-        }
-        if let Some(desc) = outcome_desc {
-            builder = builder.outcome_desc(desc);
-        }
-        if let Some(a) = agent {
-            builder = builder.agent(a, None, true);
-        }
-        sink.record(builder.build()).await;
-    }
-
     /// Runs the export job described by `lease` to completion.
     ///
     /// Every job-state mutation is fenced by `lease.worker_id` +
     /// `lease.fencing_token`; any `LeaseError::LeaseLost` aborts the run
     /// silently (the worker that reclaimed the job now owns it).
     pub async fn run_job(&self, lease: ExportJobLease) -> StorageResult<()> {
-        let inner_result = self.run_job_inner(&lease).await;
-        #[cfg(feature = "audit")]
-        let agent_subject = self
-            .jobs
-            .get_export_job_metadata(&lease.tenant, &lease.job_id)
-            .await
-            .ok()
-            .and_then(|m| m.owner_subject);
-        match inner_result {
-            Ok(WorkerRunOutcome::Completed { level }) => {
-                #[cfg(feature = "audit")]
-                self.emit_worker_audit(
-                    "worker-complete",
-                    &lease.job_id,
-                    Some(&level),
-                    agent_subject.as_deref(),
-                    "0",
-                    None,
-                )
-                .await;
-                #[cfg(not(feature = "audit"))]
-                let _ = level;
-                Ok(())
-            }
-            Ok(WorkerRunOutcome::Cancelled { level }) => {
-                #[cfg(feature = "audit")]
-                self.emit_worker_audit(
-                    "worker-cancelled",
-                    &lease.job_id,
-                    Some(&level),
-                    agent_subject.as_deref(),
-                    "4",
-                    Some("export job cancelled mid-run"),
-                )
-                .await;
-                #[cfg(not(feature = "audit"))]
-                let _ = level;
-                Ok(())
-            }
+        match self.run_job_inner(&lease).await {
+            Ok(()) => Ok(()),
             Err(LeaseError::LeaseLost { .. }) => {
-                // Another worker owns the job now — stop silently. No audit
-                // emission: the worker that reclaimed the job will emit one.
+                // Another worker owns the job now — stop silently.
                 Ok(())
             }
             Err(LeaseError::Storage(e)) => {
@@ -400,22 +301,12 @@ where
                         &e.to_string(),
                     )
                     .await;
-                #[cfg(feature = "audit")]
-                self.emit_worker_audit(
-                    "worker-failed",
-                    &lease.job_id,
-                    None,
-                    agent_subject.as_deref(),
-                    "8",
-                    Some(&e.to_string()),
-                )
-                .await;
                 Err(e)
             }
         }
     }
 
-    async fn run_job_inner(&self, lease: &ExportJobLease) -> Result<WorkerRunOutcome, LeaseError> {
+    async fn run_job_inner(&self, lease: &ExportJobLease) -> Result<(), LeaseError> {
         let tenant = &lease.tenant;
         let job_id = &lease.job_id;
         let wid = &lease.worker_id;
@@ -497,9 +388,7 @@ where
                 // Cooperative cancellation check.
                 if let Ok(progress) = self.jobs.get_export_status(tenant, job_id).await {
                     if progress.status == ExportStatus::Cancelled {
-                        return Ok(WorkerRunOutcome::Cancelled {
-                            level: view.level.clone(),
-                        });
+                        return Ok(());
                     }
                 }
 
@@ -622,17 +511,8 @@ where
         self.jobs
             .finish_export_job(tenant, job_id, wid, token)
             .await?;
-        Ok(WorkerRunOutcome::Completed { level: view.level })
+        Ok(())
     }
-}
-
-/// Terminal state of a [`DefaultExportWorker::run_job_inner`] call, used by
-/// `run_job` to pick the right audit phase after the lease/cancellation
-/// branching resolves.
-#[derive(Debug, Clone)]
-enum WorkerRunOutcome {
-    Completed { level: ExportLevel },
-    Cancelled { level: ExportLevel },
 }
 
 /// Applies `_elements` projection to an NDJSON line.

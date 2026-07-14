@@ -216,42 +216,17 @@ where
             resource_types.clone()
         };
         for t in &types_to_check {
-            if let Err(e) =
-                helios_auth::SmartScopePolicy::check(p, t, helios_auth::FhirOperation::Read)
-            {
-                let msg = e.to_string();
-                emit_export_audit_with_desc(
-                    state,
-                    Some(p),
-                    "kickoff",
-                    "",
-                    &level,
-                    &resource_types,
-                    "8",
-                    Some(&msg),
-                )
-                .await;
-                return Err(RestError::Forbidden { message: msg });
-            }
+            helios_auth::SmartScopePolicy::check(p, t, helios_auth::FhirOperation::Read).map_err(
+                |e| RestError::Forbidden {
+                    message: e.to_string(),
+                },
+            )?;
         }
         if matches!(level, ExportLevel::Group { .. }) {
-            if let Err(e) =
-                helios_auth::SmartScopePolicy::check(p, "Group", helios_auth::FhirOperation::Read)
-            {
-                let msg = e.to_string();
-                emit_export_audit_with_desc(
-                    state,
-                    Some(p),
-                    "kickoff",
-                    "",
-                    &level,
-                    &resource_types,
-                    "8",
-                    Some(&msg),
-                )
-                .await;
-                return Err(RestError::Forbidden { message: msg });
-            }
+            helios_auth::SmartScopePolicy::check(p, "Group", helios_auth::FhirOperation::Read)
+                .map_err(|e| RestError::Forbidden {
+                    message: e.to_string(),
+                })?;
         }
     }
 
@@ -261,22 +236,12 @@ where
         .await
         .map_err(map_storage_err)?;
     if active >= cfg.max_concurrent_per_tenant as u64 {
-        let msg = format!(
-            "too many concurrent exports for this tenant (max {})",
-            cfg.max_concurrent_per_tenant
-        );
-        emit_export_audit_with_desc(
-            state,
-            principal,
-            "kickoff",
-            "",
-            &level,
-            &resource_types,
-            "4",
-            Some(&msg),
-        )
-        .await;
-        return Err(RestError::BadRequest { message: msg });
+        return Err(RestError::BadRequest {
+            message: format!(
+                "too many concurrent exports for this tenant (max {})",
+                cfg.max_concurrent_per_tenant
+            ),
+        });
     }
 
     let request = ExportRequest {
@@ -301,24 +266,10 @@ where
     };
 
     let request_clone = input.request.clone();
-    let job_id = match jobs.start_export(tenant.context(), input).await {
-        Ok(id) => id,
-        Err(e) => {
-            let msg = e.to_string();
-            emit_export_audit_with_desc(
-                state,
-                principal,
-                "kickoff",
-                "",
-                &request_clone.level,
-                &request_clone.resource_types,
-                "8",
-                Some(&msg),
-            )
-            .await;
-            return Err(map_storage_err(e));
-        }
-    };
+    let job_id = jobs
+        .start_export(tenant.context(), input)
+        .await
+        .map_err(map_storage_err)?;
 
     emit_export_audit(
         state,
@@ -496,17 +447,6 @@ where
     {
         Ok(m) => m,
         Err(_) => {
-            emit_export_audit_with_desc(
-                &state,
-                principal.as_ref(),
-                "status",
-                job_id.as_str(),
-                &ExportLevel::System,
-                &[],
-                "8",
-                Some("export job not found"),
-            )
-            .await;
             return Err(RestError::NotFound {
                 resource_type: "export-job".to_string(),
                 id: job_id.to_string(),
@@ -514,17 +454,6 @@ where
         }
     };
     if !owns_job(principal.as_ref(), meta.owner_subject.as_deref()) {
-        emit_export_audit_with_desc(
-            &state,
-            principal.as_ref(),
-            "status",
-            job_id.as_str(),
-            &meta.level,
-            &[],
-            "8",
-            Some("requester is not the job owner"),
-        )
-        .await;
         return Err(RestError::NotFound {
             resource_type: "export-job".to_string(),
             id: job_id.to_string(),
@@ -533,8 +462,6 @@ where
 
     match meta.status {
         ExportStatus::Accepted | ExportStatus::InProgress => {
-            // In-progress polls are not audited individually (the BALP-relevant
-            // events are kickoff, terminal-status observation, cancel, download).
             let progress = jobs
                 .get_export_status(tenant.context(), &job_id)
                 .await
@@ -598,16 +525,6 @@ where
             let body = serde_json::to_vec(&manifest).map_err(|e| RestError::InternalError {
                 message: e.to_string(),
             })?;
-            emit_export_audit(
-                &state,
-                principal.as_ref(),
-                "status-complete",
-                job_id.as_str(),
-                &meta.level,
-                &[],
-                "0",
-            )
-            .await;
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/json")
@@ -616,39 +533,13 @@ where
                     message: e.to_string(),
                 })
         }
-        ExportStatus::Error => {
-            emit_export_audit_with_desc(
-                &state,
-                principal.as_ref(),
-                "status-error",
-                job_id.as_str(),
-                &meta.level,
-                &[],
-                "8",
-                Some("export job failed"),
-            )
-            .await;
-            Err(RestError::InternalError {
-                message: "export job failed".to_string(),
-            })
-        }
-        ExportStatus::Cancelled => {
-            emit_export_audit_with_desc(
-                &state,
-                principal.as_ref(),
-                "status-cancelled",
-                job_id.as_str(),
-                &meta.level,
-                &[],
-                "4",
-                Some("export job was cancelled"),
-            )
-            .await;
-            Err(RestError::NotFound {
-                resource_type: "export-job".to_string(),
-                id: job_id.to_string(),
-            })
-        }
+        ExportStatus::Error => Err(RestError::InternalError {
+            message: "export job failed".to_string(),
+        }),
+        ExportStatus::Cancelled => Err(RestError::NotFound {
+            resource_type: "export-job".to_string(),
+            id: job_id.to_string(),
+        }),
     }
 }
 
@@ -677,17 +568,6 @@ where
     {
         Ok(m) => m,
         Err(_) => {
-            emit_export_audit_with_desc(
-                &state,
-                principal.as_ref(),
-                "delete",
-                job_id.as_str(),
-                &ExportLevel::System,
-                &[],
-                "8",
-                Some("export job not found"),
-            )
-            .await;
             return Err(RestError::NotFound {
                 resource_type: "export-job".to_string(),
                 id: job_id.to_string(),
@@ -695,17 +575,6 @@ where
         }
     };
     if !owns_job(principal.as_ref(), meta.owner_subject.as_deref()) {
-        emit_export_audit_with_desc(
-            &state,
-            principal.as_ref(),
-            "delete",
-            job_id.as_str(),
-            &meta.level,
-            &[],
-            "8",
-            Some("requester is not the job owner"),
-        )
-        .await;
         return Err(RestError::NotFound {
             resource_type: "export-job".to_string(),
             id: job_id.to_string(),
@@ -717,36 +586,13 @@ where
         let _ = jobs.cancel_export(tenant.context(), &job_id).await;
     }
     // REST owns the two-step teardown: outputs first, then job rows.
-    if let Err(e) = output.delete_job_outputs(tenant.context(), &job_id).await {
-        let msg = e.to_string();
-        emit_export_audit_with_desc(
-            &state,
-            principal.as_ref(),
-            "delete",
-            job_id.as_str(),
-            &meta.level,
-            &[],
-            "8",
-            Some(&msg),
-        )
-        .await;
-        return Err(map_storage_err(e));
-    }
-    if let Err(e) = jobs.delete_export(tenant.context(), &job_id).await {
-        let msg = e.to_string();
-        emit_export_audit_with_desc(
-            &state,
-            principal.as_ref(),
-            "delete",
-            job_id.as_str(),
-            &meta.level,
-            &[],
-            "8",
-            Some(&msg),
-        )
-        .await;
-        return Err(map_storage_err(e));
-    }
+    output
+        .delete_job_outputs(tenant.context(), &job_id)
+        .await
+        .map_err(map_storage_err)?;
+    jobs.delete_export(tenant.context(), &job_id)
+        .await
+        .map_err(map_storage_err)?;
 
     emit_export_audit(
         &state,
@@ -787,31 +633,15 @@ where
     let principal = request.extensions().get::<Principal>().cloned();
     let job_id = ExportJobId::from_string(job_id);
 
-    let file_meta = match jobs
+    let file_meta = jobs
         .get_export_file_metadata(tenant.context(), &job_id, &part)
         .await
-    {
-        Ok(m) => m,
-        Err(_) => {
-            emit_export_audit_with_desc(
-                &state,
-                principal.as_ref(),
-                "download",
-                job_id.as_str(),
-                &ExportLevel::System,
-                &[],
-                "8",
-                Some("export file not found"),
-            )
-            .await;
-            return Err(RestError::NotFound {
-                resource_type: "export-file".to_string(),
-                id: format!("{job_id}/{part}"),
-            });
-        }
-    };
+        .map_err(|_| RestError::NotFound {
+            resource_type: "export-file".to_string(),
+            id: format!("{job_id}/{part}"),
+        })?;
 
-    if let Err(e) = file_auth
+    file_auth
         .authorize_download(
             principal.as_ref(),
             tenant.context(),
@@ -819,21 +649,9 @@ where
             &file_meta,
         )
         .await
-    {
-        let msg = e.to_string();
-        emit_export_audit_with_desc(
-            &state,
-            principal.as_ref(),
-            "download",
-            job_id.as_str(),
-            &ExportLevel::System,
-            std::slice::from_ref(&file_meta.resource_type),
-            "8",
-            Some(&msg),
-        )
-        .await;
-        return Err(RestError::Forbidden { message: msg });
-    }
+        .map_err(|e| RestError::Forbidden {
+            message: e.to_string(),
+        })?;
 
     emit_export_audit(
         &state,
@@ -867,7 +685,6 @@ where
 }
 
 /// Emits a bulk-export lifecycle `AuditEvent` when an audit sink is configured.
-#[allow(clippy::too_many_arguments)]
 async fn emit_export_audit<S>(
     state: &AppState<S>,
     principal: Option<&Principal>,
@@ -876,34 +693,6 @@ async fn emit_export_audit<S>(
     level: &ExportLevel,
     resource_types: &[String],
     outcome: &str,
-) where
-    S: ResourceStorage,
-{
-    emit_export_audit_with_desc(
-        state,
-        principal,
-        operation,
-        job_id,
-        level,
-        resource_types,
-        outcome,
-        None,
-    )
-    .await;
-}
-
-/// Variant of [`emit_export_audit`] that records an outcome description (used
-/// on failure paths to capture the rejection reason in the audit trail).
-#[allow(clippy::too_many_arguments)]
-async fn emit_export_audit_with_desc<S>(
-    state: &AppState<S>,
-    principal: Option<&Principal>,
-    operation: &str,
-    job_id: &str,
-    level: &ExportLevel,
-    resource_types: &[String],
-    outcome: &str,
-    outcome_desc: Option<&str>,
 ) where
     S: ResourceStorage,
 {
@@ -919,15 +708,10 @@ async fn emit_export_audit_with_desc<S>(
         .outcome(outcome)
         .detail("audit-operation", "bulk-export")
         .detail("bulk-export-operation", operation)
+        .detail("job-id", job_id)
         .detail("export-level", level.to_string());
-    if !job_id.is_empty() {
-        builder = builder.detail("job-id", job_id);
-    }
     if !resource_types.is_empty() {
         builder = builder.detail("resource-types", resource_types.join(","));
-    }
-    if let Some(desc) = outcome_desc {
-        builder = builder.outcome_desc(desc);
     }
     if let Some(p) = principal {
         builder = builder.agent(&p.subject, None, true);

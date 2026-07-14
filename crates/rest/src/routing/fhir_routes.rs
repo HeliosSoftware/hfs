@@ -284,13 +284,6 @@ where
             "/bulk-submit-file/{poll_token}/{part}",
             get(handlers::bulk_submit_file_handler::<S>),
         )
-        // $reindex — operation routes precede the catch-all type/instance routes.
-        .route("/$reindex", post(handlers::reindex_system_handler::<S>))
-        .route(
-            "/$reindex-status/{job_id}",
-            get(handlers::reindex_status_handler::<S>)
-                .delete(handlers::reindex_cancel_handler::<S>),
-        )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
         .route("/{resource_type}", post(handlers::create_handler::<S>))
@@ -311,20 +304,6 @@ where
         .route(
             "/{resource_type}/_history",
             get(handlers::history_type_handler::<S>),
-        )
-        // $reindex / $purge — type-scoped and instance-scoped routes must
-        // precede the `/{resource_type}/{id}` catch-all below.
-        .route(
-            "/{resource_type}/$reindex",
-            post(handlers::reindex_type_handler::<S>),
-        )
-        .route(
-            "/{resource_type}/$purge",
-            post(handlers::purge_type_handler::<S>),
-        )
-        .route(
-            "/{resource_type}/{id}/$purge",
-            delete(handlers::purge_instance_handler::<S>),
         )
         // Instance-level routes
         .route("/{resource_type}/{id}", get(handlers::read_handler::<S>))

@@ -47,7 +47,7 @@ otel = ["helios-observability/otel"]
 [dependencies]
 # Core dependencies
 helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["audit"] }
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false }
 helios-serde = { path = "../serde", version = "0.2.1", optional = true, default-features = false }
 helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.1" }

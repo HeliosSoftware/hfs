@@ -363,15 +363,6 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     // The first segment is the resource type (or tenant — handled by prefix stripping)
     let resource_type = first.to_string();
 
-    // `$`-suffixed operation endpoints (e.g. `$purge`, `$reindex`, `$export`)
-    // carry their own scope semantics that don't map onto the HTTP method —
-    // classifying `POST /{Type}/$purge` as Create would over-restrict tokens
-    // and mislabel the audit trail. Defer to the handler's scope check,
-    // matching batch (root POST) and system-level `$`-ops.
-    if segments.iter().skip(1).any(|s| s.starts_with('$')) {
-        return None;
-    }
-
     // Detect compartment search: GET /{compartment_type}/{id}/{target_type}
     // The third segment is the actual resource type being accessed, so the
     // authorization check must be against the target type, not the compartment.
@@ -726,31 +717,6 @@ mod tests {
         // A first segment starting with '$' is a system-level operation → None.
         assert!(extract_operation("/$export", "GET").is_none());
         assert!(extract_operation("/$export", "POST").is_none());
-    }
-
-    #[test]
-    fn test_extract_operation_type_scoped_dollar_op_defers_to_handler() {
-        assert!(extract_operation("/Patient/$purge", "POST").is_none());
-        assert!(extract_operation("/Patient/$reindex", "POST").is_none());
-        assert!(extract_operation("/Patient/$export", "GET").is_none());
-        assert!(extract_operation("/Group/g1/$export", "GET").is_none());
-    }
-
-    #[test]
-    fn test_extract_operation_instance_scoped_dollar_op_defers_to_handler() {
-        assert!(extract_operation("/Patient/123/$purge", "DELETE").is_none());
-    }
-
-    #[test]
-    fn test_url_routing_type_scoped_dollar_op_defers_after_tenant_strip() {
-        // Tenant prefix is stripped before classification; the `$`-op guard
-        // must still fire on the stripped path.
-        assert!(
-            extract_operation_for_routing("/acme/Patient/$purge", "POST", true).is_none()
-        );
-        assert!(
-            extract_operation_for_routing("/acme/Patient/$reindex", "POST", true).is_none()
-        );
     }
 
     #[test]
