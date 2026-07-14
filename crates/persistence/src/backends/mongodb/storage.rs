@@ -6,22 +6,25 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use mongodb::{
-    ClientSession, Cursor, SessionCursor,
+    ClientSession, Collection, Cursor, SessionCursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
     error::Error as MongoError,
+    options::FindOptions,
 };
 use serde_json::Value;
 
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
-    ResourceStorage, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage, normalize_etag,
+    PurgableStorage, ResourceStorage, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
+    normalize_etag,
 };
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::search::{SearchParameterLoader, SearchParameterStatus};
 use crate::tenant::TenantContext;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -3224,6 +3227,311 @@ fn resource_field_matches(value: Option<&Value>, expected: &str) -> bool {
         }
         _ => false,
     }
+}
+
+// ============================================================================
+// PurgableStorage
+//
+// MongoDB stores resources across three collections — `resources`,
+// `resource_history`, and `search_index` — the same shape SQLite uses, so purge
+// is the same three deletes keyed by (tenant_id, resource_type, id). Note that
+// the ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
+// tombstone. Purge is the only path that removes the bytes.
+// ============================================================================
+
+#[async_trait]
+impl PurgableStorage for MongoBackend {
+    async fn purge(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<()> {
+        let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type, "id": id };
+
+        // A resource that exists only in history (already purged from the
+        // current collection) is still purgeable; only a resource with no trace
+        // at all is NotFound. Mirrors the SQLite backend.
+        let in_resources = resources
+            .count_documents(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to check resource: {e}")))?;
+        let in_history = history
+            .count_documents(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to check resource history: {e}")))?;
+        if in_resources == 0 && in_history == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        resources
+            .delete_many(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge resource: {e}")))?;
+        history
+            .delete_many(key)
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge resource history: {e}")))?;
+
+        // The search_index collection keys the resource as `resource_id`.
+        search_index
+            .delete_many(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": id,
+            })
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge search index: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type };
+
+        // Counted before the delete, and counted over `resources` rather than
+        // `resource_history`, so the returned figure is "resources purged", not
+        // "versions purged".
+        let count = resources
+            .count_documents(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to count resources: {e}")))?;
+
+        resources
+            .delete_many(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge resources: {e}")))?;
+        history
+            .delete_many(key)
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge resource history: {e}")))?;
+        search_index
+            .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge search index: {e}")))?;
+
+        Ok(count)
+    }
+}
+
+// ============================================================================
+// ReindexSource / ReindexTarget
+//
+// MongoDB is a full primary with its own `search_index` collection, so it is
+// both — it can reindex itself standalone.
+// ============================================================================
+
+#[async_trait]
+impl ReindexSource for MongoBackend {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        let db = self.get_database().await?;
+        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+
+        let types = resources
+            .distinct(
+                "resource_type",
+                doc! { "tenant_id": tenant.tenant_id().as_str(), "is_deleted": false },
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to list resource types: {e}")))?;
+
+        Ok(types
+            .into_iter()
+            .filter_map(|b| b.as_str().map(str::to_string))
+            .collect())
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.count(tenant, Some(resource_type)).await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        let db = self.get_database().await?;
+        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+
+        let mut filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+        };
+
+        // Keyset pagination on (last_updated, id) — the same cursor shape the
+        // bulk-export batcher and the SQLite reindex source use, so a cursor is
+        // stable across pages even as resources are written.
+        if let Some((cur_dt, cur_id)) = cursor.and_then(parse_reindex_cursor) {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
+                    doc! {
+                        "last_updated": chrono_to_bson(cur_dt),
+                        "id": { "$gt": cur_id },
+                    },
+                ],
+            );
+        }
+
+        let opts = FindOptions::builder()
+            .sort(doc! { "last_updated": 1, "id": 1 })
+            .limit(limit as i64)
+            .build();
+
+        let mut stream = resources
+            .find(filter)
+            .with_options(opts)
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+
+        let mut docs = Vec::new();
+        while stream
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+        {
+            docs.push(
+                stream
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
+            );
+        }
+
+        let full_page = docs.len() as u32 == limit;
+        let next_cursor = match (full_page, docs.last()) {
+            (true, Some(last)) => {
+                let ts = last
+                    .get_datetime("last_updated")
+                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                let id = last
+                    .get_str("id")
+                    .map_err(|e| internal_error(format!("Missing id: {e}")))?;
+                Some(format!("{}|{}", bson_to_chrono(ts).to_rfc3339(), id))
+            }
+            _ => None,
+        };
+
+        let resources = docs
+            .iter()
+            .map(|doc| {
+                parse_history_row(doc, Some(resource_type), None)
+                    .map(|row| row.into_stored_resource(tenant))
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+        })
+    }
+}
+
+#[async_trait]
+impl ReindexTarget for MongoBackend {
+    async fn delete_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> StorageResult<u64> {
+        // Honors `is_search_offloaded()`: when Elasticsearch owns search, this
+        // backend keeps no index of its own and there is nothing to delete.
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
+
+        let db = self.get_database().await?;
+        let result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
+            .delete_many(doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+            })
+            .await
+            .map_err(|e| internal_error(format!("Failed to delete search entries: {e}")))?;
+
+        Ok(result.deleted_count)
+    }
+
+    async fn write_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
+
+        let db = self.get_database().await?;
+        let mut no_session: Option<ClientSession> = None;
+
+        // Reuses the CRUD indexing path, so contained resources are indexed the
+        // same way here as they are on create/update.
+        self.index_resource(
+            &db,
+            tenant.tenant_id().as_str(),
+            resource.resource_type(),
+            resource.id(),
+            resource.content(),
+            &mut no_session,
+        )
+        .await?;
+
+        let values = self
+            .search_extractor()
+            .extract(resource.content(), resource.resource_type())
+            .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
+
+        Ok(values.len())
+    }
+
+    async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
+
+        let db = self.get_database().await?;
+        let result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
+            .delete_many(doc! { "tenant_id": tenant.tenant_id().as_str() })
+            .await
+            .map_err(|e| internal_error(format!("Failed to clear search index: {e}")))?;
+
+        Ok(result.deleted_count)
+    }
+}
+
+/// Parses a `{rfc3339}|{id}` keyset-pagination cursor for the reindex source.
+fn parse_reindex_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
+    let (ts, id) = cursor.split_once('|')?;
+    let dt = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+    Some((dt, id.to_string()))
 }
 
 fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, String>) {
