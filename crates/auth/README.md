@@ -9,8 +9,6 @@ This crate provides [SMART Backend Services](https://hl7.org/fhir/smart-app-laun
 - **JWKS-Based JWT Validation**: Fetches and caches public keys from IdP JWKS endpoints
 - **SMART v2 Scope Parsing**: Parses `system/Patient.rs`, `system/*.cruds` scope syntax
 - **Scope-Based Authorization**: Maps FHIR operations to SMART permissions (CRUDS)
-- **JTI Replay Prevention**: In-memory and Redis-backed caches for JWT ID tracking
-- **Multi-Instance Coordination**: Redis leader election for JWKS refresh across scaled deployments
 - **SMART Discovery**: Builds `/.well-known/smart-configuration` documents
 - **Pluggable Audit**: Trait-based audit event sink (noop default, extensible)
 
@@ -18,10 +16,7 @@ This crate provides [SMART Backend Services](https://hl7.org/fhir/smart-app-laun
 
 ```rust
 use std::sync::Arc;
-use helios_auth::{
-    AuthConfig, JwksBearerAuthProvider, JwksCache,
-    InMemoryJtiCache, AuthProvider,
-};
+use helios_auth::{AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,17 +28,15 @@ async fn main() -> anyhow::Result<()> {
         ..AuthConfig::default()
     };
 
-    // Create caches
+    // Create the JWKS cache
     let jwks_cache = Arc::new(JwksCache::new(
         config.jwks_url.as_ref().unwrap(),
         config.jwks_min_refresh_interval,
     ));
     jwks_cache.initial_fetch().await?;
 
-    let jti_cache = Arc::new(InMemoryJtiCache::new());
-
     // Create provider
-    let provider = JwksBearerAuthProvider::new(jwks_cache, jti_cache, &config);
+    let provider = JwksBearerAuthProvider::new(jwks_cache, &config);
 
     // Validate a token
     match provider.authenticate("Bearer eyJhbGciOi...").await {
@@ -67,7 +60,6 @@ The authentication flow follows the [SMART Backend Services](https://hl7.org/fhi
    - Rejects tokens using algorithms not in the allowed list
    - Fetches the public key from the cached JWKS keyset (refreshes on unknown `kid`)
    - Validates signature, expiration, issuer, and audience claims
-   - Checks the `jti` claim against the replay prevention cache
    - Parses SMART v2 scopes from the `scope` or `scp` claim
    - Extracts the tenant ID from the configured claim
 5. **HFS enforces authorization** by checking scopes against the requested FHIR operation
@@ -113,12 +105,10 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant ID |
 | `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Allowed signing algorithms |
 
-### Caching and Replay Prevention
+### JWKS Caching
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_AUTH_JTI_BACKEND` | `disabled` | JTI replay cache (`disabled`, `memory`, or `redis`). Off by default: single-use `jti` replay protection is for `private_key_jwt` client assertions, not the reusable bearer access tokens a resource server receives — enabling it rejects the second use of any access token carrying a `jti`. |
-| `HFS_AUTH_REDIS_URL` | *(none)* | Redis URL (required for `redis` backend) |
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Min seconds between JWKS refreshes |
 
 ### SMART Discovery Endpoint
@@ -476,26 +466,32 @@ When authentication is enabled, the tenant ID is derived **exclusively** from th
 
 If the token does not contain the tenant claim, the server falls back to the standard tenant resolution (header, URL path, or default).
 
+## Token Replay
+
+HFS does **not** keep a `jti` replay cache, and bearer access tokens are accepted
+as many times as the client presents them until they expire.
+
+Single-use `jti` semantics belong to `private_key_jwt` **client assertions**
+(RFC 7523 §3), which a client mints fresh for each token request and which the
+authorization server's **token endpoint** must reject on reuse. HFS is a
+resource server: it has no token endpoint and never receives a client assertion.
+What it receives is an ordinary OAuth2 **bearer access token**, which the client
+is expected to reuse for every request until `exp`.
+
+Applying a replay cache to those tokens does not stop an attacker — a replayed
+bearer token is byte-identical to a legitimate one, so the server cannot tell
+them apart — it only rejects whichever party presents the token second, usually
+the legitimate client. Real anti-replay for bearer tokens requires
+sender-constrained tokens (DPoP or mTLS), where a fresh per-request proof is
+what gets replay-checked. Until HFS supports those, replay resistance comes from
+TLS, short token lifetimes, and audience/issuer validation.
+
 ## Multi-Instance Deployments
 
-For HFS deployments with multiple instances behind a load balancer:
-
-```bash
-# Use Redis for JTI replay prevention (shared across instances)
-HFS_AUTH_JTI_BACKEND=redis
-HFS_AUTH_REDIS_URL=redis://redis:6379
-
-# Build with Redis support
-cargo build -p helios-hfs --features redis
-```
-
-The Redis backend also coordinates JWKS refresh across instances using leader election, so only one instance fetches from the IdP's JWKS endpoint at a time.
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `redis` | Enables Redis-backed JTI cache and JWKS refresh coordination |
+`helios-auth` holds no cross-instance state. Each instance maintains its own
+JWKS cache, and token validation is purely local (signature plus claim checks),
+so instances behind a load balancer need no shared infrastructure and no sticky
+sessions.
 
 ## Testing
 
@@ -506,7 +502,6 @@ cargo test -p helios-auth
 # Run specific test module
 cargo test -p helios-auth scope
 cargo test -p helios-auth policy
-cargo test -p helios-auth jti
 ```
 
 ## Architecture
@@ -529,12 +524,7 @@ src/
 ├── jwks/
 │   ├── mod.rs          # Module exports
 │   ├── fetcher.rs      # HTTP JWKS fetcher with Cache-Control parsing
-│   ├── cache.rs        # JwksCache (background refresh, rate limiting)
-│   └── coordinator.rs  # Redis leader election (feature = "redis")
-├── jti/
-│   ├── mod.rs          # JtiCache trait
-│   ├── memory.rs       # InMemoryJtiCache (moka)
-│   └── redis.rs        # RedisJtiCache (feature = "redis")
+│   └── cache.rs        # JwksCache (background refresh, rate limiting)
 └── policy/
     └── mod.rs          # SmartScopePolicy (operation → permission check)
 ```
@@ -548,7 +538,6 @@ src/
 | `SmartPermissions` | Bitflags for CRUDS permissions |
 | `AuthProvider` | Trait for token validation (currently: JWKS Bearer) |
 | `JwksCache` | JWKS key cache with Cache-Control awareness and background refresh |
-| `JtiCache` | Trait for JWT ID replay prevention (in-memory or Redis) |
 | `SmartScopePolicy` | Checks principal scopes against FHIR operations |
 | `AuditEventSink` | Trait for recording auth events (noop default) |
 | `AuthConfig` | Configuration from environment variables |

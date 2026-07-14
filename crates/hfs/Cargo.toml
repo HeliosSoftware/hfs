@@ -35,9 +35,6 @@ mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
 
-# Auth backends
-redis = ["helios-rest/redis", "helios-auth/redis"]
-
 # Subscriptions
 subscriptions = ["helios-rest/subscriptions", "dep:helios-subscriptions"]
 

@@ -23,19 +23,6 @@ pub struct AuthConfig {
     pub tenant_claim: String,
     /// Comma-separated list of allowed JWT signing algorithms.
     pub allowed_algorithms: Vec<String>,
-    /// JTI replay-cache backend: `"disabled"` (default), `"memory"`, or
-    /// `"redis"`.
-    ///
-    /// Single-use `jti` replay protection is for `private_key_jwt` **client
-    /// assertions** (RFC 7523 §3), which the IdP's token endpoint enforces — not
-    /// for the reusable **bearer access tokens** a resource server like HFS
-    /// receives. Enabling it here rejects the second use of any access token that
-    /// carries a `jti` (which most IdPs, including Keycloak, always emit), so it
-    /// defaults to `"disabled"`. Turn it on only if your IdP issues genuinely
-    /// single-use access tokens.
-    pub jti_backend: String,
-    /// Redis connection URL (required when `jti_backend` is `"redis"`).
-    pub redis_url: Option<String>,
     /// Minimum interval (seconds) between JWKS refreshes.
     pub jwks_min_refresh_interval: u64,
 
@@ -79,9 +66,6 @@ impl AuthConfig {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
-            jti_backend: env::var("HFS_AUTH_JTI_BACKEND")
-                .unwrap_or_else(|_| "disabled".to_string()),
-            redis_url: env::var("HFS_AUTH_REDIS_URL").ok(),
             jwks_min_refresh_interval: env::var("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -121,8 +105,6 @@ impl Default for AuthConfig {
                 "ES256".to_string(),
                 "ES384".to_string(),
             ],
-            jti_backend: "disabled".to_string(),
-            redis_url: None,
             jwks_min_refresh_interval: 10,
             smart_token_endpoint: None,
             smart_authorize_endpoint: None,
@@ -150,8 +132,6 @@ mod tests {
         "HFS_AUTH_AUDIENCE",
         "HFS_AUTH_TENANT_CLAIM",
         "HFS_AUTH_ALGORITHMS",
-        "HFS_AUTH_JTI_BACKEND",
-        "HFS_AUTH_REDIS_URL",
         "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL",
         "HFS_SMART_TOKEN_ENDPOINT",
         "HFS_SMART_AUTHORIZE_ENDPOINT",
@@ -177,9 +157,6 @@ mod tests {
         let config = AuthConfig::from_env();
         assert!(!config.enabled);
         assert_eq!(config.tenant_claim, "tenant_id");
-        // JTI replay protection is off by default (#205): it belongs to
-        // single-use client assertions, not reusable bearer access tokens.
-        assert_eq!(config.jti_backend, "disabled");
         assert_eq!(config.jwks_min_refresh_interval, 10);
         assert_eq!(
             config.allowed_algorithms,
@@ -188,25 +165,10 @@ mod tests {
     }
 
     #[test]
-    fn test_from_env_jti_backend_opt_in() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        clear_auth_env();
-        unsafe { env::set_var("HFS_AUTH_JTI_BACKEND", "memory") };
-
-        let config = AuthConfig::from_env();
-        assert_eq!(config.jti_backend, "memory");
-
-        unsafe { env::remove_var("HFS_AUTH_JTI_BACKEND") };
-    }
-
-    #[test]
     fn test_default_config() {
         let config = AuthConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.tenant_claim, "tenant_id");
-        // JTI replay protection is off by default (#205): it belongs to
-        // single-use client assertions, not reusable bearer access tokens.
-        assert_eq!(config.jti_backend, "disabled");
         assert_eq!(config.jwks_min_refresh_interval, 10);
         assert_eq!(config.allowed_algorithms.len(), 4);
     }
