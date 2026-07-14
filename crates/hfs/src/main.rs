@@ -535,7 +535,7 @@ async fn start_mongodb(
     };
 
     let app = create_app_with_auth_bulk_and_settings(
-        backend,
+        backend.clone(),
         config.clone(),
         auth_config,
         auth_state,
@@ -544,7 +544,9 @@ async fn start_mongodb(
         None,
         settings_store,
     );
-    serve(app, &config, serve_audit_state).await
+    // Second handle to the same backend for the web UI's tenant-maintenance
+    // read/write path (the FHIR app keeps its own).
+    serve(app, &config, serve_audit_state, Some(backend)).await
 }
 
 /// Fallback when mongodb feature is not enabled.
@@ -566,9 +568,12 @@ async fn serve(
     app: axum::Router,
     config: &ServerConfig,
     audit_state: Option<Arc<AuditMiddlewareState>>,
+    ui_tenants: Option<Arc<dyn ResourceStorage>>,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "ui", not(feature = "headless")))]
-    let app = helios_ui::mount(app, env!("CARGO_PKG_VERSION"));
+    let app = helios_ui::mount(app, env!("CARGO_PKG_VERSION"), ui_tenants.clone());
+    #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
+    let _ = &ui_tenants;
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -877,6 +882,10 @@ async fn start_sqlite(
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
+    // Second handle to the same backend for the web UI's tenant-maintenance
+    // read/write path (the FHIR app keeps its own). Cheap: the SQLite backend
+    // shares one connection pool behind the Arc.
+    let ui_tenants: Option<Arc<dyn ResourceStorage>> = Some(backend.clone());
 
     // The SQLite backend also hosts the per-user settings store, so it always
     // keeps ownership of the backend Arc and uses the settings-capable builder.
@@ -893,7 +902,7 @@ async fn start_sqlite(
         submit_bundle,
         settings_store,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, ui_tenants).await
 }
 
 /// Constructs an embedded SQLite job store for backends that can't host job
@@ -1430,7 +1439,7 @@ async fn start_sqlite_elasticsearch(
     let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, sqlite.clone()).await?;
     let app = create_app_with_auth_bulk_and_settings(
-        composite,
+        composite.clone(),
         config.clone(),
         auth_config,
         auth_state,
@@ -1439,7 +1448,9 @@ async fn start_sqlite_elasticsearch(
         submit_bundle,
         settings_store,
     );
-    serve(app, &config, serve_audit_state).await
+    // The UI's tenant-maintenance path goes through the composite (not the
+    // bare primary) so a purge also clears the offloaded search documents.
+    serve(app, &config, serve_audit_state, Some(composite)).await
 }
 
 /// Fallback when elasticsearch feature is not enabled.
@@ -1489,7 +1500,7 @@ async fn start_postgres(
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let app = create_app_with_auth_bulk_and_settings(
-        backend,
+        backend.clone(),
         config.clone(),
         auth_config,
         auth_state,
@@ -1498,7 +1509,9 @@ async fn start_postgres(
         submit_bundle,
         settings_store,
     );
-    serve(app, &config, serve_audit_state).await
+    // Second handle to the same backend for the web UI's tenant-maintenance
+    // read/write path (the FHIR app keeps its own).
+    serve(app, &config, serve_audit_state, Some(backend)).await
 }
 
 /// Fallback when postgres feature is not enabled.
@@ -1648,7 +1661,7 @@ async fn start_postgres_elasticsearch(
     let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, pg.clone()).await?;
     let app = create_app_with_auth_bulk_and_settings(
-        composite,
+        composite.clone(),
         config.clone(),
         auth_config,
         auth_state,
@@ -1657,7 +1670,9 @@ async fn start_postgres_elasticsearch(
         submit_bundle,
         settings_store,
     );
-    serve(app, &config, serve_audit_state).await
+    // The UI's tenant-maintenance path goes through the composite (not the
+    // bare primary) so a purge also clears the offloaded search documents.
+    serve(app, &config, serve_audit_state, Some(composite)).await
 }
 
 /// Fallback when postgres+elasticsearch features are not both enabled.
@@ -1810,7 +1825,7 @@ async fn start_mongodb_elasticsearch(
     };
 
     let app = create_app_with_auth_bulk_and_settings(
-        composite,
+        composite.clone(),
         config.clone(),
         auth_config,
         auth_state,
@@ -1819,7 +1834,9 @@ async fn start_mongodb_elasticsearch(
         None,
         settings_store,
     );
-    serve(app, &config, serve_audit_state).await
+    // The UI's tenant-maintenance path goes through the composite (not the
+    // bare primary) so a purge also clears the offloaded search documents.
+    serve(app, &config, serve_audit_state, Some(composite)).await
 }
 
 /// Fallback when mongodb+elasticsearch features are not both enabled.
@@ -1890,6 +1907,9 @@ async fn start_s3(
     })?;
 
     let serve_audit_state = audit_state.clone();
+    // Second handle to the same backend (S3Backend clones share the client)
+    // for the web UI's tenant-maintenance read/write path.
+    let ui_tenants: Option<Arc<dyn ResourceStorage>> = Some(Arc::new(backend.clone()));
     let app = create_app_with_auth(
         backend,
         config.clone(),
@@ -1897,7 +1917,7 @@ async fn start_s3(
         auth_state,
         audit_state,
     );
-    serve(app, &config, serve_audit_state).await
+    serve(app, &config, serve_audit_state, ui_tenants).await
 }
 
 /// Fallback when s3 feature is not enabled.
@@ -2087,7 +2107,7 @@ async fn start_s3_elasticsearch(
         let jobs = build_embedded_job_store(&config)?;
         if let Some(bundle) = build_bulk_export(&config, s3.clone(), jobs).await? {
             let app = create_app_with_auth_and_bulk(
-                composite,
+                composite.clone(),
                 config.clone(),
                 auth_config,
                 auth_state,
@@ -2095,20 +2115,24 @@ async fn start_s3_elasticsearch(
                 Some(bundle),
                 None,
             );
-            return serve(app, &config, serve_audit_state).await;
+            // The UI's tenant-maintenance path goes through the composite (not
+            // the bare primary) so a purge also clears the offloaded search
+            // documents.
+            return serve(app, &config, serve_audit_state, Some(composite)).await;
         }
     }
 
-    let app = create_app_with_auth(
-        Arc::try_unwrap(composite).unwrap_or_else(|_| {
-            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
-        }),
+    let app = create_app_with_auth_and_bulk(
+        composite.clone(),
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        None,
+        None,
     );
-    serve(app, &config, serve_audit_state).await
+    // See above: the composite handle keeps purge search-aware in the UI too.
+    serve(app, &config, serve_audit_state, Some(composite)).await
 }
 
 /// Fallback when s3+elasticsearch features are not both enabled.
