@@ -4086,4 +4086,131 @@ mod postgres_integration {
         let backend = create_backend().await;
         assert!(backend.supports_contained_search());
     }
+
+    // ========================================================================
+    // Cluster T2 Tests (docs/cluster-testing-strategy.md §4)
+    // ========================================================================
+
+    /// T2 cross-instance suite for schema initialization: four independently
+    /// constructed backends (fresh pools, not a cloned `Arc`) cold-start
+    /// concurrently against one fresh, empty database.
+    ///
+    /// DoD rows — exclusivity: init is serialized by the advisory lock
+    /// (without it, a losing instance aborts on a pg_type duplicate-key error
+    /// from racing `CREATE TABLE IF NOT EXISTS`); visibility: create via
+    /// handle A → readable via handle B; isolation: wrong tenant sees nothing.
+    #[tokio::test]
+    async fn postgres_integration_cluster_concurrent_cold_start_schema_init() {
+        let pg = shared_pg().await;
+
+        // A database no other test touches — this must be a true cold start.
+        let dbname = format!("cold_start_{}", uuid::Uuid::new_v4().simple());
+        let admin_conn = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (admin, connection) = tokio_postgres::connect(&admin_conn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        admin
+            .execute(format!("CREATE DATABASE {}", dbname).as_str(), &[])
+            .await
+            .expect("create cold-start database");
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+
+        let mut backends = Vec::new();
+        for _ in 0..4 {
+            let config = PostgresConfig {
+                host: pg.host.clone(),
+                port: pg.port,
+                dbname: dbname.clone(),
+                user: "postgres".to_string(),
+                password: Some("postgres".to_string()),
+                max_connections: 2,
+                data_dir: Some(data_dir.clone()),
+                ..Default::default()
+            };
+            backends.push(
+                PostgresBackend::new(config)
+                    .await
+                    .expect("Failed to create PostgresBackend"),
+            );
+        }
+
+        // All four handles start init from a shared barrier to force the race.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(backends.len()));
+        let tasks: Vec<_> = backends
+            .into_iter()
+            .map(|backend| {
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    backend.init_schema().await.map(|_| backend)
+                })
+            })
+            .collect();
+        let mut handles = Vec::new();
+        for task in tasks {
+            handles.push(
+                task.await
+                    .expect("init task panicked")
+                    .expect("every instance must survive a concurrent cold start"),
+            );
+        }
+
+        // Init converged: exactly one schema_version row.
+        let cold_conn = format!(
+            "host={} port={} user=postgres password=postgres dbname={}",
+            pg.host, pg.port, dbname,
+        );
+        let (cold, connection) = tokio_postgres::connect(&cold_conn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to cold-start db");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let rows = cold
+            .query("SELECT version FROM schema_version", &[])
+            .await
+            .expect("query schema_version");
+        assert_eq!(
+            rows.len(),
+            1,
+            "racing inits must not duplicate schema_version rows"
+        );
+        assert!(rows[0].get::<_, i32>(0) >= 1);
+
+        // Visibility: create via handle A → readable via handle B (same tenant).
+        let tenant = create_tenant("cluster-cold-start");
+        let created = handles[0]
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let read_b = handles[1]
+            .read(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        assert!(read_b.is_some());
+
+        // Isolation: a different tenant on handle B sees nothing.
+        let other_tenant = create_tenant("cluster-cold-start-other");
+        let read_other = handles[1]
+            .read(&other_tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        assert!(read_other.is_none());
+    }
 }
