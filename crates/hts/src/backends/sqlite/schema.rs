@@ -804,12 +804,10 @@ mod tests {
         let mut stmt = conn
             .prepare("SELECT path FROM bootstrap_imports ORDER BY path")
             .unwrap();
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+        stmt.query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .map(Result::unwrap)
-            .collect();
-        rows
+            .collect()
     }
 
     fn has_authority_rank(conn: &rusqlite::Connection, table: &str) -> bool {
