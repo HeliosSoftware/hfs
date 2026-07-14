@@ -241,6 +241,9 @@ where
                 .put(handlers::put_user_settings::<S>)
                 .patch(handlers::patch_user_settings::<S>),
         )
+        // Natural-language search translation (#255): returns a generated
+        // query for the client to review and run via the normal search path.
+        .route("/$nl-search", post(handlers::nl_search_handler::<S>))
         .route("/", post(handlers::batch_handler::<S>))
         // Bulk Data Export ($export) — operation routes precede the catch-all.
         .route(

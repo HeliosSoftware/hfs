@@ -18,6 +18,14 @@
 //! | `HFS_CORS_HEADERS` | Content-Type,Authorization,Accept,If-Match,If-None-Match,Prefer,Content-Encoding | Allowed headers |
 //! | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 //! | `HFS_BASE_URL` | http://localhost:8080 | Server base URL |
+//! | `HFS_NL_SEARCH_ENABLED` | true | Natural-language search master switch: `false` removes the feature entirely (no endpoint, no UI affordance) |
+//! | `HFS_NL_SEARCH_API_KEY` | (unset) | LLM provider API key. Present → NL search functional; absent (with ENABLED) → UI shows the setup/teaser state |
+//! | `HFS_NL_SEARCH_MODEL` | claude-opus-4-8 | LLM model id for query translation |
+//! | `HFS_NL_SEARCH_BASE_URL` | https://api.anthropic.com | LLM endpoint base URL (self-hosted / proxied deployments) |
+//! | `HFS_NL_SEARCH_RATE_LIMIT` | 10 | NL search requests allowed per window, per user/tenant (or per IP) |
+//! | `HFS_NL_SEARCH_RATE_WINDOW_SECS` | 60 | Rate-limit window size (seconds) |
+//! | `HFS_NL_SEARCH_DAILY_LIMIT` | 200 | NL search requests per key per UTC day (slow-drip backstop) |
+//! | `HFS_NL_SEARCH_MAX_CHARS` | 500 | Maximum accepted input length (characters) |
 //! | `HFS_DEFAULT_FHIR_VERSION` | R4 | Default FHIR version (R4, R4B, R5, R6) |
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
@@ -767,6 +775,47 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
+    /// Natural-language search master switch. When false the feature is
+    /// completely off: the endpoint 404s and the UI renders nothing.
+    #[arg(long, env = "HFS_NL_SEARCH_ENABLED", default_value = "true")]
+    pub nl_search_enabled: bool,
+
+    /// LLM provider API key for natural-language search. Present makes the
+    /// feature functional; absent (with the switch on) leaves the UI in an
+    /// advertise/setup state and the endpoint non-functional.
+    #[arg(long, env = "HFS_NL_SEARCH_API_KEY")]
+    pub nl_search_api_key: Option<String>,
+
+    /// LLM model id used for query translation.
+    #[arg(long, env = "HFS_NL_SEARCH_MODEL", default_value = "claude-opus-4-8")]
+    pub nl_search_model: String,
+
+    /// LLM endpoint base URL, for self-hosted or proxied deployments.
+    #[arg(
+        long,
+        env = "HFS_NL_SEARCH_BASE_URL",
+        default_value = "https://api.anthropic.com"
+    )]
+    pub nl_search_base_url: String,
+
+    /// Natural-language search requests allowed per window, per
+    /// authenticated user/tenant (per IP when unauthenticated).
+    #[arg(long, env = "HFS_NL_SEARCH_RATE_LIMIT", default_value = "10")]
+    pub nl_search_rate_limit: u32,
+
+    /// Rate-limit window size in seconds.
+    #[arg(long, env = "HFS_NL_SEARCH_RATE_WINDOW_SECS", default_value = "60")]
+    pub nl_search_rate_window_secs: u64,
+
+    /// Requests per key per UTC day — a backstop against a slow-drip abuser
+    /// who stays under the per-window limit.
+    #[arg(long, env = "HFS_NL_SEARCH_DAILY_LIMIT", default_value = "200")]
+    pub nl_search_daily_limit: u32,
+
+    /// Maximum accepted natural-language input length, in characters.
+    #[arg(long, env = "HFS_NL_SEARCH_MAX_CHARS", default_value = "500")]
+    pub nl_search_max_chars: usize,
+
     /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
     #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
     pub export_sink: String,
@@ -899,6 +948,14 @@ impl Default for ServerConfig {
             elasticsearch_username: None,
             elasticsearch_password: None,
             sof_enabled: true,
+            nl_search_enabled: true,
+            nl_search_api_key: None,
+            nl_search_model: "claude-opus-4-8".to_string(),
+            nl_search_base_url: "https://api.anthropic.com".to_string(),
+            nl_search_rate_limit: 10,
+            nl_search_rate_window_secs: 60,
+            nl_search_daily_limit: 200,
+            nl_search_max_chars: 500,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
@@ -1019,6 +1076,14 @@ impl ServerConfig {
             elasticsearch_username: None,
             elasticsearch_password: None,
             sof_enabled: true,
+            nl_search_enabled: true,
+            nl_search_api_key: None,
+            nl_search_model: "claude-opus-4-8".to_string(),
+            nl_search_base_url: "https://api.anthropic.com".to_string(),
+            nl_search_rate_limit: 10,
+            nl_search_rate_window_secs: 60,
+            nl_search_daily_limit: 200,
+            nl_search_max_chars: 500,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,

@@ -1674,3 +1674,255 @@ button.filter-rail__item {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Search page (#255, Figma "Search V1.0"): a segmented mode switch over one
+   query — describe it in natural language, or build it by hand. Both write the
+   same editable QUERY strip, so the mode is a way of writing, not a separate
+   search path.
+   --------------------------------------------------------------------------- */
+
+.seg {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+}
+
+.seg__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.seg__btn:hover {
+  color: var(--text);
+}
+
+.seg__btn[aria-pressed="true"] {
+  color: var(--text-strong);
+  background: var(--bg-content);
+  border-color: var(--surface-border);
+  box-shadow: var(--surface-shadow);
+}
+
+/* The natural-language pane and the builder rows are the two modes; the QUERY
+   strip below them belongs to neither, and is always visible. Driven by CSS
+   rather than the `hidden` attribute so the builder's own re-render cannot
+   fight the mode switch. */
+.search-page[data-mode="nl"] .builder-sections,
+.search-page[data-mode="builder"] .nl-pane {
+  display: none;
+}
+
+.nl-pane {
+  margin-top: 14px;
+}
+
+.nl-input {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  position: relative;
+}
+
+.nl-input__spark {
+  position: absolute;
+  left: 14px;
+  color: var(--accent);
+  pointer-events: none;
+}
+
+.nl-input input {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0 14px 0 40px;
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  outline: none;
+}
+
+.nl-input input::placeholder {
+  color: var(--muted);
+}
+
+.nl-input .btn--primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+  padding: 0 20px;
+  white-space: nowrap;
+}
+
+.nl-pane__hint {
+  margin: 10px 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.nl-examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nl-examples .chip {
+  height: 30px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.nl-examples .chip:hover {
+  color: var(--text);
+}
+
+.nl-answer {
+  margin-top: 14px;
+  padding: 12px 14px;
+  font-size: 13px;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+}
+
+.nl-answer__text {
+  margin: 0;
+  color: var(--text);
+}
+
+.nl-answer--ok {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.nl-answer--working {
+  color: var(--muted);
+}
+
+/* A refused request is an answer, not a failure: the model was asked for
+   something this server does not do. Muted, not alarming. */
+.nl-answer--unsupported {
+  background: var(--input-bg);
+}
+
+.nl-answer--error {
+  background: var(--input-bg);
+  border-color: var(--muted);
+}
+
+.nl-answer__caveats-heading {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.nl-answer__caveats {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text);
+}
+
+/* Enabled but unconfigured: advertise the feature, name the env vars, link the
+   how-to. An operator who has never heard of it can turn it on from here. */
+.nl-setup {
+  margin-top: 14px;
+  padding: 18px;
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 12px;
+}
+
+.nl-setup__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  color: var(--accent);
+}
+
+.nl-setup__head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.nl-setup p {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.nl-setup__env {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-content);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+}
+
+.nl-setup__note {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* The QUERY strip: the generated query is never hidden and never read-only —
+   the user sees it, can fix it, and only then runs it. */
+.query-builder__tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 38px;
+  padding: 0 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  white-space: nowrap;
+}
+
+.query-builder__copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  color: var(--muted);
+}
+
+.query-builder__copy:hover {
+  color: var(--text);
+}
+
+@media (max-width: 900px) {
+  .query-builder__tag {
+    display: none;
+  }
+}

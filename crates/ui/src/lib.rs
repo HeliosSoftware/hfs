@@ -48,12 +48,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[folder = "assets/"]
 struct Assets;
 
+/// How natural-language search (#255) presents itself in the UI, mirroring the
+/// server's `HFS_NL_SEARCH_*` configuration.
+///
+/// The three states are deliberate: `enabled: false` makes the feature vanish
+/// (no page, no nav entry, no mention); enabled but unconfigured advertises
+/// what it does and how to switch it on; enabled and configured is the working
+/// feature. The UI never sees the API key itself — only whether one is set.
+#[derive(Clone, Debug, Default)]
+pub struct NlSearch {
+    /// `HFS_NL_SEARCH_ENABLED` — the operator's kill switch.
+    pub enabled: bool,
+    /// Whether `HFS_NL_SEARCH_API_KEY` is set.
+    pub configured: bool,
+    /// `HFS_NL_SEARCH_MODEL` — shown in the setup state so an operator can see
+    /// what they would be billed for.
+    pub model: String,
+}
+
 /// Shared router state: values that are constant for the process lifetime.
 #[derive(Clone)]
 struct WebState {
     version: &'static str,
     /// Lazily-loaded SearchParameter snapshot per FHIR version (#238).
     sp_catalog: Arc<search_params::SpCatalog>,
+    /// Natural-language search feature state (#255).
+    nl: Arc<NlSearch>,
 }
 
 /// A small, self-contained system-status snapshot — the "real read path" the
@@ -100,6 +120,31 @@ struct IndexPage {
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
+    /// Whether the sidebar links to the natural-language search page (#255).
+    nl_enabled: bool,
+}
+
+/// Search page (#255, Figma "Search V1.0"): natural language and the visual
+/// builder as two modes over one editable FHIR query.
+///
+/// Rendered only when the feature is enabled. When it is enabled but no API
+/// key is configured, the natural-language pane renders its setup state
+/// instead of an input — the page still works, in visual-builder mode.
+#[derive(Template)]
+#[template(path = "pages/search.html")]
+struct SearchPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    nl_enabled: bool,
+    /// Feature state; `configured` picks between the working pane and setup.
+    nl: NlSearch,
+    /// How-to page for the unconfigured state (docs live in the book).
+    docs_url: &'static str,
+    resource_types: Vec<String>,
+    /// The saved-query controls are the Saved Queries page's job, not this
+    /// page's (see `partials/search-builder.html`).
+    show_save: bool,
 }
 
 /// Saved FHIR queries page (#234). The shell is server-rendered; the list is
@@ -111,10 +156,12 @@ struct QueriesPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    nl_enabled: bool,
     /// The version's resource types for the picker rail, from the spec
     /// CompartmentDefinitions already vendored for the compartment viewer.
     /// Counts hydrate client-side via `_summary=count`.
     resource_types: Vec<String>,
+    show_save: bool,
 }
 
 /// SearchParameter viewer (#238). Read-only against the same snapshot the
@@ -126,6 +173,7 @@ struct SearchParametersPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    nl_enabled: bool,
     view: search_params::SpView,
 }
 
@@ -138,6 +186,7 @@ struct CompartmentsPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    nl_enabled: bool,
     view: compartments::CmpView,
 }
 
@@ -170,14 +219,30 @@ struct ParamOptionsPartial {
 /// `data_dir` is the server's data directory (`HFS_DATA_DIR`), where the
 /// SearchParameter spec bundles live; `None` falls back to `./data`, matching
 /// the storage backends.
-pub fn mount(fhir_app: Router, hfs_version: &'static str, data_dir: Option<PathBuf>) -> Router {
-    Router::new()
+///
+/// `nl` mirrors the server's natural-language search configuration. With
+/// `enabled: false` the `/ui/search` route is never registered, so the page
+/// 404s through to the FHIR app exactly as it did before the feature existed.
+pub fn mount(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+) -> Router {
+    let nl_enabled = nl.enabled;
+    let mut router = Router::new()
         .route("/ui", get(index))
         .route("/ui/queries", get(queries))
         .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/compartments", get(compartments_page))
-        .route("/ui/status", get(status))
+        .route("/ui/status", get(status));
+
+    if nl_enabled {
+        router = router.route("/ui/search", get(search));
+    }
+
+    router
         // Embedded, pinned htmx + CSS, served with br/gzip/deflate negotiation.
         .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
@@ -189,9 +254,14 @@ pub fn mount(fhir_app: Router, hfs_version: &'static str, data_dir: Option<PathB
         .with_state(WebState {
             version: hfs_version,
             sp_catalog: Arc::new(search_params::SpCatalog::new(data_dir)),
+            nl: Arc::new(nl),
         })
         .fallback_service(fhir_app)
 }
+
+/// The how-to page for natural-language search, linked from the setup state.
+const NL_SEARCH_DOCS: &str =
+    "https://heliossoftware.github.io/hfs/components/natural-language-search.html";
 
 /// Full landing page.
 async fn index(State(state): State<WebState>, locale: RequestLocale) -> Response {
@@ -200,6 +270,21 @@ async fn index(State(state): State<WebState>, locale: RequestLocale) -> Response
         metrics: DashboardMetrics::sample(),
         i18n: I18n::new(locale),
         active_page: "home",
+        nl_enabled: state.nl.enabled,
+    })
+}
+
+/// Search page: natural language and the visual builder over one editable query.
+async fn search(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    render(SearchPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "search",
+        nl_enabled: state.nl.enabled,
+        nl: (*state.nl).clone(),
+        docs_url: NL_SEARCH_DOCS,
+        resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
+        show_save: false,
     })
 }
 
@@ -209,7 +294,9 @@ async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Respon
         status: current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "queries",
+        nl_enabled: state.nl.enabled,
         resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
+        show_save: true,
     })
 }
 
@@ -279,6 +366,7 @@ async fn search_parameters(
         status: current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
+        nl_enabled: state.nl.enabled,
         view: search_params::build_view(&snapshot, &query),
     })
 }
@@ -315,6 +403,7 @@ async fn compartments_page(
             status: current_status(state.version),
             i18n: I18n::new(locale),
             active_page: "compartments",
+            nl_enabled: state.nl.enabled,
             view,
         }),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -338,6 +427,7 @@ async fn status(
             metrics: DashboardMetrics::sample(),
             i18n,
             active_page: "home",
+            nl_enabled: state.nl.enabled,
         })
     }
 }
@@ -383,6 +473,7 @@ mod tests {
                 checked_at: 42,
             },
             metrics: DashboardMetrics::sample(),
+            nl_enabled: true,
             i18n: i18n("en"),
             active_page: "home",
         }
@@ -404,6 +495,7 @@ mod tests {
                 checked_at: 42,
             },
             metrics: DashboardMetrics::sample(),
+            nl_enabled: true,
             i18n: i18n("es"),
             active_page: "home",
         }
@@ -477,9 +569,9 @@ mod tests {
             },
             i18n: i18n("en"),
             active_page: "queries",
-            resource_types: compartments::resource_type_names(
-                helios_fhir::FhirVersion::default(),
-            ),
+            nl_enabled: true,
+            show_save: true,
+            resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
         }
         .render()
         .expect("queries page renders");
@@ -514,6 +606,8 @@ mod tests {
             },
             i18n: i18n("es"),
             active_page: "queries",
+            nl_enabled: true,
+            show_save: true,
             resource_types: vec!["Patient".to_string()],
         }
         .render()
@@ -581,6 +675,7 @@ mod tests {
                 checked_at: 42,
             },
             metrics: DashboardMetrics::sample(),
+            nl_enabled: true,
             i18n: i18n("en"),
             active_page: "home",
         }
