@@ -38,13 +38,14 @@
 //! The object is named by a SHA-256 digest of the user key, never by the key
 //! itself: see [`settings_object_id`].
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::core::user_settings::{SettingsStore, StoredUserSettings, apply_merge_patch};
 use crate::error::{BackendError, ConcurrencyError, StorageError, StorageResult};
@@ -55,12 +56,14 @@ use super::client::S3ClientError;
 /// Bound on retries when an *unconditional* write loses the compare-and-swap
 /// race with a concurrent writer. This counts total *attempts*, not retries.
 ///
-/// A single unconditional writer can be beaten at most once per other concurrent
-/// writer before it wins, so this caps the tolerated concurrent-writer count.
-/// Contention on one user's own settings document is expected to be near-zero (a
-/// user updates their own settings), and each attempt costs two S3 round trips,
-/// so this bound is deliberately tighter than the relational backends'. Exceeding
-/// it surfaces as a concurrency error rather than looping forever.
+/// This is a retry bound, **not** a guaranteed tolerance of N concurrent writers:
+/// an S3 compare-and-swap has no fairness, so an unlucky writer can lose several
+/// rounds in a row. With N contenders a writer typically needs at most N attempts;
+/// pathological scheduling needs more, and exhausting the bound surfaces as a
+/// concurrency error rather than looping forever. Contention on one user's own
+/// settings document is expected to be near-zero (a user updates their own
+/// settings) and each attempt costs two S3 round trips, so the bound is
+/// deliberately tighter than the relational backends'.
 const MAX_WRITE_ATTEMPTS: usize = 8;
 
 /// Base unit for the backoff between compare-and-swap attempts.
@@ -75,19 +78,18 @@ const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(5);
 /// Returns the jittered backoff to wait before compare-and-swap attempt `attempt`
 /// (0-based), growing exponentially.
 ///
-/// The jitter is derived from the current clock's sub-millisecond noise rather
-/// than a random-number dependency: contending writers are, by construction, in
-/// different processes or tasks and observe different nanosecond offsets, which is
-/// all that is needed to de-correlate them.
+/// The jitter must be drawn *independently per writer*, not read from the clock:
+/// two tasks that lose the same compare-and-swap receive their errors within
+/// microseconds of each other, so clock-derived "noise" would hand them nearly
+/// identical delays and they would simply collide again. A v4 UUID gives an
+/// independent draw without taking on a random-number dependency (`uuid` is
+/// already a dependency of this crate).
 fn retry_backoff(attempt: usize) -> Duration {
     let exponential = RETRY_BACKOFF_BASE * (1 << attempt.min(5)) as u32;
-    let jitter_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.subsec_nanos())
-        .unwrap_or(0);
-    // Full jitter: sleep for a random point in [0, exponential).
-    let span = exponential.as_nanos().max(1) as u64;
-    Duration::from_nanos(u64::from(jitter_nanos) % span)
+    // Full jitter: sleep for a uniformly random point in [0, exponential).
+    let span = u64::try_from(exponential.as_nanos()).unwrap_or(u64::MAX);
+    let draw = Uuid::new_v4().as_u128() as u64;
+    Duration::from_nanos(draw % span)
 }
 
 /// The stored form of a user's settings: the opaque document plus the metadata
@@ -199,9 +201,9 @@ impl S3Backend {
             .unwrap_or(0))
     }
 
-    /// Read-modify-write a user's settings document using a conditional write so
-    /// concurrent writers cannot lose data or skip the `If-Match` precondition
-    /// check.
+    /// Read-modify-write a user's settings document using a conditional write, so
+    /// that no write is silently lost and no writer can skip the `If-Match`
+    /// precondition check.
     ///
     /// `compute` receives the currently stored document (or `None` when the user
     /// has no settings yet) and returns the document to persist. It may be called
@@ -319,8 +321,12 @@ impl S3Backend {
                 return Err(lock_failure(user_key, expected, actual));
             }
 
-            // An unconditional write re-reads and retries against the new state,
-            // so a concurrent writer's change is never clobbered.
+            // An unconditional write re-reads and retries against the new state.
+            // No write is ever *silently* lost: every attempt is pinned to the
+            // generation it read. Note this does not make a `put_settings` a
+            // merge — a PUT replaces the document by definition, so it is
+            // last-writer-wins over the winner's *content*, while a
+            // `patch_settings` re-applies its merge onto the winner.
         }
 
         Err(StorageError::Concurrency(
@@ -388,8 +394,15 @@ fn lock_failure(user_key: &str, expected: i64, actual: i64) -> StorageError {
     })
 }
 
-/// Prefixes the operation name onto a backend error message, leaving every other
-/// `StorageError` variant untouched.
+/// Prefixes the operation name onto a backend error message.
+///
+/// Every `BackendError` this module can raise is labelled, not just the internal
+/// ones: the failures an operator actually hits in production are transport
+/// failures — a missing bucket, throttling, and above all `AccessDenied` on the
+/// settings prefix (easy to hit with a least-privilege bucket policy written
+/// before this namespace existed) — and those arrive as `Unavailable`. An
+/// unlabelled "internal error while processing request" is not something anyone
+/// can act on at 3am.
 ///
 /// Backend errors from this module identify the failing object by its key — an
 /// opaque digest — rather than by the raw user key, which is built from the
@@ -411,6 +424,20 @@ fn context(operation: &str, err: StorageError) -> StorageError {
         // error; it needs the operation label just as much as an internal one.
         StorageError::Backend(BackendError::SerializationError { message }) => {
             StorageError::Backend(BackendError::SerializationError {
+                message: format!("{operation}: {message}"),
+            })
+        }
+        // The transport failures: missing bucket, throttling, timeouts, and
+        // access denied. These are the ones an operator has to diagnose.
+        StorageError::Backend(BackendError::Unavailable {
+            backend_name,
+            message,
+        }) => StorageError::Backend(BackendError::Unavailable {
+            backend_name,
+            message: format!("{operation}: {message}"),
+        }),
+        StorageError::Backend(BackendError::QueryError { message }) => {
+            StorageError::Backend(BackendError::QueryError {
                 message: format!("{operation}: {message}"),
             })
         }

@@ -255,11 +255,25 @@ impl S3Keyspace {
     /// [`with_tenant_prefix`](Self::with_tenant_prefix): settings are user-global,
     /// not per-tenant (see [`crate::core::user_settings`]).
     ///
-    /// The `_system.user-settings` segment contains a `.`, which the REST layer's
-    /// tenant-ID validator rejects (tenant IDs are `[A-Za-z0-9_-]{1,64}`). No
-    /// tenant can therefore ever be named such that its key prefix reaches this
-    /// namespace, so settings objects can never be reached — or purged — by a
-    /// whole-tenant prefix scan.
+    /// # Why a tenant cannot reach these objects
+    ///
+    /// The guarantee is **structural, not lexical**. A settings object sits
+    /// *directly* under the `_system.user-settings/` segment as `{digest}.json`,
+    /// whereas every tenant-scoped key lives under a `resources/`, `history/`, or
+    /// `bulk/` **sub**-prefix of its tenant segment. So even a tenant somehow
+    /// named `_system.user-settings` would write to
+    /// `_system.user-settings/resources/…`, which can never equal a
+    /// `{digest}.json` leaf — and `purge_tenant_data` sweeps only those
+    /// sub-prefixes, so it cannot delete a settings object either.
+    ///
+    /// Do **not** weaken this to "tenant IDs cannot contain `.`". That is true of
+    /// the routing validators (`is_valid_tenant_id`), but *not* of
+    /// `admin_tenants::validate_tenant_id`, which permits `.` and `/`, nor of the
+    /// JWT tenant extractor, which validates nothing. The name is dotted to keep
+    /// it unroutable, but the safety of this namespace must not depend on that.
+    /// In particular, a future change that widened a tenant purge to sweep the
+    /// whole tenant prefix would break the structural argument above and must
+    /// exclude this namespace explicitly.
     pub fn user_settings_key(&self, object_id: &str) -> String {
         self.join(&["_system.user-settings", &format!("{object_id}.json")])
     }

@@ -1575,8 +1575,13 @@ async fn settings_get_surfaces_backend_error_for_corrupt_object() {
     .await
     .unwrap();
 
-    let err = backend.get_settings("u1").await.unwrap_err();
-    assert!(matches!(err, StorageError::Backend(_)));
+    match backend.get_settings("u1").await.unwrap_err() {
+        StorageError::Backend(BackendError::SerializationError { message }) => assert!(
+            message.starts_with("read user_settings:"),
+            "error should name the operation, got: {message}"
+        ),
+        other => panic!("expected a serialization error, got {other:?}"),
+    }
 }
 
 /// The object body records its owner. If the key derivation ever regressed so
@@ -1596,8 +1601,13 @@ async fn settings_get_rejects_object_owned_by_another_user() {
     .await
     .unwrap();
 
-    let err = backend.get_settings("u1").await.unwrap_err();
-    assert!(matches!(err, StorageError::Backend(_)));
+    match backend.get_settings("u1").await.unwrap_err() {
+        StorageError::Backend(BackendError::Internal { message, .. }) => assert!(
+            message.contains("belongs to a different user"),
+            "the tripwire should say why it fired, got: {message}"
+        ),
+        other => panic!("expected an internal error, got {other:?}"),
+    }
 }
 
 /// The user key is hashed, never embedded. Keys that a lossy sanitiser would
@@ -1655,10 +1665,16 @@ async fn settings_key_is_tenant_independent_and_outside_the_fhir_keyspace() {
             .is_some()
     );
 
-    // A tenant-scoped scan must never see it. Tenant IDs cannot contain '.', so
-    // no tenant prefix can reach the `_system.user-settings` namespace.
-    let tenant_scan = keyspace.with_tenant_prefix("default").resources_prefix();
-    assert!(!key.starts_with(&tenant_scan));
+    // The adversarial case: even a tenant named after the settings namespace
+    // itself cannot reach these objects, because its keys live under a
+    // `resources/`/`history/` sub-prefix while a settings object is a
+    // `{digest}.json` leaf. This is the structural invariant the key shape
+    // relies on — it does NOT depend on tenant-ID validation.
+    let hostile = keyspace.with_tenant_prefix("_system.user-settings");
+    assert!(!key.starts_with(&hostile.resources_prefix()));
+    assert!(!key.starts_with(&hostile.history_type_prefix("Patient")));
+    let benign = keyspace.with_tenant_prefix("default");
+    assert!(!key.starts_with(&benign.resources_prefix()));
 }
 
 /// In bucket-per-tenant mode the settings object has no tenant to key off, so it
@@ -1701,12 +1717,22 @@ async fn settings_bucket_per_tenant_without_system_bucket_is_a_config_error() {
     };
     let backend = S3Backend::with_client(config, mock.clone()).expect("backend");
 
-    let err = backend
+    match backend
         .put_settings("u1", json!({"theme": "dark"}), None)
         .await
-        .unwrap_err();
-    assert!(matches!(err, StorageError::Backend(_)));
+        .unwrap_err()
+    {
+        StorageError::Backend(BackendError::Internal { message, .. }) => assert!(
+            message.contains("default_system_bucket"),
+            "the error must name the config key to set, got: {message}"
+        ),
+        other => panic!("expected an internal error, got {other:?}"),
+    }
     assert_eq!(mock.bucket_object_count("bucket-a"), 0);
+
+    // And the server must not advertise the store at all in this configuration,
+    // so `/_user/settings` reports the explained 501 instead of failing.
+    assert!(!backend.supports_user_settings());
 }
 
 /// A create that loses the race must retry and update the winner's document
@@ -1779,7 +1805,10 @@ async fn settings_create_only_write_losing_the_race_does_not_overwrite() {
 
 /// A writer that loses every race must give up after a bounded number of
 /// attempts with a concurrency error, rather than looping forever.
-#[tokio::test]
+///
+/// `start_paused` lets tokio auto-advance its clock through the retry backoffs,
+/// so this exercises all 8 attempts without actually sleeping through them.
+#[tokio::test(start_paused = true)]
 async fn settings_write_gives_up_after_bounded_attempts() {
     let (backend, mock) = settings_backend();
     mock.fail_all_puts_with_precondition();

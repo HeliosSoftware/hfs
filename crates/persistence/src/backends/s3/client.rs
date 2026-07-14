@@ -414,13 +414,19 @@ where
                 .unwrap_or_default();
             match code {
                 "NoSuchKey" | "NotFound" | "NoSuchBucket" => S3ClientError::NotFound,
-                // `ConditionalRequestConflict` (HTTP 409) is returned when two
-                // conditional writes to the same key race. Like a 412 it means
-                // "you lost the compare-and-swap"; without this arm it would fall
-                // through to `Internal` and surface as a 500.
-                "PreconditionFailed" | "ConditionalRequestConflict" => {
-                    S3ClientError::PreconditionFailed
-                }
+                // Deliberately narrow: only a 412 is a failed precondition.
+                //
+                // S3's `ConditionalRequestConflict` (HTTP 409) looks tempting to
+                // fold in here, but it is *indeterminate* — AWS documents it as
+                // "a conflicting conditional write is in progress, retry", not as
+                // "you lost the compare-and-swap". Mapping it here would send it
+                // through `map_client_error` into `BackendError::QueryError`,
+                // which the resource paths convert into `AlreadyExists` /
+                // `VersionConflict` (see `storage.rs`) — i.e. it would state a
+                // *falsehood about stored state* to a FHIR client. It currently
+                // surfaces as a 500, which is also wrong but is at least not a
+                // lie; giving it a retryable classification is tracked separately.
+                "PreconditionFailed" => S3ClientError::PreconditionFailed,
                 "SlowDown" | "Throttling" | "ThrottlingException" => {
                     S3ClientError::Throttled(message)
                 }
@@ -439,14 +445,17 @@ where
                                 .to_string(),
                         ),
                         404 => S3ClientError::NotFound,
-                        // 412 unambiguously means a failed precondition. A bare
-                        // 409 deliberately does *not* map here: it is shared by
-                        // transient conflicts such as `OperationAborted`, and the
-                        // resource paths turn `PreconditionFailed` into
-                        // `AlreadyExists`/`VersionConflict` — so mis-classifying a
-                        // 409 would report a false fact about stored state. The
-                        // one 409 that really is a lost compare-and-swap,
-                        // `ConditionalRequestConflict`, is matched by code above.
+                        // A 412 unambiguously means a failed precondition, and the
+                        // only requests this backend makes conditional are the
+                        // `put_object` calls that carry `If-Match`/`If-None-Match`
+                        // — so a 412 can only ever answer a compare-and-swap we
+                        // ourselves asked for. A 409 deliberately does *not* map
+                        // here: it is shared by *transient* conflicts
+                        // (`OperationAborted`, `ConditionalRequestConflict`), and
+                        // the resource paths turn `PreconditionFailed` into
+                        // `AlreadyExists`/`VersionConflict`, so classifying one as
+                        // a precondition failure would report a false fact about
+                        // stored state.
                         412 => S3ClientError::PreconditionFailed,
                         _ => {
                             let detail = if message.is_empty() {

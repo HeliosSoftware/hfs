@@ -1908,7 +1908,20 @@ async fn start_s3(
     // over conditional PutObject), so it keeps ownership of the backend Arc and
     // uses the settings-capable builder. Bulk export/submit are not wired on a
     // standalone S3 primary, which has no job store.
-    let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
+    //
+    // A bucket-per-tenant configuration with no `default_system_bucket` has
+    // nowhere tenant-independent to keep a user-global document, so the store is
+    // left unwired and `/_user/settings` reports the explained 501 rather than
+    // failing every request.
+    let settings_store: Option<Arc<dyn SettingsStore>> = if backend.supports_user_settings() {
+        Some(backend.clone())
+    } else {
+        tracing::warn!(
+            "S3 is configured bucket-per-tenant with no default system bucket; \
+             per-user settings (/_user/settings) will report 501 Not Implemented"
+        );
+        None
+    };
 
     let app = create_app_with_auth_bulk_and_settings(
         backend,
@@ -2106,8 +2119,17 @@ async fn start_s3_elasticsearch(
 
     // The per-user settings store lives on the S3 primary (Elasticsearch is
     // search-only), so it is wired from the underlying `s3` backend even though
-    // the app is served over the composite storage.
-    let settings_store: Option<Arc<dyn SettingsStore>> = Some(s3.clone());
+    // the app is served over the composite storage. As in `start_s3`, a tenancy
+    // mode with no tenant-independent bucket leaves it unwired (explained 501).
+    let settings_store: Option<Arc<dyn SettingsStore>> = if s3.supports_user_settings() {
+        Some(s3.clone())
+    } else {
+        tracing::warn!(
+            "S3 is configured bucket-per-tenant with no default system bucket; \
+             per-user settings (/_user/settings) will report 501 Not Implemented"
+        );
+        None
+    };
 
     // S3 primary; embedded SQLite sidecar for bulk-export job state.
     let bulk_export = {

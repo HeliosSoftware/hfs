@@ -139,11 +139,31 @@ where
         })
 }
 
-/// Parses and validates a request body as a JSON object.
+/// Maximum size of a settings document body.
+///
+/// The only other limit on this endpoint is the server-wide request body limit,
+/// which is sized for FHIR Bundles (10 MB by default, and routinely raised) — far
+/// too generous for a document that holds a theme name and a few recent queries.
+/// A settings document is read back on *every* page load and, on backends whose
+/// write is a read-modify-write, re-read and re-written on every retry, so an
+/// oversized one is paid for repeatedly. 256 KiB is orders of magnitude more than
+/// any legitimate document needs.
+const MAX_SETTINGS_BYTES: usize = 256 * 1024;
+
+/// Parses and validates a request body as a JSON object of a sane size.
 fn parse_object_body(body: &Bytes) -> RestResult<Value> {
     if body.is_empty() {
         return Err(RestError::BadRequest {
             message: "Request body must be a JSON object".to_string(),
+        });
+    }
+    if body.len() > MAX_SETTINGS_BYTES {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "Settings document must not exceed {} KiB (received {} KiB)",
+                MAX_SETTINGS_BYTES / 1024,
+                body.len().div_ceil(1024)
+            ),
         });
     }
     let value: Value = serde_json::from_slice(body).map_err(|e| RestError::BadRequest {
@@ -203,6 +223,28 @@ mod tests {
     fn parse_object_body_rejects_non_object() {
         let err = parse_object_body(&Bytes::from_static(b"[1, 2, 3]")).unwrap_err();
         assert!(matches!(err, RestError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn parse_object_body_rejects_oversized_document() {
+        let bloated = format!(r#"{{"junk":"{}"}}"#, "x".repeat(MAX_SETTINGS_BYTES));
+        let err = parse_object_body(&Bytes::from(bloated)).unwrap_err();
+        match err {
+            RestError::BadRequest { message } => assert!(
+                message.contains("must not exceed"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected a bad-request error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_object_body_accepts_document_at_the_limit() {
+        // Exactly at the limit is fine; only *over* it is rejected.
+        let padding = MAX_SETTINGS_BYTES - r#"{"k":""}"#.len();
+        let doc = format!(r#"{{"k":"{}"}}"#, "x".repeat(padding));
+        assert_eq!(doc.len(), MAX_SETTINGS_BYTES);
+        assert!(parse_object_body(&Bytes::from(doc)).unwrap().is_object());
     }
 
     #[test]

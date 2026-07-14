@@ -55,8 +55,8 @@ chrono.workspace = true
 thiserror = "2"
 async-trait = "0.1"
 # "time" backs the backoff between compare-and-swap retries in the settings
-# stores. It was previously only present by feature unification via the MongoDB
-# driver, which left it silently absent from builds that exclude that backend.
+# stores. It was previously reaching us only through feature unification with
+# other dependencies; declare the feature we actually use rather than rely on that.
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 tokio-stream = "0.1"
 tracing = "0.1"

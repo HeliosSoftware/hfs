@@ -240,6 +240,19 @@ impl S3Backend {
         self.shared_location()
     }
 
+    /// Whether this configuration can host the per-user settings store.
+    ///
+    /// False only in bucket-per-tenant mode with no `default_system_bucket`,
+    /// where there is nowhere tenant-independent to keep a user-global document.
+    /// Callers should wire the store only when this holds, so an operator on such
+    /// a configuration gets the explained `501 Not Implemented` from
+    /// `/_user/settings` rather than a `500` on every request. Mirrors
+    /// [`supports_tenant_registry`](crate::core::ResourceStorage::supports_tenant_registry),
+    /// which answers the same question for the tenant registry.
+    pub fn supports_user_settings(&self) -> bool {
+        self.shared_location().is_some()
+    }
+
     /// Resolves the bucket and keyspace holding the per-user settings objects.
     ///
     /// Unlike [`tenant_location`](Self::tenant_location) this takes no
@@ -249,9 +262,10 @@ impl S3Backend {
     /// tenant argument.
     ///
     /// When no tenant-independent bucket is configured (bucket-per-tenant with no
-    /// `default_system_bucket`) per-user settings cannot be stored, and this
-    /// returns an actionable configuration error rather than silently writing
-    /// into some arbitrary tenant's bucket.
+    /// `default_system_bucket`) per-user settings cannot be stored. Callers are
+    /// expected to have gated on [`supports_user_settings`](Self::supports_user_settings)
+    /// first, so reaching this path is a configuration error; it is reported as
+    /// one rather than silently writing into some arbitrary tenant's bucket.
     pub(crate) fn settings_location(&self) -> StorageResult<TenantLocation> {
         self.shared_location().ok_or_else(|| {
             StorageError::Backend(BackendError::Internal {
