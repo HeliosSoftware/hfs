@@ -83,23 +83,4 @@
     {% endfor %}
   </ul>
 </section>
-
-<!--
-  Progressive enhancement: this is a real link. Without JavaScript, clicking it
-  performs a hard navigation to /ui/status, which returns a full page. With htmx
-  loaded, the request carries the HX-Request header and the handler returns just
-  the fragment, swapped into #status.
--->
-<footer class="status-footer">
-  <div id="status">
-    {% include "partials/status.html" %}
-  </div>
-  <a
-    class="refresh"
-    href="/ui/status"
-    hx-get="/ui/status"
-    hx-target="#status"
-    hx-swap="innerHTML"
-  >{{ i18n.t("action-refresh-status") }}</a>
-</footer>
 {% endblock %}

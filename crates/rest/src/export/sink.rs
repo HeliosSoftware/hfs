@@ -15,11 +15,15 @@ use super::controller::ExportError;
 
 /// Trait for writing and serving export output files.
 pub trait ExportSink: Send + Sync + Clone + 'static {
-    /// Writes `data` as the `shard_index`-th shard for `job_id` and returns
-    /// the public download URL.
+    /// Writes `data` as the `shard_index`-th shard for `job_id` and returns the
+    /// shard's filename (its stable identity within the job, e.g.
+    /// `shard-0.ndjson`).
     ///
-    /// The `ext` parameter is the file extension without the leading dot,
-    /// e.g. `"ndjson"`, `"csv"`, or `"parquet"`.
+    /// The filename — not a public URL — is what the controller stores in
+    /// [`CompletedFile`](super::controller::CompletedFile); the URL is resolved
+    /// later via [`download_url`](Self::download_url). The `ext` parameter is
+    /// the file extension without the leading dot, e.g. `"ndjson"`, `"csv"`, or
+    /// `"parquet"`.
     fn write_shard(
         &self,
         job_id: &str,
@@ -32,6 +36,25 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
     ///
     /// Returns `None` if the shard does not exist.
     fn read_shard(&self, job_id: &str, filename: &str) -> Option<Vec<u8>>;
+
+    /// Resolves a shard `filename` to a public download URL.
+    ///
+    /// Called once per shard each time the completion manifest is rendered, so
+    /// the returned URL should carry a full validity window:
+    /// - server-routed sinks (filesystem / in-memory) return their stable
+    ///   `{base_url}/export/{job_id}/{filename}` route;
+    /// - [`S3Sink`] returns a freshly pre-signed GET URL, so a client polling
+    ///   the manifest hours after completion still receives a usable URL rather
+    ///   than one signed (and counting down) since write time.
+    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError>;
+
+    /// Deletes all output shards previously written for `job_id`.
+    ///
+    /// Invoked when a job is cancelled so partial results don't linger or
+    /// remain downloadable (SQL-on-FHIR operations-common, HL7/sql-on-fhir#365).
+    /// Best-effort: a job with no written shards (or an unknown `job_id`) is
+    /// not an error.
+    fn delete_job(&self, job_id: &str) -> Result<(), ExportError>;
 }
 
 // ============================================================================
@@ -79,13 +102,31 @@ impl ExportSink for FilesystemSink {
         std::fs::write(&path, data)
             .map_err(|e| ExportError::Sink(format!("failed to write shard: {e}")))?;
 
-        let url = format!("{base}/export/{job_id}/{filename}", base = self.base_url,);
-        Ok(url)
+        Ok(filename)
     }
 
     fn read_shard(&self, job_id: &str, filename: &str) -> Option<Vec<u8>> {
         let path = self.dir.join(job_id).join(filename);
         std::fs::read(path).ok()
+    }
+
+    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+        // Stable server-routed URL; served back by the download handler. No
+        // expiry, so it is identical on every poll.
+        Ok(format!(
+            "{base}/export/{job_id}/{filename}",
+            base = self.base_url
+        ))
+    }
+
+    fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
+        let job_dir = self.dir.join(job_id);
+        match std::fs::remove_dir_all(&job_dir) {
+            Ok(()) => Ok(()),
+            // A job that never wrote a shard has no directory — not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ExportError::Sink(format!("failed to delete job dir: {e}"))),
+        }
     }
 }
 
@@ -121,13 +162,30 @@ impl ExportSink for InMemorySink {
         let filename = format!("shard-{shard_index}.{ext}");
         let key = format!("{job_id}/{filename}");
         self.data.insert(key, data);
-        let url = format!("{base}/export/{job_id}/{filename}", base = self.base_url,);
-        Ok(url)
+        Ok(filename)
     }
 
     fn read_shard(&self, job_id: &str, filename: &str) -> Option<Vec<u8>> {
         let key = format!("{job_id}/{filename}");
         self.data.get(&key).map(|v| v.clone())
+    }
+
+    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+        // Mirrors the filesystem sink's stable server route.
+        Ok(format!(
+            "{base}/export/{job_id}/{filename}",
+            base = self.base_url
+        ))
+    }
+
+    fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
+        // Shards are keyed `{job_id}/{filename}`, so dropping every entry under
+        // the `{job_id}/` prefix removes exactly this job's output and leaves
+        // other jobs untouched. Always succeeds — a job with no shards is a
+        // no-op retain.
+        let prefix = format!("{job_id}/");
+        self.data.retain(|k, _| !k.starts_with(&prefix));
+        Ok(())
     }
 }
 
@@ -189,7 +247,9 @@ impl S3Sink {
 
 #[cfg(feature = "s3")]
 impl ExportSink for S3Sink {
-    /// Uploads the shard to S3 and returns a pre-signed GET URL.
+    /// Uploads the shard to S3 and returns its filename. The pre-signed GET URL
+    /// is produced later (per manifest poll) by [`download_url`](Self::download_url),
+    /// not here, so its TTL window starts at poll time rather than write time.
     fn write_shard(
         &self,
         job_id: &str,
@@ -202,11 +262,9 @@ impl ExportSink for S3Sink {
         let bucket = self.bucket.clone();
         let client = Arc::clone(&self.client);
         let data_len = data.len() as i64;
-        let presign_ttl = std::time::Duration::from_secs(self.presign_ttl_secs);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                // Upload bytes to S3.
                 client
                     .put_object()
                     .bucket(&bucket)
@@ -216,8 +274,28 @@ impl ExportSink for S3Sink {
                     .send()
                     .await
                     .map_err(|e| ExportError::Sink(format!("S3 put_object failed: {e}")))?;
+                Ok(())
+            })
+        })?;
 
-                // Build a pre-signed GET URL.
+        Ok(filename)
+    }
+
+    /// Pre-signs a fresh GET URL for the shard, valid for `presign_ttl_secs`
+    /// from now. Presigning is a local signature computation (no network round
+    /// trip), so re-signing on every manifest poll is cheap.
+    ///
+    /// Note: the URL's effective lifetime is also bounded by the signing
+    /// credentials' own validity (e.g. an STS session), which can silently
+    /// undercut `presign_ttl_secs` when running with temporary credentials.
+    fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+        let key = self.object_key(job_id, filename);
+        let bucket = self.bucket.clone();
+        let client = Arc::clone(&self.client);
+        let presign_ttl = std::time::Duration::from_secs(self.presign_ttl_secs);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
                 let presigning_config =
                     aws_sdk_s3::presigning::PresigningConfig::expires_in(presign_ttl).map_err(
                         |e| ExportError::Sink(format!("PresigningConfig::expires_in failed: {e}")),
@@ -229,7 +307,6 @@ impl ExportSink for S3Sink {
                     .presigned(presigning_config)
                     .await
                     .map_err(|e| ExportError::Sink(format!("S3 presign failed: {e}")))?;
-
                 Ok(presigned.uri().to_string())
             })
         })
@@ -254,6 +331,56 @@ impl ExportSink for S3Sink {
                         .map(|b| b.into_bytes().to_vec()),
                     Err(_) => None,
                 }
+            })
+        })
+    }
+
+    /// Lists every object under `{key_prefix}exports/{job_id}/` and deletes
+    /// them, paging through the listing until exhausted.
+    ///
+    /// Idempotent: a job with no objects produces an empty listing and returns
+    /// `Ok(())`, so re-deleting an already-cleaned job is a harmless no-op.
+    /// Runs on the blocking pool (like [`write_shard`](Self::write_shard) /
+    /// [`read_shard`](Self::read_shard)) to bridge the synchronous trait method
+    /// to the async S3 SDK.
+    fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
+        let bucket = self.bucket.clone();
+        let client = Arc::clone(&self.client);
+        // `object_key` with an empty filename yields the job's key prefix.
+        let prefix = format!("{}exports/{}/", self.key_prefix, job_id);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut continuation: Option<String> = None;
+                loop {
+                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                    if let Some(token) = &continuation {
+                        req = req.continuation_token(token);
+                    }
+                    let out = req.send().await.map_err(|e| {
+                        ExportError::Sink(format!("S3 list_objects_v2 failed: {e}"))
+                    })?;
+
+                    for item in out.contents() {
+                        if let Some(key) = item.key() {
+                            client
+                                .delete_object()
+                                .bucket(&bucket)
+                                .key(key)
+                                .send()
+                                .await
+                                .map_err(|e| {
+                                    ExportError::Sink(format!("S3 delete_object failed: {e}"))
+                                })?;
+                        }
+                    }
+
+                    match out.next_continuation_token() {
+                        Some(token) => continuation = Some(token.to_string()),
+                        None => break,
+                    }
+                }
+                Ok(())
             })
         })
     }

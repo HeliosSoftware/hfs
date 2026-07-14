@@ -144,8 +144,11 @@ toggle. The metric cards and chart render sample values from
   full-page render and the htmx swap render identical markup.
 - Handlers that back an htmx swap should also work as a **hard navigation**:
   when the `HX-Request` header is absent, return the full page. The POC's
-  `/ui/status` does exactly this, and the "Refresh status" control is a real
-  `<a href="/ui/status">` link so it works with JavaScript disabled.
+  `/ui/status` handler does exactly this and stays as the working reference
+  for the pattern; the dashboard no longer surfaces a control for it, so the
+  first real read paths (metric cards, chart) will wire their own swap
+  targets the same way — always with a real `<a href>`/`<form>` underneath
+  so the control works with JavaScript disabled.
 
 Relevant htmx request/response headers we rely on: `HX-Request` (present on
 htmx-issued requests). See the

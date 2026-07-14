@@ -25,18 +25,32 @@ use helios_audit::{
 };
 use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
-use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode, create_app_with_auth};
+use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::info;
 
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_persistence::core::SettingsStore;
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, DefaultExportWorker, DefaultSubmitWorker,
     ExportOutputStore, SubmitInputFetcher, WorkerId,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_rest::bulk_export_auth::BearerScopeAuth;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+// The S3+Elasticsearch composite is the only remaining caller of the plain
+// bulk builder: S3 has no settings store, and its bulk-export job state rides
+// on an embedded SQLite sidecar.
+#[cfg(all(feature = "s3", feature = "elasticsearch", feature = "sqlite"))]
 use helios_rest::create_app_with_auth_and_bulk;
+// Settings-capable standalone/composite backends (SQLite, PostgreSQL, MongoDB)
+// host the per-user settings store, wired alongside bulk export/submit.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use helios_rest::create_app_with_auth_bulk_and_settings;
+// S3 does not host a settings store (tracked follow-up #199), so its startup
+// paths use the plain app builder. Every other standalone/composite backend now
+// wires the per-user settings store via `create_app_with_auth_bulk_and_settings`.
+#[cfg(feature = "s3")]
+use helios_rest::create_app_with_auth;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -502,32 +516,33 @@ async fn start_mongodb(
     let backend = Arc::new(backend);
     let serve_audit_state = audit_state.clone();
 
-    // MongoDB primary; embedded SQLite sidecar for job state.
-    #[cfg(feature = "sqlite")]
-    {
-        let jobs = build_embedded_job_store(&config)?;
-        if let Some(bundle) = build_bulk_export(&config, backend.clone(), jobs).await? {
-            let app = create_app_with_auth_and_bulk(
-                backend,
-                config.clone(),
-                auth_config,
-                auth_state,
-                audit_state,
-                Some(bundle),
-                None,
-            );
-            return serve(app, &config, serve_audit_state).await;
-        }
-    }
+    // MongoDB is a full standalone primary, so it also hosts the per-user
+    // settings store: it keeps ownership of the backend Arc and wires the
+    // settings-capable builder (like the SQLite/Postgres backends).
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
 
-    let app = create_app_with_auth(
-        Arc::try_unwrap(backend).unwrap_or_else(|_| {
-            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
-        }),
+    // MongoDB primary; embedded SQLite sidecar for bulk-export job state.
+    let export_bundle = {
+        #[cfg(feature = "sqlite")]
+        {
+            let jobs = build_embedded_job_store(&config)?;
+            build_bulk_export(&config, backend.clone(), jobs).await?
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            None
+        }
+    };
+
+    let app = create_app_with_auth_bulk_and_settings(
+        backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        export_bundle,
+        None,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }
@@ -863,29 +878,20 @@ async fn start_sqlite(
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
 
+    // The SQLite backend also hosts the per-user settings store, so it always
+    // keeps ownership of the backend Arc and uses the settings-capable builder.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
-    if export_bundle.is_some() || submit_bundle.is_some() {
-        let app = create_app_with_auth_and_bulk(
-            backend,
-            config.clone(),
-            auth_config,
-            auth_state,
-            audit_state,
-            export_bundle,
-            submit_bundle,
-        );
-        return serve(app, &config, serve_audit_state).await;
-    }
-
-    let app = create_app_with_auth(
-        Arc::try_unwrap(backend).unwrap_or_else(|_| {
-            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
-        }),
+    let app = create_app_with_auth_bulk_and_settings(
+        backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        export_bundle,
+        submit_bundle,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }
@@ -1416,29 +1422,22 @@ async fn start_sqlite_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
+    // The per-user settings store lives on the SQLite primary (Elasticsearch is
+    // search-only), so it is wired from the underlying `sqlite` backend even
+    // though the app is served over the composite storage.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(sqlite.clone());
+
     let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, sqlite.clone()).await?;
-    if export_bundle.is_some() || submit_bundle.is_some() {
-        let app = create_app_with_auth_and_bulk(
-            composite,
-            config.clone(),
-            auth_config,
-            auth_state,
-            audit_state,
-            export_bundle,
-            submit_bundle,
-        );
-        return serve(app, &config, serve_audit_state).await;
-    }
-
-    let app = create_app_with_auth(
-        Arc::try_unwrap(composite).unwrap_or_else(|_| {
-            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
-        }),
+    let app = create_app_with_auth_bulk_and_settings(
+        composite,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        export_bundle,
+        submit_bundle,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }
@@ -1484,29 +1483,20 @@ async fn start_postgres(
     let backend = Arc::new(backend);
 
     let serve_audit_state = audit_state.clone();
+    // The PostgreSQL backend also hosts the per-user settings store, so it always
+    // keeps ownership of the backend Arc and uses the settings-capable builder.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
-    if export_bundle.is_some() || submit_bundle.is_some() {
-        let app = create_app_with_auth_and_bulk(
-            backend,
-            config.clone(),
-            auth_config,
-            auth_state,
-            audit_state,
-            export_bundle,
-            submit_bundle,
-        );
-        return serve(app, &config, serve_audit_state).await;
-    }
-
-    let app = create_app_with_auth(
-        Arc::try_unwrap(backend).unwrap_or_else(|_| {
-            unreachable!("backend Arc is uniquely owned when bulk export is disabled")
-        }),
+    let app = create_app_with_auth_bulk_and_settings(
+        backend,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        export_bundle,
+        submit_bundle,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }
@@ -1650,29 +1640,22 @@ async fn start_postgres_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
+    // The per-user settings store lives on the PostgreSQL primary (Elasticsearch
+    // is search-only), so it is wired from the underlying `pg` backend even
+    // though the app is served over the composite storage.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(pg.clone());
+
     let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, pg.clone()).await?;
-    if export_bundle.is_some() || submit_bundle.is_some() {
-        let app = create_app_with_auth_and_bulk(
-            composite,
-            config.clone(),
-            auth_config,
-            auth_state,
-            audit_state,
-            export_bundle,
-            submit_bundle,
-        );
-        return serve(app, &config, serve_audit_state).await;
-    }
-
-    let app = create_app_with_auth(
-        Arc::try_unwrap(composite).unwrap_or_else(|_| {
-            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
-        }),
+    let app = create_app_with_auth_bulk_and_settings(
+        composite,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        export_bundle,
+        submit_bundle,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }
@@ -1808,32 +1791,33 @@ async fn start_mongodb_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
-    // MongoDB primary; embedded SQLite sidecar for job state.
-    #[cfg(feature = "sqlite")]
-    {
-        let jobs = build_embedded_job_store(&config)?;
-        if let Some(bundle) = build_bulk_export(&config, mongo.clone(), jobs).await? {
-            let app = create_app_with_auth_and_bulk(
-                composite,
-                config.clone(),
-                auth_config,
-                auth_state,
-                audit_state,
-                Some(bundle),
-                None,
-            );
-            return serve(app, &config, serve_audit_state).await;
-        }
-    }
+    // The per-user settings store lives on the MongoDB primary (Elasticsearch is
+    // search-only), so it is wired from the underlying `mongo` backend even
+    // though the app is served over the composite storage.
+    let settings_store: Option<Arc<dyn SettingsStore>> = Some(mongo.clone());
 
-    let app = create_app_with_auth(
-        Arc::try_unwrap(composite).unwrap_or_else(|_| {
-            unreachable!("composite Arc is uniquely owned when bulk export is disabled")
-        }),
+    // MongoDB primary; embedded SQLite sidecar for bulk-export job state.
+    let export_bundle = {
+        #[cfg(feature = "sqlite")]
+        {
+            let jobs = build_embedded_job_store(&config)?;
+            build_bulk_export(&config, mongo.clone(), jobs).await?
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            None
+        }
+    };
+
+    let app = create_app_with_auth_bulk_and_settings(
+        composite,
         config.clone(),
         auth_config,
         auth_state,
         audit_state,
+        export_bundle,
+        None,
+        settings_store,
     );
     serve(app, &config, serve_audit_state).await
 }

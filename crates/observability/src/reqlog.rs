@@ -337,4 +337,31 @@ mod tests {
                 .all(|w| w[0].sample_count >= w[1].sample_count)
         );
     }
+
+    #[test]
+    fn snapshot_classifies_all_status_classes() {
+        // The status-class match arms for 3xx/4xx (and the non-standard `_`
+        // fallthrough) are only reached by non-2xx/5xx codes; the other tests
+        // exercise 2xx/5xx exclusively. Record one of each for a unique tenant so
+        // the shared process-global buffer can't hide the assertions.
+        record(301, 0.010, "tenant-status");
+        record(404, 0.020, "tenant-status");
+        // A sub-200 status (`status / 100 == 1`) hits the `_ => {}` arm: counted
+        // toward the sample total but into none of the status-class buckets.
+        record(199, 0.005, "tenant-status");
+
+        let stats = snapshot(3600, Some("tenant-status"));
+        assert!(stats.status_3xx >= 1, "3xx must be classified");
+        assert!(stats.status_4xx >= 1, "4xx must be classified");
+        // No 5xx recorded for this tenant, so the error rate stays zero even
+        // though 4xx/other responses are present.
+        assert_eq!(stats.status_5xx, 0);
+        assert_eq!(stats.error_rate, 0.0);
+        // The sub-200 sample is counted but classified into no 2xx/3xx/4xx/5xx bucket.
+        assert!(stats.sample_count >= 3);
+        assert!(
+            stats.status_2xx + stats.status_3xx + stats.status_4xx + stats.status_5xx
+                < stats.sample_count as u64
+        );
+    }
 }

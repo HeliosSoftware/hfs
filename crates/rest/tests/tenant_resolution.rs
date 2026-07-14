@@ -258,6 +258,24 @@ mod url_path_mode {
     }
 
     #[tokio::test]
+    async fn test_readiness_endpoint_reports_storage_ok() {
+        let config = MultitenancyConfig {
+            routing_mode: TenantRoutingMode::UrlPath,
+            ..Default::default()
+        };
+        let (server, _backend) = create_test_server(config).await;
+
+        // Readiness should work at root level (not tenant-scoped) and report the
+        // storage check as healthy.
+        let response = server.get("/_readiness").await;
+        response.assert_status_ok();
+
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["checks"]["storage"], "ok");
+    }
+
+    #[tokio::test]
     async fn test_tenant_search() {
         let config = MultitenancyConfig {
             routing_mode: TenantRoutingMode::UrlPath,

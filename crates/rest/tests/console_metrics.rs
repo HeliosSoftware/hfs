@@ -279,6 +279,40 @@ async fn test_resource_distribution_top_param() {
     assert!(body["types"].is_array());
 }
 
+#[tokio::test]
+async fn test_resource_distribution_rolls_up_tail_into_other() {
+    let (server, _backend) = create_test_server().await;
+    // Seed more distinct types than `top` so the handler must truncate the tail
+    // into a synthetic `other` bucket (the `counts.len() > top` branch).
+    seed_default_tenant(&server).await; // Patient (x2) + Observation
+    seed(
+        &server,
+        "Encounter",
+        serde_json::json!({ "resourceType": "Encounter", "status": "finished" }),
+    )
+    .await;
+
+    // top=1 keeps only the busiest type; the other two collapse into `other`.
+    let response = server
+        .get("/console/metrics/resource-distribution?top=1")
+        .await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    let types = body["types"].as_array().expect("types is an array");
+    // One charted type plus the rolled-up `other` row.
+    assert_eq!(types.len(), 2);
+    let other = types
+        .iter()
+        .find(|t| t["resource_type"] == "other")
+        .expect("an `other` roll-up row must be present");
+    // Two distinct types were folded into the tail.
+    assert_eq!(other["types"].as_u64().unwrap(), 2);
+    assert!(other["count"].as_u64().unwrap() >= 2);
+    // distinct_types still reflects the true count, not the truncated view.
+    assert_eq!(body["distinct_types"].as_u64().unwrap(), 3);
+}
+
 // =============================================================================
 // tenants (cross-tenant / admin; reachable with auth disabled)
 // =============================================================================
@@ -331,6 +365,35 @@ async fn test_traffic_shape() {
     );
     assert_eq!(body["scope"], "single-instance");
     assert!(body["instance"].is_string(), "instance should be present");
+}
+
+#[tokio::test]
+async fn test_tenants_includes_traffic_only_tenant() {
+    let (server, _backend) = create_test_server().await;
+    seed_default_tenant(&server).await;
+
+    // A tenant that has recent traffic but no stored resources must still appear
+    // in the roster (the "seen only in traffic" branch), reporting `resources: 0`
+    // alongside its live rates. Inject the traffic directly into the in-process
+    // request log the handler reads — the test router has no request-tracking
+    // middleware, so HTTP calls alone would leave the log empty.
+    let ghost = "ghost-traffic-tenant";
+    for _ in 0..3 {
+        helios_observability::reqlog::record(200, 0.010, ghost);
+    }
+
+    let response = server.get("/console/metrics/tenants").await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    let tenants = body["tenants"].as_array().expect("tenants is an array");
+    let row = tenants
+        .iter()
+        .find(|t| t["tenant"] == ghost)
+        .expect("a traffic-only tenant must still be listed");
+    // No resources stored for this tenant, but traffic was observed.
+    assert_eq!(row["resources"].as_u64().unwrap(), 0);
+    assert!(row["requests_per_second"].as_f64().unwrap() > 0.0);
 }
 
 #[tokio::test]

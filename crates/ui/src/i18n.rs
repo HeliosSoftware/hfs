@@ -211,7 +211,7 @@ impl I18n {
     }
 
     /// Look up a message with one named placeable, e.g.
-    /// `t_arg("status-version", "version", status.version)`.
+    /// `t_arg("status-last-checked", "timestamp", status.checked_at)`.
     pub fn t_arg(&self, key: &str, name: &str, value: impl Into<FluentValue<'static>>) -> String {
         let args: HashMap<Cow<'static, str>, FluentValue<'static>> =
             HashMap::from([(Cow::Owned(name.to_owned()), value.into())]);
