@@ -20,6 +20,7 @@ fn app() -> Router {
             configured: true,
             model: "test-model".to_string(),
         },
+        None,
     )
 }
 

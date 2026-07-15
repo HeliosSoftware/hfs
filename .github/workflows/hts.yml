@@ -730,3 +730,46 @@ jobs:
             "./data/hts-${{ matrix.label }}.db" \
             "./utg.tgz" \
             "/tmp/hts-${{ matrix.label }}.log"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Reap leaked testcontainers
+  # ─────────────────────────────────────────────────────────────────────────────
+  cleanup-test-containers:
+    name: Cleanup Test Containers
+    runs-on: [self-hosted, Linux]
+    # Only `check` (cargo test -p helios-hts) stands up testcontainers; the
+    # integration-test job uses SQLite files and a locally-run binary. `check`'s
+    # own `#[ctor::dtor]` removes its Postgres container on a *clean* process
+    # exit, but a cancelled or OOM-killed run skips the dtor and leaks it — the
+    # same static-is-never-dropped problem as the rest of the suite. This job is
+    # the backstop for that case (this workflow runs nightly on its own cron, so
+    # it cannot rely on ci.yml's sweep to clean up after it).
+    needs: [check]
+    if: always()
+    env:
+      # Orphan sweep only. Must comfortably exceed the longest CI job runtime so
+      # a *concurrent* run's live containers on the shared docker host are never
+      # killed mid-test. hts test containers carry `io.helios.hts.test-pool`
+      # rather than `github.run_id`, so an age-guarded sweep is the safe option:
+      # it can never race a concurrent hts run (e.g. nightly + a release tag).
+      MAX_CONTAINER_AGE_MIN: 90
+    steps:
+      - name: Sweep orphaned testcontainers from dead runs
+        run: |
+          # testcontainers-rs unconditionally applies
+          # `org.testcontainers.managed-by=testcontainers` to every container it
+          # starts. Reap any carrying that label older than MAX_CONTAINER_AGE_MIN
+          # — old enough to be a leak from a dead run, never a live concurrent
+          # job. See ci.yml for the full rationale.
+          now=$(date +%s)
+          reaped=0
+          for id in $(docker ps -q --filter "label=org.testcontainers.managed-by=testcontainers"); do
+            started=$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null) || continue
+            age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
+            if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
+              echo "Reaping orphan $id (age ${age_min}m)"
+              docker rm -f "$id" || true
+              reaped=$((reaped + 1))
+            fi
+          done
+          echo "Swept ${reaped} orphaned testcontainer(s)."

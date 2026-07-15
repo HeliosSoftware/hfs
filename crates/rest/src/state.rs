@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
+use helios_persistence::core::PurgableStorage;
 use helios_persistence::core::sof_runner::SofRunner;
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, ExportOutputStore, ResourceStorage, SettingsStore,
     SubmitInputFetcher,
 };
+use helios_persistence::search::ReindexOperation;
 
 use crate::bulk_export_auth::ExportFileAuth;
 use crate::config::{BulkExportConfig, BulkSubmitConfig, ServerConfig};
@@ -86,6 +88,20 @@ pub struct AppState<S> {
     /// report the feature as unavailable.
     user_settings: Option<Arc<dyn SettingsStore>>,
 
+    /// Target for `$purge`. On a composite deployment this is the composite
+    /// itself, so the purge fans out to the search secondary as well as the
+    /// primary — purging only the primary would leave the resource searchable.
+    ///
+    /// Injected as a capability rather than added to the router's trait bounds:
+    /// those bounds are shared by every route and every test `MockStorage`, and
+    /// widening them would force backends and mocks to fake capabilities they
+    /// do not have.
+    purge: Option<Arc<dyn PurgableStorage>>,
+
+    /// Driver for `$reindex`. `None` for `s3` standalone, which has no search
+    /// index of any kind, so there is nothing to rebuild.
+    reindex: Option<Arc<ReindexOperation>>,
+
     /// Bulk submit job-state store (claim + worker storage + lifecycle).
     bulk_submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
 
@@ -125,6 +141,8 @@ impl<S> Clone for AppState<S> {
             bulk_export_file_auth: self.bulk_export_file_auth.clone(),
             bulk_export_config: Arc::clone(&self.bulk_export_config),
             user_settings: self.user_settings.clone(),
+            purge: self.purge.clone(),
+            reindex: self.reindex.clone(),
             bulk_submit_jobs: self.bulk_submit_jobs.clone(),
             bulk_submit_fetcher: self.bulk_submit_fetcher.clone(),
             bulk_submit_output: self.bulk_submit_output.clone(),
@@ -165,6 +183,8 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_export_file_auth: None,
             bulk_export_config,
             user_settings: None,
+            purge: None,
+            reindex: None,
             bulk_submit_jobs: None,
             bulk_submit_fetcher: None,
             bulk_submit_output: None,
@@ -215,6 +235,8 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_export_file_auth: None,
             bulk_export_config,
             user_settings: None,
+            purge: None,
+            reindex: None,
             bulk_submit_jobs: None,
             bulk_submit_fetcher: None,
             bulk_submit_output: None,
@@ -264,6 +286,32 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns the export job controller, if one has been configured.
     pub fn export_controller(&self) -> Option<&Arc<dyn ExportJobController>> {
         self.export_controller.as_ref()
+    }
+
+    /// Sets the `$purge` target.
+    ///
+    /// On a composite deployment this MUST be the composite storage, not the
+    /// primary: purging the primary alone leaves the resource in the search
+    /// secondary, where it stays searchable and keeps holding its content.
+    pub fn with_purge(mut self, purge: Arc<dyn PurgableStorage>) -> Self {
+        self.purge = Some(purge);
+        self
+    }
+
+    /// Returns the `$purge` target, if one has been configured.
+    pub fn purge(&self) -> Option<&Arc<dyn PurgableStorage>> {
+        self.purge.as_ref()
+    }
+
+    /// Sets the `$reindex` driver.
+    pub fn with_reindex(mut self, reindex: Arc<ReindexOperation>) -> Self {
+        self.reindex = Some(reindex);
+        self
+    }
+
+    /// Returns the `$reindex` driver, if one has been configured.
+    pub fn reindex(&self) -> Option<&Arc<ReindexOperation>> {
+        self.reindex.as_ref()
     }
 
     /// Wires the bulk-export job store, output store, and file authorizer.

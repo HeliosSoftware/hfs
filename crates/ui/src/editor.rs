@@ -94,7 +94,6 @@ pub struct EditorPage {
     pub status: crate::Status,
     pub i18n: I18n,
     pub active_page: &'static str,
-    pub nl_enabled: bool,
     pub resource_type: String,
     pub resource_id: String,
 }
@@ -158,7 +157,6 @@ pub async fn page(
         status: crate::current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "editor",
-        nl_enabled: state.nl.enabled,
         resource_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
         resource_id: query.id.unwrap_or_default(),
     })

@@ -227,6 +227,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS concepts_word_fts
 USING fts5(system_id UNINDEXED, code, display,
            tokenize='unicode61 remove_diacritics 1');
 
+-- ── FTS5 search index over preferred terms and synonym designations ──────────
+-- Backs the ranked typeahead/text-filter path (fts_candidates_ranked_for_system).
+-- Unlike concepts_fts (display only) this also indexes every designation value,
+-- so a synonym hit surfaces its concept. One row per (concept, term): preferred
+-- terms use the concept id as rowid, designation rows use -cd.id so the two
+-- never collide. bm25() ranks hits; system_id is UNINDEXED (post-filter only).
+-- Trigram like concepts_fts, which serves the same MATCH expression as the
+-- fallback when this index is empty — callers guard on filter length >= 3.
+-- Populated at startup by prebuild_concepts_fts; cleared on startup.
+CREATE VIRTUAL TABLE IF NOT EXISTS concepts_search_fts
+USING fts5(system_id UNINDEXED, code, term,
+           tokenize='trigram case_sensitive 0');
+
 -- ── FTS build tracker ─────────────────────────────────────────────────────────
 -- O(1) lookup to check whether concepts_fts is populated for a given system_id.
 -- Replaces the slow FTS content scan (O(N_total_concepts)) used previously.
@@ -645,7 +658,9 @@ mod tests {
             "concept_map_elements",
             "implicit_expansion_cache",
             "implicit_expansion_fts",
+            "concepts_fts",
             "concepts_word_fts",
+            "concepts_search_fts",
             "concepts_fts_built",
         ];
 

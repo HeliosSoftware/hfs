@@ -499,7 +499,8 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - History and versioning
 - Batch/transaction support
 - Asynchronous [Bulk Data Export](crates/rest/README.md#bulk-data-export) (`$export`) at system, Patient, and Group level
-- Optional BALP-compliant `AuditEvent` logging for REST and auth interactions
+- [Administrative operations](crates/rest/README.md#administrative-operations): `$purge` (permanent, irreversible erasure of a resource and its history) and `$reindex` (rebuild the search index), each gated on its own scope
+- Optional BALP-compliant `AuditEvent` logging for REST and auth interactions, including the `$export`, `$purge`, and `$reindex` operations
 
 # Development
 

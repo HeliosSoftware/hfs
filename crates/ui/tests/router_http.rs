@@ -30,6 +30,7 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
         "9.9.9",
         Some(std::path::PathBuf::from("../../data")),
         nl,
+        None,
     )
 }
 
@@ -49,6 +50,26 @@ async fn index_serves_the_full_landing_page() {
     let html = body_text(response).await;
     assert!(html.contains("<!doctype html>"));
     assert!(html.contains("9.9.9"));
+}
+
+#[tokio::test]
+async fn page_wires_the_collapsible_nav() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    // The first-paint script is loaded (non-deferred, in <head>).
+    assert!(html.contains(r#"src="/ui/assets/nav.js""#));
+    // The toggle is a real, accessible button controlling the sidebar.
+    assert!(html.contains("data-toggle-nav"));
+    assert!(html.contains(r#"aria-controls="sidebar""#));
+    assert!(html.contains("aria-expanded"));
+    // Labels are wrapped so the collapsed rail can hide them (a11y-safe).
+    assert!(html.contains("nav-item__label"));
+    // The sidebar is addressable by the toggle's aria-controls.
+    assert!(html.contains(r#"id="sidebar""#));
 }
 
 #[tokio::test]
@@ -117,6 +138,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         "9.9.9",
         Some(std::path::PathBuf::from("../../data")),
         nl(true, true),
+        None,
     )
     .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
     .await

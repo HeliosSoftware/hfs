@@ -76,11 +76,62 @@ cargo run --bin rest-server -- --port 3000 --log-level debug
 | export status / manifest | GET | `/export-status/[job_id]` |
 | export cancel + delete | DELETE | `/export-status/[job_id]` |
 | export file download | GET | `/export-file/[job_id]/[type]-[part]` |
+| purge (instance) | DELETE | `/[type]/[id]/$purge` |
+| purge (type) | POST | `/[type]/$purge` |
+| reindex (system) | POST | `/$reindex` |
+| reindex (type) | POST | `/[type]/$reindex` |
+| reindex status | GET | `/$reindex-status/[job_id]` |
+| reindex cancel | DELETE | `/$reindex-status/[job_id]` |
 
 All `$export` kick-offs require `Prefer: respond-async` and return `202 Accepted`
 with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
 for configuration; the storage-layer job/output internals are documented in the
 [helios-persistence README](../persistence/README.md).
+
+### Administrative Operations
+
+`$purge` and `$reindex` are **not** part of the FHIR specification. Both are
+gated on their own operation scope — `system/purge` and `system/reindex` — and
+**not** on ordinary resource scopes, following the `system/bulk-submit`
+precedent. A token that may soft-delete a Patient must not thereby be able to
+destroy it irrecoverably, and a token that may write a resource must not be able
+to rebuild the whole tenant's search index. As with `system/bulk-submit`, a
+`system/*.<perm>` wildcard also grants them.
+
+**`$purge`** permanently deletes a resource and all of its versions. This is not
+the FHIR `delete` interaction: an ordinary `DELETE` is a *soft* delete that
+writes a tombstone version, keeps the resource in `_history`, and answers reads
+with `410 Gone`. `$purge` removes the bytes, which is what erasure requirements
+(GDPR Article 17 and similar) actually need. It is irreversible.
+
+- `AuditEvent` can **never** be purged, whatever scope the caller holds. A caller
+  who can erase the audit trail can erase the evidence of their own actions.
+- On a composite deployment the purge targets the *composite*, so it reaches the
+  Elasticsearch secondary too — a resource purged only from the primary would
+  remain searchable, with its full content, in the index. Secondaries are purged
+  first; if any of them fails the primary is left untouched and the operation
+  reports `500` with a failure `AuditEvent` (outcome `8`) naming the backend, so
+  the purge stays retryable rather than destroying the system of record while
+  leaving a searchable copy behind.
+
+**`$reindex`** rebuilds the search index from the stored resources, which is
+needed after a `SearchParameter` is added or changed — existing resources were
+indexed under the old definition and will not match the new one until they are
+re-extracted. Kick-off returns `202 Accepted` with a job id; the rebuild runs in
+the background and is polled via `/$reindex-status/[job_id]`.
+
+- It writes to **every** search index in the deployment, including the
+  Elasticsearch secondary. Rebuilding only the primary on a deployment where
+  Elasticsearch serves search would rebuild an index nothing queries.
+- Job state is held **in memory on the node that accepted the kick-off**, so
+  `/$reindex-status/[job_id]` returns `404` from any other node. In a multi-node
+  deployment, poll the node you kicked off against.
+- The `s3` backend standalone has no search index of any kind, so `$reindex`
+  there returns `501`. Every other backend and composite supports it.
+
+Both operations emit BALP `AuditEvent`s — purge on completion or failure,
+reindex at start and at its terminal state (complete / cancel / fail, outcome
+`0` / `4` / `8`) — each attributed to the requesting principal.
 
 ## Configuration
 

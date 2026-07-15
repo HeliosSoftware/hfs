@@ -150,6 +150,8 @@ pub mod search;
 pub mod sof;
 pub mod strategy;
 pub mod tenant;
+#[cfg(test)]
+pub(crate) mod test_audit;
 pub mod types;
 
 /// Default FHIR version for backend configuration fields.
