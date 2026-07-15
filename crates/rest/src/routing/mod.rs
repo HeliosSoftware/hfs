@@ -3,6 +3,7 @@
 //! This module contains the routing configuration that maps HTTP paths
 //! to handlers.
 
+pub mod admin_tenants;
 pub mod console_metrics;
 pub mod fhir_routes;
 

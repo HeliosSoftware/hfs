@@ -23,14 +23,23 @@
      data-msg-current="{{ i18n.t("history-current") }}"
      data-msg-not-found="{{ i18n.t("history-not-found") }}">
 
-  <!-- Locate the instance. A plain form so it works without JavaScript. -->
+  <!--
+    Locate the instance. A plain form so it works without JavaScript. Follows
+    Brett's Resource Editor: one combined "Type / id" field, and a primary
+    button that carries an icon like every other action in the design.
+  -->
   <form class="history__locate" id="history-locate">
-    <input class="history__type" name="type" value="Patient" spellcheck="false"
-           aria-label="{{ i18n.t("history-type-label") }}">
-    <span class="history__slash">/</span>
-    <input class="history__id" name="id" placeholder="{{ i18n.t("history-id-placeholder") }}"
-           spellcheck="false" aria-label="{{ i18n.t("history-id-label") }}">
-    <button class="btn btn--primary" type="submit">{{ i18n.t("history-load") }}</button>
+    <div class="history__ref">
+      <input class="history__type" name="type" value="Patient" spellcheck="false"
+             aria-label="{{ i18n.t("history-type-label") }}">
+      <span class="history__slash">/</span>
+      <input class="history__id" name="id" placeholder="{{ i18n.t("history-id-placeholder") }}"
+             spellcheck="false" aria-label="{{ i18n.t("history-id-label") }}">
+    </div>
+    <button class="button button--primary" type="submit">
+      <span class="icon">{% include "icons/history.svg" %}</span>
+      {{ i18n.t("history-load") }}
+    </button>
   </form>
 
   <div class="tabs" role="tablist" aria-label="{{ i18n.t("history-tabs-label") }}">
