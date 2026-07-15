@@ -154,3 +154,15 @@ curl http://localhost:8080/clinic-a/Patient
 | history, system | GET | `/_history` |
 | batch/transaction | POST | `/` |
 | health | GET | `/health` |
+| purge, instance | DELETE | `/[type]/[id]/$purge` |
+| purge, type | POST | `/[type]/$purge` |
+| reindex | POST | `/$reindex`, `/[type]/$reindex` |
+| reindex status / cancel | GET/DELETE | `/$reindex-status/[job_id]` |
+
+`$purge` (permanent, irreversible deletion including history) and `$reindex`
+(rebuild the search index) are administrative, non-FHIR operations. They require
+the `system/purge` / `system/reindex` scopes, never ordinary resource scopes.
+`AuditEvent` can never be purged. `$reindex` returns `501` on the `s3` backend
+standalone (no search index exists to rebuild) and its job state is per-process,
+so poll the node you kicked off against. See the
+[helios-rest README](../../../crates/rest/README.md#administrative-operations).
