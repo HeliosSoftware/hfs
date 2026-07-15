@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-15 (**Phase 1 COMPLETE** — gate met)
+**Last updated:** 2026-07-15 (**Phase 2 COMPLETE** — code landed; gate pending CI on the push)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -88,49 +88,72 @@ A second main merge (`e0cb5198`) absorbed **#205 — the jti subsystem was
 removed** (auth is stateless): the validator's C1 check was deleted with it
 and Phase 2 rescoped to C2 only (see below).
 
+### ✅ Done — Phase 2: JWKS refresh coordination (C2) (2026-07-15)
+
+**Session decision (2026-07-15):** the Redis coordinator (deleted by #205,
+never wired) was **resurrected** as an opt-in second impl — user call: keep a
+Redis scaffold for future cluster work. The DB-backed mode stays the default,
+so a DB-only cluster still needs no Redis; standing decision (2) is resolved.
+
+| What | Where | Commit |
+|------|-------|--------|
+| **PR 2.1 — `ClusterRefreshCache`** (persistence): generic string-keyed single-flight document refresh with **watermark** freshness (reuse iff stored doc is strictly newer than the caller's `fetched_at`, within `max_stale`, within its own `max_age` — what makes the rotation race deterministic with zero sleeps). `PgClusterRefreshCache`: per-key `pg_advisory_xact_lock` (seed "HFSRFRSH") in a txn, fetch closure runs under the lock, DB-clock ages; migration **v16** `cluster_refresh_cache` (server-global — no tenant column, isolation DoD row N/A by design). Seam: `ResourceStorage::cluster_refresh_cache()` default-None, mirroring `cluster_job_store()`. `testing::InMemoryClusterRefreshCache` = T1 reference. T2 in `postgres_tests.rs` (raced single-flight = exactly one fetch, durability, watermark refetch, error releases lock; **no** `CLUSTER_JOBS_TEST_LOCK` — per-test UUID keys are disjoint). | `core/cluster_refresh_cache.rs`, `postgres/cluster_refresh_cache.rs`, `schema.rs` | `b0fee864` |
+| **PR 2.2 — auth seam**: `JwksFetcher` split into `fetch_raw` (preserves the raw body + Cache-Control — what the shared store holds) and `parse_document` (local per instance); `JwksCoordination` trait (`jwks/coordination.rs`) with `Fetch` (propagate) vs `Unavailable` (warn + **fall back to direct fetch**; watermark advances so a recovering store never installs older keys); `JwksCache` now `Clone`, background loop calls `refresh()` through a clone — the pre-existing duplicated inline fetch/swap is gone, ONE refresh seam; set-once `set_coordination()` (server Arc-wraps the cache before storage exists); reused docs get age-shortened TTL (floor 1s). Config: `HFS_AUTH_JWKS_COORDINATION` + re-added `HFS_AUTH_REDIS_URL` (both in `AUTH_ENV_KEYS`). | `auth/src/jwks/*`, `auth/src/config.rs` | `1554bd28` |
+| **PR 2.3 — Redis resurrection**: `RedisJwksCoordination` behind the restored auth `redis` feature (redis 0.27, pre-#205 shape; moka stays gone) — `SET NX EX` lock with holder-token Lua compare-and-del, stored JSON doc with TTL, lock losers poll for the winner's doc, dead-holder bypass after lock TTL; every Redis error → `Unavailable` (never takes auth down). Gated T2 twin `auth/tests/jwks_cluster_redis.rs` (`RUN_REDIS_CLUSTER_TESTS=1`), identical assertions to the PG suite; new **`redis-cluster-tests.yml`** (auth-path PRs + nightly + dispatch; scheduled runs execute main's copy — effective on merge). | `auth/src/jwks/redis_coordination.rs`, workflow | `6673b00c` |
+| **PR 2.4 — rest bridge + T2 suite**: `StoreJwksCoordination` adapts persistence's store to auth's trait (rest depends on both; no persistence↔auth edge). **The strategy §8 C2 suite**: `rest/tests/jwks_cluster_pg.rs` — two fresh `JwksCache`+backend pairs vs one wiremock IdP: barrier-raced boot herd → **exactly one upstream fetch**, late-joiner reuse → zero, rotation race → exactly one additional (loser adopts via watermark). wiremock added to rest dev-deps. | `rest/src/jwks_coordination.rs`, `rest/tests/jwks_cluster_pg.rs` | `949feee3` |
+| **PR 2.5 — hfs wiring**: `resolve_jwks_coordination` (unset → `database` under `HFS_CLUSTER`; explicit `local` **warns, never refuses** — C2 is the one warn-only cluster concern, doc'd against the refusal table; `redis` needs the feature + URL; invalid values fail fast). `init_auth_with_audit` finishes local/redis boots itself and defers the database-mode initial fetch to `finish_auth_boot`, called on the **primary** handle in all 8 `start_*` fns (backends without a store warn + stay per-instance, the `reindex_cluster_store` posture). Verified end-to-end: two binaries + one Postgres + mock IdP → 1 IdP hit total, "Reused shared JWKS document" on B, refusal/warning cases exact. | `hfs/src/cluster.rs`, `hfs/src/main.rs` | `90c61cde` |
+
+**Phase 2 gate (strategy §8, rescoped):** T1 + T2 all green locally (6+4
+persistence, 6 auth contract, 3 PG suite, 3 Redis twin against a real
+container, 6 hfs resolution/validator). **CI confirmation pending the push
+of these commits** — record the run link here when green.
+
+**No T3 smoke addition** (deliberate): C2 changes no user-visible behavior —
+same keys, same 401s; its only observable is the upstream IdP hit count,
+which the strategy assigns to the T2 wiremock counter. A smoke case would
+add flake surface without new coverage.
+
+**Migration renumbering:** C2 took **v16** (`cluster_refresh_cache`), so the
+Phase 3 items sketched below shift to **v17** and Phase 4 E1 to **v18**.
+
 ---
 
 ## What's next
 
 Standing design decisions (do not re-litigate): **(1)** ~~`ExportJobController`
-→ `#[async_trait]`~~ *done in 1.3*; **(2)** JWKS coordination gets a
-DB/advisory-lock variant alongside Redis so a DB-only cluster needs no Redis
-(the jti half of this decision is moot — subsystem removed by #205); **(3)**
-C3 uses a shared **epoch** table, not LISTEN/NOTIFY (amend design §6 when it
-lands). New Phase-1-era decisions now baked into code: bulk-export traits stay
-un-generalized (F3); the cluster job store is Postgres-primary-only (other
-primaries warn and stay per-instance); F5 is a CAS + bounded retry, not an
-unguarded atomic increment.
+→ `#[async_trait]`~~ *done in 1.3*; **(2)** ~~JWKS coordination gets a
+DB/advisory-lock variant alongside Redis so a DB-only cluster needs no Redis~~
+*resolved in Phase 2: DB impl is the default, Redis resurrected as opt-in per
+the 2026-07-15 session decision*; **(3)** C3 uses a shared **epoch** table,
+not LISTEN/NOTIFY (amend design §6 when it lands). Decisions now baked into
+code — Phase 1: bulk-export traits stay un-generalized (F3); the cluster job
+store is Postgres-primary-only (other primaries warn and stay per-instance);
+F5 is a CAS + bounded retry, not an unguarded atomic increment. Phase 2:
+**watermark** freshness (not a pure staleness window) for coordinated
+refreshes; C2 is **warn-only** under `HFS_CLUSTER` (per-instance JWKS is
+functionally correct); coordination-layer failure falls back to direct IdP
+fetch (auth availability > dedupe); the refresh store is server-global by
+design (no tenant column).
 
-### Phase 2 — auth hardening (~~C1~~, C2) — **rescoped 2026-07-15**
+### Phase 2 — auth hardening — ✅ COMPLETE 2026-07-15 (see the table above)
 
-- **C1 is OBSOLETE**: main's #205 (merged 2026-07-15, PRs #268/#230) removed
-  the jti replay-cache subsystem entirely — access tokens are not one-time
-  assertions, so token validation is stateless and auth holds no
-  cross-instance state. The `HFS_AUTH_JTI_BACKEND` fail-fast check was
-  removed from the cluster validator in the same merge that absorbed #205
-  into this branch. The planned `DatabaseJtiCache`, memory-jti unsafe-contract
-  tests, and Redis jti twin are all moot.
-- What remains of Phase 2 is **C2 only**: `JwksCoordination` trait in auth
-  (dedupe concurrent IdP refreshes across instances); impls: Redis
-  `JwksCoordinator` (verify it still exists post-#205) + Postgres
-  advisory-lock impl; wire into `JwksCache`'s refresh seams. T2 C2 via
-  `wiremock` mock-IdP hit counter. Re-ground line numbers before starting —
-  #205 reshaped `crates/auth`.
-- CI: `redis-cluster-tests.yml` only if the Redis coordinator survives;
-  otherwise no new CI.
+- C1 was obsoleted by #205 (jti subsystem removed; auth is stateless).
+- C2 landed as PRs 2.1–2.5: `ClusterRefreshCache` (persistence, migration
+  v16) + `JwksCoordination` (auth) + `StoreJwksCoordination` bridge (rest) +
+  resurrected opt-in `RedisJwksCoordination` + hfs boot wiring, with the
+  strategy §8 wiremock hit-counter suites at T2 on both backends.
 
 ### Phase 3 — subscriptions cluster delivery (#170)
 
 - `EventFanout` trait; `PgNotifyFanout` on a **dedicated non-pooled** `tokio_postgres` connection with reconnect/re-LISTEN loop; NOTIFY payload ≈8KB cap ⇒ envelopes `(tenant, subscription_id, event_id)`, receivers rehydrate from DB. `HFS_SUBSCRIPTIONS_FANOUT = memory | pg-notify`.
-- B3 startup hydration (there is **zero** startup load of Subscription/SubscriptionTopic today — engine built empty at `rest/src/lib.rs` ~:713); B4 shared counters (`subscription_state` table, `UPDATE … event_number = event_number + 1 RETURNING`); B2 DB redeem-once binding tokens (`DELETE … RETURNING`); B5 durable delivery outbox (jobs-shaped lease columns), replacing the on-stack retry in `dispatch_with_retry` (`engine/mod.rs` ~:722). All migration v16.
+- B3 startup hydration (there is **zero** startup load of Subscription/SubscriptionTopic today — engine built empty at `rest/src/lib.rs` ~:713); B4 shared counters (`subscription_state` table, `UPDATE … event_number = event_number + 1 RETURNING`); B2 DB redeem-once binding tokens (`DELETE … RETURNING`); B5 durable delivery outbox (jobs-shaped lease columns), replacing the on-stack retry in `dispatch_with_retry` (`engine/mod.rs` ~:722). All migration v17 (v16 went to C2).
 - **T3 B1 is the one mandatory two-process test**: WS client on B, POST matching resource to A, socket receives; plus sticky-session negative. Reuse the FIFO WS client from `run_external_subscriptions_smoke.sh`.
 
 ### Phase 4 — HTS coherency (C3) + bootstrap lock (D1) + composite outbox (E1)
 
 - C3: one-row `terminology_epoch` table; every terminology write bumps it; an `EpochGuard` (memoized ~1s, 0 in tests) checks before serving from cache and calls the two existing clear seams (`hts/src/state.rs:280`, `backends/postgres/mod.rs:172`, incl. the `OnceLock` closure statics). `HFS_TERMINOLOGY_CACHE_INVALIDATION = local | epoch`.
 - D1: `pg_advisory_lock` around `bootstrap_sync` (new key, e.g. "HFSBSTRP"), ledger re-check after acquisition, dedicated connection (HTS owns its own deadpool pool).
-- E1: `composite_sync_outbox` (migration v17); `sync_asynchronous` writes the row, mpsc becomes a wake-up hint, workers claim with SKIP LOCKED + fencing. T3 nightly kill-9 drain case.
+- E1: `composite_sync_outbox` (migration v18; renumbered after C2 took v16); `sync_asynchronous` writes the row, mpsc becomes a wake-up hint, workers claim with SKIP LOCKED + fencing. T3 nightly kill-9 drain case.
 
 ---
 

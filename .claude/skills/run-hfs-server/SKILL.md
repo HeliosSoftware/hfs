@@ -125,7 +125,9 @@ curl http://localhost:8080/clinic-a/Patient
 | `HFS_CLUSTER` | `false` | Declares this process one of N instances: flips cluster-safe defaults and fails fast on unsafe combinations |
 | `HFS_JOB_STORE_BACKEND` | `memory` (`database` under `HFS_CLUSTER`) | Unified async-job store selector (SoF export, reindex); parsed today, wired as the phases land |
 
-`HFS_CLUSTER=true` refuses to boot on: a SQLite primary (F1), `HFS_AUTH_JTI_BACKEND=memory` with auth enabled (C1), `local-fs` bulk export/submit output (F2), `HFS_AUDIT_BACKEND=file` (F4), or an explicit `memory` job store. Design and status: `docs/cluster-capable-state-design.md`; operator guide: book chapter "Running HFS in a Cluster" (`book/src/ch15-cluster-deployment.md`).
+`HFS_CLUSTER=true` refuses to boot on: a SQLite primary (F1), `local-fs` bulk export/submit output (F2), `HFS_AUDIT_BACKEND=file` (F4), an explicit `memory` job store, or (with SoF enabled) a `memory` export controller / `fs` export sink (A1). The former C1 jti check went away with the jti subsystem (#205).
+
+JWKS refresh coordination (C2, warn-only — never a refusal): `HFS_AUTH_JWKS_COORDINATION` = `local` | `database` | `redis`; unset resolves to `database` under `HFS_CLUSTER` (Postgres primary; other primaries warn and stay per-instance). `redis` needs the `redis` build feature plus `HFS_AUTH_REDIS_URL`. Design and status: `docs/cluster-capable-state-design.md`; operator guide: book chapter "Running HFS in a Cluster" (`book/src/ch15-cluster-deployment.md`).
 
 ## Behavior
 

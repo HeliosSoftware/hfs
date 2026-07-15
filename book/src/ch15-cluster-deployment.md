@@ -63,8 +63,6 @@ export HFS_DATABASE_URL=postgresql://…      # same URL on every instance
 export HFS_BULK_EXPORT_OUTPUT_BACKEND=s3
 export HFS_BULK_SUBMIT_OUTPUT_BACKEND=s3
 export HFS_AUDIT_BACKEND=database
-export HFS_AUTH_JTI_BACKEND=redis           # when auth is enabled
-export HFS_AUTH_REDIS_URL=redis://…
 
 hfs --port 8080 &   # instance A
 hfs --port 8081 &   # instance B (in practice: another machine/pod)
@@ -86,7 +84,7 @@ current state and is updated as each phase ships.
 | SQL-on-FHIR `$viewdefinition-export` / `$sqlquery-export` (async jobs) | ✅ | ✅ with `HFS_EXPORT_CONTROLLER=database` (the default under `HFS_CLUSTER`): jobs on the shared `cluster_jobs` store, any instance polls/cancels/downloads, workers on every instance compete for work | Phase 1 (#169) — landed |
 | Search reindex jobs | ✅ | ✅ with `HFS_JOB_STORE_BACKEND=database` (the default under `HFS_CLUSTER`): jobs on the shared `cluster_jobs` store, any instance answers `$reindex-status`/cancel, workers on every instance compete for the rebuild (Postgres primary) | Phase 1 (A2) — landed |
 | JWT validation | ✅ | ✅ stateless per-request validation — the former `jti` replay cache was removed with #205 (access tokens are not one-time assertions), so auth holds no cross-instance state | already safe (#205) |
-| JWKS refresh | ✅ | ✅ functionally (each node fetches the same keys); redundant IdP fetches | Phase 2 (coordinated refresh) |
+| JWKS refresh | ✅ | ✅ coordinated with `HFS_AUTH_JWKS_COORDINATION=database` (the default under `HFS_CLUSTER`, Postgres primary): cluster-wide single-flight over the shared `cluster_refresh_cache` table — one IdP fetch per boot herd / key rotation, every other instance reuses the stored document. `redis` (build feature) is an opt-in alternative; `local` keeps per-instance refresh (functionally correct — a warning, never a refusal) | Phase 2 (C2) — landed |
 | Subscriptions (topics, delivery, WebSockets) | ✅ | ❌ **single-instance only** — registries are in-memory and only the instance that served a write reacts to it | Phase 3 (#170) |
 | Terminology (HTS) response caches | ✅ | ⚠️ a terminology import on one instance leaves stale `$expand`/`$validate-code` answers on the others | Phase 4 |
 | HTS bootstrap import | ✅ | ⚠️ N cold-starting instances all run the heavy import (correct but N× cost) | Phase 4 |
@@ -98,6 +96,29 @@ Subscriptions to one instance (or route their requests to one instance with
 sticky sessions) — the same guidance issue #170 carries. SQL-on-FHIR async
 exports and reindex are cluster-safe as of Phase 1 (`HFS_JOB_STORE_BACKEND=
 database`, plus a shared `HFS_EXPORT_SINK` for exports).
+
+### JWKS refresh coordination (Phase 2)
+
+With auth enabled, every instance caches the IdP's JWKS public keys and
+refreshes on boot, on TTL expiry, and on an unknown `kid` (key rotation) —
+so N instances all hit the IdP at the same moments. Per-instance refresh is
+**functionally correct** (every node fetches the same public keys), which is
+why this is the one cluster concern that only warns, never refuses.
+
+`HFS_AUTH_JWKS_COORDINATION` selects the behavior:
+
+| Value | Effect |
+|-------|--------|
+| *(unset)* | `database` under `HFS_CLUSTER=true`, `local` otherwise |
+| `local` | Per-instance refresh (a warning is logged when clustered) |
+| `database` | Cluster-wide single-flight over the primary backend's shared `cluster_refresh_cache` table (Postgres primary; per-URL advisory lock + stored document). Other primaries log a warning and stay per-instance |
+| `redis` | Single-flight over Redis (`HFS_AUTH_REDIS_URL` required; needs an `hfs` build with the `redis` feature) |
+
+Under coordination, exactly one instance fetches from the IdP per boot herd
+or rotation; the rest adopt the stored document, shortening their local
+cache lifetime by its age. If the coordination layer itself is unavailable
+(database or Redis down), instances log a warning and fall back to direct
+IdP fetches — auth availability outranks the dedupe optimization.
 
 ---
 

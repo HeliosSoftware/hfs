@@ -93,7 +93,10 @@ The gap (see §5, class C) is only that the safe backend is opt-in.
 A third, **already-written-but-never-wired** piece exists too: `JwksCoordinator`
 (`crates/auth/src/jwks/coordinator.rs:11`) — a Redis leader-lock
 (`hfs:jwks:refresh_lock`) plus shared key store for cluster JWKS refresh. It has
-no call sites.
+no call sites. *[amended 2026-07-15: #205 deleted it (never constructed) along
+with the whole `redis` feature; Phase 2 replaced it with the `JwksCoordination`
+trait — Postgres advisory-lock impl over `cluster_refresh_cache` (default under
+`HFS_CLUSTER`) plus a resurrected, opt-in `RedisJwksCoordination` — see §5 C2.]*
 
 ## 3. Shared substrate — what "unified" backs onto
 
@@ -246,6 +249,18 @@ and all in-memory state vanishes on restart.
   hammers the IdP on a `kid` miss. `JwksCoordinator` (`jwks/coordinator.rs:11`)
   was built to fix this (Redis leader-lock + shared key store) and is **never
   wired**. Fix: wire it under the cluster switch.
+  *[amended 2026-07-15 — landed in Phase 2, reshaped: the old coordinator was
+  deleted by #205, so C2 is a new `JwksCoordination` trait in auth with
+  **watermark** freshness (callers pass the `fetched_at` they hold; a stored
+  document is reused only when strictly newer, within a staleness cap, and
+  within its own `max_age`). Impls: Postgres — `ClusterRefreshCache` in
+  persistence (`cluster_refresh_cache` table, migration v16, per-URL
+  `pg_advisory_xact_lock`, fetch under the lock, DB-clock ages) bridged by
+  `helios_rest::StoreJwksCoordination`; Redis — `RedisJwksCoordination`
+  resurrected behind the auth `redis` feature (lock + stored doc + poll,
+  opt-in). Selected by `HFS_AUTH_JWKS_COORDINATION` (unset → `database` under
+  `HFS_CLUSTER`); coordination failures fall back to direct IdP fetches, and
+  explicit `local` under cluster warns — C2 is warn-only, never a refusal.]*
 - **C3 · HTS terminology response caches — HIGH (silent wrong clinical answers).**
   Per-process, no TTL, invalidated **only on the instance that received the
   write/import**:
@@ -361,7 +376,8 @@ One master switch plus per-subsystem overrides, all following the existing
 | `HFS_CLUSTER` | `true` / `false` | `false` | Master switch: selects cluster-safe backends below and **fails fast** if the primary backend is SQLite or a required shared dependency is unset. |
 | `HFS_JOB_STORE_BACKEND` | `memory` / `database` | `memory` (`database` when `HFS_CLUSTER`) | Unified job store (§4) — SoF export, reindex; bulk export/submit already DB-backed. |
 | ~~`HFS_AUTH_JTI_BACKEND`~~ | — | — | *[amended 2026-07-15]* removed with the jti subsystem (#205); C1 is obsolete |
-| `HFS_AUTH_REDIS_URL` | URL | — | Redis for `jti` + JWKS coordinator. *(exists)* |
+| `HFS_AUTH_JWKS_COORDINATION` | `local` / `database` / `redis` | `local` (`database` when `HFS_CLUSTER`) | Cluster single-flight JWKS refresh (C2). Warn-only: explicit `local` under cluster warns, never refuses. *(new — landed Phase 2)* **[amended 2026-07-15]** |
+| `HFS_AUTH_REDIS_URL` | URL | — | Redis for ~~`jti` +~~ the JWKS coordinator (`redis` mode; needs the `redis` build feature). *[amended 2026-07-15: removed by #205, re-added in Phase 2 for C2 only]* |
 | `HFS_SUBSCRIPTIONS_FANOUT` | `memory` / `redis` / `nats` / `pg-notify` | `memory` | Shared pub/sub for WS delivery + WS binding tokens + counters (class B). *(new)* |
 | `HFS_TERMINOLOGY_CACHE_INVALIDATION` | `local` / `pg-notify` / `redis` | `local` | Cross-instance HTS cache invalidation (C3). *(new)* |
 | `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` / `s3` | `local-fs` | Set `s3` when clustered (F2). *(exists)* |
@@ -406,6 +422,8 @@ Each phase is independently shippable and leaves the tree green.
   (A2) onto the same table.
 - **Phase 2 — auth hardening.** Make `jti` shared-mandatory under `HFS_CLUSTER`
   ~~(C1)~~ *[amended 2026-07-15: C1 obsolete per #205]*; wire `JwksCoordinator` (C2). Small, mostly existing code.
+  *[amended 2026-07-15: C2 landed — see the §5 C2 amendment for the shape it
+  took (new trait + Postgres/Redis impls, not the deleted coordinator).]*
 - **Phase 3 — Subscriptions cluster delivery (#170).** DB-backed
   subscription/topic load + startup reconciliation (B3), shared pub/sub fan-out
   (B1), shared/stateless WS binding tokens (B2), shared counters (B4), durable
@@ -421,6 +439,11 @@ Each phase is independently shippable and leaves the tree green.
   primary DB* (using `LISTEN/NOTIFY` + a DB table for replay/fan-out) so a
   cluster needs no Redis? Trade-off: DB load & `NOTIFY` fan-out limits vs one
   fewer dependency. The env-var surface above keeps both open.
+  *[amended 2026-07-15 — resolved for C2: the DB-backed coordinator is the
+  default, so a DB-only cluster needs no Redis; the Redis impl was
+  resurrected as an explicit opt-in (session decision: keep a Redis scaffold
+  for future cluster work). Its gated T2 twin runs via
+  `redis-cluster-tests.yml` / `RUN_REDIS_CLUSTER_TESTS=1`.]*
 - **Leader-elected singletons.** Reapers (D1/D2) and any future heartbeat loop
   could share one leader-election primitive rather than each rolling its own
   lease.
