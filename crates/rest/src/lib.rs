@@ -167,7 +167,7 @@ pub mod terminology;
 // Re-export commonly used types
 pub use config::{
     ExportControllerMode, JobStoreBackend, MultitenancyConfig, ServerConfig, StorageBackendMode,
-    TenantRoutingMode,
+    SubscriptionsFanoutMode, TenantRoutingMode,
 };
 pub use error::{RestError, RestResult};
 pub use jwks_coordination::StoreJwksCoordination;
@@ -799,9 +799,7 @@ where
     // Inject subscription engine if enabled
     #[cfg(feature = "subscriptions")]
     let state = {
-        let subscriptions_enabled = std::env::var("HFS_SUBSCRIPTIONS_ENABLED")
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
-            .unwrap_or(false);
+        let subscriptions_enabled = config.subscriptions_enabled();
         if subscriptions_enabled {
             let smtp = build_smtp_settings_from_env();
             let messaging = build_messaging_settings_from_env(&config.base_url);
@@ -840,13 +838,81 @@ where
             };
             // Outbound auth provider was built above (static bearer when
             // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
-            let engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
+            let mut engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
                 sub_config,
                 config.base_url.clone(),
                 outbound_auth_provider,
             );
+
+            // Cluster delivery (design §Class B): under the pg-notify fan-out
+            // mode, wire the shared persistence seams. A backend without them
+            // warns and stays per-instance (the reindex posture); the hfs
+            // validator refuses the genuinely unsafe combinations at boot.
+            let fanout_mode = config
+                .subscriptions_fanout_mode()
+                .unwrap_or(SubscriptionsFanoutMode::Memory);
+            let mut cluster_backed = false;
+            if fanout_mode == SubscriptionsFanoutMode::PgNotify {
+                let seams = (
+                    storage_arc.subscription_state_store(),
+                    storage_arc.ws_binding_token_store(),
+                    storage_arc.subscription_hydration_source(),
+                    storage_arc.subscription_fanout(),
+                    storage_arc.subscription_delivery_outbox(),
+                );
+                match seams {
+                    (
+                        Some(state_store),
+                        Some(tokens),
+                        Some(hydration),
+                        Some(fanout),
+                        Some(outbox),
+                    ) => {
+                        let instance_id = format!("hfs-{}", uuid::Uuid::new_v4());
+                        engine =
+                            engine.with_cluster_handles(helios_subscriptions::ClusterHandles {
+                                state: state_store,
+                                tokens,
+                                hydration,
+                                fanout,
+                                outbox,
+                                instance_id: instance_id.clone(),
+                            });
+                        cluster_backed = true;
+                        info!(
+                            instance_id,
+                            "Subscriptions cluster delivery ENABLED (pg-notify fan-out)"
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            backend = storage_arc.backend_name(),
+                            "HFS_SUBSCRIPTIONS_FANOUT resolves to pg-notify but this backend \
+                             has no cluster subscription seams; subscriptions stay per-instance \
+                             (a Subscription created on one instance will not fire for writes \
+                             served by another)"
+                        );
+                    }
+                }
+            }
+
             info!("Subscriptions engine ENABLED");
-            state.with_subscription_engine(Arc::new(engine))
+            let engine = Arc::new(engine);
+            if cluster_backed {
+                // Consume the fan-out (subscribes before hydration so no
+                // envelope is missed; processing is idempotent), start the
+                // outbox workers, and rebuild the projections from storage.
+                // Events served before hydration completes evaluate against
+                // a partial registry — bounded, and strictly better than the
+                // permanently-empty registry a restart meant before Phase 3.
+                engine.start_fanout_listener();
+                engine.spawn_outbox_workers(1);
+                let hydrating = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    hydrating.hydrate().await;
+                });
+            }
+            state.with_subscription_engine(engine)
         } else {
             state
         }

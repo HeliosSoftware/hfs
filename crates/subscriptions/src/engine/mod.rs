@@ -11,6 +11,12 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use helios_fhir::FhirVersion;
+use helios_persistence::core::event_fanout::{
+    EventFanout, FanoutEnvelope, FanoutKind, LifecycleOp,
+};
+use helios_persistence::core::subscription_delivery::{
+    DeliveryLeaseError, NewDelivery, SubscriptionDeliveryOutbox, WorkerId,
+};
 use helios_persistence::core::subscription_state::{
     SubscriptionHydrationSource, SubscriptionStateStore,
 };
@@ -47,6 +53,11 @@ pub struct ClusterHandles {
     pub tokens: Arc<dyn WsBindingTokenStore>,
     /// Boot-time hydration read path (B3).
     pub hydration: Arc<dyn SubscriptionHydrationSource>,
+    /// Cluster event fan-out: websocket envelopes to the instances holding
+    /// the sockets, lifecycle/state announcements, outbox wake hints (B1).
+    pub fanout: Arc<dyn EventFanout>,
+    /// Durable push-channel delivery outbox (B5).
+    pub outbox: Arc<dyn SubscriptionDeliveryOutbox>,
     /// This instance's identity, used as the fan-out origin marker.
     pub instance_id: String,
 }
@@ -292,14 +303,174 @@ impl SubscriptionEngine {
                 "Dispatching subscription event notification"
             );
 
-            // Dispatch with retry.
-            self.dispatch_with_retry(
-                &subscription,
-                &bundle,
-                "event-notification",
-                Some(event_number),
-            )
-            .await;
+            match &self.cluster {
+                // Cluster mode splits by channel (design §Class B):
+                // websocket broadcasts to every instance's local sockets;
+                // push channels go through the durable outbox.
+                Some(cluster) => match subscription.channel.channel_type {
+                    ChannelType::Websocket => {
+                        self.deliver_ws_event_clustered(
+                            cluster,
+                            &subscription,
+                            event_number,
+                            &bundle,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        self.enqueue_push_delivery(cluster, &subscription, event_number, bundle)
+                            .await;
+                    }
+                },
+                // Local mode: today's inline dispatch-with-retry.
+                None => {
+                    self.dispatch_with_retry(
+                        &subscription,
+                        &bundle,
+                        "event-notification",
+                        Some(event_number),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Cluster websocket delivery (B1): persist the bundle for the other
+    /// instances, deliver to this instance's local sockets losslessly, then
+    /// publish the fan-out envelope so every other instance delivers to its
+    /// own sockets. The origin skips its own envelope.
+    async fn deliver_ws_event_clustered(
+        &self,
+        cluster: &ClusterHandles,
+        subscription: &ActiveSubscription,
+        event_number: u64,
+        bundle: &serde_json::Value,
+    ) {
+        let tenant_id = &subscription.tenant_id;
+        let sub_id = &subscription.id;
+        if let Err(e) = cluster
+            .state
+            .put_notification_event(&tenant_ctx(tenant_id), sub_id, event_number, bundle)
+            .await
+        {
+            // Local sockets still get the event; remote instances will miss
+            // this one (gap-detectable by eventNumber).
+            warn!(
+                tenant_id,
+                subscription_id = sub_id,
+                event_number,
+                error = %e,
+                "Failed to store websocket notification for cross-instance delivery"
+            );
+        }
+        let delivered = self
+            .ws_manager
+            .send_to_subscription(tenant_id, sub_id, bundle);
+        debug!(
+            tenant_id,
+            subscription_id = sub_id,
+            event_number,
+            local_clients = delivered,
+            "Websocket notification delivered locally"
+        );
+        let envelope = FanoutEnvelope::new(FanoutKind::WsEvent {
+            origin: cluster.instance_id.clone(),
+            tenant: tenant_id.clone(),
+            sub: sub_id.clone(),
+            event: event_number,
+        });
+        if let Err(e) = cluster.fanout.publish(&envelope).await {
+            warn!(
+                tenant_id,
+                subscription_id = sub_id,
+                event_number,
+                error = %e,
+                "Failed to publish websocket fan-out envelope"
+            );
+        }
+    }
+
+    /// Cluster push-channel delivery (B5): enqueue on the durable outbox
+    /// (attempt zero) and nudge the workers. An enqueue failure falls back
+    /// to the inline dispatch path — delivering without durability beats
+    /// dropping the notification.
+    async fn enqueue_push_delivery(
+        &self,
+        cluster: &ClusterHandles,
+        subscription: &ActiveSubscription,
+        event_number: u64,
+        bundle: serde_json::Value,
+    ) {
+        let delivery = NewDelivery {
+            subscription_id: subscription.id.clone(),
+            event_number: Some(event_number),
+            notification_type: "event-notification".to_string(),
+            bundle: bundle.clone(),
+        };
+        match cluster
+            .outbox
+            .enqueue(&tenant_ctx(&subscription.tenant_id), delivery)
+            .await
+        {
+            Ok(id) => {
+                debug!(
+                    tenant_id = %subscription.tenant_id,
+                    subscription_id = %subscription.id,
+                    delivery_id = %id,
+                    event_number,
+                    "Notification enqueued on the delivery outbox"
+                );
+                if let Err(e) = cluster.fanout.publish_outbox_wake().await {
+                    debug!(error = %e, "Outbox wake hint failed (workers poll anyway)");
+                }
+            }
+            Err(e) => {
+                error!(
+                    tenant_id = %subscription.tenant_id,
+                    subscription_id = %subscription.id,
+                    event_number,
+                    error = %e,
+                    "Outbox enqueue failed; falling back to inline delivery"
+                );
+                self.dispatch_with_retry(
+                    subscription,
+                    &bundle,
+                    "event-notification",
+                    Some(event_number),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Publishes a lifecycle announcement so every other instance re-reads
+    /// the resource and patches its local projection. Best-effort — a
+    /// failed publish only delays convergence until the next resync.
+    async fn publish_lifecycle(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        op: LifecycleOp,
+    ) {
+        let Some(cluster) = &self.cluster else {
+            return;
+        };
+        let envelope = FanoutEnvelope::new(FanoutKind::Lifecycle {
+            tenant: tenant_id.to_string(),
+            rtype: resource_type.to_string(),
+            rid: resource_id.to_string(),
+            op,
+        });
+        if let Err(e) = cluster.fanout.publish(&envelope).await {
+            warn!(
+                tenant_id,
+                resource_type,
+                resource_id,
+                error = %e,
+                "Failed to publish lifecycle fan-out envelope"
+            );
         }
     }
 
@@ -338,6 +509,13 @@ impl SubscriptionEngine {
                     tenant_id,
                     subscription_id, removed, "Subscription deregistered"
                 );
+                self.publish_lifecycle(
+                    &tenant_id,
+                    &event.resource_type,
+                    subscription_id,
+                    LifecycleOp::Delete,
+                )
+                .await;
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
@@ -364,6 +542,16 @@ impl SubscriptionEngine {
                             self.activate_subscription(&sub).await;
                         }
                     }
+                    // Announce regardless of local registration success —
+                    // receivers re-read the resource and converge through
+                    // the same logic.
+                    self.publish_lifecycle(
+                        &tenant_id,
+                        &event.resource_type,
+                        subscription_id,
+                        LifecycleOp::Upsert,
+                    )
+                    .await;
                 }
             }
         }
@@ -537,6 +725,13 @@ impl SubscriptionEngine {
                         "SubscriptionTopic deleted"
                     );
                 }
+                self.publish_lifecycle(
+                    event.tenant_id.as_ref(),
+                    &event.resource_type,
+                    &event.resource_id,
+                    LifecycleOp::Delete,
+                )
+                .await;
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
@@ -546,6 +741,13 @@ impl SubscriptionEngine {
                         &event.resource_id,
                         resource,
                     );
+                    self.publish_lifecycle(
+                        event.tenant_id.as_ref(),
+                        &event.resource_type,
+                        &event.resource_id,
+                        LifecycleOp::Upsert,
+                    )
+                    .await;
                 }
             }
         }
@@ -670,16 +872,35 @@ impl SubscriptionEngine {
                     );
                 }
 
+                if recognized_topic {
+                    self.publish_lifecycle(
+                        event.tenant_id.as_ref(),
+                        &event.resource_type,
+                        &event.resource_id,
+                        LifecycleOp::Delete,
+                    )
+                    .await;
+                }
                 recognized_topic
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
-                    self.register_basic_topic_locally(
+                    let recognized = self.register_basic_topic_locally(
                         event.tenant_id.as_ref(),
                         &event.resource_type,
                         &event.resource_id,
                         resource,
-                    )
+                    );
+                    if recognized {
+                        self.publish_lifecycle(
+                            event.tenant_id.as_ref(),
+                            &event.resource_type,
+                            &event.resource_id,
+                            LifecycleOp::Upsert,
+                        )
+                        .await;
+                    }
+                    recognized
                 } else {
                     false
                 }
@@ -910,22 +1131,20 @@ impl SubscriptionEngine {
         }
     }
 
-    /// Dispatch a notification with retry logic.
-    async fn dispatch_with_retry(
+    /// Resolves the channel dispatcher for a subscription, logging (and
+    /// returning `None`) when the channel is unconfigured or unsupported.
+    fn dispatcher_for(
         &self,
         subscription: &ActiveSubscription,
-        bundle: &serde_json::Value,
-        notification_type: &'static str,
-        event_number: Option<u64>,
-    ) {
+        notification_type: &str,
+    ) -> Option<&dyn ChannelDispatcher> {
         let tenant_id = &subscription.tenant_id;
         let sub_id = &subscription.id;
-
-        let dispatcher: &dyn ChannelDispatcher = match subscription.channel.channel_type {
-            ChannelType::RestHook => self.rest_hook_channel.as_ref(),
-            ChannelType::Websocket => self.ws_channel.as_ref(),
+        match subscription.channel.channel_type {
+            ChannelType::RestHook => Some(self.rest_hook_channel.as_ref()),
+            ChannelType::Websocket => Some(self.ws_channel.as_ref()),
             ChannelType::Email => match self.email_channel.as_deref() {
-                Some(ch) => ch,
+                Some(ch) => Some(ch),
                 None => {
                     warn!(
                         tenant_id,
@@ -934,11 +1153,11 @@ impl SubscriptionEngine {
                         endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         "Email dispatch requested but no SMTP settings configured"
                     );
-                    return;
+                    None
                 }
             },
             ChannelType::Message => match self.messaging_channel.as_deref() {
-                Some(ch) => ch,
+                Some(ch) => Some(ch),
                 None => {
                     warn!(
                         tenant_id,
@@ -947,7 +1166,7 @@ impl SubscriptionEngine {
                         endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                         "Messaging dispatch requested but messaging settings not configured"
                     );
-                    return;
+                    None
                 }
             },
             _ => {
@@ -959,8 +1178,24 @@ impl SubscriptionEngine {
                     endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                     "No dispatcher for channel type"
                 );
-                return;
+                None
             }
+        }
+    }
+
+    /// Dispatch a notification with retry logic.
+    async fn dispatch_with_retry(
+        &self,
+        subscription: &ActiveSubscription,
+        bundle: &serde_json::Value,
+        notification_type: &'static str,
+        event_number: Option<u64>,
+    ) {
+        let tenant_id = &subscription.tenant_id;
+        let sub_id = &subscription.id;
+
+        let Some(dispatcher) = self.dispatcher_for(subscription, notification_type) else {
+            return;
         };
 
         let mut attempt: u32 = 0;
@@ -1118,8 +1353,8 @@ impl SubscriptionEngine {
         {
             return;
         }
-        if let Some(cluster) = &self.cluster
-            && let Err(e) = cluster
+        if let Some(cluster) = &self.cluster {
+            if let Err(e) = cluster
                 .state
                 .set_status(
                     &tenant_ctx(tenant_id),
@@ -1127,14 +1362,29 @@ impl SubscriptionEngine {
                     status.as_fhir_str(),
                 )
                 .await
-        {
-            warn!(
-                tenant_id,
-                subscription_id,
-                status = %status,
-                error = %e,
-                "Failed to record shared status transition"
-            );
+            {
+                warn!(
+                    tenant_id,
+                    subscription_id,
+                    status = %status,
+                    error = %e,
+                    "Failed to record shared status transition"
+                );
+            }
+            // Announce so other instances refresh their local projection
+            // (their evaluators filter on the LOCAL status).
+            let envelope = FanoutEnvelope::new(FanoutKind::State {
+                tenant: tenant_id.to_string(),
+                sub: subscription_id.to_string(),
+            });
+            if let Err(e) = cluster.fanout.publish(&envelope).await {
+                warn!(
+                    tenant_id,
+                    subscription_id,
+                    error = %e,
+                    "Failed to publish status fan-out envelope"
+                );
+            }
         }
     }
 
@@ -1354,6 +1604,471 @@ impl SubscriptionEngine {
             }
         }
         Some(sub)
+    }
+
+    /// Spawns the fan-out consumer (B1): websocket envelopes from other
+    /// instances deliver to this instance's local sockets; lifecycle/state
+    /// announcements patch the local projections; a resync (reconnect or
+    /// lag) triggers a full re-hydration. Returns `None` without cluster
+    /// handles. Call once, from within a Tokio runtime, after subscribing
+    /// is safe (the receiver is created before the task starts, so no
+    /// envelopes are missed between this call and the task running).
+    pub fn start_fanout_listener(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let cluster = self.cluster.as_ref()?;
+        let mut receiver = cluster.fanout.subscribe();
+        let engine = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(envelope) => engine.handle_fanout_envelope(envelope).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed, "Fan-out listener lagged; running a full resync");
+                        engine.hydrate().await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }))
+    }
+
+    /// Applies one fan-out envelope to this instance's local state.
+    async fn handle_fanout_envelope(&self, envelope: FanoutEnvelope) {
+        let Some(cluster) = &self.cluster else {
+            return;
+        };
+        match envelope.kind {
+            FanoutKind::WsEvent {
+                origin,
+                tenant,
+                sub,
+                event,
+            } => {
+                if origin == cluster.instance_id {
+                    // This instance produced the event and already
+                    // delivered to its local sockets.
+                    return;
+                }
+                match cluster
+                    .state
+                    .get_notification_event(&tenant_ctx(&tenant), &sub, event)
+                    .await
+                {
+                    Ok(Some(bundle)) => {
+                        let delivered =
+                            self.ws_manager.send_to_subscription(&tenant, &sub, &bundle);
+                        debug!(
+                            tenant_id = %tenant,
+                            subscription_id = %sub,
+                            event_number = event,
+                            local_clients = delivered,
+                            "Websocket notification delivered from fan-out"
+                        );
+                    }
+                    Ok(None) => warn!(
+                        tenant_id = %tenant,
+                        subscription_id = %sub,
+                        event_number = event,
+                        "Fan-out envelope refers to a missing stored notification"
+                    ),
+                    Err(e) => warn!(
+                        tenant_id = %tenant,
+                        subscription_id = %sub,
+                        event_number = event,
+                        error = %e,
+                        "Failed to load stored notification for fan-out delivery"
+                    ),
+                }
+            }
+            FanoutKind::Lifecycle {
+                tenant,
+                rtype,
+                rid,
+                op,
+            } => self.apply_remote_lifecycle(&tenant, &rtype, &rid, op).await,
+            FanoutKind::State { tenant, sub } => {
+                match cluster.state.get(&tenant_ctx(&tenant), &sub).await {
+                    Ok(Some(record)) => {
+                        let status = record
+                            .status
+                            .as_deref()
+                            .and_then(SubscriptionStatusCode::from_fhir_str);
+                        self.manager.apply_state_overlay(
+                            &tenant,
+                            &sub,
+                            record.event_number,
+                            record.consecutive_failures,
+                            status,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        tenant_id = %tenant,
+                        subscription_id = %sub,
+                        error = %e,
+                        "Failed to refresh shared state after a status envelope"
+                    ),
+                }
+            }
+            FanoutKind::Resync => {
+                info!("Fan-out resync requested; re-hydrating subscription state");
+                self.hydrate().await;
+            }
+        }
+    }
+
+    /// Applies a remote lifecycle announcement: re-read the resource from
+    /// storage and re-register (upsert) or deregister (delete) locally.
+    async fn apply_remote_lifecycle(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        op: LifecycleOp,
+    ) {
+        let Some(cluster) = &self.cluster else {
+            return;
+        };
+        match op {
+            LifecycleOp::Delete => self.deregister_locally(tenant_id, resource_type, resource_id),
+            LifecycleOp::Upsert => {
+                match cluster
+                    .hydration
+                    .get_current(&tenant_ctx(tenant_id), resource_type, resource_id)
+                    .await
+                {
+                    Ok(Some(resource)) => {
+                        let Some(fhir_version) =
+                            FhirVersion::from_mime_param(&resource.fhir_version)
+                        else {
+                            warn!(
+                                tenant_id,
+                                resource_type,
+                                resource_id,
+                                fhir_version = %resource.fhir_version,
+                                "Skipping lifecycle row with unknown FHIR version"
+                            );
+                            return;
+                        };
+                        match resource_type {
+                            "Subscription" => {
+                                let _ = self
+                                    .register_subscription_locally(
+                                        tenant_id,
+                                        resource_id,
+                                        &resource.content,
+                                        fhir_version,
+                                        RegistrationSource::Hydration,
+                                    )
+                                    .await;
+                            }
+                            "SubscriptionTopic" => self.register_native_topic_locally(
+                                tenant_id,
+                                resource_type,
+                                resource_id,
+                                &resource.content,
+                            ),
+                            "Basic" if fhir_version.as_str() == "R4" => {
+                                self.register_basic_topic_locally(
+                                    tenant_id,
+                                    resource_type,
+                                    resource_id,
+                                    &resource.content,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    // The resource vanished between the envelope and our
+                    // read — treat as a delete.
+                    Ok(None) => self.deregister_locally(tenant_id, resource_type, resource_id),
+                    Err(e) => warn!(
+                        tenant_id,
+                        resource_type,
+                        resource_id,
+                        error = %e,
+                        "Failed to re-read resource after a lifecycle envelope"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Removes a subscription or topic from the local projections (the
+    /// receive side of a lifecycle delete — the origin already handled the
+    /// shared state).
+    fn deregister_locally(&self, tenant_id: &str, resource_type: &str, resource_id: &str) {
+        match resource_type {
+            "Subscription" => {
+                self.manager.deregister(tenant_id, resource_id);
+                self.ws_manager.remove_all_clients(tenant_id, resource_id);
+            }
+            "SubscriptionTopic" | "Basic" => {
+                let key = (
+                    tenant_id.to_string(),
+                    resource_type.to_string(),
+                    resource_id.to_string(),
+                );
+                if let Some((_, canonical_url)) = self.topic_resource_index.remove(&key) {
+                    self.topic_registry.remove_topic(tenant_id, &canonical_url);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One deterministic outbox worker cycle (B5): claim the next due
+    /// delivery, attempt it exactly once, and record the outcome (complete /
+    /// scheduled retry / terminal failure + threshold handling). Returns
+    /// whether a delivery was claimed — the polling loop drains until
+    /// `false`; tests drive single cycles. Mirrors
+    /// `run_next_sof_export_job`'s posture.
+    pub async fn run_next_subscription_delivery(
+        &self,
+        worker_id: &WorkerId,
+        lease_duration: std::time::Duration,
+    ) -> bool {
+        let Some(cluster) = &self.cluster else {
+            return false;
+        };
+        let claimed = match cluster.outbox.claim_next(worker_id, lease_duration).await {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => return false,
+            Err(e) => {
+                warn!(error = %e, "Outbox claim failed");
+                return false;
+            }
+        };
+        let tenant_id = claimed.lease.tenant.tenant_id().as_str().to_string();
+        let sub_id = claimed.subscription_id.clone();
+
+        // Resolve the subscription: local projection first; on a miss (this
+        // instance may not have seen the lifecycle yet) a full re-hydration
+        // pulls the topic AND the subscription — registering the
+        // subscription alone would fail topic validation.
+        let subscription = match self.manager.get_subscription(&tenant_id, &sub_id) {
+            Some(subscription) => Some(subscription),
+            None => {
+                self.hydrate().await;
+                self.manager.get_subscription(&tenant_id, &sub_id)
+            }
+        };
+        let Some(subscription) = subscription else {
+            warn!(
+                tenant_id,
+                subscription_id = %sub_id,
+                delivery_id = %claimed.lease.id,
+                "Failing orphaned delivery: subscription no longer exists"
+            );
+            self.finish_failed_delivery(
+                &claimed.lease,
+                &tenant_id,
+                &sub_id,
+                "subscription no longer exists",
+                false,
+            )
+            .await;
+            return true;
+        };
+        let Some(dispatcher) = self.dispatcher_for(&subscription, &claimed.notification_type)
+        else {
+            self.finish_failed_delivery(
+                &claimed.lease,
+                &tenant_id,
+                &sub_id,
+                "channel not configured on this instance",
+                false,
+            )
+            .await;
+            return true;
+        };
+
+        match dispatcher.dispatch(&subscription, &claimed.bundle).await {
+            Ok(DispatchResult::Success) => match cluster.outbox.complete(&claimed.lease).await {
+                Ok(()) => {
+                    self.reset_delivery_failures(&tenant_id, &sub_id).await;
+                    info!(
+                        tenant_id,
+                        subscription_id = %sub_id,
+                        delivery_id = %claimed.lease.id,
+                        event_number = claimed.event_number,
+                        attempts = claimed.attempts,
+                        "Outbox delivery completed"
+                    );
+                }
+                Err(DeliveryLeaseError::LeaseLost { .. }) => warn!(
+                    tenant_id,
+                    subscription_id = %sub_id,
+                    delivery_id = %claimed.lease.id,
+                    "Delivered but the lease was lost; another worker may redeliver \
+                     (at-least-once)"
+                ),
+                Err(e) => warn!(
+                    tenant_id,
+                    subscription_id = %sub_id,
+                    delivery_id = %claimed.lease.id,
+                    error = %e,
+                    "Failed to record delivery completion"
+                ),
+            },
+            Ok(DispatchResult::RetryableError(msg)) => {
+                if retry::should_retry(&self.config, claimed.attempts) {
+                    let delay = retry::calculate_delay(&self.config, claimed.attempts);
+                    let next_attempt_at = Utc::now()
+                        + chrono::Duration::from_std(delay)
+                            .unwrap_or_else(|_| chrono::Duration::seconds(60));
+                    match cluster
+                        .outbox
+                        .release_for_retry(&claimed.lease, next_attempt_at, &msg)
+                        .await
+                    {
+                        Ok(()) => debug!(
+                            tenant_id,
+                            subscription_id = %sub_id,
+                            delivery_id = %claimed.lease.id,
+                            attempts = claimed.attempts,
+                            delay_ms = delay.as_millis() as u64,
+                            error = %msg,
+                            "Delivery re-queued for retry"
+                        ),
+                        Err(e) => warn!(
+                            tenant_id,
+                            subscription_id = %sub_id,
+                            delivery_id = %claimed.lease.id,
+                            error = %e,
+                            "Failed to re-queue delivery"
+                        ),
+                    }
+                } else {
+                    warn!(
+                        tenant_id,
+                        subscription_id = %sub_id,
+                        delivery_id = %claimed.lease.id,
+                        attempts = claimed.attempts,
+                        error = %msg,
+                        "Max retries exhausted"
+                    );
+                    self.finish_failed_delivery(&claimed.lease, &tenant_id, &sub_id, &msg, true)
+                        .await;
+                }
+            }
+            Ok(DispatchResult::PermanentError(msg)) => {
+                warn!(
+                    tenant_id,
+                    subscription_id = %sub_id,
+                    delivery_id = %claimed.lease.id,
+                    error = %msg,
+                    "Permanent delivery error"
+                );
+                self.finish_failed_delivery(&claimed.lease, &tenant_id, &sub_id, &msg, true)
+                    .await;
+            }
+            Err(e) => {
+                error!(
+                    tenant_id,
+                    subscription_id = %sub_id,
+                    delivery_id = %claimed.lease.id,
+                    error = %e,
+                    "Dispatch error"
+                );
+                self.finish_failed_delivery(
+                    &claimed.lease,
+                    &tenant_id,
+                    &sub_id,
+                    &e.to_string(),
+                    true,
+                )
+                .await;
+            }
+        }
+        true
+    }
+
+    /// Marks a claimed delivery terminally failed; when `count_failure` the
+    /// subscription's shared failure streak is bumped (error/off
+    /// thresholds). Orphan/config failures skip the streak — they say
+    /// nothing about the endpoint's health.
+    async fn finish_failed_delivery(
+        &self,
+        lease: &helios_persistence::core::subscription_delivery::DeliveryLease,
+        tenant_id: &str,
+        sub_id: &str,
+        error_message: &str,
+        count_failure: bool,
+    ) {
+        let Some(cluster) = &self.cluster else {
+            return;
+        };
+        match cluster.outbox.fail(lease, error_message).await {
+            Ok(()) => {
+                if count_failure {
+                    self.handle_delivery_failure(tenant_id, sub_id).await;
+                }
+            }
+            Err(DeliveryLeaseError::LeaseLost { .. }) => warn!(
+                tenant_id,
+                subscription_id = sub_id,
+                delivery_id = %lease.id,
+                "Lease lost while failing a delivery; the new holder decides its fate"
+            ),
+            Err(e) => warn!(
+                tenant_id,
+                subscription_id = sub_id,
+                delivery_id = %lease.id,
+                error = %e,
+                "Failed to record delivery failure"
+            ),
+        }
+    }
+
+    /// Spawns the per-instance outbox worker loop (B5): drains due
+    /// deliveries, then waits on a poll tick or an outbox wake hint —
+    /// correctness rides the poll floor, never the hint. Piggybacks
+    /// terminal-row reaping. No-op without cluster handles.
+    pub fn spawn_outbox_workers(self: &Arc<Self>, worker_count: usize) {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        const LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
+        /// Reap terminal rows older than this, every `REAP_EVERY` idle laps.
+        const REAP_TTL_SECS: i64 = 24 * 3600;
+        const REAP_EVERY: u64 = 300;
+
+        let Some(cluster) = &self.cluster else {
+            return;
+        };
+        for worker_index in 0..worker_count.max(1) {
+            let engine = Arc::clone(self);
+            let outbox = Arc::clone(&cluster.outbox);
+            let mut wake = cluster.fanout.subscribe_outbox_wake();
+            let worker_id =
+                WorkerId::new(format!("{}-outbox-{}", cluster.instance_id, worker_index));
+            tokio::spawn(async move {
+                let mut laps: u64 = 0;
+                loop {
+                    while engine
+                        .run_next_subscription_delivery(&worker_id, LEASE_DURATION)
+                        .await
+                    {}
+                    laps += 1;
+                    if laps.is_multiple_of(REAP_EVERY) {
+                        let cutoff = Utc::now() - chrono::Duration::seconds(REAP_TTL_SECS);
+                        if let Err(e) = outbox.delete_terminal_before(cutoff).await {
+                            warn!(error = %e, "Outbox reap failed");
+                        }
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                        received = wake.recv() => {
+                            if matches!(
+                                received,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed)
+                            ) {
+                                // No more hints; stay on the poll floor.
+                                tokio::time::sleep(POLL_INTERVAL).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 }
 

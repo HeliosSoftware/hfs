@@ -11,8 +11,10 @@
 //!   `eventNumber`s, asserted on the wiremock-delivered bodies.
 //! - **B2** — a binding token minted via A redeems exactly once via B.
 //!
-//! Per-test unique tenants keep rows disjoint (no suite lock needed — the
-//! outbox, whose claims are cross-tenant, is not exercised here).
+//! Per-test unique tenants keep state/token rows disjoint; tests that
+//! enqueue or drain the delivery outbox take `PG_OUTBOX_TEST_LOCK`, because
+//! `claim_next` is deliberately cross-tenant and parallel tests sharing the
+//! container would deliver each other's notifications.
 
 #![cfg(feature = "postgres")]
 
@@ -22,18 +24,34 @@ use chrono::Utc;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
 use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::subscription_delivery::WorkerId;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_subscriptions::manager::SubscriptionStatusCode;
 use helios_subscriptions::{
     ClusterHandles, ResourceEvent, ResourceEventType, SubscriptionConfig, SubscriptionEngine,
 };
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TOPIC_URL: &str = "http://example.org/topic/encounter-start";
 const SUB_ID: &str = "sub-cluster-1";
+
+/// Serializes the outbox-touching tests: `claim_next` is cross-tenant.
+static PG_OUTBOX_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// How long an event-driven await may take before the test fails.
+const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Drains the shared outbox through one engine's worker seam.
+async fn drain_outbox(engine: &SubscriptionEngine, worker: &str) {
+    let worker_id = WorkerId::new(worker);
+    while engine
+        .run_next_subscription_delivery(&worker_id, std::time::Duration::from_secs(60))
+        .await
+    {}
+}
 
 // ── Shared PostgreSQL container (the postgres_tests.rs idiom) ─────────────
 
@@ -254,12 +272,8 @@ fn tenant_ctx(tenant_id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access())
 }
 
-fn pg_cluster_engine(backend: &PostgresBackend, instance_id: &str) -> SubscriptionEngine {
-    SubscriptionEngine::new(
-        SubscriptionConfig::default(),
-        "http://localhost:8080".to_string(),
-    )
-    .with_cluster_handles(ClusterHandles {
+fn cluster_handles_of(backend: &PostgresBackend, instance_id: &str) -> ClusterHandles {
+    ClusterHandles {
         state: backend
             .subscription_state_store()
             .expect("postgres backs a subscription state store"),
@@ -269,8 +283,56 @@ fn pg_cluster_engine(backend: &PostgresBackend, instance_id: &str) -> Subscripti
         hydration: backend
             .subscription_hydration_source()
             .expect("postgres backs a hydration source"),
+        fanout: backend
+            .subscription_fanout()
+            .expect("postgres backs an event fan-out"),
+        outbox: backend
+            .subscription_delivery_outbox()
+            .expect("postgres backs a delivery outbox"),
         instance_id: instance_id.to_string(),
-    })
+    }
+}
+
+fn pg_cluster_engine(backend: &PostgresBackend, instance_id: &str) -> SubscriptionEngine {
+    SubscriptionEngine::new(
+        SubscriptionConfig::default(),
+        "http://localhost:8080".to_string(),
+    )
+    .with_cluster_handles(cluster_handles_of(backend, instance_id))
+}
+
+fn ws_subscription_resource(status: &str) -> Value {
+    if uses_backport_ig() {
+        json!({
+            "resourceType": "Subscription",
+            "id": SUB_ID,
+            "status": status,
+            "criteria": TOPIC_URL,
+            "channel": {
+                "type": "websocket",
+                "payload": "application/fhir+json"
+            }
+        })
+    } else {
+        json!({
+            "resourceType": "Subscription",
+            "id": SUB_ID,
+            "status": status,
+            "topic": TOPIC_URL,
+            "channelType": { "code": "websocket" },
+            "contentType": "application/fhir+json",
+            "content": "id-only"
+        })
+    }
+}
+
+fn ws_subscription_event(tenant_id: &str, status: &str) -> ResourceEvent {
+    event(
+        tenant_id,
+        "Subscription",
+        SUB_ID,
+        Some(ws_subscription_resource(status)),
+    )
 }
 
 fn extract_event_number(body: &Value) -> Option<u64> {
@@ -318,6 +380,7 @@ async fn delivered_event_numbers(server: &MockServer) -> Vec<u64> {
 /// B delivers.
 #[tokio::test]
 async fn pg_cluster_subscription_created_on_a_is_matchable_on_b_after_hydration() {
+    let _guard = PG_OUTBOX_TEST_LOCK.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/webhook"))
@@ -377,6 +440,7 @@ async fn pg_cluster_subscription_created_on_a_is_matchable_on_b_after_hydration(
     engine_b
         .on_resource_event(encounter_event(&tenant, "enc-b"))
         .await;
+    drain_outbox(&engine_b, "b3-worker").await;
     assert_eq!(
         delivered_event_numbers(&server).await,
         vec![1],
@@ -388,6 +452,7 @@ async fn pg_cluster_subscription_created_on_a_is_matchable_on_b_after_hydration(
 /// monotonic eventNumbers, asserted on the delivered notification bodies.
 #[tokio::test]
 async fn pg_cluster_event_numbers_are_gap_free_across_engines() {
+    let _guard = PG_OUTBOX_TEST_LOCK.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/webhook"))
@@ -412,15 +477,19 @@ async fn pg_cluster_event_numbers_are_gap_free_across_engines() {
     engine_a
         .on_resource_event(encounter_event(&tenant, "enc-1"))
         .await;
+    drain_outbox(&engine_a, "b4-worker-a").await;
     engine_b
         .on_resource_event(encounter_event(&tenant, "enc-2"))
         .await;
+    drain_outbox(&engine_b, "b4-worker-b").await;
     engine_a
         .on_resource_event(encounter_event(&tenant, "enc-3"))
         .await;
+    drain_outbox(&engine_a, "b4-worker-a").await;
     engine_b
         .on_resource_event(encounter_event(&tenant, "enc-4"))
         .await;
+    drain_outbox(&engine_b, "b4-worker-b").await;
 
     let mut numbers = delivered_event_numbers(&server).await;
     numbers.sort_unstable();
@@ -470,6 +539,7 @@ async fn pg_cluster_ws_token_minted_on_a_redeems_once_on_b() {
 /// a third, fresh instance continues the sequence.
 #[tokio::test]
 async fn pg_cluster_event_numbers_survive_engine_drop() {
+    let _guard = PG_OUTBOX_TEST_LOCK.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/webhook"))
@@ -492,6 +562,7 @@ async fn pg_cluster_event_numbers_survive_engine_drop() {
         engine
             .on_resource_event(encounter_event(&tenant, "enc-2"))
             .await;
+        drain_outbox(&engine, "durable-worker-dying").await;
     } // engine + backend dropped
 
     let backend = create_backend().await;
@@ -505,6 +576,7 @@ async fn pg_cluster_event_numbers_survive_engine_drop() {
     engine
         .on_resource_event(encounter_event(&tenant, "enc-3"))
         .await;
+    drain_outbox(&engine, "durable-worker-fresh").await;
 
     let mut numbers = delivered_event_numbers(&server).await;
     numbers.sort_unstable();
@@ -513,4 +585,134 @@ async fn pg_cluster_event_numbers_survive_engine_drop() {
         vec![1, 2, 3],
         "a fresh instance continues the sequence — registration never resets it"
     );
+}
+
+/// B5 (cross-instance): a delivery enqueued by instance A is claimed and
+/// delivered by instance B's worker — including the local-miss path where B
+/// re-reads the Subscription from storage before dispatching.
+#[tokio::test]
+async fn pg_cluster_outbox_delivery_claimed_by_other_instance() {
+    let _guard = PG_OUTBOX_TEST_LOCK.lock().await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/webhook", server.uri());
+    let tenant = unique_tenant("b5-cross");
+    let ctx = tenant_ctx(&tenant);
+    let fhir_version = current_fhir_version();
+
+    let backend_a = create_backend().await;
+    let engine_a = pg_cluster_engine(&backend_a, "instance-a");
+
+    // Persist the resources (instance B's local-miss re-read needs them).
+    let topic = topic_resource();
+    let topic_type = topic["resourceType"].as_str().unwrap().to_string();
+    backend_a
+        .create(&ctx, &topic_type, topic, fhir_version)
+        .await
+        .expect("persist topic resource");
+    backend_a
+        .create(
+            &ctx,
+            "Subscription",
+            rest_hook_subscription_resource(&endpoint, "active"),
+            fhir_version,
+        )
+        .await
+        .expect("persist subscription resource");
+    engine_a.on_resource_event(topic_event(&tenant)).await;
+    engine_a
+        .on_resource_event(subscription_event(&tenant, &endpoint, "active"))
+        .await;
+
+    // A enqueues; B (which never saw any write, no hydrate) delivers.
+    engine_a
+        .on_resource_event(encounter_event(&tenant, "enc-1"))
+        .await;
+    let backend_b = create_backend().await;
+    let engine_b = pg_cluster_engine(&backend_b, "instance-b");
+    drain_outbox(&engine_b, "b5-worker-b").await;
+
+    assert_eq!(
+        delivered_event_numbers(&server).await,
+        vec![1],
+        "instance B's worker must claim and deliver A's enqueued notification"
+    );
+}
+
+/// B1 over real LISTEN/NOTIFY: a websocket notification produced on
+/// instance A reaches a socket client registered on instance B — the
+/// in-process twin of the T3 smoke's mandatory two-process check.
+#[tokio::test]
+async fn pg_cluster_ws_event_reaches_socket_on_other_instance() {
+    let tenant = unique_tenant("b1-ws");
+    let ctx = tenant_ctx(&tenant);
+    let fhir_version = current_fhir_version();
+    let backend_a = create_backend().await;
+    let backend_b = create_backend().await;
+
+    // Persist the resources first (as the write path does): B's lifecycle
+    // receiver re-reads them from storage.
+    let topic = topic_resource();
+    let topic_type = topic["resourceType"].as_str().unwrap().to_string();
+    backend_a
+        .create(&ctx, &topic_type, topic, fhir_version)
+        .await
+        .expect("persist topic resource");
+    backend_a
+        .create(
+            &ctx,
+            "Subscription",
+            ws_subscription_resource("active"),
+            fhir_version,
+        )
+        .await
+        .expect("persist subscription resource");
+    let ws_config = SubscriptionConfig {
+        supported_channel_types: vec!["rest-hook".to_string(), "websocket".to_string()],
+        ..SubscriptionConfig::default()
+    };
+    let engine_a = std::sync::Arc::new(
+        SubscriptionEngine::new(ws_config.clone(), "http://localhost:8080".to_string())
+            .with_cluster_handles(cluster_handles_of(&backend_a, "instance-a")),
+    );
+    let engine_b = std::sync::Arc::new(
+        SubscriptionEngine::new(ws_config, "http://localhost:8080".to_string())
+            .with_cluster_handles(cluster_handles_of(&backend_b, "instance-b")),
+    );
+
+    let listener = engine_b.start_fanout_listener().expect("cluster-backed");
+    // B must be LISTENing before A publishes.
+    tokio::time::timeout(
+        RECV_TIMEOUT,
+        backend_b
+            .subscription_fanout()
+            .expect("postgres backs a fan-out")
+            .ready(),
+    )
+    .await
+    .expect("instance B's LISTEN session must establish");
+
+    for engine in [&engine_a, &engine_b] {
+        engine.on_resource_event(topic_event(&tenant)).await;
+        engine
+            .on_resource_event(ws_subscription_event(&tenant, "active"))
+            .await;
+    }
+    let (_client_id, mut rx_b) = engine_b.ws_manager().register_client(&tenant, SUB_ID);
+
+    engine_a
+        .on_resource_event(encounter_event(&tenant, "enc-1"))
+        .await;
+
+    let bundle = tokio::time::timeout(RECV_TIMEOUT, rx_b.recv())
+        .await
+        .expect("B's socket must receive the notification via LISTEN/NOTIFY")
+        .expect("channel open");
+    assert_eq!(extract_event_number(&bundle), Some(1));
+
+    listener.abort();
 }
