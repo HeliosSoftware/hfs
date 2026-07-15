@@ -26,7 +26,7 @@
 //! at all (a constraining slice) also matches nothing.
 
 use super::errors::{self, ErrorKind};
-use super::walk::{add_schemas_to_set, is_partial_match, validate_node, SchemaSet, WalkCtx};
+use super::walk::{SchemaSet, WalkCtx, add_schemas_to_set, is_partial_match, validate_node};
 use crate::schema::{Slice, Slicing};
 use indexmap::IndexMap;
 use serde_json::Value;
@@ -51,10 +51,7 @@ pub(super) fn validate_slices(
     elset: &SchemaSet,
     items: &[Value],
 ) -> HashSet<usize> {
-    let slicings: Vec<Slicing> = elset
-        .schemas()
-        .filter_map(|s| s.slicing.clone())
-        .collect();
+    let slicings: Vec<Slicing> = elset.schemas().filter_map(|s| s.slicing.clone()).collect();
     if slicings.is_empty() {
         return HashSet::new();
     }
@@ -78,13 +75,16 @@ pub(super) fn validate_slices(
         }
         // `@default` (closed slicing only) absorbs items no other slice
         // matched; count them so its own min/max can apply.
-        if slicing.slices.contains_key(DEFAULT_SLICE)
-            && slicing.rules.as_deref() == Some("closed")
+        if slicing.slices.contains_key(DEFAULT_SLICE) && slicing.rules.as_deref() == Some("closed")
         {
             let absorbed = item_matches.iter().filter(|m| m.is_empty()).count() as u64;
             *counters.get_mut(DEFAULT_SLICE).expect("counter exists") = absorbed;
         }
-        marks.push(LayerMark { slicing, counters, item_matches });
+        marks.push(LayerMark {
+            slicing,
+            counters,
+            item_matches,
+        });
     }
 
     // ---- validate matched items (item order), consuming them ----
@@ -122,7 +122,10 @@ pub(super) fn validate_slices(
                     continue;
                 }
                 match default_slice {
-                    Some(Slice { schema: Some(schema), .. }) => {
+                    Some(Slice {
+                        schema: Some(schema),
+                        ..
+                    }) => {
                         let mut extended = elset.clone();
                         add_schemas_to_set(ctx, &mut extended, Arc::clone(schema), DEFAULT_SLICE);
                         ctx.path.push_index(index);
@@ -145,17 +148,16 @@ pub(super) fn validate_slices(
                 }
             }
         } else if rules == "openAtEnd"
-            && let Some(last_matched) =
-                mark.item_matches.iter().rposition(|m| !m.is_empty())
-            {
-                for index in 0..last_matched {
-                    if mark.item_matches[index].is_empty() {
-                        ctx.path.push_index(index);
-                        ctx.error(ErrorKind::SliceUnmatched, errors::msg_slice_open_at_end());
-                        ctx.path.pop();
-                    }
+            && let Some(last_matched) = mark.item_matches.iter().rposition(|m| !m.is_empty())
+        {
+            for index in 0..last_matched {
+                if mark.item_matches[index].is_empty() {
+                    ctx.path.push_index(index);
+                    ctx.error(ErrorKind::SliceUnmatched, errors::msg_slice_open_at_end());
+                    ctx.path.pop();
                 }
             }
+        }
 
         if mark.slicing.ordered == Some(true) {
             let mut max_order_seen: Option<u64> = None;
@@ -183,7 +185,10 @@ pub(super) fn validate_slices(
                 && min > 0
                 && found < min
             {
-                ctx.error(ErrorKind::SliceCardinality, errors::msg_slice_min(min, found));
+                ctx.error(
+                    ErrorKind::SliceCardinality,
+                    errors::msg_slice_min(min, found),
+                );
             }
             // Unlike the reference validator (which skips falsy bounds),
             // `max: 0` — a prohibited slice, a real FHIR pattern — is
@@ -191,7 +196,10 @@ pub(super) fn validate_slices(
             if let Some(max) = slice.max
                 && found > max
             {
-                ctx.error(ErrorKind::SliceCardinality, errors::msg_slice_max(max, found));
+                ctx.error(
+                    ErrorKind::SliceCardinality,
+                    errors::msg_slice_max(max, found),
+                );
             }
         }
     }

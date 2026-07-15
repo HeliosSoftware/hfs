@@ -91,7 +91,13 @@ pub struct ValidationError {
 
 impl ValidationError {
     pub fn new(kind: ErrorKind, path: String, message: String) -> Self {
-        Self { kind, path, message, extra: serde_json::Map::new(), severity: Severity::Error }
+        Self {
+            kind,
+            path,
+            message,
+            extra: serde_json::Map::new(),
+            severity: Severity::Error,
+        }
     }
 
     pub fn with_severity(mut self, severity: Severity) -> Self {
@@ -300,12 +306,18 @@ mod tests {
         assert_eq!(msg_unknown_element("unknown"), "unknown is unknown");
         assert_eq!(msg_not_array("multielement"), "multielement is not array");
         assert_eq!(msg_not_singular("status"), "status is not singular");
-        assert_eq!(msg_required("anotherRequiredElement"), "anotherRequiredElement is required");
+        assert_eq!(
+            msg_required("anotherRequiredElement"),
+            "anotherRequiredElement is required"
+        );
         assert_eq!(
             msg_choice("choice", &["choiceString".into(), "choiceInteger".into()]),
             "only one choice for choice allowed, but multiple found: choiceString, choiceInteger"
         );
-        assert_eq!(msg_choice_excluded("choiceInteger"), "choiceInteger is excluded choice");
+        assert_eq!(
+            msg_choice_excluded("choiceInteger"),
+            "choiceInteger is excluded choice"
+        );
         assert_eq!(
             msg_slice_min(1, 0),
             "Slice defines the following min cardinality: '1', actual cardinality: '0'"
@@ -320,9 +332,18 @@ mod tests {
     /// [reference] set (no fixture exercises them yet).
     #[test]
     fn reference_messages_match_source_literals() {
-        assert_eq!(msg_expected_object_no_comma("string"), "expected object got string");
-        assert_eq!(msg_expected_object_comma("string"), "expected object, got string");
-        assert_eq!(msg_excluded("gender"), "excluded property gender is present");
+        assert_eq!(
+            msg_expected_object_no_comma("string"),
+            "expected object got string"
+        );
+        assert_eq!(
+            msg_expected_object_comma("string"),
+            "expected object, got string"
+        );
+        assert_eq!(
+            msg_excluded("gender"),
+            "excluded property gender is present"
+        );
         assert_eq!(msg_min(1, 0), "expected 1 > 0");
         assert_eq!(msg_max(2, 3), "expected 2 < 3");
     }
@@ -346,12 +367,18 @@ mod tests {
             msg_slice_open_at_end(),
             "unmatched item must be at the end of the array (openAtEnd slicing)"
         );
-        assert_eq!(msg_slice_order("home"), "slice 'home' is out of order (ordered slicing)");
+        assert_eq!(
+            msg_slice_order("home"),
+            "slice 'home' is out of order (ordered slicing)"
+        );
         assert_eq!(
             serde_json::to_value(ErrorKind::SliceUnmatched).unwrap(),
             json!("slice-unmatched")
         );
-        assert_eq!(serde_json::to_value(ErrorKind::SliceOrder).unwrap(), json!("slice-order"));
+        assert_eq!(
+            serde_json::to_value(ErrorKind::SliceOrder).unwrap(),
+            json!("slice-order")
+        );
     }
 
     #[test]

@@ -1562,6 +1562,28 @@ a.nav-item:hover {
   padding: 0 10px;
   font: inherit;
   font-size: 12.5px;
+/* ---------------------------------------------------------------------------
+   History & Versions (#236, Figma "History & Versions").
+
+   The version rail + two-layer diff. The textual layer cribs diff2html's
+   visual language — paired lines, +/- gutters, per-side line numbers, and a
+   word-level highlight of what changed within a line — without shipping any of
+   its JavaScript. All server-rendered.
+   --------------------------------------------------------------------------- */
+
+.history__locate {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.history__type,
+.history__id {
+  height: 34px;
+  padding: 0 12px;
+  font: inherit;
+  font-size: 13px;
   color: var(--text);
   background: var(--input-bg);
   border: 1px solid var(--surface-border);
@@ -1701,6 +1723,81 @@ button.filter-rail__item {
   font-size: 13px;
   font-weight: 500;
   color: var(--muted);
+.history__type { width: 160px; }
+.history__id { width: 220px; }
+.history__type:focus, .history__id:focus { border-color: var(--accent); }
+.history__slash { color: var(--muted); }
+
+/* Tabs (Instance / Type feed / System feed). */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.tab {
+  padding: 8px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  cursor: pointer;
+}
+
+.tab:hover { color: var(--text); }
+
+.tab--on {
+  color: var(--text-strong);
+  border-bottom-color: var(--accent);
+}
+
+.history__split {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+/* ---- version rail ---- */
+
+.history__rail {
+  padding: 12px;
+}
+
+.history__rail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.history__rail-path {
+  margin: 4px 0 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.history__versions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-version {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  font: inherit;
+  text-align: left;
   background: transparent;
   border: 1px solid transparent;
   border-radius: 9px;
@@ -1774,6 +1871,49 @@ button.filter-rail__item {
 
 .nl-pane__hint {
   margin: 10px 2px;
+.history-version:hover { background: var(--input-bg); }
+
+.history-version--current .history-version__id { color: var(--accent); }
+
+/* The two versions being compared get a visible from/to marker. */
+.history-version--from { border-color: var(--surface-border); }
+.history-version--to {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.history-version__id {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.history-version__when {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.history-version__kind {
+  margin-left: auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+/* ---- comparison controls ---- */
+
+.history__controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.history__select {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
   color: var(--muted);
 }
@@ -1824,6 +1964,45 @@ button.filter-rail__item {
 }
 
 .nl-answer--error {
+.history__select select {
+  height: 30px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+}
+
+.history__arrow { color: var(--muted); }
+
+.history__meta-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.history__empty {
+  padding: 24px;
+  font-size: 13px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* ---- banners (deleted / identical / error) ---- */
+
+.history__banner {
+  padding: 14px 16px;
+  font-size: 13px;
+  border-radius: 12px;
+  border: 1px solid var(--surface-border);
+}
+
+.history__banner--deleted {
+  color: var(--text);
   background: var(--input-bg);
   border-color: var(--muted);
 }
@@ -2013,6 +2192,23 @@ button.filter-rail__item {
 }
 
 .card-head h3 {
+.history__banner--same { color: var(--muted); }
+
+.history__banner--error {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* ---- the diff ---- */
+
+.diff__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.diff__head h3 {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2256,6 +2452,47 @@ button.filter-rail__item {
 
 .editor-row__error {
   margin: 2px 0 4px 0;
+  font-size: 14px;
+  color: var(--text-strong);
+}
+
+.diff__meta-note {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* Semantic layer: the field-level change list. */
+.diff__semantic {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 14px;
+}
+
+.diff-change {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border-radius: 8px;
+  background: var(--input-bg);
+}
+
+.diff-change__op {
+  min-width: 58px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.diff-change--add .diff-change__op { color: #1a7f37; }
+.diff-change--remove .diff-change__op { color: #cf222e; }
+.diff-change--replace .diff-change__op { color: var(--accent); }
+
+.diff-change__path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   color: var(--text);
 }
@@ -2443,4 +2680,79 @@ button.filter-rail__item {
   .editor__panes {
     grid-template-columns: 1fr;
   }
+.diff-change__was {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.diff-change__arrow { color: var(--muted); }
+
+.diff-change__value { color: var(--text-strong); }
+
+.diff__none {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Textual layer: paired lines with +/- gutters, diff2html's language. */
+.diff__textual summary {
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  margin-bottom: 8px;
+}
+
+.diff-table {
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+}
+
+.diff-line {
+  display: grid;
+  grid-template-columns: 40px 40px 16px 1fr;
+  white-space: pre;
+}
+
+.diff-line__ln {
+  padding: 0 6px;
+  color: var(--muted);
+  text-align: right;
+  user-select: none;
+}
+
+.diff-line__gutter {
+  text-align: center;
+  user-select: none;
+}
+
+.diff-line__text { padding-right: 12px; }
+
+.diff-line--add {
+  background: rgb(26 127 55 / 12%);
+}
+.diff-line--add .diff-line__gutter { color: #1a7f37; }
+
+.diff-line--del {
+  background: rgb(207 34 46 / 12%);
+}
+.diff-line--del .diff-line__gutter { color: #cf222e; }
+
+/* The word-level highlight: only the changed run inside a changed line. */
+.diff-line__text mark {
+  padding: 0 1px;
+  border-radius: 3px;
+  color: inherit;
+}
+
+.diff-line--add mark { background: rgb(26 127 55 / 32%); }
+.diff-line--del mark { background: rgb(207 34 46 / 32%); }
+
+@media (max-width: 1000px) {
+  .history__split { grid-template-columns: 1fr; }
 }

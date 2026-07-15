@@ -170,7 +170,14 @@ fn execute_constraints(
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut selected: Vec<(&str, &str, &str, Option<&str>, Severity)> = Vec::new();
     for d in deferred {
-        let Deferred::Constraint { path, id, expression, human, severity } = d else {
+        let Deferred::Constraint {
+            path,
+            id,
+            expression,
+            human,
+            severity,
+        } = d
+        else {
             continue;
         };
         let issue_severity = match severity.as_deref() {
@@ -192,7 +199,11 @@ fn execute_constraints(
 
     let refs: Vec<DeferredConstraint<'_>> = selected
         .iter()
-        .map(|(path, id, expression, _, _)| DeferredConstraint { path, id, expression })
+        .map(|(path, id, expression, _, _)| DeferredConstraint {
+            path,
+            id,
+            expression,
+        })
         .collect();
     let outcomes = evaluator.evaluate_all(resource, version, &refs);
     debug_assert_eq!(outcomes.len(), refs.len(), "evaluator must align outcomes");
@@ -236,7 +247,13 @@ async fn execute_bindings(
     };
 
     for d in deferred {
-        let Deferred::Binding { path, binding, value, type_hint } = d else {
+        let Deferred::Binding {
+            path,
+            binding,
+            value,
+            type_hint,
+        } = d
+        else {
             continue;
         };
         if binding.strength.as_deref() != Some("required") {
@@ -287,9 +304,9 @@ fn coded_value(value: &Value, type_hint: Option<&str>) -> Option<CodedValue> {
             value.as_str().map(|s| CodedValue::Code(s.to_string()))
         }
         Some("Coding") => value.is_object().then(|| CodedValue::Coding(value.clone())),
-        Some("CodeableConcept") => {
-            value.is_object().then(|| CodedValue::CodeableConcept(value.clone()))
-        }
+        Some("CodeableConcept") => value
+            .is_object()
+            .then(|| CodedValue::CodeableConcept(value.clone())),
         Some("Quantity") => {
             // Quantity binds via its system+code pair — treated as a Coding.
             value.is_object().then(|| CodedValue::Coding(value.clone()))

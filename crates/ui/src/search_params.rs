@@ -390,7 +390,13 @@ pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView 
     let rail_all = RailItem {
         name: String::new(),
         count: params.len(),
-        href: query.href_with(None, query.ptype.as_deref(), query.source.as_deref(), 1, None),
+        href: query.href_with(
+            None,
+            query.ptype.as_deref(),
+            query.source.as_deref(),
+            1,
+            None,
+        ),
         current: query.base.is_none(),
     };
 
@@ -406,9 +412,7 @@ pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView 
     let mut type_counts: HashMap<String, usize> = HashMap::new();
     let mut source_counts: HashMap<&'static str, usize> = HashMap::new();
     for param in &in_base {
-        *type_counts
-            .entry(param.param_type.to_string())
-            .or_default() += 1;
+        *type_counts.entry(param.param_type.to_string()).or_default() += 1;
         *source_counts.entry(source_key(param.source)).or_default() += 1;
     }
     let mut facets_type: Vec<Facet> = type_counts
@@ -491,8 +495,7 @@ pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView 
         .collect();
 
     let prev_href = (page > 1).then(|| query.href_current(page - 1, query.sel.as_deref()));
-    let next_href =
-        (page < page_count).then(|| query.href_current(page + 1, query.sel.as_deref()));
+    let next_href = (page < page_count).then(|| query.href_current(page + 1, query.sel.as_deref()));
     let pages: Vec<PageLink> = page_links(page, page_count)
         .into_iter()
         .map(|n| PageLink {
@@ -515,7 +518,11 @@ pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView 
                     .map(|other| other.url.clone())
                     .collect();
                 notes.push(SpNote {
-                    severity: if chip.kind == "conflict" { "error" } else { "info" },
+                    severity: if chip.kind == "conflict" {
+                        "error"
+                    } else {
+                        "info"
+                    },
                     kind: match chip.kind {
                         "conflict" => "conflict",
                         "overrides" => "overrides",
@@ -778,7 +785,11 @@ mod tests {
         };
         let view = build_view(&snapshot, &SpQuery::default());
 
-        let spec_row = view.rows.iter().find(|r| r.url.contains("hl7.org")).unwrap();
+        let spec_row = view
+            .rows
+            .iter()
+            .find(|r| r.url.contains("hl7.org"))
+            .unwrap();
         assert_eq!(spec_row.chips[0].kind, "shadowed");
         let stored_row = view.rows.iter().find(|r| r.url.contains("acme")).unwrap();
         assert_eq!(stored_row.chips[0].kind, "overrides");
@@ -808,8 +819,7 @@ mod tests {
 
     #[test]
     fn missing_spec_dir_still_serves_the_fallback() {
-        let snapshot =
-            load_snapshot(FhirVersion::default(), Some(Path::new("./does-not-exist")));
+        let snapshot = load_snapshot(FhirVersion::default(), Some(Path::new("./does-not-exist")));
         assert!(!snapshot.spec_loaded);
         assert!(!snapshot.params.is_empty(), "embedded fallback still loads");
     }

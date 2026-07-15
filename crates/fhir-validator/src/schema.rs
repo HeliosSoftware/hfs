@@ -272,8 +272,18 @@ mod tests {
             r#"{ "elements": { "z": {"type": "string"}, "a": {"type": "string"} } }"#,
         )
         .unwrap();
-        let keys: Vec<&str> = s.elements.as_ref().unwrap().keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, vec!["z", "a"], "element declaration order must be preserved");
+        let keys: Vec<&str> = s
+            .elements
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["z", "a"],
+            "element declaration order must be preserved"
+        );
     }
 
     #[test]

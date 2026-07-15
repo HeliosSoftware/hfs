@@ -105,7 +105,10 @@ impl Validator {
         opts: &ValidationOptions,
         effects: &EffectHandlers<'_>,
     ) -> Vec<ValidationError> {
-        let SyncOutcome { mut errors, deferred } = self.validate_sync(resource, opts);
+        let SyncOutcome {
+            mut errors,
+            deferred,
+        } = self.validate_sync(resource, opts);
         crate::effects::execute(resource, version, &deferred, effects, &mut errors).await;
         errors
     }

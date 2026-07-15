@@ -23,7 +23,10 @@ use helios_fhir_validator::{EffectHandlers, ErrorKind, ValidationOptions, Valida
 use serde_json::json;
 
 fn handlers(evaluator: &FhirPathConstraintEvaluator) -> EffectHandlers<'_> {
-    EffectHandlers { constraints: Some(evaluator), ..Default::default() }
+    EffectHandlers {
+        constraints: Some(evaluator),
+        ..Default::default()
+    }
 }
 
 /// dom-6 (narrative present) is a warning-severity invariant that fires on
@@ -47,7 +50,12 @@ async fn real_pat1_invariant_fires_on_detail_less_contact() {
         "contact": [{ "gender": "male" }]
     });
     let errors = validator
-        .validate(&violating, FhirVersion::R4, &ValidationOptions::default(), &h)
+        .validate(
+            &violating,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &h,
+        )
         .await;
     let pat1: Vec<_> = errors
         .iter()
@@ -70,11 +78,18 @@ async fn real_pat1_invariant_fires_on_detail_less_contact() {
         "contact": [{ "gender": "male", "name": { "family": "Smith" } }]
     });
     let errors = validator
-        .validate(&satisfied, FhirVersion::R4, &ValidationOptions::default(), &h)
+        .validate(
+            &satisfied,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &h,
+        )
         .await;
     assert!(
-        !errors.iter().any(|e| e.kind == ErrorKind::FhirpathConstraint
-            && e.extra.get("constraint") == Some(&json!("pat-1"))),
+        !errors
+            .iter()
+            .any(|e| e.kind == ErrorKind::FhirpathConstraint
+                && e.extra.get("constraint") == Some(&json!("pat-1"))),
         "pat-1 must pass when the contact has a name; got: {}",
         serde_json::to_string_pretty(&errors).unwrap()
     );

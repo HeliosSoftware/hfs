@@ -62,6 +62,16 @@ axum-embed = "0.1"
 fluent-templates = "0.13"
 unic-langid = { version = "0.9", features = ["macros"] }
 
+# History & Versions diff rendering (#236, decision recorded in
+# docs/history-diff-rendering.md). Two layers, both server-side:
+#  - json-patch: the semantic field-level view. Already in the workspace lock
+#    (a default dep of helios-rest/helios-persistence), so zero new transitive
+#    weight; it is the exact inverse of the RFC 6902 PATCH the server applies.
+#  - similar: the textual word-level view over pretty-printed JSON. No HTML
+#    formatter of its own — we iterate its changes into an Askama template.
+json-patch = "3"
+similar = { version = "2", features = ["inline"] }
+
 [dev-dependencies]
 # Parses the .ftl sources so tests can enforce key-set parity across locales.
 fluent-syntax = "0.11"

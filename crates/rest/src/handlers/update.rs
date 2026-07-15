@@ -177,9 +177,11 @@ where
 
     // Stored StructureDefinitions feed the tenant's profile registry.
     if resource_type == "StructureDefinition" {
-        state
-            .validation()
-            .upsert_stored_profile(tenant.tenant_id(), fhir_version, stored.content());
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            fhir_version,
+            stored.content(),
+        );
     }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);

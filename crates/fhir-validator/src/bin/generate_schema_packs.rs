@@ -17,16 +17,19 @@
 //! Versions whose spec files are absent (R6 before fhir-gen's download has
 //! run) are skipped with a warning.
 
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use helios_fhir_validator::converter::convert;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const SOURCE_FILES: [&str; 3] =
-    ["profiles-types.json", "profiles-resources.json", "profiles-others.json"];
+const SOURCE_FILES: [&str; 3] = [
+    "profiles-types.json",
+    "profiles-resources.json",
+    "profiles-others.json",
+];
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -83,22 +86,25 @@ fn generate_pack(source_dir: &Path, packs_dir: &Path, version: &str) -> Result<S
             .ok_or_else(|| format!("{file}: no Bundle.entry"))?;
 
         for entry in entries {
-            let Some(resource) = entry.get("resource") else { continue };
-            if resource.get("resourceType").and_then(Value::as_str) != Some("StructureDefinition")
-            {
+            let Some(resource) = entry.get("resource") else {
+                continue;
+            };
+            if resource.get("resourceType").and_then(Value::as_str) != Some("StructureDefinition") {
                 continue;
             }
             sd_count += 1;
-            let sd_url = resource.get("url").and_then(Value::as_str).unwrap_or("<no url>");
+            let sd_url = resource
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("<no url>");
             match convert(resource) {
                 Ok(conversion) => {
                     warning_count += conversion.warnings.len();
                     for w in &conversion.warnings {
                         eprintln!("{version}: [warn] {sd_url}: {w}");
                     }
-                    schemas.push(
-                        serde_json::to_value(&conversion.schema).expect("schema serializes"),
-                    );
+                    schemas
+                        .push(serde_json::to_value(&conversion.schema).expect("schema serializes"));
                 }
                 Err(e) => failures.push(format!("{sd_url}: {e}")),
             }

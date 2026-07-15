@@ -8,7 +8,7 @@ use axum_test::TestServer;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_rest::config::ValidationConfig;
 use helios_rest::{MultitenancyConfig, ServerConfig, TenantRoutingMode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 async fn create_test_server(mode: &str) -> TestServer {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -17,7 +17,10 @@ async fn create_test_server(mode: &str) -> TestServer {
         .map(|p| p.join("data"))
         .unwrap_or_else(|| PathBuf::from("data"));
 
-    let backend_config = SqliteBackendConfig { data_dir: Some(data_dir), ..Default::default() };
+    let backend_config = SqliteBackendConfig {
+        data_dir: Some(data_dir),
+        ..Default::default()
+    };
     let backend = SqliteBackend::with_config(":memory:", backend_config)
         .expect("Failed to create SQLite backend");
     backend.init_schema().expect("Failed to init schema");
@@ -30,7 +33,10 @@ async fn create_test_server(mode: &str) -> TestServer {
         },
         base_url: "http://localhost:8080".to_string(),
         default_tenant: "test-tenant".to_string(),
-        validation: ValidationConfig { mode: mode.to_string(), ..Default::default() },
+        validation: ValidationConfig {
+            mode: mode.to_string(),
+            ..Default::default()
+        },
         ..ServerConfig::for_testing()
     };
 
@@ -158,7 +164,10 @@ async fn stored_profile_registers_and_validates() {
             ]
         }
     });
-    let response = server.put("/StructureDefinition/strict-patient").json(&profile).await;
+    let response = server
+        .put("/StructureDefinition/strict-patient")
+        .json(&profile)
+        .await;
     assert!(
         response.status_code() == 201 || response.status_code() == 200,
         "profile upload failed: {}",
@@ -174,13 +183,15 @@ async fn stored_profile_registers_and_validates() {
     let outcome: Value = response.json();
     let issues = outcome["issue"].as_array().expect("issues");
     assert!(
-        issues.iter().any(|i| i["code"] == "required"
-            && i["expression"][0] == "Patient.birthDate"),
+        issues
+            .iter()
+            .any(|i| i["code"] == "required" && i["expression"][0] == "Patient.birthDate"),
         "profile-required birthDate must be reported: {outcome:#}"
     );
     assert!(
-        issues.iter().any(|i| i["code"] == "structure"
-            && i["expression"][0] == "Patient.gender"),
+        issues
+            .iter()
+            .any(|i| i["code"] == "structure" && i["expression"][0] == "Patient.gender"),
         "profile-excluded gender must be reported: {outcome:#}"
     );
 
@@ -219,7 +230,10 @@ async fn enforce_mode_honors_meta_profile_claims() {
             ]
         }
     });
-    let response = server.put("/StructureDefinition/must-have-birthdate").json(&profile).await;
+    let response = server
+        .put("/StructureDefinition/must-have-birthdate")
+        .json(&profile)
+        .await;
     assert!(
         response.status_code().is_success(),
         "profile upload failed: {}",

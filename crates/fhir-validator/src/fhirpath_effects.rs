@@ -178,7 +178,9 @@ fn parse_typed(resource: &Value, version: FhirVersion) -> Result<FhirResource, S
             .map(|r| FhirResource::R6(Box::new(r)))
             .map_err(|e| e.to_string()),
         #[allow(unreachable_patterns)]
-        other => Err(format!("FHIR version {other:?} not enabled in helios-fhir-validator")),
+        other => Err(format!(
+            "FHIR version {other:?} not enabled in helios-fhir-validator"
+        )),
     }
 }
 
@@ -193,6 +195,9 @@ mod tests {
             combine("Patient.contact.0", "name.exists() or telecom.exists()"),
             "contact[0].all(name.exists() or telecom.exists())"
         );
-        assert_eq!(combine("Patient.name.2.given", "length() < 10"), "name[2].given.all(length() < 10)");
+        assert_eq!(
+            combine("Patient.name.2.given", "length() < 10"),
+            "name[2].given.all(length() < 10)"
+        );
     }
 }

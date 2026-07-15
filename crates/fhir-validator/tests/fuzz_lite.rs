@@ -7,7 +7,7 @@
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::packs::core_registry;
 use helios_fhir_validator::{ValidationOptions, Validator};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Tiny deterministic PRNG (xorshift64*).
 struct Rng(u64);
@@ -64,7 +64,15 @@ fn mutate(value: &mut Value, rng: &mut Rng, depth: usize) {
         2 => {
             if let Some(obj) = value.as_object_mut() {
                 let j = junk(rng);
-                let names = ["x", "_x", "extension", "value", "resourceType", "contained", "9"];
+                let names = [
+                    "x",
+                    "_x",
+                    "extension",
+                    "value",
+                    "resourceType",
+                    "contained",
+                    "9",
+                ];
                 obj.insert(names[rng.below(names.len())].to_string(), j);
             } else if let Some(arr) = value.as_array_mut() {
                 let j = junk(rng);

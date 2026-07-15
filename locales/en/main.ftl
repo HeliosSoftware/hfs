@@ -333,3 +333,34 @@ editor-expand-all = Expand all
 editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
+## History & Versions (#236)
+
+history-heading = History & Versions
+history-lede = Compare two versions of a resource. Storage is fully versioned; this reads it through the ordinary _history and vread API.
+history-type-label = Resource type
+history-id-label = Resource id
+history-id-placeholder = resource id
+history-load = Load
+history-tabs-label = History scope
+history-tab-instance = Instance
+history-tab-type = Type feed
+history-tab-system = System feed
+history-versions-label = Versions
+history-pick-instance = Pick an instance
+history-current = current
+history-from = From
+history-to = To
+history-show-metadata = Show metadata changes
+history-empty = Load a resource, then pick two versions to compare.
+history-load-error = Could not load that resource's history.
+history-not-found = No history for that resource — check the type and id.
+history-diff-heading = { $from }
+history-metadata-hidden = { $count ->
+    [one] { $count } metadata change hidden
+   *[other] { $count } metadata changes hidden
+}
+history-textual = Show full text diff
+history-only-metadata = Only metadata changed between these versions.
+history-identical = These two versions are identical.
+history-deleted = { $version } is a deletion — there is nothing to diff against.
+history-parse-error = Those versions could not be read as JSON.

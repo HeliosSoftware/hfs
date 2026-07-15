@@ -9,8 +9,8 @@
 //! its constraints simply stay dormant until the matcher lands (Phase 7),
 //! and the generator surfaces a warning.
 
-use super::tree::{finalize, SliceNode};
 use super::EdDiscriminator;
+use super::tree::{SliceNode, finalize};
 use crate::schema::{Match, Slice, Slicing};
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
@@ -25,14 +25,22 @@ pub(super) fn build_slicing(
 ) -> Option<Slicing> {
     let mut out: IndexMap<String, Slice> = IndexMap::new();
     for (name, slice_node) in slices {
-        let SliceNode { node, min, max, extension_profile: _ } = slice_node;
+        let SliceNode {
+            node,
+            min,
+            max,
+            extension_profile: _,
+        } = slice_node;
 
         let match_ = build_match(&node, discriminators);
         if match_.is_none() {
             warnings.push(format!(
                 "slice '{name}': discriminator(s) {:?} not translatable to a match; \
                  slice kept without match or min",
-                discriminators.iter().map(|d| format!("{}@{}", d.type_, d.path)).collect::<Vec<_>>()
+                discriminators
+                    .iter()
+                    .map(|d| format!("{}@{}", d.type_, d.path))
+                    .collect::<Vec<_>>()
             ));
         }
 
@@ -56,7 +64,11 @@ pub(super) fn build_slicing(
     if out.is_empty() {
         return None;
     }
-    Some(Slicing { slices: out, rules, ordered })
+    Some(Slicing {
+        slices: out,
+        rules,
+        ordered,
+    })
 }
 
 /// Build a pattern match from `value`/`pattern` discriminators, reading the
@@ -92,7 +104,11 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
         None if !pattern.is_empty() => Value::Object(pattern),
         None => return None,
     };
-    Some(Match { type_: Some("pattern".to_string()), value: Some(value), resolve_ref: None })
+    Some(Match {
+        type_: Some("pattern".to_string()),
+        value: Some(value),
+        resolve_ref: None,
+    })
 }
 
 /// The fixed/pattern constant at `path` within the slice subtree
@@ -107,7 +123,11 @@ fn constant_at(node: &super::tree::Node, path: &str) -> Option<Value> {
         }
         current
     };
-    target.schema.fixed.clone().or_else(|| target.schema.pattern.clone())
+    target
+        .schema
+        .fixed
+        .clone()
+        .or_else(|| target.schema.pattern.clone())
 }
 
 /// `insert_nested(map, "a.b", v)` → `{a: {b: v}}` (merging siblings).

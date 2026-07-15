@@ -548,9 +548,18 @@ mod tests {
         let codes: Vec<&str> = definitions(R4).iter().map(|d| d.code.as_str()).collect();
         assert_eq!(
             codes,
-            ["Device", "Encounter", "Patient", "Practitioner", "RelatedPerson"]
+            [
+                "Device",
+                "Encounter",
+                "Patient",
+                "Practitioner",
+                "RelatedPerson"
+            ]
         );
-        let patient = definitions(R4).iter().find(|d| d.code == "Patient").unwrap();
+        let patient = definitions(R4)
+            .iter()
+            .find(|d| d.code == "Patient")
+            .unwrap();
         assert_eq!(patient.resource.len(), 145);
         assert_eq!(patient.member_count(R4), 66);
     }
@@ -558,7 +567,10 @@ mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn tester_resolves_membership_like_the_handler() {
-        let patient = definitions(R4).iter().find(|d| d.code == "Patient").unwrap();
+        let patient = definitions(R4)
+            .iter()
+            .find(|d| d.code == "Patient")
+            .unwrap();
 
         match run_tester(R4, patient, "example", "Observation") {
             TesterOutcome::Member {
@@ -592,7 +604,10 @@ mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn tester_reports_the_self_definition_case() {
-        let encounter = definitions(R4).iter().find(|d| d.code == "Encounter").unwrap();
+        let encounter = definitions(R4)
+            .iter()
+            .find(|d| d.code == "Encounter")
+            .unwrap();
         match run_tester(R4, encounter, "e1", "Encounter") {
             TesterOutcome::Member {
                 self_def,

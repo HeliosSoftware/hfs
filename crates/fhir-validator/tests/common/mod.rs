@@ -48,8 +48,8 @@ pub fn run_fixture_file(sub: &str, name: &str) {
         .join(name);
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read fixture {}: {e}", path.display()));
-    let file: FixtureFile = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("cannot parse fixture {name}: {e}"));
+    let file: FixtureFile =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("cannot parse fixture {name}: {e}"));
 
     let mut registry = SchemaRegistry::new();
     for (key, def) in &file.schemas {
