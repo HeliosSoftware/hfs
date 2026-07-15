@@ -65,42 +65,15 @@
         {{ i18n.t("nav-home") }}
       </a>
       <!--
-        Resources (#282): the primary read/write workspace. A flat nav entry,
-        matching Brett's sidebar — the resource-type picker lives on the page's
-        filter rail (his Search screen), not in the menu.
+        Resources (#282): the primary read/write workspace, and the one entry
+        for it. Searching, editing, and version history all live inside
+        Resources — on the page and in its edit modal — so they have no separate
+        nav entries. Their routes stay reachable by URL (/ui/search, /ui/editor,
+        /ui/history, /ui/queries); they are just not in the menu.
       -->
       <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% endif %}>
         <span class="icon">{% include "icons/layers.svg" %}</span>
         {{ i18n.t("nav-resources") }}
-      </a>
-      <a class="nav-item" href="/ui/queries"{% if active_page == "queries" %} aria-current="page"{% endif %}>
-        <span class="icon">{% include "icons/bookmark.svg" %}</span>
-        {{ i18n.t("nav-saved-queries") }}
-      </a>
-      <!--
-        Search is a real page only when natural-language search is enabled
-        (#255). With HFS_NL_SEARCH_ENABLED=false the route is not mounted and
-        the entry stays as it was: a coming-soon placeholder that says nothing
-        about the feature.
-      -->
-      {% if nl_enabled %}
-      <a class="nav-item" href="/ui/search"{% if active_page == "search" %} aria-current="page"{% endif %}>
-        <span class="icon">{% include "icons/search.svg" %}</span>
-        {{ i18n.t("nav-search") }}
-      </a>
-      {% else %}
-      <span class="nav-item nav-item--soon">
-        <span class="icon">{% include "icons/search.svg" %}</span>
-        {{ i18n.t("nav-search") }}
-      </span>
-      {% endif %}
-      <a class="nav-item" href="/ui/editor"{% if active_page == "editor" %} aria-current="page"{% endif %}>
-        <span class="icon">{% include "icons/pencil.svg" %}</span>
-        {{ i18n.t("nav-resource-editor") }}
-      </a>
-      <a class="nav-item" href="/ui/history"{% if active_page == "history" %} aria-current="page"{% endif %}>
-        <span class="icon">{% include "icons/history.svg" %}</span>
-        {{ i18n.t("nav-history-versions") }}
       </a>
       <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %}>
         <span class="icon">{% include "icons/compartments.svg" %}</span>

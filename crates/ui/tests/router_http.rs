@@ -316,8 +316,8 @@ async fn nl_search_configured_renders_the_translator_over_an_editable_query() {
     assert!(!html.contains("readonly"));
     // The key itself never reaches the page.
     assert!(!html.contains("HFS_NL_SEARCH_API_KEY"));
-    // Enabled → the sidebar links the page.
-    assert!(html.contains(r#"href="/ui/search""#));
+    // The route renders; the search surface now lives inside Resources, so
+    // there is no separate Search nav entry (#282).
 }
 
 /* The resource editor (#264). The endpoint takes the whole in-flight document

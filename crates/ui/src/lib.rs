@@ -751,9 +751,9 @@ mod tests {
         assert!(html.contains(r#"data-rail-type="Patient""#));
         assert!(html.contains(r#"data-rail-type="Observation""#));
         assert!(html.contains(r#"data-count-for="Patient""#));
-        // This page, not Home, carries aria-current in the sidebar.
-        assert!(html.contains(r#"href="/ui/queries" aria-current="page""#));
-        assert!(!html.contains(r#"href="/ui" aria-current="page""#));
+        // Saved Queries has no nav entry any more (#282 folded search / editor
+        // / history / saved-queries into Resources); the route still renders.
+        assert!(!html.contains(r#"href="/ui/queries" aria-current="page""#));
         // The delete-confirm string reaches the script with its {name} slot.
         assert!(html.contains("{name}"));
     }
