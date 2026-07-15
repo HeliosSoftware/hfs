@@ -871,3 +871,165 @@ impl PostgresBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_connection_string ───────────────────────────────────
+
+    #[test]
+    fn parses_full_url() {
+        let cfg = PostgresBackend::parse_connection_string(
+            "postgres://alice:s3cret@db.example.com:5433/clinical",
+        )
+        .unwrap();
+        assert_eq!(cfg.user, "alice");
+        assert_eq!(cfg.password.as_deref(), Some("s3cret"));
+        assert_eq!(cfg.host, "db.example.com");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.dbname, "clinical");
+    }
+
+    #[test]
+    fn strips_query_string_so_it_does_not_leak_into_dbname() {
+        // Regression for #224: a `?sslmode=...` suffix was previously parsed as
+        // part of the database name (`clinical?sslmode=require`), which no server
+        // could resolve.
+        let cfg = PostgresBackend::parse_connection_string(
+            "postgres://alice:s3cret@db.example.com:5433/clinical?sslmode=require&connect_timeout=10",
+        )
+        .unwrap();
+        assert_eq!(cfg.dbname, "clinical");
+        assert_eq!(cfg.host, "db.example.com");
+        assert_eq!(cfg.port, 5433);
+    }
+
+    #[test]
+    fn accepts_postgresql_scheme_and_defaults_port() {
+        let cfg = PostgresBackend::parse_connection_string("postgresql://bob:pw@localhost/helios")
+            .unwrap();
+        assert_eq!(cfg.user, "bob");
+        assert_eq!(cfg.host, "localhost");
+        assert_eq!(cfg.port, 5432); // no explicit port → default
+        assert_eq!(cfg.dbname, "helios");
+    }
+
+    #[test]
+    fn parses_url_without_password() {
+        let cfg =
+            PostgresBackend::parse_connection_string("postgres://svc@10.0.0.5:5432/db").unwrap();
+        assert_eq!(cfg.user, "svc");
+        assert_eq!(cfg.password, None);
+        assert_eq!(cfg.host, "10.0.0.5");
+        assert_eq!(cfg.dbname, "db");
+    }
+
+    #[test]
+    fn invalid_port_falls_back_to_default() {
+        let cfg =
+            PostgresBackend::parse_connection_string("postgres://u:p@host:not-a-port/db").unwrap();
+        assert_eq!(cfg.host, "host");
+        assert_eq!(cfg.port, 5432);
+        assert_eq!(cfg.dbname, "db");
+    }
+
+    #[test]
+    fn parses_host_and_port_without_dbname() {
+        // `rest` has no '/', so the host:port branch is taken and dbname keeps
+        // its default.
+        let cfg = PostgresBackend::parse_connection_string("postgres://u:p@myhost:6000").unwrap();
+        assert_eq!(cfg.host, "myhost");
+        assert_eq!(cfg.port, 6000);
+        assert_eq!(cfg.dbname, default_dbname());
+    }
+
+    #[test]
+    fn parses_bare_host_only() {
+        // No port and no dbname after the host.
+        let cfg = PostgresBackend::parse_connection_string("postgres://u:p@onlyhost").unwrap();
+        assert_eq!(cfg.host, "onlyhost");
+        assert_eq!(cfg.port, default_port());
+    }
+
+    // ── default tuning knobs ──────────────────────────────────────
+
+    #[test]
+    fn default_pool_size_is_bounded() {
+        // Whatever the host's core count, the pool default stays within the band
+        // #224 established as useful — and never the old fixed 10.
+        let n = default_max_connections();
+        assert!((16..=64).contains(&n), "pool default {n} out of band");
+    }
+
+    #[test]
+    fn default_timeouts_match_documented_values() {
+        assert_eq!(default_statement_timeout_ms(), 30_000);
+        assert_eq!(default_pool_wait_timeout_secs(), 10);
+        assert_eq!(default_connect_timeout_secs(), 5);
+    }
+
+    #[test]
+    fn config_default_populates_new_knobs() {
+        let cfg = PostgresConfig::default();
+        assert_eq!(cfg.pool_wait_timeout_secs, default_pool_wait_timeout_secs());
+        assert_eq!(cfg.statement_timeout_ms, default_statement_timeout_ms());
+        assert!((16..=64).contains(&cfg.max_connections));
+    }
+
+    // ── apply_env_overrides ───────────────────────────────────────
+
+    // Serializes the two env-mutating tests below against each other. Other
+    // tests in this module never assert on the env-overridable fields
+    // (max_connections / statement_timeout_ms / pool_wait_timeout_secs), so they
+    // are unaffected by these vars being set transiently.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_overrides_apply_when_set() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: serialized by ENV_GUARD, and every var is removed before the
+        // lock is released, so no other thread observes a partial state.
+        unsafe {
+            std::env::set_var("HFS_PG_MAX_CONNECTIONS", "99");
+            std::env::set_var("HFS_PG_STATEMENT_TIMEOUT_MS", "1234");
+            std::env::set_var("HFS_PG_POOL_WAIT_TIMEOUT_SECS", "7");
+        }
+
+        let mut cfg = PostgresConfig::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.max_connections, 99);
+        assert_eq!(cfg.statement_timeout_ms, 1234);
+        assert_eq!(cfg.pool_wait_timeout_secs, 7);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HFS_PG_MAX_CONNECTIONS");
+            std::env::remove_var("HFS_PG_STATEMENT_TIMEOUT_MS");
+            std::env::remove_var("HFS_PG_POOL_WAIT_TIMEOUT_SECS");
+        }
+    }
+
+    #[test]
+    fn env_overrides_ignore_unparseable_values() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: serialized by ENV_GUARD, removed before releasing the lock.
+        unsafe {
+            std::env::set_var("HFS_PG_MAX_CONNECTIONS", "not-a-number");
+        }
+
+        let mut cfg = PostgresConfig::default();
+        let before = cfg.max_connections;
+        cfg.apply_env_overrides();
+        // A value that fails to parse is ignored (parse → None), leaving the
+        // default untouched rather than zeroing the pool.
+        assert_eq!(cfg.max_connections, before);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HFS_PG_MAX_CONNECTIONS");
+        }
+    }
+}
