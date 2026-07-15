@@ -156,6 +156,7 @@ pub mod export;
 pub mod extractors;
 pub mod fhir_types;
 pub mod handlers;
+pub mod jwks_coordination;
 pub mod middleware;
 pub mod responses;
 pub mod routing;
@@ -169,6 +170,7 @@ pub use config::{
     TenantRoutingMode,
 };
 pub use error::{RestError, RestResult};
+pub use jwks_coordination::StoreJwksCoordination;
 pub use middleware::auth::AuthMiddlewareState;
 pub use state::AppState;
 pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
