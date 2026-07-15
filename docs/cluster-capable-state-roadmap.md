@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-14 (Phase 0 complete)
+**Last updated:** 2026-07-15 (Phase 1: PRs 1.1–1.3 landed on the branch)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -61,6 +61,21 @@ calibration suite green on first run (4 T2 tests), full CI-style clippy and
   including quoted in the body*. On this branch, never quote it in a commit
   that should trigger CI; after a docs-only skip-tagged head, the PR shows
   "no checks" until the next clean-message push.
+
+### ✅ Done — Phase 1, PRs 1.1–1.3 (2026-07-15)
+
+| What | Where | Commit |
+|------|-------|--------|
+| **F5 fix** — Postgres `update`/`delete` are a transactional version-guarded CAS (0 rows → re-select to disambiguate NotFound vs VersionConflict; history INSERT in the same txn); `create_or_update` absorbs transient CAS losses with a bounded retry (unconditional PUT stays last-writer-wins at the API surface). T2 races: update/update, PUT/PUT, update/delete + Mongo CAS-contract twin (`mongodb_tests.rs` gained the `#[path]` harness include and a shared-database factory — `create_backend` isolates per-call DBs, useless for cluster tests). Session decision: **CAS + retry**, not the unguarded atomic increment — preserves the trait contract asserted by sqlite/mongo. | `postgres/storage.rs`, `postgres_tests.rs`, `mongodb_tests.rs` | `d1204bf6` |
+| **PR 1.2 — `ClusterJobStore`** on a `cluster_jobs` table (migration **v15** — main took v14 for the tenant registry). Claim = bulk-export shape (txn + `FOR UPDATE SKIP LOCKED` + fencing bump); fenced mutations require `status='running'` so cancel is final; `cancel` flips queued/running → cancelled immediately + sets `cancel_requested`. Server seam mirrors `sof_runner()`: `ResourceStorage::cluster_job_store()` default-None; Postgres returns a pool-sharing `PgClusterJobStore` handle (impl NOT on the backend — would collide with `ExportClaimStrategy`'s method names). `WorkerId` reused; `LeaseError` not (carries a bulk `ExportJobId`) → `ClusterLeaseError`. T1 state-machine suite vs `testing::InMemoryClusterJobStore`; T2 DoD suite (visibility/isolation/exclusivity/fencing/durability/cross-instance cancel) via the harness, driven through the accessor seam. | `core/cluster_job_store.rs`, `postgres/cluster_jobs.rs`, `postgres/schema.rs` | `6dfb7097` |
+| **PR 1.3 — SoF export on the job store (#169)**: `ExportJobController` → `#[async_trait]`; execution engine shared between controllers via a `JobProgress` hook; new `DatabaseExportJobController` + per-instance claim/lease workers (heartbeat task, progress snapshots, cancel observed between work units, fenced-out terminal write deletes orphaned shards) + kind-scoped reaper (`delete_terminal_before` now returns reaped ids). `HFS_EXPORT_CONTROLLER` finally read (unset → follows job-store mode); validator refuses explicit `memory` controller + `fs` sink under cluster+SoF (T1 table now 8 rows). T2 two-controller suite (`rest/tests/sof_export_cluster_pg.rs`, deterministic via `run_next_sof_export_job`); **T3 smoke check 4** (kickoff on A → poll via front → download via B) with `HFS_JOB_STORE_BACKEND=database` + shared export dir in the workflow (`HFS_CLUSTER` stays unset there — the validator rightly refuses `fs` sinks; S3 out of smoke scope). ch15 SoF row flipped. | `rest/src/export/{controller,in_memory,database}.rs`, `rest/src/lib.rs`, `hfs/src/cluster.rs`, smoke script + workflow | `7bf5bf35` |
+
+**Context (2026-07-15):** main broke on the #233 merge (semantic conflict —
+`concepts_search_fts` never created; latent since `f6008b29`) and was fixed by
+**PR #273** (not ours; we closed duplicate #276 — check open PRs before
+authoring a fix). main was then merged into this branch (`9cfd120b`), bringing
+the `$purge`/`$reindex` REST endpoints (`3177ec22`) — **PR 1.4's assumption
+that `ReindexOperation` is test-only is stale; re-ground it first.**
 
 ---
 
