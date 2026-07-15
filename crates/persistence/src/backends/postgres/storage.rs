@@ -80,6 +80,13 @@ impl ResourceStorage for PostgresBackend {
         Some(std::sync::Arc::new(PgClusterJobStore::new(self.pool())))
     }
 
+    fn cluster_refresh_cache(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::cluster_refresh_cache::ClusterRefreshCache>> {
+        use super::cluster_refresh_cache::PgClusterRefreshCache;
+        Some(std::sync::Arc::new(PgClusterRefreshCache::new(self.pool())))
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,

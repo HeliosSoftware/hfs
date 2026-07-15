@@ -98,6 +98,7 @@ pub mod bulk_submit_input;
 pub mod bulk_submit_worker;
 pub mod capabilities;
 pub mod cluster_job_store;
+pub mod cluster_refresh_cache;
 pub mod history;
 pub mod search;
 pub mod sof_runner;
@@ -142,6 +143,9 @@ pub use capabilities::{
 pub use cluster_job_store::{
     ClusterJobId, ClusterJobLease, ClusterJobRecord, ClusterJobState, ClusterJobStore,
     ClusterLeaseError, JobKind,
+};
+pub use cluster_refresh_cache::{
+    ClusterRefreshCache, FetchFn, FetchFuture, FetchedDocument, RefreshCacheError, StoredDocument,
 };
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,

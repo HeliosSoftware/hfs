@@ -557,6 +557,18 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the cluster-coordinated refresh store for this backend, if it
+    /// can back one (a shared database — see
+    /// [`crate::core::cluster_refresh_cache`]).
+    ///
+    /// The default implementation returns `None`, which keeps coordinated
+    /// consumers (JWKS refresh, C2) on their process-local paths.
+    fn cluster_refresh_cache(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_refresh_cache::ClusterRefreshCache>> {
+        None
+    }
+
     /// Counts non-deleted resources for several types in one call.
     ///
     /// Returns `(resource_type, count)` pairs in the same order as

@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Advisory lock key serializing schema initialization across instances
 /// sharing one database (ASCII "HFSSCHEM").
@@ -307,6 +307,7 @@ async fn migrate_schema(
             12 => migrate_v12_to_v13(client).await?,
             13 => migrate_v13_to_v14(client).await?,
             14 => migrate_v14_to_v15(client).await?,
+            15 => migrate_v15_to_v16(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -900,6 +901,30 @@ async fn migrate_v14_to_v15(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_tenant: {}", e)))?;
+
+    Ok(())
+}
+
+/// v15 -> v16: Add the `cluster_refresh_cache` table (design doc §5 C2).
+///
+/// Shared store for cluster-coordinated single-flight document refreshes
+/// (`cluster_refresh_cache.rs`; today: IdP JWKS documents keyed by URL).
+/// Deliberately **no `tenant_id` column**: the cached documents are public
+/// upstream material shared by every tenant, so the wrong-tenant DoD row
+/// does not apply (methodology §6).
+async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS cluster_refresh_cache (
+                cache_key    TEXT PRIMARY KEY,
+                body         TEXT NOT NULL,
+                max_age_secs BIGINT,
+                fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v15->v16 failed: {}", e)))?;
 
     Ok(())
 }

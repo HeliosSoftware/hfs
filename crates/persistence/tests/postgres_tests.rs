@@ -5341,4 +5341,197 @@ mod postgres_integration {
             assert_eq!(progress.status, ReindexStatus::Queued);
         }
     }
+
+    // ========================================================================
+    // T2 cluster suite — coordinated refresh store (C2 substrate)
+    // (docs/cluster-testing-strategy.md §8 Phase 2).
+    //
+    // The `cluster_refresh_cache` table + `ClusterRefreshCache` back the
+    // cross-instance single-flight JWKS refresh. The store is deliberately
+    // server-global — documents are public upstream material (IdP JWKS keys)
+    // shared by every tenant — so the mandatory wrong-tenant DoD row is N/A
+    // here (methodology §6); there is no tenant dimension to isolate.
+    //
+    // No `CLUSTER_JOBS_TEST_LOCK` needed: unlike the cross-tenant
+    // `claim_next` queue, refresh keys are per-test UUIDs, so parallel tests
+    // cannot interfere.
+    // ========================================================================
+
+    mod cluster_refresh_cache_suite {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration as StdDuration;
+
+        use helios_persistence::core::ResourceStorage;
+        use helios_persistence::core::cluster_refresh_cache::{
+            ClusterRefreshCache, FetchFn, FetchedDocument, RefreshCacheError,
+        };
+
+        use super::create_backend;
+        use crate::cluster_harness as harness;
+
+        const HOUR: StdDuration = StdDuration::from_secs(3600);
+
+        /// The server-facing seam: the store comes off the backend the same
+        /// way `cluster_job_store()` does.
+        fn store_of(backend: &impl ResourceStorage) -> Arc<dyn ClusterRefreshCache> {
+            backend
+                .cluster_refresh_cache()
+                .expect("postgres backs a cluster refresh cache")
+        }
+
+        fn test_key(label: &str) -> String {
+            format!("https://idp.example/{label}/{}/jwks", uuid::Uuid::new_v4())
+        }
+
+        /// A fetch closure returning `body` and counting invocations across
+        /// instances via a shared counter.
+        fn counting_fetch(body: &str, hits: &Arc<AtomicUsize>) -> FetchFn {
+            let body = body.to_string();
+            let hits = Arc::clone(hits);
+            Box::new(move || {
+                Box::pin(async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok(FetchedDocument {
+                        body,
+                        max_age_secs: Some(600),
+                    })
+                })
+            })
+        }
+
+        /// DoD row: exclusivity (single flight) — two instances racing a
+        /// refresh of the same key run exactly one upstream fetch between
+        /// them, and both end up holding the same document.
+        #[tokio::test]
+        async fn postgres_integration_cluster_refresh_single_flight_across_handles() {
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let key = test_key("single-flight");
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let (key_a, key_b) = (key.clone(), key.clone());
+            let (fetch_a, fetch_b) = (
+                counting_fetch("doc-from-a", &hits),
+                counting_fetch("doc-from-b", &hits),
+            );
+            let (res_a, res_b) = harness::race2(
+                async move { a.refresh_with(&key_a, None, HOUR, fetch_a).await },
+                async move { b.refresh_with(&key_b, None, HOUR, fetch_b).await },
+            )
+            .await;
+
+            let doc_a = res_a.expect("instance A refresh succeeds");
+            let doc_b = res_b.expect("instance B refresh succeeds");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "exactly one upstream fetch across both instances"
+            );
+            assert_eq!(
+                doc_a.body, doc_b.body,
+                "both instances hold the winner's document"
+            );
+            assert_eq!(doc_a.fetched_at, doc_b.fetched_at);
+        }
+
+        /// DoD rows: visibility + durability — a document stored via
+        /// instance A is reused (no fetch) by a freshly constructed instance
+        /// that shares nothing but the database.
+        #[tokio::test]
+        async fn postgres_integration_cluster_refresh_durable_across_handles() {
+            let handles = harness::two_handles(create_backend).await;
+            let key = test_key("durability");
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let stored = store_of(&handles.a)
+                .refresh_with(&key, None, HOUR, counting_fetch("doc-v1", &hits))
+                .await
+                .unwrap();
+            drop(handles);
+
+            let fresh = create_backend().await;
+            let reused = store_of(&fresh)
+                .refresh_with(&key, None, HOUR, counting_fetch("doc-v2", &hits))
+                .await
+                .unwrap();
+            assert_eq!(reused.body, "doc-v1");
+            assert_eq!(reused.fetched_at, stored.fetched_at);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "the fresh instance reused, not fetched"
+            );
+        }
+
+        /// Watermark row: an instance that already holds the stored document
+        /// (watermark == fetched_at) forces a genuine refetch; an instance
+        /// still on the older watermark then reuses the newer document.
+        #[tokio::test]
+        async fn postgres_integration_cluster_refresh_watermark_forces_refetch() {
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let key = test_key("watermark");
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let first = a
+                .refresh_with(&key, None, HOUR, counting_fetch("doc-v1", &hits))
+                .await
+                .unwrap();
+
+            // B holds v1 too (same watermark) and asks for something newer.
+            let second = b
+                .refresh_with(
+                    &key,
+                    Some(first.fetched_at),
+                    HOUR,
+                    counting_fetch("doc-v2", &hits),
+                )
+                .await
+                .unwrap();
+            assert_eq!(second.body, "doc-v2");
+            assert!(second.fetched_at > first.fetched_at);
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+            // A, still on the v1 watermark, sees v2 as newer and reuses it.
+            let third = a
+                .refresh_with(
+                    &key,
+                    Some(first.fetched_at),
+                    HOUR,
+                    counting_fetch("doc-v3", &hits),
+                )
+                .await
+                .unwrap();
+            assert_eq!(third.body, "doc-v2");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "reuse must not fetch");
+        }
+
+        /// Abort row: a fetch failure on instance A surfaces as `Fetch`,
+        /// stores nothing, and releases the advisory lock — instance B's
+        /// immediately following refresh fetches successfully.
+        #[tokio::test]
+        async fn postgres_integration_cluster_refresh_fetch_error_releases_lock() {
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let key = test_key("abort");
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let failing: FetchFn =
+                Box::new(|| Box::pin(async { Err("idp unreachable".to_string()) }));
+            let err = a.refresh_with(&key, None, HOUR, failing).await.unwrap_err();
+            assert!(
+                matches!(err, RefreshCacheError::Fetch(ref m) if m == "idp unreachable"),
+                "fetch failure surfaces as RefreshCacheError::Fetch"
+            );
+
+            // The key is not poisoned and the lock is free: B fetches.
+            let doc = b
+                .refresh_with(&key, None, HOUR, counting_fetch("doc-after-error", &hits))
+                .await
+                .unwrap();
+            assert_eq!(doc.body, "doc-after-error");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
 }
