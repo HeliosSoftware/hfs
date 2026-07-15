@@ -327,3 +327,9 @@ editor-unknown-hint = The schema does not describe this element. It is shown so 
 
 editor-primitive-extension-badge = + extension
 editor-primitive-extension-hint = This value carries extensions of its own (a `_` sibling in the JSON). They are kept when you save.
+
+editor-collapse-all = Collapse all
+editor-expand-all = Expand all
+editor-edit-raw = Edit raw
+editor-versions = Versions
+editor-versions-none = No prior versions.

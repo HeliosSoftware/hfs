@@ -351,9 +351,9 @@ async fn editor_page_renders_the_shell() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    // Brett's two views over one document.
-    assert!(html.contains(r#"data-view-btn="form""#));
-    assert!(html.contains(r#"data-view-btn="json""#));
+    // Brett's three panels on one screen: JSON, guided form, version rail.
+    assert!(html.contains(r#"id="editor-body""#));
+    assert!(html.contains(r#"id="editor-versions""#));
     // The resource is fetched by the browser from the FHIR API; the UI crate
     // never touches storage.
     assert!(html.contains(r#"data-type="Patient""#));
@@ -372,6 +372,27 @@ async fn editor_offers_what_the_schema_allows_and_hides_what_is_spent() {
     // A value[x] is a type pick, and its concrete arms are never fields.
     assert!(html.contains(r#"data-declarer="deceased""#));
     assert!(!html.contains(r#"data-name="deceasedBoolean""#));
+}
+
+/// The JSON view sits beside the guided form (Brett's layout), line-numbered
+/// and foldable — a textarea cannot do either.
+#[tokio::test]
+async fn editor_renders_a_foldable_line_numbered_json_view() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22Duck%22%7D%5D%7D&op=")
+            .await;
+
+    // JSON and the guided form are both present — side by side, not toggled.
+    assert!(html.contains("json-view"));
+    assert!(html.contains("editor-tree"));
+    // Line numbers in the gutter.
+    assert!(html.contains("json-line__num"));
+    // A fold arrow on the object and on the name array.
+    assert!(html.contains("json-line--foldable"));
+    assert!(html.contains("data-fold="));
+    // Syntax highlighting: keys and strings are tokenised.
+    assert!(html.contains("jt--key"));
+    assert!(html.contains("jt--string"));
 }
 
 #[tokio::test]

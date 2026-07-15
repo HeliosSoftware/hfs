@@ -107,8 +107,10 @@ pub struct EditorBody {
     /// The in-flight document. This *is* the editor's state: it rides in a
     /// hidden field and comes back with every mutation.
     pub document: String,
-    /// Pretty JSON for the source view.
+    /// Pretty JSON, for the raw-edit textarea.
     pub pretty: String,
+    /// The foldable, line-numbered JSON view shown beside the guided form.
+    pub json_lines: Vec<crate::json_view::JsonLine>,
     pub error_count: usize,
     /// Issues the validator reported against a path no row owns (an invariant
     /// on a backbone element, say). Surfaced rather than swallowed.
@@ -183,6 +185,7 @@ pub async fn render_body(
                 rows: Vec::new(),
                 document: form.doc.clone(),
                 pretty: form.doc,
+                json_lines: Vec::new(),
                 error_count: 0,
                 orphan_errors: Vec::new(),
                 parse_error: Some(error.to_string()),
@@ -306,6 +309,7 @@ fn build_body(
         i18n,
         document: serde_json::to_string(&document).unwrap_or_default(),
         pretty: serde_json::to_string_pretty(&document).unwrap_or_default(),
+        json_lines: crate::json_view::lines(&document),
         error_count: errors.len(),
         orphan_errors,
         rows,

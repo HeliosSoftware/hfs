@@ -2,9 +2,10 @@
   The editor body. Re-rendered whole on every structural mutation: the server
   applies the edit, re-validates, and hands back this fragment.
 
-  `doc` is the state. Every control below posts it back with the mutation, and
-  the server hands back a new one. Nothing about the resource lives in the
-  browser, which is why a key we never render is also a key we never destroy.
+  Following Brett's Resource Editor, the JSON and the guided form sit side by
+  side over one document — not a toggle. `doc` is the state; every control posts
+  it back and the server hands back a new one, so a key we never render is also
+  a key we never destroy.
 -->
 <form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML">
   <input type="hidden" name="doc" id="editor-doc" value="{{ document }}">
@@ -24,9 +25,51 @@
 </div>
 {% else %}
 
-<div class="editor__panes">
-  <!-- Guided form: the schema, made editable. -->
-  <div class="editor__pane editor__pane--form" data-view="form">
+<div class="editor__grid">
+  <!-- ============ LEFT: JSON ============ -->
+  <section class="card editor-json">
+    <div class="card-head">
+      <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("editor-view-json") }}</h3>
+      <div class="card-head__tools">
+        <button type="button" class="editor-json__act" data-json-fold="all" title="{{ i18n.t("editor-collapse-all") }}">{{ i18n.t("editor-collapse-all") }}</button>
+        <button type="button" class="editor-json__act" data-json-fold="none" title="{{ i18n.t("editor-expand-all") }}">{{ i18n.t("editor-expand-all") }}</button>
+        <button type="button" class="editor-json__act" id="editor-json-edit">{{ i18n.t("editor-edit-raw") }}</button>
+      </div>
+    </div>
+
+    <!--
+      Line-numbered, syntax-highlighted, foldable — rendered server-side (a
+      textarea cannot number lines or fold objects). Every object and array
+      carries a fold arrow; the gutter counts lines like a code editor.
+    -->
+    <div class="json-view" id="json-view">
+      {% for line in json_lines %}
+      <div class="json-line{% if line.foldable %} json-line--foldable{% endif %}"
+           data-fold-id="{{ line.fold_id }}" data-parents="{{ line.parents }}">
+        <span class="json-line__num">{{ line.num }}</span>
+        <span class="json-line__fold">{% if line.foldable %}<span class="json-line__arrow" data-fold="{{ line.fold_id }}">▾</span>{% endif %}</span>
+        <span class="json-line__code" style="padding-left: {{ line.depth }}em">{% for t in line.tokens %}<span class="jt jt--{{ t.kind }}">{{ t.text }}</span>{% endfor %}<span class="json-line__summary">{{ line.summary }}</span></span>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Raw editing, one toggle away. On apply it re-parses and the form
+         re-renders from it. -->
+    <div class="editor-json__raw" id="editor-json-raw" hidden>
+      <textarea class="editor__source" id="editor-source" spellcheck="false">{{ pretty }}</textarea>
+      <p class="editor__source-hint">{{ i18n.t("editor-source-hint") }}</p>
+    </div>
+  </section>
+
+  <!-- ============ RIGHT: Guided form ============ -->
+  <section class="card editor-form">
+    <div class="card-head">
+      <h3><span class="icon">{% include "icons/sliders.svg" %}</span> {{ i18n.t("editor-view-form") }}</h3>
+      <div class="editor-validity{% if error_count == 0 %} editor-validity--ok{% endif %}">
+        {% if error_count == 0 %}{{ i18n.t("editor-valid") }}{% else %}{{ i18n.t_arg("editor-issues", "count", error_count.to_string()) }}{% endif %}
+      </div>
+    </div>
+
     <div class="editor-tree">
       {% for row in rows %}
       <div class="editor-row{% if row.is_extension %} editor-row--extension{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
@@ -41,9 +84,6 @@
           {% endif %}
 
           {% if row.is_modifier %}
-          <!-- An unrecognised modifier extension means: do not process this
-               resource. It is the one element in FHIR that is dangerous by
-               omission, and no editor we surveyed says so. -->
           <span class="editor-row__warn" title="{{ i18n.t("editor-modifier-warning") }}">
             {{ i18n.t("editor-modifier-badge") }}
           </span>
@@ -56,9 +96,6 @@
           {% endif %}
 
           {% if row.has_primitive_extension %}
-          <!-- An extended primitive lives in two keys (birthDate + _birthDate).
-               Marked, and carried through untouched — the quiet data-loss bug
-               every editor surveyed for #264 has. -->
           <span class="editor-row__warn editor-row__warn--muted" title="{{ i18n.t("editor-primitive-extension-hint") }}">
             {{ i18n.t("editor-primitive-extension-badge") }}
           </span>
@@ -81,11 +118,6 @@
         {% endfor %}
 
         {% if !row.addable.is_empty() %}
-        <!--
-          "What can I add here?" — answered from the schema, per node: spec
-          order, cardinality already spent excluded, value[x] offered as a type
-          pick. This is the affordance the whole editor exists for.
-        -->
         <details class="editor-add">
           <summary class="editor-add__toggle">+ {{ i18n.t("editor-add") }}</summary>
           <div class="editor-add__panel">
@@ -117,12 +149,6 @@
               {% endfor %}
             </div>
 
-            <!--
-              The ad-hoc extension path. Any node that accepts an extension
-              accepts *any* extension: type a URL and the base Extension type
-              gives us url, a recursive extension, and every value[x] arm. This
-              is what the surveyed editors cannot do without a profile.
-            -->
             {% if row.accepts_extension %}
             <div class="editor-add__ext">
               <label>{{ i18n.t("editor-extension-url") }}</label>
@@ -139,28 +165,11 @@
       </div>
       {% endfor %}
     </div>
-  </div>
 
-  <!-- The same document, as source. Kept in sync because it is the same object. -->
-  <div class="editor__pane editor__pane--json" data-view="json" hidden>
-    <textarea class="editor__source" id="editor-source" spellcheck="false">{{ pretty }}</textarea>
-    <p class="editor__source-hint">{{ i18n.t("editor-source-hint") }}</p>
-  </div>
-
-  <!-- Validation, live. Errors are anchored to their row above; these are the
-       ones whose path no row owns, surfaced rather than swallowed. -->
-  <aside class="editor__side">
-    <div class="editor__validity{% if error_count == 0 %} editor__validity--ok{% endif %}">
-      {% if error_count == 0 %}
-      {{ i18n.t("editor-valid") }}
-      {% else %}
-      {{ i18n.t_arg("editor-issues", "count", error_count.to_string()) }}
-      {% endif %}
-    </div>
     {% for message in orphan_errors %}
     <p class="editor__orphan">{{ message }}</p>
     {% endfor %}
-  </aside>
+  </section>
 </div>
 
 <!-- Required bindings become closed lists; the codes come from the schema. -->

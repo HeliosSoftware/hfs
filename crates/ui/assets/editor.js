@@ -94,54 +94,157 @@
           (resource.meta && resource.meta.lastUpdated
             ? " · " + new Date(resource.meta.lastUpdated).toLocaleString()
             : "");
-        var form = new URLSearchParams();
-        form.set("doc", JSON.stringify(resource));
-        form.set("op", "");
-        return fetch("/ui/editor/render", { method: "POST", body: form })
-          .then(function (r) {
-            return r.text();
-          })
-          .then(function (html) {
-            body.innerHTML = html;
-            applyView();
-          });
+        loadVersions();
+        return renderDocument(resource);
       })
       .catch(function () {
         say(messages.msgLoadError, "error");
       });
   }
 
-  /* ---- the two views --------------------------------------------------- */
+  /* Renders a document into the editor body (JSON + form). */
+  function renderDocument(resource) {
+    var form = new URLSearchParams();
+    form.set("doc", JSON.stringify(resource));
+    form.set("op", "");
+    return fetch("/ui/editor/render", { method: "POST", body: form })
+      .then(function (r) { return r.text(); })
+      .then(function (html) { body.innerHTML = html; applyView(); });
+  }
 
-  var view = "form";
-  function applyView() {
-    root.querySelectorAll("[data-view]").forEach(function (pane) {
-      pane.hidden = pane.dataset.view !== view;
+  /* ---- version history panel ------------------------------------------- */
+
+  var versionsHost = document.getElementById("editor-versions-list");
+
+  function loadVersions() {
+    if (!versionsHost || !resourceId) return;
+    fetch("/" + resourceType + "/" + resourceId + "/_history", {
+      headers: { Accept: "application/fhir+json" },
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (bundle) {
+        renderVersions((bundle && bundle.entry) || []);
+      })
+      .catch(function () {});
+  }
+
+  function renderVersions(entries) {
+    versionsHost.textContent = "";
+    if (!entries.length) {
+      var none = document.createElement("p");
+      none.className = "editor-versions__none";
+      none.textContent = versionsHost.dataset.msgNone;
+      versionsHost.appendChild(none);
+      return;
+    }
+    entries.forEach(function (entry, index) {
+      var resource = entry.resource || {};
+      var response = entry.response || {};
+      var request = entry.request || {};
+      var etag = /"([^"]+)"/.exec(response.etag || "");
+      var version = (resource.meta && resource.meta.versionId) || (etag && etag[1]) || "";
+      var when = (resource.meta && resource.meta.lastUpdated) || response.lastModified || "";
+      var method = (request.method || "").toUpperCase();
+      var kind =
+        method === "POST" ? "create" : method === "PATCH" ? "patch" :
+        method === "DELETE" ? "delete" : "update";
+
+      var row = document.createElement("button");
+      row.type = "button";
+      row.className = "editor-version" + (index === 0 ? " editor-version--current" : "");
+
+      var id = document.createElement("span");
+      id.className = "editor-version__id";
+      id.textContent = "v" + version;
+      var meta = document.createElement("span");
+      meta.className = "editor-version__meta";
+      meta.textContent =
+        (index === 0 ? versionsHost.dataset.msgCurrent : kind) +
+        (when ? " · " + new Date(when).toLocaleString() : "");
+
+      row.appendChild(id);
+      row.appendChild(meta);
+      // Load this version into the editor.
+      row.addEventListener("click", function () {
+        renderDocument(resource);
+        subject.textContent = resourceType + "/" + resourceId + " · v" + version;
+      });
+      versionsHost.appendChild(row);
     });
-    root.querySelectorAll("[data-view-btn]").forEach(function (button) {
-      button.setAttribute(
-        "aria-pressed",
-        button.dataset.viewBtn === view ? "true" : "false"
-      );
+  }
+
+  /* ---- JSON view: folding + raw editing -------------------------------- */
+
+  function applyView() {
+    /* No-op retained as the render hook the round trip calls after a swap. */
+  }
+
+  /* Collapses or expands a container: hides every line inside it and shows the
+   * `{ … }` / `[ N ]` summary on the opening line. Pure CSS class toggling —
+   * the fold state is a data attribute JS reads. */
+  function toggleFold(foldId, collapse) {
+    var opener = root.querySelector('.json-line[data-fold-id="' + foldId + '"]');
+    if (opener) opener.classList.toggle("json-line--collapsed", collapse);
+    root.querySelectorAll(".json-line").forEach(function (line) {
+      var parents = (line.dataset.parents || "").split(" ");
+      if (parents.indexOf(foldId) !== -1) {
+        // A line stays hidden if ANY ancestor is collapsed.
+        line.hidden = anyAncestorCollapsed(line);
+      }
+    });
+  }
+
+  function anyAncestorCollapsed(line) {
+    var parents = (line.dataset.parents || "").split(" ");
+    for (var i = 0; i < parents.length; i++) {
+      if (!parents[i]) continue;
+      var opener = root.querySelector('.json-line[data-fold-id="' + parents[i] + '"]');
+      if (opener && opener.classList.contains("json-line--collapsed")) return true;
+    }
+    return false;
+  }
+
+  function foldAll(collapse) {
+    root.querySelectorAll(".json-line--foldable").forEach(function (opener) {
+      // Never fold the root object away entirely.
+      if (!opener.dataset.parents) return;
+      opener.classList.toggle("json-line--collapsed", collapse);
+    });
+    root.querySelectorAll(".json-line").forEach(function (line) {
+      if (line.dataset.parents) line.hidden = anyAncestorCollapsed(line);
     });
   }
 
   root.addEventListener("click", function (event) {
-    var toggle = event.target.closest("[data-view-btn]");
-    if (toggle) {
-      // Leaving the source view: the text the user typed becomes the document.
-      if (view === "json" && toggle.dataset.viewBtn === "form") {
+    /* Fold arrow. */
+    var arrow = event.target.closest("[data-fold]");
+    if (arrow) {
+      var id = arrow.dataset.fold;
+      var opener = root.querySelector('.json-line[data-fold-id="' + id + '"]');
+      toggleFold(id, opener && !opener.classList.contains("json-line--collapsed"));
+      return;
+    }
+    var foldAllBtn = event.target.closest("[data-json-fold]");
+    if (foldAllBtn) {
+      foldAll(foldAllBtn.dataset.jsonFold === "all");
+      return;
+    }
+    /* Raw-edit toggle: swap the fold view for the textarea and back. */
+    if (event.target.id === "editor-json-edit") {
+      var raw = document.getElementById("editor-json-raw");
+      var viewEl = document.getElementById("json-view");
+      if (!raw || !viewEl) return;
+      if (raw.hidden) {
+        raw.hidden = false;
+        viewEl.hidden = true;
+        event.target.classList.add("editor-json__act--on");
+      } else {
+        // Leaving raw: the text becomes the document, and the form re-renders.
         var source = document.getElementById("editor-source");
-        if (source) {
-          var field = document.getElementById("editor-doc");
-          if (field) field.value = source.value;
-          view = "form";
-          send("");
-          return;
-        }
+        var field = document.getElementById("editor-doc");
+        if (source && field) field.value = source.value;
+        send("");
       }
-      view = toggle.dataset.viewBtn;
-      applyView();
       return;
     }
 

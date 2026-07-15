@@ -33,18 +33,6 @@
       <span class="editor__subject" id="editor-subject"></span>
     </div>
 
-    <!-- Two views of one document, exactly as designed. -->
-    <div class="seg" role="group" aria-label="{{ i18n.t("editor-view-label") }}">
-      <button type="button" class="seg__btn" data-view-btn="form" aria-pressed="true">
-        <span class="icon">{% include "icons/sliders.svg" %}</span>
-        {{ i18n.t("editor-view-form") }}
-      </button>
-      <button type="button" class="seg__btn" data-view-btn="json" aria-pressed="false">
-        <span class="icon">{% include "icons/code.svg" %}</span>
-        {{ i18n.t("editor-view-json") }}
-      </button>
-    </div>
-
     <div class="editor__actions">
       <button type="button" class="btn" id="editor-delete">{{ i18n.t("editor-delete") }}</button>
       <button type="button" class="btn btn--primary" id="editor-save">{{ i18n.t("editor-save") }}</button>
@@ -54,12 +42,21 @@
   <div class="editor__status" id="editor-status" role="status"></div>
 
   <!--
-    The whole editor body — tree, source, validation — is server-rendered and
-    swapped as one fragment on every structural mutation. The in-flight document
-    rides inside it in a hidden field: it is the state, and there is nowhere
-    else it lives.
+    Three panels on one screen, following Brett's Resource Editor: the JSON and
+    the guided form side by side over one document, and a version rail. The body
+    (JSON + form) is server-rendered and swapped whole on every mutation; the
+    version rail is hydrated from the ordinary _history API.
   -->
-  <div class="editor__body" id="editor-body"></div>
+  <div class="editor__layout">
+    <div class="editor__body" id="editor-body"></div>
+
+    <aside class="card editor-versions" id="editor-versions" aria-label="{{ i18n.t("editor-versions") }}">
+      <div class="card-head"><h3><span class="icon">{% include "icons/history.svg" %}</span> {{ i18n.t("editor-versions") }}</h3></div>
+      <div class="editor-versions__list" id="editor-versions-list"
+           data-msg-current="{{ i18n.t("history-current") }}"
+           data-msg-none="{{ i18n.t("editor-versions-none") }}"></div>
+    </aside>
+  </div>
 </div>
 
 <script src="/ui/assets/editor.js" defer></script>

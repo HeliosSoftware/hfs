@@ -1980,21 +1980,164 @@ button.filter-rail__item {
   color: var(--text);
 }
 
-.editor__panes {
+/* Three panels on one screen (Brett's Resource Editor): JSON + guided form side
+   by side, with a version rail to the right. */
+.editor__layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 260px;
+  grid-template-columns: minmax(0, 1fr) 240px;
   gap: 16px;
   align-items: start;
 }
 
-.editor__pane {
-  min-width: 0;
-  padding: 14px;
-  background: var(--surface);
-  border: 1px solid var(--surface-border);
-  border-radius: 14px;
-  box-shadow: var(--surface-shadow);
+.editor__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
 }
+
+.editor-json,
+.editor-form {
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.card-head h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.card-head__tools {
+  display: flex;
+  gap: 6px;
+}
+
+.editor-json__act {
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--surface-border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.editor-json__act:hover { color: var(--text); }
+.editor-json__act--on { color: var(--accent); border-color: var(--accent); }
+
+.editor-tree { padding: 12px 14px; }
+
+/* ---- the foldable JSON view ---- */
+
+.json-view {
+  padding: 10px 0;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.json-line {
+  display: flex;
+  align-items: baseline;
+  white-space: pre;
+}
+
+.json-line:hover { background: var(--input-bg); }
+
+.json-line__num {
+  flex: 0 0 auto;
+  width: 40px;
+  padding-right: 10px;
+  text-align: right;
+  color: var(--muted);
+  opacity: 0.6;
+  user-select: none;
+}
+
+.json-line__fold {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
+  color: var(--muted);
+  user-select: none;
+}
+
+.json-line__arrow {
+  cursor: pointer;
+  display: inline-block;
+  transition: transform 0.1s;
+}
+
+.json-line--collapsed .json-line__arrow { transform: rotate(-90deg); }
+
+.json-line__code { min-width: 0; }
+
+/* The summary shows only on a collapsed opener. */
+.json-line__summary { display: none; color: var(--muted); }
+.json-line--collapsed .json-line__summary { display: inline; padding-left: 2px; }
+
+/* Syntax highlighting. */
+.jt--key { color: var(--accent); }
+.jt--string { color: #1a7f37; }
+.jt--number { color: #cf222e; }
+.jt--bool,
+.jt--null { color: #8250df; font-weight: 600; }
+.jt--punct { color: var(--muted); }
+
+/* ---- version rail ---- */
+
+.editor-versions { padding: 0; }
+
+.editor-versions__list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px;
+}
+
+.editor-version {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.editor-version:hover { background: var(--input-bg); }
+.editor-version--current { border-color: var(--surface-border); }
+.editor-version--current .editor-version__id { color: var(--accent); }
+
+.editor-version__id { font-size: 13px; font-weight: 600; color: var(--text); }
+.editor-version__meta { font-size: 11px; color: var(--muted); }
+.editor-versions__none { padding: 10px; font-size: 12px; color: var(--muted); }
+
+.editor-validity {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.editor-validity--ok { color: var(--accent); }
 
 .editor__parse-error {
   padding: 12px 14px;

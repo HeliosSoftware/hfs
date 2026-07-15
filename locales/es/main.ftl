@@ -323,3 +323,9 @@ editor-unknown-hint = El esquema no describe este elemento. Se muestra para que 
 
 editor-primitive-extension-badge = + extensión
 editor-primitive-extension-hint = Este valor lleva extensiones propias (un hermano `_` en el JSON). Se conservan al guardar.
+
+editor-collapse-all = Colapsar todo
+editor-expand-all = Expandir todo
+editor-edit-raw = Editar crudo
+editor-versions = Versiones
+editor-versions-none = Sin versiones anteriores.

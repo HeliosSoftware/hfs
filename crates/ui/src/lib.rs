@@ -22,6 +22,7 @@
 mod compartments;
 mod editor;
 mod i18n;
+mod json_view;
 mod search_params;
 
 use askama::Template;
