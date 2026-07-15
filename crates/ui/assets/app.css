@@ -2810,46 +2810,6 @@ button.filter-rail__item {
    the Edit Resource modal (shadowbox).
    --------------------------------------------------------------------------- */
 
-/* Nav group: a <details> disclosure whose summary is a nav item and whose
-   children are the resource-type submenu. */
-.nav-group { border: 0; }
-.nav-group > summary { list-style: none; }
-.nav-group > summary::-webkit-details-marker { display: none; }
-
-.nav-item--group { cursor: pointer; }
-.nav-item--group .nav-item__label { flex: 1; }
-
-.nav-group__caret {
-  margin-left: auto;
-  color: var(--muted);
-  transition: transform 0.15s;
-}
-.nav-group[open] .nav-group__caret { transform: rotate(180deg); }
-
-.nav-item--current {
-  color: var(--text-strong);
-}
-
-.nav-submenu {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 2px 0 6px 22px;
-  padding-left: 12px;
-  border-left: 1px solid var(--surface-border);
-}
-
-.nav-subitem {
-  padding: 6px 10px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--muted);
-  text-decoration: none;
-  border-radius: 8px;
-}
-.nav-subitem:hover { color: var(--text-strong); background: var(--input-bg); }
-.nav-subitem--all { color: var(--accent); }
-
 /* Page head with an action on the right (Create new). */
 .page-head--row {
   display: flex;

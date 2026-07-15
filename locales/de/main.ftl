@@ -363,7 +363,6 @@ history-parse-error = Diese Versionen konnten nicht als JSON gelesen werden.
 
 ## Ressourcen-Arbeitsbereich (#282)
 
-nav-resources-all = Alle Typen
 resources-heading = Ressourcen
 resources-lede = FHIR-Ressourcen durchsuchen, suchen, erstellen und bearbeiten. In natürlicher Sprache suchen oder die Abfrage selbst bauen, dann ein Ergebnis zum Bearbeiten öffnen.
 resources-create = Neu erstellen
