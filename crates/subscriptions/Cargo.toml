@@ -14,6 +14,9 @@ R4 = ["helios-fhir/R4", "helios-persistence/R4"]
 R4B = ["helios-fhir/R4B", "helios-persistence/R4B"]
 R5 = ["helios-fhir/R5", "helios-persistence/R5"]
 R6 = ["helios-fhir/R6", "helios-persistence/R6"]
+# Gates the T2 cluster suites that need a real Postgres (testcontainers);
+# enabled in CI via --all-features, skipped by a plain `cargo test`.
+postgres = ["helios-persistence/postgres"]
 
 [dependencies]
 # FHIR models
@@ -58,6 +61,11 @@ dashmap = "6"
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# T2 cluster suites run against a real Postgres (testcontainers), driving
+# the engine through the shared persistence seams.
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["postgres"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 # `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
 # Windows test runs don't need SIGTERM cleanup, so drop the feature there.

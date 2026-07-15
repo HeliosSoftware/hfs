@@ -40,8 +40,8 @@ where
         })?;
 
     let sub = engine
-        .manager()
-        .get_subscription(tenant.tenant_id(), &id)
+        .subscription_snapshot(tenant.tenant_id(), &id)
+        .await
         .ok_or(RestError::NotFound {
             resource_type: "Subscription".to_string(),
             id: id.clone(),
@@ -75,8 +75,8 @@ where
         })?;
 
     let sub = engine
-        .manager()
-        .get_subscription(tenant.tenant_id(), &id)
+        .subscription_snapshot(tenant.tenant_id(), &id)
+        .await
         .ok_or(RestError::NotFound {
             resource_type: "Subscription".to_string(),
             id: id.clone(),
@@ -129,8 +129,8 @@ where
 
     // Verify subscription exists.
     let sub = engine
-        .manager()
-        .get_subscription(tenant.tenant_id(), &id)
+        .subscription_snapshot(tenant.tenant_id(), &id)
+        .await
         .ok_or(RestError::NotFound {
             resource_type: "Subscription".to_string(),
             id: id.clone(),
@@ -147,10 +147,14 @@ where
         });
     }
 
-    // Generate binding token.
+    // Generate binding token (in the shared store when clustered, so the
+    // WebSocket upgrade may land on any instance).
     let (token, expiration) = engine
-        .ws_token_manager()
-        .generate_token(tenant.tenant_id(), &id);
+        .generate_ws_token(tenant.tenant_id(), &id)
+        .await
+        .map_err(|e| RestError::InternalError {
+            message: format!("failed to mint WebSocket binding token: {e}"),
+        })?;
 
     // Build WebSocket URL from the base URL.
     let ws_base = state

@@ -8,7 +8,14 @@ pub mod retry;
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use helios_fhir::FhirVersion;
+use helios_persistence::core::subscription_state::{
+    SubscriptionHydrationSource, SubscriptionStateStore,
+};
+use helios_persistence::core::ws_binding_tokens::WsBindingTokenStore;
+use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use tracing::{debug, error, info, warn};
 
 use crate::channels::email::EmailChannel;
@@ -28,6 +35,42 @@ use crate::notification::{self, NotificationEventData};
 use crate::topics::InMemoryTopicRegistry;
 use helios_auth::{NoOpOutboundAuthProvider, OutboundAuthProvider};
 
+/// The cluster-shared state handles the engine consumes when running as one
+/// of N instances (cluster design §Class B). Obtained from the primary
+/// storage backend's seams (`ResourceStorage::subscription_state_store()`
+/// etc.) by the server layer; without them the engine keeps today's
+/// process-local behavior byte-for-byte.
+pub struct ClusterHandles {
+    /// Shared counters, status, and stored notification bundles (B4/B1).
+    pub state: Arc<dyn SubscriptionStateStore>,
+    /// Shared single-use WebSocket binding tokens (B2).
+    pub tokens: Arc<dyn WsBindingTokenStore>,
+    /// Boot-time hydration read path (B3).
+    pub hydration: Arc<dyn SubscriptionHydrationSource>,
+    /// This instance's identity, used as the fan-out origin marker.
+    pub instance_id: String,
+}
+
+/// Builds the full-access context the engine uses for its own store calls;
+/// tenancy is enforced by passing the subscription's owning tenant.
+fn tenant_ctx(tenant_id: &str) -> TenantContext {
+    TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access())
+}
+
+/// Where a local registration came from — a live resource write on this
+/// instance, or boot-time hydration replaying persisted resources.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistrationSource {
+    /// The write path: the fresh resource's own status is the client's
+    /// intent (e.g. re-requesting an `off` subscription), so it wins over
+    /// stored runtime status — which is re-seeded from it.
+    LiveWrite,
+    /// Hydration: the stored runtime state (status/counters) wins over the
+    /// resource's status field — an `off` flip recorded by any instance
+    /// must survive a restart.
+    Hydration,
+}
+
 /// The subscription engine orchestrates the entire subscription pipeline.
 ///
 /// It is designed to be invoked asynchronously after resource writes
@@ -45,6 +88,7 @@ pub struct SubscriptionEngine {
     messaging_channel: Option<Arc<MessagingChannel>>,
     config: SubscriptionConfig,
     base_url: String,
+    cluster: Option<ClusterHandles>,
 }
 
 fn calculate_handshake_retry_delay(
@@ -116,7 +160,20 @@ impl SubscriptionEngine {
             messaging_channel,
             config,
             base_url,
+            cluster: None,
         }
+    }
+
+    /// Attaches the cluster-shared state handles (builder style). Without
+    /// this call the engine is process-local, exactly as before Phase 3.
+    pub fn with_cluster_handles(mut self, cluster: ClusterHandles) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// Whether this engine runs against cluster-shared state.
+    pub fn is_cluster_backed(&self) -> bool {
+        self.cluster.is_some()
     }
 
     /// Returns a reference to the topic registry.
@@ -190,11 +247,12 @@ impl SubscriptionEngine {
         for eval_match in matches {
             let mut subscription = eval_match.subscription;
 
-            // Increment event counter.
+            // Increment event counter — through the shared store when
+            // clustered so `eventNumber` is monotonic and gap-free across
+            // every instance.
             let event_number = self
-                .manager
-                .increment_event_count(&subscription.tenant_id, &subscription.id)
-                .unwrap_or(0);
+                .next_event_number(&subscription.tenant_id, &subscription.id)
+                .await;
             // Ensure notification metadata reflects the event being emitted.
             subscription.events_since_start = event_number;
 
@@ -263,6 +321,19 @@ impl SubscriptionEngine {
                 let removed = self.manager.deregister(&tenant_id, subscription_id);
                 self.ws_manager
                     .remove_all_clients(&tenant_id, subscription_id);
+                if let Some(cluster) = &self.cluster
+                    && let Err(e) = cluster
+                        .state
+                        .delete(&tenant_ctx(&tenant_id), subscription_id)
+                        .await
+                {
+                    warn!(
+                        tenant_id,
+                        subscription_id,
+                        error = %e,
+                        "Failed to delete shared subscription state"
+                    );
+                }
                 info!(
                     tenant_id,
                     subscription_id, removed, "Subscription deregistered"
@@ -271,47 +342,135 @@ impl SubscriptionEngine {
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
                     // Register (or re-register) the subscription.
-                    match self.manager.register(
-                        &tenant_id,
-                        subscription_id,
-                        resource,
-                        event.fhir_version,
-                    ) {
-                        Ok(sub) => {
+                    if let Some(sub) = self
+                        .register_subscription_locally(
+                            &tenant_id,
+                            subscription_id,
+                            resource,
+                            event.fhir_version,
+                            RegistrationSource::LiveWrite,
+                        )
+                        .await
+                    {
+                        // If status is requested, perform handshake and activate.
+                        if sub.status == SubscriptionStatusCode::Requested {
                             info!(
                                 tenant_id = %sub.tenant_id,
                                 subscription_id = %sub.id,
-                                topic_url = %sub.topic_url,
                                 channel_type = %sub.channel.channel_type.as_fhir_str(),
                                 endpoint = sub.channel.endpoint.as_deref().unwrap_or(""),
-                                status = %sub.status,
-                                fhir_version = %sub.fhir_version,
-                                "Subscription registered"
+                                "Subscription activation requested"
                             );
-                            // If status is requested, perform handshake and activate.
-                            if sub.status == SubscriptionStatusCode::Requested {
-                                info!(
-                                    tenant_id = %sub.tenant_id,
-                                    subscription_id = %sub.id,
-                                    channel_type = %sub.channel.channel_type.as_fhir_str(),
-                                    endpoint = sub.channel.endpoint.as_deref().unwrap_or(""),
-                                    "Subscription activation requested"
-                                );
-                                self.activate_subscription(&sub).await;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                tenant_id,
-                                subscription_id,
-                                error = %e,
-                                "Failed to register subscription"
-                            );
+                            self.activate_subscription(&sub).await;
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Registers a subscription into the local projection WITHOUT the
+    /// activation handshake (the caller decides — a live write on this
+    /// instance handshakes; hydration must not, or N restarting instances
+    /// would re-handshake every requested subscription).
+    ///
+    /// In cluster mode the shared state row is reconciled per
+    /// [`RegistrationSource`]: hydration overlays stored runtime state onto
+    /// the projection; a live write keeps the shared `event_number`
+    /// (resource updates never reset it) but re-seeds status from the fresh
+    /// resource and zeroes the failure streak — the client's re-request
+    /// intent wins.
+    async fn register_subscription_locally(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        resource: &serde_json::Value,
+        fhir_version: FhirVersion,
+        source: RegistrationSource,
+    ) -> Option<ActiveSubscription> {
+        let mut sub =
+            match self
+                .manager
+                .register(tenant_id, subscription_id, resource, fhir_version)
+            {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(
+                        tenant_id,
+                        subscription_id,
+                        error = %e,
+                        "Failed to register subscription"
+                    );
+                    return None;
+                }
+            };
+        info!(
+            tenant_id = %sub.tenant_id,
+            subscription_id = %sub.id,
+            topic_url = %sub.topic_url,
+            channel_type = %sub.channel.channel_type.as_fhir_str(),
+            endpoint = sub.channel.endpoint.as_deref().unwrap_or(""),
+            status = %sub.status,
+            fhir_version = %sub.fhir_version,
+            "Subscription registered"
+        );
+
+        if let Some(cluster) = &self.cluster {
+            let ctx = tenant_ctx(tenant_id);
+            match cluster.state.get(&ctx, subscription_id).await {
+                Ok(Some(record)) => match source {
+                    RegistrationSource::Hydration => {
+                        let status = record
+                            .status
+                            .as_deref()
+                            .and_then(SubscriptionStatusCode::from_fhir_str);
+                        self.manager.apply_state_overlay(
+                            tenant_id,
+                            subscription_id,
+                            record.event_number,
+                            record.consecutive_failures,
+                            status,
+                        );
+                        sub.events_since_start = record.event_number;
+                        sub.consecutive_failures = record.consecutive_failures;
+                        if let Some(status) = status {
+                            sub.status = status;
+                        }
+                    }
+                    RegistrationSource::LiveWrite => {
+                        self.manager.sync_event_count(
+                            tenant_id,
+                            subscription_id,
+                            record.event_number,
+                        );
+                        sub.events_since_start = record.event_number;
+                        if let Err(e) = cluster
+                            .state
+                            .set_status(&ctx, subscription_id, sub.status.as_fhir_str())
+                            .await
+                        {
+                            warn!(tenant_id, subscription_id, error = %e,
+                                "Failed to re-seed shared subscription status");
+                        }
+                        if let Err(e) = cluster.state.reset_failures(&ctx, subscription_id).await {
+                            warn!(tenant_id, subscription_id, error = %e,
+                                "Failed to reset shared failure streak");
+                        }
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        tenant_id,
+                        subscription_id,
+                        error = %e,
+                        "Failed to read shared subscription state; using local projection"
+                    );
+                }
+            }
+        }
+
+        Some(sub)
     }
 
     /// Handle a SubscriptionTopic resource event.
@@ -368,7 +527,9 @@ impl SubscriptionEngine {
                 }
 
                 for canonical_url in candidate_urls {
-                    let removed = self.topic_registry.remove_topic(&canonical_url);
+                    let removed = self
+                        .topic_registry
+                        .remove_topic(event.tenant_id.as_ref(), &canonical_url);
                     info!(
                         resource_id = %event.resource_id,
                         topic_url = %canonical_url,
@@ -379,31 +540,54 @@ impl SubscriptionEngine {
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
-                    match InMemoryTopicRegistry::parse_topic_resource(resource) {
-                        Ok(topic) => {
-                            let canonical_url = topic.canonical_url.clone();
-                            if let Some(previous_url) = self
-                                .topic_resource_index
-                                .insert(topic_key, canonical_url.clone())
-                                .filter(|previous_url| previous_url != &canonical_url)
-                            {
-                                let _ = self.topic_registry.remove_topic(&previous_url);
-                            }
-                            info!(
-                                topic_url = %canonical_url,
-                                "Registered SubscriptionTopic"
-                            );
-                            self.topic_registry.add_topic(topic);
-                        }
-                        Err(e) => {
-                            warn!(
-                                resource_id = %event.resource_id,
-                                error = %e,
-                                "Failed to parse SubscriptionTopic"
-                            );
-                        }
-                    }
+                    self.register_native_topic_locally(
+                        event.tenant_id.as_ref(),
+                        &event.resource_type,
+                        &event.resource_id,
+                        resource,
+                    );
                 }
+            }
+        }
+    }
+
+    /// Registers (or re-registers) a native `SubscriptionTopic` into the
+    /// local projection. Shared by the live write path and hydration.
+    fn register_native_topic_locally(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &serde_json::Value,
+    ) {
+        let topic_key = (
+            tenant_id.to_string(),
+            resource_type.to_string(),
+            resource_id.to_string(),
+        );
+        match InMemoryTopicRegistry::parse_topic_resource(resource) {
+            Ok(topic) => {
+                let canonical_url = topic.canonical_url.clone();
+                if let Some(previous_url) = self
+                    .topic_resource_index
+                    .insert(topic_key, canonical_url.clone())
+                    .filter(|previous_url| previous_url != &canonical_url)
+                {
+                    let _ = self.topic_registry.remove_topic(tenant_id, &previous_url);
+                }
+                info!(
+                    tenant_id,
+                    topic_url = %canonical_url,
+                    "Registered SubscriptionTopic"
+                );
+                self.topic_registry.add_topic(tenant_id, topic);
+            }
+            Err(e) => {
+                warn!(
+                    resource_id,
+                    error = %e,
+                    "Failed to parse SubscriptionTopic"
+                );
             }
         }
     }
@@ -475,7 +659,9 @@ impl SubscriptionEngine {
                 candidate_urls.dedup();
 
                 for canonical_url in candidate_urls {
-                    let removed = self.topic_registry.remove_topic(&canonical_url);
+                    let removed = self
+                        .topic_registry
+                        .remove_topic(event.tenant_id.as_ref(), &canonical_url);
                     info!(
                         resource_id = %event.resource_id,
                         topic_url = %canonical_url,
@@ -488,36 +674,61 @@ impl SubscriptionEngine {
             }
             ResourceEventType::Create | ResourceEventType::Update => {
                 if let Some(resource) = &event.resource {
-                    match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
-                        Ok(Some(topic)) => {
-                            let canonical_url = topic.canonical_url.clone();
-                            if let Some(previous_url) = self
-                                .topic_resource_index
-                                .insert(topic_key, canonical_url.clone())
-                                .filter(|previous_url| previous_url != &canonical_url)
-                            {
-                                let _ = self.topic_registry.remove_topic(&previous_url);
-                            }
-                            info!(
-                                topic_url = %canonical_url,
-                                "Registered R4 Basic SubscriptionTopic"
-                            );
-                            self.topic_registry.add_topic(topic);
-                            true
-                        }
-                        Ok(None) => false,
-                        Err(e) => {
-                            warn!(
-                                resource_id = %event.resource_id,
-                                error = %e,
-                                "Failed to parse R4 Basic SubscriptionTopic"
-                            );
-                            true
-                        }
-                    }
+                    self.register_basic_topic_locally(
+                        event.tenant_id.as_ref(),
+                        &event.resource_type,
+                        &event.resource_id,
+                        resource,
+                    )
                 } else {
                     false
                 }
+            }
+        }
+    }
+
+    /// Registers (or re-registers) an R4 backport `Basic` topic into the
+    /// local projection. Shared by the live write path and hydration.
+    /// Returns `true` when the `Basic` resource was recognized as a topic
+    /// (including malformed topic candidates).
+    fn register_basic_topic_locally(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &serde_json::Value,
+    ) -> bool {
+        let topic_key = (
+            tenant_id.to_string(),
+            resource_type.to_string(),
+            resource_id.to_string(),
+        );
+        match InMemoryTopicRegistry::parse_r4_backport_basic_topic_resource(resource) {
+            Ok(Some(topic)) => {
+                let canonical_url = topic.canonical_url.clone();
+                if let Some(previous_url) = self
+                    .topic_resource_index
+                    .insert(topic_key, canonical_url.clone())
+                    .filter(|previous_url| previous_url != &canonical_url)
+                {
+                    let _ = self.topic_registry.remove_topic(tenant_id, &previous_url);
+                }
+                info!(
+                    tenant_id,
+                    topic_url = %canonical_url,
+                    "Registered R4 Basic SubscriptionTopic"
+                );
+                self.topic_registry.add_topic(tenant_id, topic);
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                warn!(
+                    resource_id,
+                    error = %e,
+                    "Failed to parse R4 Basic SubscriptionTopic"
+                );
+                true
             }
         }
     }
@@ -540,9 +751,8 @@ impl SubscriptionEngine {
                     error = %e,
                     "Failed to build handshake"
                 );
-                let _ =
-                    self.manager
-                        .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
+                self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                    .await;
                 return;
             }
         };
@@ -592,11 +802,8 @@ impl SubscriptionEngine {
                             endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                             "Email channel requested but no SMTP settings configured"
                         );
-                        let _ = self.manager.update_status(
-                            tenant_id,
-                            sub_id,
-                            SubscriptionStatusCode::Error,
-                        );
+                        self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                            .await;
                         return;
                     }
                 },
@@ -609,11 +816,8 @@ impl SubscriptionEngine {
                             endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                             "Messaging channel requested but messaging settings not configured"
                         );
-                        let _ = self.manager.update_status(
-                            tenant_id,
-                            sub_id,
-                            SubscriptionStatusCode::Error,
-                        );
+                        self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                            .await;
                         return;
                     }
                 },
@@ -639,11 +843,8 @@ impl SubscriptionEngine {
                         attempt,
                         "Handshake successful, activating subscription"
                     );
-                    let _ = self.manager.update_status(
-                        tenant_id,
-                        sub_id,
-                        SubscriptionStatusCode::Active,
-                    );
+                    self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Active)
+                        .await;
                     return;
                 }
                 Ok(DispatchResult::PermanentError(msg)) => {
@@ -656,11 +857,8 @@ impl SubscriptionEngine {
                         error = %msg,
                         "Handshake failed with permanent error"
                     );
-                    let _ = self.manager.update_status(
-                        tenant_id,
-                        sub_id,
-                        SubscriptionStatusCode::Error,
-                    );
+                    self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                        .await;
                     return;
                 }
                 Ok(DispatchResult::RetryableError(msg)) => {
@@ -674,11 +872,8 @@ impl SubscriptionEngine {
                             error = %msg,
                             "Handshake retries exhausted"
                         );
-                        let _ = self.manager.update_status(
-                            tenant_id,
-                            sub_id,
-                            SubscriptionStatusCode::Error,
-                        );
+                        self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                            .await;
                         return;
                     }
 
@@ -707,11 +902,8 @@ impl SubscriptionEngine {
                         error = %e,
                         "Handshake error"
                     );
-                    let _ = self.manager.update_status(
-                        tenant_id,
-                        sub_id,
-                        SubscriptionStatusCode::Error,
-                    );
+                    self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                        .await;
                     return;
                 }
             }
@@ -775,7 +967,7 @@ impl SubscriptionEngine {
         loop {
             match dispatcher.dispatch(subscription, bundle).await {
                 Ok(DispatchResult::Success) => {
-                    self.manager.reset_failures(tenant_id, sub_id);
+                    self.reset_delivery_failures(tenant_id, sub_id).await;
                     info!(
                         tenant_id,
                         subscription_id = sub_id,
@@ -798,7 +990,7 @@ impl SubscriptionEngine {
                         error = %msg,
                         "Permanent delivery error"
                     );
-                    self.handle_delivery_failure(tenant_id, sub_id);
+                    self.handle_delivery_failure(tenant_id, sub_id).await;
                     return;
                 }
                 Ok(DispatchResult::RetryableError(msg)) => {
@@ -815,7 +1007,7 @@ impl SubscriptionEngine {
                             error = %msg,
                             "Max retries exhausted"
                         );
-                        self.handle_delivery_failure(tenant_id, sub_id);
+                        self.handle_delivery_failure(tenant_id, sub_id).await;
                         return;
                     }
 
@@ -842,36 +1034,326 @@ impl SubscriptionEngine {
                         error = %e,
                         "Dispatch error"
                     );
-                    self.handle_delivery_failure(tenant_id, sub_id);
+                    self.handle_delivery_failure(tenant_id, sub_id).await;
                     return;
                 }
             }
         }
     }
 
-    /// Handle a delivery failure: increment failure count and potentially
-    /// transition status to error or off.
-    fn handle_delivery_failure(&self, tenant_id: &str, subscription_id: &str) {
-        if let Some(failure_count) = self.manager.record_failure(tenant_id, subscription_id) {
+    /// Handle a delivery failure: increment the failure count (shared when
+    /// clustered, so failures scattered across instances still reach the
+    /// thresholds) and potentially transition status to error or off.
+    async fn handle_delivery_failure(&self, tenant_id: &str, subscription_id: &str) {
+        let failure_count = match &self.cluster {
+            Some(cluster) => {
+                match cluster
+                    .state
+                    .record_failure(&tenant_ctx(tenant_id), subscription_id)
+                    .await
+                {
+                    Ok(count) => Some(count),
+                    Err(e) => {
+                        warn!(
+                            tenant_id,
+                            subscription_id,
+                            error = %e,
+                            "Failed to record shared delivery failure; counting locally"
+                        );
+                        self.manager.record_failure(tenant_id, subscription_id)
+                    }
+                }
+            }
+            None => self.manager.record_failure(tenant_id, subscription_id),
+        };
+        if let Some(failure_count) = failure_count {
             if failure_count >= self.config.off_threshold {
                 warn!(
                     subscription_id,
                     failures = failure_count,
                     "Turning off subscription after repeated failures"
                 );
-                let _ = self.manager.update_status(
-                    tenant_id,
-                    subscription_id,
-                    SubscriptionStatusCode::Off,
-                );
+                self.transition_status(tenant_id, subscription_id, SubscriptionStatusCode::Off)
+                    .await;
             } else if failure_count >= self.config.error_threshold {
-                let _ = self.manager.update_status(
-                    tenant_id,
-                    subscription_id,
-                    SubscriptionStatusCode::Error,
-                );
+                self.transition_status(tenant_id, subscription_id, SubscriptionStatusCode::Error)
+                    .await;
             }
         }
+    }
+
+    /// Resets the consecutive-failure streak after a successful delivery,
+    /// locally and (when clustered) in the shared store.
+    async fn reset_delivery_failures(&self, tenant_id: &str, subscription_id: &str) {
+        self.manager.reset_failures(tenant_id, subscription_id);
+        if let Some(cluster) = &self.cluster
+            && let Err(e) = cluster
+                .state
+                .reset_failures(&tenant_ctx(tenant_id), subscription_id)
+                .await
+        {
+            warn!(
+                tenant_id,
+                subscription_id,
+                error = %e,
+                "Failed to reset shared failure streak"
+            );
+        }
+    }
+
+    /// Records a runtime status transition locally and (when clustered) in
+    /// the shared store, so every instance's snapshot observes it. Local
+    /// transition validation keeps today's semantics; the shared write is
+    /// skipped when the local transition is refused.
+    async fn transition_status(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        status: SubscriptionStatusCode,
+    ) {
+        if self
+            .manager
+            .update_status(tenant_id, subscription_id, status)
+            .is_err()
+        {
+            return;
+        }
+        if let Some(cluster) = &self.cluster
+            && let Err(e) = cluster
+                .state
+                .set_status(
+                    &tenant_ctx(tenant_id),
+                    subscription_id,
+                    status.as_fhir_str(),
+                )
+                .await
+        {
+            warn!(
+                tenant_id,
+                subscription_id,
+                status = %status,
+                error = %e,
+                "Failed to record shared status transition"
+            );
+        }
+    }
+
+    /// Mints the next event number — cluster-wide monotonic through the
+    /// shared store when clustered, else the local counter. A store failure
+    /// falls back to the local counter (delivering with a possibly-duplicate
+    /// number beats dropping the notification; subscribers gap-detect).
+    async fn next_event_number(&self, tenant_id: &str, subscription_id: &str) -> u64 {
+        if let Some(cluster) = &self.cluster {
+            match cluster
+                .state
+                .next_event_number(&tenant_ctx(tenant_id), subscription_id)
+                .await
+            {
+                Ok(event_number) => {
+                    self.manager
+                        .sync_event_count(tenant_id, subscription_id, event_number);
+                    return event_number;
+                }
+                Err(e) => {
+                    error!(
+                        tenant_id,
+                        subscription_id,
+                        error = %e,
+                        "Failed to increment shared event number; falling back to local"
+                    );
+                }
+            }
+        }
+        self.manager
+            .increment_event_count(tenant_id, subscription_id)
+            .unwrap_or(0)
+    }
+
+    /// Rebuilds the in-memory projections from persisted resources (B3
+    /// startup hydration): topics first (native `SubscriptionTopic` plus R4
+    /// backport `Basic`), then `Subscription` resources — each overlaid with
+    /// its shared runtime state (status/counters win over the resource's
+    /// status field). Never fires activation handshakes. Idempotent, also
+    /// used as the full-resync response after a fan-out reconnect.
+    pub async fn hydrate(&self) {
+        let Some(cluster) = &self.cluster else {
+            return;
+        };
+        let resources = match cluster
+            .hydration
+            .list_current(&["SubscriptionTopic", "Basic", "Subscription"])
+            .await
+        {
+            Ok(resources) => resources,
+            Err(e) => {
+                error!(error = %e, "Subscription hydration read failed");
+                return;
+            }
+        };
+
+        let mut topics = 0usize;
+        let mut subscriptions = 0usize;
+        for resource in resources
+            .iter()
+            .filter(|r| r.resource_type != "Subscription")
+        {
+            let Some(fhir_version) = FhirVersion::from_mime_param(&resource.fhir_version) else {
+                warn!(
+                    tenant_id = %resource.tenant_id,
+                    resource_type = %resource.resource_type,
+                    resource_id = %resource.resource_id,
+                    fhir_version = %resource.fhir_version,
+                    "Skipping hydration row with unknown FHIR version"
+                );
+                continue;
+            };
+            match resource.resource_type.as_str() {
+                "SubscriptionTopic" => {
+                    self.register_native_topic_locally(
+                        &resource.tenant_id,
+                        &resource.resource_type,
+                        &resource.resource_id,
+                        &resource.content,
+                    );
+                    topics += 1;
+                }
+                "Basic" if fhir_version.as_str() == "R4" => {
+                    if self.register_basic_topic_locally(
+                        &resource.tenant_id,
+                        &resource.resource_type,
+                        &resource.resource_id,
+                        &resource.content,
+                    ) {
+                        topics += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for resource in resources
+            .iter()
+            .filter(|r| r.resource_type == "Subscription")
+        {
+            let Some(fhir_version) = FhirVersion::from_mime_param(&resource.fhir_version) else {
+                warn!(
+                    tenant_id = %resource.tenant_id,
+                    resource_id = %resource.resource_id,
+                    fhir_version = %resource.fhir_version,
+                    "Skipping hydration row with unknown FHIR version"
+                );
+                continue;
+            };
+            if self
+                .register_subscription_locally(
+                    &resource.tenant_id,
+                    &resource.resource_id,
+                    &resource.content,
+                    fhir_version,
+                    RegistrationSource::Hydration,
+                )
+                .await
+                .is_some()
+            {
+                subscriptions += 1;
+            }
+        }
+
+        info!(
+            topics,
+            subscriptions, "Subscription state hydrated from storage"
+        );
+    }
+
+    /// Mints a single-use WebSocket binding token — in the shared store
+    /// when clustered (redeemable on any instance), else in the local map.
+    pub async fn generate_ws_token(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+    ) -> Result<(String, DateTime<Utc>), crate::error::SubscriptionError> {
+        match &self.cluster {
+            Some(cluster) => {
+                cluster
+                    .tokens
+                    .mint(
+                        &tenant_ctx(tenant_id),
+                        subscription_id,
+                        std::time::Duration::from_secs(
+                            self.config.ws_token_lifetime_secs.max(0) as u64
+                        ),
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::error::SubscriptionError::Internal(format!(
+                            "failed to mint binding token: {e}"
+                        ))
+                    })
+            }
+            None => Ok(self
+                .ws_token_manager
+                .generate_token(tenant_id, subscription_id)),
+        }
+    }
+
+    /// Redeems a single-use WebSocket binding token, returning
+    /// `(tenant_id, subscription_id)` exactly once. Fails closed: a shared
+    /// store error reads as an invalid token.
+    pub async fn redeem_ws_token(&self, token: &str) -> Option<(String, String)> {
+        match &self.cluster {
+            Some(cluster) => match cluster.tokens.redeem(token).await {
+                Ok(redeemed) => redeemed,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Binding token redeem failed against the shared store"
+                    );
+                    None
+                }
+            },
+            None => self.ws_token_manager.validate_and_consume(token),
+        }
+    }
+
+    /// A read of one subscription with cluster-shared runtime state
+    /// overlaid (eventNumber, failure streak, status) when clustered —
+    /// what `$status`/`$events` should serve. Local mode: identical to
+    /// `manager().get_subscription`.
+    pub async fn subscription_snapshot(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+    ) -> Option<ActiveSubscription> {
+        let mut sub = self.manager.get_subscription(tenant_id, subscription_id)?;
+        if let Some(cluster) = &self.cluster {
+            match cluster
+                .state
+                .get(&tenant_ctx(tenant_id), subscription_id)
+                .await
+            {
+                Ok(Some(record)) => {
+                    sub.events_since_start = record.event_number;
+                    sub.consecutive_failures = record.consecutive_failures;
+                    if let Some(status) = record
+                        .status
+                        .as_deref()
+                        .and_then(SubscriptionStatusCode::from_fhir_str)
+                    {
+                        sub.status = status;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        tenant_id,
+                        subscription_id,
+                        error = %e,
+                        "Failed to read shared subscription state; serving local snapshot"
+                    );
+                }
+            }
+        }
+        Some(sub)
     }
 }
 
@@ -1008,11 +1490,11 @@ mod tests {
     async fn test_topic_event_registers_topic() {
         let engine = make_engine("http://localhost:8080");
 
-        assert!(engine.topic_registry().list_topics().is_empty());
+        assert!(engine.topic_registry().list_topics("t1").is_empty());
 
         engine.on_resource_event(topic_event()).await;
 
-        let topics = engine.topic_registry().list_topics();
+        let topics = engine.topic_registry().list_topics("t1");
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start".to_string()));
     }
@@ -1036,7 +1518,7 @@ mod tests {
 
         engine.on_resource_event(delete_event).await;
 
-        let topics = engine.topic_registry().list_topics();
+        let topics = engine.topic_registry().list_topics("t1");
         assert!(topics.is_empty());
     }
 
@@ -1045,11 +1527,11 @@ mod tests {
     async fn test_r4_basic_topic_event_registers_topic() {
         let engine = make_engine("http://localhost:8080");
 
-        assert!(engine.topic_registry().list_topics().is_empty());
+        assert!(engine.topic_registry().list_topics("t1").is_empty());
 
         engine.on_resource_event(r4_basic_topic_event()).await;
 
-        let topics = engine.topic_registry().list_topics();
+        let topics = engine.topic_registry().list_topics("t1");
         assert_eq!(topics.len(), 1);
         assert!(topics.contains(&"http://example.org/topic/encounter-start-basic".to_string()));
     }
@@ -1063,7 +1545,7 @@ mod tests {
             .await;
 
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Create a subscription event.
         let sub_resource = crate::manager::tests::build_subscription_json(
@@ -1110,7 +1592,7 @@ mod tests {
             ..Default::default()
         };
         let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         let sub_resource = crate::manager::tests::build_subscription_json(
             "http://example.org/topic/encounter-start",
@@ -1147,7 +1629,7 @@ mod tests {
             .await;
 
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Register and activate a subscription.
         let sub_resource = crate::manager::tests::build_subscription_json(
@@ -1180,7 +1662,7 @@ mod tests {
     #[tokio::test]
     async fn test_no_dispatch_when_no_matching_subscriptions() {
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Fire an event with no subscriptions registered.
         engine.on_resource_event(encounter_event()).await;
@@ -1197,7 +1679,7 @@ mod tests {
             .await;
 
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Register subscription for Encounter topic.
         let sub_resource = crate::manager::tests::build_subscription_json(
@@ -1260,7 +1742,7 @@ mod tests {
             ..Default::default()
         };
         let engine = SubscriptionEngine::new(config, "http://localhost:8080".to_string());
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Register subscription.
         let sub_resource = crate::manager::tests::build_subscription_json(
@@ -1294,7 +1776,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_delete_event() {
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        engine.topic_registry().add_topic("t1", encounter_topic());
 
         // Register directly.
         let resource = crate::manager::tests::default_subscription_json();
@@ -1333,7 +1815,10 @@ mod tests {
             .await;
 
         let engine = make_engine("http://localhost:8080");
-        engine.topic_registry().add_topic(encounter_topic());
+        // Topics are tenant-scoped: the topic exists for tenant-a only.
+        engine
+            .topic_registry()
+            .add_topic("tenant-a", encounter_topic());
 
         // Register subscription for tenant-a.
         let sub_resource = crate::manager::tests::build_subscription_json(
