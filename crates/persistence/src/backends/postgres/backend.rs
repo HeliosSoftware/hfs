@@ -24,6 +24,10 @@ pub struct PostgresBackend {
     search_registry: Arc<RwLock<SearchParameterRegistry>>,
     /// Extractor for deriving searchable values from resources.
     search_extractor: Arc<SearchParameterExtractor>,
+    /// Memoized subscription event fan-out: one LISTEN connection per
+    /// backend, spawned lazily by the first `subscription_fanout()` call
+    /// (which must happen inside a Tokio runtime) and stopped on drop.
+    subscription_fanout: std::sync::OnceLock<Arc<super::subscription_fanout::PgNotifyFanout>>,
 }
 
 impl Debug for PostgresBackend {
@@ -192,6 +196,7 @@ impl PostgresBackend {
             config,
             search_registry,
             search_extractor,
+            subscription_fanout: std::sync::OnceLock::new(),
         })
     }
 
@@ -484,6 +489,14 @@ impl PostgresBackend {
     /// `deadpool_postgres::Pool` is `Clone` (Arc-backed), so this is cheap.
     pub(crate) fn pool(&self) -> Pool {
         self.pool.clone()
+    }
+
+    /// Returns the memoization slot for the subscription event fan-out
+    /// (see the field docs on [`PostgresBackend`]).
+    pub(crate) fn fanout_slot(
+        &self,
+    ) -> &std::sync::OnceLock<Arc<super::subscription_fanout::PgNotifyFanout>> {
+        &self.subscription_fanout
     }
 
     /// Returns a reference to the search parameter registry.

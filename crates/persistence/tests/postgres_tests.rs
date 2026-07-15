@@ -5534,4 +5534,558 @@ mod postgres_integration {
             assert_eq!(hits.load(Ordering::SeqCst), 1);
         }
     }
+
+    // ========================================================================
+    // T2 cluster suite — subscriptions substrate (Phase 3, strategy §8;
+    // B2 tokens / B4 counters / B5 outbox / B1 fan-out / B3 hydration).
+    //
+    // Every test drives two freshly constructed handles that share only the
+    // database (methodology §6). State/token/hydration tests need no lock —
+    // per-test unique tenants keep their rows disjoint; the outbox suite
+    // takes SUBSCRIPTION_OUTBOX_TEST_LOCK because `claim_next` is
+    // deliberately cross-tenant.
+    // ========================================================================
+    mod subscription_cluster_suite {
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        use serde_json::json;
+        use tokio::sync::Mutex;
+        use tokio::time::timeout;
+
+        use helios_fhir::FhirVersion;
+        use helios_persistence::backends::postgres::PostgresBackend;
+        use helios_persistence::core::ResourceStorage;
+        use helios_persistence::core::event_fanout::{FanoutEnvelope, FanoutKind, LifecycleOp};
+        use helios_persistence::core::subscription_delivery::{
+            DeliveryLeaseError, DeliveryState, NewDelivery, SubscriptionDeliveryOutbox, WorkerId,
+        };
+        use helios_persistence::core::subscription_state::SubscriptionStateStore;
+        use helios_persistence::core::ws_binding_tokens::WsBindingTokenStore;
+
+        use super::{create_backend, create_tenant};
+        use crate::cluster_harness as harness;
+
+        static SUBSCRIPTION_OUTBOX_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+        /// How long an event-driven await may take before the test fails —
+        /// generous for a loaded CI Docker host, never slept in full.
+        const RECV_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+        fn state_of(backend: &PostgresBackend) -> Arc<dyn SubscriptionStateStore> {
+            backend
+                .subscription_state_store()
+                .expect("postgres backs a subscription state store")
+        }
+
+        fn tokens_of(backend: &PostgresBackend) -> Arc<dyn WsBindingTokenStore> {
+            backend
+                .ws_binding_token_store()
+                .expect("postgres backs a ws binding token store")
+        }
+
+        fn outbox_of(backend: &PostgresBackend) -> Arc<dyn SubscriptionDeliveryOutbox> {
+            backend
+                .subscription_delivery_outbox()
+                .expect("postgres backs a delivery outbox")
+        }
+
+        fn delivery(sub: &str) -> NewDelivery {
+            NewDelivery {
+                subscription_id: sub.to_string(),
+                event_number: Some(1),
+                notification_type: "event-notification".to_string(),
+                bundle: json!({"resourceType": "Bundle", "type": "subscription-notification"}),
+            }
+        }
+
+        /// DoD row (B4): exclusivity/atomicity — two instances racing the
+        /// event-number increment observe distinct consecutive values, so
+        /// `eventNumber` stays monotonic and gap-free cluster-wide.
+        #[tokio::test]
+        async fn postgres_integration_cluster_subscription_state_increment_race_gap_free() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("sub-state-race");
+            let (a, b) = (state_of(&handles.a), state_of(&handles.b));
+
+            let (tenant_a, tenant_b) = (tenant.clone(), tenant.clone());
+            let (got_a, got_b) = harness::race2(
+                async move { a.next_event_number(&tenant_a, "sub-1").await.unwrap() },
+                async move { b.next_event_number(&tenant_b, "sub-1").await.unwrap() },
+            )
+            .await;
+
+            let mut numbers = [got_a, got_b];
+            numbers.sort_unstable();
+            assert_eq!(
+                numbers,
+                [1, 2],
+                "racing increments must observe distinct consecutive values"
+            );
+        }
+
+        /// DoD rows (B4): visibility + isolation — failures scattered across
+        /// instances accumulate in one row; a status flip via A is observed
+        /// via B; another tenant sees nothing.
+        #[tokio::test]
+        async fn postgres_integration_cluster_subscription_state_shared_and_isolated() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("sub-state-vis");
+            let (a, b) = (state_of(&handles.a), state_of(&handles.b));
+
+            // Failures scattered across instances still accumulate (the
+            // "dead endpoint never reaches the off threshold" disease).
+            assert_eq!(a.record_failure(&tenant, "sub-1").await.unwrap(), 1);
+            assert_eq!(b.record_failure(&tenant, "sub-1").await.unwrap(), 2);
+            assert_eq!(a.record_failure(&tenant, "sub-1").await.unwrap(), 3);
+
+            a.set_status(&tenant, "sub-1", "error").await.unwrap();
+            let seen_via_b = harness::assert_visible(
+                b.get(&tenant, "sub-1").await.unwrap(),
+                "state row written via instance A",
+            );
+            assert_eq!(seen_via_b.consecutive_failures, 3);
+            assert_eq!(seen_via_b.status.as_deref(), Some("error"));
+
+            // A success via B resets the shared counter for both.
+            b.reset_failures(&tenant, "sub-1").await.unwrap();
+            assert_eq!(
+                a.get(&tenant, "sub-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .consecutive_failures,
+                0
+            );
+
+            let other_tenant = create_tenant("sub-state-other");
+            harness::assert_wrong_tenant_hidden(
+                b.get(&other_tenant, "sub-1").await.unwrap(),
+                "subscription state row",
+            );
+        }
+
+        /// DoD row (B4): durability — counters survive the writing handle.
+        #[tokio::test]
+        async fn postgres_integration_cluster_subscription_state_survives_handle_drop() {
+            let tenant = create_tenant("sub-state-durable");
+            {
+                let writer = create_backend().await;
+                let state = state_of(&writer);
+                assert_eq!(state.next_event_number(&tenant, "sub-1").await.unwrap(), 1);
+                assert_eq!(state.next_event_number(&tenant, "sub-1").await.unwrap(), 2);
+            } // writer dropped
+
+            let fresh = create_backend().await;
+            let state = state_of(&fresh);
+            assert_eq!(
+                state.next_event_number(&tenant, "sub-1").await.unwrap(),
+                3,
+                "a fresh instance continues the sequence, no reset"
+            );
+        }
+
+        /// DoD rows (B1 substrate): a websocket notification bundle stored
+        /// via instance A is loadable via instance B by its fan-out key, and
+        /// invisible to another tenant.
+        #[tokio::test]
+        async fn postgres_integration_cluster_notification_events_roundtrip_across_handles() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("sub-events");
+            let (a, b) = (state_of(&handles.a), state_of(&handles.b));
+
+            let bundle = json!({
+                "resourceType": "Bundle",
+                "type": "subscription-notification",
+                "entry": [{"request": {"url": "Encounter/enc-1"}}]
+            });
+            a.put_notification_event(&tenant, "sub-1", 42, &bundle)
+                .await
+                .unwrap();
+
+            let loaded = harness::assert_visible(
+                b.get_notification_event(&tenant, "sub-1", 42)
+                    .await
+                    .unwrap(),
+                "notification bundle stored via instance A",
+            );
+            assert_eq!(loaded, bundle);
+
+            let other_tenant = create_tenant("sub-events-other");
+            harness::assert_wrong_tenant_hidden(
+                b.get_notification_event(&other_tenant, "sub-1", 42)
+                    .await
+                    .unwrap(),
+                "notification bundle",
+            );
+
+            // Subscription delete via B removes the stored bundles too.
+            b.delete(&tenant, "sub-1").await.unwrap();
+            assert!(
+                a.get_notification_event(&tenant, "sub-1", 42)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        /// DoD row (B2): exclusivity — mint on A, redeem exactly once on B;
+        /// the second redeem (any instance) fails. A zero-TTL token is
+        /// expired on arrival (DB clock — no sleeps).
+        #[tokio::test]
+        async fn postgres_integration_cluster_ws_token_mint_on_a_redeem_once_on_b() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("ws-token");
+            let (a, b) = (tokens_of(&handles.a), tokens_of(&handles.b));
+
+            let (token, expires_at) = a
+                .mint(&tenant, "sub-1", StdDuration::from_secs(30))
+                .await
+                .unwrap();
+            assert!(expires_at > chrono::Utc::now());
+
+            let redeemed = b.redeem(&token).await.unwrap();
+            assert_eq!(
+                redeemed,
+                Some((tenant.tenant_id().as_str().to_string(), "sub-1".to_string())),
+                "a token minted via A must redeem via B"
+            );
+            assert!(
+                a.redeem(&token).await.unwrap().is_none(),
+                "second redeem must fail on every instance"
+            );
+
+            // Expired-on-arrival: zero TTL, judged on the database clock.
+            let (expired, _) = a.mint(&tenant, "sub-1", StdDuration::ZERO).await.unwrap();
+            assert!(
+                b.redeem(&expired).await.unwrap().is_none(),
+                "an expired token must not redeem"
+            );
+        }
+
+        /// DoD row (B5): exclusivity — two instances race `claim_next` on
+        /// one queued delivery and exactly one wins.
+        #[tokio::test]
+        async fn postgres_integration_cluster_outbox_claim_exclusive_across_handles() {
+            let _guard = SUBSCRIPTION_OUTBOX_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("outbox-claim");
+
+            outbox_of(&handles.a)
+                .enqueue(&tenant, delivery("sub-1"))
+                .await
+                .unwrap();
+
+            let worker_a = WorkerId::new(format!("outbox-a-{}", uuid::Uuid::new_v4()));
+            let worker_b = WorkerId::new(format!("outbox-b-{}", uuid::Uuid::new_v4()));
+            let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+            let (claim_a, claim_b) = harness::race2(
+                async move {
+                    a.claim_next(&worker_a, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+                async move {
+                    b.claim_next(&worker_b, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+            )
+            .await;
+
+            harness::assert_exactly_one(&claim_a, &claim_b, "the claim on one queued delivery");
+            let winner = claim_a.or(claim_b).unwrap();
+            assert_eq!(winner.subscription_id, "sub-1");
+            assert_eq!(winner.attempts, 1, "the claim is the first attempt");
+            assert_eq!(
+                winner.lease.tenant.tenant_id().as_str(),
+                tenant.tenant_id().as_str(),
+                "the lease carries the enqueueing tenant"
+            );
+
+            // Leave nothing claimable for the next test.
+            outbox_of(&handles.b).complete(&winner.lease).await.unwrap();
+        }
+
+        /// DoD rows (B5): durability + fencing — a delivery claimed by a
+        /// worker whose lease expires (and whose handle is dropped) is
+        /// reclaimed by a fresh instance under a bumped fencing token; the
+        /// zombie's terminal write is refused. Deterministic: the "expiry"
+        /// is a zero-length lease, no sleeps.
+        #[tokio::test]
+        async fn postgres_integration_cluster_outbox_reclaimed_after_worker_death() {
+            let _guard = SUBSCRIPTION_OUTBOX_TEST_LOCK.lock().await;
+            let tenant = create_tenant("outbox-durable");
+
+            let stale = {
+                let dying = create_backend().await;
+                let outbox = outbox_of(&dying);
+                outbox.enqueue(&tenant, delivery("sub-1")).await.unwrap();
+                let worker = WorkerId::new(format!("outbox-dying-{}", uuid::Uuid::new_v4()));
+                outbox
+                    .claim_next(&worker, StdDuration::ZERO)
+                    .await
+                    .unwrap()
+                    .expect("the enqueued delivery is claimable")
+            }; // the claiming handle is dropped mid-delivery
+
+            let fresh = create_backend().await;
+            let outbox = outbox_of(&fresh);
+            let worker = WorkerId::new(format!("outbox-fresh-{}", uuid::Uuid::new_v4()));
+            let reclaimed = outbox
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("the expired-lease delivery must be reclaimable");
+            assert_eq!(reclaimed.lease.id, stale.lease.id);
+            assert_eq!(reclaimed.attempts, 2, "the reclaim is a new attempt");
+            assert!(reclaimed.lease.fencing_token > stale.lease.fencing_token);
+
+            // The dead worker's lease is fenced out of every terminal write.
+            assert!(matches!(
+                outbox.complete(&stale.lease).await,
+                Err(DeliveryLeaseError::LeaseLost { .. })
+            ));
+            assert!(matches!(
+                outbox.fail(&stale.lease, "zombie").await,
+                Err(DeliveryLeaseError::LeaseLost { .. })
+            ));
+
+            outbox.complete(&reclaimed.lease).await.unwrap();
+            let record = outbox
+                .get(&tenant, reclaimed.lease.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, DeliveryState::Delivered);
+        }
+
+        /// DoD rows (B5): retry scheduling + isolation — a retryable failure
+        /// re-queues with a future due time (not claimable until then, on
+        /// the DB's schedule column), and another tenant cannot read the
+        /// row.
+        #[tokio::test]
+        async fn postgres_integration_cluster_outbox_retry_schedule_and_isolation() {
+            let _guard = SUBSCRIPTION_OUTBOX_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("outbox-retry");
+            let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+
+            let id = a.enqueue(&tenant, delivery("sub-1")).await.unwrap();
+            let worker = WorkerId::new(format!("outbox-retry-{}", uuid::Uuid::new_v4()));
+            let claimed = a
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(3600);
+            a.release_for_retry(&claimed.lease, next_attempt, "503 from endpoint")
+                .await
+                .unwrap();
+
+            // Visible via B with the recorded error and schedule...
+            let record = harness::assert_visible(
+                b.get(&tenant, id).await.unwrap(),
+                "outbox row released via instance A",
+            );
+            assert_eq!(record.state, DeliveryState::Queued);
+            assert_eq!(record.attempts, 1);
+            assert_eq!(record.last_error.as_deref(), Some("503 from endpoint"));
+
+            // ...but not claimable before its due time.
+            let early_worker = WorkerId::new(format!("outbox-early-{}", uuid::Uuid::new_v4()));
+            assert!(
+                b.claim_next(&early_worker, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a future next_attempt_at must not be claimable"
+            );
+
+            let other_tenant = create_tenant("outbox-retry-other");
+            harness::assert_wrong_tenant_hidden(
+                b.get(&other_tenant, id).await.unwrap(),
+                "outbox row",
+            );
+            // The row stays queued an hour out — invisible to every other
+            // outbox test in this binary's lifetime, no drain needed.
+        }
+
+        /// DoD row (B1): an envelope published via instance A's fan-out
+        /// reaches instance B's subscriber over LISTEN/NOTIFY — two fully
+        /// independent fan-outs sharing only the database. Event-driven
+        /// await under a timeout, no sleeps.
+        #[tokio::test]
+        async fn postgres_integration_cluster_fanout_publish_reaches_other_handle() {
+            let handles = harness::two_handles(create_backend).await;
+            let fanout_a = handles
+                .a
+                .subscription_fanout()
+                .expect("postgres backs a fan-out");
+            let fanout_b = handles
+                .b
+                .subscription_fanout()
+                .expect("postgres backs a fan-out");
+
+            let mut envelopes_b = fanout_b.subscribe();
+            let mut wakes_b = fanout_b.subscribe_outbox_wake();
+            // B must be LISTENing before A publishes, or the NOTIFY is
+            // (correctly, by contract) lost.
+            timeout(RECV_TIMEOUT, fanout_b.ready())
+                .await
+                .expect("instance B's LISTEN session must establish");
+
+            let envelope = FanoutEnvelope::new(FanoutKind::Lifecycle {
+                tenant: "tenant-fanout".into(),
+                rtype: "Subscription".into(),
+                rid: "sub-1".into(),
+                op: LifecycleOp::Upsert,
+            });
+            fanout_a.publish(&envelope).await.unwrap();
+            let received = timeout(RECV_TIMEOUT, envelopes_b.recv())
+                .await
+                .expect("envelope must arrive on instance B")
+                .unwrap();
+            assert_eq!(received, envelope);
+
+            fanout_a.publish_outbox_wake().await.unwrap();
+            timeout(RECV_TIMEOUT, wakes_b.recv())
+                .await
+                .expect("wake hint must arrive on instance B")
+                .unwrap();
+        }
+
+        /// DoD rows (B3): hydration enumerates current subscription/topic
+        /// resources across ALL tenants — including tenants never touched by
+        /// the tenant registry — pre-filters `Basic` to backport topics, and
+        /// tenant-checks the single-resource read.
+        #[tokio::test]
+        async fn postgres_integration_cluster_hydration_lists_across_tenants() {
+            let handles = harness::two_handles(create_backend).await;
+            let tenant_a = create_tenant("hydrate-a");
+            let tenant_b = create_tenant("hydrate-b");
+
+            handles
+                .a
+                .create(
+                    &tenant_a,
+                    "SubscriptionTopic",
+                    json!({
+                        "resourceType": "SubscriptionTopic",
+                        "id": "topic-1",
+                        "url": "http://example.org/topics/encounter",
+                        "status": "active"
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            handles
+                .a
+                .create(
+                    &tenant_b,
+                    "Subscription",
+                    json!({
+                        "resourceType": "Subscription",
+                        "id": "sub-1",
+                        "status": "requested"
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            // A backport topic Basic (must be listed)...
+            handles
+                .a
+                .create(
+                    &tenant_a,
+                    "Basic",
+                    json!({
+                        "resourceType": "Basic",
+                        "id": "basic-topic",
+                        "code": {"coding": [{
+                            "system": "http://hl7.org/fhir/fhir-types",
+                            "code": "SubscriptionTopic"
+                        }]}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            // ...and an unrelated Basic (must be pre-filtered out in SQL).
+            handles
+                .a
+                .create(
+                    &tenant_a,
+                    "Basic",
+                    json!({
+                        "resourceType": "Basic",
+                        "id": "basic-unrelated",
+                        "code": {"coding": [{
+                            "system": "http://example.org/other",
+                            "code": "SomethingElse"
+                        }]}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            // Enumerate via the OTHER instance (shared-DB visibility).
+            let source = handles
+                .b
+                .subscription_hydration_source()
+                .expect("postgres backs a hydration source");
+            let listed = source
+                .list_current(&["Subscription", "SubscriptionTopic", "Basic"])
+                .await
+                .unwrap();
+
+            let ours: Vec<_> = listed
+                .iter()
+                .filter(|r| {
+                    r.tenant_id == tenant_a.tenant_id().as_str()
+                        || r.tenant_id == tenant_b.tenant_id().as_str()
+                })
+                .collect();
+            assert_eq!(
+                ours.len(),
+                3,
+                "topic + subscription + backport Basic; unrelated Basic filtered in SQL"
+            );
+            assert!(
+                ours.iter().any(|r| r.resource_type == "Subscription"
+                    && r.tenant_id == tenant_b.tenant_id().as_str()),
+                "hydration must cross tenants (registry-independent)"
+            );
+            assert!(
+                !ours.iter().any(|r| r.resource_id == "basic-unrelated"),
+                "a non-topic Basic must not be hauled into memory"
+            );
+            for resource in &ours {
+                assert!(
+                    !resource.fhir_version.is_empty(),
+                    "hydrated rows carry their FHIR version for parser selection"
+                );
+            }
+
+            // Tenant-checked single read (the lifecycle re-read path).
+            let read = harness::assert_visible(
+                source
+                    .get_current(&tenant_a, "SubscriptionTopic", "topic-1")
+                    .await
+                    .unwrap(),
+                "topic resource read back for its owner",
+            );
+            assert_eq!(read.content["url"], "http://example.org/topics/encounter");
+            harness::assert_wrong_tenant_hidden(
+                source
+                    .get_current(&tenant_b, "SubscriptionTopic", "topic-1")
+                    .await
+                    .unwrap(),
+                "another tenant's topic resource",
+            );
+        }
+    }
 }

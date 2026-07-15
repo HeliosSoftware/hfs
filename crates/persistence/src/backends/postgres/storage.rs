@@ -87,6 +87,52 @@ impl ResourceStorage for PostgresBackend {
         Some(std::sync::Arc::new(PgClusterRefreshCache::new(self.pool())))
     }
 
+    fn subscription_state_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::subscription_state::SubscriptionStateStore>> {
+        use super::subscription_state::PgSubscriptionStateStore;
+        Some(std::sync::Arc::new(PgSubscriptionStateStore::new(
+            self.pool(),
+        )))
+    }
+
+    fn subscription_hydration_source(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::subscription_state::SubscriptionHydrationSource>>
+    {
+        use super::subscription_state::PgSubscriptionStateStore;
+        Some(std::sync::Arc::new(PgSubscriptionStateStore::new(
+            self.pool(),
+        )))
+    }
+
+    fn subscription_delivery_outbox(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>>
+    {
+        use super::subscription_outbox::PgSubscriptionDeliveryOutbox;
+        Some(std::sync::Arc::new(PgSubscriptionDeliveryOutbox::new(
+            self.pool(),
+        )))
+    }
+
+    fn ws_binding_token_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
+        use super::subscription_ws_tokens::PgWsBindingTokenStore;
+        Some(std::sync::Arc::new(PgWsBindingTokenStore::new(self.pool())))
+    }
+
+    fn subscription_fanout(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::event_fanout::EventFanout>> {
+        use super::subscription_fanout::PgNotifyFanout;
+        let fanout = self.fanout_slot().get_or_init(|| {
+            std::sync::Arc::new(PgNotifyFanout::new(self.pool(), self.config().clone()))
+        });
+        Some(std::sync::Arc::clone(fanout) as _)
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,

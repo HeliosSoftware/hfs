@@ -81,6 +81,10 @@ pub(crate) mod schema;
 pub mod search;
 mod search_impl;
 mod storage;
+mod subscription_fanout;
+mod subscription_outbox;
+mod subscription_state;
+mod subscription_ws_tokens;
 mod transaction;
 mod user_settings;
 
