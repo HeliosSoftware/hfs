@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -15,7 +15,7 @@ const MIGRATION_LOCK_KEY: i64 = 0x4846_5300_4d49_4752; // "HFS\0MIGR"
 /// processes routinely share one database (see `.github/workflows/cluster-smoke.yml`,
 /// which runs two), and `schema_version` is read-then-written without a
 /// transaction. While every migration was millisecond-fast the race window was
-/// invisible; v14 builds indexes over the whole `search_index` table, which
+/// invisible; v15 builds indexes over the whole `search_index` table, which
 /// widens it to minutes. Without the lock, a second instance can observe the old
 /// version, re-run the migration, and begin serving traffic while the first is
 /// still building.
@@ -312,6 +312,7 @@ async fn migrate_schema(
             11 => migrate_v11_to_v12(client).await?,
             12 => migrate_v12_to_v13(client).await?,
             13 => migrate_v13_to_v14(client).await?,
+            14 => migrate_v14_to_v15(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -826,7 +827,7 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v13 -> v14: search performance indexes (issue #224).
+/// v14 -> v15: search performance indexes (issue #224).
 ///
 /// Purely additive — nothing is dropped and no query semantics change. Every index
 /// here was validated against a 1.45M-row replica of the benchmark dataset: each
@@ -861,7 +862,7 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
 /// `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would see the name and skip it forever
 /// — the index would silently never exist while the version marker claimed
 /// otherwise.
-async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v14_to_v15(client: &deadpool_postgres::Client) -> StorageResult<()> {
     let stmts = [
         // Ordered pagination.
         //
@@ -916,7 +917,7 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
         client
             .execute(sql, &[])
             .await
-            .map_err(|e| pg_error(format!("Migration v13->v14 failed: {}", e)))?;
+            .map_err(|e| pg_error(format!("Migration v14->v15 failed: {}", e)))?;
     }
 
     // Multivariate statistics.
@@ -966,13 +967,41 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
     for sql in stats {
         if let Err(e) = client.execute(sql, &[]).await {
             tracing::warn!(
-                "Migration v13->v14: optional statistics step failed (plans may be \
+                "Migration v14->v15: optional statistics step failed (plans may be \
                  suboptimal, search remains correct): {}",
                 e
             );
         }
     }
 
+    Ok(())
+}
+
+/// v13 -> v14: Add the tenant registry, mirroring the SQLite v14 migration.
+///
+/// A canonical list of first-class tenants backing the admin
+/// tenant-maintenance API (list / add / delete). Until now a tenant was only
+/// ever an implicit identifier string; this table records the tenants that
+/// have been explicitly provisioned, with an optional human-friendly display
+/// name and a creation timestamp. Tenants that merely have data but were never
+/// registered are still discoverable via a `GROUP BY tenant_id` on
+/// `resources`; the registry adds the metadata that data alone cannot provide.
+///
+/// `created_at` is stored as RFC 3339 TEXT (not TIMESTAMPTZ) so the registry
+/// reads back byte-identically across backends.
+async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS tenants (
+                id           TEXT PRIMARY KEY,
+                display_name TEXT,
+                created_at   TEXT NOT NULL DEFAULT \
+                    to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v13->v14 failed: {}", e)))?;
     Ok(())
 }
 
