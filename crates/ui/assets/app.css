@@ -3062,3 +3062,49 @@ body.has-nav-panel {
   text-align: left;
   font-weight: 500;
 }
+
+/* ---------------------------------------------------------------------------
+   Collapsible sidebar (#282): a toggle shrinks the sidebar to an icon rail.
+   The state is a class on <html> set before first paint by nav.js.
+   --------------------------------------------------------------------------- */
+
+.nav-collapse {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  margin-left: auto;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.nav-collapse:hover { color: var(--text); background: var(--input-bg); }
+
+/* Collapsed: the sidebar column narrows, labels hide, icons stay centred. */
+html.nav-collapsed body { grid-template-columns: 72px 1fr; }
+html.nav-collapsed body.has-nav-panel { grid-template-columns: 72px 232px 1fr; }
+
+html.nav-collapsed .sidebar { padding: 20px 12px; }
+
+/* Text nodes (raw nav labels) collapse with font-size:0; the SVG icon keeps
+   its own size. Explicit label elements hide outright. */
+html.nav-collapsed .nav-item { font-size: 0; justify-content: center; padding: 0; }
+html.nav-collapsed .nav-item .icon { font-size: initial; }
+html.nav-collapsed .brand__text,
+html.nav-collapsed .nav__section,
+html.nav-collapsed .selector__label,
+html.nav-collapsed .selector__chevrons,
+html.nav-collapsed .sidebar__foot { display: none; }
+
+/* On the rail the brand stacks — logo, then the toggle to expand back. */
+html.nav-collapsed .brand {
+  flex-direction: column;
+  gap: 10px;
+  align-items: center;
+}
+html.nav-collapsed .nav-collapse { margin: 0; }
+html.nav-collapsed .selector { justify-content: center; padding: 8px; }
+html.nav-collapsed .selector > .avatar { margin: 0; }
+html.nav-collapsed .menu__panel { left: 0; }

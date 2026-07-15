@@ -376,3 +376,5 @@ resources-tab-history = History
 resources-types-heading = Resource types
 
 queries-saved-group = Saved
+
+nav-collapse = Collapse menu

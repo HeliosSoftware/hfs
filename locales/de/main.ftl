@@ -372,3 +372,5 @@ resources-tab-history = Verlauf
 resources-types-heading = Ressourcentypen
 
 queries-saved-group = Gespeichert
+
+nav-collapse = Menü einklappen

@@ -372,3 +372,5 @@ resources-tab-history = Historial
 resources-types-heading = Tipos de recurso
 
 queries-saved-group = Guardadas
+
+nav-collapse = Colapsar menú
