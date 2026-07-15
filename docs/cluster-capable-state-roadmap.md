@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-15 (**Phase 2 COMPLETE** — code landed; gate pending CI on the push)
+**Last updated:** 2026-07-15 (**Phase 2 COMPLETE** — gate met)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -103,10 +103,19 @@ so a DB-only cluster still needs no Redis; standing decision (2) is resolved.
 | **PR 2.4 — rest bridge + T2 suite**: `StoreJwksCoordination` adapts persistence's store to auth's trait (rest depends on both; no persistence↔auth edge). **The strategy §8 C2 suite**: `rest/tests/jwks_cluster_pg.rs` — two fresh `JwksCache`+backend pairs vs one wiremock IdP: barrier-raced boot herd → **exactly one upstream fetch**, late-joiner reuse → zero, rotation race → exactly one additional (loser adopts via watermark). wiremock added to rest dev-deps. | `rest/src/jwks_coordination.rs`, `rest/tests/jwks_cluster_pg.rs` | `949feee3` |
 | **PR 2.5 — hfs wiring**: `resolve_jwks_coordination` (unset → `database` under `HFS_CLUSTER`; explicit `local` **warns, never refuses** — C2 is the one warn-only cluster concern, doc'd against the refusal table; `redis` needs the feature + URL; invalid values fail fast). `init_auth_with_audit` finishes local/redis boots itself and defers the database-mode initial fetch to `finish_auth_boot`, called on the **primary** handle in all 8 `start_*` fns (backends without a store warn + stay per-instance, the `reindex_cluster_store` posture). Verified end-to-end: two binaries + one Postgres + mock IdP → 1 IdP hit total, "Reused shared JWKS document" on B, refusal/warning cases exact. | `hfs/src/cluster.rs`, `hfs/src/main.rs` | `90c61cde` |
 
-**Phase 2 gate (strategy §8, rescoped):** T1 + T2 all green locally (6+4
-persistence, 6 auth contract, 3 PG suite, 3 Redis twin against a real
-container, 6 hfs resolution/validator). **CI confirmation pending the push
-of these commits** — record the run link here when green.
+**Phase 2 gate (strategy §8, rescoped): MET 2026-07-15.** On the Phase 2 head
+(`20056ff5` — an empty `ci:` commit; the docs head carried `[skip ci]`, the
+known gotcha): full CI green
+([run 29441746666](https://github.com/HeliosSoftware/hfs/actions/runs/29441746666)
+— the C2 T2 suites ride `test-rust`), the new **Redis Cluster Tests**
+workflow green on its first `pull_request` firing
+([run 29441746418](https://github.com/HeliosSoftware/hfs/actions/runs/29441746418)
+— gated twin against a real Redis container on the CI Docker host), and
+cluster-smoke green
+([run 29441743065](https://github.com/HeliosSoftware/hfs/actions/runs/29441743065)
+— no regression; no new smoke check by design). Locally the same suites were
+green first (6+4 persistence, 6 auth contract, 3 PG, 3 Redis twin, 6 hfs
+resolution/validator), plus the two-binary end-to-end boot check.
 
 **No T3 smoke addition** (deliberate): C2 changes no user-visible behavior —
 same keys, same 401s; its only observable is the upstream IdP hit count,
