@@ -41,6 +41,8 @@ pub mod scope;
 pub use config::AuthConfig;
 pub use discovery::SmartConfiguration;
 pub use error::{AuthError, FhirOperation};
+#[cfg(feature = "redis")]
+pub use jwks::RedisJwksCoordination;
 pub use jwks::{
     CoordinatedJwks, FetchedJwks, JwksCache, JwksCoordination, JwksCoordinationError, JwksFetchFn,
 };

@@ -44,6 +44,9 @@ bulk-submit-jwe = ["helios-rest/bulk-submit-jwe"]
 # Cloud audit backends
 cloudwatch = ["helios-audit/cloudwatch"]
 
+# Redis-backed JWKS refresh coordination (HFS_AUTH_JWKS_COORDINATION=redis)
+redis = ["helios-auth/redis"]
+
 # OpenTelemetry OTLP trace export (heavy deps; opt-in for production images)
 otel = ["helios-observability/otel"]
 
