@@ -482,6 +482,15 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
                     });
                 }
 
+                if crate::ucum_validate::is_ucum_url(&system)
+                    && crate::ucum_validate::is_valid_ucum_code(&req.code)
+                {
+                    return Ok(crate::ucum_validate::composed_code_success(
+                        &req.code,
+                        cs_version_str,
+                    ));
+                }
+
                 let text = match cs_version_str.as_deref() {
                     Some(v) => format!(
                         "Unknown code '{}' in the CodeSystem '{}' version '{}'",
@@ -564,16 +573,16 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         }
 
         // Inactive concept: emit the canonical INACTIVE_CONCEPT_FOUND warning.
-        // When the concept's status is more specific than `inactive` (e.g.
-        // `retired`), the operations layer rewrites this issue's text in place
-        // to the merged form ("...status of retired and inactive...") via
-        // `lookup_concept_status`.
+        // The operations layer also appends a specific-status companion (e.g.
+        // "...status of retired...") via `lookup_concept_status`.
         //
         // No `location` field — the IG `validation/validate-contained-good`
         // fixture (inline-VS path) pins this warning WITHOUT a location.
-        // URL-based VS-validate-code paths (e.g. `inactive-2a-validate`) emit
-        // their own INACTIVE_CONCEPT_FOUND WITH location via
-        // finish_validate_code_response, separately.
+        // The operations layer then clones the template for the
+        // specific-status companion, so the location-less template flows
+        // through both issues. URL-based VS-validate-code paths (e.g.
+        // `inactive-2a-validate`) emit their own INACTIVE_CONCEPT_FOUND
+        // WITH location via finish_validate_code_response, separately.
         // Mirrors SQLite's CS-side behaviour (which doesn't emit at all).
         if is_inactive {
             issues.push(crate::types::ValidationIssue {
@@ -1328,7 +1337,18 @@ async fn resolve_code_system(
              FROM code_systems
              WHERE url = $1
                AND ($2::text IS NULL OR (resource_json->>'date') <= $2)
-             ORDER BY COALESCE(version, '') DESC",
+             ORDER BY (CASE COALESCE(content, 'complete')
+                            WHEN 'complete'   THEN 0
+                            WHEN 'supplement' THEN 0
+                            WHEN 'fragment'   THEN 1
+                            WHEN 'example'    THEN 1
+                            WHEN 'not-present' THEN 2
+                            ELSE 1 END),
+                      (CASE WHEN EXISTS (
+                          SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id
+                      ) THEN 0 ELSE 1 END),
+                      COALESCE(version, '') DESC,
+                      id",
             &[&url, &date],
         )
         .await
@@ -1347,6 +1367,9 @@ async fn resolve_code_system(
             select_best_version_match(&candidates, ver).ok_or_else(|| {
                 HtsError::NotFound(format!("CodeSystem not found: {url} (version {ver})"))
             })
+        }
+        Some(ver) if crate::backends::code_system_version_is_current(ver) => {
+            Ok(candidates.into_iter().next().expect("non-empty checked"))
         }
         Some(ver) => candidates
             .into_iter()

@@ -267,7 +267,11 @@ impl ElasticsearchBackend {
     }
 
     /// Returns the search parameter extractor.
-    pub(crate) fn search_extractor(&self) -> &Arc<SearchParameterExtractor> {
+    ///
+    /// Public because the `s3`+Elasticsearch composite has no SQL primary to
+    /// borrow an extractor from: S3 stores resources but maintains no search
+    /// index, so Elasticsearch's extractor is the only one in that deployment.
+    pub fn search_extractor(&self) -> &Arc<SearchParameterExtractor> {
         &self.search_extractor
     }
 
