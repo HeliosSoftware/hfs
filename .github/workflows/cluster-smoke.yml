@@ -63,7 +63,7 @@ jobs:
       - name: Build HFS binary
         run: |
           cargo build -p helios-hfs --no-default-features \
-            --features R4,postgres
+            --features R4,postgres,subscriptions
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v7
@@ -235,6 +235,8 @@ jobs:
             HFS_JOB_STORE_BACKEND=database
             HFS_EXPORT_CONTROLLER=database
             HFS_EXPORT_DIR="$SHARED_EXPORT_DIR"
+            HFS_SUBSCRIPTIONS_ENABLED=true
+            HFS_SUBSCRIPTIONS_FANOUT=pg-notify
           )
 
           # Persisted so the nightly kill-9 check can restart an instance
@@ -277,6 +279,35 @@ jobs:
           wait_ready A "$HFS_PID_A" "$HFS_PORT_A" "$HFS_LOG_A"
           wait_ready B "$HFS_PID_B" "$HFS_PORT_B" "$HFS_LOG_B"
 
+      # Check 5 (Phase 3 WS fan-out) needs a websocket client; same pinned
+      # build the subscriptions smoke uses.
+      - name: Install websocat
+        run: |
+          if command -v websocat >/dev/null 2>&1; then
+            echo "WEBSOCAT_BIN=$(command -v websocat)" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64)
+              ASSET="websocat.x86_64-unknown-linux-musl"
+              ;;
+            aarch64|arm64)
+              ASSET="websocat.aarch64-unknown-linux-musl"
+              ;;
+            *)
+              echo "::error::Unsupported architecture for websocat install: $ARCH"
+              exit 1
+              ;;
+          esac
+
+          WEBSOCAT_PATH="/tmp/websocat"
+          curl -fsSL "https://github.com/vi/websocat/releases/download/v1.13.0/${ASSET}" -o "$WEBSOCAT_PATH"
+          chmod +x "$WEBSOCAT_PATH"
+          echo "WEBSOCAT_BIN=$WEBSOCAT_PATH" >> $GITHUB_ENV
+          "$WEBSOCAT_PATH" --version
+
       - name: Run cluster smoke checks
         run: |
           BASE_URL_A="http://localhost:$HFS_PORT_A" \
@@ -285,6 +316,7 @@ jobs:
           FHIR_VERSION="$FHIR_VERSION" \
           RESULTS_DIR="$RESULTS_DIR" \
           SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}" \
+          WEBSOCAT_BIN="$WEBSOCAT_BIN" \
           ./crates/hfs/tests/cluster/run_external_cluster_smoke.sh
 
       - name: Nightly kill-9 recovery check (A1)
