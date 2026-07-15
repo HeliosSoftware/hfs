@@ -53,6 +53,15 @@ impl SearchParameterStatus {
 }
 
 /// Source of a SearchParameter definition.
+///
+/// The source also carries the **shadowing precedence** (see
+/// [`precedence`](Self::precedence)): when two parameters from *different*
+/// sources share a `(base, code)` slot, the higher-precedence source resolves
+/// searches — deliberately, so an implementer can override a spec parameter's
+/// expression by loading their own definition under a new canonical URL. Two
+/// parameters from the *same* source sharing a slot have no precedence to
+/// break the tie and are rejected as a conflict
+/// ([`RegistryError::DuplicateCode`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchParameterSource {
@@ -63,6 +72,22 @@ pub enum SearchParameterSource {
     Stored,
     /// Runtime configuration file.
     Config,
+}
+
+impl SearchParameterSource {
+    /// Shadowing precedence: `Embedded < Config < Stored`.
+    ///
+    /// Spec defaults lose to definitions the operator placed in the data
+    /// directory, which in turn lose to definitions administered through the
+    /// FHIR API. Resolution depends only on this ordering, never on load
+    /// order.
+    pub fn precedence(&self) -> u8 {
+        match self {
+            SearchParameterSource::Embedded => 0,
+            SearchParameterSource::Config => 1,
+            SearchParameterSource::Stored => 2,
+        }
+    }
 }
 
 /// Component of a composite search parameter.
@@ -208,9 +233,18 @@ impl SearchParameterDefinition {
 /// Provides fast lookup by (resource_type, param_code) and by URL.
 /// External locking (e.g. `Arc<RwLock<...>>`) is the caller's
 /// responsibility — the registry itself is a plain struct.
+///
+/// Every registered parameter is kept in both indexes. A `(base, code)` slot
+/// holds *all* the parameters claiming it, ordered by
+/// [`SearchParameterSource::precedence`] (ties broken by registration order),
+/// and the head of that list is what resolves searches. Registering,
+/// unregistering, or re-statusing a *shadowed* parameter therefore never
+/// changes which definition answers a query, and removing the winner
+/// re-points the slot at the next candidate instead of leaving a hole (#239).
 pub struct SearchParameterRegistry {
-    /// Parameters indexed by (resource_type, param_code).
-    params_by_type: HashMap<String, HashMap<String, Arc<SearchParameterDefinition>>>,
+    /// Parameters indexed by (resource_type, param_code). Each slot holds the
+    /// candidates in descending precedence order; the first entry wins.
+    params_by_type: HashMap<String, HashMap<String, Vec<Arc<SearchParameterDefinition>>>>,
 
     /// Parameters indexed by canonical URL.
     params_by_url: HashMap<String, Arc<SearchParameterDefinition>>,
@@ -251,12 +285,16 @@ impl SearchParameterRegistry {
     }
 
     /// Gets all active parameters for a resource type.
+    ///
+    /// One parameter per `(base, code)` slot — the winning candidate — with
+    /// unusable statuses filtered out.
     pub fn get_active_params(&self, resource_type: &str) -> Vec<Arc<SearchParameterDefinition>> {
         self.params_by_type
             .get(resource_type)
             .map(|params| {
                 params
                     .values()
+                    .filter_map(|candidates| candidates.first())
                     .filter(|p| p.status.is_usable())
                     .cloned()
                     .collect()
@@ -265,10 +303,19 @@ impl SearchParameterRegistry {
     }
 
     /// Gets all parameters for a resource type (including inactive).
+    ///
+    /// One parameter per `(base, code)` slot — shadowed candidates are not
+    /// included; they remain reachable via [`get_by_url`](Self::get_by_url).
     pub fn get_all_params(&self, resource_type: &str) -> Vec<Arc<SearchParameterDefinition>> {
         self.params_by_type
             .get(resource_type)
-            .map(|params| params.values().cloned().collect())
+            .map(|params| {
+                params
+                    .values()
+                    .filter_map(|candidates| candidates.first())
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -281,6 +328,7 @@ impl SearchParameterRegistry {
         self.params_by_type
             .get(resource_type)
             .and_then(|params| params.get(code))
+            .and_then(|candidates| candidates.first())
             .cloned()
     }
 
@@ -290,15 +338,43 @@ impl SearchParameterRegistry {
     }
 
     /// Registers a new parameter.
+    ///
+    /// Fails with [`RegistryError::DuplicateUrl`] when the canonical URL is
+    /// already registered, and with [`RegistryError::DuplicateCode`] when a
+    /// parameter **from the same source** already claims one of the
+    /// `(base, code)` slots — same-source collisions have no precedence to
+    /// resolve them. A cross-source collision registers successfully as a
+    /// shadow (resolved by [`SearchParameterSource::precedence`]) and logs a
+    /// `WARN` naming both canonical URLs.
     pub fn register(&mut self, param: SearchParameterDefinition) -> Result<(), RegistryError> {
         if self.params_by_url.contains_key(&param.url) {
             return Err(RegistryError::DuplicateUrl { url: param.url });
+        }
+        // Validate every slot before mutating any, so a rejected registration
+        // leaves the registry untouched.
+        for base in &param.base {
+            if let Some(existing) = self
+                .params_by_type
+                .get(base)
+                .and_then(|params| params.get(&param.code))
+                .and_then(|candidates| candidates.iter().find(|c| c.source == param.source))
+            {
+                return Err(RegistryError::DuplicateCode {
+                    base: base.clone(),
+                    code: param.code.clone(),
+                    existing_url: existing.url.clone(),
+                });
+            }
         }
         self.register_internal(param);
         Ok(())
     }
 
     /// Internal registration without duplicate checking.
+    ///
+    /// Bulk-load path: same-source `(base, code)` collisions are tolerated
+    /// here (first registration wins the tie) so that loading a malformed
+    /// custom file degrades to a warning instead of aborting startup.
     fn register_internal(&mut self, param: SearchParameterDefinition) {
         let param = Arc::new(param);
 
@@ -308,14 +384,50 @@ impl SearchParameterRegistry {
 
         // Index by (resource_type, code) for each base type
         for base in &param.base {
-            self.params_by_type
+            let candidates = self
+                .params_by_type
                 .entry(base.clone())
                 .or_default()
-                .insert(param.code.clone(), Arc::clone(&param));
+                .entry(param.code.clone())
+                .or_default();
+
+            // Descending precedence, stable within a precedence level, so the
+            // winner (index 0) is independent of load order.
+            let position = candidates
+                .iter()
+                .position(|c| c.source.precedence() < param.source.precedence())
+                .unwrap_or(candidates.len());
+            candidates.insert(position, Arc::clone(&param));
+
+            if position == 0 {
+                if let Some(shadowed) = candidates.get(1) {
+                    tracing::warn!(
+                        base = %base,
+                        code = %param.code,
+                        winner = %param.url,
+                        shadowed = %shadowed.url,
+                        "SearchParameter shadows an existing definition on (base, code); \
+                         the higher-precedence source now resolves searches"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    base = %base,
+                    code = %param.code,
+                    winner = %candidates[0].url,
+                    shadowed = %param.url,
+                    "SearchParameter registered shadowed on (base, code); \
+                     an existing higher-precedence definition keeps resolving searches"
+                );
+            }
         }
     }
 
     /// Updates a parameter's status.
+    ///
+    /// Replaces the definition **in place** in every index: a shadowed
+    /// parameter keeps its position behind the winner, so a status edit never
+    /// changes which definition resolves searches.
     pub fn update_status(
         &mut self,
         url: &str,
@@ -338,10 +450,15 @@ impl SearchParameterRegistry {
         self.params_by_url
             .insert(url.to_string(), Arc::clone(&new_param));
 
-        // Update type indexes
+        // Update type indexes: swap the same slot position by URL identity.
         for base in &new_param.base {
-            if let Some(type_params) = self.params_by_type.get_mut(base) {
-                type_params.insert(new_param.code.clone(), Arc::clone(&new_param));
+            if let Some(candidates) = self
+                .params_by_type
+                .get_mut(base)
+                .and_then(|params| params.get_mut(&new_param.code))
+                && let Some(slot) = candidates.iter_mut().find(|c| c.url == *url)
+            {
+                *slot = Arc::clone(&new_param);
             }
         }
 
@@ -349,6 +466,10 @@ impl SearchParameterRegistry {
     }
 
     /// Removes a parameter from the registry.
+    ///
+    /// Only the candidate with this exact canonical URL is evicted from each
+    /// `(base, code)` slot; removing a shadowed parameter leaves the winner
+    /// untouched, and removing the winner promotes the next candidate.
     pub fn unregister(&mut self, url: &str) -> Result<(), RegistryError> {
         let param = self
             .params_by_url
@@ -357,10 +478,15 @@ impl SearchParameterRegistry {
                 identifier: url.to_string(),
             })?;
 
-        // Remove from type indexes
+        // Remove from type indexes by URL identity.
         for base in &param.base {
             if let Some(type_params) = self.params_by_type.get_mut(base) {
-                type_params.remove(&param.code);
+                if let Some(candidates) = type_params.get_mut(&param.code) {
+                    candidates.retain(|c| c.url != param.url);
+                    if candidates.is_empty() {
+                        type_params.remove(&param.code);
+                    }
+                }
                 if type_params.is_empty() {
                     self.params_by_type.remove(base);
                 }
@@ -653,5 +779,171 @@ mod tests {
         registry.register(def.clone()).unwrap();
         let result = registry.register(def);
         assert!(matches!(result, Err(RegistryError::DuplicateUrl { .. })));
+    }
+
+    // ---- (base, code) shadowing (#239) ----------------------------------
+
+    const SPEC_URL: &str = "http://hl7.org/fhir/SearchParameter/clinical-code";
+    const CUSTOM_URL: &str = "http://acme.health/fhir/SearchParameter/observation-code-local";
+
+    fn spec_code_param() -> SearchParameterDefinition {
+        SearchParameterDefinition::new(SPEC_URL, "code", SearchParamType::Token, "Observation.code")
+            .with_base(vec!["Observation"])
+            .with_source(SearchParameterSource::Embedded)
+    }
+
+    fn custom_code_param() -> SearchParameterDefinition {
+        SearchParameterDefinition::new(
+            CUSTOM_URL,
+            "code",
+            SearchParamType::Token,
+            "Observation.code.coding.where(system='http://acme.health/local')",
+        )
+        .with_base(vec!["Observation"])
+        .with_source(SearchParameterSource::Config)
+    }
+
+    #[test]
+    fn shadowing_resolves_by_source_precedence_not_load_order() {
+        for reversed in [false, true] {
+            let mut registry = SearchParameterRegistry::new();
+            let (first, second) = if reversed {
+                (custom_code_param(), spec_code_param())
+            } else {
+                (spec_code_param(), custom_code_param())
+            };
+            registry.register(first).unwrap();
+            registry.register(second).unwrap();
+
+            // Both registrations are visible and reachable by URL.
+            assert_eq!(registry.len(), 2);
+            assert!(registry.get_by_url(SPEC_URL).is_some());
+            assert!(registry.get_by_url(CUSTOM_URL).is_some());
+
+            // Config outranks Embedded regardless of which loaded first.
+            let resolved = registry.get_param("Observation", "code").unwrap();
+            assert_eq!(resolved.url, CUSTOM_URL, "reversed={reversed}");
+            assert_eq!(registry.get_active_params("Observation").len(), 1);
+        }
+    }
+
+    #[test]
+    fn same_source_collision_is_rejected() {
+        let mut registry = SearchParameterRegistry::new();
+        registry.register(custom_code_param()).unwrap();
+
+        let rival = SearchParameterDefinition::new(
+            "http://acme.health/fhir/SearchParameter/observation-code-other",
+            "code",
+            SearchParamType::Token,
+            "Observation.code",
+        )
+        .with_base(vec!["Observation"])
+        .with_source(SearchParameterSource::Config);
+
+        let result = registry.register(rival);
+        assert!(matches!(
+            result,
+            Err(RegistryError::DuplicateCode { ref existing_url, .. }) if existing_url == CUSTOM_URL
+        ));
+        // The losing registration left no trace.
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.get_param("Observation", "code").unwrap().url,
+            CUSTOM_URL
+        );
+    }
+
+    /// A rejected registration must not leave partial index entries behind
+    /// when only one of several base types collides.
+    #[test]
+    fn rejected_registration_leaves_registry_untouched() {
+        let mut registry = SearchParameterRegistry::new();
+        registry.register(custom_code_param()).unwrap();
+
+        let partial_collision = SearchParameterDefinition::new(
+            "http://acme.health/fhir/SearchParameter/multi-base-code",
+            "code",
+            SearchParamType::Token,
+            "Observation.code",
+        )
+        .with_base(vec!["Patient", "Observation"])
+        .with_source(SearchParameterSource::Config);
+
+        assert!(registry.register(partial_collision).is_err());
+        assert!(registry.get_param("Patient", "code").is_none());
+        assert!(!registry.resource_types().contains(&"Patient".to_string()));
+    }
+
+    /// Symptom 2 (#239): unregistering the shadowed loser must not evict the
+    /// winner's index entry.
+    #[test]
+    fn unregister_shadowed_param_keeps_winner_searchable() {
+        let mut registry = SearchParameterRegistry::new();
+        registry.register(spec_code_param()).unwrap();
+        registry.register(custom_code_param()).unwrap();
+
+        registry.unregister(SPEC_URL).unwrap();
+
+        assert_eq!(registry.len(), 1);
+        let resolved = registry.get_param("Observation", "code").unwrap();
+        assert_eq!(resolved.url, CUSTOM_URL);
+        assert!(
+            registry
+                .resource_types()
+                .contains(&"Observation".to_string())
+        );
+    }
+
+    /// Removing the winner promotes the next candidate instead of leaving the
+    /// slot empty.
+    #[test]
+    fn unregister_winner_promotes_next_candidate() {
+        let mut registry = SearchParameterRegistry::new();
+        registry.register(spec_code_param()).unwrap();
+        registry.register(custom_code_param()).unwrap();
+
+        registry.unregister(CUSTOM_URL).unwrap();
+
+        let resolved = registry.get_param("Observation", "code").unwrap();
+        assert_eq!(resolved.url, SPEC_URL);
+    }
+
+    /// Symptom 3 (#239): a status edit on the shadowed loser must not flip
+    /// which definition resolves searches.
+    #[test]
+    fn update_status_on_shadowed_does_not_change_resolution() {
+        let mut registry = SearchParameterRegistry::new();
+        registry.register(spec_code_param()).unwrap();
+        registry.register(custom_code_param()).unwrap();
+
+        registry
+            .update_status(SPEC_URL, SearchParameterStatus::Retired)
+            .unwrap();
+
+        let resolved = registry.get_param("Observation", "code").unwrap();
+        assert_eq!(resolved.url, CUSTOM_URL);
+        // The edit itself landed on the shadowed definition.
+        assert_eq!(
+            registry.get_by_url(SPEC_URL).unwrap().status,
+            SearchParameterStatus::Retired
+        );
+    }
+
+    #[test]
+    fn update_status_still_applies_to_the_winner() {
+        let mut registry = SearchParameterRegistry::new();
+        registry.register(spec_code_param()).unwrap();
+        registry.register(custom_code_param()).unwrap();
+
+        registry
+            .update_status(CUSTOM_URL, SearchParameterStatus::Retired)
+            .unwrap();
+
+        // The winner still owns the slot; it is just no longer active.
+        let resolved = registry.get_param("Observation", "code").unwrap();
+        assert_eq!(resolved.url, CUSTOM_URL);
+        assert_eq!(resolved.status, SearchParameterStatus::Retired);
+        assert!(registry.get_active_params("Observation").is_empty());
     }
 }

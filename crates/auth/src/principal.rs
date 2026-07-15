@@ -16,7 +16,8 @@ pub struct Principal {
     pub tenant_id: Option<String>,
     /// Parsed SMART v2 scopes granted to this principal.
     pub scopes: ScopeSet,
-    /// The `jti` (JWT ID) claim, used for replay prevention.
+    /// The `jti` (JWT ID) claim, if the token carried one. Informational —
+    /// bearer access tokens are reusable, so this is not a single-use marker.
     pub jti: Option<String>,
     /// Token expiration time.
     pub expires_at: DateTime<Utc>,

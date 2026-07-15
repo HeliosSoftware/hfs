@@ -86,6 +86,36 @@ nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capacidad y conformidad
 nav-admin-ops = Administración / Operaciones
 nav-subscriptions = Suscripciones
+nav-tenants = Tenants
+nav-toggle = Contraer o expandir la navegación
+
+## Mantenimiento de tenants (/ui/tenants)
+
+tenants-title = Mantenimiento de tenants
+tenants-unavailable = El registro de tenants no está disponible en este backend de almacenamiento.
+tenants-stat-total = Tenants totales
+tenants-stat-total-sub = { $count ->
+    [one] { $count } registrado
+   *[other] { $count } registrados
+}
+tenants-stat-resources = Recursos almacenados
+tenants-stat-resources-sub = en todos los tenants
+tenants-search-placeholder = Buscar por nombre o id de tenant…
+tenants-add = Añadir tenant
+tenants-add-title = Añadir un tenant
+tenants-field-id = Id del tenant
+tenants-field-id-hint = Se usa en la API (cabecera X-Tenant-ID, prefijo de URL, claim del JWT).
+tenants-field-name = Nombre visible (opcional)
+tenants-field-name-hint = Una etiqueta legible; no se usa para el enrutamiento.
+tenants-add-submit = Aprovisionar tenant
+tenants-col-tenant = Tenant
+tenants-col-resources = Recursos
+tenants-col-created = Creado
+tenants-col-actions = Acciones
+tenants-empty = Ningún tenant coincide.
+tenants-unregistered = sin registrar
+tenants-delete = Eliminar tenant
+tenants-delete-confirm = ¿Dar de baja el tenant «{ $id }»? Sus datos se conservan salvo que se purguen vía API.
 
 tenant-heading = Tenants
 tenant-all = Todos los tenants
@@ -107,9 +137,40 @@ card-uptime = Disponibilidad
 card-uptime-sub = últimos 30 días
 
 chart-title = Recursos FHIR en el tiempo
-chart-unit-patients = pacientes
 chart-expand = Ampliar el gráfico
+chart-window = Intervalo de tiempo del gráfico
 
 ## Pie de página
 
 footer-copyright = © { $year } { -org-name }
+
+## Saved queries (#234)
+
+nav-saved-queries = Consultas guardadas
+
+queries-heading = Consultas guardadas
+queries-lede = Guarda consultas de búsqueda FHIR por tipo de recurso, ordenadas por su última ejecución. Se guardan en tu configuración de usuario y te siguen entre dispositivos.
+queries-add-heading = Guardar una consulta
+queries-type-label = Tipo de recurso
+queries-type-placeholder = p. ej. Patient
+queries-name-label = Nombre
+queries-name-placeholder = p. ej. Smith en Boston
+queries-query-label = Cadena de consulta
+queries-query-placeholder = p. ej. name=smith&address-city=Boston
+queries-empty = Aún no hay consultas guardadas. Guarda una arriba para empezar.
+queries-never-run = Nunca ejecutada
+queries-run = Ejecutar
+queries-rename = Renombrar
+queries-delete = Eliminar
+queries-rename-prompt = Nuevo nombre
+queries-confirm-delete = ¿Eliminar «{ $name }»?
+queries-unavailable = Las consultas guardadas no están disponibles: el backend de almacenamiento de este servidor no admite configuración por usuario.
+
+queries-builder-heading = Constructor de búsquedas
+queries-url-label = URL de búsqueda FHIR
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Edita la URL GET directamente. Ejecutar abre la búsqueda en una pestaña nueva y la registra en Recientes; ponle un nombre para conservarla en la lista de abajo.
+queries-recent = Recientes
+queries-recent-heading = Búsquedas recientes
+queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
+queries-invalid-url = Escribe una búsqueda como GET /Patient?name=smith — el tipo de recurso sale de la ruta.

@@ -13,6 +13,10 @@ keywords = ["helios-software", "fhir", "ui", "htmx"]
 # Web framework (matches the version used by helios-hfs / helios-rest)
 axum = "0.8"
 
+# Chart bucket timestamps: formatting x-axis labels, and shaping the placeholder
+# series rendered when no dashboard provider is registered.
+chrono.workspace = true
+
 # Compile-time, type-checked, auto-escaping templates (Jinja2-like).
 # Markup lives in templates/, never in Rust source.
 askama = "0.16"
@@ -34,6 +38,19 @@ axum-embed = "0.1"
 fluent-templates = "0.13"
 unic-langid = { version = "0.9", features = ["macros"] }
 
+# Storage-agnostic dashboard snapshot registry. The server registers a
+# provider (backed by the persistence layer) at startup; this crate reads the
+# latest snapshot to render the "FHIR resources over time" chart without any
+# dependency on the persistence layer itself. Falls back to placeholder data
+# when no provider is registered (e.g. the standalone UI example).
+helios-observability = { path = "../observability", version = "0.2.1" }
+
+# Read path for the tenant-maintenance page: the `ResourceStorage` tenant
+# registry (list/register/deregister) + per-tenant resource counts. The UI
+# depends on the rest of the server, never the reverse.
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
+serde = { version = "1", features = ["derive"] }
+
 [dev-dependencies]
 # Parses the .ftl sources so tests can enforce key-set parity across locales.
 fluent-syntax = "0.11"
@@ -41,3 +58,9 @@ fluent-syntax = "0.11"
 tokio = { version = "1", features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# A real SQLite-backed store so the tenant-maintenance page tests exercise the
+# actual registry read/write path (the `sqlite` feature is test-only).
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4", "sqlite"] }
+# Seed a FHIR resource in tests so a data-only (unregistered) tenant appears.
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false, features = ["R4"] }
+serde_json = "1"

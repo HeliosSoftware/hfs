@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// Initialize the database schema.
 pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
@@ -276,6 +276,7 @@ async fn migrate_schema(
             10 => migrate_v10_to_v11(client).await?,
             11 => migrate_v11_to_v12(client).await?,
             12 => migrate_v12_to_v13(client).await?,
+            13 => migrate_v13_to_v14(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -787,6 +788,34 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v12->v13 failed: {}", e)))?;
+    Ok(())
+}
+
+/// v13 -> v14: Add the tenant registry, mirroring the SQLite v14 migration.
+///
+/// A canonical list of first-class tenants backing the admin
+/// tenant-maintenance API (list / add / delete). Until now a tenant was only
+/// ever an implicit identifier string; this table records the tenants that
+/// have been explicitly provisioned, with an optional human-friendly display
+/// name and a creation timestamp. Tenants that merely have data but were never
+/// registered are still discoverable via a `GROUP BY tenant_id` on
+/// `resources`; the registry adds the metadata that data alone cannot provide.
+///
+/// `created_at` is stored as RFC 3339 TEXT (not TIMESTAMPTZ) so the registry
+/// reads back byte-identically across backends.
+async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS tenants (
+                id           TEXT PRIMARY KEY,
+                display_name TEXT,
+                created_at   TEXT NOT NULL DEFAULT \
+                    to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v13->v14 failed: {}", e)))?;
     Ok(())
 }
 

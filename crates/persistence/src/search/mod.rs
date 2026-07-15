@@ -86,8 +86,8 @@ pub use registry::{
     SearchParameterStatus, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
-    ReindexOperation, ReindexProgress, ReindexRequest, ReindexStatus, ReindexableStorage,
-    ResourcePage,
+    ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
+    ReindexableStorage, ResourcePage,
 };
 pub use text_fold::fold_text;
 pub use writer::SearchIndexWriter;
