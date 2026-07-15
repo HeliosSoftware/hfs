@@ -99,12 +99,23 @@ PR-by-PR (each independently shippable, feature + DoD tests together):
 4. **PR 1.4 — reindex (A2)** onto the same table (store-backed mode for `ReindexOperation`, `persistence/src/search/reindex.rs` ~:357). T2 DoD suite for `JobKind::Reindex`.
 5. **PR 1.5 — nightly kill-9 (A1)** — `on: schedule` for `cluster-smoke.yml` + `NIGHTLY`-gated check: kill -9 instance A mid-export, B claims the orphaned lease and completes.
 
-### Phase 2 — auth hardening (C1, C2)
+### Phase 2 — auth hardening (~~C1~~, C2) — **rescoped 2026-07-15**
 
-- `HFS_AUTH_JTI_BACKEND=database`: migration v15 `jti_replay` table, atomic `INSERT … ON CONFLICT … WHERE expires_at < now() RETURNING`; adapter `DatabaseJtiCache` in **hfs** (auth must not depend on persistence). Fix `InMemoryJtiCache` ignoring `expires_at` (flat 1h TTL, `memory.rs:26/:43`). Cluster default flips memory→database.
-- `JwksCoordination` trait in auth; impls: existing Redis `JwksCoordinator` (currently dead code, `jwks/coordinator.rs`) + Postgres advisory-lock impl; wire into `JwksCache`'s two refresh seams (`cache.rs` ~:55-73, ~:112).
-- T2 C1 on DB + the **memory unsafe contract** (two `InMemoryJtiCache`s do NOT see each other) + identical suite vs `RedisJtiCache` behind `RUN_REDIS_CLUSTER_TESTS=1` (first Redis testcontainer in the tree). T2 C2 via `wiremock` mock-IdP hit counter (already an auth dev-dep, but only used for outbound today).
-- CI: new `redis-cluster-tests.yml` (paths filter `crates/auth/**` + nightly + dispatch).
+- **C1 is OBSOLETE**: main's #205 (merged 2026-07-15, PRs #268/#230) removed
+  the jti replay-cache subsystem entirely — access tokens are not one-time
+  assertions, so token validation is stateless and auth holds no
+  cross-instance state. The `HFS_AUTH_JTI_BACKEND` fail-fast check was
+  removed from the cluster validator in the same merge that absorbed #205
+  into this branch. The planned `DatabaseJtiCache`, memory-jti unsafe-contract
+  tests, and Redis jti twin are all moot.
+- What remains of Phase 2 is **C2 only**: `JwksCoordination` trait in auth
+  (dedupe concurrent IdP refreshes across instances); impls: Redis
+  `JwksCoordinator` (verify it still exists post-#205) + Postgres
+  advisory-lock impl; wire into `JwksCache`'s refresh seams. T2 C2 via
+  `wiremock` mock-IdP hit counter. Re-ground line numbers before starting —
+  #205 reshaped `crates/auth`.
+- CI: `redis-cluster-tests.yml` only if the Redis coordinator survives;
+  otherwise no new CI.
 
 ### Phase 3 — subscriptions cluster delivery (#170)
 

@@ -32,25 +32,24 @@ service-account clients); see the note in §5 on `private_key_jwt`.
 | 7 | Issuer validation | `HFS_AUTH_ISSUER` set | ✅ enforced; HFS also refuses to boot with auth on and no issuer |
 | 8 | Algorithm allow-list | `HFS_AUTH_ALGORITHMS=ES384` vs RS256 token | ✅ `401` (`Unsupported algorithm: RS256`) |
 | 9 | JWKS fetch/refresh | cold start, no key preload | ✅ keys fetched on first validation from `HFS_AUTH_JWKS_URL`; min refresh interval `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` (default 10s) |
-| 10 | JTI replay cache — memory | default | ⚠️ **see #205** — rejects *legitimate* token reuse |
-| 11 | JTI replay cache — redis | `--features redis`, `HFS_AUTH_REDIS_URL` | ✅ backend works and persists across HFS restarts; ⚠️ same reuse problem as memory (#205) |
-| 12 | JTI disabled | `HFS_AUTH_JTI_BACKEND=disabled` | ✅ token reuse works (200/200/200) |
-| 13 | Audience validation — claim present | `HFS_AUTH_AUDIENCE=hfs-api` (realm now emits `aud`) | ✅ matching `aud` `200`; wrong expected `aud` `401` (`Invalid audience`) |
-| 14 | Audience validation — claim absent | `HFS_AUTH_AUDIENCE=hfs-api`, token w/o `aud` | ⚠️ **see #206** — token missing `aud` is accepted |
+| 10 | Access-token reuse | none (no replay cache exists) | ✅ same token reused three times → `200`/`200`/`200`; was `401` on the 2nd use before #205 |
+| 11 | Audience validation — claim present | `HFS_AUTH_AUDIENCE=hfs-api` (realm now emits `aud`) | ✅ matching `aud` `200`; wrong expected `aud` `401` (`Invalid audience`) |
+| 12 | Audience validation — claim absent | `HFS_AUTH_AUDIENCE=hfs-api`, token w/o `aud` | ⚠️ **see #206** — token missing `aud` is accepted |
 
 **Net:** the core validation path — signature, issuer, algorithm allow-list,
 SMART v2 scope enforcement, discovery, JWKS — works correctly and as intended.
-Two defects surfaced (below); both have workarounds and neither blocks the
-Keycloak setup once configured as in §2.
+Two defects surfaced (below): #205 is now fixed, and #206 has a workaround, so
+neither blocks the Keycloak setup once configured as in §2.
 
 ### Gaps found (filed as issues)
 
-- **#205 — JTI replay cache rejects legitimate bearer-token reuse.**
-  `check_and_store` runs on every bearer validation, so the *second* request
-  with the same still-valid access token is `401`ed. Single-use `jti` semantics
+- **#205 — JTI replay cache rejected legitimate bearer-token reuse. FIXED.**
+  `check_and_store` ran on every bearer validation, so the *second* request with
+  the same still-valid access token was `401`ed. Single-use `jti` semantics
   belong to the `private_key_jwt` **client-assertion** JWT (checked by the IdP),
-  not to resource-server access tokens. With the default `memory` backend HFS is
-  unusable against Keycloak until `HFS_AUTH_JTI_BACKEND=disabled` is set.
+  not to resource-server access tokens, so the replay cache has been removed
+  outright — along with `HFS_AUTH_JTI_BACKEND`, `HFS_AUTH_REDIS_URL`, and the
+  `redis` feature. Pinned by `crates/auth/tests/bearer_token_reuse.rs`.
 - **#206 — `HFS_AUTH_AUDIENCE` not enforced when the token omits `aud`.**
   `jsonwebtoken` only validates `aud` when present; a token with no `aud` claim
   bypasses the restriction. `aud` should be added to `required_spec_claims` when
@@ -97,12 +96,11 @@ docker compose -f docker/keycloak/docker-compose.yml up -d
 export TOKEN=$(docker/keycloak/get-token.sh)                     # hfs-backend-client
 export RO=$(docker/keycloak/get-token.sh hfs-readonly-client)    # hfs-readonly-client
 
-# 3. Run HFS pointed at the realm. NOTE the JTI override (see #205) so a token
-#    can be reused for its full lifetime, as every OAuth2 client expects.
+# 3. Run HFS pointed at the realm. (Since #205 there is no JTI replay cache, so
+#    a token is reusable for its full lifetime as OAuth2 expects.)
 export HFS_AUTH_ENABLED=true
 export HFS_AUTH_JWKS_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/certs
 export HFS_AUTH_ISSUER=http://localhost:8180/realms/fhir
-export HFS_AUTH_JTI_BACKEND=disabled
 export HFS_SMART_TOKEN_ENDPOINT=http://localhost:8180/realms/fhir/protocol/openid-connect/token
 export HFS_SMART_AUTHORIZE_ENDPOINT=http://localhost:8180/realms/fhir/protocol/openid-connect/auth
 cargo run --bin hfs

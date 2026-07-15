@@ -23,11 +23,7 @@ second instance, you need:
    `HFS_BULK_EXPORT_OUTPUT_BACKEND=s3` and `HFS_BULK_SUBMIT_OUTPUT_BACKEND=s3`.
    The default `local-fs` writes to node-local disk, so a download routed to a
    different node than the writer returns 404.
-3. **A shared replay/coordination store for auth** — Redis
-   (`HFS_AUTH_REDIS_URL` + `HFS_AUTH_JTI_BACKEND=redis`) today; a
-   database-backed alternative is planned so a cluster needs no extra
-   dependency beyond the primary database.
-4. **A shared audit sink** — `HFS_AUDIT_BACKEND=database` or `cloudwatch`.
+3. **A shared audit sink** — `HFS_AUDIT_BACKEND=database` or `cloudwatch`.
    The `file` sink writes node-local NDJSON and produces a fragmented,
    restart-lossy audit trail.
 
@@ -48,7 +44,6 @@ things:
 | Check | Refused when clustered | Fix |
 |-------|------------------------|-----|
 | Primary backend | `HFS_STORAGE_BACKEND=sqlite` (or `sqlite-elasticsearch`) | Use `postgres`, `mongodb`, or an `*-elasticsearch` mode over them |
-| JWT replay cache | `HFS_AUTH_JTI_BACKEND=memory` (with auth enabled) | Use `redis` (shared) — `disabled` also boots, but replay protection is then off everywhere |
 | Bulk export output | `HFS_BULK_EXPORT_OUTPUT_BACKEND=local-fs` (with bulk export enabled) | Use `s3` |
 | Bulk submit output | `HFS_BULK_SUBMIT_OUTPUT_BACKEND=local-fs` (with bulk submit enabled) | Use `s3` |
 | Audit sink | `HFS_AUDIT_BACKEND=file` (with audit enabled) | Use `database` or `cloudwatch` |
@@ -90,7 +85,7 @@ current state and is updated as each phase ships.
 | Concurrent cold-start schema init | ✅ | ✅ serialized by a Postgres advisory lock | fixed 2026-07-14 (D3) |
 | SQL-on-FHIR `$viewdefinition-export` / `$sqlquery-export` (async jobs) | ✅ | ✅ with `HFS_EXPORT_CONTROLLER=database` (the default under `HFS_CLUSTER`): jobs on the shared `cluster_jobs` store, any instance polls/cancels/downloads, workers on every instance compete for work | Phase 1 (#169) — landed |
 | Search reindex jobs | ✅ | ✅ with `HFS_JOB_STORE_BACKEND=database` (the default under `HFS_CLUSTER`): jobs on the shared `cluster_jobs` store, any instance answers `$reindex-status`/cancel, workers on every instance compete for the rebuild (Postgres primary) | Phase 1 (A2) — landed |
-| JWT `jti` replay protection | ✅ | ⚠️ `memory` is per-node (replay possible on other nodes) — refused by fail-fast; use `redis` | Phase 2 hardens defaults, adds `database` |
+| JWT validation | ✅ | ✅ stateless per-request validation — the former `jti` replay cache was removed with #205 (access tokens are not one-time assertions), so auth holds no cross-instance state | already safe (#205) |
 | JWKS refresh | ✅ | ✅ functionally (each node fetches the same keys); redundant IdP fetches | Phase 2 (coordinated refresh) |
 | Subscriptions (topics, delivery, WebSockets) | ✅ | ❌ **single-instance only** — registries are in-memory and only the instance that served a write reacts to it | Phase 3 (#170) |
 | Terminology (HTS) response caches | ✅ | ⚠️ a terminology import on one instance leaves stale `$expand`/`$validate-code` answers on the others | Phase 4 |

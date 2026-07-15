@@ -143,3 +143,34 @@ chart-window = Zeitfenster des Diagramms
 ## Fußzeile
 
 footer-copyright = © { $year } { -org-name }
+
+## Saved queries (#234)
+
+nav-saved-queries = Gespeicherte Abfragen
+
+queries-heading = Gespeicherte Abfragen
+queries-lede = FHIR-Suchabfragen je Ressourcentyp aufbewahren, sortiert nach der letzten Ausführung. Sie werden in deinen Benutzereinstellungen gespeichert und stehen auf allen Geräten bereit.
+queries-add-heading = Abfrage speichern
+queries-type-label = Ressourcentyp
+queries-type-placeholder = z. B. Patient
+queries-name-label = Name
+queries-name-placeholder = z. B. Smiths in Boston
+queries-query-label = Abfrage
+queries-query-placeholder = z. B. name=smith&address-city=Boston
+queries-empty = Noch keine gespeicherten Abfragen. Speichere oben eine, um loszulegen.
+queries-never-run = Nie ausgeführt
+queries-run = Ausführen
+queries-rename = Umbenennen
+queries-delete = Löschen
+queries-rename-prompt = Neuer Name
+queries-confirm-delete = „{ $name }“ löschen?
+queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-Backend dieses Servers unterstützt keine Benutzereinstellungen.
+
+queries-builder-heading = Such-Builder
+queries-url-label = FHIR-Such-URL
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Bearbeite die GET-URL direkt. Ausführen öffnet die Suche in einem neuen Tab und trägt sie unter „Zuletzt" ein; mit einem Namen bleibt sie in der Liste unten gespeichert.
+queries-recent = Zuletzt
+queries-recent-heading = Letzte Suchen
+queries-recent-empty = Noch keine letzten Suchen — führe eine aus, um sie hier einzutragen.
+queries-invalid-url = Gib eine Suche wie GET /Patient?name=smith ein — der Ressourcentyp kommt aus dem Pfad.

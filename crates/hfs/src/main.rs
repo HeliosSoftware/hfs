@@ -25,7 +25,7 @@ use std::sync::Arc;
 use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
-use helios_auth::{AuthConfig, InMemoryJtiCache, JtiCache, JwksBearerAuthProvider, JwksCache};
+use helios_auth::{AuthConfig, JwksBearerAuthProvider, JwksCache};
 use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::info;
@@ -635,39 +635,6 @@ async fn init_auth_with_audit(
         anyhow::bail!("HFS_AUTH_ISSUER is required when HFS_AUTH_ENABLED=true");
     }
 
-    // Create JTI cache
-    let jti_cache: Arc<dyn JtiCache> = match auth_config.jti_backend.as_str() {
-        #[cfg(feature = "redis")]
-        "redis" => {
-            let redis_url = auth_config.redis_url.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("HFS_AUTH_REDIS_URL is required when HFS_AUTH_JTI_BACKEND=redis")
-            })?;
-            info!(redis_url = %redis_url, "Using Redis JTI cache");
-            Arc::new(helios_auth::RedisJtiCache::new(redis_url)?)
-        }
-        #[cfg(not(feature = "redis"))]
-        "redis" => {
-            anyhow::bail!(
-                "Redis JTI backend requires the 'redis' feature. \
-                 Build with: cargo build -p helios-hfs --features redis"
-            );
-        }
-        "memory" => {
-            info!("Using in-memory JTI cache");
-            Arc::new(InMemoryJtiCache::new())
-        }
-        "disabled" | "none" => {
-            info!("JTI replay cache is DISABLED");
-            Arc::new(helios_auth::DisabledJtiCache)
-        }
-        other => {
-            anyhow::bail!(
-                "Invalid HFS_AUTH_JTI_BACKEND '{}'. Valid values: memory, redis, disabled",
-                other
-            );
-        }
-    };
-
     // Create JWKS cache
     let jwks_cache = Arc::new(JwksCache::new(
         jwks_url,
@@ -676,7 +643,7 @@ async fn init_auth_with_audit(
     jwks_cache.initial_fetch().await?;
 
     // Create auth provider
-    let provider = JwksBearerAuthProvider::new(jwks_cache, jti_cache, &auth_config);
+    let provider = JwksBearerAuthProvider::new(jwks_cache, &auth_config);
 
     info!(
         jwks_url = %jwks_url,
@@ -796,17 +763,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Cluster-mode fail-fast: refuse configurations that cannot run as one
     // of N instances (docs/cluster-capable-state-design.md §6) before any
-    // subsystem starts. Auth/audit configs are re-parsed by their init
-    // functions below; parsing here too is cheap and keeps this check pure.
+    // subsystem starts. The audit config is re-parsed by its init function
+    // below; parsing here too is cheap and keeps this check pure. (Auth no
+    // longer participates: #205 made token validation stateless, so it holds
+    // no cross-instance state to validate.)
     {
-        let auth_config = AuthConfig::from_env();
         let audit_config = AuditConfig::from_env();
         let view = cluster::ClusterConfigView {
             cluster: config.cluster,
             primary_backend: backend_mode.primary_backend_kind(),
             job_store_backend: &config.job_store_backend,
-            auth_enabled: auth_config.enabled,
-            jti_backend: &auth_config.jti_backend,
             bulk_export_enabled: config.bulk_export.enabled,
             bulk_export_output_backend: &config.bulk_export.output_backend,
             bulk_submit_enabled: config.bulk_submit.enabled,

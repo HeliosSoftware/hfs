@@ -33,13 +33,6 @@ pub enum AuthError {
         kid: String,
     },
 
-    /// Token with this JTI has already been used.
-    #[error("JTI replay detected: {jti}")]
-    ReplayDetected {
-        /// The replayed JWT ID.
-        jti: String,
-    },
-
     /// Authenticated principal lacks required scopes.
     #[error("Forbidden: insufficient scope for {operation} on {resource_type}")]
     Forbidden {

@@ -273,6 +273,13 @@ mod shared_mongo {
                     // image default and keeps the mapped port reachable once we
                     // supply our own command.
                     .with_cmd(["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"])
+                    // Every test creates its own uniquely-named database, and
+                    // WiredTiger holds file handles open per collection/index
+                    // across all of them. With 50+ test databases the stock
+                    // container nofile limit is exhausted and index builds die
+                    // with TooManyFilesOpen (error 264) late in the run. 64000
+                    // is mongod's own recommended minimum.
+                    .with_ulimit("nofile", 64000, Some(64000))
                     .with_startup_timeout(std::time::Duration::from_secs(120))
                     .start()
                     .await
@@ -605,8 +612,14 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
     };
 
     let created_during_test = after - before;
+    // `totalCreated` is a server-global counter on the SHARED mongo, so
+    // concurrently running neighbor tests (each with its own client pool)
+    // inflate it — observed spilling past 50 on wide runners. The regression
+    // this guards against (a fresh client per operation) creates at least one
+    // connection per iteration: 8 tasks × 20 ops ≥ 160. A 120 ceiling keeps
+    // that detectable while tolerating neighbor noise.
     assert!(
-        created_during_test <= 50,
+        created_during_test <= 120,
         "MongoDB backend should reuse one client pool; created {} connections during concurrent read/search",
         created_during_test
     );

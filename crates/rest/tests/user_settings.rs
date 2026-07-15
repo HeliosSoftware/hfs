@@ -214,6 +214,197 @@ async fn theme_patch_creates_the_document_when_missing() {
     assert_eq!(get.json::<Value>(), json!({"theme": "dark"}));
 }
 
+/// The `savedQueries` convention (#234): lists are objects keyed by query id
+/// precisely so one entry can be touched by merge-patch. Bumping
+/// `lastAccessedAt`/`accessCount` on one query must not clobber its siblings
+/// in the same resource type, other types, or unrelated settings keys.
+#[tokio::test]
+async fn saved_queries_single_entry_patch_preserves_siblings() {
+    let server = create_test_server();
+    server
+        .put("/_user/settings")
+        .json(&json!({
+            "theme": "dark",
+            "savedQueries": {
+                "Patient": {
+                    "q1": {"name": "Smiths", "query": "name=smith",
+                           "createdAt": "2026-07-01T12:00:00Z"},
+                    "q2": {"name": "Bostonians", "query": "address-city=Boston",
+                           "createdAt": "2026-07-02T12:00:00Z"}
+                },
+                "Observation": {
+                    "q3": {"name": "Vitals", "query": "category=vital-signs",
+                           "createdAt": "2026-07-03T12:00:00Z"}
+                }
+            }
+        }))
+        .await;
+
+    // What the UI sends when the user runs q1.
+    let touch = server
+        .patch("/_user/settings")
+        .json(&json!({
+            "savedQueries": {"Patient": {"q1": {
+                "lastAccessedAt": "2026-07-09T09:14:22Z",
+                "accessCount": 1
+            }}}
+        }))
+        .await;
+    assert_eq!(touch.status_code(), StatusCode::OK);
+
+    let doc = server.get("/_user/settings").await.json::<Value>();
+    assert_eq!(
+        doc["savedQueries"]["Patient"]["q1"]["lastAccessedAt"],
+        json!("2026-07-09T09:14:22Z")
+    );
+    assert_eq!(
+        doc["savedQueries"]["Patient"]["q1"]["accessCount"],
+        json!(1)
+    );
+    // Siblings and unrelated keys are untouched.
+    assert_eq!(
+        doc["savedQueries"]["Patient"]["q1"]["name"],
+        json!("Smiths")
+    );
+    assert_eq!(
+        doc["savedQueries"]["Patient"]["q2"]["name"],
+        json!("Bostonians")
+    );
+    assert_eq!(
+        doc["savedQueries"]["Observation"]["q3"]["name"],
+        json!("Vitals")
+    );
+    assert_eq!(doc["theme"], json!("dark"));
+}
+
+/// A `null` merge-patch member deletes a single saved query.
+#[tokio::test]
+async fn saved_queries_null_patch_deletes_one_entry() {
+    let server = create_test_server();
+    server
+        .put("/_user/settings")
+        .json(&json!({
+            "savedQueries": {"Patient": {
+                "q1": {"name": "Smiths", "query": "name=smith"},
+                "q2": {"name": "Bostonians", "query": "address-city=Boston"}
+            }}
+        }))
+        .await;
+
+    server
+        .patch("/_user/settings")
+        .json(&json!({"savedQueries": {"Patient": {"q1": null}}}))
+        .await;
+
+    let doc = server.get("/_user/settings").await.json::<Value>();
+    assert!(doc["savedQueries"]["Patient"].get("q1").is_none());
+    assert_eq!(
+        doc["savedQueries"]["Patient"]["q2"]["name"],
+        json!("Bostonians")
+    );
+}
+
+/// Builds a `savedQueries.<type>` object with `n` entries.
+fn saved_queries_entries(n: usize) -> Value {
+    let entries: serde_json::Map<String, Value> = (0..n)
+        .map(|i| {
+            (
+                format!("q{i}"),
+                json!({"name": format!("query {i}"), "query": "name=x"}),
+            )
+        })
+        .collect();
+    Value::Object(entries)
+}
+
+#[tokio::test]
+async fn saved_queries_per_type_cap_is_enforced_on_put_and_patch() {
+    let server = create_test_server();
+
+    // 100 entries is the documented cap: accepted.
+    let at_cap = server
+        .put("/_user/settings")
+        .json(&json!({"savedQueries": {"Patient": saved_queries_entries(100)}}))
+        .await;
+    assert_eq!(at_cap.status_code(), StatusCode::OK);
+
+    // A wholesale PUT over the cap is rejected.
+    let over_cap = server
+        .put("/_user/settings")
+        .json(&json!({"savedQueries": {"Patient": saved_queries_entries(101)}}))
+        .await;
+    assert_eq!(over_cap.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A merge-patch adding the 101st entry is rejected too — the bound applies
+    // to the post-merge document, not the patch body.
+    let one_more = server
+        .patch("/_user/settings")
+        .json(&json!({"savedQueries": {"Patient": {"q100": {"name": "one too many", "query": "name=x"}}}}))
+        .await;
+    assert_eq!(one_more.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The stored document was not modified by the rejected writes.
+    let doc = server.get("/_user/settings").await.json::<Value>();
+    assert_eq!(
+        doc["savedQueries"]["Patient"].as_object().unwrap().len(),
+        100
+    );
+}
+
+#[tokio::test]
+async fn saved_queries_must_be_objects_not_arrays() {
+    let server = create_test_server();
+
+    // Arrays are exactly what the keyed-by-id convention exists to avoid.
+    let top_level_array = server
+        .put("/_user/settings")
+        .json(&json!({"savedQueries": ["name=smith"]}))
+        .await;
+    assert_eq!(
+        top_level_array.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let per_type_array = server
+        .put("/_user/settings")
+        .json(&json!({"savedQueries": {"Patient": ["name=smith"]}}))
+        .await;
+    assert_eq!(
+        per_type_array.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
+async fn oversized_document_is_rejected_with_413() {
+    let server = create_test_server();
+
+    // A single ~300 KiB string value blows the 256 KiB document cap.
+    let response = server
+        .put("/_user/settings")
+        .json(&json!({"blob": "x".repeat(300 * 1024)}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn patch_with_stale_if_match_is_rejected_with_412() {
+    let server = create_test_server();
+    server.put("/_user/settings").json(&json!({"a": 1})).await; // -> version 1
+    server.put("/_user/settings").json(&json!({"a": 2})).await; // -> version 2
+
+    let conflict = server
+        .patch("/_user/settings")
+        .add_header(IF_MATCH, HeaderValue::from_static("W/\"1\""))
+        .json(&json!({"a": 3}))
+        .await;
+
+    assert_eq!(conflict.status_code(), StatusCode::PRECONDITION_FAILED);
+    // The stale write did not land.
+    let doc = server.get("/_user/settings").await.json::<Value>();
+    assert_eq!(doc["a"], json!(2));
+}
+
 #[tokio::test]
 async fn if_none_match_returns_304_for_unchanged_document() {
     let server = create_test_server();

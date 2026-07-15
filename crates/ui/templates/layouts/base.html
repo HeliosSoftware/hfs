@@ -78,9 +78,13 @@
 
     <nav class="nav">
       <div class="nav__section">{{ i18n.t("nav-section-work") }}</div>
-      <a class="nav-item" href="/ui" aria-current="page" title="{{ i18n.t("nav-home") }}">
+      <a class="nav-item" href="/ui"{% if active_page == "home" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-home") }}">
         <span class="icon">{% include "icons/home.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-home") }}</span>
+      </a>
+      <a class="nav-item" href="/ui/queries"{% if active_page == "queries" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-saved-queries") }}">
+        <span class="icon">{% include "icons/bookmark.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-saved-queries") }}</span>
       </a>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-search") }}">
         <span class="icon">{% include "icons/search.svg" %}</span>
@@ -114,7 +118,7 @@
       </span>
 
       <div class="nav__section">{{ i18n.t("nav-section-server") }}</div>
-      <a class="nav-item" href="/ui/tenants" title="{{ i18n.t("nav-tenants") }}">
+      <a class="nav-item" href="/ui/tenants"{% if active_page == "tenants" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-tenants") }}">
         <span class="icon">{% include "icons/building.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-tenants") }}</span>
       </a>

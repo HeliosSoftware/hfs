@@ -225,7 +225,13 @@ and all in-memory state vanishes on restart.
 
 ### Class C — shared caches / replay with local-only invalidation → shared store or cross-instance invalidation
 
-- **C1 · JWT `jti` replay cache — SECURITY HOLE (default-on).**
+- **C1 · JWT `jti` replay cache — OBSOLETE.** *[amended 2026-07-15: #205
+  (merged via PRs #268/#230) removed the jti subsystem entirely — access
+  tokens are not one-time assertions, so replay caching them was wrong-layer;
+  token validation is now stateless per-request and auth holds no
+  cross-instance state. The `HFS_AUTH_JTI_BACKEND` env var, its fail-fast
+  check, and the Phase 2 C1 work items no longer exist. Original inventory
+  kept below for the record.]*
   `InMemoryJtiCache` (`crates/auth/src/jti/memory.rs:14`) is the **default**
   (`config.rs:73`; built in `crates/hfs/src/main.rs:617`). A one-time client
   assertion accepted on A and replayed to B is honored again — B's cache never
@@ -354,7 +360,7 @@ One master switch plus per-subsystem overrides, all following the existing
 |----------|--------|---------|--------|
 | `HFS_CLUSTER` | `true` / `false` | `false` | Master switch: selects cluster-safe backends below and **fails fast** if the primary backend is SQLite or a required shared dependency is unset. |
 | `HFS_JOB_STORE_BACKEND` | `memory` / `database` | `memory` (`database` when `HFS_CLUSTER`) | Unified job store (§4) — SoF export, reindex; bulk export/submit already DB-backed. |
-| `HFS_AUTH_JTI_BACKEND` | `memory` / `redis` / `disabled` | `memory` | **Must be shared (`redis`) when clustered** (C1). Consider fail-closed under `HFS_CLUSTER`. *(exists)* |
+| ~~`HFS_AUTH_JTI_BACKEND`~~ | — | — | *[amended 2026-07-15]* removed with the jti subsystem (#205); C1 is obsolete |
 | `HFS_AUTH_REDIS_URL` | URL | — | Redis for `jti` + JWKS coordinator. *(exists)* |
 | `HFS_SUBSCRIPTIONS_FANOUT` | `memory` / `redis` / `nats` / `pg-notify` | `memory` | Shared pub/sub for WS delivery + WS binding tokens + counters (class B). *(new)* |
 | `HFS_TERMINOLOGY_CACHE_INVALIDATION` | `local` / `pg-notify` / `redis` | `local` | Cross-instance HTS cache invalidation (C3). *(new)* |
@@ -399,7 +405,7 @@ Each phase is independently shippable and leaves the tree green.
   it, wire `HFS_JOB_STORE_BACKEND`/`HFS_EXPORT_CONTROLLER`. Fold reindex jobs
   (A2) onto the same table.
 - **Phase 2 — auth hardening.** Make `jti` shared-mandatory under `HFS_CLUSTER`
-  (C1); wire `JwksCoordinator` (C2). Small, security-first, mostly existing code.
+  ~~(C1)~~ *[amended 2026-07-15: C1 obsolete per #205]*; wire `JwksCoordinator` (C2). Small, mostly existing code.
 - **Phase 3 — Subscriptions cluster delivery (#170).** DB-backed
   subscription/topic load + startup reconciliation (B3), shared pub/sub fan-out
   (B1), shared/stateless WS binding tokens (B2), shared counters (B4), durable

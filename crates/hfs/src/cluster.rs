@@ -3,8 +3,11 @@
 //!
 //! `HFS_CLUSTER=true` declares this process one of N instances behind a load
 //! balancer. Several configurations that are fine single-instance silently
-//! lose data or regress security when clustered (Class C1/F1/F2/F4 in the
-//! design); this module refuses to boot on them instead.
+//! lose data or degrade when clustered (Class A1/F1/F2/F4 in the design);
+//! this module refuses to boot on them instead. (The former C1 check — a
+//! per-instance JWT replay cache — went away with the jti subsystem itself:
+//! #205 made token validation stateless, so auth holds no cross-instance
+//! state to guard.)
 //!
 //! The checks live here — not in `helios-rest`'s `ServerConfig::validate()` —
 //! because they span three config domains that only the `hfs` binary sees
@@ -27,10 +30,6 @@ pub struct ClusterConfigView<'a> {
     pub primary_backend: BackendKind,
     /// Raw `HFS_JOB_STORE_BACKEND` value ("" when unset).
     pub job_store_backend: &'a str,
-    /// `HFS_AUTH_ENABLED`.
-    pub auth_enabled: bool,
-    /// `HFS_AUTH_JTI_BACKEND`.
-    pub jti_backend: &'a str,
     /// `HFS_BULK_EXPORT_ENABLED`.
     pub bulk_export_enabled: bool,
     /// `HFS_BULK_EXPORT_OUTPUT_BACKEND`.
@@ -68,18 +67,6 @@ pub fn validate_cluster_config(view: &ClusterConfigView<'_>) -> Result<(), Vec<S
             "HFS_CLUSTER=true requires a shared primary backend, but HFS_STORAGE_BACKEND \
              resolves to sqlite — a single-writer local file that cannot be shared between \
              instances. Use postgres, mongodb, s3, or an *-elasticsearch mode over them."
-                .to_string(),
-        );
-    }
-
-    // C1 — a per-instance JWT replay cache is a security regression: a
-    // one-time token accepted on this instance would be honored again by
-    // every other instance.
-    if view.auth_enabled && view.jti_backend == "memory" {
-        errors.push(
-            "HFS_CLUSTER=true requires a shared JWT replay cache, but \
-             HFS_AUTH_JTI_BACKEND=memory is per-instance, so a one-time token replayed \
-             against another instance would be accepted. Use redis (HFS_AUTH_REDIS_URL)."
                 .to_string(),
         );
     }
@@ -164,8 +151,6 @@ mod tests {
             cluster: true,
             primary_backend: BackendKind::Postgres,
             job_store_backend: "",
-            auth_enabled: true,
-            jti_backend: "redis",
             bulk_export_enabled: true,
             bulk_export_output_backend: "s3",
             bulk_submit_enabled: true,
@@ -185,8 +170,6 @@ mod tests {
             cluster: false,
             primary_backend: BackendKind::Sqlite,
             job_store_backend: "memory",
-            auth_enabled: true,
-            jti_backend: "memory",
             bulk_export_enabled: true,
             bulk_export_output_backend: "local-fs",
             bulk_submit_enabled: true,
@@ -222,14 +205,6 @@ mod tests {
                     ..safe_cluster_view()
                 },
                 expect_var: "HFS_STORAGE_BACKEND",
-            },
-            Case {
-                name: "C1 memory jti",
-                view: ClusterConfigView {
-                    jti_backend: "memory",
-                    ..safe_cluster_view()
-                },
-                expect_var: "HFS_AUTH_JTI_BACKEND",
             },
             Case {
                 name: "F2 local-fs export output",
@@ -302,8 +277,6 @@ mod tests {
             cluster: true,
             primary_backend: BackendKind::Sqlite,
             job_store_backend: "memory",
-            auth_enabled: true,
-            jti_backend: "memory",
             bulk_export_enabled: true,
             bulk_export_output_backend: "local-fs",
             bulk_submit_enabled: true,
@@ -314,7 +287,7 @@ mod tests {
             export_sink: "fs",
         };
         let errors = validate_cluster_config(&view).unwrap_err();
-        assert_eq!(errors.len(), 8);
+        assert_eq!(errors.len(), 7);
     }
 
     #[test]
@@ -322,8 +295,6 @@ mod tests {
         // A disabled subsystem's unsafe backend cannot hurt a cluster:
         // auth off + memory jti, bulk off + local-fs, audit off (None).
         let view = ClusterConfigView {
-            auth_enabled: false,
-            jti_backend: "memory",
             bulk_export_enabled: false,
             bulk_export_output_backend: "local-fs",
             bulk_submit_enabled: false,
@@ -332,17 +303,6 @@ mod tests {
             sof_enabled: false,
             export_controller: "memory",
             export_sink: "fs",
-            ..safe_cluster_view()
-        };
-        assert_eq!(validate_cluster_config(&view), Ok(()));
-    }
-
-    #[test]
-    fn disabled_jti_boots_with_replay_protection_off_everywhere() {
-        // `disabled` is uniform across instances (no false sense of shared
-        // protection), so it boots; the operator doc carries the caveat.
-        let view = ClusterConfigView {
-            jti_backend: "disabled",
             ..safe_cluster_view()
         };
         assert_eq!(validate_cluster_config(&view), Ok(()));
