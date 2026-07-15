@@ -592,7 +592,9 @@ async fn resources_deep_links_focus_the_selected_type() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    // The rail marks the deep-linked type, and Create targets it.
+    // The rail marks the deep-linked type, and Create targets it. The type
+    // list is the nav panel now (part of the menu), not a card in the content.
     assert!(html.contains(r#"data-selected-type="Observation""#));
-    assert!(html.contains(r#"filter-rail__item--on" data-rail-type="Observation""#));
+    assert!(html.contains(r#"nav-panel__item--on" data-rail-type="Observation""#));
+    assert!(html.contains(r#"class="nav-panel""#));
 }

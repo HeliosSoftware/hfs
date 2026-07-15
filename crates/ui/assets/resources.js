@@ -60,12 +60,101 @@
   /* ---- load a resource into the embedded editor ------------------------ */
 
   function renderEditor(resource) {
+    return editorSend("", { doc: JSON.stringify(resource) });
+  }
+
+  /* The editor inside the modal is the same fragment the Editor page uses, but
+   * editor.js is bound to that page's ids — so the interactions live here,
+   * scoped to the modal body. Each structural edit posts the whole document
+   * plus the op and swaps the body, exactly as the Editor page does. */
+  function editorSend(op, fields) {
     var form = new URLSearchParams();
-    form.set("doc", JSON.stringify(resource));
-    form.set("op", "");
+    var docField = editorBody.querySelector("#editor-doc");
+    form.set("doc", (fields && fields.doc) || (docField ? docField.value : "{}"));
+    form.set("op", op || "");
+    Object.keys(fields || {}).forEach(function (k) {
+      if (k !== "doc") form.set(k, fields[k]);
+    });
     return fetch("/ui/editor/render", { method: "POST", body: form })
       .then(function (r) { return r.text(); })
       .then(function (html) { editorBody.innerHTML = html; });
+  }
+
+  /* Delegated editor interactions within the modal body. */
+  editorBody.addEventListener("click", function (event) {
+    var arrow = event.target.closest("[data-fold]");
+    if (arrow) { toggleFold(arrow.dataset.fold); return; }
+    var foldAllBtn = event.target.closest("[data-json-fold]");
+    if (foldAllBtn) { setAllFolds(foldAllBtn.dataset.jsonFold === "all"); return; }
+    if (event.target.id === "editor-json-edit") {
+      var raw = editorBody.querySelector("#editor-json-raw");
+      var viewEl = editorBody.querySelector("#json-view");
+      if (!raw || !viewEl) return;
+      if (raw.hidden) { raw.hidden = false; viewEl.hidden = true; event.target.classList.add("editor-json__act--on"); }
+      else {
+        var src = editorBody.querySelector("#editor-source");
+        var fld = editorBody.querySelector("#editor-doc");
+        if (src && fld) fld.value = src.value;
+        editorSend("");
+      }
+      return;
+    }
+    var add = event.target.closest("[data-add]");
+    if (add) { editorSend("add", { path: add.dataset.add, name: add.dataset.name }); return; }
+    var rm = event.target.closest("[data-remove]");
+    if (rm) { editorSend("remove", { path: rm.dataset.remove }); return; }
+    var ext = event.target.closest("[data-extension]");
+    if (ext) {
+      var panel = ext.closest(".editor-add__ext");
+      var url = panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "";
+      editorSend("extension", { path: ext.dataset.extension, url: url });
+    }
+  });
+
+  editorBody.addEventListener("change", function (event) {
+    var choose = event.target.closest("[data-choose]");
+    if (choose && choose.value) {
+      editorSend("choose", { path: choose.dataset.choose, name: choose.dataset.declarer, arm: choose.value });
+    }
+  });
+
+  editorBody.addEventListener("blur", function (event) {
+    var input = event.target.closest("[data-set]");
+    if (!input) return;
+    editorSend("set", { path: input.dataset.set, value: input.value });
+  }, true);
+
+  editorBody.addEventListener("input", function (event) {
+    var filter = event.target.closest(".editor-add__filter");
+    if (!filter) return;
+    var needle = filter.value.trim().toLowerCase();
+    filter.closest(".editor-add__panel").querySelectorAll("[data-add-name]").forEach(function (item) {
+      item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) < 0;
+    });
+  });
+
+  /* JSON fold helpers, scoped to the modal body. */
+  function toggleFold(foldId) {
+    var opener = editorBody.querySelector('.json-line[data-fold-id="' + foldId + '"]');
+    if (!opener) return;
+    opener.classList.toggle("json-line--collapsed", !opener.classList.contains("json-line--collapsed"));
+    reflowFolds();
+  }
+  function setAllFolds(collapse) {
+    editorBody.querySelectorAll(".json-line--foldable").forEach(function (o) {
+      if (o.dataset.parents) o.classList.toggle("json-line--collapsed", collapse);
+    });
+    reflowFolds();
+  }
+  function reflowFolds() {
+    editorBody.querySelectorAll(".json-line").forEach(function (line) {
+      var parents = (line.dataset.parents || "").split(" ");
+      line.hidden = parents.some(function (p) {
+        if (!p) return false;
+        var o = editorBody.querySelector('.json-line[data-fold-id="' + p + '"]');
+        return o && o.classList.contains("json-line--collapsed");
+      });
+    });
   }
 
   function openResource(type, id) {
@@ -87,8 +176,10 @@
   }
 
   /* Clicking a result row opens it. The results table (from saved-queries.js)
-   * renders id links as `/{type}/{id}`; intercept them into the modal. */
-  root.addEventListener(
+   * renders id links as `/{type}/{id}`; intercept them into the modal. The
+   * results live in the content column, not under `root` (the type panel), so
+   * the listener is on the document. */
+  document.addEventListener(
     "click",
     function (event) {
       var link = event.target.closest("#query-results-body a.url");

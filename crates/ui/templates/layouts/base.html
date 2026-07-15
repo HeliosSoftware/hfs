@@ -10,7 +10,7 @@
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar">
     <div class="brand">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
@@ -135,6 +135,13 @@
       </div>
     </div>
   </aside>
+
+  <!--
+    Optional secondary panel, flush against the sidebar and styled as part of
+    the menu (Brett's Resources frame): the Resources page fills it with the
+    resource-type list. Absent on every other page.
+  -->
+  {% block nav_panel %}{% endblock %}
 
   <div class="pane">
     <header class="topbar">

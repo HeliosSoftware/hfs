@@ -2,55 +2,50 @@
 
 {% block title %}{{ i18n.t("resources-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
+{% block body_class %}has-nav-panel{% endblock %}
 {% block content_class %} content--wide{% endblock %}
 
-{% block content %}
 <!--
-  Resources workspace (#282), following Brett's Search screen: the resource-type
-  filter rail, the search area (natural language + visual builder), a "Create
-  new" button, and — on a result click — the Edit Resource modal that reuses the
-  schema-driven editor with save / delete / version history / diff.
-
-  It ties together pieces built elsewhere: the type rail and search builder
-  (#255/#234), the editor (#264), and the history diff (#236). The document is
-  fetched from and written to the ordinary FHIR API; the UI crate never touches
-  storage.
+  Resources workspace (#282), following Brett's "Resources" frame (Figma
+  142:2): the resource-type list is a panel flush against the sidebar — part of
+  the menu, not a card in the content — and the centre is search + a "Create
+  new" primary button + the results table.
 -->
+{% block nav_panel %}
+<aside class="nav-panel" id="resources" aria-label="{{ i18n.t("queries-rail-heading") }}"
+       data-selected-type="{{ selected_type }}">
+  <div class="nav-panel__head">{{ i18n.t("resources-types-heading") }}</div>
+  <div class="nav-panel__search">
+    <span class="icon">{% include "icons/search.svg" %}</span>
+    <input type="search" id="type-rail-filter"
+           placeholder="{{ i18n.t("queries-rail-filter") }}"
+           aria-label="{{ i18n.t("queries-rail-filter") }}">
+  </div>
+  <div class="nav-panel__list" id="type-rail-list">
+    {% for t in resource_types %}
+    <button type="button" class="nav-panel__item{% if t.as_str() == selected_type.as_str() %} nav-panel__item--on{% endif %}" data-rail-type="{{ t }}">
+      <span class="nav-panel__name">{{ t }}</span>
+      <span class="count" data-count-for="{{ t }}"></span>
+    </button>
+    {% endfor %}
+  </div>
+</aside>
+{% endblock %}
+
+{% block content %}
 <section class="page-head page-head--row">
   <div>
     <h1 class="page-head__title">{{ i18n.t("resources-heading") }}</h1>
-    <p class="page-head__lede">{{ i18n.t("resources-lede") }}</p>
+    <p class="page-head__lede" id="resources-subtitle">{{ i18n.t("resources-lede") }}</p>
   </div>
-  <button type="button" class="button button--primary" id="resource-create"
+  <button type="button" class="btn btn--primary resources-create" id="resource-create"
           data-type="{{ selected_type }}">
-    <span class="icon">{% include "icons/pencil.svg" %}</span>
+    <span class="icon">{% include "icons/plus.svg" %}</span>
     {{ i18n.t("resources-create") }}
   </button>
 </section>
 
-<div class="queries-layout search-page" id="resources"
-     data-mode="{% if nl.configured %}nl{% else %}builder{% endif %}"
-     data-selected-type="{{ selected_type }}">
-
-  <aside class="card filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}">
-    <div class="filter-rail__search">
-      <span class="icon">{% include "icons/search.svg" %}</span>
-      <input type="search" id="type-rail-filter"
-             placeholder="{{ i18n.t("queries-rail-filter") }}"
-             aria-label="{{ i18n.t("queries-rail-filter") }}">
-    </div>
-    <div class="filter-rail__heading">{{ i18n.t("queries-rail-heading") }}</div>
-    <div class="filter-rail__list" id="type-rail-list">
-      {% for t in resource_types %}
-      <button type="button" class="filter-rail__item{% if t.as_str() == selected_type.as_str() %} filter-rail__item--on{% endif %}" data-rail-type="{{ t }}">
-        <span>{{ t }}</span>
-        <span class="count" data-count-for="{{ t }}"></span>
-      </button>
-      {% endfor %}
-    </div>
-  </aside>
-
-  <div class="queries-main">
+<div class="queries-main search-page" data-mode="{% if nl.configured %}nl{% else %}builder{% endif %}">
     <section class="card query-form-card">
       {% if nl.configured %}
       <div class="seg" role="group" aria-label="{{ i18n.t("search-mode-label") }}">
@@ -108,14 +103,12 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 
     {% include "partials/search-results.html" %}
     {% include "partials/search-messages.html" %}
-  </div>
 </div>
 
 <!--
   Edit Resource modal (shadowbox). Opened by JS when a result row is clicked, or
   by "Create new" for a fresh resource. It embeds the schema-driven editor body
-  (fetched from /ui/editor/render) and offers Save / Delete / History with the
-  version diff, over the ordinary FHIR API.
+  and offers Save / Delete / History with the version diff, over the FHIR API.
 -->
 <div class="modal" id="resource-modal" hidden
      data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"
@@ -140,11 +133,9 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
     </header>
     <div class="modal__status" id="resource-modal-status" role="status"></div>
     <div class="modal__body">
-      <!-- Edit tab: the schema-driven editor body (JSON + guided form). -->
       <div class="modal__pane" data-modal-pane="edit">
         <div id="resource-editor-body"></div>
       </div>
-      <!-- History tab: the version rail + two-layer diff (#236). -->
       <div class="modal__pane" data-modal-pane="history" hidden>
         <div class="history" id="resource-history"
              data-msg-load-error="{{ i18n.t("history-load-error") }}"

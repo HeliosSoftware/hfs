@@ -373,3 +373,6 @@ resources-create = Create new
 resources-edit-title = Edit resource
 resources-tab-edit = Edit
 resources-tab-history = History
+resources-types-heading = Resource types
+
+queries-saved-group = Saved

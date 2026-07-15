@@ -2944,3 +2944,121 @@ button.filter-rail__item {
   .modal__box { max-height: 96vh; }
   .modal__head { flex-wrap: wrap; }
 }
+
+/* ---------------------------------------------------------------------------
+   Resources: the resource-type panel as part of the menu (#282, Brett's
+   "Resources" frame). A secondary column flush against the sidebar — same
+   surface, no card — with the search + results in the content column.
+   --------------------------------------------------------------------------- */
+
+/* Three columns when a nav panel is present: sidebar, the panel, content. */
+body.has-nav-panel {
+  grid-template-columns: 250px 232px 1fr;
+}
+
+.nav-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 100vh;
+  padding: 20px 16px;
+  border-right: 1px solid var(--divider);
+  box-shadow: 1px 0 0 var(--divider-glint);
+  overflow-y: auto;
+}
+
+.nav-panel__head {
+  padding: 4px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nav-panel__search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 12px;
+  color: var(--muted);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+}
+
+.nav-panel__search input {
+  width: 100%;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+}
+
+.nav-panel__list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 4px;
+}
+
+.nav-panel__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.nav-panel__item:hover { background: var(--input-bg); }
+
+.nav-panel__item--on {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.nav-panel__item .count {
+  font-size: 12px;
+  color: var(--muted);
+}
+.nav-panel__item--on .count { color: var(--accent); }
+
+/* The Create-new primary button (blue + plus), top-right of the page head. */
+.resources-create {
+  flex: none;
+}
+
+@media (max-width: 1100px) {
+  body.has-nav-panel { grid-template-columns: 250px 1fr; }
+  .nav-panel { display: none; }
+}
+
+/* Saved / Recent group headings inside the Recent dropdown (#282). */
+.recent-group {
+  margin: 8px 4px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.recent-group:first-child { margin-top: 0; }
+.recent-item__saved {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-weight: 500;
+}

@@ -369,3 +369,6 @@ resources-create = Crear nuevo
 resources-edit-title = Editar recurso
 resources-tab-edit = Editar
 resources-tab-history = Historial
+resources-types-heading = Tipos de recurso
+
+queries-saved-group = Guardadas
