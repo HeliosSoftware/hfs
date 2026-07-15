@@ -9,9 +9,10 @@ name: HFS Cluster Smoke
 # it with ref=<feature-branch> to run the branch's version of this file and of
 # the smoke script. The skeleton asserts only behavior that is already
 # cluster-safe (shared-Postgres CRUD visibility A→B, round-robin through the
-# front) — it calibrates the two-instance harness. Phase 1 adds the SoF
-# $export A→B round-trip; Phase 3 adds the WebSocket fan-out A→B case; the
-# nightly kill-9 recovery cases (A1/E1) get a schedule trigger when they land.
+# front) — it calibrates the two-instance harness. Phase 1 added the SoF
+# $export A→B round-trip (check 4) and the nightly kill-9 recovery check (A1,
+# schedule-gated: kill -9 the lease holder mid-export, the survivor reclaims
+# and completes); Phase 3 adds the WebSocket fan-out A→B case.
 #
 # Cloned from bulk-export-smoke.yml: same self-hosted runners, remote Docker
 # host (containers are reached at $DOCKER_HOST_IP, the hfs binaries run on the
@@ -19,6 +20,17 @@ name: HFS Cluster Smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      nightly:
+        description: "Also run the slow kill-9 recovery check (A1)"
+        type: boolean
+        default: false
+  schedule:
+    # Nightly recovery tier (strategy §8/§10). NOTE: scheduled runs execute
+    # the default branch's copy of this workflow; until the feature branch
+    # merges, exercise the branch's version via workflow_dispatch with
+    # nightly=true and ref=<branch>.
+    - cron: "17 6 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -69,6 +81,7 @@ jobs:
       FHIR_VERSION: R4
       HFS_PORT_A: "18200"
       HFS_PORT_B: "18201"
+      NIGHTLY: ${{ (github.event_name == 'schedule' || inputs.nightly == true) && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -224,6 +237,10 @@ jobs:
             HFS_EXPORT_DIR="$SHARED_EXPORT_DIR"
           )
 
+          # Persisted so the nightly kill-9 check can restart an instance
+          # with identical configuration (values are space-free).
+          printf '%s\n' "${COMMON_ENV[@]}" > "$RESULTS_DIR/cluster-env.list"
+
           HFS_LOG_A="$RESULTS_DIR/hfs-a.log"
           HFS_LOG_B="$RESULTS_DIR/hfs-b.log"
           echo "HFS_LOG_A=$HFS_LOG_A" >> "$GITHUB_ENV"
@@ -270,10 +287,25 @@ jobs:
           SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}" \
           ./crates/hfs/tests/cluster/run_external_cluster_smoke.sh
 
+      - name: Nightly kill-9 recovery check (A1)
+        if: env.NIGHTLY == 'true'
+        run: |
+          BASE_URL_A="http://localhost:$HFS_PORT_A" \
+          BASE_URL_B="http://localhost:$HFS_PORT_B" \
+          FHIR_VERSION="$FHIR_VERSION" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          HFS_BINARY="./target/debug/hfs" \
+          CLUSTER_ENV_FILE="$RESULTS_DIR/cluster-env.list" \
+          ./crates/hfs/tests/cluster/run_nightly_kill9_check.sh
+
       - name: Stop HFS instances gracefully
         if: always()
         run: |
-          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}"; do
+          NIGHTLY_B_PID=""
+          if [ -f "$RESULTS_DIR/nightly-b.pid" ]; then
+            NIGHTLY_B_PID="$(cat "$RESULTS_DIR/nightly-b.pid")"
+          fi
+          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}" "$NIGHTLY_B_PID"; do
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
               kill -INT "$pid" 2>/dev/null || true
               for _ in {1..50}; do
