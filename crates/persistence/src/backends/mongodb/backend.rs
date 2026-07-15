@@ -157,6 +157,7 @@ impl MongoBackend {
     pub(crate) const RESOURCES_COLLECTION: &'static str = "resources";
     pub(crate) const RESOURCE_HISTORY_COLLECTION: &'static str = "resource_history";
     pub(crate) const SEARCH_INDEX_COLLECTION: &'static str = "search_index";
+    pub(crate) const TENANTS_COLLECTION: &'static str = "tenants";
 
     /// Creates a new MongoDB backend from the provided configuration.
     pub fn new(config: MongoBackendConfig) -> StorageResult<Self> {

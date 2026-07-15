@@ -262,11 +262,17 @@ fn is_duplicate_key_error(err: &MongoError) -> bool {
 const MAX_TRANSIENT_RETRIES: u32 = 4;
 
 /// True when a MongoDB error is transient and safe to retry: one the driver has
-/// itself labelled retryable, or a network/connection/server-selection error
-/// (e.g. a connection reset by a momentarily overloaded server). The driver
-/// retries such errors once; a server that stays busy longer than that outlasts
-/// the single retry, so we add a short bounded retry on top. Non-transient
-/// errors (duplicate key, bad command, decode) are never retried here.
+/// itself labelled retryable, or a fast network/connection failure (e.g. a
+/// connection reset by a momentarily overloaded server). The driver retries such
+/// errors once; a server that stays busy longer than that outlasts the single
+/// retry, so we add a short bounded retry on top. Non-transient errors
+/// (duplicate key, bad command, decode) are never retried here.
+///
+/// A `ServerSelection` timeout is deliberately *not* treated as transient: it
+/// already means the driver waited its full `server_selection_timeout` and found
+/// no usable server, so a fast backoff-retry would just pay that wait again
+/// (blocking the caller for minutes against a genuinely-down server) without
+/// improving the odds. Such an error is surfaced promptly instead.
 fn is_transient_mongo_error(err: &MongoError) -> bool {
     use mongodb::error::{ErrorKind, RETRYABLE_ERROR, RETRYABLE_WRITE_ERROR};
 
@@ -274,9 +280,7 @@ fn is_transient_mongo_error(err: &MongoError) -> bool {
         || err.contains_label(RETRYABLE_WRITE_ERROR)
         || matches!(
             err.kind.as_ref(),
-            ErrorKind::Io(_)
-                | ErrorKind::ConnectionPoolCleared { .. }
-                | ErrorKind::ServerSelection { .. }
+            ErrorKind::Io(_) | ErrorKind::ConnectionPoolCleared { .. }
         )
 }
 

@@ -86,6 +86,36 @@ nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capability & Konformität
 nav-admin-ops = Admin / Betrieb
 nav-subscriptions = Abonnements
+nav-tenants = Mandanten
+nav-toggle = Navigation ein- oder ausklappen
+
+## Mandantenverwaltung (/ui/tenants)
+
+tenants-title = Mandantenverwaltung
+tenants-unavailable = Die Mandantenregistrierung ist auf diesem Speicher-Backend nicht verfügbar.
+tenants-stat-total = Mandanten gesamt
+tenants-stat-total-sub = { $count ->
+    [one] { $count } registriert
+   *[other] { $count } registriert
+}
+tenants-stat-resources = Gespeicherte Ressourcen
+tenants-stat-resources-sub = über alle Mandanten
+tenants-search-placeholder = Nach Name oder Mandanten-ID suchen…
+tenants-add = Mandant hinzufügen
+tenants-add-title = Einen Mandanten hinzufügen
+tenants-field-id = Mandanten-ID
+tenants-field-id-hint = Wird in der API verwendet (Header X-Tenant-ID, URL-Präfix, JWT-Claim).
+tenants-field-name = Anzeigename (optional)
+tenants-field-name-hint = Eine lesbare Bezeichnung; nicht für das Routing verwendet.
+tenants-add-submit = Mandant bereitstellen
+tenants-col-tenant = Mandant
+tenants-col-resources = Ressourcen
+tenants-col-created = Erstellt
+tenants-col-actions = Aktionen
+tenants-empty = Keine Mandanten gefunden.
+tenants-unregistered = nicht registriert
+tenants-delete = Mandant löschen
+tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten bleiben erhalten, sofern sie nicht über die API bereinigt werden.
 
 tenant-heading = Tenants
 tenant-all = Alle Tenants
@@ -107,9 +137,40 @@ card-uptime = Verfügbarkeit
 card-uptime-sub = letzte 30 Tage
 
 chart-title = FHIR-Ressourcen im Zeitverlauf
-chart-unit-patients = Patienten
 chart-expand = Diagramm vergrößern
+chart-window = Zeitfenster des Diagramms
 
 ## Fußzeile
 
 footer-copyright = © { $year } { -org-name }
+
+## Saved queries (#234)
+
+nav-saved-queries = Gespeicherte Abfragen
+
+queries-heading = Gespeicherte Abfragen
+queries-lede = FHIR-Suchabfragen je Ressourcentyp aufbewahren, sortiert nach der letzten Ausführung. Sie werden in deinen Benutzereinstellungen gespeichert und stehen auf allen Geräten bereit.
+queries-add-heading = Abfrage speichern
+queries-type-label = Ressourcentyp
+queries-type-placeholder = z. B. Patient
+queries-name-label = Name
+queries-name-placeholder = z. B. Smiths in Boston
+queries-query-label = Abfrage
+queries-query-placeholder = z. B. name=smith&address-city=Boston
+queries-empty = Noch keine gespeicherten Abfragen. Speichere oben eine, um loszulegen.
+queries-never-run = Nie ausgeführt
+queries-run = Ausführen
+queries-rename = Umbenennen
+queries-delete = Löschen
+queries-rename-prompt = Neuer Name
+queries-confirm-delete = „{ $name }“ löschen?
+queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-Backend dieses Servers unterstützt keine Benutzereinstellungen.
+
+queries-builder-heading = Such-Builder
+queries-url-label = FHIR-Such-URL
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Bearbeite die GET-URL direkt. Ausführen öffnet die Suche in einem neuen Tab und trägt sie unter „Zuletzt" ein; mit einem Namen bleibt sie in der Liste unten gespeichert.
+queries-recent = Zuletzt
+queries-recent-heading = Letzte Suchen
+queries-recent-empty = Noch keine letzten Suchen — führe eine aus, um sie hier einzutragen.
+queries-invalid-url = Gib eine Suche wie GET /Patient?name=smith ein — der Ressourcentyp kommt aus dem Pfad.
