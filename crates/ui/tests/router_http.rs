@@ -554,3 +554,45 @@ async fn unparseable_versions_report_an_error_not_an_empty_diff() {
     let html = diff("from=%7Bnope&to=%7B%7D").await;
     assert!(html.contains("history__banner--error"));
 }
+
+/* Resources workspace (#282): the nav submenu + the page that ties the type
+ * filter, search, and edit modal together. */
+
+#[tokio::test]
+async fn resources_page_has_the_filter_search_and_create_button() {
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The type filter rail, the search builder, and the Create button.
+    assert!(html.contains(r#"id="type-rail-list""#));
+    assert!(html.contains(r#"id="saved-query-form""#));
+    assert!(html.contains(r#"id="resource-create""#));
+    // The edit modal shell, with its Edit / History tabs.
+    assert!(html.contains(r#"id="resource-modal""#));
+    assert!(html.contains(r#"data-modal-tab="history""#));
+    // The nav carries the Resources submenu, and this page marks it current.
+    assert!(html.contains(r#"class="nav-submenu""#));
+    assert!(html.contains(r#"href="/ui/resources?type=Patient""#));
+}
+
+#[tokio::test]
+async fn resources_deep_links_focus_the_selected_type() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/resources?type=Observation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The rail marks the deep-linked type, and Create targets it.
+    assert!(html.contains(r#"data-selected-type="Observation""#));
+    assert!(html.contains(r#"filter-rail__item--on" data-rail-type="Observation""#));
+}

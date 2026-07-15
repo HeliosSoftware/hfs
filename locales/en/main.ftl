@@ -364,3 +364,13 @@ history-only-metadata = Only metadata changed between these versions.
 history-identical = These two versions are identical.
 history-deleted = { $version } is a deletion — there is nothing to diff against.
 history-parse-error = Those versions could not be read as JSON.
+
+## Resources workspace (#282)
+
+nav-resources-all = All types
+resources-heading = Resources
+resources-lede = Browse, search, create, and edit FHIR resources. Search in natural language or build the query by hand, then open any result to edit it.
+resources-create = Create new
+resources-edit-title = Edit resource
+resources-tab-edit = Edit
+resources-tab-history = History

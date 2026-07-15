@@ -64,6 +64,25 @@
         <span class="icon">{% include "icons/home.svg" %}</span>
         {{ i18n.t("nav-home") }}
       </a>
+      <!--
+        Resources (#282): the primary read/write workspace. A <details>
+        disclosure so the resource-type submenu opens without JavaScript; it
+        stays open on the Resources page. The submenu carries the common types
+        as deep links; the full list is the page's own filter rail.
+      -->
+      <details class="nav-group"{% if active_page == "resources" %} open{% endif %}>
+        <summary class="nav-item nav-item--group{% if active_page == "resources" %} nav-item--current{% endif %}">
+          <span class="icon">{% include "icons/layers.svg" %}</span>
+          <span class="nav-item__label">{{ i18n.t("nav-resources") }}</span>
+          <span class="icon nav-group__caret">{% include "icons/chevron-down.svg" %}</span>
+        </summary>
+        <div class="nav-submenu">
+          {% for t in ["Patient", "Observation", "Encounter", "Condition", "MedicationRequest", "DiagnosticReport", "Procedure", "Organization"] %}
+          <a class="nav-subitem" href="/ui/resources?type={{ t }}">{{ t }}</a>
+          {% endfor %}
+          <a class="nav-subitem nav-subitem--all" href="/ui/resources">{{ i18n.t("nav-resources-all") }}</a>
+        </div>
+      </details>
       <a class="nav-item" href="/ui/queries"{% if active_page == "queries" %} aria-current="page"{% endif %}>
         <span class="icon">{% include "icons/bookmark.svg" %}</span>
         {{ i18n.t("nav-saved-queries") }}

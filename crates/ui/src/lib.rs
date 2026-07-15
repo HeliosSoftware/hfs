@@ -150,6 +150,23 @@ struct SearchPage {
     show_save: bool,
 }
 
+/// Resources page (#282): type filter + search + edit modal, on one screen.
+#[derive(Template)]
+#[template(path = "pages/resources.html")]
+struct ResourcesPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    nl_enabled: bool,
+    nl: NlSearch,
+    docs_url: &'static str,
+    resource_types: Vec<String>,
+    selected_type: String,
+    /// The search-builder partial's save controls are the Saved Queries page's
+    /// job, not this one's.
+    show_save: bool,
+}
+
 /// Saved FHIR queries page (#234). The shell is server-rendered; the list is
 /// hydrated client-side from `/_user/settings` by `assets/saved-queries.js`,
 /// the same per-user document (and fetch pattern) the theme toggle uses.
@@ -266,6 +283,8 @@ pub fn mount(
     let nl_enabled = nl.enabled;
     let mut router = Router::new()
         .route("/ui", get(index))
+        // Resources workspace (#282): the type filter + search + edit modal.
+        .route("/ui/resources", get(resources))
         .route("/ui/queries", get(queries))
         .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
@@ -343,6 +362,38 @@ async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Respon
         resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
         show_save: true,
     })
+}
+
+/// Resources page (#282): the primary read/write workspace. Ties together the
+/// type filter, the search (natural-language + visual builder), and — on a
+/// result click — the edit modal that reuses the schema-driven editor, with
+/// save / delete / version history / diff. The pieces are the same partials the
+/// Search and Editor pages render; this page is the place they come together.
+async fn resources(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    Query(query): Query<ResourcesQuery>,
+) -> Response {
+    render(ResourcesPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "resources",
+        nl_enabled: state.nl.enabled,
+        nl: (*state.nl).clone(),
+        docs_url: NL_SEARCH_DOCS,
+        resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
+        // The type the rail opens focused on (from the nav submenu deep link).
+        selected_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
+        show_save: false,
+    })
+}
+
+/// Query string for the Resources page: an optional pre-selected type, so the
+/// nav submenu can deep-link `/ui/resources?type=Observation`.
+#[derive(Deserialize, Default)]
+struct ResourcesQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
