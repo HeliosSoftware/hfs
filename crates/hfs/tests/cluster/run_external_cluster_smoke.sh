@@ -238,7 +238,13 @@ if [ "$status" != "200" ]; then
   fail "SoF export manifest fetch returned HTTP $status, expected 200"
 fi
 
-DOWNLOAD_URL="$(grep -o '"valueUri"[[:space:]]*:[[:space:]]*"[^"]*"' "$HTTP_DIR/export-manifest.json" | head -1 | sed 's/.*"\(http[^"]*\)".*/\1/')"
+# The manifest carries several valueUri params: a top-level `location` /
+# `cancelUrl` (both point at the status endpoint) and, inside each `output`
+# part, the shard's download `location`. Only the shard URL serves bytes —
+# the status URLs answer 303 — so filter the status endpoints out rather
+# than taking the first match.
+DOWNLOAD_URL="$(grep -o '"valueUri"[[:space:]]*:[[:space:]]*"[^"]*"' "$HTTP_DIR/export-manifest.json" \
+  | sed 's/.*"\(http[^"]*\)".*/\1/' | grep -v '/status$' | head -1)"
 [ -n "$DOWNLOAD_URL" ] || { cat "$HTTP_DIR/export-manifest.json" >&2; fail "SoF export manifest has no output location"; }
 
 # Rewrite the front-based download URL to target instance B directly: the
