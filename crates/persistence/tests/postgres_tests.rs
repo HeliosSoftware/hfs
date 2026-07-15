@@ -719,6 +719,10 @@ mod postgres_integration {
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
     static BULK_EXPORT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    // Serializes the cluster-jobs T2 suite: `claim_next` is deliberately
+    // cross-tenant, so parallel tests sharing the container would claim (and
+    // finish) each other's queued jobs.
+    static CLUSTER_JOBS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
@@ -4855,5 +4859,287 @@ mod postgres_integration {
             other => panic!("resource must end deleted, got {other:?}"),
         }
         assert_history_versions(&verifier, &tenant, "Patient", &id, expected_versions).await;
+    }
+
+    // ========================================================================
+    // T2 cluster suite — unified cluster job store (A1 substrate)
+    // (docs/cluster-testing-strategy.md §8 Phase 1).
+    //
+    // The `cluster_jobs` table + `ClusterJobStore` back the SoF `$export`
+    // (#169) and reindex (A2) surfaces. Every test takes
+    // `CLUSTER_JOBS_TEST_LOCK`: `claim_next` is deliberately cross-tenant,
+    // so parallel tests sharing the container would claim each other's jobs.
+    //
+    // Nested module: `ClusterJobStore` and `ExportClaimStrategy` both give
+    // `PostgresBackend` a `claim_next`/`heartbeat`/`release`, so the two
+    // traits must never be in scope together or every call is ambiguous.
+    // ========================================================================
+
+    mod cluster_jobs_suite {
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        use serde_json::json;
+
+        use helios_persistence::core::{
+            ClusterJobState, ClusterJobStore, ClusterLeaseError, JobKind, ResourceStorage, WorkerId,
+        };
+
+        use super::{CLUSTER_JOBS_TEST_LOCK, create_backend, create_tenant};
+        use crate::cluster_harness as harness;
+
+        /// The server-facing seam: the store comes off the backend the same
+        /// way `sof_runner()` does.
+        fn store_of(backend: &impl ResourceStorage) -> Arc<dyn ClusterJobStore> {
+            backend
+                .cluster_job_store()
+                .expect("postgres backs a cluster job store")
+        }
+
+        /// Claims and finishes every eligible job of `kind` so an exclusivity
+        /// or fencing test starts from an empty queue (same rationale as
+        /// `drain_export_queue`).
+        async fn drain_cluster_jobs(store: &dyn ClusterJobStore, kind: JobKind) {
+            let reaper = WorkerId::new(format!("cluster-jobs-drain-{}", uuid::Uuid::new_v4()));
+            while let Some((lease, _payload)) = store
+                .claim_next(kind, &reaper, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+            {
+                store
+                    .complete(&lease, json!({"drained": true}))
+                    .await
+                    .expect("draining a leftover cluster job");
+            }
+        }
+
+        /// DoD rows: visibility + isolation — a job enqueued via instance A is
+        /// observable (status and list) via instance B, and invisible to
+        /// another tenant.
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_visible_and_isolated_across_handles() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let tenant = create_tenant("cluster-jobs-vis");
+
+            let job_id = a
+                .enqueue(&tenant, JobKind::SofExport, json!({"probe": "vis"}))
+                .await
+                .unwrap();
+
+            let rec = harness::assert_visible(
+                b.get_status(&tenant, &job_id).await.unwrap(),
+                "cluster job enqueued via instance A",
+            );
+            assert_eq!(rec.state, ClusterJobState::Queued);
+            assert_eq!(rec.payload, json!({"probe": "vis"}));
+            assert!(!rec.cancel_requested);
+
+            let listed = b.list_jobs(&tenant, JobKind::SofExport).await.unwrap();
+            assert_eq!(listed.len(), 1, "list_jobs must see the job via instance B");
+
+            harness::assert_wrong_tenant_hidden(
+                b.get_status(&create_tenant("cluster-jobs-vis-other"), &job_id)
+                    .await
+                    .unwrap(),
+                "cluster job",
+            );
+            assert!(
+                b.list_jobs(&create_tenant("cluster-jobs-vis-other"), JobKind::SofExport)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "tenant isolation violated: cluster job listed under the wrong tenant"
+            );
+        }
+
+        /// DoD row: exclusivity — two instances race `claim_next` on one
+        /// queued job and exactly one wins (`FOR UPDATE SKIP LOCKED`).
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_claim_exclusive_across_handles() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let tenant = create_tenant("cluster-jobs-claim");
+
+            drain_cluster_jobs(a.as_ref(), JobKind::SofExport).await;
+
+            let job_id = a
+                .enqueue(&tenant, JobKind::SofExport, json!({"probe": "claim"}))
+                .await
+                .unwrap();
+
+            let worker_a = WorkerId::new(format!("cluster-jobs-a-{}", uuid::Uuid::new_v4()));
+            let worker_b = WorkerId::new(format!("cluster-jobs-b-{}", uuid::Uuid::new_v4()));
+            let (racer_a, racer_b) = (Arc::clone(&a), Arc::clone(&b));
+            let (claim_a, claim_b) = harness::race2(
+                async move {
+                    racer_a
+                        .claim_next(JobKind::SofExport, &worker_a, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+                async move {
+                    racer_b
+                        .claim_next(JobKind::SofExport, &worker_b, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+            )
+            .await;
+
+            harness::assert_exactly_one(&claim_a, &claim_b, "the claim on one queued cluster job");
+            let (lease, payload) = claim_a.or(claim_b).unwrap();
+            assert_eq!(lease.job_id, job_id);
+            assert_eq!(payload, json!({"probe": "claim"}));
+            assert_eq!(
+                lease.tenant.tenant_id().as_str(),
+                tenant.tenant_id().as_str()
+            );
+        }
+
+        /// DoD row: fencing — after a release/reclaim moves the lease to
+        /// another instance, every stale-holder write is refused with
+        /// `LeaseLost` while the current holder is unaffected. Deterministic:
+        /// release, not expiry.
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_stale_handle_fenced_after_release() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let tenant = create_tenant("cluster-jobs-fence");
+
+            drain_cluster_jobs(a.as_ref(), JobKind::SofExport).await;
+
+            let job_id = a
+                .enqueue(&tenant, JobKind::SofExport, json!({"probe": "fence"}))
+                .await
+                .unwrap();
+
+            let worker_a = WorkerId::new(format!("cluster-fence-a-{}", uuid::Uuid::new_v4()));
+            let (lease_a, _) = a
+                .claim_next(JobKind::SofExport, &worker_a, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("instance A claims the queued job");
+            assert_eq!(lease_a.job_id, job_id);
+            a.release(lease_a.clone()).await.unwrap();
+
+            let worker_b = WorkerId::new(format!("cluster-fence-b-{}", uuid::Uuid::new_v4()));
+            let (lease_b, _) = b
+                .claim_next(JobKind::SofExport, &worker_b, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("instance B reclaims after release");
+            assert_eq!(lease_b.job_id, job_id);
+            assert!(lease_b.fencing_token > lease_a.fencing_token);
+
+            assert!(matches!(
+                a.heartbeat(&lease_a).await,
+                Err(ClusterLeaseError::LeaseLost { .. })
+            ));
+            assert!(matches!(
+                a.update_progress(&lease_a, json!({"pct": 1})).await,
+                Err(ClusterLeaseError::LeaseLost { .. })
+            ));
+            assert!(matches!(
+                a.complete(&lease_a, json!({})).await,
+                Err(ClusterLeaseError::LeaseLost { .. })
+            ));
+
+            b.heartbeat(&lease_b).await.unwrap();
+            b.complete(&lease_b, json!({"ok": true})).await.unwrap();
+
+            let rec = a.get_status(&tenant, &job_id).await.unwrap().unwrap();
+            assert_eq!(rec.state, ClusterJobState::Completed);
+            assert_eq!(rec.result, Some(json!({"ok": true})));
+        }
+
+        /// DoD row: durability — dropping the enqueueing handle (simulated
+        /// redeploy) must not lose the job; a fresh handle sees and can claim
+        /// it.
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_survive_handle_drop() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let tenant = create_tenant("cluster-jobs-durable");
+
+            let first_backend = create_backend().await;
+            let first = store_of(&first_backend);
+            drain_cluster_jobs(first.as_ref(), JobKind::Reindex).await;
+            let job_id = first
+                .enqueue(&tenant, JobKind::Reindex, json!({"probe": "durable"}))
+                .await
+                .unwrap();
+            drop(first);
+            drop(first_backend);
+
+            let replacement_backend = create_backend().await;
+            let replacement = store_of(&replacement_backend);
+            let rec = harness::assert_visible(
+                replacement.get_status(&tenant, &job_id).await.unwrap(),
+                "cluster job after its enqueueing handle was dropped",
+            );
+            assert_eq!(rec.state, ClusterJobState::Queued);
+
+            let (lease, payload) = replacement
+                .claim_next(
+                    JobKind::Reindex,
+                    &WorkerId::new(format!("cluster-durable-{}", uuid::Uuid::new_v4())),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                .expect("a fresh handle claims the surviving job");
+            assert_eq!(lease.job_id, job_id);
+            assert_eq!(payload, json!({"probe": "durable"}));
+        }
+
+        /// Cross-instance cancel: the worker holds the lease on instance A,
+        /// the cancel arrives via instance B — pollers see `cancelled`
+        /// immediately, A's worker observes `cancel_requested`, and its
+        /// terminal writes are refused (a cancelled job cannot be
+        /// resurrected).
+        #[tokio::test]
+        async fn postgres_integration_cluster_jobs_cancel_via_other_handle_reaches_worker() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let (a, b) = (store_of(&handles.a), store_of(&handles.b));
+            let tenant = create_tenant("cluster-jobs-cancel");
+
+            drain_cluster_jobs(a.as_ref(), JobKind::SofExport).await;
+
+            let job_id = a
+                .enqueue(&tenant, JobKind::SofExport, json!({"probe": "cancel"}))
+                .await
+                .unwrap();
+            let (lease, _) = a
+                .claim_next(
+                    JobKind::SofExport,
+                    &WorkerId::new(format!("cluster-cancel-{}", uuid::Uuid::new_v4())),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                .expect("instance A claims the queued job");
+            assert!(!a.cancel_requested(&lease).await.unwrap());
+
+            // Cancel arrives on the other instance; wrong tenant is a no-op.
+            assert!(
+                !b.cancel(&create_tenant("cluster-jobs-cancel-other"), &job_id)
+                    .await
+                    .unwrap()
+            );
+            assert!(b.cancel(&tenant, &job_id).await.unwrap());
+
+            let rec = b.get_status(&tenant, &job_id).await.unwrap().unwrap();
+            assert_eq!(rec.state, ClusterJobState::Cancelled);
+
+            assert!(a.cancel_requested(&lease).await.unwrap());
+            assert!(matches!(
+                a.complete(&lease, json!({})).await,
+                Err(ClusterLeaseError::LeaseLost { .. })
+            ));
+        }
     }
 }

@@ -73,6 +73,13 @@ impl ResourceStorage for PostgresBackend {
         Some(std::sync::Arc::new(PgInDbRunner::new(self.pool())))
     }
 
+    fn cluster_job_store(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+        use super::cluster_jobs::PgClusterJobStore;
+        Some(std::sync::Arc::new(PgClusterJobStore::new(self.pool())))
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,

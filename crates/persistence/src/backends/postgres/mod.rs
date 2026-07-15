@@ -75,6 +75,7 @@
 mod backend;
 mod bulk_export;
 mod bulk_submit;
+mod cluster_jobs;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;

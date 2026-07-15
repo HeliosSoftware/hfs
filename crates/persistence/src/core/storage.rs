@@ -546,6 +546,17 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the unified cluster job store for this backend, if it can back
+    /// one (a shared database — see [`crate::core::cluster_job_store`]).
+    ///
+    /// The default implementation returns `None`, which keeps async job
+    /// surfaces on their process-local (single-instance) paths.
+    fn cluster_job_store(
+        &self,
+    ) -> Option<Arc<dyn crate::core::cluster_job_store::ClusterJobStore>> {
+        None
+    }
+
     /// Counts non-deleted resources for several types in one call.
     ///
     /// Returns `(resource_type, count)` pairs in the same order as

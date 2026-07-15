@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// Advisory lock key serializing schema initialization across instances
 /// sharing one database (ASCII "HFSSCHEM").
@@ -306,6 +306,7 @@ async fn migrate_schema(
             11 => migrate_v11_to_v12(client).await?,
             12 => migrate_v12_to_v13(client).await?,
             13 => migrate_v13_to_v14(client).await?,
+            14 => migrate_v14_to_v15(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -845,6 +846,61 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v13->v14 failed: {}", e)))?;
+    Ok(())
+}
+
+/// v14 -> v15: Add the unified `cluster_jobs` table (design doc §4).
+///
+/// One shared queue for every async job surface that was process-local
+/// (SoF `$export` #169, search reindex A2), discriminated by `kind`. Claiming
+/// uses the same lease + fencing-token discipline as `bulk_export_jobs`
+/// (worker_id / lease_expiry / heartbeat_at / fencing_token columns and the
+/// `FOR UPDATE SKIP LOCKED` claim in `cluster_jobs.rs`); bulk export/submit
+/// deliberately stay on their own tables (resolved decision F3).
+async fn migrate_v14_to_v15(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS cluster_jobs (
+                id               TEXT PRIMARY KEY,
+                tenant_id        TEXT NOT NULL,
+                kind             TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'queued',
+                payload          JSONB NOT NULL,
+                progress         JSONB,
+                result           JSONB,
+                error_message    TEXT,
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                worker_id        TEXT,
+                lease_expiry     TIMESTAMPTZ,
+                heartbeat_at     TIMESTAMPTZ,
+                fencing_token    BIGINT NOT NULL DEFAULT 0,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                started_at       TIMESTAMPTZ,
+                finished_at      TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v14->v15 failed: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_jobs_claim
+                 ON cluster_jobs(kind, status, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_claim: {}", e)))?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_cluster_jobs_tenant
+                 ON cluster_jobs(tenant_id, kind, created_at DESC)",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to create idx_cluster_jobs_tenant: {}", e)))?;
+
     Ok(())
 }
 

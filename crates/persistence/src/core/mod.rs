@@ -97,6 +97,7 @@ pub mod bulk_submit;
 pub mod bulk_submit_input;
 pub mod bulk_submit_worker;
 pub mod capabilities;
+pub mod cluster_job_store;
 pub mod history;
 pub mod search;
 pub mod sof_runner;
@@ -137,6 +138,10 @@ pub use capabilities::{
     CapabilityProvider, GlobalSearchCapabilities, Interaction, ResourceCapabilities,
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
     StorageCapabilities, SystemInteraction, UnsupportedFeatureType, UnsupportedSearchFeature,
+};
+pub use cluster_job_store::{
+    ClusterJobId, ClusterJobLease, ClusterJobRecord, ClusterJobState, ClusterJobStore,
+    ClusterLeaseError, JobKind,
 };
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
