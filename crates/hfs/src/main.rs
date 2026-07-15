@@ -854,6 +854,12 @@ async fn main() -> anyhow::Result<()> {
             sof_enabled: config.sof_enabled,
             export_controller: &config.export_controller,
             export_sink: &config.export_sink,
+            // Feature-gated: a binary without the subscriptions feature
+            // cannot run the engine, so its configuration cannot hurt a
+            // cluster.
+            subscriptions_enabled: cfg!(feature = "subscriptions")
+                && config.subscriptions_enabled(),
+            subscriptions_fanout: &config.subscriptions_fanout,
         };
         if let Err(errors) = cluster::validate_cluster_config(&view) {
             for error in &errors {

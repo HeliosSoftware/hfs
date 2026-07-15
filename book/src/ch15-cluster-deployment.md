@@ -50,6 +50,8 @@ things:
 | Job store | explicit `HFS_JOB_STORE_BACKEND=memory` | Remove it or set `database` |
 | SoF export controller | explicit `HFS_EXPORT_CONTROLLER=memory` (with SoF enabled) | Remove it (defaults to `database` when clustered) or set `database` |
 | SoF export output | `HFS_EXPORT_SINK=fs` (with SoF enabled) | Use `s3` |
+| Subscriptions fan-out | explicit `HFS_SUBSCRIPTIONS_FANOUT=memory` (with subscriptions enabled) | Remove it (defaults to `pg-notify` when clustered) or disable subscriptions |
+| Subscriptions primary | subscriptions enabled on a non-PostgreSQL primary | Use a `postgres` primary (the fan-out and shared delivery state ride it) or disable subscriptions |
 
 With `HFS_CLUSTER` unset (the default), nothing changes: a single instance
 keeps its zero-configuration SQLite defaults.
@@ -85,17 +87,16 @@ current state and is updated as each phase ships.
 | Search reindex jobs | ✅ | ✅ with `HFS_JOB_STORE_BACKEND=database` (the default under `HFS_CLUSTER`): jobs on the shared `cluster_jobs` store, any instance answers `$reindex-status`/cancel, workers on every instance compete for the rebuild (Postgres primary) | Phase 1 (A2) — landed |
 | JWT validation | ✅ | ✅ stateless per-request validation — the former `jti` replay cache was removed with #205 (access tokens are not one-time assertions), so auth holds no cross-instance state | already safe (#205) |
 | JWKS refresh | ✅ | ✅ coordinated with `HFS_AUTH_JWKS_COORDINATION=database` (the default under `HFS_CLUSTER`, Postgres primary): cluster-wide single-flight over the shared `cluster_refresh_cache` table — one IdP fetch per boot herd / key rotation, every other instance reuses the stored document. `redis` (build feature) is an opt-in alternative; `local` keeps per-instance refresh (functionally correct — a warning, never a refusal) | Phase 2 (C2) — landed |
-| Subscriptions (topics, delivery, WebSockets) | ✅ | ❌ **single-instance only** — registries are in-memory and only the instance that served a write reacts to it | Phase 3 (#170) |
+| Subscriptions (topics, delivery, WebSockets) | ✅ | ✅ with `HFS_SUBSCRIPTIONS_FANOUT=pg-notify` (the default under `HFS_CLUSTER`, Postgres primary): registries hydrate from the database at boot and stay in sync over LISTEN/NOTIFY, `eventNumber`/failure counters are shared (migration v17), WebSocket binding tokens mint/redeem on any instance, notifications reach sockets on every instance, and push-channel deliveries (rest-hook/email/message) run on a durable leased outbox that survives restarts | Phase 3 (#170) — landed |
 | Terminology (HTS) response caches | ✅ | ⚠️ a terminology import on one instance leaves stale `$expand`/`$validate-code` answers on the others | Phase 4 |
 | HTS bootstrap import | ✅ | ⚠️ N cold-starting instances all run the heavy import (correct but N× cost) | Phase 4 |
 | Composite async search sync | ✅ | ⚠️ in-process queue; a crash loses queued secondary-index writes | Phase 4 (durable outbox) |
 | Audit, metrics, health | ✅ | ✅ with shared sinks; `/metrics` is per-instance (aggregate in your scraper) | already safe |
 
-**⚠️ single-instance-only features:** until their phase lands, pin
-Subscriptions to one instance (or route their requests to one instance with
-sticky sessions) — the same guidance issue #170 carries. SQL-on-FHIR async
-exports and reindex are cluster-safe as of Phase 1 (`HFS_JOB_STORE_BACKEND=
-database`, plus a shared `HFS_EXPORT_SINK` for exports).
+SQL-on-FHIR async exports and reindex are cluster-safe as of Phase 1
+(`HFS_JOB_STORE_BACKEND=database`, plus a shared `HFS_EXPORT_SINK` for
+exports); Subscriptions as of Phase 3 (`HFS_SUBSCRIPTIONS_FANOUT=pg-notify`,
+Postgres primary).
 
 ### JWKS refresh coordination (Phase 2)
 
@@ -120,17 +121,57 @@ cache lifetime by its age. If the coordination layer itself is unavailable
 (database or Redis down), instances log a warning and fall back to direct
 IdP fetches — auth availability outranks the dedupe optimization.
 
+### Subscriptions cluster delivery (Phase 3)
+
+`HFS_SUBSCRIPTIONS_FANOUT` selects the behavior (with subscriptions enabled):
+
+| Value | Effect |
+|-------|--------|
+| *(unset)* | `pg-notify` under `HFS_CLUSTER=true`, `memory` otherwise |
+| `memory` | Per-instance registries and delivery — single-instance only (refused under `HFS_CLUSTER=true`) |
+| `pg-notify` | Cluster delivery over the PostgreSQL primary: shared counters/status/outbox tables (migration v17) plus a LISTEN/NOTIFY fan-out on a dedicated connection. Non-Postgres primaries log a warning and stay per-instance |
+
+How the pieces behave, and the guarantees they carry:
+
+- **Registries** (SubscriptionTopic + Subscription, including the R4
+  backport `Basic` form) hydrate from the database at startup and stay in
+  sync at runtime via lifecycle announcements — a Subscription created on
+  any instance fires for matching writes served by every instance. Topics
+  are tenant-scoped as of Phase 3: one tenant's SubscriptionTopic is no
+  longer resolvable by another tenant's Subscription.
+- **`eventNumber` is cluster-wide monotonic and gap-free** (a shared
+  counter row per subscription); resource updates never reset it.
+  Consecutive delivery failures accumulate across instances, so the
+  `error`/`off` status thresholds work no matter which instance failed.
+- **WebSockets**: `$get-ws-binding-token` mints into a shared single-use
+  table, so the WebSocket upgrade may land on any instance. Notifications
+  produced anywhere reach sockets everywhere via the fan-out. Delivery to
+  *remote* sockets is best-effort: envelopes published while an instance's
+  listen connection is down are lost, the instance re-syncs on reconnect,
+  and clients detect gaps via `eventNumber` (the FHIR WebSocket channel
+  contract).
+- **Push channels** (rest-hook, email, message) deliver from a durable
+  outbox with worker leases and persisted retry backoff — a redeploy no
+  longer drops pending retries. Semantics are **at-least-once**: endpoints
+  should tolerate a duplicate delivery after a worker crash (dedupe by
+  `eventNumber`).
+- **Pooler caveat**: the fan-out LISTENs on a dedicated session-level
+  connection. A transaction-pooling proxy (e.g. pgbouncer in transaction
+  mode) between HFS and PostgreSQL breaks LISTEN/NOTIFY — connect the
+  instances directly, or use session pooling.
+- The subscription heartbeat interval remains unwired; if it lands later it
+  must be lease-guarded, not a per-instance timer.
+
 ---
 
 ## Load-balancer notes
 
 - **Round-robin is fine for CRUD** — any instance answers any request against
   the shared database.
-- **Sticky sessions are *not* sufficient for Subscriptions.** A WebSocket
-  client can be pinned to instance B, but the resource write that triggers a
-  notification can land on instance A — and today only the instance that
-  served the write reacts. Cross-instance delivery requires the Phase 3
-  pub/sub fan-out, not routing tricks.
+- **Sticky sessions are no longer needed for Subscriptions** (Phase 3): a
+  WebSocket client pinned to instance B receives notifications for writes
+  served by instance A via the pg-notify fan-out, and binding tokens redeem
+  on any instance.
 - **WebSocket upgrades** need the usual `Upgrade`/`Connection` header
   pass-through on the proxy.
 - **Health checks**: probe each instance's `/health` directly, not through

@@ -178,6 +178,22 @@ Grouped by the fix class they need. Each item: location · what breaks · severi
 
 ### Class B — node-local connection registries & fan-out → shared pub/sub + shared state (Subscriptions, [#170])
 
+*[amended 2026-07-15: Phase 3 landed B1–B5 on migration v17. Resolved
+shapes: the fan-out is Postgres LISTEN/NOTIFY (`EventFanout` /
+`PgNotifyFanout`, dedicated non-pooled listen connection, envelopes only —
+websocket bundles persist in a `subscription_notification_events` table and
+receivers rehydrate by `(tenant, sub, eventNumber)`); B2 chose the shared-KV
+design (DB `DELETE … RETURNING` redeem-once), not stateless HMAC; B5 is
+fully outbox-driven from attempt zero (at-least-once), not
+inline-then-outbox; B4 counter rows are created lazily by upsert-increment,
+so a Subscription update can NOT reset shared counters (deliberately not
+replicating the in-memory register's reset); and the topic registry became
+tenant-scoped (`(tenant_id, canonical_url)`) in both modes, closing a
+pre-existing cross-tenant topic-visibility leak. `HFS_SUBSCRIPTIONS_FANOUT
+= memory | pg-notify`; explicit `memory` (or a non-Postgres primary) with
+subscriptions enabled is a refusal under `HFS_CLUSTER=true`. Original
+inventory kept below for the record.]*
+
 Systemic: subscription reaction is per-instance, fire-and-forget, in-memory.
 `emit_subscription_event` (`crates/rest/src/handlers/subscription_event.rs:47`)
 `tokio::spawn`s `on_resource_event` on whichever instance served the write,

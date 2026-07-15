@@ -46,6 +46,12 @@ pub struct ClusterConfigView<'a> {
     pub export_controller: &'a str,
     /// `HFS_EXPORT_SINK`.
     pub export_sink: &'a str,
+    /// Whether the Subscriptions engine is enabled (resolved
+    /// `HFS_SUBSCRIPTIONS_ENABLED` AND the binary carries the feature —
+    /// a subsystem that cannot run cannot hurt a cluster).
+    pub subscriptions_enabled: bool,
+    /// Raw `HFS_SUBSCRIPTIONS_FANOUT` value ("" when unset).
+    pub subscriptions_fanout: &'a str,
 }
 
 /// Refuses configurations that cannot run as one of N instances.
@@ -133,6 +139,32 @@ pub fn validate_cluster_config(view: &ClusterConfigView<'_>) -> Result<(), Vec<S
         }
     }
 
+    // B1-B5 (#170) — subscription reaction must be cluster-shared: an
+    // in-process fan-out silently drops notifications for every write routed
+    // to an instance that doesn't hold the registration (unlike C2's
+    // warn-only per-instance JWKS, this is functional breakage).
+    if view.subscriptions_enabled {
+        if view.subscriptions_fanout.eq_ignore_ascii_case("memory") {
+            errors.push(
+                "HFS_CLUSTER=true is incompatible with HFS_SUBSCRIPTIONS_FANOUT=memory: \
+                 subscription registrations, sockets, and delivery state would be \
+                 per-instance, silently dropping notifications for writes served by other \
+                 instances. Remove the variable (it defaults to pg-notify when clustered) \
+                 or set HFS_SUBSCRIPTIONS_ENABLED=false."
+                    .to_string(),
+            );
+        }
+        if view.primary_backend != BackendKind::Postgres {
+            errors.push(
+                "HFS_CLUSTER=true with HFS_SUBSCRIPTIONS_ENABLED requires a postgres \
+                 primary backend: the subscriptions fan-out and shared delivery state ride \
+                 the primary database (LISTEN/NOTIFY), which this backend cannot provide. \
+                 Use a postgres primary or set HFS_SUBSCRIPTIONS_ENABLED=false."
+                    .to_string(),
+            );
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -211,7 +243,9 @@ mod tests {
     use super::*;
 
     /// A view that passes every cluster check; cases below perturb one
-    /// dimension at a time.
+    /// dimension at a time. Subscriptions are off here so the sqlite-primary
+    /// case fires exactly its own row; the subscriptions-on acceptance has
+    /// its own assert.
     fn safe_cluster_view() -> ClusterConfigView<'static> {
         ClusterConfigView {
             cluster: true,
@@ -225,6 +259,8 @@ mod tests {
             sof_enabled: true,
             export_controller: "",
             export_sink: "s3",
+            subscriptions_enabled: false,
+            subscriptions_fanout: "",
         }
     }
 
@@ -244,6 +280,8 @@ mod tests {
             sof_enabled: true,
             export_controller: "memory",
             export_sink: "fs",
+            subscriptions_enabled: true,
+            subscriptions_fanout: "memory",
         };
         assert_eq!(validate_cluster_config(&view), Ok(()));
     }
@@ -251,6 +289,19 @@ mod tests {
     #[test]
     fn cluster_on_accepts_a_fully_shared_configuration() {
         assert_eq!(validate_cluster_config(&safe_cluster_view()), Ok(()));
+        // Subscriptions on a postgres primary (fanout unset → pg-notify) is
+        // the supported cluster shape.
+        let with_subscriptions = ClusterConfigView {
+            subscriptions_enabled: true,
+            ..safe_cluster_view()
+        };
+        assert_eq!(validate_cluster_config(&with_subscriptions), Ok(()));
+        let explicit_fanout = ClusterConfigView {
+            subscriptions_enabled: true,
+            subscriptions_fanout: "pg-notify",
+            ..safe_cluster_view()
+        };
+        assert_eq!(validate_cluster_config(&explicit_fanout), Ok(()));
     }
 
     /// The refusal table: one unsafe dimension at a time, each error naming
@@ -320,6 +371,24 @@ mod tests {
                 },
                 expect_var: "HFS_EXPORT_SINK",
             },
+            Case {
+                name: "B explicit memory subscriptions fanout",
+                view: ClusterConfigView {
+                    subscriptions_enabled: true,
+                    subscriptions_fanout: "memory",
+                    ..safe_cluster_view()
+                },
+                expect_var: "HFS_SUBSCRIPTIONS_FANOUT",
+            },
+            Case {
+                name: "B subscriptions on a non-postgres primary",
+                view: ClusterConfigView {
+                    subscriptions_enabled: true,
+                    primary_backend: BackendKind::MongoDB,
+                    ..safe_cluster_view()
+                },
+                expect_var: "HFS_SUBSCRIPTIONS_ENABLED",
+            },
         ];
 
         for case in cases {
@@ -351,9 +420,12 @@ mod tests {
             sof_enabled: true,
             export_controller: "memory",
             export_sink: "fs",
+            subscriptions_enabled: true,
+            subscriptions_fanout: "memory",
         };
         let errors = validate_cluster_config(&view).unwrap_err();
-        assert_eq!(errors.len(), 7);
+        // 7 pre-Phase-3 rows + the memory fanout + the non-postgres primary.
+        assert_eq!(errors.len(), 9);
     }
 
     /// The C2 resolution table (warn-only by design — contrast with the
@@ -432,6 +504,8 @@ mod tests {
             sof_enabled: false,
             export_controller: "memory",
             export_sink: "fs",
+            subscriptions_enabled: false,
+            subscriptions_fanout: "memory",
             ..safe_cluster_view()
         };
         assert_eq!(validate_cluster_config(&view), Ok(()));
