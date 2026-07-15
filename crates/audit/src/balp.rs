@@ -83,6 +83,14 @@ pub fn detect_interaction(
 ) -> AuditAction {
     let method = method.to_ascii_uppercase();
 
+    // A FHIR *operation* endpoint is an invocation, not a REST interaction on
+    // the resource type in the path. Without this, `POST /Patient/$purge` is
+    // reported as a Create on Patient — the wrong action code entirely, and a
+    // misleading one for a destructive operation.
+    if is_operation_path(path) {
+        return AuditAction::Execute;
+    }
+
     if matches!(method.as_str(), "GET" | "HEAD") {
         // GET/HEAD on a resource type endpoint is typically search/type-history.
         if resource_type.is_some() && resource_id.is_none() {
@@ -114,6 +122,16 @@ pub fn detect_interaction(
         "DELETE" => AuditAction::Delete,
         _ => AuditAction::Execute,
     }
+}
+
+/// True when the path's final segment names a FHIR operation (`$…`).
+///
+/// Matched on the last segment rather than anywhere in the path, so a resource
+/// whose id happens to contain a `$` cannot be mistaken for an operation.
+fn is_operation_path(path: &str) -> bool {
+    path.rsplit('/')
+        .find(|s| !s.is_empty())
+        .is_some_and(|last| last.starts_with('$'))
 }
 
 fn is_history_path(path: &str) -> bool {
@@ -236,6 +254,45 @@ mod tests {
         assert_eq!(
             detect_interaction("Post", "/Patient", Some("Patient"), None),
             AuditAction::Create
+        );
+    }
+
+    /// An operation invocation is an Execute, not a REST interaction on the
+    /// resource type that happens to be in its path. `POST /Patient/$purge` is
+    /// a destructive operation; reporting it as a Create on Patient is both the
+    /// wrong action code and a dangerously misleading audit record.
+    #[test]
+    fn test_detect_interaction_operation_paths_are_execute() {
+        assert_eq!(
+            detect_interaction("POST", "/Patient/$purge", Some("Patient"), None),
+            AuditAction::Execute
+        );
+        assert_eq!(
+            detect_interaction(
+                "DELETE",
+                "/Patient/123/$purge",
+                Some("Patient"),
+                Some("123")
+            ),
+            AuditAction::Execute
+        );
+        assert_eq!(
+            detect_interaction("POST", "/Patient/$reindex", Some("Patient"), None),
+            AuditAction::Execute
+        );
+        assert_eq!(
+            detect_interaction("GET", "/Patient/$export", Some("Patient"), None),
+            AuditAction::Execute
+        );
+    }
+
+    /// A `$` inside a resource id must not make an ordinary read look like an
+    /// operation — only the *final* segment names the operation.
+    #[test]
+    fn test_detect_interaction_dollar_in_id_is_not_an_operation() {
+        assert_eq!(
+            detect_interaction("GET", "/Patient/a$b", Some("Patient"), Some("a$b")),
+            AuditAction::Read
         );
     }
 

@@ -1037,6 +1037,10 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             )
         })?;
 
+        if let Some(resp) = crate::bcp13::validate_mimetypes_code(&url, &req) {
+            return Ok(resp);
+        }
+
         // TODO: cache — port the per-instance response cache from SQLite
         // (validate_code_response_cache). The SQLite cache key folds in
         //   url, value_set_version, system, code, version, display,
