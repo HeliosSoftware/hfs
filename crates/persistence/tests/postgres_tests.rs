@@ -4890,7 +4890,7 @@ mod postgres_integration {
 
         /// The server-facing seam: the store comes off the backend the same
         /// way `sof_runner()` does.
-        fn store_of(backend: &impl ResourceStorage) -> Arc<dyn ClusterJobStore> {
+        pub(super) fn store_of(backend: &impl ResourceStorage) -> Arc<dyn ClusterJobStore> {
             backend
                 .cluster_job_store()
                 .expect("postgres backs a cluster job store")
@@ -4899,7 +4899,7 @@ mod postgres_integration {
         /// Claims and finishes every eligible job of `kind` so an exclusivity
         /// or fencing test starts from an empty queue (same rationale as
         /// `drain_export_queue`).
-        async fn drain_cluster_jobs(store: &dyn ClusterJobStore, kind: JobKind) {
+        pub(super) async fn drain_cluster_jobs(store: &dyn ClusterJobStore, kind: JobKind) {
             let reaper = WorkerId::new(format!("cluster-jobs-drain-{}", uuid::Uuid::new_v4()));
             while let Some((lease, _payload)) = store
                 .claim_next(kind, &reaper, StdDuration::from_secs(60))
@@ -5140,6 +5140,205 @@ mod postgres_integration {
                 a.complete(&lease, json!({})).await,
                 Err(ClusterLeaseError::LeaseLost { .. })
             ));
+        }
+    }
+
+    mod reindex_cluster_suite {
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        use serde_json::json;
+
+        use helios_fhir::FhirVersion;
+        use helios_persistence::backends::postgres::PostgresBackend;
+        use helios_persistence::core::ResourceStorage;
+        use helios_persistence::core::cluster_job_store::{JobKind, WorkerId};
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+        use helios_persistence::tenant::TenantContext;
+
+        use super::cluster_jobs_suite::{drain_cluster_jobs, store_of};
+        use super::{CLUSTER_JOBS_TEST_LOCK, create_backend, create_tenant};
+        use crate::cluster_harness as harness;
+
+        /// One simulated instance: a fresh backend handle and a reindex
+        /// driver wired the way `hfs` wires it in cluster mode (the job
+        /// store off the same backend's `cluster_job_store()` seam).
+        async fn instance() -> (Arc<PostgresBackend>, ReindexOperation) {
+            let backend = Arc::new(create_backend().await);
+            let store = store_of(backend.as_ref());
+            let op = ReindexOperation::new(backend.clone(), backend.search_extractor().clone())
+                .with_cluster_store(store);
+            (backend, op)
+        }
+
+        async fn seed_patients(backend: &PostgresBackend, tenant: &TenantContext, n: usize) {
+            for i in 0..n {
+                backend
+                    .create(
+                        tenant,
+                        "Patient",
+                        json!({"resourceType": "Patient", "name": [{"family": format!("Reindex{i}")}]}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .expect("seed patient");
+            }
+        }
+
+        /// DoD rows (A2): visibility + isolation — a reindex started via
+        /// instance A is pollable (status and list) via instance B and
+        /// invisible to another tenant.
+        #[tokio::test]
+        async fn postgres_integration_cluster_reindex_visible_and_isolated_across_handles() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let (_backend_a, op_a) = instance().await;
+            let (_backend_b, op_b) = instance().await;
+            let tenant = create_tenant("cluster-reindex-vis");
+
+            let job_id = op_a
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let progress = harness::assert_visible(
+                op_b.get_progress(&tenant, &job_id).await,
+                "reindex job started via instance A",
+            );
+            assert_eq!(progress.status, ReindexStatus::Queued);
+
+            assert_eq!(op_b.list_jobs(&tenant).await.len(), 1);
+
+            harness::assert_wrong_tenant_hidden(
+                op_b.get_progress(&create_tenant("cluster-reindex-vis-other"), &job_id)
+                    .await,
+                "reindex job",
+            );
+            assert!(
+                op_b.list_jobs(&create_tenant("cluster-reindex-vis-other"))
+                    .await
+                    .is_empty(),
+                "tenant isolation violated: reindex job listed under the wrong tenant"
+            );
+        }
+
+        /// Cross-instance execution: started via A, claimed and run to
+        /// completion by B's worker (one deterministic cycle), completion
+        /// visible from A with real progress counters.
+        #[tokio::test]
+        async fn postgres_integration_cluster_reindex_runs_on_other_instance() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let (backend_a, op_a) = instance().await;
+            let (_backend_b, op_b) = instance().await;
+            let tenant = create_tenant("cluster-reindex-run");
+
+            drain_cluster_jobs(store_of(backend_a.as_ref()).as_ref(), JobKind::Reindex).await;
+            seed_patients(&backend_a, &tenant, 2).await;
+
+            let job_id = op_a
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let ran = op_b
+                .run_next_cluster_job(
+                    &WorkerId::new(format!("reindex-t2-{}", uuid::Uuid::new_v4())),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .expect("worker cycle");
+            assert!(ran, "B's worker must claim the queued reindex job");
+
+            let progress = op_a
+                .get_progress(&tenant, &job_id)
+                .await
+                .expect("job visible via A after completion");
+            assert_eq!(
+                progress.status,
+                ReindexStatus::Completed,
+                "got {progress:?}"
+            );
+            assert_eq!(progress.processed_resources, 2);
+            assert!(progress.entries_created > 0);
+        }
+
+        /// Cross-instance cancel: started via A, cancelled via B before any
+        /// worker runs — pollers see `Cancelled` everywhere and the job is
+        /// no longer claimable.
+        #[tokio::test]
+        async fn postgres_integration_cluster_reindex_cancel_via_other_instance() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let (backend_a, op_a) = instance().await;
+            let (_backend_b, op_b) = instance().await;
+            let tenant = create_tenant("cluster-reindex-cancel");
+
+            drain_cluster_jobs(store_of(backend_a.as_ref()).as_ref(), JobKind::Reindex).await;
+
+            let job_id = op_a
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"]),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Wrong tenant cannot cancel (indistinguishable from missing).
+            assert!(
+                op_b.cancel(&create_tenant("cluster-reindex-cancel-other"), &job_id)
+                    .await
+                    .is_err()
+            );
+            op_b.cancel(&tenant, &job_id).await.unwrap();
+
+            let progress = op_a
+                .get_progress(&tenant, &job_id)
+                .await
+                .expect("cancelled job still pollable");
+            assert_eq!(progress.status, ReindexStatus::Cancelled);
+
+            let ran = op_a
+                .run_next_cluster_job(
+                    &WorkerId::new(format!("reindex-t2-{}", uuid::Uuid::new_v4())),
+                    StdDuration::from_secs(60),
+                )
+                .await
+                .expect("worker cycle");
+            assert!(!ran, "a cancelled reindex job must not be claimable");
+        }
+
+        /// DoD row (A2): durability — the job survives its starting handle.
+        #[tokio::test]
+        async fn postgres_integration_cluster_reindex_survives_handle_drop() {
+            let _guard = CLUSTER_JOBS_TEST_LOCK.lock().await;
+            let tenant = create_tenant("cluster-reindex-durable");
+
+            let (backend_a, op_a) = instance().await;
+            drain_cluster_jobs(store_of(backend_a.as_ref()).as_ref(), JobKind::Reindex).await;
+            let job_id = op_a
+                .start(
+                    tenant.clone(),
+                    ReindexRequest::for_types(vec!["Patient"]),
+                    None,
+                )
+                .await
+                .unwrap();
+            drop(op_a);
+            drop(backend_a);
+
+            let (_backend, op) = instance().await;
+            let progress = harness::assert_visible(
+                op.get_progress(&tenant, &job_id).await,
+                "reindex job after its starting handle was dropped",
+            );
+            assert_eq!(progress.status, ReindexStatus::Queued);
         }
     }
 }

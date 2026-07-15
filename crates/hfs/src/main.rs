@@ -536,6 +536,7 @@ async fn start_mongodb(
         backend.clone(),
         backend.search_extractor().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, backend.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
@@ -930,6 +931,7 @@ async fn start_sqlite(
         backend.clone(),
         backend.search_extractor().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, backend.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
@@ -1092,10 +1094,40 @@ where
     }))
 }
 
-/// Attaches the audit sink to a reindex driver and hands back a shared handle.
+/// The shared cluster job store for reindex, when the configuration selects
+/// the database job store and the backend can provide one.
+///
+/// A `database` job-store mode over a backend with no cluster store (SQLite,
+/// MongoDB, S3 primaries) falls back to the in-memory driver with a loud
+/// warning rather than refusing to boot — reindex is always-on, and those
+/// primaries are documented single-instance for Phase 1 features.
+fn reindex_cluster_store<S: helios_persistence::core::ResourceStorage>(
+    config: &helios_rest::ServerConfig,
+    storage: &S,
+) -> Option<Arc<dyn helios_persistence::core::ClusterJobStore>> {
+    match config.job_store_backend_mode() {
+        Ok(helios_rest::JobStoreBackend::Database) => {
+            let store = storage.cluster_job_store();
+            if store.is_none() {
+                tracing::warn!(
+                    backend = storage.backend_name(),
+                    "HFS_JOB_STORE_BACKEND=database but this backend has no cluster job \
+                     store; reindex jobs stay per-instance"
+                );
+            }
+            store
+        }
+        _ => None,
+    }
+}
+
+/// Attaches the audit sink (and, in cluster mode, the shared job store) to a
+/// reindex driver, spawns the per-instance reindex workers when cluster-backed,
+/// and hands back a shared handle.
 fn wire_reindex(
     op: ReindexOperation,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
+    cluster_store: Option<Arc<dyn helios_persistence::core::ClusterJobStore>>,
 ) -> Arc<ReindexOperation> {
     let op = match audit_state {
         Some(state) => op.with_audit(
@@ -1104,7 +1136,15 @@ fn wire_reindex(
         ),
         None => op,
     };
-    Arc::new(op)
+    let op = match cluster_store {
+        Some(store) => op.with_cluster_store(store),
+        None => op,
+    };
+    let op = Arc::new(op);
+    if op.is_cluster_backed() {
+        helios_persistence::search::spawn_reindex_cluster_workers(Arc::clone(&op), 1);
+    }
+    op
 }
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
@@ -1113,6 +1153,7 @@ fn standalone_ops<B>(
     backend: Arc<B>,
     extractor: Arc<SearchParameterExtractor>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
+    cluster_store: Option<Arc<dyn helios_persistence::core::ClusterJobStore>>,
 ) -> OperationsBundle
 where
     B: PurgableStorage + helios_persistence::search::ReindexableStorage + 'static,
@@ -1122,6 +1163,7 @@ where
         reindex: Some(wire_reindex(
             ReindexOperation::new(backend, extractor),
             audit_state,
+            cluster_store,
         )),
     }
 }
@@ -1142,12 +1184,14 @@ fn composite_ops(
     targets: Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
     extractor: Arc<SearchParameterExtractor>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
+    cluster_store: Option<Arc<dyn helios_persistence::core::ClusterJobStore>>,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
             ReindexOperation::with_parts(source, targets, extractor),
             audit_state,
+            cluster_store,
         )),
     }
 }
@@ -1554,6 +1598,7 @@ async fn start_sqlite_elasticsearch(
         vec![sqlite.clone(), es.clone()],
         sqlite.search_extractor().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, sqlite.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
@@ -1621,6 +1666,7 @@ async fn start_postgres(
         backend.clone(),
         backend.search_extractor().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, backend.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
@@ -1796,6 +1842,7 @@ async fn start_postgres_elasticsearch(
         vec![pg.clone(), es.clone()],
         pg.search_extractor().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, pg.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
@@ -1974,6 +2021,7 @@ async fn start_mongodb_elasticsearch(
         vec![mongo.clone(), es.clone()],
         mongo.search_extractor().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, mongo.as_ref()),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
@@ -2285,6 +2333,7 @@ async fn start_s3_elasticsearch(
         vec![es.clone()],
         es.search_extractor().clone(),
         audit_state.as_ref(),
+        reindex_cluster_store(&config, s3.as_ref()),
     );
 
     // S3 primary; embedded SQLite sidecar for job state.

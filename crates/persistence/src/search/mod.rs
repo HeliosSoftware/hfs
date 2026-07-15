@@ -87,7 +87,7 @@ pub use registry::{
 };
 pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
-    ReindexableStorage, ResourcePage,
+    ReindexableStorage, ResourcePage, spawn_reindex_cluster_workers,
 };
 pub use text_fold::fold_text;
 pub use writer::SearchIndexWriter;

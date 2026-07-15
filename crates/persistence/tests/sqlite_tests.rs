@@ -2342,7 +2342,7 @@ async fn test_reindex_operation_full() {
     let mut attempts = 0;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let progress = reindex.get_progress(&job_id).await.unwrap();
+        let progress = reindex.get_progress(&tenant, &job_id).await.unwrap();
 
         if progress.status == ReindexStatus::Completed {
             assert_eq!(
@@ -2409,13 +2409,13 @@ async fn test_reindex_operation_cancel() {
     let job_id = reindex.start(tenant.clone(), request, None).await.unwrap();
 
     // Cancel immediately
-    reindex.cancel(&job_id).await.unwrap();
+    reindex.cancel(&tenant, &job_id).await.unwrap();
 
     // Wait a bit for cancellation to take effect
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Check status
-    let progress = reindex.get_progress(&job_id).await.unwrap();
+    let progress = reindex.get_progress(&tenant, &job_id).await.unwrap();
     assert!(
         progress.status == ReindexStatus::Cancelled || progress.status == ReindexStatus::Completed,
         "Job should be cancelled or already completed"
@@ -2501,7 +2501,7 @@ async fn test_reindex_fans_out_to_every_target() {
     let mut attempts = 0;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let progress = reindex.get_progress(&job_id).await.unwrap();
+        let progress = reindex.get_progress(&tenant, &job_id).await.unwrap();
         if progress.status == ReindexStatus::Completed {
             break;
         }

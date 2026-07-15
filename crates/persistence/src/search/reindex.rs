@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::core::cluster_job_store::{
+    ClusterJobId, ClusterJobRecord, ClusterJobState, ClusterJobStore, ClusterLeaseError, JobKind,
+    WorkerId,
+};
 use crate::error::StorageResult;
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
@@ -395,11 +399,14 @@ struct ReindexAudit {
 /// index), so the source and the writers are separate, dynamically-dispatched
 /// handles. A type parameter could only ever name one writer.
 ///
-/// # Job state is per-process
+/// # Job state: per-process by default, shared with a cluster store
 ///
-/// Jobs live in an in-memory map, so `$reindex-status` for a job started on one
-/// node is not visible from another. In a multi-node deployment, poll the node
-/// that accepted the kick-off.
+/// By default jobs live in an in-memory map, so `$reindex-status` for a job
+/// started on one node is not visible from another. With
+/// [`with_cluster_store`](Self::with_cluster_store) jobs live on the shared
+/// cluster job store instead: any node answers status/cancel and any node's
+/// [`run_next_cluster_job`](Self::run_next_cluster_job) worker may run the
+/// rebuild.
 pub struct ReindexOperation {
     /// Where resources are read from — the primary.
     source: Arc<dyn ReindexSource>,
@@ -409,10 +416,17 @@ pub struct ReindexOperation {
     extractor: Arc<SearchParameterExtractor>,
     /// Active jobs.
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    /// Owning tenant of each in-memory job, for tenant-checked reads.
+    job_tenants: Arc<RwLock<HashMap<String, String>>>,
     /// Cancellation channels.
     cancel_channels: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>,
     /// Optional audit sink for reindex lifecycle events.
     audit: Option<ReindexAudit>,
+    /// When set, jobs live on the shared cluster job store instead of the
+    /// in-memory map: any instance can poll/cancel, and any instance's
+    /// [`run_next_cluster_job`](Self::run_next_cluster_job) worker can claim
+    /// and run them (Phase 1, A2).
+    store: Option<Arc<dyn ClusterJobStore>>,
 }
 
 impl ReindexOperation {
@@ -444,9 +458,25 @@ impl ReindexOperation {
             writers,
             extractor,
             jobs: Arc::new(RwLock::new(HashMap::new())),
+            job_tenants: Arc::new(RwLock::new(HashMap::new())),
             cancel_channels: Arc::new(RwLock::new(HashMap::new())),
             audit: None,
+            store: None,
         }
+    }
+
+    /// Moves job state onto the shared cluster job store (`HFS_JOB_STORE_BACKEND=database`):
+    /// `start` enqueues instead of spawning, reads/cancel go to the store, and
+    /// the work itself is claimed by per-instance workers
+    /// ([`run_next_cluster_job`](Self::run_next_cluster_job)).
+    pub fn with_cluster_store(mut self, store: Arc<dyn ClusterJobStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Whether jobs live on the shared cluster job store.
+    pub fn is_cluster_backed(&self) -> bool {
+        self.store.is_some()
     }
 
     /// Emits a BALP `AuditEvent` at each reindex lifecycle transition.
@@ -483,11 +513,46 @@ impl ReindexOperation {
         request: ReindexRequest,
         agent: Option<String>,
     ) -> Result<String, ReindexError> {
+        // Cluster mode: durably enqueue for any instance's worker; no local
+        // state, no local spawn. The start audit event is still emitted here
+        // (the terminal one comes from whichever worker runs the job).
+        if let Some(store) = &self.store {
+            let payload = serde_json::json!({
+                "request": request,
+                "agent": agent,
+            });
+            let job_id = store
+                .enqueue(&tenant, JobKind::Reindex, payload)
+                .await
+                .map_err(|e| ReindexError::StorageError {
+                    message: format!("failed to enqueue reindex job: {e}"),
+                })?
+                .to_string();
+
+            if let Some(audit) = &self.audit {
+                audit::record_reindex_event(
+                    audit.sink.as_ref(),
+                    &audit.source_observer,
+                    agent.as_deref(),
+                    &job_id,
+                    "start",
+                    &request.resource_types.clone().unwrap_or_default(),
+                    0,
+                    "0",
+                )
+                .await;
+            }
+            return Ok(job_id);
+        }
+
         let job_id = Uuid::new_v4().to_string();
         let progress = ReindexProgress::new(&job_id);
 
-        // Store the job
+        // Store the job (and its owning tenant, for tenant-checked reads)
         self.jobs.write().insert(job_id.clone(), progress);
+        self.job_tenants
+            .write()
+            .insert(job_id.clone(), tenant.tenant_id().as_str().to_string());
 
         // Create cancellation channel
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
@@ -573,15 +638,55 @@ impl ReindexOperation {
         Ok(job_id)
     }
 
-    /// Gets the progress of a reindex job.
-    pub async fn get_progress(&self, job_id: &str) -> Option<ReindexProgress> {
+    /// Gets the progress of a reindex job. Tenant-checked: a job belonging
+    /// to another tenant is indistinguishable from a missing one.
+    pub async fn get_progress(
+        &self,
+        tenant: &TenantContext,
+        job_id: &str,
+    ) -> Option<ReindexProgress> {
+        if let Some(store) = &self.store {
+            let record = store
+                .get_status(tenant, &ClusterJobId::from_string(job_id))
+                .await
+                .ok()??;
+            return Some(progress_from_record(&record));
+        }
+        if !self.owned_by(tenant, job_id) {
+            return None;
+        }
         self.jobs.read().get(job_id).cloned()
     }
 
-    /// Cancels a running reindex job.
-    pub async fn cancel(&self, job_id: &str) -> Result<(), ReindexError> {
-        // Check if job exists and is running
+    /// Cancels a running reindex job. Tenant-checked like
+    /// [`get_progress`](Self::get_progress).
+    pub async fn cancel(&self, tenant: &TenantContext, job_id: &str) -> Result<(), ReindexError> {
+        if let Some(store) = &self.store {
+            // Flips a queued/running job to cancelled at once (pollers on any
+            // instance see it); the owning worker observes cancel_requested
+            // and stops between batches.
+            let found = store
+                .cancel(tenant, &ClusterJobId::from_string(job_id))
+                .await
+                .map_err(|e| ReindexError::StorageError {
+                    message: format!("failed to cancel reindex job: {e}"),
+                })?;
+            return if found {
+                Ok(())
+            } else {
+                Err(ReindexError::JobNotFound {
+                    job_id: job_id.to_string(),
+                })
+            };
+        }
+
+        // Check if job exists (for this tenant) and is running
         {
+            if !self.owned_by(tenant, job_id) {
+                return Err(ReindexError::JobNotFound {
+                    job_id: job_id.to_string(),
+                });
+            }
             let jobs = self.jobs.read();
             let progress = jobs.get(job_id).ok_or_else(|| ReindexError::JobNotFound {
                 job_id: job_id.to_string(),
@@ -610,9 +715,198 @@ impl ReindexOperation {
         Ok(())
     }
 
-    /// Lists all jobs (active and recent).
-    pub fn list_jobs(&self) -> Vec<ReindexProgress> {
-        self.jobs.read().values().cloned().collect()
+    /// Lists this tenant's jobs (active and recent).
+    pub async fn list_jobs(&self, tenant: &TenantContext) -> Vec<ReindexProgress> {
+        if let Some(store) = &self.store {
+            return store
+                .list_jobs(tenant, JobKind::Reindex)
+                .await
+                .map(|records| records.iter().map(progress_from_record).collect())
+                .unwrap_or_default();
+        }
+        let tenants = self.job_tenants.read();
+        self.jobs
+            .read()
+            .iter()
+            .filter(|(id, _)| {
+                tenants.get(*id).map(String::as_str) == Some(tenant.tenant_id().as_str())
+            })
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+
+    /// True when the in-memory job exists and belongs to `tenant`.
+    fn owned_by(&self, tenant: &TenantContext, job_id: &str) -> bool {
+        self.job_tenants.read().get(job_id).map(String::as_str) == Some(tenant.tenant_id().as_str())
+    }
+
+    /// Claims at most one queued reindex job from the cluster store and
+    /// drives it to a terminal state; returns whether a job was claimed.
+    ///
+    /// The worker pool's unit of work
+    /// ([`spawn_reindex_cluster_workers`]), exposed so tests can execute a
+    /// claim/run cycle deterministically. Errors only on claim-time storage
+    /// trouble or when the operation is not cluster-backed.
+    pub async fn run_next_cluster_job(
+        &self,
+        worker_id: &WorkerId,
+        lease_duration: std::time::Duration,
+    ) -> Result<bool, ReindexError> {
+        let Some(store) = &self.store else {
+            return Err(ReindexError::StorageError {
+                message: "reindex is not cluster-backed (no job store configured)".to_string(),
+            });
+        };
+        let claimed = store
+            .claim_next(JobKind::Reindex, worker_id, lease_duration)
+            .await
+            .map_err(|e| ReindexError::StorageError {
+                message: format!("failed to claim reindex job: {e}"),
+            })?;
+        let Some((lease, payload)) = claimed else {
+            return Ok(false);
+        };
+        let jid = lease.job_id.to_string();
+
+        // Renew the lease in the background for long-running rebuilds.
+        let heartbeat = {
+            let store = Arc::clone(store);
+            let lease = lease.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    if let Err(ClusterLeaseError::LeaseLost { .. }) = store.heartbeat(&lease).await
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let request: ReindexRequest = match payload
+            .get("request")
+            .cloned()
+            .ok_or_else(|| "payload has no request".to_string())
+            .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+        {
+            Ok(request) => request,
+            Err(e) => {
+                heartbeat.abort();
+                let msg = format!("invalid reindex payload: {e}");
+                let _ = store.fail(&lease, &msg).await;
+                return Ok(true);
+            }
+        };
+        let agent: Option<String> = payload
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // `run_reindex` is shared with the in-memory mode and reports into a
+        // jobs map + a local cancel channel; the bridge task below mirrors
+        // that map into the store as progress snapshots and feeds
+        // cross-instance cancellation (and lease loss) back into the channel.
+        let local_jobs: Arc<RwLock<HashMap<String, ReindexProgress>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        local_jobs
+            .write()
+            .insert(jid.clone(), ReindexProgress::new(&jid));
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+
+        let bridge = {
+            let store = Arc::clone(store);
+            let lease = lease.clone();
+            let local_jobs = Arc::clone(&local_jobs);
+            let jid = jid.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let snapshot = local_jobs.read().get(&jid).cloned();
+                    if let Some(progress) = snapshot
+                        && let Ok(value) = serde_json::to_value(&progress)
+                        && let Err(ClusterLeaseError::LeaseLost { .. }) =
+                            store.update_progress(&lease, value).await
+                    {
+                        let _ = cancel_tx.send(()).await;
+                        break;
+                    }
+                    match store.cancel_requested(&lease).await {
+                        Ok(true) | Err(ClusterLeaseError::LeaseLost { .. }) => {
+                            let _ = cancel_tx.send(()).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+        };
+
+        run_reindex(
+            jid.clone(),
+            lease.tenant.clone(),
+            request.clone(),
+            self.source.clone(),
+            self.writers.clone(),
+            self.extractor.clone(),
+            Arc::clone(&local_jobs),
+            cancel_rx,
+        )
+        .await;
+        bridge.abort();
+        heartbeat.abort();
+
+        let final_progress = local_jobs
+            .read()
+            .get(&jid)
+            .cloned()
+            .unwrap_or_else(|| ReindexProgress::new(&jid));
+        let final_json = serde_json::to_value(&final_progress).unwrap_or(serde_json::Value::Null);
+        let terminal = match final_progress.status {
+            ReindexStatus::Completed => store.complete(&lease, final_json).await,
+            // A local cancel is only ever bridge-induced: the store row is
+            // already cancelled (or reclaimed), so there is nothing to write.
+            ReindexStatus::Cancelled => Ok(()),
+            _ => {
+                let message = final_progress
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "reindex failed".to_string());
+                // Best-effort final snapshot before the terminal transition.
+                let _ = store.update_progress(&lease, final_json).await;
+                store.fail(&lease, &message).await
+            }
+        };
+        if let Err(ClusterLeaseError::Storage(e)) = terminal {
+            tracing::warn!(job_id = %jid, error = %e, "failed to record reindex outcome");
+        }
+
+        // Terminal audit event, mirroring the in-memory background task.
+        if let Some(audit) = &self.audit {
+            let (phase, outcome) = match final_progress.status {
+                ReindexStatus::Completed => ("complete", "0"),
+                ReindexStatus::Cancelled => ("cancel", "4"),
+                ReindexStatus::Failed | ReindexStatus::Queued | ReindexStatus::InProgress => {
+                    ("fail", "8")
+                }
+            };
+            audit::record_reindex_event(
+                audit.sink.as_ref(),
+                &audit.source_observer,
+                agent.as_deref(),
+                &jid,
+                phase,
+                &request.resource_types.unwrap_or_default(),
+                final_progress.processed_resources,
+                outcome,
+            )
+            .await;
+        }
+
+        Ok(true)
     }
 
     /// Removes completed jobs older than the specified duration.
@@ -643,6 +937,89 @@ impl std::fmt::Debug for ReindexOperation {
             .field("writers", &self.writers.len())
             .finish()
     }
+}
+
+/// Maps a cluster-job row onto the caller-facing [`ReindexProgress`].
+///
+/// The worker's snapshots (progress/result) carry the full progress document;
+/// the row's state is authoritative for terminal transitions the worker never
+/// wrote (cancel-before-claim, hard crash before the terminal write).
+fn progress_from_record(record: &ClusterJobRecord) -> ReindexProgress {
+    let mut progress: ReindexProgress = record
+        .result
+        .clone()
+        .or_else(|| record.progress.clone())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_else(|| ReindexProgress::new(record.id.as_str()));
+    match record.state {
+        ClusterJobState::Cancelled => {
+            progress.status = ReindexStatus::Cancelled;
+            if progress.completed_at.is_none() {
+                progress.completed_at = record.finished_at.map(|t| t.to_rfc3339());
+            }
+        }
+        ClusterJobState::Failed => {
+            progress.status = ReindexStatus::Failed;
+            if progress.error_message.is_none() {
+                progress.error_message = record.error.clone();
+            }
+            if progress.completed_at.is_none() {
+                progress.completed_at = record.finished_at.map(|t| t.to_rfc3339());
+            }
+        }
+        ClusterJobState::Queued | ClusterJobState::Running | ClusterJobState::Completed => {}
+    }
+    progress
+}
+
+/// Spawns the per-instance reindex worker pool over the cluster store, plus a
+/// reaper that ages out terminal job rows (the cluster twin of
+/// [`ReindexOperation::cleanup_old_jobs`]).
+///
+/// # Panics
+///
+/// Panics when `op` is not cluster-backed — wiring error, same posture as the
+/// other boot-time misconfigurations.
+pub fn spawn_reindex_cluster_workers(op: Arc<ReindexOperation>, worker_count: usize) {
+    const LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+    const TERMINAL_TTL_SECONDS: i64 = 24 * 60 * 60;
+
+    let store = op
+        .store
+        .clone()
+        .expect("spawn_reindex_cluster_workers requires a cluster-backed ReindexOperation");
+
+    for n in 0..worker_count.max(1) {
+        let op = Arc::clone(&op);
+        let worker_id = WorkerId::new(format!("reindex-{n}-{}", Uuid::new_v4()));
+        tokio::spawn(async move {
+            tracing::info!(worker = %worker_id, "reindex worker started");
+            loop {
+                match op.run_next_cluster_job(&worker_id, LEASE).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(worker = %worker_id, error = %e, "reindex worker error");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(TERMINAL_TTL_SECONDS);
+            if let Err(e) = store.delete_terminal_before(JobKind::Reindex, cutoff).await {
+                tracing::warn!(error = %e, "reindex job reaper failed");
+            }
+        }
+    });
 }
 
 /// Marks a job as failed.

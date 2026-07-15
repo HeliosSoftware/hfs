@@ -89,7 +89,7 @@ current state and is updated as each phase ships.
 | Bulk output download | ✅ | ✅ with `s3` output; ❌ with `local-fs` | F2 — enforced by fail-fast |
 | Concurrent cold-start schema init | ✅ | ✅ serialized by a Postgres advisory lock | fixed 2026-07-14 (D3) |
 | SQL-on-FHIR `$viewdefinition-export` / `$sqlquery-export` (async jobs) | ✅ | ✅ with `HFS_EXPORT_CONTROLLER=database` (the default under `HFS_CLUSTER`): jobs on the shared `cluster_jobs` store, any instance polls/cancels/downloads, workers on every instance compete for work | Phase 1 (#169) — landed |
-| Search reindex jobs | ✅ | ⚠️ single-instance only (in-memory job registry) | Phase 1 |
+| Search reindex jobs | ✅ | ✅ with `HFS_JOB_STORE_BACKEND=database` (the default under `HFS_CLUSTER`): jobs on the shared `cluster_jobs` store, any instance answers `$reindex-status`/cancel, workers on every instance compete for the rebuild (Postgres primary) | Phase 1 (A2) — landed |
 | JWT `jti` replay protection | ✅ | ⚠️ `memory` is per-node (replay possible on other nodes) — refused by fail-fast; use `redis` | Phase 2 hardens defaults, adds `database` |
 | JWKS refresh | ✅ | ✅ functionally (each node fetches the same keys); redundant IdP fetches | Phase 2 (coordinated refresh) |
 | Subscriptions (topics, delivery, WebSockets) | ✅ | ❌ **single-instance only** — registries are in-memory and only the instance that served a write reacts to it | Phase 3 (#170) |
@@ -98,11 +98,11 @@ current state and is updated as each phase ships.
 | Composite async search sync | ✅ | ⚠️ in-process queue; a crash loses queued secondary-index writes | Phase 4 (durable outbox) |
 | Audit, metrics, health | ✅ | ✅ with shared sinks; `/metrics` is per-instance (aggregate in your scraper) | already safe |
 
-**⚠️ single-instance-only features:** until their phase lands, pin reindex
-and Subscriptions to one instance (or route their requests to one instance
-with sticky sessions) — the same guidance issues #169 and #170 carry. SQL-on-
-FHIR async exports are cluster-safe as of Phase 1 (`HFS_EXPORT_CONTROLLER=
-database` + a shared `HFS_EXPORT_SINK`).
+**⚠️ single-instance-only features:** until their phase lands, pin
+Subscriptions to one instance (or route their requests to one instance with
+sticky sessions) — the same guidance issue #170 carries. SQL-on-FHIR async
+exports and reindex are cluster-safe as of Phase 1 (`HFS_JOB_STORE_BACKEND=
+database`, plus a shared `HFS_EXPORT_SINK` for exports).
 
 ---
 

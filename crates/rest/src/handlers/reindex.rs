@@ -20,12 +20,14 @@
 //! — not on ordinary `Update` scope. A reindex rewrites the entire search index
 //! for a tenant, which is an administrative operation, not a resource write.
 //!
-//! # Job state is per-process
+//! # Job state: per-process by default, shared under the cluster job store
 //!
-//! Progress lives in an in-memory map on the node that accepted the kick-off, so
-//! `GET /$reindex-status/{job_id}` returns 404 on any other node. In a
-//! multi-node deployment, poll the node you kicked off against. (Persisting job
-//! state across the cluster is tracked separately.)
+//! With the default in-memory driver, progress lives on the node that accepted
+//! the kick-off, so `GET /$reindex-status/{job_id}` returns 404 on any other
+//! node — poll the node you kicked off against. Under
+//! `HFS_JOB_STORE_BACKEND=database` the driver is cluster-backed: jobs live on
+//! the shared `cluster_jobs` store, any node answers status/cancel, and any
+//! node's worker may run the rebuild.
 //!
 //! # Composite deployments
 //!
@@ -196,6 +198,7 @@ where
 /// `GET /$reindex-status/{job_id}` — poll a job's progress.
 pub async fn reindex_status_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     Path(job_id): Path<String>,
     request: Request,
 ) -> RestResult<Response>
@@ -207,7 +210,7 @@ where
     let op = driver(&state)?;
 
     let progress = op
-        .get_progress(&job_id)
+        .get_progress(tenant.context(), &job_id)
         .await
         .ok_or_else(|| RestError::NotFound {
             resource_type: "ReindexJob".to_string(),
@@ -220,6 +223,7 @@ where
 /// `DELETE /$reindex-status/{job_id}` — cancel a running job.
 pub async fn reindex_cancel_handler<S>(
     State(state): State<AppState<S>>,
+    tenant: TenantExtractor,
     Path(job_id): Path<String>,
     request: Request,
 ) -> RestResult<Response>
@@ -230,10 +234,12 @@ where
     check_reindex_scope(principal.as_ref())?;
     let op = driver(&state)?;
 
-    op.cancel(&job_id).await.map_err(|_| RestError::NotFound {
-        resource_type: "ReindexJob".to_string(),
-        id: job_id.clone(),
-    })?;
+    op.cancel(tenant.context(), &job_id)
+        .await
+        .map_err(|_| RestError::NotFound {
+            resource_type: "ReindexJob".to_string(),
+            id: job_id.clone(),
+        })?;
 
     Ok(StatusCode::ACCEPTED.into_response())
 }
