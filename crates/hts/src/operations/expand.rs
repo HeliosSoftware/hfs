@@ -1620,7 +1620,18 @@ async fn process_expand_inner<B: TerminologyBackend>(
         // pure-full-system case this applies to URL-resolved ValueSets too
         // (the IG `search/search-filter-yes` fixture is URL-resolved). Inspect
         // the inline compose when present, else fetch the referenced VS.
-        if hierarchical.is_none() {
+        //
+        // Paging suppresses this default. Tree mode returns the whole subtree —
+        // the backends drop `count`/`offset` and report no `offset` — so nesting a
+        // paged request would silently ignore what the caller asked for, and
+        // answering `count=10` over a SNOMED is-a root would first read that
+        // root's ~10^5 descendants. The IG agrees: every fixture pairing a
+        // subsumption filter with count/offset (`simple-cases/simple-expand-isa-
+        // {c2,o2,o2c2}`, `snomed/expand-pc-none`) expects a flat list, and no
+        // fixture expecting nesting pages. A text `filter` does NOT suppress it —
+        // `search/search-filter-yes` filters and still expects a tree. An explicit
+        // `hierarchical=true` / `excludeNested=false` nests regardless.
+        if hierarchical.is_none() && count.is_none() && offset.is_none() {
             let ctx = TenantContext::system();
             let resolved_vs: Option<Value> = if value_set.is_some() {
                 value_set.clone()

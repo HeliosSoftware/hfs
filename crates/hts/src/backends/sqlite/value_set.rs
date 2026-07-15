@@ -5019,11 +5019,22 @@ fn fts_candidates_ranked_for_system(
         .unwrap_or(false);
 
     let ranked_codes: Vec<(String, f64)> = if search_populated {
+        // A concept contributes one row per term (preferred display + each
+        // designation), so scores are collapsed per code with MIN — bm25 is
+        // negative and lower is better, i.e. the concept's best-matching term
+        // wins. The CTE must be MATERIALIZED: bm25() is an FTS5 auxiliary
+        // function and SQLite rejects it in an aggregate context, so without
+        // the fence it gets flattened into the GROUP BY and the query fails
+        // with "unable to use function bm25 in the requested context".
         let mut stmt = conn
             .prepare_cached(
-                "SELECT code, MIN(bm25(concepts_search_fts)) AS rank
-                 FROM concepts_search_fts
-                 WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
+                "WITH hits AS MATERIALIZED (
+                     SELECT code, bm25(concepts_search_fts) AS rank
+                     FROM concepts_search_fts
+                     WHERE concepts_search_fts MATCH ?1 AND system_id = ?2
+                 )
+                 SELECT code, MIN(rank) AS rank
+                 FROM hits
                  GROUP BY code
                  ORDER BY rank ASC
                  LIMIT ?3",
@@ -12103,5 +12114,40 @@ mod tests {
             .await
             .unwrap();
         assert!(!v_out.result, "code C must not be found in vs-import");
+    }
+
+    /// Regression for #272. `concepts_search_fts` was queried and populated but
+    /// never created, so this path failed with "no such table". Because the
+    /// EXISTS probe swallows that error and falls back to `concepts_fts`, the
+    /// ranked query below had never actually executed — and it aggregated
+    /// `bm25()`, which FTS5 rejects outside a MATCH scan. Exercise it for real.
+    #[test]
+    fn concepts_search_fts_ranked_query_runs() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::backends::sqlite::schema::apply(&conn).expect("schema should apply");
+
+        conn.execute_batch(
+            "INSERT INTO code_systems(id, url, created_at, updated_at)
+                 VALUES ('sys1', 'http://example.org/cs', '2026-01-01', '2026-01-01');
+             INSERT INTO concepts(id, system_id, code, display) VALUES
+                 (1, 'sys1', 'data-exchange',  'Data Exchange'),
+                 (2, 'sys1', 'data-exchange1', 'Data Exchange1'),
+                 (3, 'sys1', 'unrelated',      'Something Else');
+             INSERT INTO concept_designations(id, concept_id, value)
+                 VALUES (7, 3, 'Data synonym');",
+        )
+        .expect("fixture should insert");
+
+        populate_concepts_search_fts_for_system(&conn, "sys1").expect("populate should succeed");
+
+        let hits =
+            fts_candidates_ranked_for_system(&conn, "sys1", "http://example.org/cs", "data", None)
+                .expect("ranked search must not error");
+
+        let mut codes: Vec<&str> = hits.iter().map(|c| c.code.as_str()).collect();
+        codes.sort_unstable();
+        // `unrelated` matches on its designation alone — the reason this index
+        // exists separately from concepts_fts, which indexes display only.
+        assert_eq!(codes, ["data-exchange", "data-exchange1", "unrelated"]);
     }
 }

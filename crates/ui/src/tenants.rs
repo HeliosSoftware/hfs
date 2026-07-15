@@ -90,6 +90,8 @@ struct TenantsPage {
     q: String,
     available: bool,
     error: Option<String>,
+    /// Which sidebar entry carries `aria-current="page"` (see base.html).
+    active_page: &'static str,
 }
 
 #[derive(Template)]
@@ -223,6 +225,7 @@ pub async fn page(
             q: query.q,
             available: false,
             error: None,
+            active_page: "tenants",
         });
     };
 
@@ -242,6 +245,7 @@ pub async fn page(
         q: query.q,
         available: true,
         error,
+        active_page: "tenants",
     })
 }
 

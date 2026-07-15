@@ -111,6 +111,21 @@ pub enum RegistryError {
         url: String,
     },
 
+    /// A parameter from the same source already occupies `(base, code)`.
+    ///
+    /// Cross-source collisions are legal shadowing resolved by
+    /// [`SearchParameterSource`](super::registry::SearchParameterSource)
+    /// precedence; within one source there is no precedence to break the tie,
+    /// so the registration is rejected.
+    DuplicateCode {
+        /// The resource type whose `(base, code)` slot is taken.
+        base: String,
+        /// The parameter code.
+        code: String,
+        /// Canonical URL of the parameter already occupying the slot.
+        existing_url: String,
+    },
+
     /// Parameter not found in registry.
     NotFound {
         /// The URL or code that was not found.
@@ -135,6 +150,17 @@ impl fmt::Display for RegistryError {
         match self {
             RegistryError::DuplicateUrl { url } => {
                 write!(f, "SearchParameter with URL '{}' already exists", url)
+            }
+            RegistryError::DuplicateCode {
+                base,
+                code,
+                existing_url,
+            } => {
+                write!(
+                    f,
+                    "SearchParameter code '{}' on base '{}' is already defined by '{}' from the same source",
+                    code, base, existing_url
+                )
             }
             RegistryError::NotFound { identifier } => {
                 write!(f, "SearchParameter '{}' not found", identifier)
