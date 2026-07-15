@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-15 (Phase 1: PRs 1.1–1.3 landed on the branch)
+**Last updated:** 2026-07-15 (**Phase 1 COMPLETE** — gate met)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -70,12 +70,23 @@ calibration suite green on first run (4 T2 tests), full CI-style clippy and
 | **PR 1.2 — `ClusterJobStore`** on a `cluster_jobs` table (migration **v15** — main took v14 for the tenant registry). Claim = bulk-export shape (txn + `FOR UPDATE SKIP LOCKED` + fencing bump); fenced mutations require `status='running'` so cancel is final; `cancel` flips queued/running → cancelled immediately + sets `cancel_requested`. Server seam mirrors `sof_runner()`: `ResourceStorage::cluster_job_store()` default-None; Postgres returns a pool-sharing `PgClusterJobStore` handle (impl NOT on the backend — would collide with `ExportClaimStrategy`'s method names). `WorkerId` reused; `LeaseError` not (carries a bulk `ExportJobId`) → `ClusterLeaseError`. T1 state-machine suite vs `testing::InMemoryClusterJobStore`; T2 DoD suite (visibility/isolation/exclusivity/fencing/durability/cross-instance cancel) via the harness, driven through the accessor seam. | `core/cluster_job_store.rs`, `postgres/cluster_jobs.rs`, `postgres/schema.rs` | `6dfb7097` |
 | **PR 1.3 — SoF export on the job store (#169)**: `ExportJobController` → `#[async_trait]`; execution engine shared between controllers via a `JobProgress` hook; new `DatabaseExportJobController` + per-instance claim/lease workers (heartbeat task, progress snapshots, cancel observed between work units, fenced-out terminal write deletes orphaned shards) + kind-scoped reaper (`delete_terminal_before` now returns reaped ids). `HFS_EXPORT_CONTROLLER` finally read (unset → follows job-store mode); validator refuses explicit `memory` controller + `fs` sink under cluster+SoF (T1 table now 8 rows). T2 two-controller suite (`rest/tests/sof_export_cluster_pg.rs`, deterministic via `run_next_sof_export_job`); **T3 smoke check 4** (kickoff on A → poll via front → download via B) with `HFS_JOB_STORE_BACKEND=database` + shared export dir in the workflow (`HFS_CLUSTER` stays unset there — the validator rightly refuses `fs` sinks; S3 out of smoke scope). ch15 SoF row flipped. | `rest/src/export/{controller,in_memory,database}.rs`, `rest/src/lib.rs`, `hfs/src/cluster.rs`, smoke script + workflow | `7bf5bf35` |
 
+| **PR 1.4 — reindex on the job store (A2)**: `ReindexOperation::with_cluster_store` — `start` enqueues `JobKind::Reindex`, any instance answers status/cancel, per-instance workers claim and run the untouched `run_reindex` via a bridge task (local progress map → store snapshots; cross-instance cancel/lease-loss → local cancel channel). `get_progress`/`cancel`/`list_jobs` now tenant-checked in **both** modes (the in-memory map previously served any tenant's job by UUID). hfs wires the store through the ops bundles under the database job-store mode (backends without a store warn + stay per-instance). T2 suite: visibility+list, isolation, cross-instance execution via deterministic `run_next_cluster_job`, cross-instance cancel, durability. | `search/reindex.rs`, `handlers/reindex.rs`, `hfs/main.rs` | `24517f54` |
+| **PR 1.5 — nightly kill-9 (A1)**: `cluster-smoke.yml` gains `schedule` + `nightly=true` dispatch input gating `run_nightly_kill9_check.sh` — stop B, seed 200k patients via psql, kick off on A, wait for the claim, `kill -9` A, restart B from the persisted env; assert reclaim after lease expiry under a new worker_id + bumped fencing token, completion, and a full-count shard via B. **Passed on first dispatch.** Scheduled runs execute main's copy — until merge, exercise via dispatch `-f nightly=true`. | workflow + `run_nightly_kill9_check.sh` | `9955e79c` |
+
+**Phase 1 gate (strategy §8): MET 2026-07-15.** A1+A2+F5 T2 suites green in CI
+on the merged head ([run 29430658948](https://github.com/HeliosSoftware/hfs/actions/runs/29430658948));
+smoke check 4 (SoF export A→front→B) green ([run 29427174805](https://github.com/HeliosSoftware/hfs/actions/runs/29427174805)
+and again on the merged head, [run 29430704358](https://github.com/HeliosSoftware/hfs/actions/runs/29430704358));
+nightly kill-9 green ([run 29428583874](https://github.com/HeliosSoftware/hfs/actions/runs/29428583874)).
+
 **Context (2026-07-15):** main broke on the #233 merge (semantic conflict —
 `concepts_search_fts` never created; latent since `f6008b29`) and was fixed by
 **PR #273** (not ours; we closed duplicate #276 — check open PRs before
 authoring a fix). main was then merged into this branch (`9cfd120b`), bringing
-the `$purge`/`$reindex` REST endpoints (`3177ec22`) — **PR 1.4's assumption
-that `ReindexOperation` is test-only is stale; re-ground it first.**
+the `$purge`/`$reindex` REST endpoints (`3177ec22`), which 1.4 built on.
+A second main merge (`e0cb5198`) absorbed **#205 — the jti subsystem was
+removed** (auth is stateless): the validator's C1 check was deleted with it
+and Phase 2 rescoped to C2 only (see below).
 
 ---
 
