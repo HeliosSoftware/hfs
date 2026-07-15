@@ -113,3 +113,35 @@ chart-expand = Ampliar el gráfico
 ## Pie de página
 
 footer-copyright = © { $year } { -org-name }
+
+## Historial y versiones (#236)
+
+history-heading = Historial y versiones
+history-lede = Compara dos versiones de un recurso. El almacenamiento está totalmente versionado; esto lo lee con la API estándar _history y vread.
+history-type-label = Tipo de recurso
+history-id-label = Id del recurso
+history-id-placeholder = id del recurso
+history-load = Cargar
+history-tabs-label = Alcance del historial
+history-tab-instance = Instancia
+history-tab-type = Feed por tipo
+history-tab-system = Feed del sistema
+history-versions-label = Versiones
+history-pick-instance = Elige una instancia
+history-current = actual
+history-from = Desde
+history-to = Hasta
+history-show-metadata = Mostrar cambios de metadatos
+history-empty = Carga un recurso y elige dos versiones para comparar.
+history-load-error = No se pudo cargar el historial de ese recurso.
+history-not-found = No hay historial para ese recurso — revisa el tipo y el id.
+history-diff-heading = { $from }
+history-metadata-hidden = { $count ->
+    [one] { $count } cambio de metadatos oculto
+   *[other] { $count } cambios de metadatos ocultos
+}
+history-textual = Ver diff de texto completo
+history-only-metadata = Entre estas versiones solo cambiaron los metadatos.
+history-identical = Estas dos versiones son idénticas.
+history-deleted = { $version } es una eliminación — no hay contra qué comparar.
+history-parse-error = No se pudieron leer esas versiones como JSON.

@@ -1,0 +1,82 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("history-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content_class %} content--wide{% endblock %}
+
+{% block content %}
+<!--
+  History & Versions (#236), following the Figma "History & Versions" frame: the
+  Instance / Type feed / System feed tabs, the version rail, and the diff panel.
+  Storage is fully versioned already; this reads it through the ordinary
+  _history / vread FHIR API. The diff itself is computed server-side (see
+  docs/history-diff-rendering.md) — the browser only fetches the versions and
+  posts them to /ui/history/diff.
+-->
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("history-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("history-lede") }}</p>
+</section>
+
+<div class="history" id="history"
+     data-msg-load-error="{{ i18n.t("history-load-error") }}"
+     data-msg-current="{{ i18n.t("history-current") }}"
+     data-msg-not-found="{{ i18n.t("history-not-found") }}">
+
+  <!-- Locate the instance. A plain form so it works without JavaScript. -->
+  <form class="history__locate" id="history-locate">
+    <input class="history__type" name="type" value="Patient" spellcheck="false"
+           aria-label="{{ i18n.t("history-type-label") }}">
+    <span class="history__slash">/</span>
+    <input class="history__id" name="id" placeholder="{{ i18n.t("history-id-placeholder") }}"
+           spellcheck="false" aria-label="{{ i18n.t("history-id-label") }}">
+    <button class="btn btn--primary" type="submit">{{ i18n.t("history-load") }}</button>
+  </form>
+
+  <div class="tabs" role="tablist" aria-label="{{ i18n.t("history-tabs-label") }}">
+    <button type="button" class="tab tab--on" data-tab="instance" aria-selected="true">{{ i18n.t("history-tab-instance") }}</button>
+    <button type="button" class="tab" data-tab="type" aria-selected="false">{{ i18n.t("history-tab-type") }}</button>
+    <button type="button" class="tab" data-tab="system" aria-selected="false">{{ i18n.t("history-tab-system") }}</button>
+  </div>
+
+  <div class="history__split">
+    <!-- Version rail: newest first, each with the interaction that produced it
+         (create / update / patch), fetched from /{type}/{id}/_history. -->
+    <aside class="card history__rail" aria-label="{{ i18n.t("history-versions-label") }}">
+      <div class="history__rail-head">
+        <span class="icon">{% include "icons/history.svg" %}</span>
+        <span id="history-subject">{{ i18n.t("history-pick-instance") }}</span>
+      </div>
+      <div class="history__rail-path mono" id="history-path"></div>
+      <div class="history__versions" id="history-versions"></div>
+    </aside>
+
+    <div class="history__main">
+      <!-- Comparison controls: which two versions, and whether to show the
+           metadata churn (versionId/lastUpdated move on every version). -->
+      <div class="history__controls" id="history-controls" hidden>
+        <label class="history__select">
+          <span>{{ i18n.t("history-from") }}</span>
+          <select id="history-from"></select>
+        </label>
+        <span class="history__arrow">→</span>
+        <label class="history__select">
+          <span>{{ i18n.t("history-to") }}</span>
+          <select id="history-to"></select>
+        </label>
+        <label class="history__meta-toggle">
+          <input type="checkbox" id="history-show-metadata">
+          {{ i18n.t("history-show-metadata") }}
+        </label>
+      </div>
+
+      <!-- The rendered diff drops in here on every selection change. -->
+      <div class="history__diff" id="history-diff">
+        <p class="history__empty">{{ i18n.t("history-empty") }}</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/ui/assets/history.js" defer></script>
+{% endblock %}

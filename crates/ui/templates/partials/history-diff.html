@@ -1,0 +1,69 @@
+<!--
+  The rendered diff (#236), two layers, both server-side. Swapped in by htmx
+  when the version selection changes.
+-->
+{% if parse_error %}
+<div class="history__banner history__banner--error" role="alert">
+  {{ i18n.t("history-parse-error") }}
+</div>
+{% else if deleted %}
+<!-- A deleted version is a tombstone: no semantic diff against nothing. -->
+<div class="history__banner history__banner--deleted" role="status">
+  {{ i18n.t_arg("history-deleted", "version", to_label.clone()) }}
+</div>
+{% else if diff.identical %}
+<div class="history__banner history__banner--same" role="status">
+  {{ i18n.t("history-identical") }}
+</div>
+{% else %}
+
+<div class="diff">
+  <div class="diff__head">
+    <h3>
+      <span class="icon">{% include "icons/history.svg" %}</span>
+      {{ i18n.t_arg("history-diff-heading", "from", from_label.clone()) }} → {{ to_label }}
+    </h3>
+    {% if !show_metadata && diff.metadata_hidden > 0 %}
+    <span class="diff__meta-note">{{ i18n.t_arg("history-metadata-hidden", "count", diff.metadata_hidden.to_string()) }}</span>
+    {% endif %}
+  </div>
+
+  <!-- Semantic layer: the field-level change list, the inverse of a FHIR
+       PATCH. This is the "what changed" view. -->
+  <div class="diff__semantic">
+    {% if diff.changes.is_empty() %}
+    <p class="diff__none">{{ i18n.t("history-only-metadata") }}</p>
+    {% endif %}
+    {% for change in diff.changes %}
+    <div class="diff-change diff-change--{{ change.op }}">
+      <span class="diff-change__op">{{ change.op }}</span>
+      <code class="diff-change__path">{{ change.path }}</code>
+      {% if let Some(was) = change.was %}
+      <span class="diff-change__was">{{ was }}</span>
+      <span class="diff-change__arrow">→</span>
+      {% endif %}
+      {% if !change.value.is_empty() %}
+      <span class="diff-change__value">{{ change.value }}</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- Textual layer: the pretty-printed JSON, side-tracked by line, with
+       word-level highlighting of what changed within a line. The "show me
+       exactly" view. -->
+  <details class="diff__textual" open>
+    <summary>{{ i18n.t("history-textual") }}</summary>
+    <div class="diff-table">
+      {% for line in diff.lines %}
+      <div class="diff-line diff-line--{{ line.tag }}">
+        <span class="diff-line__ln diff-line__ln--old">{{ line.old_ln }}</span>
+        <span class="diff-line__ln diff-line__ln--new">{{ line.new_ln }}</span>
+        <span class="diff-line__gutter">{% if line.tag == "add" %}+{% else if line.tag == "del" %}-{% endif %}</span>
+        <span class="diff-line__text">{% for seg in line.segments %}{% if seg.emphasis %}<mark>{{ seg.text }}</mark>{% else %}{{ seg.text }}{% endif %}{% endfor %}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+</div>
+{% endif %}
