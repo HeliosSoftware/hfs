@@ -17,13 +17,17 @@
 //! [`CleanupConfig`]-driven reaper once a finished job ages past its TTL.
 
 pub mod controller;
+pub mod database;
 pub mod in_memory;
 pub mod planner;
 pub mod sink;
 
 pub use controller::{
     CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobStatus,
-    NamedSqlQuery, SqlExportLimits, SqlTableSource,
+    NamedSqlQuery, NamedView, SqlExportLimits, SqlTableSource,
+};
+pub use database::{
+    DatabaseExportJobController, run_next_sof_export_job, spawn_sof_export_workers,
 };
 pub use in_memory::{CleanupConfig, InMemoryController};
 pub use planner::DEFAULT_SHARD_ROWS;

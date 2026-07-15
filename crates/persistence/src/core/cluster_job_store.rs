@@ -310,9 +310,15 @@ pub trait ClusterJobStore: Send + Sync {
         error_message: &str,
     ) -> Result<(), ClusterLeaseError>;
 
-    /// Deletes terminal jobs that finished before `cutoff`; returns how many
-    /// were removed. Idempotent — safe for every instance to run on a timer.
-    async fn delete_terminal_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64>;
+    /// Deletes terminal jobs of `kind` that finished before `cutoff`,
+    /// returning the removed ids so the caller can reap associated artifacts
+    /// (e.g. export output files). Idempotent — safe for every instance to
+    /// run on a timer.
+    async fn delete_terminal_before(
+        &self,
+        kind: JobKind,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<Vec<ClusterJobId>>;
 }
 
 /// Test support: an in-memory [`ClusterJobStore`] implementing the same
@@ -610,13 +616,25 @@ pub mod testing {
             }
         }
 
-        async fn delete_terminal_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64> {
+        async fn delete_terminal_before(
+            &self,
+            kind: JobKind,
+            cutoff: DateTime<Utc>,
+        ) -> StorageResult<Vec<ClusterJobId>> {
             let mut jobs = self.jobs.lock().unwrap();
-            let before = jobs.len();
-            jobs.retain(|_, j| {
-                !(j.state.is_terminal() && j.finished_at.is_some_and(|f| f < cutoff))
-            });
-            Ok((before - jobs.len()) as u64)
+            let doomed: Vec<String> = jobs
+                .iter()
+                .filter(|(_, j)| {
+                    j.kind == kind
+                        && j.state.is_terminal()
+                        && j.finished_at.is_some_and(|f| f < cutoff)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &doomed {
+                jobs.remove(id);
+            }
+            Ok(doomed.into_iter().map(ClusterJobId::from_string).collect())
         }
     }
 }
@@ -836,20 +854,27 @@ mod tests {
             .unwrap();
 
         let removed = store
-            .delete_terminal_before(Utc::now() + chrono::Duration::seconds(1))
+            .delete_terminal_before(
+                JobKind::SofExport,
+                Utc::now() + chrono::Duration::seconds(1),
+            )
             .await
             .unwrap();
-        assert_eq!(removed, 1);
+        assert_eq!(removed, vec![done.clone()]);
         assert!(store.get_status(&t, &done).await.unwrap().is_none());
         assert!(store.get_status(&t, &live).await.unwrap().is_some());
 
-        // Idempotent.
-        assert_eq!(
+        // Idempotent; kind-scoped (the live job is SofExport but queued, and
+        // a terminal job of another kind would be out of scope entirely).
+        assert!(
             store
-                .delete_terminal_before(Utc::now() + chrono::Duration::seconds(1))
+                .delete_terminal_before(
+                    JobKind::SofExport,
+                    Utc::now() + chrono::Duration::seconds(1)
+                )
                 .await
-                .unwrap(),
-            0
+                .unwrap()
+                .is_empty()
         );
     }
 

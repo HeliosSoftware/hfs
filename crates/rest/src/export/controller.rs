@@ -14,7 +14,7 @@ pub type JobId = String;
 /// Per the SQL-on-FHIR v2 spec, `$viewdefinition-export` accepts `view` 1..*,
 /// each with an optional `name` plus either `viewResource` or `viewReference`.
 /// The kickoff handler resolves references and packages each view here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NamedView {
     /// `view.name` from the spec — drives `output.name` in the manifest.
     pub name: String,
@@ -25,7 +25,7 @@ pub struct NamedView {
 /// One table source for a SQL query export: a resolved ViewDefinition that is
 /// materialized under `label` for the SQL to query against. Table sources do
 /// not produce their own `output` entries in the manifest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SqlTableSource {
     /// Table alias the SQL references (the `relatedArtifact.label`).
     pub label: String,
@@ -53,7 +53,7 @@ pub struct NamedSqlQuery {
 /// Execution caps for SQL query export work. Mirrors the `$sqlquery-run`
 /// server configuration so exports and synchronous runs enforce the same
 /// resource limits.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct SqlExportLimits {
     /// Maximum rows materialized per depends-on ViewDefinition.
     pub max_source_rows_per_vd: usize,
@@ -99,7 +99,7 @@ pub struct ExportTask {
 }
 
 /// A single output file produced by an export job.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletedFile {
     /// Logical view name this file belongs to (matches `view.name`).
     pub view_name: String,
@@ -189,9 +189,12 @@ pub enum ExportError {
 
 /// Trait for managing async export jobs.
 ///
-/// All methods are synchronous (no `async`) because the controller uses internal
-/// locking (DashMap) for shared state.  The actual work is spawned via
-/// `tokio::spawn` inside `submit()`.
+/// Methods are `async`: the in-memory controller answers from internal
+/// locking (DashMap) and spawns work via `tokio::spawn` inside `submit()`,
+/// while the database controller (cluster mode) persists jobs to the shared
+/// job store, where any instance's worker can claim them. `submit` MUST make
+/// the job durable (or at least registered) before returning, since the
+/// handler answers `202 Accepted` with a polling URL immediately after.
 ///
 /// Status/cancel/download methods all require the caller's `tenant_id`.
 /// Implementations MUST return `None` / `false` when the supplied `tenant_id`
@@ -199,32 +202,34 @@ pub enum ExportError {
 /// cannot poll, cancel, or read another tenant's exports by guessing a
 /// job ID. The handler maps `None`/`false` to `404 Not Found` rather than
 /// `403 Forbidden` to avoid leaking the existence of cross-tenant jobs.
+#[async_trait::async_trait]
 pub trait ExportJobController: Send + Sync + 'static {
     /// Submits a new export job and returns its [`JobId`].
     ///
-    /// The job begins running immediately in the background. The tenant
-    /// is taken from `task.tenant` and recorded so subsequent accessor
-    /// calls can be tenant-checked.
-    fn submit(&self, task: ExportTask) -> JobId;
+    /// The job begins running in the background (immediately in-process, or
+    /// when a worker claims it from the shared store). The tenant is taken
+    /// from `task.tenant` and recorded so subsequent accessor calls can be
+    /// tenant-checked.
+    async fn submit(&self, task: ExportTask) -> JobId;
 
     /// Returns the current [`JobStatus`] for the given job, or `None` if
     /// the job ID is unknown OR if `tenant_id` does not match the tenant
     /// that submitted the job.
-    fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus>;
+    async fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus>;
 
     /// Requests cancellation of the given job.
     ///
     /// Returns `true` if the job was found (and cancelled / already done),
     /// `false` if the job ID was not found OR if `tenant_id` does not match
     /// the tenant that submitted the job.
-    fn cancel(&self, tenant_id: &str, job_id: &str) -> bool;
+    async fn cancel(&self, tenant_id: &str, job_id: &str) -> bool;
 
     /// Reads raw bytes for a shard file produced by a completed job.
     ///
     /// Used by the download handler to serve the file contents.
     /// Returns `None` if the job or shard does not exist OR if `tenant_id`
     /// does not match the tenant that submitted the job.
-    fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>>;
+    async fn read_shard(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<Vec<u8>>;
 
     /// Resolves a completed shard's [`CompletedFile::filename`] to a public
     /// download URL, freshly each call.
@@ -236,5 +241,5 @@ pub trait ExportJobController: Send + Sync + 'static {
     ///
     /// Returns `None` if `tenant_id` does not match the submitting tenant, or if
     /// the sink fails to produce a URL (e.g. an S3 pre-signing error).
-    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String>;
+    async fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String>;
 }

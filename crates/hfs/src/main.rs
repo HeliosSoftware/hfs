@@ -811,6 +811,9 @@ async fn main() -> anyhow::Result<()> {
             bulk_submit_enabled: config.bulk_submit.enabled,
             bulk_submit_output_backend: &config.bulk_submit.output_backend,
             audit_backend: audit_config.backend,
+            sof_enabled: config.sof_enabled,
+            export_controller: &config.export_controller,
+            export_sink: &config.export_sink,
         };
         if let Err(errors) = cluster::validate_cluster_config(&view) {
             for error in &errors {

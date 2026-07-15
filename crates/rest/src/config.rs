@@ -138,6 +138,17 @@ impl FromStr for StorageBackendMode {
     }
 }
 
+/// Resolved SoF export controller (see [`ServerConfig::export_controller_mode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportControllerMode {
+    /// Process-local job state (DashMap) + `tokio::spawn` workers — visible
+    /// only to this instance.
+    Memory,
+    /// Jobs on the shared cluster job store (`cluster_jobs` table);
+    /// per-instance claim/lease workers — cluster-capable.
+    Database,
+}
+
 /// Unified async-job store backend (docs/cluster-capable-state-design.md §4).
 ///
 /// Selects where cluster-affected async job state (SQL-on-FHIR export,
@@ -828,9 +839,13 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_SHARD_ROWS", default_value = "500000")]
     pub export_shard_rows: usize,
 
-    /// Export job controller backend: "memory" (default, in-process).
-    /// Future values: "kafka", "sqs".
-    #[arg(long, env = "HFS_EXPORT_CONTROLLER", default_value = "memory")]
+    /// SoF export job controller backend: "memory" (in-process job state,
+    /// single-instance) or "database" (jobs on the shared cluster job store,
+    /// any instance can poll/cancel/download and run the work). Unset
+    /// resolves via HFS_JOB_STORE_BACKEND — i.e. "database" under
+    /// HFS_CLUSTER=true, "memory" otherwise. See
+    /// [`ServerConfig::export_controller_mode`].
+    #[arg(long, env = "HFS_EXPORT_CONTROLLER", default_value = "")]
     pub export_controller: String,
 
     /// Retention (seconds) for a finished export job's output and bookkeeping.
@@ -913,6 +928,23 @@ impl ServerConfig {
             "database" | "db" => Ok(JobStoreBackend::Database),
             other => Err(format!(
                 "Invalid job store backend '{}'. Valid values: memory, database",
+                other
+            )),
+        }
+    }
+
+    /// Resolves `HFS_EXPORT_CONTROLLER`, defaulting to the job-store mode
+    /// (`database` under `HFS_CLUSTER=true`, else `memory`) when unset.
+    pub fn export_controller_mode(&self) -> Result<ExportControllerMode, String> {
+        match self.export_controller.to_lowercase().as_str() {
+            "" => Ok(match self.job_store_backend_mode()? {
+                JobStoreBackend::Database => ExportControllerMode::Database,
+                JobStoreBackend::Memory => ExportControllerMode::Memory,
+            }),
+            "memory" => Ok(ExportControllerMode::Memory),
+            "database" | "db" => Ok(ExportControllerMode::Database),
+            other => Err(format!(
+                "Invalid export controller '{}'. Valid values: memory, database",
                 other
             )),
         }
@@ -1025,6 +1057,10 @@ impl ServerConfig {
 
         if let Err(job_store_error) = self.job_store_backend_mode() {
             errors.push(job_store_error);
+        }
+
+        if let Err(export_controller_error) = self.export_controller_mode() {
+            errors.push(export_controller_error);
         }
 
         if let Err(mut bulk_errors) = self.bulk_export.validate() {

@@ -1219,11 +1219,12 @@ mod sof_export_tests {
         failed_at: chrono::DateTime<chrono::Utc>,
     }
 
+    #[async_trait::async_trait]
     impl ExportJobController for FailingController {
-        fn submit(&self, _task: ExportTask) -> String {
+        async fn submit(&self, _task: ExportTask) -> String {
             self.job_id.clone()
         }
-        fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
+        async fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
             if tenant_id != self.tenant || job_id != self.job_id {
                 return None;
             }
@@ -1233,13 +1234,13 @@ mod sof_export_tests {
                 failed_at: self.failed_at,
             })
         }
-        fn cancel(&self, _t: &str, _j: &str) -> bool {
+        async fn cancel(&self, _t: &str, _j: &str) -> bool {
             false
         }
-        fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
+        async fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
             None
         }
-        fn download_url(&self, _t: &str, _j: &str, _f: &str) -> Option<String> {
+        async fn download_url(&self, _t: &str, _j: &str, _f: &str) -> Option<String> {
             // This controller only ever reports `Failed`, so the manifest path
             // that resolves download URLs is never exercised.
             None
@@ -1335,11 +1336,12 @@ mod sof_export_tests {
         completed_at: chrono::DateTime<chrono::Utc>,
     }
 
+    #[async_trait::async_trait]
     impl ExportJobController for UnresolvableUrlController {
-        fn submit(&self, _task: ExportTask) -> String {
+        async fn submit(&self, _task: ExportTask) -> String {
             self.job_id.clone()
         }
-        fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
+        async fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
             if tenant_id != self.tenant || job_id != self.job_id {
                 return None;
             }
@@ -1355,13 +1357,13 @@ mod sof_export_tests {
                 client_tracking_id: None,
             })
         }
-        fn cancel(&self, _t: &str, _j: &str) -> bool {
+        async fn cancel(&self, _t: &str, _j: &str) -> bool {
             false
         }
-        fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
+        async fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
             None
         }
-        fn download_url(&self, _t: &str, _j: &str, _f: &str) -> Option<String> {
+        async fn download_url(&self, _t: &str, _j: &str, _f: &str) -> Option<String> {
             // Stand in for an S3 pre-signing failure at poll time: the shard
             // exists but no usable URL can be produced.
             None

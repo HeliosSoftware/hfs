@@ -168,6 +168,94 @@ if [ "$status" != "200" ]; then
 fi
 pass "Patient is readable through the nginx front"
 
+# --- 4. SoF $viewdefinition-export across instances (Phase 1, #169) ---------
+# Jobs live on the shared cluster job store (HFS_JOB_STORE_BACKEND=database +
+# HFS_EXPORT_CONTROLLER=database in the workflow), and shards in a shared
+# export dir, so: kick off on A, poll the status URL through the front
+# (either instance answers), and download the shard via B explicitly.
+
+EXPORT_BODY="$HTTP_DIR/export-kickoff.json"
+cat > "$EXPORT_BODY" <<EOF
+{
+  "resourceType": "Parameters",
+  "parameter": [{
+    "name": "view",
+    "part": [
+      {"name": "name", "valueString": "patients"},
+      {"name": "viewResource", "resource": {
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "status": "active",
+        "select": [{"column": [{"path": "id", "name": "patient_id", "type": "string"}]}]
+      }}
+    ]
+  }]
+}
+EOF
+
+KICKOFF_HEADERS="$HTTP_DIR/export-kickoff-headers.txt"
+status="$(curl -sS -o "$HTTP_DIR/export-kickoff.out" -w "%{http_code}" \
+  -D "$KICKOFF_HEADERS" \
+  -X POST "$BASE_URL_A/ViewDefinition/\$viewdefinition-export" \
+  -H "Content-Type: $FHIR_CT" -H "Accept: $FHIR_CT" -H "Prefer: respond-async" \
+  --data-binary @"$EXPORT_BODY")" || fail "SoF export kickoff curl failed"
+if [ "$status" != "202" ]; then
+  cat "$HTTP_DIR/export-kickoff.out" >&2 || true
+  fail "SoF export kickoff on instance A returned HTTP $status, expected 202"
+fi
+
+STATUS_URL="$(awk 'tolower($1) == "content-location:" {print $2}' "$KICKOFF_HEADERS" | tr -d '\r' | tail -1)"
+[ -n "$STATUS_URL" ] || fail "SoF export kickoff response has no Content-Location header"
+case "$STATUS_URL" in
+  "$FRONT_URL"*) ;;
+  *) fail "status URL '$STATUS_URL' is not front-based (HFS_BASE_URL should be the front)" ;;
+esac
+
+# Poll through the front until the 303 redirect to the result URL.
+RESULT_URL=""
+for _ in $(seq 1 60); do
+  POLL_HEADERS="$HTTP_DIR/export-poll-headers.txt"
+  status="$(curl -sS -o "$HTTP_DIR/export-poll.out" -w "%{http_code}" \
+    -D "$POLL_HEADERS" -H "Accept: $FHIR_CT" "$STATUS_URL")" || fail "SoF export poll curl failed"
+  case "$status" in
+    202) sleep 1 ;;
+    303)
+      RESULT_URL="$(awk 'tolower($1) == "location:" {print $2}' "$POLL_HEADERS" | tr -d '\r' | tail -1)"
+      break
+      ;;
+    *)
+      cat "$HTTP_DIR/export-poll.out" >&2 || true
+      fail "SoF export poll via the front returned HTTP $status, expected 202/303"
+      ;;
+  esac
+done
+[ -n "$RESULT_URL" ] || fail "SoF export did not complete within 60s of polling via the front"
+pass "SoF export kicked off on A completed while polling through the front"
+
+status="$(curl_json GET "$RESULT_URL" "" "$HTTP_DIR/export-manifest.json")"
+if [ "$status" != "200" ]; then
+  cat "$HTTP_DIR/export-manifest.json" >&2 || true
+  fail "SoF export manifest fetch returned HTTP $status, expected 200"
+fi
+
+DOWNLOAD_URL="$(grep -o '"valueUri"[[:space:]]*:[[:space:]]*"[^"]*"' "$HTTP_DIR/export-manifest.json" | head -1 | sed 's/.*"\(http[^"]*\)".*/\1/')"
+[ -n "$DOWNLOAD_URL" ] || { cat "$HTTP_DIR/export-manifest.json" >&2; fail "SoF export manifest has no output location"; }
+
+# Rewrite the front-based download URL to target instance B directly: the
+# shard was (possibly) written by the other instance's worker, so a 200 here
+# proves the output storage is genuinely shared.
+DOWNLOAD_PATH="${DOWNLOAD_URL#"$FRONT_URL"}"
+status="$(curl -sS -o "$HTTP_DIR/export-shard.ndjson" -w "%{http_code}" "$BASE_URL_B$DOWNLOAD_PATH")" || fail "SoF export download curl failed"
+if [ "$status" != "200" ]; then
+  cat "$HTTP_DIR/export-shard.ndjson" >&2 || true
+  fail "SoF export shard download via instance B returned HTTP $status, expected 200"
+fi
+if ! grep -q "\"$PATIENT_ID\"" "$HTTP_DIR/export-shard.ndjson"; then
+  cat "$HTTP_DIR/export-shard.ndjson" >&2 || true
+  fail "SoF export shard downloaded via B does not contain patient $PATIENT_ID"
+fi
+pass "SoF export shard downloaded via instance B contains the exported patient"
+
 log "all cluster smoke checks passed"
 echo "" >> "$SUMMARY_FILE"
 echo "All checks passed." >> "$SUMMARY_FILE"

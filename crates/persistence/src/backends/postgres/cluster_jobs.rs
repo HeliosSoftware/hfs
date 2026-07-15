@@ -424,17 +424,26 @@ impl ClusterJobStore for PgClusterJobStore {
         }
     }
 
-    async fn delete_terminal_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64> {
+    async fn delete_terminal_before(
+        &self,
+        kind: JobKind,
+        cutoff: DateTime<Utc>,
+    ) -> StorageResult<Vec<ClusterJobId>> {
         let client = self.get_client().await?;
-        let deleted = client
-            .execute(
+        let rows = client
+            .query(
                 "DELETE FROM cluster_jobs
-                 WHERE status IN ('completed', 'failed', 'cancelled')
-                   AND finished_at IS NOT NULL AND finished_at < $1",
-                &[&cutoff],
+                 WHERE kind = $1
+                   AND status IN ('completed', 'failed', 'cancelled')
+                   AND finished_at IS NOT NULL AND finished_at < $2
+                 RETURNING id",
+                &[&kind.as_str(), &cutoff],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to reap cluster jobs: {}", e)))?;
-        Ok(deleted)
+        Ok(rows
+            .iter()
+            .map(|r| ClusterJobId::from_string(r.get::<_, String>(0)))
+            .collect())
     }
 }

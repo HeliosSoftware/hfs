@@ -165,7 +165,8 @@ pub mod terminology;
 
 // Re-export commonly used types
 pub use config::{
-    JobStoreBackend, MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode,
+    ExportControllerMode, JobStoreBackend, MultitenancyConfig, ServerConfig, StorageBackendMode,
+    TenantRoutingMode,
 };
 pub use error::{RestError, RestResult};
 pub use middleware::auth::AuthMiddlewareState;
@@ -654,21 +655,68 @@ where
 
         // Wire the export job controller.
         use crate::export::{
-            CleanupConfig, ExportJobController, FilesystemSink, InMemoryController,
+            CleanupConfig, DatabaseExportJobController, ExportJobController, ExportSink,
+            FilesystemSink, InMemoryController, spawn_sof_export_workers,
         };
-        let controller: Arc<dyn ExportJobController> = {
-            let max_concurrency = Some(config.export_max_concurrency);
-            let shard_rows = Some(config.export_shard_rows);
-            // Reaper that reclaims finished jobs' output after the TTL. The
-            // interval is clamped to >= 1s because `tokio::time::interval`
-            // panics on a zero period.
-            let cleanup = Some(CleanupConfig {
-                output_ttl: std::time::Duration::from_secs(config.export_output_ttl_secs),
-                interval: std::time::Duration::from_secs(
-                    config.export_cleanup_interval_secs.max(1),
-                ),
-            });
 
+        // Selected by HFS_EXPORT_CONTROLLER (unset follows the job-store
+        // mode: `database` under HFS_CLUSTER=true). `validate()` already
+        // rejected unparsable values at startup.
+        let controller_mode = config
+            .export_controller_mode()
+            .expect("export controller mode validated at startup");
+
+        /// Builds the selected controller over a concrete sink type; the
+        /// `database` mode also spawns this instance's claim/lease worker
+        /// pool and output reaper.
+        fn build_controller<Sink: ExportSink>(
+            mode: config::ExportControllerMode,
+            runner: Arc<dyn helios_persistence::core::SofRunner>,
+            sink: Sink,
+            store: Option<Arc<dyn helios_persistence::core::ClusterJobStore>>,
+            config: &ServerConfig,
+        ) -> Arc<dyn ExportJobController> {
+            let output_ttl = std::time::Duration::from_secs(config.export_output_ttl_secs);
+            // Interval clamped to >= 1s: `tokio::time::interval` panics on a
+            // zero period.
+            let cleanup_interval =
+                std::time::Duration::from_secs(config.export_cleanup_interval_secs.max(1));
+            match mode {
+                config::ExportControllerMode::Memory => Arc::new(InMemoryController::with_options(
+                    runner,
+                    sink,
+                    Some(config.export_max_concurrency),
+                    Some(config.export_shard_rows),
+                    Some(CleanupConfig {
+                        output_ttl,
+                        interval: cleanup_interval,
+                    }),
+                )),
+                config::ExportControllerMode::Database => {
+                    let store = store.unwrap_or_else(|| {
+                        // Hard config error, same posture as the missing
+                        // SofRunner panic above.
+                        panic!(
+                            "HFS_EXPORT_CONTROLLER=database requires a storage backend that \
+                             provides a cluster job store (postgres)"
+                        )
+                    });
+                    spawn_sof_export_workers(
+                        Arc::clone(&store),
+                        runner,
+                        sink.clone(),
+                        config.export_max_concurrency,
+                        config.export_shard_rows,
+                        output_ttl,
+                        cleanup_interval,
+                    );
+                    Arc::new(DatabaseExportJobController::new(store, sink))
+                }
+            }
+        }
+
+        let job_store = storage_arc.cluster_job_store();
+        let controller: Arc<dyn ExportJobController> = {
             #[cfg(feature = "s3")]
             if config.export_sink.to_lowercase() == "s3" {
                 use crate::export::S3Sink;
@@ -689,13 +737,13 @@ where
                         ttl,
                     ))
                 }) {
-                    Ok(sink) => Arc::new(InMemoryController::with_options(
+                    Ok(sink) => build_controller(
+                        controller_mode,
                         runner_for_export,
                         sink,
-                        max_concurrency,
-                        shard_rows,
-                        cleanup,
-                    )),
+                        job_store,
+                        &config,
+                    ),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -703,38 +751,26 @@ where
                             "S3 export sink init failed — falling back to FilesystemSink"
                         );
                         let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                        Arc::new(InMemoryController::with_options(
+                        build_controller(
+                            controller_mode,
                             runner_for_export,
                             sink,
-                            max_concurrency,
-                            shard_rows,
-                            cleanup,
-                        ))
+                            job_store,
+                            &config,
+                        )
                     }
                 }
             } else {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_options(
-                    runner_for_export,
-                    sink,
-                    max_concurrency,
-                    shard_rows,
-                    cleanup,
-                ))
+                build_controller(controller_mode, runner_for_export, sink, job_store, &config)
             }
 
             #[cfg(not(feature = "s3"))]
             {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_options(
-                    runner_for_export,
-                    sink,
-                    max_concurrency,
-                    shard_rows,
-                    cleanup,
-                ))
+                build_controller(controller_mode, runner_for_export, sink, job_store, &config)
             }
         };
         state = state.with_export_controller(controller);

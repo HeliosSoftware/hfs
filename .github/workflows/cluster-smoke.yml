@@ -200,6 +200,14 @@ jobs:
 
           # One logical cluster: both instances share the database and the
           # public base URL (the nginx front), differing only in port.
+          #
+          # SoF export (Phase 1, #169) runs on the shared cluster job store;
+          # both instances run from this runner host, so a shared export
+          # directory stands in for the shared object store. HFS_CLUSTER=true
+          # is deliberately NOT set here: its fail-fast validator (rightly)
+          # refuses HFS_EXPORT_SINK=fs, and S3 is out of scope for the smoke.
+          SHARED_EXPORT_DIR="$PWD/cluster-shared-exports"
+          mkdir -p "$SHARED_EXPORT_DIR"
           COMMON_ENV=(
             HFS_BASE_URL="$FRONT_URL"
             HFS_DEFAULT_FHIR_VERSION="$FHIR_VERSION"
@@ -211,6 +219,9 @@ jobs:
             HFS_PG_DBNAME=helios
             HFS_PG_USER=helios
             HFS_PG_PASSWORD=helios
+            HFS_JOB_STORE_BACKEND=database
+            HFS_EXPORT_CONTROLLER=database
+            HFS_EXPORT_DIR="$SHARED_EXPORT_DIR"
           )
 
           HFS_LOG_A="$RESULTS_DIR/hfs-a.log"

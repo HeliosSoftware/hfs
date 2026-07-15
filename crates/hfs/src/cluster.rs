@@ -41,6 +41,12 @@ pub struct ClusterConfigView<'a> {
     pub bulk_submit_output_backend: &'a str,
     /// `HFS_AUDIT_BACKEND` (`None` means audit is disabled).
     pub audit_backend: AuditBackend,
+    /// `HFS_SOF_ENABLED`.
+    pub sof_enabled: bool,
+    /// Raw `HFS_EXPORT_CONTROLLER` value ("" when unset).
+    pub export_controller: &'a str,
+    /// `HFS_EXPORT_SINK`.
+    pub export_sink: &'a str,
 }
 
 /// Refuses configurations that cannot run as one of N instances.
@@ -118,6 +124,28 @@ pub fn validate_cluster_config(view: &ClusterConfigView<'_>) -> Result<(), Vec<S
         );
     }
 
+    // A1 (#169) — SoF async export state must be cluster-shared: the
+    // controller on the shared job store, and shards in shared storage.
+    if view.sof_enabled {
+        if view.export_controller.eq_ignore_ascii_case("memory") {
+            errors.push(
+                "HFS_CLUSTER=true is incompatible with HFS_EXPORT_CONTROLLER=memory: SoF \
+                 export jobs would be per-instance, so poll/cancel/download on another \
+                 instance 404s. Remove the variable (it defaults to database when \
+                 clustered) or set database."
+                    .to_string(),
+            );
+        }
+        if view.export_sink.eq_ignore_ascii_case("fs") {
+            errors.push(
+                "HFS_CLUSTER=true requires shared SoF export output, but HFS_EXPORT_SINK=fs \
+                 writes shards to node-local disk, so downloads routed to another instance \
+                 return 404. Use s3 (or set HFS_SOF_ENABLED=false)."
+                    .to_string(),
+            );
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -143,6 +171,9 @@ mod tests {
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "s3",
             audit_backend: AuditBackend::Database,
+            sof_enabled: true,
+            export_controller: "",
+            export_sink: "s3",
         }
     }
 
@@ -161,6 +192,9 @@ mod tests {
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "local-fs",
             audit_backend: AuditBackend::File,
+            sof_enabled: true,
+            export_controller: "memory",
+            export_sink: "fs",
         };
         assert_eq!(validate_cluster_config(&view), Ok(()));
     }
@@ -229,6 +263,22 @@ mod tests {
                 },
                 expect_var: "HFS_JOB_STORE_BACKEND",
             },
+            Case {
+                name: "A1 explicit memory export controller",
+                view: ClusterConfigView {
+                    export_controller: "memory",
+                    ..safe_cluster_view()
+                },
+                expect_var: "HFS_EXPORT_CONTROLLER",
+            },
+            Case {
+                name: "A1 node-local export sink",
+                view: ClusterConfigView {
+                    export_sink: "fs",
+                    ..safe_cluster_view()
+                },
+                expect_var: "HFS_EXPORT_SINK",
+            },
         ];
 
         for case in cases {
@@ -259,9 +309,12 @@ mod tests {
             bulk_submit_enabled: true,
             bulk_submit_output_backend: "local-fs",
             audit_backend: AuditBackend::File,
+            sof_enabled: true,
+            export_controller: "memory",
+            export_sink: "fs",
         };
         let errors = validate_cluster_config(&view).unwrap_err();
-        assert_eq!(errors.len(), 6);
+        assert_eq!(errors.len(), 8);
     }
 
     #[test]
@@ -276,6 +329,9 @@ mod tests {
             bulk_submit_enabled: false,
             bulk_submit_output_backend: "local-fs",
             audit_backend: AuditBackend::None,
+            sof_enabled: false,
+            export_controller: "memory",
+            export_sink: "fs",
             ..safe_cluster_view()
         };
         assert_eq!(validate_cluster_config(&view), Ok(()));

@@ -53,6 +53,8 @@ things:
 | Bulk submit output | `HFS_BULK_SUBMIT_OUTPUT_BACKEND=local-fs` (with bulk submit enabled) | Use `s3` |
 | Audit sink | `HFS_AUDIT_BACKEND=file` (with audit enabled) | Use `database` or `cloudwatch` |
 | Job store | explicit `HFS_JOB_STORE_BACKEND=memory` | Remove it or set `database` |
+| SoF export controller | explicit `HFS_EXPORT_CONTROLLER=memory` (with SoF enabled) | Remove it (defaults to `database` when clustered) or set `database` |
+| SoF export output | `HFS_EXPORT_SINK=fs` (with SoF enabled) | Use `s3` |
 
 With `HFS_CLUSTER` unset (the default), nothing changes: a single instance
 keeps its zero-configuration SQLite defaults.
@@ -86,7 +88,7 @@ current state and is updated as each phase ships.
 | Bulk Data `$export` / `$bulk-submit` (jobs) | ✅ | ✅ DB-leased jobs with fencing tokens; every instance runs competing workers | already safe (Postgres primary) |
 | Bulk output download | ✅ | ✅ with `s3` output; ❌ with `local-fs` | F2 — enforced by fail-fast |
 | Concurrent cold-start schema init | ✅ | ✅ serialized by a Postgres advisory lock | fixed 2026-07-14 (D3) |
-| SQL-on-FHIR `$viewdefinition-export` (async jobs) | ✅ | ⚠️ **single-instance only** — job state is in-memory; poll/cancel/download on another instance 404s | Phase 1 (#169, unified job store) |
+| SQL-on-FHIR `$viewdefinition-export` / `$sqlquery-export` (async jobs) | ✅ | ✅ with `HFS_EXPORT_CONTROLLER=database` (the default under `HFS_CLUSTER`): jobs on the shared `cluster_jobs` store, any instance polls/cancels/downloads, workers on every instance compete for work | Phase 1 (#169) — landed |
 | Search reindex jobs | ✅ | ⚠️ single-instance only (in-memory job registry) | Phase 1 |
 | JWT `jti` replay protection | ✅ | ⚠️ `memory` is per-node (replay possible on other nodes) — refused by fail-fast; use `redis` | Phase 2 hardens defaults, adds `database` |
 | JWKS refresh | ✅ | ✅ functionally (each node fetches the same keys); redundant IdP fetches | Phase 2 (coordinated refresh) |
@@ -96,10 +98,11 @@ current state and is updated as each phase ships.
 | Composite async search sync | ✅ | ⚠️ in-process queue; a crash loses queued secondary-index writes | Phase 4 (durable outbox) |
 | Audit, metrics, health | ✅ | ✅ with shared sinks; `/metrics` is per-instance (aggregate in your scraper) | already safe |
 
-**⚠️ single-instance-only features:** until their phase lands, pin SQL-on-FHIR
-async exports, reindex, and Subscriptions to one instance (or route their
-requests to one instance with sticky sessions) — the same guidance issues
-#169 and #170 carry.
+**⚠️ single-instance-only features:** until their phase lands, pin reindex
+and Subscriptions to one instance (or route their requests to one instance
+with sticky sessions) — the same guidance issues #169 and #170 carry. SQL-on-
+FHIR async exports are cluster-safe as of Phase 1 (`HFS_EXPORT_CONTROLLER=
+database` + a shared `HFS_EXPORT_SINK`).
 
 ---
 
@@ -124,7 +127,11 @@ requests to one instance with sticky sessions) — the same guidance issues
 The repository ships a two-instance smoke harness — two `hfs` processes
 sharing one PostgreSQL behind an nginx round-robin front
 (`.github/workflows/cluster-smoke.yml`). It asserts health on both instances
-and the front, real round-robin distribution, and cross-instance visibility
-(write on A, read on B). The same checks are easy to run by hand against any
-deployment: create a resource through the balancer, then `GET` it repeatedly
-and confirm every instance serves it.
+and the front, real round-robin distribution, cross-instance visibility
+(write on A, read on B), and — since Phase 1 — a full SoF `$viewdefinition-
+export` round-trip across instances: kick off on A, poll the status URL
+through the front, download the shard via B. The same checks are easy to run
+by hand against any deployment: create a resource through the balancer, then
+`GET` it repeatedly and confirm every instance serves it; kick off an export
+and poll/download it from a different instance than the one that accepted
+it.
