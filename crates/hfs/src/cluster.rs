@@ -140,6 +140,72 @@ pub fn validate_cluster_config(view: &ClusterConfigView<'_>) -> Result<(), Vec<S
     }
 }
 
+/// How JWKS refreshes are coordinated across instances (design §5 C2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwksCoordinationMode {
+    /// Per-instance refresh (the single-instance default).
+    Local,
+    /// Cluster-wide single-flight over the primary backend's shared
+    /// refresh cache.
+    Database,
+    /// Cluster-wide single-flight over Redis (`HFS_AUTH_REDIS_URL`).
+    Redis,
+}
+
+/// Resolves `HFS_AUTH_JWKS_COORDINATION` (`raw`, "" when unset).
+///
+/// Unlike the refusal table above, C2 is **warn-only by design**: per-instance
+/// JWKS refresh is functionally correct (every node fetches the same public
+/// keys) — the cost is only a thundering herd on the IdP. So under
+/// `HFS_CLUSTER=true` an unset value resolves to `Database` and an explicit
+/// `local` yields a warning (returned as the second tuple element), never a
+/// refusal. Invalid *values* still fail fast, naming the variable.
+pub fn resolve_jwks_coordination(
+    raw: &str,
+    cluster: bool,
+    redis_url: Option<&str>,
+) -> Result<(JwksCoordinationMode, Option<String>), String> {
+    match raw {
+        "" => {
+            if cluster {
+                Ok((JwksCoordinationMode::Database, None))
+            } else {
+                Ok((JwksCoordinationMode::Local, None))
+            }
+        }
+        "local" => {
+            let warning = cluster.then(|| {
+                "HFS_CLUSTER=true with HFS_AUTH_JWKS_COORDINATION=local: every instance \
+                 refreshes JWKS independently, hammering the IdP on boot and key rotation. \
+                 Functionally correct, but consider database."
+                    .to_string()
+            });
+            Ok((JwksCoordinationMode::Local, warning))
+        }
+        "database" => Ok((JwksCoordinationMode::Database, None)),
+        "redis" => {
+            if !cfg!(feature = "redis") {
+                return Err(
+                    "HFS_AUTH_JWKS_COORDINATION=redis requires an hfs binary built with the \
+                     'redis' feature. Rebuild with --features redis, or use database."
+                        .to_string(),
+                );
+            }
+            if redis_url.is_none_or(str::is_empty) {
+                return Err(
+                    "HFS_AUTH_JWKS_COORDINATION=redis requires HFS_AUTH_REDIS_URL to be set."
+                        .to_string(),
+                );
+            }
+            Ok((JwksCoordinationMode::Redis, None))
+        }
+        other => Err(format!(
+            "Unknown HFS_AUTH_JWKS_COORDINATION value '{other}'. \
+             Use local, database, or redis."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +354,69 @@ mod tests {
         };
         let errors = validate_cluster_config(&view).unwrap_err();
         assert_eq!(errors.len(), 7);
+    }
+
+    /// The C2 resolution table (warn-only by design — contrast with the
+    /// refusal rows above).
+    #[test]
+    fn jwks_coordination_resolution_table() {
+        use JwksCoordinationMode::*;
+
+        // Unset follows the cluster switch.
+        assert_eq!(
+            resolve_jwks_coordination("", false, None),
+            Ok((Local, None))
+        );
+        assert_eq!(
+            resolve_jwks_coordination("", true, None),
+            Ok((Database, None))
+        );
+
+        // Explicit local: allowed everywhere; warned (not refused) under
+        // cluster.
+        assert_eq!(
+            resolve_jwks_coordination("local", false, None),
+            Ok((Local, None))
+        );
+        let (mode, warning) = resolve_jwks_coordination("local", true, None).unwrap();
+        assert_eq!(mode, Local);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("HFS_AUTH_JWKS_COORDINATION")),
+            "the warning must name the variable"
+        );
+
+        // Explicit database: fine with or without the cluster switch.
+        assert_eq!(
+            resolve_jwks_coordination("database", false, None),
+            Ok((Database, None))
+        );
+        assert_eq!(
+            resolve_jwks_coordination("database", true, None),
+            Ok((Database, None))
+        );
+
+        // Redis needs the feature and a URL; both errors name the variable.
+        let no_url = resolve_jwks_coordination("redis", true, None).unwrap_err();
+        assert!(no_url.contains("HFS_AUTH_JWKS_COORDINATION"));
+        let empty_url = resolve_jwks_coordination("redis", true, Some("")).unwrap_err();
+        assert!(empty_url.contains("HFS_AUTH_JWKS_COORDINATION"));
+        if cfg!(feature = "redis") {
+            assert_eq!(
+                resolve_jwks_coordination("redis", true, Some("redis://localhost:6379")),
+                Ok((Redis, None))
+            );
+        } else {
+            let no_feature =
+                resolve_jwks_coordination("redis", true, Some("redis://localhost:6379"))
+                    .unwrap_err();
+            assert!(no_feature.contains("'redis' feature"));
+        }
+
+        // Unknown values fail fast, naming the variable.
+        let unknown = resolve_jwks_coordination("zookeeper", true, None).unwrap_err();
+        assert!(unknown.contains("HFS_AUTH_JWKS_COORDINATION"));
     }
 
     #[test]
