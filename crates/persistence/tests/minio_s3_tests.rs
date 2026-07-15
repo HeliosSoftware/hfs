@@ -102,6 +102,7 @@ async fn shared_minio() -> &'static SharedMinio {
             let root_password = std::env::var("MINIO_ROOT_PASSWORD")
                 .unwrap_or_else(|_| DEFAULT_MINIO_ROOT_PASSWORD.to_string());
 
+            let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
             let container = GenericImage::new(image, tag)
                 .with_wait_for(WaitFor::message_on_stderr("API:"))
                 .with_exposed_port(9000.tcp())
@@ -110,6 +111,7 @@ async fn shared_minio() -> &'static SharedMinio {
                 .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
                 .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
                 .with_cmd(["server", "/data", "--console-address", ":9001"])
+                .with_label("github.run_id", &run_id)
                 .start()
                 .await
                 .expect("failed to start MinIO container");

@@ -12,7 +12,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn app() -> Router {
-    helios_ui::mount(Router::new(), "9.9.9")
+    helios_ui::mount(Router::new(), "9.9.9", None)
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -31,6 +31,26 @@ async fn index_serves_the_full_landing_page() {
     let html = body_text(response).await;
     assert!(html.contains("<!doctype html>"));
     assert!(html.contains("9.9.9"));
+}
+
+#[tokio::test]
+async fn page_wires_the_collapsible_nav() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    // The first-paint script is loaded (non-deferred, in <head>).
+    assert!(html.contains(r#"src="/ui/assets/nav.js""#));
+    // The toggle is a real, accessible button controlling the sidebar.
+    assert!(html.contains("data-toggle-nav"));
+    assert!(html.contains(r#"aria-controls="sidebar""#));
+    assert!(html.contains("aria-expanded"));
+    // Labels are wrapped so the collapsed rail can hide them (a11y-safe).
+    assert!(html.contains("nav-item__label"));
+    // The sidebar is addressable by the toggle's aria-controls.
+    assert!(html.contains(r#"id="sidebar""#));
 }
 
 #[tokio::test]
@@ -94,7 +114,7 @@ async fn embedded_assets_are_served() {
 async fn non_ui_paths_fall_through_to_the_fhir_app() {
     // Stand-in for the FHIR REST router: proves /ui never shadows it.
     let fhir_app = Router::new().route("/Patient", get(|| async { "fhir handled" }));
-    let response = helios_ui::mount(fhir_app, "9.9.9")
+    let response = helios_ui::mount(fhir_app, "9.9.9", None)
         .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
         .await
         .unwrap();
