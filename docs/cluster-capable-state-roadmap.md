@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-16 (**Phase 4 implemented locally** — D1/C3/E1 landed, not yet committed; E1 nightly kill-9 outstanding — see below)
+**Last updated:** 2026-07-16 (**Phase 4 COMPLETE** — gate met, full CI + cluster-smoke green; E1 nightly kill-9 outstanding — see below)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -163,18 +163,42 @@ will keep poisoning whatever runs it picks up.
 
 ---
 
-### 🟡 In progress — Phase 4: HTS coherency (C3) + bootstrap lock (D1) + composite outbox (E1) (2026-07-16)
+### ✅ Done — Phase 4: HTS coherency (C3) + bootstrap lock (D1) + composite outbox (E1) (2026-07-16)
 
-**Not yet committed** — implemented and verified locally (fmt/CI-style
-clippy clean, all new + pre-existing test suites green, `cargo build
---features postgres` clean across the default workspace); commit hashes and
-CI run links to be filled in once pushed.
-
-| What | Where | Status |
+| What | Where | Commit |
 |------|-------|--------|
-| **D1 — HTS bootstrap advisory lock**: `bootstrap_sync_postgres` wraps the whole directory-sync call in `schema::with_bootstrap_lock` (new dedicated key `HTS_BOOTSTRAP_LOCK` = "HTS_BOOT", distinct from schema-DDL's "HTS_SCHM"), unconditional — no `HFS_CLUSTER` gating (HTS reads no such flag). Per-file ledger check runs inside the lock, so a loser naturally skips what the winner already imported — no separate re-check needed. T2: `postgres_bootstrap_lock.rs`, a read-sleep-write race proving the lock serializes two independently constructed handles (verified red-without-fix / green-with-fix). | `crates/hts/src/main.rs`, `crates/hts/src/backends/postgres/schema.rs`, `crates/hts/tests/postgres_bootstrap_lock.rs` | Implemented, tested locally |
-| **C3 — HTS terminology cache epoch**: new `terminology_epoch` single-row table (idempotent DDL in HTS's monolithic `SCHEMA` const, no versioned migration needed) + `EpochGuard` (`crates/hts/src/backends/postgres/epoch.rs`) shared between the `AppState`-layer handler caches and the `PostgresTerminologyBackend`-layer response caches, each independently tracking its own last-cleared epoch against one shared memoized fetch. Bump sits alongside the existing `clear_response_caches()` calls in `import_parsed`/`delete_normalized`. **Standalone HTS opt-in** (user decision this session): `HTS_TERMINOLOGY_CACHE_INVALIDATION = local \| epoch`, no `HFS_CLUSTER` coupling. T1: `EpochGuard` unit tests. T2: `postgres_epoch_cluster.rs` — two independent `AppState`/backend pairs over HTTP prove a pre-warmed stale lookup on B is invalidated by an update via A (both cache layers), plus the `local`-mode unsafe-contract negative. T3: new smoke stage — two `hts` processes sharing the `hfs` instances' Postgres, `run_external_hts_cluster_smoke.sh`, verified locally end-to-end against real `hts` processes (dry run, not yet dispatched in CI). | `crates/hts/src/{main.rs,config.rs,state.rs,backends/postgres/{mod.rs,epoch.rs,schema.rs,code_system.rs,concept_map.rs,value_set.rs},operations/{expand.rs,lookup.rs,validate_code.rs}}`, `crates/hts/tests/postgres_epoch_cluster.rs`, `.github/workflows/cluster-smoke.yml`, `crates/hfs/tests/cluster/run_external_hts_cluster_smoke.sh` | Implemented, tested locally (incl. a real two-process dry run against a local Postgres) |
-| **E1 — composite sync durable outbox**: new `CompositeSyncOutbox` trait (`crates/persistence/src/core/composite_sync_outbox.rs`, mirrors `SubscriptionDeliveryOutbox`'s shape) + Postgres impl (`backends/postgres/composite_sync_outbox.rs`, claim query cloned from `subscription_outbox.rs`) on migration **v18**; denormalized to **one row per `(event, backend_id)` pair**, `Create`/`Update`/`Delete` only — `SyncEvent::BulkSync` stays on the pre-existing in-memory channel. **Capability-based wiring, not `HFS_CLUSTER`-gated**: `CompositeStorage::new` wires the outbox unconditionally whenever the primary backend is Postgres (same reasoning as F5's unconditional fix) — no new env var, no `hfs`/`main.rs` changes needed. `SyncManager` gained `run_next_composite_sync`/`spawn_composite_sync_workers`, a local `tokio::sync::Notify` same-process wake hint (no cross-instance fan-out — reasoned not to be needed, see design doc §5 E1 amendment), and a retry/backoff schedule mirroring `sync_event_to_backend`'s existing math. `crates/hfs/src/cluster.rs` gained **warn-only** `resolve_composite_sync_durability` (a composite secondary on a non-Postgres primary under `HFS_CLUSTER` keeps today's in-memory fallback — not a refusal, contrast with subscriptions). T1: state-machine tests against `InMemorySyncOutbox`. T2: `composite_sync_cluster_suite` in `postgres_tests.rs` — exclusivity, fencing+durability (reclaim after death), retry-schedule+isolation, and an end-to-end `CompositeStorage` wiring test (two independent composites, a genuinely separate throwaway "secondary" database so applies don't collide with the primary's own row) proving a write via A durably enqueues with no worker running on A, and B's `run_next_composite_sync` claims and applies it. | `crates/persistence/src/core/composite_sync_outbox.rs` (new), `crates/persistence/src/backends/postgres/composite_sync_outbox.rs` (new), `crates/persistence/src/backends/postgres/schema.rs` (v18), `crates/persistence/src/{core/storage.rs,composite/{storage.rs,sync.rs}}`, `crates/hfs/src/{cluster.rs,main.rs}`, `crates/persistence/tests/postgres_tests.rs` | Implemented, tested locally |
+| **D1 — HTS bootstrap advisory lock**: `bootstrap_sync_postgres` wraps the whole directory-sync call in `schema::with_bootstrap_lock` (new dedicated key `HTS_BOOTSTRAP_LOCK` = "HTS_BOOT", distinct from schema-DDL's "HTS_SCHM"), unconditional — no `HFS_CLUSTER` gating (HTS reads no such flag). Per-file ledger check runs inside the lock, so a loser naturally skips what the winner already imported — no separate re-check needed. T2: `postgres_bootstrap_lock.rs`, a read-sleep-write race proving the lock serializes two independently constructed handles (verified red-without-fix / green-with-fix). | `crates/hts/src/main.rs`, `crates/hts/src/backends/postgres/schema.rs`, `crates/hts/tests/postgres_bootstrap_lock.rs` | `c76d0833` |
+| **C3 — HTS terminology cache epoch**: new `terminology_epoch` single-row table (idempotent DDL in HTS's monolithic `SCHEMA` const, no versioned migration needed) + `EpochGuard` (`crates/hts/src/backends/postgres/epoch.rs`) shared between the `AppState`-layer handler caches and the `PostgresTerminologyBackend`-layer response caches, each independently tracking its own last-cleared epoch against one shared memoized fetch. Bump sits alongside the existing `clear_response_caches()` calls in `import_parsed`/`delete_normalized`. **Standalone HTS opt-in** (user decision this session): `HTS_TERMINOLOGY_CACHE_INVALIDATION = local \| epoch`, no `HFS_CLUSTER` coupling. T1: `EpochGuard` unit tests. T2: `postgres_epoch_cluster.rs` — two independent `AppState`/backend pairs over HTTP prove a pre-warmed stale lookup on B is invalidated by an update via A (both cache layers), plus the `local`-mode unsafe-contract negative. | `crates/hts/src/{main.rs,config.rs,state.rs,backends/postgres/{mod.rs,epoch.rs,schema.rs,code_system.rs,concept_map.rs,value_set.rs},operations/{expand.rs,lookup.rs,validate_code.rs}}`, `crates/hts/tests/postgres_epoch_cluster.rs` | `9c78e24c` |
+| **C3 T3 smoke check**: two `hts` processes sharing the `hfs` instances' Postgres, `run_external_hts_cluster_smoke.sh` — import via A, pre-warm B's caches with the stale display, update via A, assert B self-corrects (not just a cold read, which would pass even without C3). | `.github/workflows/cluster-smoke.yml`, `crates/hfs/tests/cluster/run_external_hts_cluster_smoke.sh` | `ab6fd0a1` |
+| **E1 — composite sync durable outbox**: new `CompositeSyncOutbox` trait (`crates/persistence/src/core/composite_sync_outbox.rs`, mirrors `SubscriptionDeliveryOutbox`'s shape) + Postgres impl (`backends/postgres/composite_sync_outbox.rs`, claim query cloned from `subscription_outbox.rs`) on migration **v18**; denormalized to **one row per `(event, backend_id)` pair**, `Create`/`Update`/`Delete` only — `SyncEvent::BulkSync` stays on the pre-existing in-memory channel. **Capability-based wiring, not `HFS_CLUSTER`-gated**: `CompositeStorage::new` wires the outbox unconditionally whenever the primary backend is Postgres (same reasoning as F5's unconditional fix) — no new env var, no `hfs`/`main.rs` changes needed for activation. `SyncManager` gained `run_next_composite_sync`/`spawn_composite_sync_workers`, a local `tokio::sync::Notify` same-process wake hint (no cross-instance fan-out — reasoned not to be needed, see design doc §5 E1 amendment), and a retry/backoff schedule mirroring `sync_event_to_backend`'s existing math. T1: state-machine tests against `InMemorySyncOutbox`. T2: `composite_sync_cluster_suite` in `postgres_tests.rs` — exclusivity, fencing+durability (reclaim after death), retry-schedule+isolation, and an end-to-end `CompositeStorage` wiring test (two independent composites, a genuinely separate throwaway "secondary" database so applies don't collide with the primary's own row) proving a write via A durably enqueues with no worker running on A, and B's `run_next_composite_sync` claims and applies it. | `crates/persistence/src/core/composite_sync_outbox.rs` (new), `crates/persistence/src/backends/postgres/composite_sync_outbox.rs` (new), `crates/persistence/src/backends/postgres/schema.rs` (v18), `crates/persistence/src/{core/storage.rs,composite/{storage.rs,sync.rs}}`, `crates/persistence/tests/postgres_tests.rs` | `6c322303` |
+| **E1 warn-only validator**: `resolve_composite_sync_durability` (mirroring the warn-only `resolve_jwks_coordination`) — a composite secondary on a non-Postgres primary under `HFS_CLUSTER` keeps today's in-memory fallback and only logs a warning, not a refusal, contrast with subscriptions' hard refusal. | `crates/hfs/src/{cluster.rs,main.rs}` | `e7f16735` |
+| Docs: ch15 matrix flipped, C3/E1 operator sections added; design doc `[amended 2026-07-16]` markers on §5 C3/D1/E1 + the `HFS_TERMINOLOGY_CACHE_INVALIDATION`→`HTS_TERMINOLOGY_CACHE_INVALIDATION` §6 correction; roadmap Phase 4 table. | `docs/cluster-*.md`, `book/src/ch15-cluster-deployment.md` | `f99eeec0` |
+
+**Phase 4 gate (strategy §8): MET 2026-07-16.** T3 **cluster-smoke green on
+first dispatch**
+([run 29510624382](https://github.com/HeliosSoftware/hfs/actions/runs/29510624382)
+— all checks incl. the new HTS C3 stage: health, warm-then-stale-then-fresh
+lookup across two independent `hts` processes); full CI green on the Phase 4
+head `864b8cad`
+([run 29511136310](https://github.com/HeliosSoftware/hfs/actions/runs/29511136310)
+— Test Rust incl. all new D1/C3/E1 T2 suites, Linting, Security Audit, Code
+Coverage, Test Python, Test FHIRPath); Redis Cluster Tests green on the same
+head. Locally the same suites were green first (1 D1 + 2 C3 + 9 E1 T2 tests,
+the full pre-existing `helios-hts` 652 lib + 49+34 postgres integration and
+`helios-persistence` 763 lib + 149 postgres_tests suites unedited and green,
+run 3× to check for flakiness), plus a real two-process dry run of the C3
+smoke script against a local Postgres before it ever touched CI.
+**Infra note:** `Test Rust` failed twice on **github-agent5** (machine
+`Stevens-Mini`) with a macOS dyld shared-cache mapping failure
+(`SystemConfiguration.framework` failed to load, `SIGABRT`) — zero test
+assertions failed either time; purely an OS-level runner fault (same runner
+flagged for a disk-space issue during the Phase 3 push). Green on a later
+retry once the runner recovered. **Gotcha (new): `[skip ci]` isn't scoped to
+just the tip commit** — pushing a batch of commits where an EARLIER commit
+in that batch carries `[skip ci]` suppresses `pull_request` CI for the whole
+push, even when the tip commit's own message is clean. The Phase 0-3 fix
+(one clean trailing commit) only works when that commit is pushed **on its
+own**, not bundled with the skip-tagged commit in the same push.
 
 **Not done — deliberately deferred, tracked separately:** the T3 nightly
 kill-9 case for E1 (methodology §6/§7, mirroring A1's — needs an
@@ -182,14 +206,7 @@ Elasticsearch container added to `cluster-smoke.yml`, which doesn't have one
 today; a substantially larger CI addition than C3's smoke stage, which
 reused the existing Postgres container). Not required for the Phase 4 gate
 proper (the strategy's own gate criteria list it as a nightly-tier addendum,
-not a blocker), but the design doc's Phase 4 amendment flags it as
-outstanding.
-
-**Local verification detail (2026-07-16):**
-- `cargo fmt --all` clean; CI-style `cargo clippy --all-targets --all-features -- -D warnings <allow-list>` clean on `helios-hts`, `helios-persistence`, and `helios-hfs` (the last checked with `--all-features`, matching CI's actual invocation, after a narrower manual feature combination surfaced two pre-existing, unrelated dead-code lints that disappear under the real CI flag set).
-- `cargo build --features postgres` clean across the full default workspace (pysof, which is excluded from default members, has a pre-existing unrelated PyO3 linker failure when force-included via `--workspace`).
-- All new T1/T2 suites green, plus the full pre-existing `helios-hts` (652 lib + 49 + 34 + existing postgres integration tests) and `helios-persistence` (763 lib + 149 postgres_tests, run 3× to check for flakiness) suites green — zero regressions.
-- The C3 smoke script (`run_external_hts_cluster_smoke.sh`) was dry-run end-to-end against two real `hts` processes sharing a local Postgres container (not through the actual GitHub Actions workflow) — confirmed the ~1s production epoch memo window needed a poll loop, not an instant assertion, and the fixed script passed cleanly on rerun.
+not a blocker) — now the active work item.
 
 ---
 
@@ -238,7 +255,7 @@ var for E1 at all.
   topic registry in both modes, WS-bundle store table
   (`subscription_notification_events`) so envelopes stay tiny.
 
-### Phase 4 — HTS coherency (C3) + bootstrap lock (D1) + composite outbox (E1) — 🟡 implemented locally 2026-07-16, not yet committed (see the table above)
+### Phase 4 — HTS coherency (C3) + bootstrap lock (D1) + composite outbox (E1) — ✅ COMPLETE 2026-07-16 (see the table above)
 
 - C3: one-row `terminology_epoch` table; every terminology write bumps it; an `EpochGuard` (memoized ~1s, 0 in tests) checks before serving from cache and calls the two existing clear seams (`hts/src/state.rs:280`, `backends/postgres/mod.rs:172`, incl. the `OnceLock` closure statics — turned out already covered, no separate handling needed). `HTS_TERMINOLOGY_CACHE_INVALIDATION = local | epoch`, standalone to the `hts` binary (not `HFS_*`, not `HFS_CLUSTER`-gated — session decision).
 - D1: `pg_advisory_lock` around `bootstrap_sync` (dedicated key `HTS_BOOTSTRAP_LOCK` = "HTS_BOOT"), the per-file ledger check runs inside the lock so no separate re-check step was needed, unconditional (no gating).
