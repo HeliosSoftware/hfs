@@ -604,6 +604,19 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the durable composite secondary-backend sync outbox (see
+    /// [`crate::core::composite_sync_outbox`]), if this backend can back
+    /// one.
+    ///
+    /// The default implementation returns `None`, which keeps
+    /// `composite::sync::SyncManager`'s async mode on its pre-existing
+    /// in-memory-channel path (best-effort, not crash-durable).
+    fn composite_sync_outbox(
+        &self,
+    ) -> Option<Arc<dyn crate::core::composite_sync_outbox::CompositeSyncOutbox>> {
+        None
+    }
+
     /// Returns the shared WebSocket binding-token store (see
     /// [`crate::core::ws_binding_tokens`]), if this backend can back one.
     ///

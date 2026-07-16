@@ -6088,4 +6088,326 @@ mod postgres_integration {
             );
         }
     }
+
+    // ========================================================================
+    // Phase 4 (E1): durable composite secondary-backend sync outbox T2 suite.
+    //
+    // Same two-fresh-handles-over-one-shared-store contract as the other
+    // cluster suites. `claim_next` is cross-tenant, so the exclusivity/
+    // fencing/retry tests take COMPOSITE_SYNC_OUTBOX_TEST_LOCK.
+    // ========================================================================
+    mod composite_sync_cluster_suite {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        use helios_fhir::FhirVersion;
+        use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+        use helios_persistence::composite::{CompositeConfig, CompositeStorage, SyncMode};
+        use helios_persistence::core::composite_sync_outbox::{
+            CompositeSyncOutbox, NewSyncOutboxEntry, SyncLeaseError, SyncOperation,
+            SyncOutboxState, WorkerId,
+        };
+        use helios_persistence::core::{BackendKind, ResourceStorage};
+        use serde_json::json;
+        use tokio::sync::Mutex;
+
+        use super::{create_backend, create_tenant, shared_pg};
+        use crate::cluster_harness as harness;
+
+        static COMPOSITE_SYNC_OUTBOX_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+        fn outbox_of(backend: &PostgresBackend) -> Arc<dyn CompositeSyncOutbox> {
+            backend
+                .composite_sync_outbox()
+                .expect("postgres backs a composite sync outbox")
+        }
+
+        fn entry(backend_id: &str, resource_id: &str) -> NewSyncOutboxEntry {
+            NewSyncOutboxEntry {
+                backend_id: backend_id.to_string(),
+                operation: SyncOperation::Create,
+                resource_type: "Patient".to_string(),
+                resource_id: resource_id.to_string(),
+                content: Some(json!({"resourceType": "Patient", "id": resource_id})),
+                version: None,
+                tenant_id: "t1".to_string(),
+                fhir_version: Some("R4".to_string()),
+            }
+        }
+
+        /// DoD row: exclusivity — two instances race `claim_next` on one
+        /// queued entry and exactly one wins.
+        #[tokio::test]
+        async fn postgres_integration_cluster_composite_sync_claim_exclusive_across_handles() {
+            let _guard = COMPOSITE_SYNC_OUTBOX_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("composite-sync-claim");
+
+            outbox_of(&handles.a)
+                .enqueue(&tenant, entry("es", "p1"))
+                .await
+                .unwrap();
+
+            let worker_a = WorkerId::new(format!("csync-a-{}", uuid::Uuid::new_v4()));
+            let worker_b = WorkerId::new(format!("csync-b-{}", uuid::Uuid::new_v4()));
+            let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+            let (claim_a, claim_b) = harness::race2(
+                async move {
+                    a.claim_next(&worker_a, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+                async move {
+                    b.claim_next(&worker_b, StdDuration::from_secs(60))
+                        .await
+                        .unwrap()
+                },
+            )
+            .await;
+
+            harness::assert_exactly_one(&claim_a, &claim_b, "the claim on one queued entry");
+            let winner = claim_a.or(claim_b).unwrap();
+            assert_eq!(winner.backend_id, "es");
+            assert_eq!(winner.resource_id, "p1");
+            assert_eq!(winner.attempts, 1, "the claim is the first attempt");
+            assert_eq!(
+                winner.lease.tenant.tenant_id().as_str(),
+                tenant.tenant_id().as_str(),
+                "the lease carries the enqueueing tenant"
+            );
+
+            // Leave nothing claimable for the next test.
+            outbox_of(&handles.b).complete(&winner.lease).await.unwrap();
+        }
+
+        /// DoD rows: durability + fencing — an entry claimed by a worker
+        /// whose lease expires (and whose handle is dropped) is reclaimed by
+        /// a fresh instance under a bumped fencing token; the zombie's
+        /// terminal write is refused. Deterministic: the "expiry" is a
+        /// zero-length lease, no sleeps.
+        #[tokio::test]
+        async fn postgres_integration_cluster_composite_sync_reclaimed_after_worker_death() {
+            let _guard = COMPOSITE_SYNC_OUTBOX_TEST_LOCK.lock().await;
+            let tenant = create_tenant("composite-sync-durable");
+
+            let stale = {
+                let dying = create_backend().await;
+                let outbox = outbox_of(&dying);
+                outbox.enqueue(&tenant, entry("es", "p1")).await.unwrap();
+                let worker = WorkerId::new(format!("csync-dying-{}", uuid::Uuid::new_v4()));
+                outbox
+                    .claim_next(&worker, StdDuration::ZERO)
+                    .await
+                    .unwrap()
+                    .expect("the enqueued entry is claimable")
+            }; // the claiming handle is dropped mid-apply
+
+            let fresh = create_backend().await;
+            let outbox = outbox_of(&fresh);
+            let worker = WorkerId::new(format!("csync-fresh-{}", uuid::Uuid::new_v4()));
+            let reclaimed = outbox
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("the expired-lease entry must be reclaimable");
+            assert_eq!(reclaimed.lease.id, stale.lease.id);
+            assert_eq!(reclaimed.attempts, 2, "the reclaim is a new attempt");
+            assert!(reclaimed.lease.fencing_token > stale.lease.fencing_token);
+
+            // The dead worker's lease is fenced out of every terminal write.
+            assert!(matches!(
+                outbox.complete(&stale.lease).await,
+                Err(SyncLeaseError::LeaseLost { .. })
+            ));
+            assert!(matches!(
+                outbox.fail(&stale.lease, "zombie").await,
+                Err(SyncLeaseError::LeaseLost { .. })
+            ));
+
+            outbox.complete(&reclaimed.lease).await.unwrap();
+            let record = outbox
+                .get(&tenant, reclaimed.lease.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, SyncOutboxState::Applied);
+        }
+
+        /// DoD rows: retry scheduling + isolation — a retryable failure
+        /// re-queues with a future due time (on the DB's schedule column,
+        /// not claimable until then), and another tenant cannot read the
+        /// row.
+        #[tokio::test]
+        async fn postgres_integration_cluster_composite_sync_retry_schedule_and_isolation() {
+            let _guard = COMPOSITE_SYNC_OUTBOX_TEST_LOCK.lock().await;
+            let handles = harness::two_handles(create_backend).await;
+            let tenant = create_tenant("composite-sync-retry");
+            let (a, b) = (outbox_of(&handles.a), outbox_of(&handles.b));
+
+            let id = a.enqueue(&tenant, entry("es", "p1")).await.unwrap();
+            let worker = WorkerId::new(format!("csync-retry-{}", uuid::Uuid::new_v4()));
+            let claimed = a
+                .claim_next(&worker, StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(3600);
+            a.release_for_retry(&claimed.lease, next_attempt, "connection refused")
+                .await
+                .unwrap();
+
+            let record = harness::assert_visible(
+                b.get(&tenant, id).await.unwrap(),
+                "outbox row released via instance A",
+            );
+            assert_eq!(record.state, SyncOutboxState::Queued);
+            assert_eq!(record.attempts, 1);
+            assert_eq!(record.last_error.as_deref(), Some("connection refused"));
+
+            let early_worker = WorkerId::new(format!("csync-early-{}", uuid::Uuid::new_v4()));
+            assert!(
+                b.claim_next(&early_worker, StdDuration::from_secs(60))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a future next_attempt_at must not be claimable"
+            );
+
+            let other_tenant = create_tenant("composite-sync-retry-other");
+            harness::assert_wrong_tenant_hidden(
+                b.get(&other_tenant, id).await.unwrap(),
+                "outbox row",
+            );
+            // The row stays queued an hour out — invisible to every other
+            // outbox test in this binary's lifetime, no drain needed.
+        }
+
+        /// End-to-end wiring: two independently constructed `CompositeStorage`
+        /// handles (Postgres primary + a genuinely separate "secondary"
+        /// database standing in for Elasticsearch, so applying a create
+        /// doesn't collide with the primary's own row) prove
+        /// `sync_asynchronous` actually durably enqueues — a write via A
+        /// survives without A ever running a worker — and a fresh handle's
+        /// `run_next_composite_sync` (B) claims and applies it to its own
+        /// secondary connection.
+        #[tokio::test]
+        async fn postgres_integration_cluster_composite_storage_durably_syncs_across_handles() {
+            // CompositeStorage::new() wires the outbox unconditionally
+            // (E1), so even without start_sync_workers() this test's
+            // enqueue lands in the same cross-tenant-claimable table the
+            // other tests in this suite race on.
+            let _guard = COMPOSITE_SYNC_OUTBOX_TEST_LOCK.lock().await;
+            let pg = shared_pg().await;
+            let dbname = format!("composite_sync_secondary_{}", uuid::Uuid::new_v4().simple());
+            let admin_conn = format!(
+                "host={} port={} user=postgres password=postgres dbname=postgres",
+                pg.host, pg.port,
+            );
+            let (admin, connection) = tokio_postgres::connect(&admin_conn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to shared pg");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            admin
+                .execute(format!("CREATE DATABASE {}", dbname).as_str(), &[])
+                .await
+                .expect("create secondary database");
+
+            let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("data"))
+                .unwrap_or_else(|| PathBuf::from("data"));
+
+            async fn secondary_backend(
+                pg_host: &str,
+                pg_port: u16,
+                dbname: &str,
+                data_dir: &std::path::Path,
+            ) -> Arc<dyn ResourceStorage + Send + Sync> {
+                let config = PostgresConfig {
+                    host: pg_host.to_string(),
+                    port: pg_port,
+                    dbname: dbname.to_string(),
+                    user: "postgres".to_string(),
+                    password: Some("postgres".to_string()),
+                    max_connections: 2,
+                    data_dir: Some(data_dir.to_path_buf()),
+                    ..Default::default()
+                };
+                let backend = PostgresBackend::new(config)
+                    .await
+                    .expect("secondary backend should connect");
+                backend
+                    .init_schema()
+                    .await
+                    .expect("secondary schema should initialize");
+                Arc::new(backend) as Arc<dyn ResourceStorage + Send + Sync>
+            }
+
+            let build_composite = || async {
+                let mut backends = std::collections::HashMap::new();
+                backends.insert(
+                    "primary".to_string(),
+                    Arc::new(create_backend().await) as Arc<dyn ResourceStorage + Send + Sync>,
+                );
+                backends.insert(
+                    "es".to_string(),
+                    secondary_backend(&pg.host, pg.port, &dbname, &data_dir).await,
+                );
+                let config = CompositeConfig::builder()
+                    .primary("primary", BackendKind::Postgres)
+                    .search_backend("es", BackendKind::Elasticsearch)
+                    .sync_mode(SyncMode::Asynchronous)
+                    .build()
+                    .unwrap();
+                CompositeStorage::new(config, backends).unwrap()
+            };
+
+            // Handle A: enqueue only, no worker started — proves durability
+            // does not depend on the writer's own instance running a worker.
+            let composite_a = build_composite().await;
+            let tenant = create_tenant("composite-storage-e2e");
+            composite_a
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "sync-e2e-1"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            // Handle B: a fresh instance drains the row A enqueued.
+            let composite_b = build_composite().await;
+            let worker_id = WorkerId::new(format!("csync-e2e-{}", uuid::Uuid::new_v4()));
+            let mut drained = false;
+            for _ in 0..20 {
+                if composite_b
+                    .run_next_composite_sync(&worker_id, StdDuration::from_secs(30))
+                    .await
+                {
+                    drained = true;
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+            assert!(drained, "B's worker cycle must claim the row A enqueued");
+
+            // The secondary now genuinely has the resource — applied by B,
+            // not A.
+            let secondary_check = secondary_backend(&pg.host, pg.port, &dbname, &data_dir).await;
+            let read = secondary_check
+                .read(&tenant, "Patient", "sync-e2e-1")
+                .await
+                .unwrap();
+            assert!(
+                read.is_some(),
+                "the secondary must have the resource after B's worker applied it"
+            );
+        }
+    }
 }

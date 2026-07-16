@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 17;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// Advisory lock key serializing schema initialization across instances
 /// sharing one database (ASCII "HFSSCHEM").
@@ -309,6 +309,7 @@ async fn migrate_schema(
             14 => migrate_v14_to_v15(client).await?,
             15 => migrate_v15_to_v16(client).await?,
             16 => migrate_v16_to_v17(client).await?,
+            17 => migrate_v17_to_v18(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -1061,6 +1062,78 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
         .map_err(|e| {
             pg_error(format!(
                 "Migration v16->v17 (subscription_ws_tokens) failed: {}",
+                e
+            ))
+        })?;
+
+    Ok(())
+}
+
+/// v17 -> v18: durable composite secondary-backend sync outbox (design doc
+/// §Class E, E1).
+///
+/// One table, `composite_sync_outbox`, denormalized to one row per
+/// `(event, backend_id)` pair under the cluster-jobs lease + fencing
+/// discipline plus a retry schedule — the same shape as
+/// `subscription_delivery_outbox` (v17), adapted for a resource-sync
+/// payload instead of a push-notification payload.
+async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "CREATE TABLE IF NOT EXISTS composite_sync_outbox (
+                id              BIGSERIAL PRIMARY KEY,
+                tenant_id       TEXT NOT NULL,
+                backend_id      TEXT NOT NULL,
+                operation       TEXT NOT NULL,
+                resource_type   TEXT NOT NULL,
+                resource_id     TEXT NOT NULL,
+                content         JSONB,
+                version         TEXT,
+                fhir_version    TEXT,
+                attempts        INT NOT NULL DEFAULT 0,
+                next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status          TEXT NOT NULL DEFAULT 'queued',
+                last_error      TEXT,
+                worker_id       TEXT,
+                lease_expiry    TIMESTAMPTZ,
+                fencing_token   BIGINT NOT NULL DEFAULT 0,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at     TIMESTAMPTZ
+            )",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Migration v17->v18 (composite_sync_outbox) failed: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_composite_sync_outbox_claim
+                 ON composite_sync_outbox(status, next_attempt_at, lease_expiry)",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Failed to create idx_composite_sync_outbox_claim: {}",
+                e
+            ))
+        })?;
+
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_composite_sync_outbox_tenant
+                 ON composite_sync_outbox(tenant_id, backend_id)",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            pg_error(format!(
+                "Failed to create idx_composite_sync_outbox_tenant: {}",
                 e
             ))
         })?;

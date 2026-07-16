@@ -293,9 +293,18 @@ impl CompositeStorage {
         let router = QueryRouter::new(config.clone());
         let merger = ResultMerger::new();
 
-        // Create sync manager if we have secondaries
+        // Create sync manager if we have secondaries. Capability-based, not
+        // `HFS_CLUSTER`-gated: wire the durable outbox (E1) unconditionally
+        // whenever the primary backend can back one (a Postgres primary) —
+        // see the module doc on `crate::core::composite_sync_outbox` for why
+        // this is unconditional rather than mirroring the other cluster
+        // seams' higher-layer activation gating.
         let sync_manager = if !secondaries.is_empty() {
-            Some(SyncManager::new(config.sync_config.clone()))
+            let mut manager = SyncManager::new(config.sync_config.clone());
+            if let Some(outbox) = primary.composite_sync_outbox() {
+                manager = manager.with_composite_sync_outbox(outbox);
+            }
+            Some(manager)
         } else {
             None
         };
@@ -358,6 +367,8 @@ impl CompositeStorage {
                 SyncMode::Asynchronous | SyncMode::Hybrid { .. }
             ) {
                 manager.start_async_worker(self.secondaries.clone());
+                // No-op unless a durable outbox was wired in `new()` (E1).
+                manager.spawn_composite_sync_workers(self.secondaries.clone(), 1);
             }
         }
         self
@@ -466,6 +477,23 @@ impl CompositeStorage {
             sync_manager.sync(&event, &self.secondaries).await?;
         }
         Ok(())
+    }
+
+    /// One deterministic composite-sync outbox worker cycle (E1) — the test
+    /// seam for driving the durable outbox without spawning a poller.
+    /// Returns `false` when no outbox is wired (no secondaries, or a
+    /// non-Postgres primary) or nothing is currently claimable.
+    pub async fn run_next_composite_sync(
+        &self,
+        worker_id: &crate::core::composite_sync_outbox::WorkerId,
+        lease_duration: std::time::Duration,
+    ) -> bool {
+        let Some(ref sync_manager) = self.sync_manager else {
+            return false;
+        };
+        sync_manager
+            .run_next_composite_sync(worker_id, lease_duration, &self.secondaries)
+            .await
     }
 
     /// Routes and executes a search query.
@@ -792,6 +820,12 @@ impl ResourceStorage for CompositeStorage {
         &self,
     ) -> Option<Arc<dyn crate::core::subscription_delivery::SubscriptionDeliveryOutbox>> {
         self.primary.subscription_delivery_outbox()
+    }
+
+    fn composite_sync_outbox(
+        &self,
+    ) -> Option<Arc<dyn crate::core::composite_sync_outbox::CompositeSyncOutbox>> {
+        self.primary.composite_sync_outbox()
     }
 
     fn ws_binding_token_store(
@@ -3038,6 +3072,14 @@ mod tests {
                 crate::core::event_fanout::testing::InMemoryEventFanout::default(),
             ))
         }
+
+        fn composite_sync_outbox(
+            &self,
+        ) -> Option<Arc<dyn crate::core::composite_sync_outbox::CompositeSyncOutbox>> {
+            Some(Arc::new(
+                crate::core::composite_sync_outbox::testing::InMemorySyncOutbox::new(),
+            ))
+        }
     }
 
     /// Every cluster seam forwards to the primary: a composite over a
@@ -3065,6 +3107,7 @@ mod tests {
         assert!(composite.subscription_delivery_outbox().is_some());
         assert!(composite.ws_binding_token_store().is_some());
         assert!(composite.subscription_fanout().is_some());
+        assert!(composite.composite_sync_outbox().is_some());
 
         let plain = make_composite_no_secondary();
         assert!(plain.cluster_job_store().is_none());
@@ -3074,6 +3117,7 @@ mod tests {
         assert!(plain.subscription_delivery_outbox().is_none());
         assert!(plain.ws_binding_token_store().is_none());
         assert!(plain.subscription_fanout().is_none());
+        assert!(plain.composite_sync_outbox().is_none());
     }
 
     // ── PurgableStorage fan-out ────────────────────────────────────

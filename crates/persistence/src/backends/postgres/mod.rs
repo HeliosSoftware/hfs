@@ -77,6 +77,7 @@ mod bulk_export;
 mod bulk_submit;
 mod cluster_jobs;
 mod cluster_refresh_cache;
+mod composite_sync_outbox;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;

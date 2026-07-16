@@ -99,6 +99,7 @@ pub mod bulk_submit_worker;
 pub mod capabilities;
 pub mod cluster_job_store;
 pub mod cluster_refresh_cache;
+pub mod composite_sync_outbox;
 pub mod event_fanout;
 pub mod history;
 pub mod search;

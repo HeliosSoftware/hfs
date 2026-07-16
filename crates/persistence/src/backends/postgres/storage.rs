@@ -116,6 +116,13 @@ impl ResourceStorage for PostgresBackend {
         )))
     }
 
+    fn composite_sync_outbox(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::core::composite_sync_outbox::CompositeSyncOutbox>> {
+        use super::composite_sync_outbox::PgCompositeSyncOutbox;
+        Some(std::sync::Arc::new(PgCompositeSyncOutbox::new(self.pool())))
+    }
+
     fn ws_binding_token_store(
         &self,
     ) -> Option<std::sync::Arc<dyn crate::core::ws_binding_tokens::WsBindingTokenStore>> {
