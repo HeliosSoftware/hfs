@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-16 (**Phase 4 COMPLETE** — gate met, full CI + cluster-smoke green; E1 nightly kill-9 case implemented and dry-run verified, pending its first real dispatch — see below)
+**Last updated:** 2026-07-16 (**Phase 4 COMPLETE** — gate met, full CI + cluster-smoke green; E1 nightly kill-9 case implemented, dry-run verified, and now dispatched green against real CI — see below)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -216,14 +216,18 @@ through B that Elasticsearch genuinely has every row — not just that the
 outbox says so. **Passed on first local dry run** (500-row override against
 real local Postgres + Elasticsearch containers: 459 rows still
 queued/applying when the kill landed, 1 genuinely orphaned mid-`applying`
-under A's lease, full recovery and convergence after restart). | workflow +
-`run_nightly_e1_kill9_check.sh` | *pending commit* |
+under A's lease, full recovery and convergence after restart). **Passed on
+first real CI dispatch** (`-f nightly=true`, default `SEED_ROWS=2000`): the
+"Nightly kill-9 recovery check (E1)" step completed in 71s with no failed
+rows, and the whole run finished green end to end
+([run 29524686368](https://github.com/HeliosSoftware/hfs/actions/runs/29524686368)).
+| workflow + `run_nightly_e1_kill9_check.sh` | `99037703` |
 
 **Not required for the Phase 4 gate proper** (the strategy's own gate
 criteria list the nightly tier as an addendum, not a blocker) — implemented
-as a fast-follow per the standing decision, not yet dispatched against the
-real CI self-hosted runners (needs `-f nightly=true` since scheduled runs
-execute `main`'s copy until this branch merges).
+as a fast-follow per the standing decision, and now confirmed green on real
+CI self-hosted runners via `-f nightly=true` (scheduled runs will pick this
+up automatically once this branch merges to `main`).
 
 ---
 
@@ -276,7 +280,7 @@ var for E1 at all.
 
 - C3: one-row `terminology_epoch` table; every terminology write bumps it; an `EpochGuard` (memoized ~1s, 0 in tests) checks before serving from cache and calls the two existing clear seams (`hts/src/state.rs:280`, `backends/postgres/mod.rs:172`, incl. the `OnceLock` closure statics — turned out already covered, no separate handling needed). `HTS_TERMINOLOGY_CACHE_INVALIDATION = local | epoch`, standalone to the `hts` binary (not `HFS_*`, not `HFS_CLUSTER`-gated — session decision).
 - D1: `pg_advisory_lock` around `bootstrap_sync` (dedicated key `HTS_BOOTSTRAP_LOCK` = "HTS_BOOT"), the per-file ledger check runs inside the lock so no separate re-check step was needed, unconditional (no gating).
-- E1: `composite_sync_outbox` on migration **v18** (confirmed: v17 was Phase 3's head); `sync_asynchronous` durably enqueues one row per `(event, backend_id)` when the outbox is wired; a same-process `Notify` is the fast-path wake, not a cross-instance fan-out (reasoned unnecessary — see design doc §5 E1 amendment); workers claim with `FOR UPDATE SKIP LOCKED` + fencing. Wiring is capability-based (automatic on a Postgres primary), not `HFS_CLUSTER`-gated. T3 nightly kill-9 drain case landed (PR 4.4) — a dedicated `postgres-elasticsearch` pair + Elasticsearch container, gated `NIGHTLY`; dry-run verified, real dispatch pending.
+- E1: `composite_sync_outbox` on migration **v18** (confirmed: v17 was Phase 3's head); `sync_asynchronous` durably enqueues one row per `(event, backend_id)` when the outbox is wired; a same-process `Notify` is the fast-path wake, not a cross-instance fan-out (reasoned unnecessary — see design doc §5 E1 amendment); workers claim with `FOR UPDATE SKIP LOCKED` + fencing. Wiring is capability-based (automatic on a Postgres primary), not `HFS_CLUSTER`-gated. T3 nightly kill-9 drain case landed (PR 4.4) — a dedicated `postgres-elasticsearch` pair + Elasticsearch container, gated `NIGHTLY`; dry-run verified, and green on its first real CI dispatch ([run 29524686368](https://github.com/HeliosSoftware/hfs/actions/runs/29524686368)).
 
 ---
 
