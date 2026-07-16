@@ -112,6 +112,23 @@ pub struct HtsConfig {
     /// Changing this re-triggers bootstrap imports of affected files.
     #[arg(long, env = "HTS_IMPORT_LANGUAGES", default_value = "")]
     pub import_languages: String,
+
+    /// Cross-instance terminology response-cache invalidation (C3,
+    /// PostgreSQL only). `local` (the default): every instance clears only
+    /// its own caches on a write it serves directly — a CodeSystem/ValueSet/
+    /// ConceptMap import on one instance leaves the others serving stale
+    /// `$expand`/`$validate-code`/`$lookup`/`$translate`/`$subsumes`
+    /// results. `epoch`: every write bumps a shared `terminology_epoch`
+    /// counter; every instance checks it (memoized, ~1s) before trusting its
+    /// local caches. Standalone to this crate — not coupled to the `hfs`
+    /// binary's `HFS_CLUSTER` switch, since HTS can be scaled independently
+    /// of the FHIR server.
+    #[arg(
+        long,
+        env = "HTS_TERMINOLOGY_CACHE_INVALIDATION",
+        default_value = "local"
+    )]
+    pub terminology_cache_invalidation: String,
 }
 
 impl HtsConfig {
@@ -136,6 +153,7 @@ impl Default for HtsConfig {
             bootstrap_dir: String::new(),
             bootstrap_batch_size: 5000,
             import_languages: String::new(),
+            terminology_cache_invalidation: "local".into(),
         }
     }
 }

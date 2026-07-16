@@ -123,7 +123,21 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     use helios_persistence::backends::postgres::PostgresBackend;
     use std::sync::Arc;
 
-    let backend = PostgresTerminologyBackend::new(&config.database_url).await?;
+    let epoch_enabled = match config.terminology_cache_invalidation.as_str() {
+        "epoch" => true,
+        "local" => false,
+        other => {
+            tracing::warn!(
+                value = other,
+                "Unrecognized HTS_TERMINOLOGY_CACHE_INVALIDATION value; defaulting to 'local'"
+            );
+            false
+        }
+    };
+    let backend = PostgresTerminologyBackend::new(&config.database_url)
+        .await?
+        .with_epoch_guard(epoch_enabled, std::time::Duration::from_secs(1));
+    let epoch_guard = backend.epoch_guard();
 
     bootstrap_sync_postgres(&backend, &config).await?;
 
@@ -149,6 +163,7 @@ async fn run_server_postgres(config: HtsConfig) -> anyhow::Result<()> {
     let state = helios_hts::state::AppState::new(backend.clone())
         .with_resource_store_pg(resource_store)
         .with_terminology_importer(Arc::new(backend))
+        .with_epoch_guard(epoch_guard)
         .with_max_expansion_size(config.max_expansion_size);
 
     let app = helios_hts::server::create_app(&config, state);

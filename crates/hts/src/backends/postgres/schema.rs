@@ -235,6 +235,20 @@ CREATE TABLE IF NOT EXISTS bootstrap_imports (
 -- Bring pre-existing ledgers up to the current shape (idempotent).
 ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS mtime_unix BIGINT;
 ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS languages TEXT NOT NULL DEFAULT '';
+
+-- ── Terminology epoch (C3, cross-instance cache invalidation) ────────────────
+-- Single-row counter bumped by every terminology write (see
+-- backends/postgres/epoch.rs). Read-path choke points compare against their
+-- own last-cleared value to decide whether to clear their local response
+-- caches. Opt-in via HTS_TERMINOLOGY_CACHE_INVALIDATION=epoch; the row exists
+-- unconditionally (cheap, idempotent DDL) so enabling the mode later needs no
+-- separate migration step.
+CREATE TABLE IF NOT EXISTS terminology_epoch (
+    id        INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    epoch     BIGINT NOT NULL DEFAULT 1,
+    bumped_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO terminology_epoch (id, epoch) VALUES (1, 1) ON CONFLICT (id) DO NOTHING;
 ";
 
 /// Advisory lock key guarding bootstrap terminology import

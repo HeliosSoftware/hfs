@@ -188,6 +188,14 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             ));
         }
 
+        // Cross-instance freshness (C3) — before the warm-hit fast path
+        // below. Memoized (default ~1s), so this costs a mutex lock and an
+        // elapsed-time comparison on every request except the rare one that
+        // falls outside the memo window, not a DB round trip per request.
+        self.epoch
+            .check_backend(|| self.clear_response_caches())
+            .await;
+
         // The `max_expansion_size` cap is intended as a guardrail against
         // unbounded materialisation: when the caller has already bounded the
         // request via `count`, SQLite's expand skips the cap (see

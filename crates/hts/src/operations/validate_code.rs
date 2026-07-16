@@ -2201,6 +2201,9 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // Cross-instance freshness (C3) — before any handler-cache read below.
+    state.check_terminology_epoch().await;
+
     // ── Handler-level response cache (CS path) ───────────────────────────────
     // Skips ALL pre-call helpers (resolve_supplements, supplement_url_in_coding_error,
     // CodeSystemOperations::validate_code) when the same canonical params have
@@ -4016,6 +4019,9 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
+    // Cross-instance freshness (C3) — before any handler-cache read below.
+    state.check_terminology_epoch().await;
+
     // ── Handler-level response cache (VS path) ───────────────────────────────
     // The VS validate-code handler is dominated by pre-call helpers that hit
     // the DB even when no work is needed:

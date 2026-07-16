@@ -42,6 +42,11 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
         _ctx: &TenantContext,
         req: TranslateRequest,
     ) -> Result<TranslateResponse, HtsError> {
+        // Cross-instance freshness (C3) — before any cache read.
+        self.epoch
+            .check_backend(|| self.clear_response_caches())
+            .await;
+
         // CM01/CM02 hot-path memo — bench pool entries repeat the same
         // translation tuples across 50 VUs.
         let cache_key = translate_cache_key(&req);

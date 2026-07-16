@@ -22,6 +22,8 @@ use r2d2::Pool;
 #[cfg(feature = "sqlite")]
 use r2d2_sqlite::SqliteConnectionManager;
 
+#[cfg(feature = "postgres")]
+use crate::backends::postgres::EpochGuard;
 use crate::error::HtsError;
 use crate::import::BundleImportBackend;
 use crate::traits::TerminologyBackend;
@@ -230,6 +232,17 @@ pub struct AppState<B: TerminologyBackend> {
     /// `process_lookup`).  See [`LookupHandlerCache`].
     pub lookup_handler_cache: LookupHandlerCache,
 
+    /// Cross-instance freshness check (C3) for the `AppState`-layer handler
+    /// caches below. `None` on the SQLite path and whenever
+    /// `HTS_TERMINOLOGY_CACHE_INVALIDATION=local` (the default) — set via
+    /// [`Self::with_epoch_guard`]. Shares the same `Arc<EpochGuard>` as the
+    /// `PostgresTerminologyBackend` it wraps (see
+    /// `PostgresTerminologyBackend::with_epoch_guard`'s doc comment for why
+    /// the two layers share one guard but track separate cleared-epoch
+    /// counters).
+    #[cfg(feature = "postgres")]
+    pub epoch_guard: Option<Arc<EpochGuard>>,
+
     /// Negative cache for `$lookup` requests that returned `NotFound`.
     ///
     /// Iter 7i — targets LK05 (PG ~50% of SQLite). The positive
@@ -258,6 +271,8 @@ impl<B: TerminologyBackend> AppState<B> {
             hts_pool: None,
             #[cfg(feature = "postgres")]
             resource_store_pg: None,
+            #[cfg(feature = "postgres")]
+            epoch_guard: None,
             terminology_importer: None,
             max_expansion_size: 10_000,
             expand_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -336,6 +351,26 @@ impl<B: TerminologyBackend> AppState<B> {
     pub fn with_terminology_importer(mut self, importer: Arc<dyn BundleImportBackend>) -> Self {
         self.terminology_importer = Some(importer);
         self
+    }
+
+    /// Attach the epoch guard (C3) shared with the `PostgresTerminologyBackend`
+    /// this state wraps — see `PostgresTerminologyBackend::epoch_guard`.
+    #[cfg(feature = "postgres")]
+    pub fn with_epoch_guard(mut self, guard: Arc<EpochGuard>) -> Self {
+        self.epoch_guard = Some(guard);
+        self
+    }
+
+    /// Checks this state's handler-layer caches' freshness against the
+    /// shared terminology epoch, clearing them on a detected transition.
+    /// A no-op when no guard is attached (SQLite, or
+    /// `HTS_TERMINOLOGY_CACHE_INVALIDATION=local`). Call at the top of every
+    /// `process_*` handler entry point, before any handler-cache read.
+    pub async fn check_terminology_epoch(&self) {
+        #[cfg(feature = "postgres")]
+        if let Some(guard) = &self.epoch_guard {
+            guard.check_appstate(|| self.clear_expand_cache()).await;
+        }
     }
 
     /// Access the terminology backend directly (avoids cloning the `Arc`).
