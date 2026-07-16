@@ -297,6 +297,18 @@ and all in-memory state vanishes on restart.
   terminology-version epoch keyed into the caches, or short TTLs). The SQLite-side
   equivalents (`sqlite/value_set.rs:73`, `code_system.rs:119`) are **Low** — a
   cluster can't share a SQLite file anyway.
+  *[amended 2026-07-16 — landed in Phase 4: a shared `terminology_epoch`
+  single-row counter (not `LISTEN/NOTIFY`), bumped by `import_parsed`/
+  `delete_normalized` and checked (memoized ~1s) by an `EpochGuard` shared
+  between the `AppState`-layer handler caches and the backend-layer response
+  caches (`crates/hts/src/backends/postgres/epoch.rs`). The two `OnceLock`
+  closure statics turned out to already be covered by the existing
+  `clear_response_caches()`, so no separate handling was needed for them.
+  Opt-in and standalone to the `hts` crate — `HTS_TERMINOLOGY_CACHE_INVALIDATION
+  = local | epoch`, **not** coupled to the `hfs` binary's `HFS_CLUSTER` switch
+  (session decision: HTS scales independently of the FHIR server, so it gets
+  its own toggle in its own `HTS_*` namespace rather than a cross-binary
+  dependency).]*
 
 ### Class D — once-per-instance background tasks → leader-election / leasing
 
@@ -308,6 +320,14 @@ and all in-memory state vanishes on restart.
   SNOMED/LOINC/RxNorm/ICD-10 file concurrently. Idempotent upserts keep the end
   state correct, but you pay N× cost + write contention. Fix: `pg_advisory_lock`
   around bootstrap, or leader-election.
+  *[amended 2026-07-16 — landed in Phase 4: `bootstrap_sync_postgres` wraps the
+  whole directory-sync call in a session-scoped advisory lock
+  (`schema::with_bootstrap_lock`, a new distinct key "HTS_BOOT" alongside
+  the existing schema-DDL lock "HTS_SCHM") — one lock scope covers every file
+  in one pass, and the per-file ledger check inside `bootstrap_sync` runs
+  *inside* the locked section, so a loser that queues behind the winner
+  naturally skips whatever the winner already imported. Unconditional, no
+  gating (matches D3's precedent) — leader-election was not needed.]*
 - **D2 · Bulk export/submit cleanup reapers — LOW (already tolerable).**
   Unleased per-instance reapers (`crates/hfs/src/main.rs:1063,1244`) scan the
   shared DB and race on deletes, but deletes are idempotent → duplicated work
@@ -338,6 +358,25 @@ and all in-memory state vanishes on restart.
   writes → the search index silently diverges from the primary, recoverable only
   by a full reindex. Both a crash-durability and a cluster issue. Fix: a durable
   outbox (DB table) drained by workers.
+  *[amended 2026-07-16 — landed in Phase 4: new `composite_sync_outbox` table
+  (migration v18) + `CompositeSyncOutbox` trait
+  (`crates/persistence/src/core/composite_sync_outbox.rs`), denormalized to
+  **one row per `(event, backend_id)` pair** — not `QueuedEvent`'s prior
+  one-row-fans-out-to-N-backends shape — under the same lease + fencing
+  discipline as `cluster_jobs`/the subscription delivery outbox, cloned from
+  `subscription_outbox.rs`'s claim query. `SyncEvent::BulkSync` stays on the
+  pre-existing in-memory channel (doesn't denormalize cleanly to one row per
+  resource without changing its batch semantics; bulk resync already rides
+  the cluster-safe reindex job store). Wiring is **capability-based, not
+  `HFS_CLUSTER`-gated**: `CompositeStorage::new` wires the outbox
+  unconditionally whenever the primary backend is Postgres — durable delivery
+  beats the in-memory channel even single-instance, the same reasoning behind
+  F5's unconditional fix — so there is no new env var and no `hfs`-binary
+  wiring needed. `crates/hfs/src/cluster.rs` gained a **warn-only**
+  `resolve_composite_sync_durability` (not a refusal row): a non-Postgres
+  primary with a composite secondary under `HFS_CLUSTER=true` keeps today's
+  already-shipped in-memory fallback, not a cluster-introduced regression,
+  unlike subscriptions' functionally-broken-without-Postgres refusal.]*
 
 ### Class F — configuration-level cluster caveats (no new code, must be documented)
 
@@ -395,7 +434,7 @@ One master switch plus per-subsystem overrides, all following the existing
 | `HFS_AUTH_JWKS_COORDINATION` | `local` / `database` / `redis` | `local` (`database` when `HFS_CLUSTER`) | Cluster single-flight JWKS refresh (C2). Warn-only: explicit `local` under cluster warns, never refuses. *(new — landed Phase 2)* **[amended 2026-07-15]** |
 | `HFS_AUTH_REDIS_URL` | URL | — | Redis for ~~`jti` +~~ the JWKS coordinator (`redis` mode; needs the `redis` build feature). *[amended 2026-07-15: removed by #205, re-added in Phase 2 for C2 only]* |
 | `HFS_SUBSCRIPTIONS_FANOUT` | `memory` / `redis` / `nats` / `pg-notify` | `memory` | Shared pub/sub for WS delivery + WS binding tokens + counters (class B). *(new)* |
-| `HFS_TERMINOLOGY_CACHE_INVALIDATION` | `local` / `pg-notify` / `redis` | `local` | Cross-instance HTS cache invalidation (C3). *(new)* |
+| ~~`HFS_TERMINOLOGY_CACHE_INVALIDATION`~~ `HTS_TERMINOLOGY_CACHE_INVALIDATION` | `local` / `epoch` | `local` | Cross-instance HTS cache invalidation (C3), read by the **`hts` binary**, not `hfs` — HTS has its own `HTS_*` config surface and no `HFS_CLUSTER` coupling. *(new — landed Phase 4)* **[amended 2026-07-16: corrected the variable's prefix/name to match the code — it lives in `crates/hts`, not `hfs`/`rest`, so the `HFS_` prefix used above was wrong; also corrected values from the original `local / pg-notify / redis` sketch to the shape actually landed, `local / epoch`, a shared-counter table not `LISTEN/NOTIFY` or Redis]** |
 | `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` / `s3` | `local-fs` | Set `s3` when clustered (F2). *(exists)* |
 | `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` / `s3` | `local-fs` | Set `s3` when clustered (F2). *(exists)* |
 | `HFS_AUDIT_BACKEND` | `database` / `file` / `cloudwatch` / `none` | `none` | Avoid `file` when clustered (F4). *(exists — was misnamed `HFS_AUDIT_SINK` here; the code parses `HFS_AUDIT_BACKEND`, `crates/audit/src/config.rs`)* **[amended 2026-07-14]** |
@@ -446,6 +485,12 @@ Each phase is independently shippable and leaves the tree green.
   delivery outbox (B5).
 - **Phase 4 — HTS cache coherency (C3) + bootstrap lock (D1)** and
   **composite durable sync outbox (E1).**
+  *[amended 2026-07-16 — landed: D1 (unconditional advisory lock), C3
+  (opt-in `HTS_TERMINOLOGY_CACHE_INVALIDATION=epoch`, standalone to the
+  `hts` binary), and E1 (`composite_sync_outbox`, capability-based wiring,
+  no `HFS_CLUSTER` gating needed) — see the §5 C3/D1/E1 amendments for the
+  shapes actually landed. The T3 kill-9 nightly case for E1 (methodology
+  §6/§7, mirroring A1's) remains outstanding.]*
 - **Continuous — config caveats (F1–F5)** documented in Phase 0, code fixes
   (F5 atomic version increment) folded in where cheap.
 
