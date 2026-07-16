@@ -30,6 +30,7 @@ HTS_DATABASE_URL=./my-terminology.db HTS_SERVER_PORT=9090 cargo run --bin hts
 | `HTS_MAX_BODY_SIZE` | `10485760` | Max request body size in bytes, applied after decompression |
 | `HTS_ENABLE_CORS` | `true` | Enable CORS |
 | `HTS_CORS_ORIGINS` | `*` | Allowed CORS origins |
+| `HTS_TERMINOLOGY_CACHE_INVALIDATION` | `local` | `local` or `epoch`; `epoch` enables cross-instance terminology response cache invalidation for a clustered Postgres deployment |
 
 ## Bootstrap Directory Sync
 
@@ -39,6 +40,15 @@ When `HTS_BOOTSTRAP_DIR` points at a directory, HTS synchronizes recognized file
 - Replacing a file with a newer terminology release re-imports it. Imports upsert on canonical `(url, version)`, so a new version coexists with the old and a same-version re-import refreshes in place.
 - Unchanged files are skipped without reparsing.
 - RxNorm RRF directory signatures are derived from immediate children's `(name, size)` instead of full content hashing to avoid rereading multi-gigabyte folders on every boot.
+
+## Clustering (Postgres backend only)
+
+HTS clustering is a standalone `hts`-binary concern — its `HTS_*` env vars are independent of `hfs`'s `HFS_CLUSTER`, since HTS can scale separately from the FHIR server.
+
+- **Bootstrap advisory lock (D1)**: when `HTS_BOOTSTRAP_DIR` is set and the storage backend is Postgres, `bootstrap_sync` runs the whole directory sync under a dedicated `pg_advisory_lock`, unconditionally — N cold-starting instances serialize on the same import instead of redundantly racing it. The per-file `bootstrap_imports` ledger check runs inside the lock, so a loser naturally skips whatever the winner already imported. No configuration needed.
+- **Terminology cache epoch (C3)**: set `HTS_TERMINOLOGY_CACHE_INVALIDATION=epoch` so a CodeSystem/ValueSet/ConceptMap write on one instance invalidates the handler- and backend-layer response caches (`$lookup`/`$expand`/`$validate-code`/`$translate`/`$subsumes`) on every other instance within ~1s, instead of only the instance that received the write. Default `local` keeps single-instance behavior (each instance's caches clear only for its own writes) — safe for a single `hts` process, unsafe behind a load balancer with more than one instance.
+
+Operator guide: book chapter "Running HFS in a Cluster" (`book/src/ch15-cluster-deployment.md`).
 
 ## API Endpoints
 

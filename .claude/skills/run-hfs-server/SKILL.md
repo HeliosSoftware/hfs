@@ -128,7 +128,13 @@ curl http://localhost:8080/clinic-a/Patient
 
 `HFS_CLUSTER=true` refuses to boot on: a SQLite primary (F1), `local-fs` bulk export/submit output (F2), `HFS_AUDIT_BACKEND=file` (F4), an explicit `memory` job store, (with SoF enabled) a `memory` export controller / `fs` export sink (A1), or (with subscriptions enabled) an explicit `memory` fanout or a non-Postgres primary (B). The former C1 jti check went away with the jti subsystem (#205).
 
-JWKS refresh coordination (C2, warn-only — never a refusal): `HFS_AUTH_JWKS_COORDINATION` = `local` | `database` | `redis`; unset resolves to `database` under `HFS_CLUSTER` (Postgres primary; other primaries warn and stay per-instance). `redis` needs the `redis` build feature plus `HFS_AUTH_REDIS_URL`. Design and status: `docs/cluster-capable-state-design.md`; operator guide: book chapter "Running HFS in a Cluster" (`book/src/ch15-cluster-deployment.md`).
+JWKS refresh coordination (C2, warn-only — never a refusal): `HFS_AUTH_JWKS_COORDINATION` = `local` | `database` | `redis`; unset resolves to `database` under `HFS_CLUSTER` (Postgres primary; other primaries warn and stay per-instance). `redis` needs the `redis` build feature plus `HFS_AUTH_REDIS_URL`.
+
+Composite secondary-backend sync durability (E1, Phase 4, warn-only): when a composite storage secondary is present (e.g. `HFS_STORAGE_BACKEND=postgres-elasticsearch`) and the primary is Postgres, `CompositeStorage` wires a durable `composite_sync_outbox` automatically — capability-based, no env var. A composite secondary on a non-Postgres primary under `HFS_CLUSTER` warns and keeps the pre-existing in-memory-channel behavior rather than refusing boot.
+
+HTS terminology-server clustering (bootstrap lock D1, cache invalidation C3) is a standalone `hts`-binary concern with its own `HTS_*` env var, not `HFS_CLUSTER`-gated — see `/work-with-hts`.
+
+Operator guide: book chapter "Running HFS in a Cluster" (`book/src/ch15-cluster-deployment.md`).
 
 ## Behavior
 
