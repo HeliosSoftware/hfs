@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-15 (**Phase 2 COMPLETE** — gate met)
+**Last updated:** 2026-07-15 (**Phase 3 code + smoke COMPLETE** — T3 green; full-CI leg of the gate pending a runner-disk re-run, see the Phase 3 gate note)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -125,6 +125,34 @@ add flake surface without new coverage.
 **Migration renumbering:** C2 took **v16** (`cluster_refresh_cache`), so the
 Phase 3 items sketched below shift to **v17** and Phase 4 E1 to **v18**.
 
+### ✅ Done — Phase 3: subscriptions cluster delivery (#170) (2026-07-15)
+
+**Session decisions (2026-07-15):** the topic registry is now
+**tenant-scoped** (`(tenant_id, canonical_url)`) in BOTH modes — user call,
+closing the pre-existing cross-tenant topic-visibility leak; and
+`CompositeStorage` now forwards **all** cluster seams to its primary,
+including the Phase 1/2 `cluster_job_store`/`cluster_refresh_cache`
+accessors it had silently dropped (latent gap: `postgres-elasticsearch`
+modes reported no cluster stores).
+
+| What | Where | Commit |
+|------|-------|--------|
+| **PR 3.1 — persistence substrate (migration v17)**: four core seams with `pub mod testing` T1 reference models + Postgres impls — `subscription_state` (lazy upsert-increment counters — an update can never reset them; cluster-visible status; `subscription_notification_events` bundle store; the cross-tenant registry-independent `SubscriptionHydrationSource` with the R4 `Basic` marker pre-filtered in SQL), `subscription_delivery` (dedicated jobs-shaped outbox with `attempts`/`next_attempt_at` schedule — claim bumps attempts; NOT a `cluster_jobs` kind), `ws_binding_tokens` (`DELETE … RETURNING` redeem-once, DB-clock expiry), `event_fanout` (`PgNotifyFanout`: pooled `pg_notify` publish, dedicated non-pooled LISTEN connection, capped-backoff reconnect + synthesized `Resync`, memoized per backend, stopped on drop, `ready()` for deterministic tests). Five `ResourceStorage` accessors (default-None). **All schedule/lease math on the DB clock** (client-clock compare flaked once against a container clock). 10-test T2 suite in `postgres_tests.rs` (`SUBSCRIPTION_OUTBOX_TEST_LOCK` for the cross-tenant claims); ran green 3×. | `persistence/src/core/{subscription_state,subscription_delivery,ws_binding_tokens,event_fanout}.rs`, `backends/postgres/subscription_*.rs`, `schema.rs` | `7ab9a074` |
+| **PR 3.2 — engine seams (B2/B3/B4)**: `ClusterHandles` + `with_cluster_handles` (without them: byte-for-byte local behavior, full pre-existing suite unedited); shared `next_event_number` (store failure → local fallback with error — deliver-with-possible-dup beats dropping); `hydrate()` via non-handshaking `register_*_locally` helpers (topics→subs, stored runtime state overlays the resource status; live writes keep `event_number` but re-seed status + zero the failure streak — re-request intent wins); `generate_ws_token`/`redeem_ws_token` (fail-closed); `subscription_snapshot` overlay serving `$status`/`$events`/bind. Topic registry tenant-scoped. T1 `tests/cluster_engine.rs` (incl. the asserted-unsafe memory twin: duplicate eventNumbers) + T2 `tests/subscriptions_cluster_pg.rs` (new `postgres` marker feature, on in CI via `--all-features`). | `subscriptions/src/{engine,manager,topics,evaluator}`, `rest/src/handlers/{subscriptions,ws}.rs` | `0697ab79` |
+| **PR 3.3 — fan-out delivery (B1) + durable outbox (B5) + rest wiring**: cluster mode splits per channel — websocket: persist bundle → lossless local delivery → `ws-event` envelope (origin skips its own; receivers load by key); push channels: fully outbox-driven from attempt zero, workers claim one attempt per cycle (`run_next_subscription_delivery` = the deterministic test seam), persisted backoff, shared thresholds, local-miss → full re-hydrate (topic + sub together — sub-only re-read fails topic validation); enqueue failure → inline fallback. Lifecycle/state envelopes + listener (vanished resource ⇒ delete; `Resync`/lag ⇒ re-hydrate). `HFS_SUBSCRIPTIONS_FANOUT` (unset → `pg-notify` under `HFS_CLUSTER`); `HFS_SUBSCRIPTIONS_ENABLED` parse hoisted onto `ServerConfig` (truthiness preserved); `build_app` wires the five seams (missing → warn + per-instance), starts listener before hydration, spawns workers. T1 + T2 grew ws-fan-out-over-real-LISTEN/NOTIFY, retry-requeue-then-deliver, lifecycle propagation incl. delete, B5 cross-instance claim. | `subscriptions/src/engine/mod.rs`, `rest/src/{config,lib}.rs` | `a2ea5e83` |
+| **PR 3.4 — validator + docs**: two refusal rows under cluster+subscriptions — explicit `memory` fanout, non-Postgres primary (functional breakage, unlike C2's warn-only); feature-gated enabled resolution (a binary without the engine is exempt); T1 table = 9 collected violations worst-case. ch15 Phase 3 section (WS best-effort + gap detection, outbox at-least-once, **pgbouncer transaction-pooling breaks LISTEN** caveat, heartbeat still unwired), skills updated, design doc Class B `[amended]`. **Verified end-to-end, two binaries + one Postgres**: `$status` active via B for a subscription created on A; token minted on A bound on B; Encounter → A delivered to B's socket over LISTEN/NOTIFY; token re-use on A closed 1008; both refusal messages exact. | `hfs/src/{cluster,main}.rs`, `book/src/ch15-cluster-deployment.md`, skills, design doc | `7563a2c5` |
+| **PR 3.5 — T3 smoke check 5 (the mandatory two-process B1 test)**: websocat client on **B**, matching Encounter written to **A**, event-notification frame asserted on B — plus lifecycle propagation (`$status` active via B), token mint-on-A/bind-on-B, and the sticky-session negative (consumed token rejected on A). Workflow: build gains `subscriptions`, `COMMON_ENV` += `HFS_SUBSCRIPTIONS_ENABLED=true` + explicit `HFS_SUBSCRIPTIONS_FANOUT=pg-notify` (`HFS_CLUSTER` still unset there — fs sink), pinned websocat install; the nginx WS plumbing was already in place. Check-5 section verified locally verbatim before dispatch. | `cluster-smoke.yml`, `run_external_cluster_smoke.sh` | `e9407064` |
+
+**Phase 3 gate (strategy §8):** T3 **cluster-smoke green on first dispatch**
+([run 29459960052](https://github.com/HeliosSoftware/hfs/actions/runs/29459960052)
+— all 5 checks incl. the new WS fan-out A→B and redeem-once negative); all
+B2/B3/B4/B5 T2 suites green locally (10 persistence + 8 T1 engine + 6 PG
+engine + 6 hfs validator + 2 rest config; full pre-existing subscriptions
+suite unedited and green). The full-CI leg hit the known self-hosted-runner
+**disk-full** infrastructure failure twice (`No space left on device` while
+building `helios-fhir` — Linting/Redis suites green, nothing code-related);
+gate to be stamped MET when the re-run lands green.
+
 ---
 
 ## What's next
@@ -152,11 +180,17 @@ design (no tenant column).
   resurrected opt-in `RedisJwksCoordination` + hfs boot wiring, with the
   strategy §8 wiremock hit-counter suites at T2 on both backends.
 
-### Phase 3 — subscriptions cluster delivery (#170)
+### Phase 3 — subscriptions cluster delivery (#170) — ✅ COMPLETE 2026-07-15 (see the table above)
 
-- `EventFanout` trait; `PgNotifyFanout` on a **dedicated non-pooled** `tokio_postgres` connection with reconnect/re-LISTEN loop; NOTIFY payload ≈8KB cap ⇒ envelopes `(tenant, subscription_id, event_id)`, receivers rehydrate from DB. `HFS_SUBSCRIPTIONS_FANOUT = memory | pg-notify`.
-- B3 startup hydration (there is **zero** startup load of Subscription/SubscriptionTopic today — engine built empty at `rest/src/lib.rs` ~:713); B4 shared counters (`subscription_state` table, `UPDATE … event_number = event_number + 1 RETURNING`); B2 DB redeem-once binding tokens (`DELETE … RETURNING`); B5 durable delivery outbox (jobs-shaped lease columns), replacing the on-stack retry in `dispatch_with_retry` (`engine/mod.rs` ~:722). All migration v17 (v16 went to C2).
-- **T3 B1 is the one mandatory two-process test**: WS client on B, POST matching resource to A, socket receives; plus sticky-session negative. Reuse the FIFO WS client from `run_external_subscriptions_smoke.sh`.
+- Landed as PRs 3.1–3.5 on migration v17: the four persistence seams +
+  `PgNotifyFanout`, the engine's `ClusterHandles` (hydration, shared
+  counters, shared tokens), the channel-split delivery (WS fan-out +
+  durable outbox), the validator refusal rows, and smoke check 5.
+- Additional decisions baked in: fully outbox-driven push delivery
+  (at-least-once, no inline first attempt), B2 as DB redeem-once (not
+  stateless HMAC), lazy counter rows (updates never reset), tenant-scoped
+  topic registry in both modes, WS-bundle store table
+  (`subscription_notification_events`) so envelopes stay tiny.
 
 ### Phase 4 — HTS coherency (C3) + bootstrap lock (D1) + composite outbox (E1)
 
