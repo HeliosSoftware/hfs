@@ -174,7 +174,6 @@ fn start_tx_stub() -> String {
         Mock::given(method("POST"))
             .and(path("/ConceptMap/$translate"))
             .and(|req: &Request| has_params(req, &["url", "code", "system"]))
-            .with_priority(1)
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "resourceType": "Parameters",
                 "parameter": [
@@ -194,18 +193,20 @@ fn start_tx_stub() -> String {
                     { "name": "result", "valueBoolean": true }
                 ]
             })))
+            // Lower number wins: MockSet sorts by priority ascending, so this is
+            // tried before the catch-all below. Must follow respond_with -- it is a
+            // method on Mock, not on MockBuilder.
+            .with_priority(1)
             .mount(&server)
             .await;
 
         // Any other shape of $translate gets the 400 live HTS actually returns.
-        // Lower priority, so the well-formed mock above wins when it matches.
         //
         // Without this a regressed client would get wiremock's bare "no mock matched"
         // 404 and fail on a confusing error. Mirroring HTS's real rejection means the
         // suite fails the same way production does, with the same diagnostics.
         Mock::given(method("POST"))
             .and(path("/ConceptMap/$translate"))
-            .with_priority(10)
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
                 "resourceType": "OperationOutcome",
                 "issue": [
@@ -216,6 +217,7 @@ fn start_tx_stub() -> String {
                     }
                 ]
             })))
+            .with_priority(10)
             .mount(&server)
             .await;
 
