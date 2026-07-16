@@ -65,9 +65,21 @@ fn load_test_resource_r5(json_filename: &str) -> Result<EvaluationContext, Strin
 /// These tests used to reach the public `tx.fhir.org` because the evaluator
 /// defaulted to it, which made `cargo test` fail whenever that server was down or
 /// rate-limiting. The evaluator has no default any more (issue #217), so the suite
-/// supplies its own server. The responses mirror the shapes a real terminology
-/// server returns for these two operations; the expected values (4 gender codes,
-/// `result = true`) are fixed by the FHIR specification, not by any one server.
+/// supplies its own server.
+///
+/// # Why every mock matches on the request body
+///
+/// A stub that matches on method and path alone answers *any* request, including one
+/// the real server rejects — so it certifies a broken client as working. That is not
+/// hypothetical here: an earlier revision of this stub answered `$translate` with `H`
+/// while live HTS was returning `400 Missing required parameter: code or sourceCode`
+/// to the exact request our client sent (#287). The test was green over a path that
+/// could not work in production.
+///
+/// So each mock asserts the shape live HTS actually requires, and `$translate` has a
+/// catch-all returning HTS's real 400 for anything else. A client that regresses to a
+/// request HTS would reject fails here the same way it fails in production, instead of
+/// being quietly waved through.
 ///
 /// The server is leaked rather than dropped: `Drop for MockServer` signals shutdown,
 /// and the stub has to keep serving for the whole suite. The runtime that started it
@@ -75,18 +87,43 @@ fn load_test_resource_r5(json_filename: &str) -> Result<EvaluationContext, Strin
 /// to exit.
 #[cfg(feature = "R5")]
 fn start_tx_stub() -> String {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// True when the body is a `Parameters` resource carrying every one of `names`
+    /// as a named parameter.
+    ///
+    /// Presence-only by design: the point is to pin the parameter *names* the server
+    /// requires, which is exactly what the `$translate` bug got wrong (it sent
+    /// `coding` where HTS demands `code`).
+    fn has_params(req: &Request, names: &[&str]) -> bool {
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+            return false;
+        };
+        let Some(parameters) = body.get("parameter").and_then(|p| p.as_array()) else {
+            return false;
+        };
+        names.iter().all(|name| {
+            parameters
+                .iter()
+                .any(|p| p.get("name").and_then(|n| n.as_str()) == Some(*name))
+        })
+    }
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to build stub runtime");
 
     let uri = runtime.block_on(async {
         let server = MockServer::start().await;
 
-        // txTest01: expand(administrative-gender).expansion.contains.count() = 4
+        // txTest01: expand(administrative-gender).expansion.contains.count() = 4.
+        // `expand()` passes the ValueSet as a `url` query parameter on a GET.
         let gender_system = "http://hl7.org/fhir/administrative-gender";
         Mock::given(method("GET"))
             .and(path("/ValueSet/$expand"))
+            .and(query_param(
+                "url",
+                "http://hl7.org/fhir/ValueSet/administrative-gender",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "resourceType": "ValueSet",
                 "id": "administrative-gender",
@@ -107,15 +144,76 @@ fn start_tx_stub() -> String {
             .mount(&server)
             .await;
 
-        // txTest02: validateVS(administrative-gender, Patient.gender) -> result = true
+        // txTest02: validateVS(administrative-gender, Patient.gender) -> result = true.
+        // `validate_vs` sends `url` + `coding`. Unlike $translate, `coding` *is* a
+        // spec parameter for ValueSet/$validate-code and live HTS accepts it.
         Mock::given(method("POST"))
             .and(path("/ValueSet/$validate-code"))
+            .and(|req: &Request| has_params(req, &["url", "coding"]))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "resourceType": "Parameters",
                 "parameter": [
                     { "name": "result", "valueBoolean": true },
                     { "name": "code", "valueCode": "male" },
                     { "name": "system", "valueUri": gender_system }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // txTest03: translate(cm-address-use-v2, Patient.address.use = 'home') -> 'H'.
+        //
+        // HTS requires `code` + `system` as named parameters. It rejects a lone
+        // `coding` (which our client used to send, #287) and also rejects the
+        // R5-spec `sourceCoding` -- that second one is an HTS spec violation tracked
+        // in #288, so `code` + `system` is currently the only form that works.
+        // Matching on those names is what stops this stub from certifying a request
+        // the real server 400s. The response body is HTS's actual answer, re-derived
+        // against the server we now point people at rather than tx.fhir.org (#217);
+        // #289's CI pre-flight probe re-checks it against live HTS on every run.
+        Mock::given(method("POST"))
+            .and(path("/ConceptMap/$translate"))
+            .and(|req: &Request| has_params(req, &["url", "code", "system"]))
+            .with_priority(1)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resourceType": "Parameters",
+                "parameter": [
+                    {
+                        "name": "match",
+                        "part": [
+                            {
+                                "name": "concept",
+                                "valueCoding": {
+                                    "system": "http://terminology.hl7.org/CodeSystem/v2-0190",
+                                    "code": "H"
+                                }
+                            },
+                            { "name": "relationship", "valueCode": "equivalent" }
+                        ]
+                    },
+                    { "name": "result", "valueBoolean": true }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // Any other shape of $translate gets the 400 live HTS actually returns.
+        // Lower priority, so the well-formed mock above wins when it matches.
+        //
+        // Without this a regressed client would get wiremock's bare "no mock matched"
+        // 404 and fail on a confusing error. Mirroring HTS's real rejection means the
+        // suite fails the same way production does, with the same diagnostics.
+        Mock::given(method("POST"))
+            .and(path("/ConceptMap/$translate"))
+            .with_priority(10)
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [
+                    {
+                        "severity": "error",
+                        "code": "required",
+                        "diagnostics": "Missing required parameter: code or sourceCode"
+                    }
                 ]
             })))
             .mount(&server)
@@ -245,6 +343,14 @@ fn test_r5_test_suite() {
             // depend on a public server being reachable, so point these at the
             // in-process stub. FHIRPATH_TERMINOLOGY_SERVER still wins when set, which is
             // how these expectations get re-validated against a real server.
+            //
+            // Note txTest03 passes here but remains a known failure in the .NET
+            // conformance harness (#289). That is not a contradiction: it declares
+            // `<output type="code">`, and `parse_expected_output` maps `code` to
+            // EvaluationResult::String, so this suite compares the value ("H") and is
+            // blind to the type. The .NET harness checks the type and still sees
+            // `code` returned as `string`. This assertion covers the $translate value
+            // path only -- output type fidelity is tracked separately.
             if test.mode == "tx" && std::env::var("FHIRPATH_TERMINOLOGY_SERVER").is_err() {
                 context.set_terminology_server(tx_stub_uri.clone());
             }
@@ -282,17 +388,6 @@ fn test_r5_test_suite() {
                 println!(
                     "  SKIP: {} - test data uses R4-format ConceptMap incompatible with R5 model",
                     test.name
-                );
-                skipped_tests += 1;
-                continue;
-            }
-
-            // Skip translate-based tx tests - the stub does not serve $translate, and
-            // ConceptMap cm-address-use-v2 is not reliably available on public servers.
-            if test.mode == "tx" && test.expression.contains("translate(") {
-                println!(
-                    "  SKIP: {} - '{}' - ConceptMap $translate not covered by the terminology stub",
-                    test.name, test.expression
                 );
                 skipped_tests += 1;
                 continue;
