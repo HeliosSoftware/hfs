@@ -490,7 +490,12 @@ Each phase is independently shippable and leaves the tree green.
   `hts` binary), and E1 (`composite_sync_outbox`, capability-based wiring,
   no `HFS_CLUSTER` gating needed) — see the §5 C3/D1/E1 amendments for the
   shapes actually landed. The T3 kill-9 nightly case for E1 (methodology
-  §6/§7, mirroring A1's) remains outstanding.]*
+  §6/§7, mirroring A1's) also landed: a dedicated `postgres-elasticsearch`
+  instance pair in `cluster-smoke.yml`, gated on the existing `NIGHTLY`
+  condition, seeds a large transaction Bundle rather than A1's single
+  long-running job (E1's failure unit is many small rows, not one job), and
+  verifies convergence via a live Elasticsearch search rather than trusting
+  the outbox's own "applied" status.]*
 - **Continuous — config caveats (F1–F5)** documented in Phase 0, code fixes
   (F5 atomic version increment) folded in where cheap.
 

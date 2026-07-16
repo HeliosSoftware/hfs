@@ -63,7 +63,7 @@ jobs:
       - name: Build HFS binary
         run: |
           cargo build -p helios-hfs --no-default-features \
-            --features R4,postgres,subscriptions
+            --features R4,postgres,subscriptions,elasticsearch
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v7
@@ -94,6 +94,11 @@ jobs:
       FHIR_VERSION: R4
       HFS_PORT_A: "18200"
       HFS_PORT_B: "18201"
+      # Dedicated postgres-elasticsearch pair for the nightly E1 kill-9
+      # check only — distinct ports so it can run alongside (or right after)
+      # the main postgres-only pair without any bind-address race.
+      HFS_E1_PORT_A: "18210"
+      HFS_E1_PORT_B: "18211"
       NIGHTLY: ${{ (github.event_name == 'schedule' || inputs.nightly == true) && 'true' || 'false' }}
     steps:
       - name: Checkout code
@@ -414,6 +419,107 @@ jobs:
           CLUSTER_ENV_FILE="$RESULTS_DIR/cluster-env.list" \
           ./crates/hfs/tests/cluster/run_nightly_kill9_check.sh
 
+      # --- Nightly E1 kill-9 recovery check (Phase 4) -------------------------
+      # Needs a dedicated postgres-elasticsearch pair: the main A/B instances
+      # above are plain postgres (no composite secondary, so no
+      # composite_sync_outbox activity to crash-test). Sharing $PG_URL/
+      # $PG_CONTAINER, new Elasticsearch container, new ports.
+
+      - name: Start Elasticsearch (nightly E1 kill-9 check)
+        if: env.NIGHTLY == 'true'
+        run: |
+          ES_CONTAINER="es-cluster-smoke-e1-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+            elasticsearch:8.15.0
+          echo "ES_CONTAINER=$ES_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            ES_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$ES_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" >/dev/null 2>&1; then
+              echo "ES_PORT=$ES_PORT" >> "$GITHUB_ENV"
+              echo "Elasticsearch is ready on port $ES_PORT"
+              exit 0
+            fi
+            echo "Attempt $i/30: Elasticsearch not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$ES_CONTAINER"
+          exit 1
+
+      - name: Start postgres-elasticsearch instances A and B (nightly E1 kill-9 check)
+        if: env.NIGHTLY == 'true'
+        run: |
+          E1_TENANT="cluster-e1-${{ github.run_id }}-${{ github.run_attempt }}"
+          E1_ENV=(
+            HFS_BASE_URL="http://localhost:$HFS_E1_PORT_A"
+            HFS_DEFAULT_FHIR_VERSION=R4
+            HFS_DEFAULT_TENANT="$E1_TENANT"
+            HFS_STORAGE_BACKEND=postgres-elasticsearch
+            HFS_DATABASE_URL="$PG_URL"
+            HFS_PG_HOST="$DOCKER_HOST_IP"
+            HFS_PG_PORT="$PG_PORT"
+            HFS_PG_DBNAME=helios
+            HFS_PG_USER=helios
+            HFS_PG_PASSWORD=helios
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT"
+          )
+          printf '%s\n' "${E1_ENV[@]}" > "$RESULTS_DIR/cluster-e1-env.list"
+
+          HFS_LOG_E1_A="$RESULTS_DIR/hfs-e1-a.log"
+          HFS_LOG_E1_B="$RESULTS_DIR/hfs-e1-b.log"
+          echo "HFS_LOG_E1_A=$HFS_LOG_E1_A" >> "$GITHUB_ENV"
+          echo "HFS_LOG_E1_B=$HFS_LOG_E1_B" >> "$GITHUB_ENV"
+
+          env "${E1_ENV[@]}" \
+            ./target/debug/hfs --log-level info --port "$HFS_E1_PORT_A" --host 0.0.0.0 > "$HFS_LOG_E1_A" 2>&1 &
+          echo "HFS_E1_PID_A=$!" >> "$GITHUB_ENV"
+
+          env "${E1_ENV[@]}" \
+            ./target/debug/hfs --log-level info --port "$HFS_E1_PORT_B" --host 0.0.0.0 > "$HFS_LOG_E1_B" 2>&1 &
+          echo "HFS_E1_PID_B=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for postgres-elasticsearch instances to be ready (nightly E1 kill-9 check)
+        if: env.NIGHTLY == 'true'
+        run: |
+          wait_ready() {
+            local name="$1" pid="$2" port="$3" log="$4"
+            for i in {1..45}; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "HFS E1 instance $name exited"
+                cat "$log"
+                return 1
+              fi
+              if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
+                echo "HFS E1 instance $name is ready on port $port"
+                return 0
+              fi
+              echo "Attempt $i/45: HFS E1 instance $name not ready yet..."
+              sleep 2
+            done
+            tail -100 "$log"
+            return 1
+          }
+          wait_ready A "$HFS_E1_PID_A" "$HFS_E1_PORT_A" "$HFS_LOG_E1_A"
+          wait_ready B "$HFS_E1_PID_B" "$HFS_E1_PORT_B" "$HFS_LOG_E1_B"
+
+      - name: Nightly kill-9 recovery check (E1)
+        if: env.NIGHTLY == 'true'
+        run: |
+          BASE_URL_A="http://localhost:$HFS_E1_PORT_A" \
+          BASE_URL_B="http://localhost:$HFS_E1_PORT_B" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          HFS_PID_A="$HFS_E1_PID_A" \
+          HFS_PID_B="$HFS_E1_PID_B" \
+          HFS_PORT_B="$HFS_E1_PORT_B" \
+          HFS_BINARY="./target/debug/hfs" \
+          CLUSTER_ENV_FILE="$RESULTS_DIR/cluster-e1-env.list" \
+          ./crates/hfs/tests/cluster/run_nightly_e1_kill9_check.sh
+
       - name: Stop HFS instances gracefully
         if: always()
         run: |
@@ -421,7 +527,12 @@ jobs:
           if [ -f "$RESULTS_DIR/nightly-b.pid" ]; then
             NIGHTLY_B_PID="$(cat "$RESULTS_DIR/nightly-b.pid")"
           fi
-          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}" "${HTS_PID_A:-}" "${HTS_PID_B:-}" "$NIGHTLY_B_PID"; do
+          NIGHTLY_E1_B_PID=""
+          if [ -f "$RESULTS_DIR/nightly-e1-b.pid" ]; then
+            NIGHTLY_E1_B_PID="$(cat "$RESULTS_DIR/nightly-e1-b.pid")"
+          fi
+          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}" "${HTS_PID_A:-}" "${HTS_PID_B:-}" \
+                     "${HFS_E1_PID_A:-}" "${HFS_E1_PID_B:-}" "$NIGHTLY_B_PID" "$NIGHTLY_E1_B_PID"; do
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
               kill -INT "$pid" 2>/dev/null || true
               for _ in {1..50}; do
@@ -444,6 +555,9 @@ jobs:
           fi
           if [ -n "${NGINX_CONTAINER:-}" ]; then
             docker logs "$NGINX_CONTAINER" > "$RESULTS_DIR/backend-logs/nginx.log" 2>&1 || true
+          fi
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker logs "$ES_CONTAINER" > "$RESULTS_DIR/backend-logs/elasticsearch.log" 2>&1 || true
           fi
 
       - name: Append smoke report to summary
@@ -473,4 +587,7 @@ jobs:
           fi
           if [ -n "${NGINX_CONTAINER:-}" ]; then
             docker rm -f "$NGINX_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            docker rm -f "$ES_CONTAINER" 2>/dev/null || true
           fi

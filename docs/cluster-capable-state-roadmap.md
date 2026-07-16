@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-16 (**Phase 4 COMPLETE** — gate met, full CI + cluster-smoke green; E1 nightly kill-9 outstanding — see below)
+**Last updated:** 2026-07-16 (**Phase 4 COMPLETE** — gate met, full CI + cluster-smoke green; E1 nightly kill-9 case implemented and dry-run verified, pending its first real dispatch — see below)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -200,13 +200,30 @@ push, even when the tip commit's own message is clean. The Phase 0-3 fix
 (one clean trailing commit) only works when that commit is pushed **on its
 own**, not bundled with the skip-tagged commit in the same push.
 
-**Not done — deliberately deferred, tracked separately:** the T3 nightly
-kill-9 case for E1 (methodology §6/§7, mirroring A1's — needs an
-Elasticsearch container added to `cluster-smoke.yml`, which doesn't have one
-today; a substantially larger CI addition than C3's smoke stage, which
-reused the existing Postgres container). Not required for the Phase 4 gate
-proper (the strategy's own gate criteria list it as a nightly-tier addendum,
-not a blocker) — now the active work item.
+**PR 4.4 — T3 nightly kill-9 recovery case (E1)**: `cluster-smoke.yml` gains
+a dedicated `postgres-elasticsearch` instance pair (new ports, new
+Elasticsearch container, nightly-gated) alongside the existing plain-Postgres
+A/B pair — the main pair has no composite secondary, so no
+`composite_sync_outbox` activity to crash-test. `run_nightly_e1_kill9_check.sh`
+mirrors A1's shape adapted for E1's many-small-rows-not-one-big-job profile:
+stop the pair's B, POST a 2000-Patient transaction Bundle via A (durably
+enqueues one outbox row per resource without waiting on any Elasticsearch
+apply), poll for a healthy queued/applying backlog (proving the single
+worker hasn't already drained it — fail loudly and say "raise SEED_ROWS" if
+it has, same discipline as A1), `kill -9` A, restart B, wait for the outbox
+to fully drain, then verify via a `Patient?family=…&_summary=count` search
+through B that Elasticsearch genuinely has every row — not just that the
+outbox says so. **Passed on first local dry run** (500-row override against
+real local Postgres + Elasticsearch containers: 459 rows still
+queued/applying when the kill landed, 1 genuinely orphaned mid-`applying`
+under A's lease, full recovery and convergence after restart). | workflow +
+`run_nightly_e1_kill9_check.sh` | *pending commit* |
+
+**Not required for the Phase 4 gate proper** (the strategy's own gate
+criteria list the nightly tier as an addendum, not a blocker) — implemented
+as a fast-follow per the standing decision, not yet dispatched against the
+real CI self-hosted runners (needs `-f nightly=true` since scheduled runs
+execute `main`'s copy until this branch merges).
 
 ---
 
@@ -259,7 +276,7 @@ var for E1 at all.
 
 - C3: one-row `terminology_epoch` table; every terminology write bumps it; an `EpochGuard` (memoized ~1s, 0 in tests) checks before serving from cache and calls the two existing clear seams (`hts/src/state.rs:280`, `backends/postgres/mod.rs:172`, incl. the `OnceLock` closure statics — turned out already covered, no separate handling needed). `HTS_TERMINOLOGY_CACHE_INVALIDATION = local | epoch`, standalone to the `hts` binary (not `HFS_*`, not `HFS_CLUSTER`-gated — session decision).
 - D1: `pg_advisory_lock` around `bootstrap_sync` (dedicated key `HTS_BOOTSTRAP_LOCK` = "HTS_BOOT"), the per-file ledger check runs inside the lock so no separate re-check step was needed, unconditional (no gating).
-- E1: `composite_sync_outbox` on migration **v18** (confirmed: v17 was Phase 3's head); `sync_asynchronous` durably enqueues one row per `(event, backend_id)` when the outbox is wired; a same-process `Notify` is the fast-path wake, not a cross-instance fan-out (reasoned unnecessary — see design doc §5 E1 amendment); workers claim with `FOR UPDATE SKIP LOCKED` + fencing. Wiring is capability-based (automatic on a Postgres primary), not `HFS_CLUSTER`-gated. T3 nightly kill-9 drain case **not yet built** (tracked separately — needs an Elasticsearch container added to the smoke workflow).
+- E1: `composite_sync_outbox` on migration **v18** (confirmed: v17 was Phase 3's head); `sync_asynchronous` durably enqueues one row per `(event, backend_id)` when the outbox is wired; a same-process `Notify` is the fast-path wake, not a cross-instance fan-out (reasoned unnecessary — see design doc §5 E1 amendment); workers claim with `FOR UPDATE SKIP LOCKED` + fencing. Wiring is capability-based (automatic on a Postgres primary), not `HFS_CLUSTER`-gated. T3 nightly kill-9 drain case landed (PR 4.4) — a dedicated `postgres-elasticsearch` pair + Elasticsearch container, gated `NIGHTLY`; dry-run verified, real dispatch pending.
 
 ---
 
