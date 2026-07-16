@@ -67,7 +67,15 @@ pub struct PostgresConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
-    /// Connection timeout in seconds.
+    /// Upper bound, in seconds, for establishing a connection to the server.
+    ///
+    /// Bounds the whole of connection establishment — DNS, TCP, TLS and the
+    /// Postgres startup/auth exchange — via deadpool's `create_timeout`, not just
+    /// the TCP handshake that tokio-postgres' own `connect_timeout` covers.
+    ///
+    /// Raise it for servers that are slow to answer a fresh connection: a cold or
+    /// loaded cluster, a cross-region failover, or a TLS handshake against a
+    /// distant proxy. Settable as `HFS_PG_CONNECT_TIMEOUT_SECS`.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
 
@@ -127,6 +135,20 @@ fn default_max_connections() -> usize {
 
 fn default_connect_timeout_secs() -> u64 {
     5
+}
+
+/// Reads `HFS_PG_CONNECT_TIMEOUT_SECS`, falling back to the default.
+///
+/// This value bounds deadpool's `create_timeout` and is therefore a hard ceiling
+/// on connection establishment. It must be reachable from every construction path
+/// — an operator whose server needs longer than the default has no other way to
+/// say so, and before this was wired up the field was dead config, so no
+/// deployment has ever had to think about it.
+fn connect_timeout_secs_from_env() -> u64 {
+    std::env::var("HFS_PG_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(default_connect_timeout_secs)
 }
 
 fn default_statement_timeout_ms() -> u64 {
@@ -197,8 +219,14 @@ impl PostgresBackend {
     }
 
     /// Creates a backend from a connection string.
+    ///
+    /// The URL carries the connection's identity (host, port, database,
+    /// credentials); `HFS_PG_CONNECT_TIMEOUT_SECS` still applies on top of it, so
+    /// a URL-configured deployment can tune connection establishment exactly as an
+    /// `HFS_PG_*`-configured one can.
     pub async fn from_connection_string(url: &str) -> StorageResult<Self> {
-        let config = Self::parse_connection_string(url)?;
+        let mut config = Self::parse_connection_string(url)?;
+        config.connect_timeout_secs = connect_timeout_secs_from_env();
         Self::new(config).await
     }
 
@@ -211,6 +239,7 @@ impl PostgresBackend {
     /// - `HFS_PG_USER` (default: "helios")
     /// - `HFS_PG_PASSWORD`
     /// - `HFS_PG_MAX_CONNECTIONS` (default: 10)
+    /// - `HFS_PG_CONNECT_TIMEOUT_SECS` (default: 5)
     pub async fn from_env() -> StorageResult<Self> {
         let config = PostgresConfig {
             host: std::env::var("HFS_PG_HOST").unwrap_or_else(|_| default_host()),
@@ -225,6 +254,7 @@ impl PostgresBackend {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or_else(default_max_connections),
+            connect_timeout_secs: connect_timeout_secs_from_env(),
             ..Default::default()
         };
         Self::new(config).await

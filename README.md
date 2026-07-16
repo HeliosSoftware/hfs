@@ -299,6 +299,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_PG_USER` | `helios` | Database user |
 | `HFS_PG_PASSWORD` | *(none)* | Database password |
 | `HFS_PG_MAX_CONNECTIONS` | `10` | Connection pool size |
+| `HFS_PG_CONNECT_TIMEOUT_SECS` | `5` | How long establishing a connection may take before failing (s), covering DNS, TCP, TLS and authentication. Raise it for a server that is slow to answer a fresh connection. |
 
 **MongoDB**
 

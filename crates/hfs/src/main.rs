@@ -2418,6 +2418,7 @@ mod tests {
             "HFS_MONGODB_DATABASE" => Some("inferno_suite".to_string()),
             "HFS_MONGODB_MAX_CONNECTIONS" => Some("24".to_string()),
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
+            "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
         });
 
@@ -2428,6 +2429,7 @@ mod tests {
         assert_eq!(mongo_config.database_name, "inferno_suite");
         assert_eq!(mongo_config.max_connections, 24);
         assert_eq!(mongo_config.connect_timeout_ms, 7500);
+        assert_eq!(mongo_config.server_selection_timeout_ms, 2500);
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);
