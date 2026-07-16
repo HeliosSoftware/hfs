@@ -237,6 +237,49 @@ ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS mtime_unix BIGINT;
 ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS languages TEXT NOT NULL DEFAULT '';
 ";
 
+/// Advisory lock key guarding bootstrap terminology import
+/// (`crates/hts/src/main.rs`'s `bootstrap_sync_postgres`). Distinct from
+/// `apply`'s own `HTS_SCHEMA_LOCK` (schema DDL is a separate critical section
+/// from the bootstrap import that follows it) but packed the same way — the
+/// ASCII bytes of `"HTS_BOOT"`.
+pub const HTS_BOOTSTRAP_LOCK: i64 = 0x4854_535f_424f_4f54u64 as i64; // "HTS_BOOT"
+
+/// Runs `work` while holding [`HTS_BOOTSTRAP_LOCK`] on one dedicated
+/// connection checked out from `pool`.
+///
+/// Serializes concurrent bootstrap terminology imports across instances
+/// cold-starting against the same database — `work` is typically the whole
+/// directory-sync pass (every terminology file in one call), not a
+/// per-file unit, so a single lock scope covers all of it. Whatever
+/// idempotent ledger re-check `work` performs internally naturally sees the
+/// winner's already-imported state once a loser acquires the lock — no
+/// separate "did someone else already run bootstrap" flag is needed. The
+/// lock is released on both the success and error path: a session-level
+/// advisory lock left held in a pooled connection would otherwise wedge
+/// every other caller sharing that pool forever.
+pub async fn with_bootstrap_lock<F, Fut, T>(
+    pool: &deadpool_postgres::Pool,
+    work: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let client = pool.get().await?;
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&HTS_BOOTSTRAP_LOCK])
+        .await?;
+
+    let result = work().await;
+
+    // Always release the lock, even if `work` failed.
+    let _ = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&HTS_BOOTSTRAP_LOCK])
+        .await;
+
+    result
+}
+
 /// Apply the HTS PostgreSQL schema to the given client connection.
 ///
 /// Safe to call on every startup — all statements are idempotent. Concurrent
