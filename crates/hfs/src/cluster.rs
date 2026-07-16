@@ -238,6 +238,45 @@ pub fn resolve_jwks_coordination(
     }
 }
 
+/// Warns (never refuses) when the composite secondary-backend sync outbox
+/// (E1) cannot back cluster-durable delivery.
+///
+/// Unlike the refusal table above, this is deliberately **warn-only**:
+/// `CompositeStorage` wires the durable outbox unconditionally whenever the
+/// primary backend supports it (a Postgres primary) — no env var selects it,
+/// so there is nothing to "refuse" here. On a non-Postgres primary,
+/// composite sync falls back to the pre-existing in-memory-channel
+/// behavior — the *exact same* behavior already shipped single-instance
+/// today, not a cluster-introduced regression. Contrast with subscriptions'
+/// hard refusal: subscription delivery is functionally *broken* (zero
+/// notifications) without Postgres+pg-notify, whereas composite sync
+/// degrading to best-effort in-memory is a known, tolerable, already-shipped
+/// fallback. Only relevant in `Asynchronous`/`Hybrid` mode — `Synchronous`
+/// blocks on the secondary write and is already durable by construction.
+pub fn resolve_composite_sync_durability(
+    cluster: bool,
+    primary_backend: BackendKind,
+    composite_secondary_present: bool,
+    sync_mode_synchronous: bool,
+) -> Option<String> {
+    if !cluster || !composite_secondary_present || sync_mode_synchronous {
+        return None;
+    }
+    if primary_backend != BackendKind::Postgres {
+        return Some(
+            "HFS_CLUSTER=true with a composite secondary backend (an *-elasticsearch storage \
+             mode) on a non-postgres primary: secondary-backend sync stays on the in-memory \
+             async worker (best-effort, not crash-durable) because the durable outbox seam \
+             (E1) is Postgres-primary-only. This is the same fallback behavior as \
+             single-instance today — no regression — but a crash or redeploy can still \
+             silently lose queued secondary-index writes. Consider a postgres primary for \
+             durable composite sync."
+                .to_string(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +528,38 @@ mod tests {
         // Unknown values fail fast, naming the variable.
         let unknown = resolve_jwks_coordination("zookeeper", true, None).unwrap_err();
         assert!(unknown.contains("HFS_AUTH_JWKS_COORDINATION"));
+    }
+
+    /// The E1 resolution table (warn-only by design — contrast with the
+    /// refusal rows above, mirroring C2's `jwks_coordination_resolution_table`).
+    #[test]
+    fn composite_sync_durability_resolution_table() {
+        // Not clustered: never warns, regardless of backend/mode.
+        assert_eq!(
+            resolve_composite_sync_durability(false, BackendKind::MongoDB, true, false),
+            None
+        );
+        // No composite secondary: nothing to warn about.
+        assert_eq!(
+            resolve_composite_sync_durability(true, BackendKind::MongoDB, false, false),
+            None
+        );
+        // Synchronous mode is already durable by blocking — no warning even
+        // on a non-Postgres primary.
+        assert_eq!(
+            resolve_composite_sync_durability(true, BackendKind::MongoDB, true, true),
+            None
+        );
+        // Postgres primary: the outbox is wired, so no warning.
+        assert_eq!(
+            resolve_composite_sync_durability(true, BackendKind::Postgres, true, false),
+            None
+        );
+        // The only warning case: clustered, async/hybrid mode, a composite
+        // secondary, and a non-Postgres primary.
+        let warning =
+            resolve_composite_sync_durability(true, BackendKind::MongoDB, true, false).unwrap();
+        assert!(warning.contains("non-postgres primary"));
     }
 
     #[test]

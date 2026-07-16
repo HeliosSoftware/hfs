@@ -897,6 +897,33 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // E1 — composite secondary-backend sync durability. Warn-only: the
+    // durable outbox wires itself automatically (in `CompositeStorage::new`)
+    // whenever the primary backend supports it, so there is no env var to
+    // validate here, only an operator warning when it can't apply.
+    #[cfg(feature = "elasticsearch")]
+    {
+        let composite_secondary_present = matches!(
+            backend_mode,
+            StorageBackendMode::SqliteElasticsearch
+                | StorageBackendMode::PostgresElasticsearch
+                | StorageBackendMode::MongoDBElasticsearch
+                | StorageBackendMode::S3Elasticsearch
+        );
+        let sync_mode_synchronous = matches!(
+            composite_sync_mode_from_env(),
+            helios_persistence::composite::SyncMode::Synchronous
+        );
+        if let Some(warning) = cluster::resolve_composite_sync_durability(
+            config.cluster,
+            backend_mode.primary_backend_kind(),
+            composite_secondary_present,
+            sync_mode_synchronous,
+        ) {
+            tracing::warn!("{warning}");
+        }
+    }
+
     // Propagate HFS_TERMINOLOGY_SERVER to FHIRPATH_TERMINOLOGY_SERVER so that any
     // FHIRPath evaluation (CDS Hooks, _filter, etc.) delegates terminology
     // operations (memberOf, subsumes) to the configured HTS instance.
