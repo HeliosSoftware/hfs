@@ -72,6 +72,19 @@ jobs:
           path: target/debug/hfs
           retention-days: 1
 
+      - name: Build HTS binary
+        # Phase 4 (C3): needs the postgres feature; kept alongside the
+        # sqlite+R4 defaults so a single build covers both HTS test suites.
+        run: |
+          cargo build -p helios-hts --bin hts --features postgres
+
+      - name: Upload HTS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hts-cluster-smoke-binary
+          path: target/debug/hts
+          retention-days: 1
+
   cluster-smoke:
     name: Cluster smoke (R4 / postgres)
     needs: build
@@ -92,10 +105,18 @@ jobs:
           name: hfs-cluster-smoke-binary
           path: target/debug
 
+      - name: Download HTS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hts-cluster-smoke-binary
+          path: target/debug
+
       - name: Make executables available
         run: |
           chmod +x target/debug/hfs
+          chmod +x target/debug/hts
           chmod +x crates/hfs/tests/cluster/run_external_cluster_smoke.sh
+          chmod +x crates/hfs/tests/cluster/run_external_hts_cluster_smoke.sh
 
       - name: Determine runner and Docker host IP
         run: |
@@ -279,6 +300,61 @@ jobs:
           wait_ready A "$HFS_PID_A" "$HFS_PORT_A" "$HFS_LOG_A"
           wait_ready B "$HFS_PID_B" "$HFS_PORT_B" "$HFS_LOG_B"
 
+      - name: Start HTS instances A and B (Phase 4, C3)
+        run: |
+          # HTS is its own binary with its own Postgres pool, sharing the
+          # same database as the two hfs instances (HTS's tables are
+          # distinctly named — no collision). epoch mode is set explicitly:
+          # this check exists to prove that mode works, not HTS's local
+          # default.
+          HTS_LOG_A="$RESULTS_DIR/hts-a.log"
+          HTS_LOG_B="$RESULTS_DIR/hts-b.log"
+          echo "HTS_LOG_A=$HTS_LOG_A" >> "$GITHUB_ENV"
+          echo "HTS_LOG_B=$HTS_LOG_B" >> "$GITHUB_ENV"
+          echo "HTS_PORT_A=18400" >> "$GITHUB_ENV"
+          echo "HTS_PORT_B=18401" >> "$GITHUB_ENV"
+
+          env \
+            HTS_SERVER_PORT=18400 \
+            HTS_SERVER_HOST=0.0.0.0 \
+            HTS_DATABASE_URL="$PG_URL" \
+            HTS_STORAGE_BACKEND=postgres \
+            HTS_TERMINOLOGY_CACHE_INVALIDATION=epoch \
+            ./target/debug/hts run > "$HTS_LOG_A" 2>&1 &
+          echo "HTS_PID_A=$!" >> "$GITHUB_ENV"
+
+          env \
+            HTS_SERVER_PORT=18401 \
+            HTS_SERVER_HOST=0.0.0.0 \
+            HTS_DATABASE_URL="$PG_URL" \
+            HTS_STORAGE_BACKEND=postgres \
+            HTS_TERMINOLOGY_CACHE_INVALIDATION=epoch \
+            ./target/debug/hts run > "$HTS_LOG_B" 2>&1 &
+          echo "HTS_PID_B=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for both HTS instances to be ready
+        run: |
+          wait_ready() {
+            local name="$1" pid="$2" port="$3" log="$4"
+            for i in {1..45}; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "HTS instance $name exited"
+                cat "$log"
+                return 1
+              fi
+              if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
+                echo "HTS instance $name is ready on port $port"
+                return 0
+              fi
+              echo "Attempt $i/45: HTS instance $name not ready yet..."
+              sleep 2
+            done
+            tail -100 "$log"
+            return 1
+          }
+          wait_ready A "$HTS_PID_A" "$HTS_PORT_A" "$HTS_LOG_A"
+          wait_ready B "$HTS_PID_B" "$HTS_PORT_B" "$HTS_LOG_B"
+
       # Check 5 (Phase 3 WS fan-out) needs a websocket client; same pinned
       # build the subscriptions smoke uses.
       - name: Install websocat
@@ -319,6 +395,14 @@ jobs:
           WEBSOCAT_BIN="$WEBSOCAT_BIN" \
           ./crates/hfs/tests/cluster/run_external_cluster_smoke.sh
 
+      - name: Run HTS cluster smoke check (Phase 4, C3)
+        run: |
+          HTS_BASE_URL_A="http://localhost:$HTS_PORT_A" \
+          HTS_BASE_URL_B="http://localhost:$HTS_PORT_B" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}" \
+          ./crates/hfs/tests/cluster/run_external_hts_cluster_smoke.sh
+
       - name: Nightly kill-9 recovery check (A1)
         if: env.NIGHTLY == 'true'
         run: |
@@ -337,7 +421,7 @@ jobs:
           if [ -f "$RESULTS_DIR/nightly-b.pid" ]; then
             NIGHTLY_B_PID="$(cat "$RESULTS_DIR/nightly-b.pid")"
           fi
-          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}" "$NIGHTLY_B_PID"; do
+          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}" "${HTS_PID_A:-}" "${HTS_PID_B:-}" "$NIGHTLY_B_PID"; do
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
               kill -INT "$pid" 2>/dev/null || true
               for _ in {1..50}; do
