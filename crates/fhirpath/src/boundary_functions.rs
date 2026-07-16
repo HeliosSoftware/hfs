@@ -43,10 +43,12 @@ pub fn low_boundary_function(
     } else if args.len() == 1 {
         match &args[0] {
             EvaluationResult::Integer(p, _, _) => {
+                // A precision outside the representable range yields empty, not an error
+                // (tests-fhir-r5.xml LowBoundaryDecimal3/LowBoundaryNegDecimal3 declare no
+                // expected output). Erroring on `< 0` while returning empty for `> 28` made
+                // the same out-of-range condition behave two different ways (#287).
                 if *p < 0 {
-                    return Err(EvaluationError::InvalidArgument(
-                        "lowBoundary precision must be >= 0".to_string(),
-                    ));
+                    return Ok(EvaluationResult::Empty);
                 }
                 // rust_decimal supports up to 28 decimal places
                 if *p > 28 {
@@ -175,10 +177,10 @@ pub fn high_boundary_function(
     } else if args.len() == 1 {
         match &args[0] {
             EvaluationResult::Integer(p, _, _) => {
+                // See lowBoundary: out-of-range precision yields empty, not an error.
+                // tests-fhir-r5.xml HighBoundaryDecimal3 declares no expected output (#287).
                 if *p < 0 {
-                    return Err(EvaluationError::InvalidArgument(
-                        "highBoundary precision must be >= 0".to_string(),
-                    ));
+                    return Ok(EvaluationResult::Empty);
                 }
                 // rust_decimal supports up to 28 decimal places
                 if *p > 28 {

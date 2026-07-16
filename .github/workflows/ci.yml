@@ -421,6 +421,20 @@ jobs:
     name: Test FHIRPath
     runs-on: [self-hosted, Windows]
     needs: [test-rust]
+    # This job had no ceiling at all, so a hang held a scarce self-hosted Windows
+    # runner until GitHub's 6h default fired. Green runs are ~15-20 min (#287).
+    timeout-minutes: 45
+    env:
+      # The FHIR test cases include mode="tx" tests (txTest01-03) that exercise
+      # %terminologies. Point them at our own HTS rather than the public tx.fhir.org
+      # (#183). HTS serves operations at the root (no /r4, /r5 path segment).
+      # Job-level, not step-level: the pre-flight probe and the server must agree on
+      # the target, and two definitions would drift.
+      FHIRPATH_TERMINOLOGY_SERVER: https://hts.heliossoftware.com
+      # Pinned deliberately. With getLatestRelease, cutting a release in the validator
+      # repo changed this job's verdict with no commit here to review or bisect to.
+      # A test oracle must be a stable reference; bump this in a reviewed PR (#287).
+      FHIRPATH_VALIDATOR_TAG: v0.1.15
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -434,14 +448,16 @@ jobs:
           script: |
             const fs = require('fs');
 
-            console.log('Fetching latest FhirPath Validator release...');
+            const tag = process.env.FHIRPATH_VALIDATOR_TAG;
+            console.log(`Fetching pinned FhirPath Validator release ${tag}...`);
 
-            const { data: release } = await github.rest.repos.getLatestRelease({
+            const { data: release } = await github.rest.repos.getReleaseByTag({
               owner: 'HeliosSoftware',
-              repo: 'Hl7.Fhir.FhirPath.Validator'
+              repo: 'Hl7.Fhir.FhirPath.Validator',
+              tag
             });
 
-            console.log(`Latest FhirPath Validator release: ${release.tag_name}`);
+            console.log(`FhirPath Validator release: ${release.tag_name}`);
 
             // Find the Windows executable archive
             const asset = release.assets.find(asset =>
@@ -571,13 +587,172 @@ jobs:
             } catch { }
             Start-Sleep -Seconds 1
           } while ((Get-Date) -lt $deadline)
-          Write-Warning 'FHIRPath server did not become ready in time'
+          # Was Write-Warning + an implicit exit 0: a server that never started produced
+          # a warning, and the validator then ran 1048 tests against a dead socket and
+          # reported them as ordinary failures. Fail here instead (#287).
+          Write-Host "::error title=fhirpath-server never started::[SERVER-DEAD] fhirpath-server did not answer /health within 30s, so no test in this job would have exercised the evaluator. Failing now rather than reporting a suite of meaningless results. Check the 'Start fhirpath-server' step and target\debug\fhirpath-server.exe."
+          exit 1
 
-      - name: Create FhirPath Results Directory
-        shell: cmd
-        run: if not exist fhirpath-results mkdir fhirpath-results
+      # Must run BEFORE the validator. The validator MERGES into this file (read, upsert
+      # by group/test name, rewrite), this runner checks out with clean:false, and
+      # fhirpath-results/ is untracked -- so a previous run's results survive here. A test
+      # that STOPS executing would keep its stale PASSING entry indefinitely, and the
+      # coverage audit below would happily verify last week's data. Purge, don't
+      # mkdir-if-missing (#287).
+      - name: Purge stale FhirPath results
+        shell: 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''{0}''"'
+        run: |
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'fhirpath-results'
+          if (Test-Path $dir) {
+            Write-Host "Removing stale results directory from a previous run: $dir"
+            Get-ChildItem -Recurse -Force $dir | ForEach-Object { Write-Host "  stale: $($_.Name)" }
+            Remove-Item -Recurse -Force $dir -ErrorAction Stop
+          }
+          # Don't trust Remove-Item's status alone: a file lock (AV scanner, a lingering
+          # validator) can leave it in place, and a silently-surviving file is the whole bug.
+          if (Test-Path $dir) {
+            throw "Failed to purge $dir - refusing to run, because results would be indistinguishable from a previous run's."
+          }
+          New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null
+
+          # Freshness watermark for the audit. 2s of slack for filesystem timestamp
+          # granularity. Belt-and-braces with the purge: the purge can be defeated by a
+          # lock, this can be defeated by a clock, and they don't fail together.
+          $stamp = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString('o')
+          $stamp | Out-File -FilePath "$env:RUNNER_TEMP\fhirpath_job_start.txt" -Encoding ascii
+          Write-Host "Run watermark: $stamp"
+
+      # Establishes out-of-band ground truth BEFORE the suite runs. This is what makes the
+      # failure taxonomy possible: fhirpath-server returns 422 + OperationOutcome for BOTH
+      # "terminology server unreachable" AND "this expression legitimately failed", so
+      # nothing downstream can tell an HTS outage from an evaluator regression by itself.
+      #
+      # Probes HTS DIRECTLY (not through fhirpath-server, which would re-enter the same
+      # ambiguity), and asserts VALUES rather than liveness: an HTS that is 'up' but expands
+      # administrative-gender to 3 concepts is an HTS regression, and a /health check would
+      # misreport that as "HTS fine, your evaluator broke".
+      #
+      # Also serves #287 item 4: it re-validates txTest03's $translate expectation against
+      # live HTS on every run, independently of the type-fidelity limitation that keeps
+      # txTest03 itself on the known-failures list.
+      - name: Pre-flight - probe HTS terminology server
+        id: tx_preflight
+        timeout-minutes: 5
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const base = (process.env.FHIRPATH_TERMINOLOGY_SERVER || '').replace(/\/+$/, '');
+            if (!base) {
+              core.setFailed('[TX-CONFIG-MISSING] FHIRPATH_TERMINOLOGY_SERVER is unset on the Test FHIRPath job. The mode="tx" tests cannot exercise a terminology server without it, and would be silently skipped -- which is the hole #287 closes.');
+              return;
+            }
+
+            // The exact operations txTest01-03 depend on, with the inputs from
+            // patient-example.json (gender=male, address.use=home).
+            const probes = [
+              { id: 'expand', op: 'ValueSet/$expand', expect: '4',
+                desc: 'ValueSet/$expand administrative-gender -> expansion.contains.count()',
+                body: { resourceType: 'Parameters', parameter: [
+                  { name: 'url', valueUri: 'http://hl7.org/fhir/ValueSet/administrative-gender' }] },
+                read: r => String((r.expansion && r.expansion.contains || []).length) },
+              { id: 'validate', op: 'ValueSet/$validate-code', expect: 'true',
+                desc: 'ValueSet/$validate-code administrative-gender/male -> result',
+                body: { resourceType: 'Parameters', parameter: [
+                  { name: 'url', valueUri: 'http://hl7.org/fhir/ValueSet/administrative-gender' },
+                  { name: 'system', valueUri: 'http://hl7.org/fhir/administrative-gender' },
+                  { name: 'code', valueCode: 'male' }] },
+                read: r => String((r.parameter || []).find(p => p.name === 'result')?.valueBoolean) },
+              { id: 'translate', op: 'ConceptMap/$translate', expect: 'H',
+                desc: 'ConceptMap/$translate cm-address-use-v2/home -> match.part(concept).value.code',
+                body: { resourceType: 'Parameters', parameter: [
+                  { name: 'url', valueUri: 'http://hl7.org/fhir/ConceptMap/cm-address-use-v2' },
+                  { name: 'code', valueCode: 'home' },
+                  { name: 'system', valueUri: 'http://hl7.org/fhir/address-use' }] },
+                read: r => String(((r.parameter || []).find(p => p.name === 'match')?.part || [])
+                                    .find(p => p.name === 'concept')?.valueCoding?.code) },
+            ];
+
+            const rows = [];
+            let unreachable = null;
+            const baddata = [];
+
+            for (const p of probes) {
+              const url = `${base}/${p.op}`;
+              let resp = null, lastErr = null, mode = null;
+
+              // Retry with backoff: absorbs a deploy blip or an LB failover WITHOUT
+              // absorbing an outage. Unbounded retry would just be a silent skip again.
+              for (const delay of [0, 5, 15, 45]) {
+                if (delay) await new Promise(r => setTimeout(r, delay * 1000));
+                try {
+                  const r = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/fhir+json', Accept: 'application/fhir+json' },
+                    body: JSON.stringify(p.body),
+                    signal: AbortSignal.timeout(20000),
+                  });
+                  const text = await r.text();
+                  if (!r.ok) {
+                    lastErr = `HTTP ${r.status}: ${text.slice(0, 300)}`;
+                    mode = r.status >= 500
+                      ? `HTTP ${r.status} - HTS is up but returning server errors`
+                      : `HTTP ${r.status} on ${p.op} - HTS is up but the endpoint is wrong or content is not loaded`;
+                    continue;
+                  }
+                  resp = JSON.parse(text);
+                  lastErr = null;
+                  break;
+                } catch (e) {
+                  lastErr = `${e.name}: ${e.message}${e.cause ? ' (' + e.cause + ')' : ''}`;
+                  if (/getaddrinfo|ENOTFOUND|EAI_AGAIN/i.test(lastErr))        mode = 'DNS resolution failed';
+                  else if (/certificate|TLS|SSL|self-signed/i.test(lastErr))   mode = 'TLS handshake failed - certificate may have expired';
+                  else if (/TimeoutError|timed out|aborted/i.test(lastErr))    mode = 'Timed out after 20s per attempt - HTS accepts connections but is not responding';
+                  else if (/ECONNREFUSED/i.test(lastErr))                      mode = 'Connection refused - HTS is not listening';
+                  else                                                         mode = 'Unclassified transport error';
+                }
+              }
+
+              if (lastErr) {
+                unreachable = { mode, err: lastErr, op: p.op };
+                core.info(`  [FAIL] ${p.desc} -- ${mode}`);
+                break; // Once HTS is down, probing the rest costs 90s and teaches nothing.
+              }
+
+              const actual = p.read(resp);
+              if (actual === p.expect) {
+                core.info(`  [ OK ] ${p.desc} = ${actual}`);
+                rows.push(`| \`${p.desc}\` | \`${p.expect}\` | \`${actual}\` | :white_check_mark: |`);
+              } else {
+                core.info(`  [BAD ] ${p.desc} = ${actual} (expected ${p.expect})`);
+                rows.push(`| \`${p.desc}\` | \`${p.expect}\` | \`${actual}\` | :x: |`);
+                baddata.push(`${p.desc} returned ${actual}, expected ${p.expect}`);
+              }
+            }
+
+            require('fs').writeFileSync(
+              require('path').join(process.env.RUNNER_TEMP, 'tx_probe_rows.md'), rows.join('\n'));
+
+            if (unreachable) {
+              core.setOutput('status', 'unreachable');
+              core.setOutput('mode', unreachable.mode);
+              core.setOutput('detail', unreachable.err);
+              core.warning(`[HTS-UNREACHABLE] ${unreachable.mode}. Continuing so the non-terminology tests still report, but the coverage audit will fail this job.`);
+            } else if (baddata.length) {
+              core.setOutput('status', 'baddata');
+              core.setOutput('detail', baddata.join('; '));
+              core.warning(`[HTS-REGRESSION] ${baddata.join('; ')}`);
+            } else {
+              core.setOutput('status', 'healthy');
+              core.info('HTS pre-flight: 3/3 green - terminology data verified correct.');
+            }
 
       - name: Run FhirPath Validation with FHIR Test Cases
+        id: validator
+        # The coverage audit below adjudicates. The validator's own exit code cannot be the
+        # verdict on its own: it is 1 only when (failed > 0 || knownFailuresFixed > 0), so a
+        # test downgraded to inconclusive -- or one that never ran at all -- exits 0 (#287).
+        continue-on-error: true
+        timeout-minutes: 25
         uses: actions/github-script@v9
         with:
           script: |
@@ -632,6 +807,165 @@ jobs:
           name: fhirpath-test-results
           path: fhirpath-results/
           retention-days: 7
+
+      # THE GATE (#287).
+      #
+      # The validator exits 0 for a test that errored, was downgraded to inconclusive, or
+      # never ran at all -- so "the job was green" has never meant "the suite ran". This
+      # step makes green mean something: every test declared in the FHIR test cases either
+      # produced a passing result, or is explicitly declared as a known failure.
+      #
+      # Deliberately NOT a grep for txTest01/02/03. Hardcoding three names protects three
+      # tests and leaves everything else free to vanish; deriving the expectation from the
+      # XML covers all ~1048 and needs no edit when upstream adds a txTest04.
+      - name: Audit conformance coverage
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          TX_STATUS: ${{ steps.tx_preflight.outputs.status }}
+          TX_MODE: ${{ steps.tx_preflight.outputs.mode }}
+          TX_DETAIL: ${{ steps.tx_preflight.outputs.detail }}
+          VALIDATOR_OUTCOME: ${{ steps.validator.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const resultsFile = path.resolve('fhirpath-results', 'Helios Software r5.json');
+            const xmlPath = path.resolve('fhir-test-cases/r5/fhirpath/tests-fhir-r5.xml');
+            const kfPath = path.resolve('crates/fhirpath/tests/data/r5/known-test-failures.json');
+            const codes = [];
+            const lines = [];
+
+            // --- Expected set: the XML is the manifest -------------------------------
+            // <group name="X"> ... <test name="Y" mode="tx"> ... </group>
+            // Comments are stripped first: the corpus carries commented-out tests
+            // (testMatchesUnicodeCharacters), and demanding a result for a test that is
+            // not live would make this gate permanently and unfixably red.
+            const xml = fs.readFileSync(xmlPath, 'utf8').replace(/<!--[\s\S]*?-->/g, '');
+            const expected = [];
+            const re = /<group\s+name="([^"]+)"|<test\s+name="([^"]+)"([^>]*)>/g;
+            let m, group = null;
+            while ((m = re.exec(xml)) !== null) {
+              if (m[1] !== undefined) { group = m[1]; continue; }
+              const attrs = m[3] || '';
+              const mode = (attrs.match(/\bmode="([^"]+)"/) || [])[1] || '';
+              // The runner skips mode="cda" outright (Hl7UnitTests.cs: `if (t.Mode ==
+              // "cda") continue;`), so those tests never produce a result by design and
+              // are not ours to demand.
+              if (mode === 'cda') continue;
+              expected.push({ group, name: m[2], mode });
+            }
+            const txExpected = expected.filter(t => t.mode === 'tx');
+
+            // A scraper that silently matches nothing would make this gate vacuous -- it
+            // would pass loudest exactly when it had stopped checking anything.
+            if (expected.length < 500 || txExpected.length < 3) {
+              core.setFailed(`[MANIFEST-BROKEN] Scraped only ${expected.length} tests (${txExpected.length} mode="tx") from ${xmlPath}; expected >=500 and >=3. Either the test corpus changed shape or this parser broke. Refusing to run a vacuous gate that would pass by checking nothing.`);
+              return;
+            }
+            core.info(`Manifest: ${expected.length} tests declared, ${txExpected.length} mode="tx" (${txExpected.map(t => t.name).join(', ')})`);
+
+            // --- Known failures: tests allowed to fail, each for a stated reason -------
+            const kf = JSON.parse(fs.readFileSync(kfPath, 'utf8')).knownFailures || [];
+            const isKnown = (g, n) => kf.some(e =>
+              (e.groupName || '').trim() === g &&
+              ((e.testName || '').trim() === n || (e.testName || '').trim() === '*'));
+
+            // --- Results file: present, fresh, parseable ------------------------------
+            let doc = null;
+            if (!fs.existsSync(resultsFile)) {
+              core.error(`[RESULTS-MISSING] The validator exited '${process.env.VALIDATOR_OUTCOME}' but produced no ${path.basename(resultsFile)}. Nothing can be asserted about whether any test ran. Treating as failure: a green verdict requires positive evidence that the tests ran, never the absence of evidence that they didn't.`);
+              codes.push('RESULTS-MISSING');
+            } else {
+              const watermark = new Date(fs.readFileSync(
+                path.join(process.env.RUNNER_TEMP, 'fhirpath_job_start.txt'), 'utf8').trim());
+              const mtime = fs.statSync(resultsFile).mtime;
+              if (mtime < watermark) {
+                core.error(`[RESULTS-STALE] ${path.basename(resultsFile)} was last written ${mtime.toISOString()}, before this run started (${watermark.toISOString()}). The validator merges into this file rather than overwriting it, and this self-hosted runner checks out with clean:false -- so this is a previous run's data and any verdict read from it would be last week's answer. The 'Purge stale FhirPath results' step should have prevented this.`);
+                codes.push('RESULTS-STALE');
+              } else {
+                try { doc = JSON.parse(fs.readFileSync(resultsFile, 'utf8')); }
+                catch (e) { core.error(`[RESULTS-CORRUPT] ${resultsFile} is not parseable JSON (${e.message}) -- the validator likely died mid-rewrite.`); codes.push('RESULTS-CORRUPT'); }
+              }
+            }
+
+            // --- Classify every declared test ----------------------------------------
+            const absent = [], failed = [];
+            if (doc) {
+              const byKey = new Map();
+              for (const g of (doc.Groups || [])) {
+                for (const tc of (g.TestCases || [])) byKey.set(JSON.stringify([g.Name, tc.Name]), tc);
+              }
+              for (const t of expected) {
+                if (isKnown(t.group, t.name)) continue; // allowed to fail, by declaration
+                const tc = byKey.get(JSON.stringify([t.group, t.name]));
+                // Result===null means the runner recorded the case but reached no verdict;
+                // that is absence wearing a hat, so it counts as not-executed.
+                if (!tc || tc.Result === null || tc.Result === undefined) absent.push(t);
+                else if (tc.Result !== true) failed.push({ ...t, msg: tc.FailureMessage || '(no message)' });
+              }
+            }
+
+            // --- Verdict --------------------------------------------------------------
+            const txBroken = [...absent, ...failed].filter(t => t.mode === 'tx');
+            if (absent.length || failed.length) {
+              const st = process.env.TX_STATUS;
+              if (txBroken.length && st === 'unreachable') {
+                core.error(`[HTS-UNREACHABLE] ${txBroken.length} terminology test(s) did not pass, and the pre-flight probe could not reach ${process.env.FHIRPATH_TERMINOLOGY_SERVER}: ${process.env.TX_MODE} (${process.env.TX_DETAIL}). THIS IS NOT A REGRESSION IN YOUR CHANGE -- HTS is our own infrastructure and it is down. Fix HTS or wait for it to recover, then re-run. Do not disable the tx tests to get green.`);
+                codes.push('HTS-UNREACHABLE');
+              } else if (txBroken.length && st === 'baddata') {
+                core.error(`[HTS-REGRESSION] HTS is reachable but is serving data that contradicts the FHIR test expectations: ${process.env.TX_DETAIL}. This is a defect in HTS itself, not in the FHIRPath evaluator and not in your PR (unless it touched helios-hts). File against helios-hts before investigating crates/fhirpath.`);
+                codes.push('HTS-REGRESSION');
+              }
+              // Anything the HTS verdict above already explains is reported there and must
+              // not be repeated here: re-listing an outage's tx tests under a heading that
+              // says "terminology infrastructure is not the cause" is a contradiction, and
+              // sends the on-call after the evaluator during an HTS outage.
+              const explainedByHts = txBroken.length && st !== 'healthy';
+              const remaining = explainedByHts
+                ? [...absent, ...failed].filter(t => t.mode !== 'tx')
+                : [...absent, ...failed];
+              if (remaining.length) {
+                const detail = remaining.map(t => t.msg
+                  ? `  ${t.group}/${t.name}: FAILED - ${t.msg}`
+                  : `  ${t.group}/${t.name}: DID NOT EXECUTE (no recorded result)`).join('\n');
+                const txNote = remaining.some(t => t.mode === 'tx')
+                  ? `\n\nThe HTS pre-flight probe was healthy (3/3), so terminology infrastructure is NOT the cause of the tx test(s) above -- this is the evaluator.`
+                  : '';
+                core.error(`[COVERAGE-LOST] ${remaining.length} test(s) declared in tests-fhir-r5.xml did not pass and are not listed in known-test-failures.json:\n${detail}${txNote}\n\nA test marked DID NOT EXECUTE was downgraded to inconclusive by the runner, or never ran at all; neither affects the runner's exit code, which is the silent skip this gate exists to catch. Fix the defect, or add an entry to known-test-failures.json with a reason and a linked issue. Do not delete the test to get green.`);
+                codes.push('COVERAGE-LOST');
+              }
+            }
+
+            // --- Summary --------------------------------------------------------------
+            const probeRows = (() => {
+              try { return fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'tx_probe_rows.md'), 'utf8'); }
+              catch { return ''; }
+            })();
+            lines.push(codes.length
+              ? `## :x: FHIRPath conformance coverage - ${codes.join(', ')}`
+              : `## :white_check_mark: FHIRPath conformance coverage`);
+            lines.push('', `| | |`, `|---|---|`,
+              `| Terminology server | \`${process.env.FHIRPATH_TERMINOLOGY_SERVER}\` |`,
+              `| HTS pre-flight | \`${process.env.TX_STATUS}\` |`,
+              `| Tests declared | ${expected.length} (${txExpected.length} \`mode="tx"\`) |`,
+              `| Known failures | ${kf.length} entries |`,
+              `| Did not execute | ${absent.length} |`,
+              `| Failed | ${failed.length} |`);
+            if (probeRows) lines.push('', '### HTS pre-flight probes', '',
+              '| Probe | Expected | Actual | |', '|---|---|---|---|', probeRows);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+
+            if (codes.length) {
+              core.setFailed(`FHIRPath conformance coverage gate failed: ${codes.join(', ')}`);
+            } else if (process.env.VALIDATOR_OUTCOME === 'failure') {
+              core.setFailed('FhirPath validation reported failures - see the validator step log.');
+            } else {
+              // On the green path this asserts something, so a missing notice means the
+              // gate itself has rotted rather than that everything is fine.
+              core.notice(`All ${expected.length} declared FHIRPath tests are accounted for; ${txExpected.length} terminology tests executed against ${process.env.FHIRPATH_TERMINOLOGY_SERVER}. HTS pre-flight: 3/3.`);
+            }
 
       - name: Cleanup fhirpath-server (Windows)
         if: always()
