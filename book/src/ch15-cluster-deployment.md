@@ -4,9 +4,8 @@ This chapter describes what happens when you run more than one `hfs` instance
 behind a load balancer, which subsystems are cluster-safe today, and how the
 `HFS_CLUSTER` switch enforces a safe configuration at boot.
 
-The full design and its status live in the repository under
-[`docs/cluster-capable-state-design.md`](https://github.com/HeliosSoftware/hfs/blob/main/docs/cluster-capable-state-design.md)
-(discussion #223). This chapter is the operator-facing summary.
+See discussion [#223](https://github.com/HeliosSoftware/hfs/discussions/223)
+for the design background. This chapter is the operator-facing summary.
 
 ---
 

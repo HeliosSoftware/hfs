@@ -1,4 +1,4 @@
-//! T2 cluster-harness helpers (docs/cluster-testing-methodology.md §4).
+//! T2 cluster-harness helpers.
 //!
 //! A cluster bug is a multi-observer bug, and the faithful single-process
 //! simulation of two `hfs` instances is two *freshly constructed* backend

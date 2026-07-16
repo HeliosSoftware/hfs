@@ -1,17 +1,17 @@
-//! T2 cluster twin — Redis-coordinated JWKS refresh
-//! (docs/cluster-testing-strategy.md §5, §8 Phase 2, row C2).
+//! T2 cluster twin — Redis-coordinated JWKS refresh (C2).
 //!
 //! The Redis twin of `rest/tests/jwks_cluster_pg.rs`: two independently
 //! constructed `JwksCache`s, each with its own fresh `RedisJwksCoordination`
-//! (never a cloned handle — methodology §4), over one shared Redis container
-//! and one wiremock IdP whose hit count is the observable.
+//! (never a cloned handle), over one shared Redis container and one wiremock
+//! IdP whose hit count is the observable.
 //!
-//! Gated behind `RUN_REDIS_CLUSTER_TESTS=1` (strategy §5: the Redis seam gets
-//! the identical assertions, runnable on demand, without adding Redis to
-//! every CI run) — see `.github/workflows/redis-cluster-tests.yml`.
+//! Gated behind `RUN_REDIS_CLUSTER_TESTS=1` — the Redis seam gets the
+//! identical assertions as the CI-default DB backend, runnable on demand
+//! without adding Redis to every CI run — see
+//! `.github/workflows/redis-cluster-tests.yml`.
 //!
 //! Tenant-isolation DoD row: N/A — JWKS documents are server-global public
-//! key material; there is no tenant dimension (methodology §6).
+//! key material; there is no tenant dimension.
 
 #![cfg(feature = "redis")]
 

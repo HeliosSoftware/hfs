@@ -1,5 +1,4 @@
-//! Cluster-mode configuration fail-fast validation
-//! (docs/cluster-capable-state-design.md §6).
+//! Cluster-mode configuration fail-fast validation.
 //!
 //! `HFS_CLUSTER=true` declares this process one of N instances behind a load
 //! balancer. Several configurations that are fine single-instance silently

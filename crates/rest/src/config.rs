@@ -149,7 +149,7 @@ pub enum ExportControllerMode {
     Database,
 }
 
-/// Unified async-job store backend (docs/cluster-capable-state-design.md §4).
+/// Unified async-job store backend.
 ///
 /// Selects where cluster-affected async job state (SQL-on-FHIR export,
 /// reindex) lives. Resolved by [`ServerConfig::job_store_backend_mode`].
@@ -161,8 +161,8 @@ pub enum JobStoreBackend {
     Database,
 }
 
-/// Subscriptions event fan-out backend (docs/cluster-capable-state-design.md
-/// §Class B). Resolved by [`ServerConfig::subscriptions_fanout_mode`].
+/// Subscriptions event fan-out backend. Resolved by
+/// [`ServerConfig::subscriptions_fanout_mode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionsFanoutMode {
     /// In-process only — notifications reach only sockets and workers on
@@ -942,8 +942,7 @@ impl ServerConfig {
     /// Resolves the unified async-job store backend.
     ///
     /// An unset value defaults to [`JobStoreBackend::Database`] when
-    /// `cluster` is set and [`JobStoreBackend::Memory`] otherwise
-    /// (docs/cluster-capable-state-design.md §6).
+    /// `cluster` is set and [`JobStoreBackend::Memory`] otherwise.
     pub fn job_store_backend_mode(&self) -> Result<JobStoreBackend, String> {
         match self.job_store_backend.to_lowercase().as_str() {
             "" => Ok(if self.cluster {
@@ -976,8 +975,7 @@ impl ServerConfig {
     /// Resolves the subscriptions fan-out backend.
     ///
     /// An unset value defaults to [`SubscriptionsFanoutMode::PgNotify`] when
-    /// `cluster` is set and [`SubscriptionsFanoutMode::Memory`] otherwise
-    /// (docs/cluster-capable-state-design.md §Class B).
+    /// `cluster` is set and [`SubscriptionsFanoutMode::Memory`] otherwise.
     pub fn subscriptions_fanout_mode(&self) -> Result<SubscriptionsFanoutMode, String> {
         match self.subscriptions_fanout.to_lowercase().as_str() {
             "" => Ok(if self.cluster {

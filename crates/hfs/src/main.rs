@@ -835,9 +835,9 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid storage backend configuration: {}", e))?;
 
     // Cluster-mode fail-fast: refuse configurations that cannot run as one
-    // of N instances (docs/cluster-capable-state-design.md §6) before any
-    // subsystem starts. The audit config is re-parsed by its init function
-    // below; parsing here too is cheap and keeps this check pure. (Auth no
+    // of N instances before any subsystem starts. The audit config is
+    // re-parsed by its init function below; parsing here too is cheap and
+    // keeps this check pure. (Auth no
     // longer participates: #205 made token validation stateless, so it holds
     // no cross-instance state to validate.)
     {

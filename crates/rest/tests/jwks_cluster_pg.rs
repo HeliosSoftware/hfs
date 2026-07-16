@@ -1,10 +1,9 @@
-//! T2 cluster suite — Postgres-coordinated JWKS refresh
-//! (docs/cluster-testing-strategy.md §8 Phase 2, row C2).
+//! T2 cluster suite — Postgres-coordinated JWKS refresh (C2).
 //!
 //! Two independently constructed `JwksCache`s play "instance A" and
-//! "instance B" (docs/cluster-testing-methodology.md §4 — fresh handles,
-//! never a cloned `Arc`), each wired the way `hfs` wires them in cluster
-//! mode: a fresh `PostgresBackend` → `cluster_refresh_cache()` →
+//! "instance B" (fresh handles, never a cloned `Arc`), each wired the way
+//! `hfs` wires them in cluster mode: a fresh `PostgresBackend` →
+//! `cluster_refresh_cache()` →
 //! `StoreJwksCoordination` → `set_coordination`. One wiremock IdP's hit
 //! count is the observable: N concurrent refreshes must produce exactly one
 //! upstream fetch.

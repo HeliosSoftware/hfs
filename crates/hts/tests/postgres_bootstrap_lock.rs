@@ -4,7 +4,7 @@
 //! instances racing the same heavy terminology import — actually serializes
 //! concurrent callers against a shared PostgreSQL database, using two
 //! independently constructed `PostgresTerminologyBackend` handles (never a
-//! cloned `Arc`), per `docs/cluster-testing-strategy.md`'s T2 contract.
+//! cloned `Arc`).
 //!
 //! Run with:
 //!   `cargo test -p helios-hts --features postgres --test postgres_bootstrap_lock`

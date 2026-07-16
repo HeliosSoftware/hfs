@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cluster smoke skeleton (T3 tier of docs/cluster-testing-strategy.md).
+# Cluster smoke skeleton (T3 tier: true multi-process end-to-end).
 #
 # Drives two hfs instances that share one Postgres, plus an nginx round-robin
 # front. This skeleton only asserts behavior that is already cluster-safe on
 # main (shared-Postgres CRUD visibility), calibrating the two-instance harness
 # before any cluster-capable-state phase depends on it — the same
-# calibrate-against-known-good principle the T2 harness uses
-# (docs/cluster-testing-methodology.md §5). Phase 1+ extends this script with
-# the real cross-instance assertions (SoF $export A→B, WS fan-out A→B).
+# calibrate-against-known-good principle the T2 harness uses. Phase 1+
+# extends this script with the real cross-instance assertions (SoF $export
+# A→B, WS fan-out A→B).
 
 BASE_URL_A="${BASE_URL_A:-http://localhost:18200}"
 BASE_URL_B="${BASE_URL_B:-http://localhost:18201}"

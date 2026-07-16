@@ -1,6 +1,5 @@
-//! Cross-instance terminology cache invalidation (Class C3 of the
-//! cluster-capable-state effort — `docs/cluster-capable-state-design.md`
-//! §5 C3).
+//! Cross-instance terminology cache invalidation (cluster-capable-state
+//! effort, Class C3).
 //!
 //! A CodeSystem/ValueSet/ConceptMap write clears this *instance's* response
 //! caches (`PostgresTerminologyBackend::clear_response_caches`,

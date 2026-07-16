@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Nightly T3 kill-9 recovery check (E1) — docs/cluster-testing-strategy.md §8
-# Phase 4, §10. Composite secondary-backend sync is the other worst-blast-
-# radius durable path (alongside A1): this check kill -9s the instance
+# Nightly T3 kill-9 recovery check (E1). Composite secondary-backend sync
+# is the other worst-blast-radius durable path (alongside A1): this check
+# kill -9s the instance
 # whose worker is mid-drain of the composite_sync_outbox and asserts the
 # surviving instance reclaims the orphaned rows and the secondary
 # (Elasticsearch) index converges — no silently lost propagation.

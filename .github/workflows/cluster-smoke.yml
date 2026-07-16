@@ -1,7 +1,7 @@
 name: HFS Cluster Smoke
 
-# T3 tier of docs/cluster-testing-strategy.md (§3, §7): two hfs processes on
-# separate ports sharing one Postgres, behind an nginx round-robin front.
+# T3 tier (true multi-process end-to-end): two hfs processes on separate
+# ports sharing one Postgres, behind an nginx round-robin front.
 #
 # This is the workflow_dispatch skeleton for the cluster-capable-state work
 # (discussion #223). It lands on main ahead of the feature phases because a

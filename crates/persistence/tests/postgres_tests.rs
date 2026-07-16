@@ -11,9 +11,9 @@
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::{BackendCapability, BackendKind};
 
-// T2 cluster-harness helpers shared by the cluster suites
-// (docs/cluster-testing-methodology.md §4). Included by `#[path]` rather than
-// via `mod common;` so this test binary compiles only the harness it uses.
+// T2 cluster-harness helpers shared by the cluster suites. Included by
+// `#[path]` rather than via `mod common;` so this test binary compiles only
+// the harness it uses.
 #[path = "common/cluster_harness.rs"]
 mod cluster_harness;
 
@@ -4269,7 +4269,7 @@ mod postgres_integration {
     }
 
     // ========================================================================
-    // Cluster T2 Tests (docs/cluster-testing-strategy.md §4)
+    // Cluster T2 Tests
     // ========================================================================
 
     /// T2 cross-instance suite for schema initialization: four independently
@@ -4397,9 +4397,9 @@ mod postgres_integration {
 
     // ========================================================================
     // T2 cluster calibration suite — bulk-export job store
-    // (docs/cluster-testing-strategy.md §8 Phase 0).
+    // ========================================================================
     //
-    // The bulk-export job store is already cluster-safe (design §2a); these
+    // The bulk-export job store is already cluster-safe; these
     // tests calibrate the `cluster_harness` helpers against it, so every row
     // must pass green immediately. If a row is red, either the harness is
     // unfaithful or the "already safe" boundary is drawn wrong — both are
@@ -4592,7 +4592,7 @@ mod postgres_integration {
 
     // ========================================================================
     // T2 cluster suite — F5 resource version-id race
-    // (docs/cluster-testing-strategy.md §8 Phase 1).
+    // ========================================================================
     //
     // `update`/`delete` are version-guarded (CAS) and bump the version inside
     // one transaction with the history insert, so two instances racing
@@ -4863,7 +4863,7 @@ mod postgres_integration {
 
     // ========================================================================
     // T2 cluster suite — unified cluster job store (A1 substrate)
-    // (docs/cluster-testing-strategy.md §8 Phase 1).
+    // ========================================================================
     //
     // The `cluster_jobs` table + `ClusterJobStore` back the SoF `$export`
     // (#169) and reindex (A2) surfaces. Every test takes
@@ -5344,7 +5344,7 @@ mod postgres_integration {
 
     // ========================================================================
     // T2 cluster suite — coordinated refresh store (C2 substrate)
-    // (docs/cluster-testing-strategy.md §8 Phase 2).
+    // ========================================================================
     //
     // The `cluster_refresh_cache` table + `ClusterRefreshCache` back the
     // cross-instance single-flight JWKS refresh. The store is deliberately

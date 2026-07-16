@@ -39,9 +39,9 @@ use mongodb::Client;
 use mongodb::bson::{Document, doc};
 use serde_json::json;
 
-// T2 cluster-harness helpers shared by the cluster suites
-// (docs/cluster-testing-methodology.md §4). Included by `#[path]` rather than
-// via `mod common;` so this test binary compiles only the harness it uses.
+// T2 cluster-harness helpers shared by the cluster suites. Included by
+// `#[path]` rather than via `mod common;` so this test binary compiles only
+// the harness it uses.
 #[path = "common/cluster_harness.rs"]
 mod cluster_harness;
 
@@ -3251,7 +3251,7 @@ async fn mongodb_integration_settings_get_surfaces_decode_error() {
 
 // ============================================================================
 // T2 cluster suite — F5 resource version-id race
-// (docs/cluster-testing-strategy.md §8 Phase 1).
+// ============================================================================
 //
 // The Mongo backend was already a version-guarded CAS (`update_one` filters
 // on the version the caller read), so this suite asserts that existing

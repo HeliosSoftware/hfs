@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# T3 wiring check for C3 (docs/cluster-testing-strategy.md §8, Phase 4):
+# T3 wiring check for C3 (HTS terminology cache cross-instance invalidation):
 # import a CodeSystem via HTS instance A, prove a *pre-warmed stale* cache on
 # instance B is invalidated by the shared terminology epoch after an update
 # via A — not just that a cold read on B sees fresh data (which would be true

@@ -1,8 +1,8 @@
 name: HFS Redis Cluster Tests
 
-# Runs the Redis twin of the T2 cluster suites (docs/cluster-testing-strategy.md
-# §5): the Redis seam gets the identical assertions as the CI-default DB
-# backend, without adding Redis to every CI run or making it a merge blocker.
+# Runs the Redis twin of the T2 cluster suites: the Redis seam gets the
+# identical assertions as the CI-default DB backend, without adding Redis to
+# every CI run or making it a merge blocker.
 # Today that is the C2 JWKS-coordination twin
 # (crates/auth/tests/jwks_cluster_redis.rs), gated in-code behind
 # RUN_REDIS_CLUSTER_TESTS=1.

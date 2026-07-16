@@ -1,10 +1,9 @@
-//! T2 cluster suite — SoF `$export` on the database-backed controller
-//! (docs/cluster-testing-strategy.md §8 Phase 1, row A1).
+//! T2 cluster suite — SoF `$export` on the database-backed controller (A1).
 //!
 //! Two independently constructed `DatabaseExportJobController`s over one
-//! shared Postgres container play "instance A" and "instance B"
-//! (docs/cluster-testing-methodology.md §4 — fresh handles, never a cloned
-//! `Arc`). The sink is one shared directory, standing in for the shared
+//! shared Postgres container play "instance A" and "instance B" (fresh
+//! handles, never a cloned `Arc`). The sink is one shared directory,
+//! standing in for the shared
 //! object store the cluster validator requires. Work execution is driven
 //! deterministically via `run_next_sof_export_job` (the worker pool's unit
 //! of work) — no polling loops, no sleeps.

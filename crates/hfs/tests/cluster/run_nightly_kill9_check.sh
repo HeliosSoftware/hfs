@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Nightly T3 kill-9 recovery check (A1) — docs/cluster-testing-strategy.md §8
-# Phase 1, §10. SoF export is one of the two worst-blast-radius durable paths:
-# this check kill -9s the instance holding an export lease mid-run and asserts
-# the surviving instance reclaims the orphaned lease after expiry and completes
-# the job — no lost or torn job, no lock held by the corpse.
+# Nightly T3 kill-9 recovery check (A1). SoF export is one of the two
+# worst-blast-radius durable paths: this check kill -9s the instance holding
+# an export lease mid-run and asserts the surviving instance reclaims the
+# orphaned lease after expiry and completes the job — no lost or torn job,
+# no lock held by the corpse.
 #
 # Deliberately slow (waits out a real ~60s lease expiry), so it runs in the
-# nightly schedule only, never in `cargo test` (methodology §6 determinism
-# rule) and outside coverage.
+# nightly schedule only, never in `cargo test`, and outside coverage.
 #
 # Sequence (deterministic about *which* instance holds the lease):
 #   1. stop B gracefully → only A's workers can claim

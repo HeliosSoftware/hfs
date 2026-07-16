@@ -3,8 +3,7 @@
 //! handles over one shared PostgreSQL database, exercised over real HTTP
 //! (`server::create_app`) so both the `AppState`-layer handler caches and the
 //! `PostgresTerminologyBackend`-layer response caches are covered in one
-//! request, per `docs/cluster-testing-strategy.md`'s T2 `invalidation` DoD
-//! row.
+//! request.
 //!
 //! Run with:
 //!   `cargo test -p helios-hts --features postgres --test postgres_epoch_cluster`
