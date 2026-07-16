@@ -913,6 +913,59 @@ mod tests {
         );
     }
 
+    /// Regression test for #287: `1.587.lowBoundary(-1)` and `1.587.highBoundary(-1)`.
+    ///
+    /// A precision outside the representable range yields empty, not an error. The R5
+    /// test cases (LowBoundaryDecimal3, LowBoundaryNegDecimal3, HighBoundaryDecimal3)
+    /// declare no expected output, i.e. empty. These previously returned
+    /// `Err(InvalidArgument)`, and the resulting error was downgraded to an inconclusive
+    /// by the conformance runner and recorded as a skip, so CI stayed green over it.
+    #[test]
+    fn test_boundary_negative_precision_is_empty_not_error() {
+        let decimal_val = EvaluationResult::decimal(Decimal::from_str("1.587").unwrap());
+        let neg_decimal = EvaluationResult::decimal(Decimal::from_str("-1.587").unwrap());
+        let neg_precision = [EvaluationResult::integer(-1)];
+
+        assert_eq!(
+            low_boundary_function(&decimal_val, &neg_precision).unwrap(),
+            EvaluationResult::Empty,
+            "1.587.lowBoundary(-1) must be empty, not an error"
+        );
+        assert_eq!(
+            low_boundary_function(&neg_decimal, &neg_precision).unwrap(),
+            EvaluationResult::Empty,
+            "(-1.587).lowBoundary(-1) must be empty, not an error"
+        );
+        assert_eq!(
+            high_boundary_function(&decimal_val, &neg_precision).unwrap(),
+            EvaluationResult::Empty,
+            "1.587.highBoundary(-1) must be empty, not an error"
+        );
+    }
+
+    /// The two out-of-range directions must agree: a precision above what `rust_decimal`
+    /// can represent already returned empty, while a negative one returned an error.
+    /// That inconsistency within one function is what #287 corrected.
+    #[test]
+    fn test_boundary_out_of_range_precision_is_consistent() {
+        let decimal_val = EvaluationResult::decimal(Decimal::from_str("1.587").unwrap());
+
+        for precision in [-1, 39] {
+            assert_eq!(
+                low_boundary_function(&decimal_val, &[EvaluationResult::integer(precision)])
+                    .unwrap(),
+                EvaluationResult::Empty,
+                "lowBoundary({precision}) must be empty"
+            );
+            assert_eq!(
+                high_boundary_function(&decimal_val, &[EvaluationResult::integer(precision)])
+                    .unwrap(),
+                EvaluationResult::Empty,
+                "highBoundary({precision}) must be empty"
+            );
+        }
+    }
+
     #[test]
     fn test_last_day_of_month() {
         assert_eq!(last_day_of_month(2020, 2), Some(29)); // Leap year February
