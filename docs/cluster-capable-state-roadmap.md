@@ -2,7 +2,7 @@
 
 **Status:** living tracker — update as each phase/PR lands
 **Branch:** `feat/cluster-capable-state` (off `main`)
-**Last updated:** 2026-07-15 (**Phase 3 code + smoke COMPLETE** — T3 green; full-CI leg of the gate pending a runner-disk re-run, see the Phase 3 gate note)
+**Last updated:** 2026-07-15 (**Phase 3 COMPLETE** — gate met)
 **Companions:**
 [`cluster-capable-state-design.md`](./cluster-capable-state-design.md) (the design, mirror of discussion #223) ·
 [`cluster-testing-strategy.md`](./cluster-testing-strategy.md) (T1/T2/T3 tiers, DoD map, per-phase test plans) ·
@@ -143,15 +143,22 @@ modes reported no cluster stores).
 | **PR 3.4 — validator + docs**: two refusal rows under cluster+subscriptions — explicit `memory` fanout, non-Postgres primary (functional breakage, unlike C2's warn-only); feature-gated enabled resolution (a binary without the engine is exempt); T1 table = 9 collected violations worst-case. ch15 Phase 3 section (WS best-effort + gap detection, outbox at-least-once, **pgbouncer transaction-pooling breaks LISTEN** caveat, heartbeat still unwired), skills updated, design doc Class B `[amended]`. **Verified end-to-end, two binaries + one Postgres**: `$status` active via B for a subscription created on A; token minted on A bound on B; Encounter → A delivered to B's socket over LISTEN/NOTIFY; token re-use on A closed 1008; both refusal messages exact. | `hfs/src/{cluster,main}.rs`, `book/src/ch15-cluster-deployment.md`, skills, design doc | `7563a2c5` |
 | **PR 3.5 — T3 smoke check 5 (the mandatory two-process B1 test)**: websocat client on **B**, matching Encounter written to **A**, event-notification frame asserted on B — plus lifecycle propagation (`$status` active via B), token mint-on-A/bind-on-B, and the sticky-session negative (consumed token rejected on A). Workflow: build gains `subscriptions`, `COMMON_ENV` += `HFS_SUBSCRIPTIONS_ENABLED=true` + explicit `HFS_SUBSCRIPTIONS_FANOUT=pg-notify` (`HFS_CLUSTER` still unset there — fs sink), pinned websocat install; the nginx WS plumbing was already in place. Check-5 section verified locally verbatim before dispatch. | `cluster-smoke.yml`, `run_external_cluster_smoke.sh` | `e9407064` |
 
-**Phase 3 gate (strategy §8):** T3 **cluster-smoke green on first dispatch**
+**Phase 3 gate (strategy §8): MET 2026-07-15.** T3 **cluster-smoke green on
+first dispatch**
 ([run 29459960052](https://github.com/HeliosSoftware/hfs/actions/runs/29459960052)
-— all 5 checks incl. the new WS fan-out A→B and redeem-once negative); all
-B2/B3/B4/B5 T2 suites green locally (10 persistence + 8 T1 engine + 6 PG
-engine + 6 hfs validator + 2 rest config; full pre-existing subscriptions
-suite unedited and green). The full-CI leg hit the known self-hosted-runner
-**disk-full** infrastructure failure twice (`No space left on device` while
-building `helios-fhir` — Linting/Redis suites green, nothing code-related);
-gate to be stamped MET when the re-run lands green.
+— all 5 checks incl. the new WS fan-out A→B and redeem-once negative); full
+CI green on the Phase 3 head `e9407064`
+([run 29459963541](https://github.com/HeliosSoftware/hfs/actions/runs/29459963541),
+attempt 2 — the B2/B3/B4/B5 T2 suites ride `test-rust` via
+`--all-features`); Redis Cluster Tests green on the same head. Locally the
+same suites were green first (10 persistence + 8 T1 engine + 6 PG engine +
+6 hfs validator + 2 rest config; the full pre-existing subscriptions suite
+unedited and green), plus the two-binary end-to-end WS check.
+**Infra note:** attempt 1's `Test Rust` failed twice with `No space left on
+device` — specifically the self-hosted runner **github-agent5**
+(`/Volumes/SN850X-1TB/_work/hfs/hfs/target` full); the rerun scheduled onto
+agent6 and passed. Agent5 needs a manual `cargo clean`/target wipe or it
+will keep poisoning whatever runs it picks up.
 
 ---
 
