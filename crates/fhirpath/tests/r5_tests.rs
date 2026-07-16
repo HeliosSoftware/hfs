@@ -145,11 +145,20 @@ fn start_tx_stub() -> String {
             .await;
 
         // txTest02: validateVS(administrative-gender, Patient.gender) -> result = true.
-        // `validate_vs` sends `url` + `coding`. Unlike $translate, `coding` *is* a
-        // spec parameter for ValueSet/$validate-code and live HTS accepts it.
+        //
+        // `$this.gender` is a bare code with no system, so validate_vs takes its
+        // system-less branch: `url` + `code` + `inferSystem`, letting the server
+        // resolve the system from the ValueSet. It sends a `coding` parameter only
+        // when handed a full Coding, which this test does not do -- so matching on
+        // `coding` here is wrong, and wiremock rightly 404s it.
+        //
+        // Only `url` + `code` are pinned. `inferSystem` is what the client sends
+        // today, but requiring it would assert a server rule this test has not
+        // verified; live HTS accepts this shape, which #289's pre-flight probe
+        // re-checks against the real server on every run.
         Mock::given(method("POST"))
             .and(path("/ValueSet/$validate-code"))
-            .and(|req: &Request| has_params(req, &["url", "coding"]))
+            .and(|req: &Request| has_params(req, &["url", "code"]))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "resourceType": "Parameters",
                 "parameter": [
