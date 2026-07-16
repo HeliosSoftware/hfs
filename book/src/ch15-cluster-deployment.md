@@ -9,6 +9,72 @@ for the design background. This chapter is the operator-facing summary.
 
 ---
 
+## Architecture at a glance
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 40, "rankSpacing": 70}}}%%
+flowchart TB
+    Clients["HTTP + WebSocket clients"]
+    LB["Load balancer<br/>round-robin"]
+    Clients --> LB
+
+    subgraph HFS["hfs instances (N)"]
+        direction LR
+        A["hfs A"]
+        B["hfs B"]
+        Dots1["..."]
+    end
+
+    LB --> HFS
+
+    PG[("PostgreSQL primary<br/>cluster_jobs · cluster_refresh_cache<br/>subscription_state / outbox / ws_tokens<br/>composite_sync_outbox")]
+    HFS ---|"reads / writes<br/>+ LISTEN/NOTIFY"| PG
+
+    S3[("S3 / object storage<br/>bulk export &amp; submit output")]
+    HFS -.-> S3
+
+    ES[("Elasticsearch<br/>(optional secondary)")]
+    HFS -.->|"composite_sync_outbox<br/>drain workers"| ES
+
+    Audit[("Audit sink<br/>database / CloudWatch")]
+    HFS -.-> Audit
+
+    Redis[("Redis<br/>(optional JWKS coordination)")]
+    HFS -.-> Redis
+
+    IdP["Identity provider<br/>JWKS endpoint"]
+    HFS -.->|"single-flight fetch<br/>via cluster_refresh_cache"| IdP
+
+    subgraph HTS["hts instances (N)"]
+        direction LR
+        HA["hts A"]
+        HB["hts B"]
+    end
+
+    HFS -.->|"$expand / $validate-code<br/>via HFS_TERMINOLOGY_SERVER"| HTS
+
+    PG2[("PostgreSQL (HTS)<br/>terminology_epoch<br/>HTS_BOOTSTRAP_LOCK")]
+    HTS --> PG2
+
+    classDef store fill:#1f2937,stroke:#60a5fa,color:#e5e7eb;
+    classDef instance fill:#111827,stroke:#34d399,color:#e5e7eb;
+    classDef external fill:#111827,stroke:#f59e0b,color:#e5e7eb;
+
+    class PG,PG2,S3,ES,Audit,Redis store;
+    class A,B,HA,HB instance;
+    class Clients,LB,IdP external;
+```
+
+Solid edges are load-bearing for every request (the shared PostgreSQL
+primary); dashed edges are optional, async, or specific to a subset of
+requests (S3, Elasticsearch, Redis, the audit sink, JWKS fetches, and HTS
+terminology delegation). `hts` is a separate binary with its own storage and
+its own cluster switch (`HTS_TERMINOLOGY_CACHE_INVALIDATION`, not
+`HFS_CLUSTER`) — see [Terminology (HTS) cache
+coherency](#terminology-hts-cache-coherency-phase-4-c3) below.
+
+---
+
 ## Prerequisites
 
 A cluster is only as shared as its slowest-moving state. Before starting a
