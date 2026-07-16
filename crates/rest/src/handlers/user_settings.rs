@@ -41,6 +41,14 @@ use crate::state::AppState;
 /// Upper bound on the serialized settings document, applied to every write.
 /// The document lives in a single row/document on every backend, so an
 /// unbounded blob degrades reads of *all* of a user's settings at once.
+///
+/// The only other limit on this endpoint is the server-wide request body limit,
+/// which is sized for FHIR Bundles (10 MB by default, and routinely raised) — far
+/// too generous for a document that holds a theme name and a few recent queries.
+/// A settings document is read back on *every* page load and, on backends whose
+/// write is a read-modify-write, re-read and re-written on every retry, so an
+/// oversized one is paid for repeatedly. 256 KiB is orders of magnitude more than
+/// any legitimate document needs.
 const MAX_SETTINGS_DOCUMENT_BYTES: usize = 256 * 1024;
 
 /// Upper bound on saved queries per resource type under the `savedQueries`
@@ -234,17 +242,6 @@ where
         })
 }
 
-/// Maximum size of a settings document body.
-///
-/// The only other limit on this endpoint is the server-wide request body limit,
-/// which is sized for FHIR Bundles (10 MB by default, and routinely raised) — far
-/// too generous for a document that holds a theme name and a few recent queries.
-/// A settings document is read back on *every* page load and, on backends whose
-/// write is a read-modify-write, re-read and re-written on every retry, so an
-/// oversized one is paid for repeatedly. 256 KiB is orders of magnitude more than
-/// any legitimate document needs.
-const MAX_SETTINGS_BYTES: usize = 256 * 1024;
-
 /// Parses and validates a request body as a JSON object of a sane size.
 fn parse_object_body(body: &Bytes) -> RestResult<Value> {
     if body.is_empty() {
@@ -252,12 +249,14 @@ fn parse_object_body(body: &Bytes) -> RestResult<Value> {
             message: "Request body must be a JSON object".to_string(),
         });
     }
-    if body.len() > MAX_SETTINGS_BYTES {
-        return Err(RestError::BadRequest {
+    // A cheap guard on the wire size so an oversized blob is refused before it
+    // is parsed. `validate_settings_document` re-checks the *post-merge*
+    // document, which a small PATCH can still push over the cap.
+    if body.len() > MAX_SETTINGS_DOCUMENT_BYTES {
+        return Err(RestError::PayloadTooLarge {
             message: format!(
-                "Settings document must not exceed {} KiB (received {} KiB)",
-                MAX_SETTINGS_BYTES / 1024,
-                body.len().div_ceil(1024)
+                "Settings document is {} bytes; the limit is {MAX_SETTINGS_DOCUMENT_BYTES}",
+                body.len()
             ),
         });
     }
@@ -322,23 +321,26 @@ mod tests {
 
     #[test]
     fn parse_object_body_rejects_oversized_document() {
-        let bloated = format!(r#"{{"junk":"{}"}}"#, "x".repeat(MAX_SETTINGS_BYTES));
+        let bloated = format!(
+            r#"{{"junk":"{}"}}"#,
+            "x".repeat(MAX_SETTINGS_DOCUMENT_BYTES)
+        );
         let err = parse_object_body(&Bytes::from(bloated)).unwrap_err();
         match err {
-            RestError::BadRequest { message } => assert!(
-                message.contains("must not exceed"),
+            RestError::PayloadTooLarge { message } => assert!(
+                message.contains("the limit is"),
                 "unexpected message: {message}"
             ),
-            other => panic!("expected a bad-request error, got {other:?}"),
+            other => panic!("expected a payload-too-large error, got {other:?}"),
         }
     }
 
     #[test]
     fn parse_object_body_accepts_document_at_the_limit() {
         // Exactly at the limit is fine; only *over* it is rejected.
-        let padding = MAX_SETTINGS_BYTES - r#"{"k":""}"#.len();
+        let padding = MAX_SETTINGS_DOCUMENT_BYTES - r#"{"k":""}"#.len();
         let doc = format!(r#"{{"k":"{}"}}"#, "x".repeat(padding));
-        assert_eq!(doc.len(), MAX_SETTINGS_BYTES);
+        assert_eq!(doc.len(), MAX_SETTINGS_DOCUMENT_BYTES);
         assert!(parse_object_body(&Bytes::from(doc)).unwrap().is_object());
     }
 
