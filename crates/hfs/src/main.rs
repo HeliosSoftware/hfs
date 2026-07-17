@@ -580,6 +580,15 @@ async fn serve(
         // own FHIR API over HTTP. It calls itself on the loopback address, with
         // the configured outbound service token (HFS_OUTBOUND_BEARER_TOKEN) when
         // set, or no credentials when auth is disabled.
+        //
+        // TODO(service-token): when auth is enabled, this relies on an operator
+        // provisioning a valid, non-expiring bearer via HFS_OUTBOUND_BEARER_TOKEN;
+        // without one the self-call is rejected and the conformance pages degrade
+        // to a warning. The follow-up is to mint a short-lived, auto-refreshed
+        // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
+        // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
+        // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
+        // configured from HFS_UI_* client credentials.
         let self_base_url = format!("http://127.0.0.1:{}", config.port);
         let outbound_auth = AuthConfig::from_env().outbound_provider();
         helios_ui::mount(
