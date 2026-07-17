@@ -4,12 +4,13 @@ name: UI Tests
 # WCAG 2.2 AA via axe-core, theme behavior, progressive enhancement, and the
 # no-CDN invariants — the class of behavior tower::oneshot tests cannot reach.
 #
-# Two jobs: `build` compiles the server on the host (which already carries the
-# Rust toolchain, LLD, and the openssl/sqlite build deps), and `browser` runs
-# the Playwright suite inside the official Playwright container (which ships the
-# browsers and their system libraries). The container is why the browser job
-# doesn't need `playwright install --with-deps` — the self-hosted runner has no
-# passwordless sudo to install those libraries itself.
+# The server is built on the host (it already carries the Rust toolchain, LLD,
+# and the openssl/sqlite build deps). The Playwright suite runs inside the
+# official Playwright container via `docker run` — the same in-a-step Docker
+# pattern the Inferno/HTS jobs use, because this self-hosted runner does not
+# support job-level `container:`. The container ships the browsers and their
+# system libraries, so no `playwright install --with-deps` (and no sudo) is
+# needed.
 
 on:
   pull_request:
@@ -27,12 +28,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
+  # Keep in step with @playwright/test in crates/ui/e2e/package.json.
+  PLAYWRIGHT_IMAGE: mcr.microsoft.com/playwright:v1.49.1-noble
 
 jobs:
-  build:
-    name: helios-ui unit tests + server build
+  ui-tests:
+    name: helios-ui browser suite
     # Linux only: the pool also has Windows runners where dtolnay/rust-toolchain
-    # fails (it runs through bash/WSL), and the browser job's container is Linux.
+    # fails (it runs through bash/WSL), and the Playwright image is Linux.
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
@@ -59,44 +62,17 @@ jobs:
       - name: Build hfs (ui feature)
         run: cargo build -p helios-hfs --features ui
 
-      - name: Upload hfs binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: hfs-ui-bin
-          path: target/debug/hfs
-          retention-days: 1
-
-  browser:
-    name: helios-ui browser suite
-    needs: build
-    runs-on: [self-hosted, Linux]
-    # The Playwright container carries the pinned browsers and every system
-    # library they need; keep the tag in step with @playwright/test in
-    # crates/ui/e2e/package.json.
-    container:
-      image: mcr.microsoft.com/playwright:v1.49.1-noble
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          clean: false
-
-      - name: Download hfs binary
-        uses: actions/download-artifact@v4
-        with:
-          name: hfs-ui-bin
-          path: target/debug
-
-      - name: Make hfs executable
-        run: chmod +x target/debug/hfs
-
-      - name: Install e2e dependencies
-        working-directory: crates/ui/e2e
-        run: npm ci
-
-      - name: Run browser suite
-        working-directory: crates/ui/e2e
-        run: npx playwright test
+      # The browser ring, inside the Playwright container. boot.mjs starts the
+      # host-built hfs (mounted at /work/target/debug/hfs) and Playwright drives
+      # it — both live in the container, so they share its localhost.
+      - name: Run browser suite (Playwright container)
+        run: |
+          docker run --rm \
+            -e CI=1 \
+            -v "$GITHUB_WORKSPACE":/work \
+            -w /work/crates/ui/e2e \
+            "$PLAYWRIGHT_IMAGE" \
+            bash -c "npm ci && npx playwright test"
 
       - name: Upload Playwright report
         if: failure()
