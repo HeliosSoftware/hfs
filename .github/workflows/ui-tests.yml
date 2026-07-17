@@ -29,7 +29,10 @@ env:
 jobs:
   ui-tests:
     name: helios-ui browser suite
-    runs-on: [self-hosted]
+    # Pin to a Linux self-hosted runner: the pool also has Windows runners,
+    # where dtolnay/rust-toolchain fails (it shells out through bash/WSL), and
+    # Playwright's browsers + the container fallback are Linux-oriented.
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
