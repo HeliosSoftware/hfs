@@ -4,10 +4,12 @@ name: UI Tests
 # WCAG 2.2 AA via axe-core, theme behavior, progressive enhancement, and the
 # no-CDN invariants — the class of behavior tower::oneshot tests cannot reach.
 #
-# The fast Rust ring (cargo test -p helios-ui) runs first and always. The
-# browser ring boots a freshly built `hfs --features ui` and drives it with
-# Playwright. Everything Node lives under crates/ui/e2e/; the cargo workspace is
-# untouched.
+# Two jobs: `build` compiles the server on the host (which already carries the
+# Rust toolchain, LLD, and the openssl/sqlite build deps), and `browser` runs
+# the Playwright suite inside the official Playwright container (which ships the
+# browsers and their system libraries). The container is why the browser job
+# doesn't need `playwright install --with-deps` — the self-hosted runner has no
+# passwordless sudo to install those libraries itself.
 
 on:
   pull_request:
@@ -27,11 +29,10 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
-  ui-tests:
-    name: helios-ui browser suite
-    # Pin to a Linux self-hosted runner: the pool also has Windows runners,
-    # where dtolnay/rust-toolchain fails (it shells out through bash/WSL), and
-    # Playwright's browsers + the container fallback are Linux-oriented.
+  build:
+    name: helios-ui unit tests + server build
+    # Linux only: the pool also has Windows runners where dtolnay/rust-toolchain
+    # fails (it runs through bash/WSL), and the browser job's container is Linux.
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
@@ -44,8 +45,7 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Configure Rust to use LLD (Linux)
-        if: runner.os == 'Linux'
+      - name: Configure Rust to use LLD
         run: |
           mkdir -p ~/.cargo
           rm -f ~/.cargo/config.toml
@@ -56,40 +56,50 @@ jobs:
       - name: cargo test -p helios-ui
         run: cargo test -p helios-ui
 
-      # Only the browser ring needs a built server and Node; skip cleanly if the
-      # e2e harness is absent (e.g. on a branch that predates it).
       - name: Build hfs (ui feature)
-        if: hashFiles('crates/ui/e2e/package.json') != ''
         run: cargo build -p helios-hfs --features ui
 
-      - name: Set up Node
-        if: hashFiles('crates/ui/e2e/package.json') != ''
-        uses: actions/setup-node@v4
+      - name: Upload hfs binary
+        uses: actions/upload-artifact@v4
         with:
-          node-version: 20
+          name: hfs-ui-bin
+          path: target/debug/hfs
+          retention-days: 1
+
+  browser:
+    name: helios-ui browser suite
+    needs: build
+    runs-on: [self-hosted, Linux]
+    # The Playwright container carries the pinned browsers and every system
+    # library they need; keep the tag in step with @playwright/test in
+    # crates/ui/e2e/package.json.
+    container:
+      image: mcr.microsoft.com/playwright:v1.49.1-noble
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Download hfs binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hfs-ui-bin
+          path: target/debug
+
+      - name: Make hfs executable
+        run: chmod +x target/debug/hfs
 
       - name: Install e2e dependencies
-        if: hashFiles('crates/ui/e2e/package.json') != ''
         working-directory: crates/ui/e2e
         run: npm ci
 
-      # No `--with-deps`: it shells out to sudo apt-get, which the self-hosted
-      # runner can't do non-interactively. Just fetch the pinned browser; the
-      # runner is expected to carry the shared libraries. If a runner lacks
-      # them, run this job in the `mcr.microsoft.com/playwright` container
-      # instead (issue #249's noted fallback), which ships browsers + deps.
-      - name: Install Playwright browser
-        if: hashFiles('crates/ui/e2e/package.json') != ''
-        working-directory: crates/ui/e2e
-        run: npx playwright install chromium
-
       - name: Run browser suite
-        if: hashFiles('crates/ui/e2e/package.json') != ''
         working-directory: crates/ui/e2e
         run: npx playwright test
 
       - name: Upload Playwright report
-        if: ${{ failure() && hashFiles('crates/ui/e2e/package.json') != '' }}
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
