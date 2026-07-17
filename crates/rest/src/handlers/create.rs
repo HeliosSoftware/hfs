@@ -104,6 +104,11 @@ where
         });
     }
 
+    // Organic tenants — a tenant id first seen on a write — get a registry row
+    // so their created_at is captured (#240). Guarded by a per-process cache, so
+    // only the first write for an id touches the registry; best-effort otherwise.
+    state.ensure_tenant_registered(tenant.tenant_id()).await;
+
     // Check for conditional create
     if let Some(search_params) = conditional.if_none_exist() {
         debug!(search_params = %search_params, "Processing conditional create");

@@ -93,6 +93,10 @@ where
                 message: "Bundle must have a type".to_string(),
             })?;
 
+    // A batch/transaction may create the tenant's first resource — capture it
+    // in the registry (#240). Cache-guarded, so only the first write pays it.
+    state.ensure_tenant_registered(tenant.tenant_id()).await;
+
     match bundle_type {
         "batch" => process_batch(&state, tenant, &prefer, &bundle, principal.as_ref()).await,
         "transaction" => {

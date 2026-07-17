@@ -138,9 +138,11 @@ async fn invalid_ids_are_rejected() {
 #[tokio::test]
 async fn list_includes_data_only_tenants_with_counts() {
     let server = create_test_server().await;
-    // A tenant that has data but was never registered.
+    // A tenant that has data but no registry row. Writes auto-register a tenant
+    // now (#240), so deregister it to get the pure data-only state back.
     seed_for(&server, "beta", "Patient").await;
     seed_for(&server, "beta", "Observation").await;
+    server.delete("/admin/tenants/beta").await;
     // A registered tenant with data.
     server
         .post("/admin/tenants")
@@ -160,6 +162,45 @@ async fn list_includes_data_only_tenants_with_counts() {
     assert_eq!(beta["registered"], false);
     assert_eq!(beta["resources"], 2);
     assert!(beta["created_at"].is_null());
+}
+
+#[tokio::test]
+async fn first_write_auto_registers_the_tenant() {
+    let server = create_test_server().await;
+    // A brand-new tenant that was never provisioned via POST /admin/tenants.
+    seed_for(&server, "organic-co", "Patient").await;
+
+    // Its first write captured it in the registry (#240): registered, with a
+    // created_at — no longer a `registered: false, created_at: null` row.
+    let list = server.get("/admin/tenants").await.json::<Value>();
+    let t = find(&list, "organic-co").expect("organic tenant auto-registered by its first write");
+    assert_eq!(t["registered"], true);
+    assert!(
+        t["created_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "created_at captured: {t}"
+    );
+    assert_eq!(t["resources"], 1);
+}
+
+#[tokio::test]
+async fn writing_to_an_already_registered_tenant_does_not_clobber_it() {
+    let server = create_test_server().await;
+    // Provision explicitly, with a display name.
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "pre", "display_name": "Pre Co" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // The write's auto-registration finds a row already there: the duplicate is
+    // treated as success (never fails the write) and must not overwrite the name.
+    seed_for(&server, "pre", "Patient").await;
+
+    let list = server.get("/admin/tenants").await.json::<Value>();
+    let t = find(&list, "pre").expect("pre");
+    assert_eq!(t["registered"], true);
+    assert_eq!(t["display_name"], "Pre Co");
+    assert_eq!(t["resources"], 1);
 }
 
 #[tokio::test]

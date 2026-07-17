@@ -106,6 +106,9 @@ where
         });
     }
 
+    // Capture an organically-appearing tenant in the registry (#240).
+    state.ensure_tenant_registered(tenant.tenant_id()).await;
+
     // Validate ID in body matches URL (if present)
     if let Some(body_id) = resource.get("id").and_then(|v| v.as_str()) {
         if body_id != id {
@@ -263,6 +266,9 @@ where
         fhir_version = %fhir_version,
         "Processing conditional update request"
     );
+
+    // A conditional update can create — capture an organic tenant (#240).
+    state.ensure_tenant_registered(tenant.tenant_id()).await;
 
     // Validate resourceType
     if let Some(body_type) = resource.get("resourceType").and_then(|v| v.as_str()) {

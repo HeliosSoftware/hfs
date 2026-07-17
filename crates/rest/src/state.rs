@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
 use helios_persistence::core::PurgableStorage;
@@ -116,6 +117,12 @@ pub struct AppState<S> {
 
     /// Bulk submit configuration.
     bulk_submit_config: Arc<BulkSubmitConfig>,
+
+    /// Tenant ids this process has already tried to auto-register (#240). A
+    /// positive, append-only in-memory cache so the write path never pays a
+    /// registry lookup: the first write for an id spawns a best-effort
+    /// `register_tenant`, and every later write just sees the id here and skips.
+    seen_tenants: Arc<DashMap<String, ()>>,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -144,6 +151,7 @@ impl<S> Clone for AppState<S> {
             bulk_submit_output: self.bulk_submit_output.clone(),
             bulk_submit_file_auth: self.bulk_submit_file_auth.clone(),
             bulk_submit_config: Arc::clone(&self.bulk_submit_config),
+            seen_tenants: Arc::clone(&self.seen_tenants),
         }
     }
 }
@@ -181,6 +189,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_output: None,
             bulk_submit_file_auth: None,
             bulk_submit_config,
+            seen_tenants: Arc::new(DashMap::new()),
         }
     }
 
@@ -228,6 +237,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_output: None,
             bulk_submit_file_auth: None,
             bulk_submit_config,
+            seen_tenants: Arc::new(DashMap::new()),
         }
     }
 
@@ -386,6 +396,22 @@ impl<S: ResourceStorage> AppState<S> {
     /// Returns a clone of the storage Arc.
     pub fn storage_arc(&self) -> Arc<S> {
         Arc::clone(&self.storage)
+    }
+
+    /// Auto-registers the tenant a write is landing on (#240), best-effort.
+    /// Cheap on the hot path — a single in-memory probe guards it, so only the
+    /// first write for a given id this process touches the registry at all; no
+    /// per-write lookup. The registration itself is idempotent: a duplicate (a
+    /// concurrent registration won the race) or an unsupported backend surfaces
+    /// as an error that is simply dropped, so it never blocks or fails a write.
+    pub async fn ensure_tenant_registered(&self, tenant_id: &str) {
+        // `insert` returns the previous value; `Some` means this id was already
+        // handled. The insert is atomic, so a concurrent first-write for the
+        // same id skips here and the registration runs exactly once.
+        if self.seen_tenants.insert(tenant_id.to_string(), ()).is_some() {
+            return;
+        }
+        let _ = self.storage.register_tenant(tenant_id, None).await;
     }
 
     /// Returns a reference to the server configuration.
