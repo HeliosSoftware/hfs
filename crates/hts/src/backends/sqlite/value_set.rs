@@ -76,6 +76,20 @@ fn cs_id_cache() -> &'static RwLock<SystemIdCacheMap> {
     SYSTEM_ID_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Truncate a URL to at most 80 characters for `hts::probe` log labels,
+/// appending an ellipsis when it was shortened. Operates on `char` boundaries,
+/// so a URL with a multibyte character straddling byte 80 is truncated safely
+/// rather than panicking as a raw `&u[..80]` byte slice would.
+fn truncate_url_for_probe(u: &str) -> String {
+    let mut chars = u.chars();
+    let head: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// Clear the process-wide URL→system_id cache. Called by code paths that
 /// write to the `code_systems` table (CRUD + bulk import).
 pub(crate) fn invalidate_cs_id_cache() {
@@ -215,13 +229,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         let probe_url_short: String = if probe_on {
             req.url
                 .as_deref()
-                .map(|u| {
-                    if u.len() > 80 {
-                        format!("{}…", &u[..80])
-                    } else {
-                        u.to_string()
-                    }
-                })
+                .map(truncate_url_for_probe)
                 .unwrap_or_else(|| "<inline>".to_string())
         } else {
             String::new()
@@ -9054,6 +9062,29 @@ mod tests {
 
     fn backend() -> SqliteTerminologyBackend {
         SqliteTerminologyBackend::in_memory().expect("in-memory backend should initialise")
+    }
+
+    #[test]
+    fn truncate_url_for_probe_is_char_safe() {
+        // Short and exactly-80-char inputs pass through unchanged.
+        assert_eq!(truncate_url_for_probe("http://x/vs"), "http://x/vs");
+        let exactly_80 = "a".repeat(80);
+        assert_eq!(truncate_url_for_probe(&exactly_80), exactly_80);
+
+        // Longer input is truncated to 80 chars with an ellipsis.
+        let long = "a".repeat(81);
+        assert_eq!(
+            truncate_url_for_probe(&long),
+            format!("{}…", "a".repeat(80))
+        );
+
+        // A multibyte character straddling byte 80: the old `&u[..80]` byte slice
+        // panicked here; the char-based truncation keeps 80 chars safely.
+        let multibyte = "€".repeat(100); // 3 bytes each → byte 80 falls mid-char
+        assert_eq!(
+            truncate_url_for_probe(&multibyte),
+            format!("{}…", "€".repeat(80))
+        );
     }
 
     fn ctx() -> TenantContext {
