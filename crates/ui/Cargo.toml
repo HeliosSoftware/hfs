@@ -57,7 +57,10 @@ axum-htmx = { version = "0.8", features = ["auto-vary"] }
 # Static assets (htmx, CSS) embedded into the binary at compile time so the
 # server has no runtime CDN dependency and works in air-gapped deployments.
 # `axum-embed` serves them with precompressed (br/gzip/deflate) negotiation.
-rust-embed = "8"
+# `debug-embed` makes debug builds embed too (the default reads them from the
+# source tree at runtime), so the binary is self-contained wherever it runs —
+# notably the e2e container, which has the binary but not the asset folder.
+rust-embed = { version = "8", features = ["debug-embed"] }
 axum-embed = "0.1"
 
 # Fluent message catalogs (locales/<locale>/main.ftl at the workspace root),
