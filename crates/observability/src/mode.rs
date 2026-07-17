@@ -82,23 +82,25 @@ fn parse(raw: &str) -> Option<ObsMode> {
     }
 }
 
+/// Resolve a raw `HELIOS_OBS_MODE` value to an arm, warning and falling back to
+/// [`ObsMode::Default`] on an unrecognised value rather than failing startup: a
+/// typo in a diagnostic env var should not take a server down, and the warning
+/// is enough to catch a mistyped benchmark arm. Split out from [`mode`] so the
+/// fallback path is unit-testable without the process-global `OnceLock`.
+fn resolve(raw: &str) -> ObsMode {
+    parse(raw).unwrap_or_else(|| {
+        tracing::warn!(
+            value = %raw,
+            "unrecognised HELIOS_OBS_MODE; expected one of default|full|no-span|off — using default"
+        );
+        ObsMode::Default
+    })
+}
+
 /// The process-wide observability arm, read once from `HELIOS_OBS_MODE`.
-///
-/// An unrecognised value warns and falls back to [`ObsMode::Default`] rather
-/// than failing startup: a typo in a diagnostic env var should not take a
-/// server down, and the warning is enough to catch a mistyped benchmark arm.
 pub fn mode() -> ObsMode {
     static MODE: OnceLock<ObsMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        let raw = std::env::var("HELIOS_OBS_MODE").unwrap_or_default();
-        parse(&raw).unwrap_or_else(|| {
-            tracing::warn!(
-                value = %raw,
-                "unrecognised HELIOS_OBS_MODE; expected one of default|full|no-span|off — using default"
-            );
-            ObsMode::Default
-        })
-    })
+    *MODE.get_or_init(|| resolve(&std::env::var("HELIOS_OBS_MODE").unwrap_or_default()))
 }
 
 #[cfg(test)]
@@ -174,5 +176,13 @@ mod tests {
         // OnceLock hands back the same arm on every call.
         let first = mode();
         assert_eq!(first, mode());
+    }
+
+    #[test]
+    fn resolve_maps_known_values_and_falls_back_on_garbage() {
+        assert_eq!(resolve("full"), ObsMode::Full);
+        assert_eq!(resolve(""), ObsMode::Default);
+        // The unrecognised path warns and degrades to Default rather than panicking.
+        assert_eq!(resolve("verbose"), ObsMode::Default);
     }
 }
