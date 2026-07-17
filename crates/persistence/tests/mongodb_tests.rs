@@ -2455,6 +2455,92 @@ async fn mongodb_integration_search_parameter_create_registers_active() {
     assert_eq!(param.status, SearchParameterStatus::Active);
 }
 
+/// The TTL-cache refresh (#235) rebuilds the registry's stored parameters from
+/// what the database currently holds: a parameter written by a cluster-mate
+/// enters resolution on the next refresh, and a deleted one leaves it. This is
+/// the SQLite integration test's contract exercised over the Mongo cursor path.
+#[tokio::test]
+async fn mongodb_integration_refresh_rebuilds_stored_parameters() {
+    use helios_persistence::search::registry::SearchParameterSource;
+
+    let Some(backend) = create_backend("search_param_refresh").await else {
+        eprintln!(
+            "Skipping mongodb_integration_refresh_rebuilds_stored_parameters (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-search-param-refresh");
+
+    backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "mongo-refresh-nickname",
+                "url": "http://example.org/fhir/SearchParameter/mongo-refresh-nickname",
+                "name": "MongoRefreshNickname",
+                "status": "active",
+                "code": "mongo-refresh-nickname",
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.where(use='nickname').given"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Simulate a freshly booted cluster-mate: storage holds the parameter but
+    // its registry has never seen it (drop the write-hook registration).
+    backend
+        .search_registry()
+        .write()
+        .unregister_source(SearchParameterSource::Stored);
+    assert!(
+        backend
+            .search_registry()
+            .read()
+            .get_param("Patient", "mongo-refresh-nickname")
+            .is_none(),
+        "not visible before the refresh"
+    );
+
+    let stored = backend
+        .refresh_stored_search_parameters()
+        .await
+        .expect("refresh from storage");
+    assert_eq!(stored, 1);
+    assert!(
+        backend
+            .search_registry()
+            .read()
+            .get_param("Patient", "mongo-refresh-nickname")
+            .is_some(),
+        "visible after the refresh"
+    );
+
+    // Delete it from storage; the next refresh drops it from resolution.
+    backend
+        .delete(&tenant, "SearchParameter", "mongo-refresh-nickname")
+        .await
+        .unwrap();
+    let stored = backend
+        .refresh_stored_search_parameters()
+        .await
+        .expect("refresh after delete");
+    assert_eq!(stored, 0);
+    assert!(
+        backend
+            .search_registry()
+            .read()
+            .get_param("Patient", "mongo-refresh-nickname")
+            .is_none(),
+        "gone after the refresh"
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_search_parameter_create_draft_not_registered() {
     let Some(backend) = create_backend("search_param_create_draft").await else {

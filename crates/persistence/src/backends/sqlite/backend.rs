@@ -338,6 +338,19 @@ impl SqliteBackend {
     /// This is called during schema initialization to restore any custom
     /// SearchParameters that were POSTed to the server.
     fn load_stored_search_parameters(&self) -> StorageResult<usize> {
+        self.refresh_stored_search_parameters()
+    }
+
+    /// Rebuilds the registry's `Stored` parameters from what the database
+    /// currently holds, returning how many are registered afterwards.
+    ///
+    /// This is the TTL-cache refresh (#235): storage is the source of truth,
+    /// so a SearchParameter POSTed to a cluster-mate appears here on the next
+    /// pass. All rows are read and parsed **before** the write lock is taken
+    /// (the lock is sync and shared with request paths), and on any read
+    /// error the registry is left untouched — a node serves its stale cache
+    /// rather than losing search resolution.
+    pub fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
         let conn = self.get_connection()?;
@@ -353,10 +366,6 @@ impl SqliteBackend {
                 })
             })?;
 
-        let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut registry = self.search_registry.write();
-        let mut count = 0;
-
         let rows = stmt
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(|e| {
@@ -367,6 +376,8 @@ impl SqliteBackend {
                 })
             })?;
 
+        let loader = SearchParameterLoader::new(self.config.fhir_version);
+        let mut definitions = Vec::new();
         for row in rows {
             let data = match row {
                 Ok(data) => data,
@@ -375,7 +386,6 @@ impl SqliteBackend {
                     continue;
                 }
             };
-
             let json: serde_json::Value = match serde_json::from_slice(&data) {
                 Ok(json) => json,
                 Err(e) => {
@@ -383,15 +393,12 @@ impl SqliteBackend {
                     continue;
                 }
             };
-
             match loader.parse_resource(&json) {
                 Ok(mut def) => {
                     // Only register active parameters
                     if def.status == SearchParameterStatus::Active {
                         def.source = SearchParameterSource::Stored;
-                        if registry.register(def).is_ok() {
-                            count += 1;
-                        }
+                        definitions.push(def);
                     }
                 }
                 Err(e) => {
@@ -400,6 +407,17 @@ impl SqliteBackend {
             }
         }
 
+        // Synchronous rebuild under the existing lock; the Arc identity must
+        // be preserved (extractor/ES/chain builders hold clones).
+        let mut registry = self.search_registry.write();
+        registry.unregister_source(SearchParameterSource::Stored);
+        let mut count = 0;
+        for def in definitions {
+            match registry.register(def) {
+                Ok(()) => count += 1,
+                Err(e) => tracing::warn!("Stored SearchParameter not registered: {}", e),
+            }
+        }
         Ok(count)
     }
 
