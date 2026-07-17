@@ -165,4 +165,14 @@ mod tests {
         assert!(ObsMode::Full.reqlog_enabled(false));
         assert!(!ObsMode::Off.reqlog_enabled(true));
     }
+
+    #[test]
+    fn mode_reads_once_and_is_stable() {
+        // Exercises the process-global read path. The value depends on the
+        // ambient `HELIOS_OBS_MODE` (unset in the unit-test process → Default),
+        // so assert on the invariant that matters rather than a fixed arm: the
+        // OnceLock hands back the same arm on every call.
+        let first = mode();
+        assert_eq!(first, mode());
+    }
 }

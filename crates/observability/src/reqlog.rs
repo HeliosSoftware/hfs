@@ -391,4 +391,14 @@ mod tests {
                 < stats.sample_count as u64
         );
     }
+
+    #[test]
+    fn enable_sets_the_consumer_flag() {
+        // The flag is process-global; other tests never call `enable`, so it
+        // starts `false`. `record` is unconditional regardless of this flag —
+        // it gates only the middleware — so flipping it here cannot disturb the
+        // other tests that record directly.
+        enable();
+        assert!(enabled(), "enable() must make enabled() report true");
+    }
 }
