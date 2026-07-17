@@ -325,45 +325,57 @@
     try {
       parsed = JSON.parse(doc);
     } catch (error) {
-      say(String(error), "error");
+      say(messages.msgSaveInvalid || String(error), "error");
       return;
     }
 
-    var isNew = !parsed.id;
-    var url = "/" + resourceType + (isNew ? "" : "/" + parsed.id);
+    // Validate the exact document being saved by re-rendering it (this also
+    // commits a raw edit), then refuse to persist a new version while the
+    // editor reports any issue — an invalid resource must not reach history.
+    send("").then(function () {
+      var form = document.getElementById("editor-form");
+      var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
+      if (errors > 0) {
+        say(messages.msgSaveBlocked, "error");
+        return;
+      }
 
-    fetch(url, {
-      method: isNew ? "POST" : "PUT",
-      headers: {
-        "Content-Type": "application/fhir+json",
-        Accept: "application/fhir+json",
-      },
-      body: doc,
-    })
-      .then(function (response) {
-        return response.json().then(function (payload) {
-          return { ok: response.ok, payload: payload };
+      var isNew = !parsed.id;
+      var url = "/" + resourceType + (isNew ? "" : "/" + parsed.id);
+
+      fetch(url, {
+        method: isNew ? "POST" : "PUT",
+        headers: {
+          "Content-Type": "application/fhir+json",
+          Accept: "application/fhir+json",
+        },
+        body: doc,
+      })
+        .then(function (response) {
+          return response.json().then(function (payload) {
+            return { ok: response.ok, payload: payload };
+          });
+        })
+        .then(function (result) {
+          if (!result.ok) {
+            // The server refused it. Show its OperationOutcome, not our guess.
+            var issue = result.payload && result.payload.issue && result.payload.issue[0];
+            say(
+              (issue && (issue.diagnostics || (issue.details && issue.details.text))) ||
+                "",
+              "error"
+            );
+            return;
+          }
+          say(messages.msgSaved, "ok");
+          if (result.payload && result.payload.id && !parsed.id) {
+            resourceId = result.payload.id;
+          }
+        })
+        .catch(function (error) {
+          say(String(error), "error");
         });
-      })
-      .then(function (result) {
-        if (!result.ok) {
-          // The server refused it. Show its OperationOutcome, not our guess.
-          var issue = result.payload && result.payload.issue && result.payload.issue[0];
-          say(
-            (issue && (issue.diagnostics || (issue.details && issue.details.text))) ||
-              "",
-            "error"
-          );
-          return;
-        }
-        say(messages.msgSaved, "ok");
-        if (result.payload && result.payload.id && !parsed.id) {
-          resourceId = result.payload.id;
-        }
-      })
-      .catch(function (error) {
-        say(String(error), "error");
-      });
+    });
   }
 
   function remove_resource() {

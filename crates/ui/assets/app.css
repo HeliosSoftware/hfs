@@ -2622,7 +2622,7 @@ button.filter-rail__item {
 .editor-validity {
   font-size: 12px;
   font-weight: 600;
-  color: var(--muted);
+  color: #cf222e;
 }
 .editor-validity--ok { color: var(--accent); }
 
@@ -2738,13 +2738,13 @@ button.filter-rail__item {
 }
 
 .editor-row--error .editor-row__input {
-  border-color: var(--accent);
+  border-color: #cf222e;
 }
 
 .editor-row__error {
   margin: 2px 0 4px 0;
   font-size: 12px;
-  color: var(--text);
+  color: #cf222e;
 }
 
 /* ---- "what can I add here?" ---- */
@@ -2923,7 +2923,7 @@ button.filter-rail__item {
 .editor__orphan {
   margin: 8px 0 0;
   font-size: 12px;
-  color: var(--muted);
+  color: #cf222e;
 }
 
 @media (max-width: 1100px) {
