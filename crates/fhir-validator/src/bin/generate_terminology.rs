@@ -43,7 +43,11 @@ fn main() {
 
     let mut failed = false;
     for version in versions {
-        match generate(&resources_root.join(version).join("valuesets.json"), &packs_dir, version) {
+        match generate(
+            &resources_root.join(version).join("valuesets.json"),
+            &packs_dir,
+            version,
+        ) {
             Ok(report) => println!("{report}"),
             Err(e) => {
                 eprintln!("{version}: {e}");
@@ -93,7 +97,9 @@ fn generate(source: &Path, packs_dir: &Path, version: &str) -> Result<String, St
         if r.get("resourceType").and_then(Value::as_str) != Some("CodeSystem") {
             continue;
         }
-        let Some(url) = r.get("url").and_then(Value::as_str) else { continue };
+        let Some(url) = r.get("url").and_then(Value::as_str) else {
+            continue;
+        };
         let mut codes = Vec::new();
         collect_concepts(r.get("concept").and_then(Value::as_array), &mut codes);
         systems.insert(
@@ -112,7 +118,9 @@ fn generate(source: &Path, packs_dir: &Path, version: &str) -> Result<String, St
         if r.get("resourceType").and_then(Value::as_str) != Some("ValueSet") {
             continue;
         }
-        let Some(url) = r.get("url").and_then(Value::as_str) else { continue };
+        let Some(url) = r.get("url").and_then(Value::as_str) else {
+            continue;
+        };
         match expand(r, &systems) {
             Some(codes) if !codes.is_empty() => {
                 table.insert(url.to_string(), codes);
@@ -179,8 +187,15 @@ fn expand(vs: &Value, systems: &BTreeMap<String, CodeSystem>) -> Option<Vec<(Str
             if ex.get("filter").is_some() || ex.get("valueSet").is_some() {
                 return None;
             }
-            let Some(system) = ex.get("system").and_then(Value::as_str) else { continue };
-            for c in ex.get("concept").and_then(Value::as_array).into_iter().flatten() {
+            let Some(system) = ex.get("system").and_then(Value::as_str) else {
+                continue;
+            };
+            for c in ex
+                .get("concept")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 if let Some(code) = c.get("code").and_then(Value::as_str) {
                     drop.insert((system.to_string(), code.to_string()));
                 }

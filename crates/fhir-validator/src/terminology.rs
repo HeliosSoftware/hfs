@@ -208,13 +208,17 @@ mod tests {
         let vs = "http://hl7.org/fhir/ValueSet/administrative-gender";
         for good in ["male", "female", "other", "unknown"] {
             assert!(
-                tx.validate_code(vs, &CodedValue::Code(good.into())).await.unwrap(),
+                tx.validate_code(vs, &CodedValue::Code(good.into()))
+                    .await
+                    .unwrap(),
                 "{good} is a valid administrative-gender code"
             );
         }
         // "masculino" is a Spanish display, not a FHIR code.
         assert!(
-            !tx.validate_code(vs, &CodedValue::Code("masculino".into())).await.unwrap(),
+            !tx.validate_code(vs, &CodedValue::Code("masculino".into()))
+                .await
+                .unwrap(),
             "masculino is not an administrative-gender code"
         );
     }

@@ -158,10 +158,16 @@ async fn delete_deregisters_a_tenant() {
 #[tokio::test]
 async fn page_reports_registry_unavailable_without_a_store() {
     // No storage handle → the page renders the "unavailable" notice, not a crash.
-    let res = helios_ui::mount(Router::new(), "9.9.9", None, helios_ui::NlSearch::default(), None)
-        .oneshot(Request::get("/ui/tenants").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    let res = helios_ui::mount(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        None,
+    )
+    .oneshot(Request::get("/ui/tenants").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let html = body_text(res).await;
     assert!(html.contains("not available"));
