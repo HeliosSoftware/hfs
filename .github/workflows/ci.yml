@@ -63,7 +63,13 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
+          # loadable-bundle linker mode, not valid for executables/test
+          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
+          # map against the shared cache ("syscall to map cache into shared
+          # region failed" -> SystemConfiguration.framework fails to load ->
+          # SIGABRT). Match the Linux side: only bump the main-thread stack.
+          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
       - name: Run tests with all features
         run: |
@@ -162,7 +168,13 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
+          # loadable-bundle linker mode, not valid for executables/test
+          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
+          # map against the shared cache ("syscall to map cache into shared
+          # region failed" -> SystemConfiguration.framework fails to load ->
+          # SIGABRT). Match the Linux side: only bump the main-thread stack.
+          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
       - name: Build pysof wheel
         working-directory: crates/pysof
@@ -214,10 +226,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
+          # loadable-bundle linker mode, not valid for executables/test
+          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
+          # map against the shared cache ("syscall to map cache into shared
+          # region failed" -> SystemConfiguration.framework fails to load ->
+          # SIGABRT). Match the Linux side: only bump the main-thread stack.
+          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Check HTS canonical precedence is centralized (issue #200)
+        run: crates/hts/scripts/check-canonical-precedence.sh
 
       - name: Run clippy
         run: |
@@ -281,7 +302,13 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
+          # loadable-bundle linker mode, not valid for executables/test
+          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
+          # map against the shared cache ("syscall to map cache into shared
+          # region failed" -> SystemConfiguration.framework fails to load ->
+          # SIGABRT). Match the Linux side: only bump the main-thread stack.
+          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
@@ -375,7 +402,13 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
+          # loadable-bundle linker mode, not valid for executables/test
+          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
+          # map against the shared cache ("syscall to map cache into shared
+          # region failed" -> SystemConfiguration.framework fails to load ->
+          # SIGABRT). Match the Linux side: only bump the main-thread stack.
+          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
@@ -749,7 +782,13 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
+          # loadable-bundle linker mode, not valid for executables/test
+          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
+          # map against the shared cache ("syscall to map cache into shared
+          # region failed" -> SystemConfiguration.framework fails to load ->
+          # SIGABRT). Match the Linux side: only bump the main-thread stack.
+          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
       - name: Build Release (Windows)
         if: matrix.os == 'Windows'
