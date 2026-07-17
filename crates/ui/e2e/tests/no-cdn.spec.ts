@@ -1,8 +1,18 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "../pages/fixtures";
 
 // crates/ui/README.md states "rules of the road" that were enforced only by
-// review. These make three of them executable.
-const ROUTES = ["/ui", "/ui/resources", "/ui/compartments", "/ui/search-parameters"];
+// review. These make three of them executable, across every full page.
+const ROUTES = [
+  "/ui",
+  "/ui/resources",
+  "/ui/compartments",
+  "/ui/search-parameters",
+  "/ui/queries",
+  "/ui/history",
+  "/ui/search",
+  "/ui/tenants",
+  "/ui/editor?type=Patient",
+];
 
 test("no page makes an external-origin request (no CDN)", async ({ page, baseURL }) => {
   const origin = new URL(baseURL!).origin;

@@ -10,12 +10,28 @@ Everything Node lives here; the cargo workspace is untouched.
 
 ## Layout
 
+Specs live in `tests/`; the **Page Object Model** lives in `pages/` — one class
+per page/component, wired onto Playwright's `test` via `pages/fixtures.ts`. Specs
+import `{ test, expect }` from `../pages/fixtures` and receive page objects as
+fixtures (`async ({ resources, history }) => …`); `pages/api.ts` seeds resources
+over the REST API for state-dependent tests.
+
 | Path | What it covers |
 |------|----------------|
-| `tests/a11y.spec.ts` | axe-core WCAG 2.2 AA over `/ui`, `/ui/resources`, `/ui/compartments`, `/ui/search-parameters`, light × dark |
+| `tests/a11y.spec.ts` | axe-core WCAG 2.2 AA over every full page, light × dark |
+| `tests/no-cdn.spec.ts` | no off-origin requests, no page errors, no inline `<script>` — every page |
 | `tests/theme.spec.ts` | FOUC guard, OS-preference precedence, PATCH merge-patch, server-roam, graceful degradation |
-| `tests/no-cdn.spec.ts` | no off-origin requests, no page errors, no inline `<script>` blob |
-| `tests/resources-editor.spec.ts` | Resources edit flows: Create targets the picked type, inline binding validation, Save blocked on invalid, raw-edit round-trips to the FHIR API |
+| `tests/chrome.spec.ts` | the collapsible nav: toggle, aria sync, localStorage cache, `/_user/settings` roam |
+| `tests/dashboard.spec.ts` | stat cards, chart, time-window + legend link controls |
+| `tests/resources.spec.ts` | type rail (filter + live counts), **every resource type is reachable**, modal open/close, delete |
+| `tests/resources-editor.spec.ts` | edit flows: Create targets the picked type, inline binding validation, Save blocked on invalid, raw-edit round-trips |
+| `tests/editor-controls.spec.ts` | fold/expand, add-node (+filter), remove, `value[x]` choice, ad-hoc extension, standalone `/ui/editor` |
+| `tests/history.spec.ts` | version rail, from/to selects, the **show-metadata diff checkbox**, deep-link, not-found |
+| `tests/compartments.spec.ts` | rail + tabs, and the membership tester's four outcomes (member/self/not-member/fan-out) |
+| `tests/queries.spec.ts` | query builder: run → results, pagination, add-condition, per-type param datalist, Recent |
+| `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
+| `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
+| `tests/tenants.spec.ts` | add-tenant slide-over, htmx search filter, delete (skips if no tenant store) |
 | `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) |
 
 ## Run it

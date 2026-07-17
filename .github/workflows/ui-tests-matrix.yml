@@ -16,6 +16,10 @@ on:
   schedule:
     # 06:00 UTC nightly.
     - cron: "0 6 * * *"
+  # While the suite is being built out, run the full matrix on every push to the
+  # e2e branch so coverage growth is validated across all backends as it lands.
+  push:
+    branches: [feat/249-ui-e2e]
 
 concurrency:
   group: ui-tests-matrix-${{ github.ref }}
