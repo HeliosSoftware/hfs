@@ -81,10 +81,10 @@ pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
     EffectHandlers, TerminologyError, TerminologyProvider,
 };
-pub use terminology::{CoreTerminology, core_terminology};
 pub use engine::{
     ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
     Validator, dotted_to_fhirpath,
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};
+pub use terminology::{CoreTerminology, core_terminology};
