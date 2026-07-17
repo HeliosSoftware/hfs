@@ -63,13 +63,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
-          # loadable-bundle linker mode, not valid for executables/test
-          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
-          # map against the shared cache ("syscall to map cache into shared
-          # region failed" -> SystemConfiguration.framework fails to load ->
-          # SIGABRT). Match the Linux side: only bump the main-thread stack.
-          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Run tests with all features
         run: |
@@ -168,13 +174,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
-          # loadable-bundle linker mode, not valid for executables/test
-          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
-          # map against the shared cache ("syscall to map cache into shared
-          # region failed" -> SystemConfiguration.framework fails to load ->
-          # SIGABRT). Match the Linux side: only bump the main-thread stack.
-          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Build pysof wheel
         working-directory: crates/pysof
@@ -226,13 +238,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
-          # loadable-bundle linker mode, not valid for executables/test
-          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
-          # map against the shared cache ("syscall to map cache into shared
-          # region failed" -> SystemConfiguration.framework fails to load ->
-          # SIGABRT). Match the Linux side: only bump the main-thread stack.
-          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -302,13 +320,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
-          # loadable-bundle linker mode, not valid for executables/test
-          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
-          # map against the shared cache ("syscall to map cache into shared
-          # region failed" -> SystemConfiguration.framework fails to load ->
-          # SIGABRT). Match the Linux side: only bump the main-thread stack.
-          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
@@ -402,13 +426,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
-          # loadable-bundle linker mode, not valid for executables/test
-          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
-          # map against the shared cache ("syscall to map cache into shared
-          # region failed" -> SystemConfiguration.framework fails to load ->
-          # SIGABRT). Match the Linux side: only bump the main-thread stack.
-          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
@@ -782,13 +812,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # NOTE: do NOT pass `-undefined dynamic_lookup` here. That is a
-          # loadable-bundle linker mode, not valid for executables/test
-          # binaries. On Apple Silicon it yields Mach-O binaries dyld cannot
-          # map against the shared cache ("syscall to map cache into shared
-          # region failed" -> SystemConfiguration.framework fails to load ->
-          # SIGABRT). Match the Linux side: only bump the main-thread stack.
-          echo 'rustflags = ["-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Build Release (Windows)
         if: matrix.os == 'Windows'
