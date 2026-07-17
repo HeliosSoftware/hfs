@@ -14,14 +14,6 @@ use helios_hts::state::AppState;
 #[cfg(feature = "postgres")]
 use helios_hts::backends::PostgresTerminologyBackend;
 
-fn init_logging(log_level: &str) {
-    use tracing_subscriber::{EnvFilter, fmt};
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
-
-    fmt().with_env_filter(filter).with_target(false).init();
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -30,7 +22,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| Command::Run(HtsConfig::parse_from(["hts"])))
     {
         Command::Run(config) => {
-            init_logging(&config.log_level);
+            helios_observability::uptime::init();
+            helios_observability::telemetry::init("hts", &config.log_level);
+            helios_observability::metrics::init("hts");
             info!(
                 port = config.port,
                 host = %config.host,
@@ -46,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 &args.log_level
             };
-            init_logging(log_level);
+            helios_observability::telemetry::init("hts", log_level);
             let code = run_import(args).await?;
             std::process::exit(code);
         }

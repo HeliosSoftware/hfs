@@ -19,6 +19,10 @@ const RESERVED_SYSTEM_PATHS: &[&str] = &[
     "v1",
     "v2",
     "fhir",
+    // Management-console namespace (`/console/metrics/*`). Reserved so a tenant
+    // can never be named `console` under URL-path routing, keeping the console
+    // paths unambiguous with the authz console guard (see `middleware::auth`).
+    "console",
 ];
 
 /// Checks if a path segment is a reserved path (not a tenant identifier).
@@ -207,6 +211,11 @@ mod tests {
         assert!(extract_tenant_from_path("/Provenance/123", &version).is_none());
         assert!(extract_tenant_from_path("/AuditEvent/456", &version).is_none());
         assert!(extract_tenant_from_path("/Binary/789", &version).is_none());
+
+        // The management-console namespace must never be parsed as a tenant, so
+        // `console` cannot shadow / be confused with a tenant literally named
+        // "console" under URL-path routing.
+        assert!(extract_tenant_from_path("/console/metrics/uptime", &version).is_none());
     }
 
     #[test]
@@ -216,6 +225,11 @@ mod tests {
         // System paths
         assert!(is_reserved_path("metadata", &version));
         assert!(is_reserved_path("health", &version));
+
+        // Management-console namespace is reserved (case-insensitive), so a
+        // tenant named "console" cannot exist under URL-path routing.
+        assert!(is_reserved_path("console", &version));
+        assert!(is_reserved_path("Console", &version));
 
         // FHIR resource types (case insensitive)
         assert!(is_reserved_path("Patient", &version));

@@ -7,20 +7,103 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
 use crate::core::sof_runner::SofRunner;
-use crate::error::{StorageError, StorageResult};
+use crate::error::{BackendError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
+/// A registered tenant, as returned by the tenant registry.
+///
+/// A "tenant" is otherwise implicit — any well-formed tenant id is accepted the
+/// first time it is used. The registry makes tenants **first-class** so they can
+/// be listed with a creation date and an optional human-friendly name, and
+/// explicitly provisioned or removed via the admin API. The `id` is the value
+/// used everywhere in the API (the `X-Tenant-ID` header, the URL prefix, or the
+/// JWT tenant claim); `display_name` is purely for presentation and is never
+/// used for routing or scoping. See [`ResourceStorage::list_tenants`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TenantRecord {
+    /// The tenant id — the value used to scope data and route requests.
+    pub id: String,
+    /// Optional human-friendly display name (presentation only).
+    pub display_name: Option<String>,
+    /// RFC 3339 timestamp of when the tenant was registered.
+    pub created_at: String,
+}
+
+/// One UTC-day bucket of stored-resource counts.
+///
+/// Returned by [`ResourceStorage::count_by_day`] to back "FHIR resources over
+/// time" dashboards. See that method for the precise counting semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyResourceCount {
+    /// The UTC calendar day this bucket covers.
+    pub day: NaiveDate,
+    /// Number of non-deleted, current-version resources whose `last_updated`
+    /// falls on `day`.
+    pub count: u64,
+}
+
+/// One fixed-width time bucket of net stored-resource growth.
+///
+/// Returned by [`ResourceStorage::count_deltas_by_bucket`] to back
+/// creation-time-accurate "FHIR resources over time" charts. See that method for
+/// the precise counting semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceCountDelta {
+    /// Inclusive start of the bucket (UTC), aligned to the Unix epoch.
+    pub bucket_start: DateTime<Utc>,
+    /// Creations minus deletions recorded in this bucket. May be negative.
+    pub delta: i64,
+}
+
+/// Floors `ts` to the start of the epoch-aligned bucket of width
+/// `bucket_seconds` that contains it. Shared by the backends (to compute the
+/// query's lower bound) and by callers densifying a returned series, so both
+/// agree on where bucket boundaries fall. A non-positive `bucket_seconds`
+/// returns `ts` unchanged.
+pub fn bucket_floor(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
+    if bucket_seconds <= 0 {
+        return ts;
+    }
+    let secs = ts.timestamp();
+    // `div_euclid` floors toward negative infinity, so pre-1970 instants (which
+    // have negative epoch seconds) still land on the bucket that contains them.
+    let floored = secs.div_euclid(bucket_seconds) * bucket_seconds;
+    DateTime::from_timestamp(floored, 0).unwrap_or(ts)
+}
+
+/// One `(weekday, hour)` cell of write-activity, used by
+/// [`ResourceStorage::activity_histogram`] to back the dashboard's "Activity"
+/// heatmap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityCell {
+    /// UTC day of week, `0` = Sunday … `6` = Saturday (matching JavaScript's
+    /// `Date.getDay()`, so the frontend can index directly).
+    pub weekday: u8,
+    /// UTC hour of day, `0` … `23`.
+    pub hour: u8,
+    /// Number of write operations (resource versions) in this cell.
+    pub count: u64,
+}
+
 /// Audit event helpers for purge operations.
-#[cfg(feature = "audit")]
 pub mod audit {
     use helios_audit::{AuditAction, AuditEventBuilder, AuditSink};
 
     /// Record an audit event for a purge (permanent deletion) operation.
+    ///
+    /// `outcome` is a FHIR `AuditEvent.outcome` code — `"0"` on success, `"8"`
+    /// on failure. A purge that fails partway across a composite deployment
+    /// (say, the search secondary rejects the delete) must still be recorded,
+    /// so failures are audited with `outcome = "8"` and an `outcome_desc`
+    /// naming the backend that failed. There is no partial-success code: a
+    /// purge either removed the resource everywhere or it did not.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_purge_event(
         sink: &dyn AuditSink,
         source_observer: &str,
@@ -29,6 +112,8 @@ pub mod audit {
         resource_id: Option<&str>,
         count: u64,
         patient_ref: Option<&str>,
+        outcome: &str,
+        outcome_desc: Option<&str>,
     ) {
         let mut builder = AuditEventBuilder::new(source_observer)
             .event_type(
@@ -36,7 +121,7 @@ pub mod audit {
                 "object",
             )
             .action(AuditAction::Delete)
-            .outcome("0")
+            .outcome(outcome)
             .detail("audit-operation", "purge")
             .detail("count", count.to_string());
         if let Some(id) = resource_id {
@@ -50,61 +135,131 @@ pub mod audit {
         if let Some(p) = patient_ref {
             builder = builder.patient(p);
         }
+        if let Some(d) = outcome_desc {
+            builder = builder.outcome_desc(d);
+        }
         sink.record(builder.build()).await;
     }
 
     #[cfg(test)]
     mod tests {
-        use helios_audit::{AuditAction, AuditEventBuilder};
+        use super::*;
+        use crate::test_audit::{CollectorSink, detail_map};
 
-        #[test]
-        fn test_purge_event_action_is_delete() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .event_type(
-                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "object",
-                )
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .detail("audit-operation", "purge")
-                .resource("Patient", "123")
-                .detail("count", "1")
-                .build();
+        /// Purge is a destructive operation, so the event must carry the `D`
+        /// action code — that is what a BALP consumer filters on.
+        #[tokio::test]
+        async fn test_purge_event_action_is_delete() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "Patient",
+                Some("123"),
+                1,
+                None,
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(events.len(), 1);
             assert_eq!(
-                event.action.as_ref().and_then(|a| a.value.as_deref()),
+                events[0].action.as_ref().and_then(|a| a.value.as_deref()),
                 Some("D")
+            );
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("audit-operation").map(String::as_str),
+                Some("purge")
+            );
+            assert_eq!(details.get("count").map(String::as_str), Some("1"));
+        }
+
+        /// A type-level `purge_all` has no single resource id, so the type must
+        /// still be recoverable from the event.
+        #[tokio::test]
+        async fn test_purge_all_event_records_resource_type_and_count() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                None,
+                "Observation",
+                None,
+                15,
+                None,
+                "0",
+                None,
+            )
+            .await;
+
+            let events = sink.events();
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("resource-type").map(String::as_str),
+                Some("Observation")
+            );
+            assert_eq!(details.get("count").map(String::as_str), Some("15"));
+        }
+
+        /// A purge that fails on one backend of a composite deployment must
+        /// still be audited, with a failure outcome and the backend named.
+        /// Before `outcome` was a parameter this was impossible — the helper
+        /// hardcoded `"0"`, so a failed purge looked exactly like a successful
+        /// one in the audit log.
+        #[tokio::test]
+        async fn test_purge_failure_is_audited_with_outcome_8() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                Some("Practitioner/dr-1"),
+                "Patient",
+                Some("123"),
+                0,
+                None,
+                "8",
+                Some("purge failed on secondary 'es'"),
+            )
+            .await;
+
+            let events = sink.events();
+            assert_eq!(
+                events[0].outcome.as_ref().and_then(|o| o.value.as_deref()),
+                Some("8")
+            );
+            assert_eq!(
+                events[0]
+                    .outcome_desc
+                    .as_ref()
+                    .and_then(|d| d.value.as_deref()),
+                Some("purge failed on secondary 'es'")
             );
         }
 
-        #[test]
-        fn test_purge_event_includes_count() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .event_type(
-                    "http://terminology.hl7.org/CodeSystem/audit-event-type",
-                    "object",
-                )
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .detail("audit-operation", "purge")
-                .resource("Observation", "obs-1")
-                .detail("count", "15")
-                .build();
-            let details = event.entity.as_ref().unwrap()[0].detail.as_ref().unwrap();
-            let count_detail = details
-                .iter()
-                .find(|d| d.r#type.value.as_deref() == Some("count"));
-            assert!(count_detail.is_some());
-        }
+        /// Purging a patient-compartment resource must attach the patient
+        /// entity, which is what the BALP patient-oriented profiles key on.
+        #[tokio::test]
+        async fn test_purge_with_patient_has_patient_entity() {
+            let sink = CollectorSink::new();
+            record_purge_event(
+                &sink,
+                "Device/hfs",
+                None,
+                "Observation",
+                Some("obs-1"),
+                1,
+                Some("Patient/456"),
+                "0",
+                None,
+            )
+            .await;
 
-        #[test]
-        fn test_purge_with_patient_has_patient_entity() {
-            let event = AuditEventBuilder::new("Device/hfs")
-                .action(AuditAction::Delete)
-                .outcome("0")
-                .resource("Observation", "obs-1")
-                .patient("Patient/456")
-                .build();
-            let entities = event.entity.as_ref().unwrap();
+            let events = sink.events();
+            let entities = events[0].entity.as_ref().unwrap();
             assert_eq!(entities.len(), 2);
             assert_eq!(
                 entities[1]
@@ -182,6 +337,15 @@ pub mod audit {
 pub trait ResourceStorage: Send + Sync {
     /// Returns a human-readable name for this storage backend.
     fn backend_name(&self) -> &'static str;
+
+    /// Whether this backend's stored data is shared across all HFS instances in a
+    /// cluster (a networked database) vs. local to one instance (e.g. an on-disk
+    /// SQLite file). Used to label console metrics honestly in multi-instance
+    /// deployments. Conservative default: `false` (never over-claims cluster
+    /// consistency).
+    fn is_cluster_shared(&self) -> bool {
+        false
+    }
 
     /// Creates a new resource.
     ///
@@ -380,6 +544,234 @@ pub trait ResourceStorage: Send + Sync {
     /// The default implementation returns `None`.
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
         None
+    }
+
+    /// Counts non-deleted resources for several types in one call.
+    ///
+    /// Returns `(resource_type, count)` pairs in the same order as
+    /// `resource_types`. The default implementation issues one
+    /// [`count`](Self::count) query per type; backends may override with a
+    /// single grouped query.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_types` - The FHIR resource types to count
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        let mut counts = Vec::with_capacity(resource_types.len());
+        for &rt in resource_types {
+            counts.push((rt.to_string(), self.count(tenant, Some(rt)).await?));
+        }
+        Ok(counts)
+    }
+
+    /// Counts non-deleted, current-version resources of `resource_type`,
+    /// grouped by the UTC calendar day of their `last_updated`, restricted to
+    /// days on or after `since`.
+    ///
+    /// Only non-empty days are returned, in ascending day order. This powers
+    /// "FHIR resources over time" dashboards.
+    ///
+    /// # Semantics
+    ///
+    /// A resource contributes to the day of its **most recent** version, so a
+    /// running cumulative sum of these buckets converges to the current total
+    /// reported by [`count`](Self::count); it does not reconstruct historical
+    /// creation dates. A creation-time-accurate series would require
+    /// aggregating `resource_history` and is intentionally out of scope here.
+    ///
+    /// The default implementation returns an empty series for backends that
+    /// cannot bucket by time; callers should treat that as "no time resolution
+    /// available" and fall back to the current total.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_type` - The FHIR resource type to bucket
+    /// * `since` - Inclusive lower bound; only days on or after this instant
+    async fn count_by_day(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _since: DateTime<Utc>,
+    ) -> StorageResult<Vec<DailyResourceCount>> {
+        Ok(Vec::new())
+    }
+
+    /// Buckets net stored-resource growth of `resource_type` into fixed-width
+    /// time buckets, from the immutable `resource_history` log.
+    ///
+    /// This is the creation-time-accurate counterpart to
+    /// [`count_by_day`](Self::count_by_day). Where that method buckets the
+    /// *current* row by its `last_updated` — so a resource silently moves to a
+    /// newer bucket every time it is edited — this one buckets the write events
+    /// themselves, which never change once written. That makes the resulting
+    /// curve stable under later edits and therefore meaningful at sub-day
+    /// resolution, where the retroactive drift of `count_by_day` would dominate.
+    ///
+    /// # Semantics
+    ///
+    /// Each history version contributes a delta to the bucket its `last_updated`
+    /// falls in: a creation (`version_id = "1"`, not deleted) is `+1`, a delete
+    /// is `-1`, and a plain update is `0`. A bucket's `delta` is the sum, so it
+    /// may be negative. Only non-empty buckets are returned, in ascending order.
+    ///
+    /// Callers reconstruct the curve by summing deltas forward from a baseline of
+    /// `count() - sum(deltas in window)`, which pins the final point to the live
+    /// total from [`count`](Self::count). Any drift — a resurrecting `PUT` after
+    /// a delete, which re-adds a resource under a non-`1` version and so is not
+    /// counted as `+1`, or history predating this table — is absorbed into that
+    /// baseline rather than showing up as a wrong endpoint.
+    ///
+    /// The default implementation returns an empty series for backends with no
+    /// history log; callers should treat that as "no time resolution available"
+    /// and fall back to the current total.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_type` - The FHIR resource type to bucket
+    /// * `since` - Inclusive lower bound on version `last_updated`
+    /// * `bucket_seconds` - Bucket width in seconds (e.g. `60` for one-minute
+    ///   buckets, `86_400` for daily). Buckets are aligned to the Unix epoch, so
+    ///   day-width buckets line up with UTC calendar days. Must be positive.
+    async fn count_deltas_by_bucket(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _since: DateTime<Utc>,
+        _bucket_seconds: i64,
+    ) -> StorageResult<Vec<ResourceCountDelta>> {
+        Ok(Vec::new())
+    }
+
+    /// Buckets write activity into a weekly-rhythm grid by UTC weekday and hour.
+    ///
+    /// Every resource version (create, update, or delete) recorded in
+    /// `resource_history` on or after `since` counts as one write operation; the
+    /// result is the per-`(weekday, hour)` operation count aggregated across the
+    /// whole window. Only non-empty cells are returned, so callers densify into
+    /// the full 7×24 grid themselves.
+    ///
+    /// This powers the dashboard "Activity" heatmap. It reflects **writes only**
+    /// — reads and searches are not in `resource_history`; an
+    /// all-operations variant would draw from `AuditEvent` instead.
+    ///
+    /// The default implementation returns an empty grid for backends that cannot
+    /// bucket by time.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `since` - Inclusive lower bound; only versions on or after this instant
+    async fn activity_histogram(
+        &self,
+        _tenant: &TenantContext,
+        _since: DateTime<Utc>,
+    ) -> StorageResult<Vec<ActivityCell>> {
+        Ok(Vec::new())
+    }
+
+    /// Counts non-deleted resources grouped by resource type for `tenant`,
+    /// returning one `(resource_type, count)` pair per type present. Order is
+    /// unspecified; callers sort as needed.
+    ///
+    /// Powers the dashboard "resource composition" treemap. Unlike
+    /// [`count_by_types`](Self::count_by_types), the caller does not supply the
+    /// type list — every stored type is discovered via a single `GROUP BY`. The
+    /// default implementation returns an empty list (it cannot enumerate types
+    /// without such a query); the SQL and document backends override it.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    async fn count_all_types(&self, _tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        Ok(Vec::new())
+    }
+
+    /// Counts non-deleted resources grouped by tenant across the entire backend.
+    ///
+    /// **This intentionally spans tenants** and exists for operator/admin
+    /// dashboards (the per-tenant comparison widget), not for tenant-scoped
+    /// request handling — hence it takes no [`TenantContext`]. The default
+    /// implementation returns an empty list; the SQL and document backends
+    /// override it with a single `GROUP BY tenant_id`.
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        Ok(Vec::new())
+    }
+
+    // ---- Tenant registry (first-class tenant maintenance) ------------------
+    //
+    // These make tenants explicit, backing the admin `/admin/tenants` API
+    // (list / add / delete). They are administrative and span tenants, so they
+    // take no `TenantContext`. Backends that do not maintain a registry keep the
+    // defaults: `supports_tenant_registry` is `false`, reads are empty, and the
+    // mutating calls report an unsupported-capability error rather than
+    // pretending to succeed.
+
+    /// Whether this backend maintains a first-class tenant registry (the
+    /// `list_tenants` / `register_tenant` / `deregister_tenant` /
+    /// `purge_tenant_data` family). The admin API returns `501 Not Implemented`
+    /// when this is `false`. Default `false`; the primary backends (SQLite,
+    /// PostgreSQL, MongoDB, S3) override it, and composite storage forwards the
+    /// primary's answer.
+    fn supports_tenant_registry(&self) -> bool {
+        false
+    }
+
+    /// Lists registered tenants (registry rows only — this does **not** include
+    /// tenants that merely have data but were never registered; the admin
+    /// handler merges those in from [`count_by_tenant`](Self::count_by_tenant)).
+    /// Ordered by `created_at` ascending. Default: empty.
+    async fn list_tenants(&self) -> StorageResult<Vec<TenantRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Looks up a single registered tenant by id. Default: `None`.
+    async fn get_tenant(&self, _id: &str) -> StorageResult<Option<TenantRecord>> {
+        Ok(None)
+    }
+
+    /// Registers (provisions) a new tenant, stamping `created_at` with the
+    /// current time. Returns [`StorageError`] if the tenant is already
+    /// registered. Default: unsupported-capability error.
+    async fn register_tenant(
+        &self,
+        _id: &str,
+        _display_name: Option<&str>,
+    ) -> StorageResult<TenantRecord> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Removes a tenant's registration row. Returns `true` if a row was removed,
+    /// `false` if the tenant was not registered. This does **not** delete the
+    /// tenant's stored data — see [`purge_tenant_data`](Self::purge_tenant_data).
+    /// Default: unsupported-capability error.
+    async fn deregister_tenant(&self, _id: &str) -> StorageResult<bool> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Permanently deletes all of a tenant's stored resources (current rows,
+    /// history, and search index). Returns the number of current-version
+    /// resource rows removed. Invoked by the delete path only when the
+    /// teardown policy is enabled. Default: unsupported-capability error.
+    async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
+        Err(self.tenant_registry_unsupported())
+    }
+
+    /// Builds the unsupported-capability error used by the tenant-registry
+    /// default methods. Not part of the public surface — a helper for the
+    /// defaults above.
+    #[doc(hidden)]
+    fn tenant_registry_unsupported(&self) -> StorageError {
+        StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: self.backend_name().to_string(),
+            capability: "tenant-registry".to_string(),
+        })
     }
 }
 

@@ -188,6 +188,11 @@ where
         // responses when the client sends `Accept-Encoding`.
         .layer(RequestDecompressionLayer::new())
         .layer(CompressionLayer::new())
+        // Observability: `/metrics` (state-free) + per-request metrics/trace span.
+        .merge(helios_observability::metrics::router())
+        .layer(axum::middleware::from_fn(
+            helios_observability::middleware::track,
+        ))
         .layer(cors)
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,

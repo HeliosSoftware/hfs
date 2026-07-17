@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -23,6 +23,30 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
         migrate_schema(conn, current_version)?;
     }
 
+    // Safety net for the tenant registry (schema v14). A pre-release build could
+    // stamp a database at the registry's version without creating the `tenants`
+    // table (the migration was completed after the version bump), leaving the
+    // version-gated migration above unable to re-run. The table's DDL is
+    // `IF NOT EXISTS` and idempotent, so ensuring it here every startup
+    // self-heals such databases and is a no-op for correctly-migrated ones.
+    ensure_tenants_table(conn)?;
+
+    Ok(())
+}
+
+/// Idempotently ensures the tenant-registry table exists. Called on every
+/// startup as a self-heal (see [`initialize_schema`]); also the body of the
+/// v12 -> v13 migration.
+fn ensure_tenants_table(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tenants (
+            id TEXT PRIMARY KEY,
+            display_name TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("ensure tenants table: {e}")))?;
     Ok(())
 }
 
@@ -269,6 +293,8 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             9 => migrate_v9_to_v10(conn)?,
             10 => migrate_v10_to_v11(conn)?,
             11 => migrate_v11_to_v12(conn)?,
+            12 => migrate_v12_to_v13(conn)?,
+            13 => migrate_v13_to_v14(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1190,6 +1216,40 @@ fn migrate_v11_to_v12(conn: &Connection) -> StorageResult<()> {
     add_bulk_submit_worker_schema(conn)
 }
 
+/// Migrate from schema version 12 to version 13.
+///
+/// Adds the `user_settings` table that backs the per-user UI settings store
+/// (theme, default tenant, active FHIR version, recent queries, …). One opaque
+/// JSON document is stored per user, keyed by `user_key`, with a monotonic
+/// `version` for optimistic locking. This table is intentionally independent of
+/// the FHIR `resources` table so UI preferences never leak into FHIR machinery.
+fn migrate_v12_to_v13(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_settings (
+            user_key   TEXT NOT NULL PRIMARY KEY,
+            data       BLOB NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create user_settings table: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 13 to version 14.
+///
+/// Adds the tenant registry: a canonical list of first-class tenants backing
+/// the admin tenant-maintenance API (list / add / delete). Until now a tenant
+/// was only ever an implicit identifier string; this table records the tenants
+/// that have been explicitly provisioned, with an optional human-friendly
+/// display name and a creation timestamp. Tenants that merely have data but
+/// were never registered are still discoverable via a `GROUP BY tenant_id` on
+/// `resources`; the registry adds the metadata that data alone cannot provide.
+fn migrate_v13_to_v14(conn: &Connection) -> StorageResult<()> {
+    ensure_tenants_table(conn)
+}
+
 fn migration_err(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(crate::error::BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -1272,6 +1332,79 @@ mod tests {
         assert!(tables.contains(&"resource_history".to_string()));
         assert!(tables.contains(&"search_index".to_string()));
         assert!(tables.contains(&"schema_version".to_string()));
+        // The tenant registry (schema v14) is created on a fresh init.
+        assert!(tables.contains(&"tenants".to_string()));
+    }
+
+    #[test]
+    fn test_migration_creates_tenants_table_on_upgrade() {
+        // Build a pre-registry schema (no `tenants` table) then upgrade it exactly
+        // as `initialize_schema` would for an existing database.
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema_v1(&conn).unwrap();
+        let _ = get_schema_version(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        migrate_v3_to_v4(&conn).unwrap();
+        migrate_v4_to_v5(&conn).unwrap();
+        migrate_v5_to_v6(&conn).unwrap();
+        migrate_v6_to_v7(&conn).unwrap();
+        migrate_v7_to_v8(&conn).unwrap();
+        migrate_v8_to_v9(&conn).unwrap();
+        migrate_v9_to_v10(&conn).unwrap();
+        migrate_v10_to_v11(&conn).unwrap();
+        migrate_v11_to_v12(&conn).unwrap();
+        migrate_v12_to_v13(&conn).unwrap();
+        set_schema_version(&conn, 13).unwrap();
+
+        // No tenants table before the upgrade.
+        let before: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tenants'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+
+        // The same entry point the server uses on an existing database.
+        initialize_schema(&conn).unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let after: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tenants'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "the upgrade must create the tenants table");
+    }
+
+    #[test]
+    fn test_initialize_schema_self_heals_missing_tenants_table() {
+        // Simulate a database left at the registry's version by a pre-release
+        // build that stamped the version but never created the table (the
+        // version-gated migration then can't re-run). initialize_schema restores it.
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute("DROP TABLE tenants", []).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Re-init (as a server restart would) heals it without a version change.
+        initialize_schema(&conn).unwrap();
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tenants'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "initialize_schema must self-heal the tenants table"
+        );
     }
 
     #[test]

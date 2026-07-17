@@ -472,6 +472,17 @@ fn populate_properties<'a, B: TerminologyBackend>(
         for c in contains.iter_mut() {
             if let Some(list) = map.remove(&(c.system.clone(), c.code.clone())) {
                 let cs_types = prop_types_by_system.get(&c.system);
+                // Dedupe identical (property, value) pairs. `concept_property_values`
+                // joins by CodeSystem URL only, so when the same URL is stored
+                // in more than one version (e.g. v3-ActReason from UTG plus the
+                // IG's own cs-act-reason.json fixture), a concept's `status`
+                // property is returned once per version. The IG
+                // `tho/expand-vs-act-exclusion` fixture expects a single
+                // `status` entry — an exact-pair dedupe collapses the versions
+                // while still allowing genuinely-distinct same-code properties
+                // (e.g. multiple `parent` values) through.
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
                 c.properties = list
                     .into_iter()
                     .filter(|(code, value)| {
@@ -485,6 +496,7 @@ fn populate_properties<'a, B: TerminologyBackend>(
                         // Only emit when the status is non-active.
                         !(code == "status" && value == "active")
                     })
+                    .filter(|pair| seen.insert(pair.clone()))
                     .map(|(code, value)| {
                         // Pick the FHIR `value[x]` shape from the property
                         // code:
@@ -626,6 +638,50 @@ fn pure_full_system_includes(value_set: Option<&Value>) -> Option<Vec<(String, O
         out.push((system.to_string(), version));
     }
     Some(out)
+}
+
+/// Systems of any include that designates a hierarchy subtree via an `is-a` or
+/// `descendent-of` filter on `concept`/`code`. Such a compose should expand
+/// hierarchically by default (nest matched concepts under their in-result
+/// ancestors) — tx.fhir.org behaviour, pinned by the IG `search/search-filter-yes`
+/// fixture, which upstream flipped from a flat to a nested expected expansion.
+/// Any non-empty exclude disqualifies (curated set, not a faithful subtree).
+/// Returns None when no include carries a subsumption filter, so plain
+/// full-system, enumerated, and text-`filter`-only composes keep the flat
+/// default. Unlike [`pure_full_system_includes`] the caller applies this to the
+/// URL-resolved ValueSet too, not just inline composes.
+fn subsumption_filter_includes(value_set: Option<&Value>) -> Option<Vec<(String, Option<String>)>> {
+    let compose = value_set?.get("compose")?;
+    if compose
+        .get("exclude")
+        .and_then(|e| e.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return None;
+    }
+    let includes = compose.get("include")?.as_array()?;
+    let mut out = Vec::new();
+    for inc in includes {
+        let Some(system) = inc.get("system").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(filters) = inc.get("filter").and_then(|f| f.as_array()) else {
+            continue;
+        };
+        let is_subsumption = filters.iter().any(|f| {
+            let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            let prop = f.get("property").and_then(|v| v.as_str()).unwrap_or("");
+            matches!(op, "is-a" | "descendent-of") && matches!(prop, "concept" | "code")
+        });
+        if is_subsumption {
+            let version = inc
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            out.push((system.to_string(), version));
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// The HL7 `hl7TermMaintInfra` system + code identifying a designation as
@@ -1559,6 +1615,53 @@ async fn process_expand_inner<B: TerminologyBackend>(
                 hierarchical = Some(true);
             }
         }
+        // A compose that designates a hierarchy subtree via an is-a /
+        // descendent-of filter also defaults to tree mode — and unlike the
+        // pure-full-system case this applies to URL-resolved ValueSets too
+        // (the IG `search/search-filter-yes` fixture is URL-resolved). Inspect
+        // the inline compose when present, else fetch the referenced VS.
+        //
+        // Paging suppresses this default. Tree mode returns the whole subtree —
+        // the backends drop `count`/`offset` and report no `offset` — so nesting a
+        // paged request would silently ignore what the caller asked for, and
+        // answering `count=10` over a SNOMED is-a root would first read that
+        // root's ~10^5 descendants. The IG agrees: every fixture pairing a
+        // subsumption filter with count/offset (`simple-cases/simple-expand-isa-
+        // {c2,o2,o2c2}`, `snomed/expand-pc-none`) expects a flat list, and no
+        // fixture expecting nesting pages. A text `filter` does NOT suppress it —
+        // `search/search-filter-yes` filters and still expects a tree. An explicit
+        // `hierarchical=true` / `excludeNested=false` nests regardless.
+        if hierarchical.is_none() && count.is_none() && offset.is_none() {
+            let ctx = TenantContext::system();
+            let resolved_vs: Option<Value> = if value_set.is_some() {
+                value_set.clone()
+            } else if let Some(u) = url.as_ref() {
+                ValueSetOperations::search(
+                    state.backend(),
+                    &ctx,
+                    crate::types::ResourceSearchQuery {
+                        url: Some(u.clone()),
+                        version: pipe_version.clone(),
+                        count: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|mut v| v.pop())
+            } else {
+                None
+            };
+            // No `code_system_is_hierarchical` gate here: an is-a /
+            // descendent-of filter already implies a hierarchy intent, and over
+            // a flat CS it resolves to just the filter's own code, so nesting is
+            // a harmless no-op. Gating on hierarchy detection would instead
+            // silently drop nesting when that probe under-reports (as it does
+            // for the `search` CS).
+            if subsumption_filter_includes(resolved_vs.as_ref()).is_some() {
+                hierarchical = Some(true);
+            }
+        }
     }
 
     // ── Resolve supplements (request `useSupplement` params) ────────────────
@@ -1948,7 +2051,25 @@ async fn process_expand_inner<B: TerminologyBackend>(
             None
         }
     };
-    let (_, source_vs_search) = tokio::join!(flags_fut, source_vs_fut);
+    // Which ValueSet row would the backend itself resolve for this URL? Ask it,
+    // rather than re-deriving the answer by sorting version strings below.
+    // Same-URL precedence depends on `authority_rank`, a storage column that is
+    // deliberately absent from the FHIR resource, so a Rust-side sort cannot see
+    // it and would echo the re-published copy while the backend expanded the
+    // original (issue #200, ValueSet path). Only needed when no version is pinned.
+    let resolved_vs_version_fut = async {
+        match (&url_for_neg_cache, &req_vs_version) {
+            (Some(u), None) => {
+                ValueSetOperations::value_set_version_for_url(state.backend(), &ctx, u)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        }
+    };
+    let (_, source_vs_search, resolved_vs_version) =
+        tokio::join!(flags_fut, source_vs_fut, resolved_vs_version_fut);
     let source_vs: Option<Value> = if url_for_neg_cache.is_some() {
         source_vs_search.and_then(|mut v| {
             // If a specific version was requested, return the row whose
@@ -1968,7 +2089,15 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     .find(|r| r.get("version").and_then(|x| x.as_str()) == Some(want.as_str()))
                     .cloned();
                 exact.or_else(|| v.into_iter().next())
+            } else if let Some(ref resolved) = resolved_vs_version {
+                // Echo the row the backend actually resolved.
+                v.iter()
+                    .find(|r| r.get("version").and_then(|x| x.as_str()) == Some(resolved.as_str()))
+                    .cloned()
+                    .or_else(|| v.into_iter().next())
             } else {
+                // Backend has no opinion (unversioned row, or a backend that does
+                // not implement the accessor): fall back to highest version.
                 v.sort_by(|a, b| {
                     let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
                     let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
@@ -3481,13 +3610,25 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     pinned_version = Some(default_v.clone());
                 }
             }
-            // When no version pin is in effect, fetch up to 20 candidates and
-            // pick the highest version — mirrors `resolve_value_set_versioned`'s
-            // order-by-version-DESC behaviour.  `count: Some(1)` against the
+            // When no version pin is in effect, fetch up to 20 candidates and pick
+            // the one the BACKEND would resolve.  `count: Some(1)` against the
             // search SQL (which orders by created_at) yields the earliest-
             // imported row instead, silently picking vs-version-a1 over -a2
             // for the `default-valueset-version/indirect-expand-zero` fixture.
+            //
+            // The winner is asked of the backend rather than re-derived by sorting
+            // version strings: precedence depends on `authority_rank`, a storage
+            // column absent from the resource JSON, so a Rust-side sort would echo
+            // a re-published copy while the backend expanded the original.
             let count_hint = if pinned_version.is_some() { 1 } else { 20 };
+            let resolved_vs_version: Option<String> = if pinned_version.is_none() {
+                ValueSetOperations::value_set_version_for_url(state.backend(), &ctx, &bare_url)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let referenced_vs: Option<Value> = ValueSetOperations::search(
                 state.backend(),
                 &ctx,
@@ -3503,9 +3644,22 @@ async fn process_expand_inner<B: TerminologyBackend>(
             .and_then(|mut hits| {
                 if pinned_version.is_some() {
                     hits.pop()
+                } else if let Some(ref resolved) = resolved_vs_version {
+                    hits.iter()
+                        .find(|r| {
+                            r.get("version").and_then(|x| x.as_str()) == Some(resolved.as_str())
+                        })
+                        .cloned()
+                        .or_else(|| {
+                            hits.sort_by(|a, b| {
+                                let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                bv.cmp(av)
+                            });
+                            hits.into_iter().next()
+                        })
                 } else {
-                    // No pin: highest version wins (matches the backend's
-                    // `ORDER BY COALESCE(version,'') DESC` resolution).
+                    // Backend has no opinion: fall back to highest version.
                     hits.sort_by(|a, b| {
                         let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
                         let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");

@@ -2267,15 +2267,16 @@ pub fn iter_ndjson_chunks<R: BufRead>(
 // End Streaming/Chunked Processing Types
 // =============================================================================
 
-/// Parse a JSON value into a FhirResource for the given FHIR version.
+/// Parse a JSON value into a [`helios_fhir::FhirResource`] for the given FHIR version.
 ///
-/// This is used internally for streaming/chunked processing where we have
-/// raw JSON that needs to be converted to typed resources for FHIRPath evaluation.
-/// Crate-internal entry point for the compartment filter to convert raw
-/// JSON to a typed `FhirResource` (matching the version the caller already
-/// negotiated). Wraps the private [`parse_json_to_fhir_resource`] without
-/// exposing it as a public stable API.
-pub(crate) fn parse_json_to_fhir_resource_pub(
+/// Used for streaming/chunked processing where raw JSON must be converted to typed
+/// resources for FHIRPath evaluation. It is the stable entry point callers use to
+/// build the `external` resources passed to
+/// [`PreparedViewDefinition::process_chunk_with_external`] — e.g. the compartment
+/// filter, the remote-`resolve()` prefetch, and the persistence layer's
+/// storage-backed `resolve()` prefetch. Wraps the private
+/// [`parse_json_to_fhir_resource`].
+pub fn parse_json_to_fhir_resource_pub(
     json: serde_json::Value,
     version: FhirVersion,
 ) -> Result<helios_fhir::FhirResource, SofError> {

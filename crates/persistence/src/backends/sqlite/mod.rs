@@ -75,5 +75,6 @@ pub mod search;
 mod search_impl;
 mod storage;
 mod transaction;
+mod user_settings;
 
 pub use backend::{SqliteBackend, SqliteBackendConfig};

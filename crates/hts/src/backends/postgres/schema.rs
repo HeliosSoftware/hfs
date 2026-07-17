@@ -30,7 +30,19 @@ CREATE TABLE IF NOT EXISTS code_systems (
     content      TEXT NOT NULL DEFAULT 'complete',
     resource_json JSONB,
     created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    -- Provenance precedence among rows sharing `url`; lower wins. 0 = the source
+    -- owns this canonical URL (or came from outside any package); 2 = a package
+    -- re-published someone else's canonical (e.g. hl7.fhir.r4.core shipping a
+    -- truncated copy of a terminology.hl7.org CodeSystem).
+    --
+    -- Deliberately NULLABLE with no default: NULL means 'no source has claimed
+    -- this row yet', which is what every pre-existing row looks like right after
+    -- the column is added. Readers COALESCE it to 0, so an un-re-imported database
+    -- behaves exactly as before. A DEFAULT 0 would make 'asserted authoritative'
+    -- indistinguishable from 'never asserted', and a re-imported copy could then
+    -- never demote itself.
+    authority_rank INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_code_systems_url_version
     ON code_systems(url, COALESCE(version, ''));
@@ -127,7 +139,9 @@ CREATE TABLE IF NOT EXISTS value_sets (
     compose_json  TEXT,
     resource_json JSONB,
     created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    updated_at    TEXT NOT NULL,
+    -- See code_systems.authority_rank.
+    authority_rank INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_value_sets_url_version
     ON value_sets(url, COALESCE(version, ''));
@@ -235,6 +249,50 @@ CREATE TABLE IF NOT EXISTS bootstrap_imports (
 -- Bring pre-existing ledgers up to the current shape (idempotent).
 ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS mtime_unix BIGINT;
 ALTER TABLE bootstrap_imports ADD COLUMN IF NOT EXISTS languages TEXT NOT NULL DEFAULT '';
+
+-- ── Provenance backfill ────────────────────────────────────────────────────────
+-- `authority_rank` records whether the package that shipped a row actually owns
+-- the canonical URL it claims. It cannot be derived after the fact — nothing
+-- already stored on the row says which package supplied it — so a database that
+-- predates the column must re-import its packages to learn the truth.
+--
+-- Adding the column is therefore the signal to invalidate the `.tgz` entries in
+-- the bootstrap ledger, so the next startup re-imports those packages and stamps
+-- the ranks. Without this the column would sit at its DEFAULT 0 on every existing
+-- row (readers coalesce NULL to 0) and the fix would be a silent no-op on any
+-- server with a persistent database: the ledger skips any file whose size and
+-- mtime are unchanged, so packages would never re-import and never stamp a rank.
+--
+-- Only `.tgz` rows are cleared. The multi-GB SNOMED/LOINC/RxNorm archives keep
+-- their ledger entries and are not re-imported — they come from native importers
+-- that are authoritative by construction and have nothing to learn from a reload.
+-- Must run after bootstrap_imports exists, hence its position at the end.
+DO $$
+DECLARE
+    added boolean := false;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'code_systems'::regclass
+          AND attname = 'authority_rank' AND NOT attisdropped
+    ) THEN
+        ALTER TABLE code_systems ADD COLUMN authority_rank INTEGER;
+        added := true;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'value_sets'::regclass
+          AND attname = 'authority_rank' AND NOT attisdropped
+    ) THEN
+        ALTER TABLE value_sets ADD COLUMN authority_rank INTEGER;
+        added := true;
+    END IF;
+
+    IF added THEN
+        DELETE FROM bootstrap_imports WHERE path LIKE '%.tgz';
+    END IF;
+END $$;
 ";
 
 /// Apply the HTS PostgreSQL schema to the given client connection.
@@ -284,8 +342,29 @@ pub async fn build_concept_closure_pg(
 ) -> Result<(), tokio_postgres::Error> {
     use std::collections::{HashMap, VecDeque};
 
-    // Load all concept codes for this system.
-    let concepts: Vec<String> = client
+    // Do the whole build in ONE transaction that first pins the parent
+    // `code_systems` row with `FOR SHARE`. A concurrent `DELETE FROM
+    // code_systems` (e.g. `delete_normalized` removing a CodeSystem, which
+    // cascades to concepts/hierarchy/closure) then blocks until we commit and
+    // can't drop the row mid-build — which would otherwise make the closure
+    // INSERTs below violate `concept_closure_system_id_fkey`. If the row is
+    // already gone, another writer deleted the system first, so there is
+    // nothing to build.
+    let tx = client.transaction().await?;
+    if tx
+        .query_opt(
+            "SELECT 1 FROM code_systems WHERE id = $1 FOR SHARE",
+            &[&system_id],
+        )
+        .await?
+        .is_none()
+    {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    // Load all concept codes for this system (within the locked snapshot).
+    let concepts: Vec<String> = tx
         .query(
             "SELECT code FROM concepts WHERE system_id = $1",
             &[&system_id],
@@ -296,12 +375,12 @@ pub async fn build_concept_closure_pg(
         .collect();
 
     if concepts.is_empty() {
-        client
-            .execute(
-                "DELETE FROM concept_closure WHERE system_id = $1",
-                &[&system_id],
-            )
-            .await?;
+        tx.execute(
+            "DELETE FROM concept_closure WHERE system_id = $1",
+            &[&system_id],
+        )
+        .await?;
+        tx.commit().await?;
         return Ok(());
     }
 
@@ -315,7 +394,7 @@ pub async fn build_concept_closure_pg(
 
     // Build per-node children lists (index-based).
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); concepts.len()];
-    let rows = client
+    let rows = tx
         .query(
             "SELECT parent_code, child_code FROM concept_hierarchy WHERE system_id = $1",
             &[&system_id],
@@ -336,7 +415,6 @@ pub async fn build_concept_closure_pg(
     let mut anc_batch: Vec<&str> = Vec::with_capacity(BATCH);
     let mut des_batch: Vec<&str> = Vec::with_capacity(BATCH);
 
-    let tx = client.transaction().await?;
     tx.execute(
         "DELETE FROM concept_closure WHERE system_id = $1",
         &[&system_id],

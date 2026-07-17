@@ -15,18 +15,22 @@
 //! - [`versions`] - Get supported FHIR versions ($versions operation)
 //! - [`health`] - Health check endpoint
 
+pub mod admin_tenants;
 pub mod batch;
 pub mod bulk_common;
 pub mod bulk_export;
 pub mod bulk_submit;
 pub mod capabilities;
 pub mod compartment;
+pub mod console_metrics;
 pub mod create;
 pub mod delete;
 pub mod health;
 pub mod history;
 pub mod patch;
+pub mod purge;
 pub mod read;
+pub mod reindex;
 pub mod search;
 pub mod smart_discovery;
 pub mod sof;
@@ -35,6 +39,7 @@ pub mod subscription_event;
 #[cfg(feature = "subscriptions")]
 pub mod subscriptions;
 pub mod update;
+pub mod user_settings;
 pub mod versions;
 pub mod vread;
 #[cfg(feature = "subscriptions")]
@@ -74,8 +79,13 @@ pub use history::{
     history_system_handler, history_type_handler,
 };
 pub use patch::patch_handler;
+pub use purge::{purge_instance_handler, purge_type_handler};
 pub use read::{head_read_handler, read_handler};
+pub use reindex::{
+    reindex_cancel_handler, reindex_status_handler, reindex_system_handler, reindex_type_handler,
+};
 pub use search::{search_get_handler, search_post_handler};
 pub use update::{conditional_update_handler, update_handler};
+pub use user_settings::{get_user_settings, patch_user_settings, put_user_settings};
 pub use versions::versions_handler;
 pub use vread::vread_handler;

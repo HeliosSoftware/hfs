@@ -20,7 +20,7 @@ use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::search::loader::SearchParameterLoader;
 use crate::search::registry::SearchParameterStatus;
-use crate::search::reindex::{ReindexableStorage, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -62,6 +62,10 @@ fn extract_part_value(part: &Value) -> Option<Value> {
 impl ResourceStorage for PostgresBackend {
     fn backend_name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn is_cluster_shared(&self) -> bool {
+        true
     }
 
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
@@ -466,6 +470,338 @@ impl ResourceStorage for PostgresBackend {
 
         Ok(count as u64)
     }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // `last_updated` is `TIMESTAMPTZ`; normalise to UTC before truncating to a
+        // calendar day so buckets are stable regardless of the session time zone.
+        // The `(tenant_id, last_updated)` index supports the `>= $3` range scan.
+        let rows = client
+            .query(
+                "SELECT (last_updated AT TIME ZONE 'UTC')::date AS day, COUNT(*)::bigint AS n \
+                 FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE \
+                   AND last_updated >= $3 \
+                 GROUP BY day ORDER BY day",
+                &[&tenant_id, &resource_type, &since],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count resources by day: {}", e)))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let day: chrono::NaiveDate = row.get(0);
+            let n: i64 = row.get(1);
+            out.push(crate::core::DailyResourceCount {
+                day,
+                count: n.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds);
+
+        // Floor each version's `last_updated` to its epoch-aligned bucket:
+        // epoch seconds / width, floored, scaled back, then read as a timestamptz.
+        // Epoch arithmetic is timezone-independent, so buckets are stable whatever
+        // the session TimeZone. The `(tenant_id, last_updated)` history index
+        // supports the `>= $3` range scan. Delta rule per the trait doc: creation
+        // `+1`, delete `-1`, plain update `0`.
+        //
+        // `$4::bigint` is cast explicitly: `EXTRACT(EPOCH FROM ...)` is `numeric`, so
+        // without it Postgres infers the parameter as `numeric` too and rejects the
+        // `i64` we bind.
+        let rows = client
+            .query(
+                "SELECT to_timestamp( \
+                          (FLOOR(EXTRACT(EPOCH FROM last_updated) / $4::bigint) * $4::bigint) \
+                          ::double precision \
+                        ) AS bucket, \
+                        SUM(CASE WHEN is_deleted THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END)::bigint AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND last_updated >= $3 \
+                 GROUP BY bucket \
+                 HAVING SUM(CASE WHEN is_deleted THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) <> 0 \
+                 ORDER BY bucket",
+                &[&tenant_id, &resource_type, &since_bound, &bucket_seconds],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count resource deltas: {}", e)))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let bucket_start: DateTime<Utc> = row.get(0);
+            let delta: i64 = row.get(1);
+            out.push(crate::core::ResourceCountDelta {
+                bucket_start,
+                delta,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<crate::core::ActivityCell>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Normalise to UTC, then EXTRACT weekday (DOW: 0=Sunday..6=Saturday) and
+        // hour (0..23) so the grid matches the SQL/Mongo backends and JS's
+        // `Date.getDay()`. The `(tenant_id, last_updated)` history index backs
+        // the `>= $2` range scan.
+        let rows = client
+            .query(
+                "SELECT EXTRACT(DOW FROM (last_updated AT TIME ZONE 'UTC'))::int AS wd, \
+                        EXTRACT(HOUR FROM (last_updated AT TIME ZONE 'UTC'))::int AS hr, \
+                        COUNT(*)::bigint AS n \
+                 FROM resource_history \
+                 WHERE tenant_id = $1 AND last_updated >= $2 \
+                 GROUP BY wd, hr",
+                &[&tenant_id, &since],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to compute activity histogram: {}", e)))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let wd: i32 = row.get(0);
+            let hr: i32 = row.get(1);
+            let n: i64 = row.get(2);
+            out.push(crate::core::ActivityCell {
+                weekday: wd.clamp(0, 6) as u8,
+                hour: hr.clamp(0, 23) as u8,
+                count: n.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let rows = client
+            .query(
+                "SELECT resource_type, COUNT(*)::bigint FROM resources \
+                 WHERE tenant_id = $1 AND is_deleted = FALSE \
+                 GROUP BY resource_type",
+                &[&tenant_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count all types: {}", e)))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rt: String = row.get(0);
+            let n: i64 = row.get(1);
+            out.push((rt, n.max(0) as u64));
+        }
+        Ok(out)
+    }
+
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        // An empty `IN ()` is invalid SQL; nothing to count.
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Bind tenant_id as $1 and each requested type as $2, $3, ...; the type
+        // names are bound as parameters, never interpolated into the SQL text.
+        let placeholders = (0..resource_types.len())
+            .map(|i| format!("${}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT resource_type, COUNT(*)::bigint FROM resources \
+             WHERE tenant_id = $1 AND is_deleted = FALSE AND resource_type IN ({}) \
+             GROUP BY resource_type",
+            placeholders
+        );
+
+        // Owned bind values in $1..$n order: tenant first, then the requested types.
+        let mut query_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            Vec::with_capacity(resource_types.len() + 1);
+        query_params.push(Box::new(tenant_id.to_string()));
+        for rt in resource_types {
+            query_params.push(Box::new(rt.to_string()));
+        }
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = query_params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        let rows = client
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| internal_error(format!("Failed to count by types: {}", e)))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rt: String = row.get(0);
+            let n: i64 = row.get(1);
+            out.push((rt, n.max(0) as u64));
+        }
+        Ok(out)
+    }
+
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT tenant_id, COUNT(*)::bigint FROM resources \
+                 WHERE is_deleted = FALSE GROUP BY tenant_id",
+                &[],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count by tenant: {}", e)))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tid: String = row.get(0);
+            let n: i64 = row.get(1);
+            out.push((tid, n.max(0) as u64));
+        }
+        Ok(out)
+    }
+
+    fn supports_tenant_registry(&self) -> bool {
+        true
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT id, display_name, created_at FROM tenants \
+                 ORDER BY created_at ASC, id ASC",
+                &[],
+            )
+            .await
+            .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| crate::core::TenantRecord {
+                id: row.get(0),
+                display_name: row.get(1),
+                created_at: row.get(2),
+            })
+            .collect())
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT id, display_name, created_at FROM tenants WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("query get_tenant: {e}")))?;
+        Ok(row.map(|row| crate::core::TenantRecord {
+            id: row.get(0),
+            display_name: row.get(1),
+            created_at: row.get(2),
+        }))
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        let client = self.get_client().await?;
+        // Plain INSERT so a duplicate id surfaces as a constraint error; the
+        // admin handler pre-checks existence and returns 409, so reaching here
+        // with a duplicate is a race and a 500 is acceptable.
+        let row = client
+            .query_one(
+                "INSERT INTO tenants (id, display_name) VALUES ($1, $2) \
+                 RETURNING id, display_name, created_at",
+                &[&id, &display_name],
+            )
+            .await
+            .map_err(|e| internal_error(format!("register_tenant: {e}")))?;
+        Ok(crate::core::TenantRecord {
+            id: row.get(0),
+            display_name: row.get(1),
+            created_at: row.get(2),
+        })
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        let client = self.get_client().await?;
+        let changed = client
+            .execute("DELETE FROM tenants WHERE id = $1", &[&id])
+            .await
+            .map_err(|e| internal_error(format!("deregister_tenant: {e}")))?;
+        Ok(changed > 0)
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("purge begin: {e}")))?;
+        // Count current-version rows first (soft-deleted included) so we can
+        // report what was removed.
+        let removed: i64 = tx
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM resources WHERE tenant_id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("purge count: {e}")))?
+            .get(0);
+        // search_index and resource_fts cascade from resources, but delete them
+        // explicitly too, mirroring the purge/purge_all deletion order.
+        for sql in [
+            "DELETE FROM search_index WHERE tenant_id = $1",
+            "DELETE FROM resource_fts WHERE tenant_id = $1",
+            "DELETE FROM resource_history WHERE tenant_id = $1",
+            "DELETE FROM resources WHERE tenant_id = $1",
+        ] {
+            tx.execute(sql, &[&id])
+                .await
+                .map_err(|e| internal_error(format!("purge delete: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        Ok(removed.max(0) as u64)
+    }
 }
 
 // ============================================================================
@@ -685,20 +1021,22 @@ impl PostgresBackend {
     }
 
     /// Delete search index entries for a resource.
+    /// Removes a resource's search entries, returning how many `search_index`
+    /// rows were deleted.
     pub(crate) async fn delete_search_index(
         &self,
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Delete from main search index
-        client
+        let deleted = client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                 &[&tenant_id, &resource_type, &resource_id],
@@ -714,7 +1052,7 @@ impl PostgresBackend {
             )
             .await;
 
-        Ok(())
+        Ok(deleted)
     }
 }
 
@@ -2657,11 +2995,12 @@ fn resolve_bundle_references(
 }
 
 // ============================================================================
-// ReindexableStorage Implementation
+// ReindexSource Implementation — PostgreSQL is a primary, so it is where
+// resources are read from during a reindex.
 // ============================================================================
 
 #[async_trait]
-impl ReindexableStorage for PostgresBackend {
+impl ReindexSource for PostgresBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
@@ -2779,13 +3118,21 @@ impl ReindexableStorage for PostgresBackend {
             next_cursor,
         })
     }
+}
 
+// ============================================================================
+// ReindexTarget Implementation — PostgreSQL keeps search entries in its own
+// `search_index` table, so it is also a writer and can reindex itself.
+// ============================================================================
+
+#[async_trait]
+impl ReindexTarget for PostgresBackend {
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         let client = self.get_client().await?;
         self.delete_search_index(
             &client,
@@ -2799,17 +3146,18 @@ impl ReindexableStorage for PostgresBackend {
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
+        resource: &StoredResource,
     ) -> StorageResult<usize> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
 
         // Use the dynamic extraction
         let values = self
             .search_extractor()
-            .extract(resource, resource_type)
+            .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
         let mut count = 0;
@@ -2828,7 +3176,7 @@ impl ReindexableStorage for PostgresBackend {
         // Re-index contained resources too, so `$reindex` rebuilds `_contained`
         // search entries.
         count += self
-            .index_contained_resources(&client, tenant_id, resource_type, resource_id, resource)
+            .index_contained_resources(&client, tenant_id, resource_type, resource_id, content)
             .await?;
 
         Ok(count)

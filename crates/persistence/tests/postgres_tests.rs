@@ -689,9 +689,10 @@ mod postgres_integration {
     use serde_json::json;
 
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+    use helios_persistence::core::SettingsStore;
     use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
     use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
-    use helios_persistence::error::{ResourceError, StorageError};
+    use helios_persistence::error::{ConcurrencyError, ResourceError, StorageError};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
     use testcontainers::ImageExt;
@@ -703,7 +704,10 @@ mod postgres_integration {
     struct SharedPg {
         host: String,
         port: u16,
-        /// Kept alive for the duration of the test binary; dropped at process exit.
+        /// Kept alive for the duration of the test binary. NOTE: a `static` is
+        /// never dropped, so `Drop for ContainerAsync` — testcontainers' only
+        /// container-removal path — never runs. The container outlives the test
+        /// process and is reaped in CI by its `github.run_id` label.
         _container: testcontainers::ContainerAsync<Postgres>,
     }
 
@@ -1183,6 +1187,345 @@ mod postgres_integration {
 
         assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 3);
         assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 2);
+    }
+
+    // ========================================================================
+    // Console Dashboard count_* Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn postgres_integration_count_by_types() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-count-by-types");
+
+        // Seed a small deterministic dataset: 2 Patients, 1 Observation.
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let counts = backend
+            .count_by_types(&tenant, &["Patient", "Observation", "Encounter"])
+            .await
+            .unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get("Patient"), Some(&2));
+        assert_eq!(map.get("Observation"), Some(&1));
+        // A type with zero rows is ABSENT from the result, not a 0 row.
+        assert!(!map.contains_key("Encounter"));
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_count_all_types() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-count-all-types");
+
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let counts = backend.count_all_types(&tenant).await.unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get("Patient"), Some(&2));
+        assert_eq!(map.get("Observation"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_count_by_day() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-count-by-day");
+
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // `since` = start of today (UTC midnight), built the same way the handler
+        // does; `today` is derived from the same clock so this stays date-robust.
+        let since = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let today = chrono::Utc::now().date_naive();
+
+        let rows = backend
+            .count_by_day(&tenant, "Patient", since)
+            .await
+            .unwrap();
+        let today_row = rows
+            .iter()
+            .find(|r| r.day == today)
+            .expect("today bucket should be present");
+        assert_eq!(today_row.count, 2);
+    }
+
+    /// The history-backed delta rule on real Postgres: create `+1`, update `0`,
+    /// delete `-1`, on epoch-aligned buckets. Mirrors the SQLite unit test, so the
+    /// two backends are held to the same bucketing contract.
+    #[tokio::test]
+    async fn postgres_integration_count_deltas_by_bucket() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-count-deltas");
+
+        let first = backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .update(&tenant, &first, json!({"active": true}))
+            .await
+            .unwrap();
+
+        let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|r| r.delta).sum::<i64>(),
+            2,
+            "two creates and one update net to +2"
+        );
+        assert!(
+            rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+            "buckets are epoch-aligned to their width"
+        );
+
+        backend
+            .delete(&tenant, "Patient", first.id())
+            .await
+            .unwrap();
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_activity_histogram() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("console-activity-histogram");
+
+        // 3 writes for this tenant -> 3 resource_history rows.
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let since = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+
+        let cells = backend.activity_histogram(&tenant, since).await.unwrap();
+        assert!(!cells.is_empty());
+        // Total across returned cells equals the number of writes seeded.
+        let total: u64 = cells.iter().map(|c| c.count).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_console_count_by_tenant() {
+        let backend = create_backend().await;
+        // Unique tenant IDs isolate this cross-tenant aggregate from every other
+        // test sharing the same PostgreSQL container.
+        let tenant_a = create_tenant("console-count-by-tenant-a");
+        let tenant_b = create_tenant("console-count-by-tenant-b");
+
+        // tenant-a: 3 resources, tenant-b: 2 resources.
+        backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_b, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // Cross-tenant admin aggregate: takes NO TenantContext. Look up by the
+        // actual (uuid-suffixed) tenant IDs so other tests' rows never interfere.
+        let counts = backend.count_by_tenant().await.unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get(tenant_a.tenant_id().as_str()), Some(&3));
+        assert_eq!(map.get(tenant_b.tenant_id().as_str()), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_is_cluster_shared() {
+        let backend = create_backend().await;
+        assert!(backend.is_cluster_shared());
+    }
+
+    // ========================================================================
+    // Tenant Registry Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn postgres_integration_tenant_registry_crud() {
+        let backend = create_backend().await;
+        assert!(backend.supports_tenant_registry());
+
+        // Unique ids isolate this test from others sharing the database. The
+        // shared uuid base plus "-a"/"-b" suffixes make the id ASC tie-break
+        // deterministic when both rows land in the same created_at second.
+        let base = uuid::Uuid::new_v4().simple().to_string();
+        let id_a = format!("registry-{}-a", base);
+        let id_b = format!("registry-{}-b", base);
+
+        assert!(backend.get_tenant(&id_a).await.unwrap().is_none());
+
+        // Register two tenants, one with a display name.
+        let acme = backend
+            .register_tenant(&id_a, Some("Acme Corp"))
+            .await
+            .unwrap();
+        assert_eq!(acme.id, id_a);
+        assert_eq!(acme.display_name.as_deref(), Some("Acme Corp"));
+        assert!(!acme.created_at.is_empty());
+
+        let beta = backend.register_tenant(&id_b, None).await.unwrap();
+        assert_eq!(beta.id, id_b);
+        assert_eq!(beta.display_name, None);
+
+        // get_tenant round-trips the registered records.
+        assert_eq!(backend.get_tenant(&id_a).await.unwrap(), Some(acme));
+        assert_eq!(backend.get_tenant(&id_b).await.unwrap(), Some(beta));
+
+        // The database is shared across tests, so only assert on our own rows:
+        // both are present, ordered a before b (created_at ASC, id ASC).
+        let all = backend.list_tenants().await.unwrap();
+        let pos_a = all.iter().position(|t| t.id == id_a);
+        let pos_b = all.iter().position(|t| t.id == id_b);
+        assert!(pos_a.is_some(), "registered tenant {} not listed", id_a);
+        assert!(pos_b.is_some(), "registered tenant {} not listed", id_b);
+        assert!(pos_a < pos_b, "expected {} to sort before {}", id_a, id_b);
+
+        // Duplicate registration is an error (handler pre-checks for 409).
+        assert!(backend.register_tenant(&id_a, None).await.is_err());
+
+        // Deregister removes the row; repeat and unknown ids report nothing
+        // removed.
+        assert!(backend.deregister_tenant(&id_a).await.unwrap());
+        assert!(backend.get_tenant(&id_a).await.unwrap().is_none());
+        assert!(!backend.deregister_tenant(&id_a).await.unwrap());
+        assert!(
+            !backend
+                .deregister_tenant(&format!("never-registered-{}", base))
+                .await
+                .unwrap()
+        );
+
+        let remaining = backend.list_tenants().await.unwrap();
+        assert!(!remaining.iter().any(|t| t.id == id_a));
+        assert!(remaining.iter().any(|t| t.id == id_b));
+
+        backend.deregister_tenant(&id_b).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_purge_tenant_data() {
+        let backend = create_backend().await;
+        let tenant_a = create_tenant("purge-tenant-a");
+        let tenant_b = create_tenant("purge-tenant-b");
+
+        let mut a_ids = Vec::new();
+        for i in 0..3 {
+            let patient = json!({
+                "resourceType": "Patient",
+                "name": [{"family": format!("Purge{}", i)}]
+            });
+            let created = backend
+                .create(&tenant_a, "Patient", patient, FhirVersion::default())
+                .await
+                .unwrap();
+            a_ids.push(created.id().to_string());
+        }
+        let b_created = backend
+            .create(
+                &tenant_b,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "Kept"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Purge removes tenant-a's data only, reporting its current-row count.
+        let removed = backend
+            .purge_tenant_data(tenant_a.tenant_id().as_str())
+            .await
+            .unwrap();
+        assert_eq!(removed, 3);
+
+        assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 0);
+        for id in &a_ids {
+            assert!(
+                backend
+                    .read(&tenant_a, "Patient", id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // tenant-b's data is intact.
+        assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 1);
+        assert!(
+            backend
+                .read(&tenant_b, "Patient", b_created.id())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     // ========================================================================
@@ -3171,7 +3514,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_list_types() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
@@ -3214,7 +3557,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_count() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
@@ -3246,7 +3589,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_fetch_page() {
-        use helios_persistence::search::ReindexableStorage;
+        use helios_persistence::search::ReindexSource;
 
         let backend = create_backend().await;
         let tenant = create_tenant("test-tenant");
@@ -3676,6 +4019,98 @@ mod postgres_integration {
             .unwrap();
         // Only completed/error/cancelled jobs can expire — these are accepted.
         assert!(expired_now.is_empty());
+    }
+
+    // ========================================================================
+    // Per-user settings store
+    // ========================================================================
+
+    /// A user key unique to each test, so tests sharing the database don't
+    /// collide on the single-row-per-user `user_settings` table.
+    fn unique_user_key(prefix: &str) -> String {
+        format!("{}|{}", prefix, uuid::Uuid::new_v4().simple())
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_settings_get_missing_is_none() {
+        let backend = create_backend().await;
+        let user = unique_user_key("missing");
+        assert!(backend.get_settings(&user).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_settings_put_get_and_version() {
+        let backend = create_backend().await;
+        let user = unique_user_key("round-trip");
+        let doc = json!({"theme": "dark", "recentQueries": {"Patient": ["name=smith"]}});
+
+        let stored = backend
+            .put_settings(&user, doc.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(stored.version, 1);
+
+        let fetched = backend.get_settings(&user).await.unwrap().unwrap();
+        assert_eq!(fetched.document, doc);
+        assert_eq!(fetched.version, 1);
+
+        let second = backend
+            .put_settings(&user, json!({"theme": "light"}), None)
+            .await
+            .unwrap();
+        assert_eq!(second.version, 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_settings_patch_merges_and_deletes() {
+        let backend = create_backend().await;
+        let user = unique_user_key("patch");
+        backend
+            .put_settings(
+                &user,
+                json!({"theme": "dark", "defaultTenant": "acme"}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patched = backend
+            .patch_settings(
+                &user,
+                json!({"theme": "light", "defaultTenant": null}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(patched.document, json!({"theme": "light"}));
+        assert_eq!(patched.version, 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_settings_optimistic_lock() {
+        let backend = create_backend().await;
+        let user = unique_user_key("lock");
+        backend
+            .put_settings(&user, json!({"a": 1}), None)
+            .await
+            .unwrap(); // version 1
+
+        // Stale precondition is rejected.
+        let err = backend
+            .put_settings(&user, json!({"a": 2}), Some(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })
+        ));
+
+        // Matching precondition succeeds.
+        let ok = backend
+            .put_settings(&user, json!({"a": 2}), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(ok.version, 2);
     }
 
     // ========================================================================

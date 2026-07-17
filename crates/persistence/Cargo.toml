@@ -31,14 +31,11 @@ s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
 # Configuration advisor binary
 advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
 
-# Audit event integration
-audit = ["dep:helios-audit"]
-
-# FHIR version features (pass through to helios-fhir, helios-fhirpath, helios-sof)
-R4 = ["helios-fhir/R4", "helios-fhirpath/R4", "helios-sof/R4", "helios-audit?/R4"]
-R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B", "helios-sof/R4B", "helios-audit?/R4B"]
-R5 = ["helios-fhir/R5", "helios-fhirpath/R5", "helios-sof/R5", "helios-audit?/R5"]
-R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-sof/R6", "helios-audit?/R6"]
+# FHIR version features (pass through to helios-fhir, helios-fhirpath, helios-sof, helios-audit)
+R4 = ["helios-fhir/R4", "helios-fhirpath/R4", "helios-sof/R4", "helios-audit/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B", "helios-sof/R4B", "helios-audit/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath/R5", "helios-sof/R5", "helios-audit/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-sof/R6", "helios-audit/R6"]
 
 [dependencies]
 # Core dependencies (always included)
@@ -97,8 +94,15 @@ aws-sdk-s3 = { version = "1", optional = true, default-features = false, feature
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
 
-# Audit event integration
-helios-audit = { path = "../audit", version = "0.2.1", optional = true, default-features = false }
+# Audit event integration.
+#
+# Deliberately NOT optional. The persistence layer emits BALP AuditEvents from
+# the purge path, the reindex driver, and the bulk-export worker. Gating that
+# behind a cargo feature meant every call site needed a `#[cfg]` arm, and
+# `helios-rest` — which does not enable the feature — could not call the shared
+# emit helpers at all, so it grew a hand-rolled duplicate that silently drifted.
+# helios-audit only depends on helios-fhir, so this introduces no cycle.
+helios-audit = { path = "../audit", version = "0.2.1", default-features = false }
 
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }
@@ -114,7 +118,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
-testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio", "mongo"] }
 paste = "1.0"
 
 # `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.

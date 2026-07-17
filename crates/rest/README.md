@@ -76,11 +76,62 @@ cargo run --bin rest-server -- --port 3000 --log-level debug
 | export status / manifest | GET | `/export-status/[job_id]` |
 | export cancel + delete | DELETE | `/export-status/[job_id]` |
 | export file download | GET | `/export-file/[job_id]/[type]-[part]` |
+| purge (instance) | DELETE | `/[type]/[id]/$purge` |
+| purge (type) | POST | `/[type]/$purge` |
+| reindex (system) | POST | `/$reindex` |
+| reindex (type) | POST | `/[type]/$reindex` |
+| reindex status | GET | `/$reindex-status/[job_id]` |
+| reindex cancel | DELETE | `/$reindex-status/[job_id]` |
 
 All `$export` kick-offs require `Prefer: respond-async` and return `202 Accepted`
 with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
 for configuration; the storage-layer job/output internals are documented in the
 [helios-persistence README](../persistence/README.md).
+
+### Administrative Operations
+
+`$purge` and `$reindex` are **not** part of the FHIR specification. Both are
+gated on their own operation scope — `system/purge` and `system/reindex` — and
+**not** on ordinary resource scopes, following the `system/bulk-submit`
+precedent. A token that may soft-delete a Patient must not thereby be able to
+destroy it irrecoverably, and a token that may write a resource must not be able
+to rebuild the whole tenant's search index. As with `system/bulk-submit`, a
+`system/*.<perm>` wildcard also grants them.
+
+**`$purge`** permanently deletes a resource and all of its versions. This is not
+the FHIR `delete` interaction: an ordinary `DELETE` is a *soft* delete that
+writes a tombstone version, keeps the resource in `_history`, and answers reads
+with `410 Gone`. `$purge` removes the bytes, which is what erasure requirements
+(GDPR Article 17 and similar) actually need. It is irreversible.
+
+- `AuditEvent` can **never** be purged, whatever scope the caller holds. A caller
+  who can erase the audit trail can erase the evidence of their own actions.
+- On a composite deployment the purge targets the *composite*, so it reaches the
+  Elasticsearch secondary too — a resource purged only from the primary would
+  remain searchable, with its full content, in the index. Secondaries are purged
+  first; if any of them fails the primary is left untouched and the operation
+  reports `500` with a failure `AuditEvent` (outcome `8`) naming the backend, so
+  the purge stays retryable rather than destroying the system of record while
+  leaving a searchable copy behind.
+
+**`$reindex`** rebuilds the search index from the stored resources, which is
+needed after a `SearchParameter` is added or changed — existing resources were
+indexed under the old definition and will not match the new one until they are
+re-extracted. Kick-off returns `202 Accepted` with a job id; the rebuild runs in
+the background and is polled via `/$reindex-status/[job_id]`.
+
+- It writes to **every** search index in the deployment, including the
+  Elasticsearch secondary. Rebuilding only the primary on a deployment where
+  Elasticsearch serves search would rebuild an index nothing queries.
+- Job state is held **in memory on the node that accepted the kick-off**, so
+  `/$reindex-status/[job_id]` returns `404` from any other node. In a multi-node
+  deployment, poll the node you kicked off against.
+- The `s3` backend standalone has no search index of any kind, so `$reindex`
+  there returns `501`. Every other backend and composite supports it.
+
+Both operations emit BALP `AuditEvent`s — purge on completion or failure,
+reindex at start and at its terminal state (complete / cancel / fail, outcome
+`0` / `4` / `8`) — each attributed to the requesting principal.
 
 ## Configuration
 
@@ -139,6 +190,33 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 
 A runnable multi-instance stack (HFS + PostgreSQL + MinIO + Keycloak) is provided
 as a compose example in [`docker/bulk-export/`](../../docker/bulk-export/README.md).
+
+### SQL-on-FHIR Async Export
+
+Separate from Bulk Data Export, the SQL-on-FHIR `$viewdefinition-export` and
+`$sqlquery-export` operations run asynchronously and write their tabular output
+to a dedicated *export sink*, configured via `HFS_EXPORT_*`. The whole subsystem
+is gated by `HFS_SOF_ENABLED` (which also enables `$viewdefinition-run`); when
+enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
+`postgres`).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$viewdefinition-run`/`-export`, `$sqlquery-*`). |
+| `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
+| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
+| `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). |
+| `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. |
+| `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
+| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`. Aligns with the manifest's advertised 24h `Expires`. |
+| `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
+
+Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
+job's already-written partial shards immediately; the reaper above reclaims
+*completed* jobs once they age past `HFS_EXPORT_OUTPUT_TTL`.
 
 ## Multi-Tenancy
 

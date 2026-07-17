@@ -62,6 +62,37 @@ Parquet type mapping follows Pathling conventions:
 
 Arrays map to Arrow List types. All fields are OPTIONAL. Snappy compression is the default.
 
+## Async Export in the HFS Server
+
+The `hfs` binary embeds SQL-on-FHIR via `helios-rest` and exposes the async
+`$viewdefinition-export` and `$sqlquery-export` operations. These run in the
+background and write tabular shards to an *export sink*, configured with the
+`HFS_EXPORT_*` variables below (distinct from the standalone `sof-server`
+`SOF_*` vars above, and from Bulk Data Export's `HFS_BULK_EXPORT_*`).
+
+The subsystem is gated by `HFS_SOF_ENABLED`, and the configured storage backend
+must provide an in-DB SOF runner (`sqlite` or `postgres`) — there is no
+in-process fallback.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR ops (`$viewdefinition-run`/`-export`, `$sqlquery-*`) |
+| `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3` |
+| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink |
+| `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3` |
+| `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink |
+| `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for `s3`, seconds (spec requires ≥ 24h) |
+| `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files |
+| `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory` in-process; `kafka`/`sqs` reserved) |
+| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
+| `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
+
+Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
+job's partial shards immediately; the reaper reclaims *completed* jobs once they
+age past `HFS_EXPORT_OUTPUT_TTL`. Full `HFS_EXPORT_*` reference lives in the
+[helios-rest README](../../../crates/rest/README.md#sql-on-fhir-async-export).
+
 ## Testing
 
 - Unit tests live in `src/` files.

@@ -6,22 +6,25 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use mongodb::{
-    ClientSession, Cursor, SessionCursor,
+    ClientSession, Collection, Cursor, SessionCursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
     error::Error as MongoError,
+    options::FindOptions,
 };
 use serde_json::Value;
 
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
-    ResourceStorage, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage, normalize_etag,
+    PurgableStorage, ResourceStorage, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
+    normalize_etag,
 };
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::search::{SearchParameterLoader, SearchParameterStatus};
 use crate::tenant::TenantContext;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -515,6 +518,10 @@ async fn commit_best_effort_multi_write_session(
 impl ResourceStorage for MongoBackend {
     fn backend_name(&self) -> &'static str {
         "mongodb"
+    }
+
+    fn is_cluster_shared(&self) -> bool {
+        true
     }
 
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
@@ -1159,6 +1166,404 @@ impl ResourceStorage for MongoBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))
     }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let since_bson = BsonDateTime::from_millis(since.timestamp_millis());
+
+        // Bucket on the server: `$match` narrows to this tenant/type/window
+        // (covered by the `(tenant_id, last_updated)` index), then `$group`
+        // collapses to one document per UTC calendar day. `$dateToString` with an
+        // explicit UTC timezone keeps day boundaries consistent with the SQL
+        // backends.
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": { "$dateToString": {
+                    "format": "%Y-%m-%d",
+                    "date": "$last_updated",
+                    "timezone": "UTC",
+                }},
+                "n": { "$sum": 1 },
+            }},
+            doc! { "$sort": { "_id": 1 } },
+        ];
+
+        let mut cursor = resources
+            .aggregate(pipeline)
+            .await
+            .map_err(|e| internal_error(format!("Failed to aggregate count_by_day: {}", e)))?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("count_by_day cursor advance: {}", e)))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("count_by_day cursor deserialize: {}", e)))?;
+            let day_str = doc.get_str("_id").unwrap_or_default();
+            // `$sum: 1` yields an int32 unless it overflows into int64.
+            let n = doc
+                .get_i32("n")
+                .map(i64::from)
+                .or_else(|_| doc.get_i64("n"))
+                .unwrap_or(0);
+            if let Ok(day) = chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d") {
+                out.push(crate::core::DailyResourceCount {
+                    day,
+                    count: n.max(0) as u64,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let bucket_ms = bucket_seconds * 1000;
+        let since_bson = BsonDateTime::from_millis(
+            crate::core::bucket_floor(since, bucket_seconds).timestamp_millis(),
+        );
+
+        // Bucket on the server: `$match` narrows to this tenant/type/window (covered
+        // by the `(tenant_id, last_updated)` history index), then `$group` floors each
+        // version to its epoch-aligned bucket by subtracting the remainder of its
+        // epoch-millis modulo the bucket width — the same arithmetic the SQL backends
+        // do, so bucket boundaries agree across backends. Delta rule per the trait
+        // doc: creation `+1`, delete `-1`, plain update `0`.
+        let epoch_ms = doc! { "$toLong": "$last_updated" };
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": { "$subtract": [
+                    epoch_ms.clone(),
+                    { "$mod": [epoch_ms, bucket_ms] },
+                ]},
+                "delta": { "$sum": { "$switch": {
+                    "branches": [
+                        { "case": { "$eq": ["$is_deleted", true] }, "then": -1 },
+                        { "case": { "$eq": ["$version_id", "1"] }, "then": 1 },
+                    ],
+                    "default": 0,
+                }}},
+            }},
+            doc! { "$match": { "delta": { "$ne": 0 } } },
+            doc! { "$sort": { "_id": 1 } },
+        ];
+
+        let mut cursor = history.aggregate(pipeline).await.map_err(|e| {
+            internal_error(format!("Failed to aggregate count_deltas_by_bucket: {}", e))
+        })?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("count_deltas cursor advance: {}", e)))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("count_deltas cursor deserialize: {}", e)))?;
+            let bucket_ms_start = doc.get_i64("_id").unwrap_or_default();
+            // `$sum` yields an int32 for small totals and an int64 once it overflows,
+            // so accept either width rather than assuming one.
+            let delta = doc
+                .get_i64("delta")
+                .or_else(|_| doc.get_i32("delta").map(i64::from))
+                .unwrap_or_default();
+            if let Some(bucket_start) = DateTime::from_timestamp_millis(bucket_ms_start) {
+                out.push(crate::core::ResourceCountDelta {
+                    bucket_start,
+                    delta,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<crate::core::ActivityCell>> {
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let since_bson = BsonDateTime::from_millis(since.timestamp_millis());
+
+        // `$dayOfWeek` returns 1=Sunday..7=Saturday and `$hour` 0..23, both in the
+        // requested timezone. We subtract 1 from the weekday below to land on the
+        // 0=Sunday..6=Saturday convention shared with the SQL backends.
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": {
+                    "wd": { "$dayOfWeek": { "date": "$last_updated", "timezone": "UTC" } },
+                    "hr": { "$hour": { "date": "$last_updated", "timezone": "UTC" } },
+                },
+                "n": { "$sum": 1 },
+            }},
+        ];
+
+        let mut cursor = history.aggregate(pipeline).await.map_err(|e| {
+            internal_error(format!("Failed to aggregate activity histogram: {}", e))
+        })?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("activity cursor advance: {}", e)))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("activity cursor deserialize: {}", e)))?;
+            let id = match doc.get_document("_id") {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let wd = id.get_i32("wd").unwrap_or(1); // 1=Sunday..7=Saturday
+            let hr = id.get_i32("hr").unwrap_or(0);
+            let n = doc
+                .get_i32("n")
+                .map(i64::from)
+                .or_else(|_| doc.get_i64("n"))
+                .unwrap_or(0);
+            out.push(crate::core::ActivityCell {
+                weekday: (wd - 1).clamp(0, 6) as u8,
+                hour: hr.clamp(0, 23) as u8,
+                count: n.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let pipeline = vec![
+            doc! { "$match": { "tenant_id": tenant_id, "is_deleted": false } },
+            doc! { "$group": { "_id": "$resource_type", "n": { "$sum": 1 } } },
+        ];
+        grouped_string_counts(resources, pipeline).await
+    }
+
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        // Nothing to match; avoid an empty `$in` round-trip.
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        // Same filters as `count_all_types` plus a `resource_type IN (...)` restriction.
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "is_deleted": false,
+                "resource_type": { "$in": resource_types.to_vec() },
+            }},
+            doc! { "$group": { "_id": "$resource_type", "n": { "$sum": 1 } } },
+        ];
+        grouped_string_counts(resources, pipeline).await
+    }
+
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let pipeline = vec![
+            doc! { "$match": { "is_deleted": false } },
+            doc! { "$group": { "_id": "$tenant_id", "n": { "$sum": 1 } } },
+        ];
+        grouped_string_counts(resources, pipeline).await
+    }
+
+    fn supports_tenant_registry(&self) -> bool {
+        true
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        let db = self.get_database().await?;
+        let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
+        let mut cursor = tenants
+            .find(doc! {})
+            .sort(doc! { "created_at": 1, "id": 1 })
+            .await
+            .map_err(|e| internal_error(format!("query list_tenants: {}", e)))?;
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("list_tenants cursor advance: {}", e)))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| internal_error(format!("list_tenants cursor deserialize: {}", e)))?;
+            out.push(tenant_record_from_doc(&doc)?);
+        }
+        Ok(out)
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        let db = self.get_database().await?;
+        let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
+        let doc = tenants
+            .find_one(doc! { "id": id })
+            .await
+            .map_err(|e| internal_error(format!("query get_tenant: {}", e)))?;
+        doc.map(|d| tenant_record_from_doc(&d)).transpose()
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        let db = self.get_database().await?;
+        let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
+        // RFC 3339 string, matching the SQLite registry's `created_at` format so
+        // the admin API is byte-identical across backends.
+        let created_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        // Plain insert so a duplicate id surfaces as a unique-index error; the
+        // admin handler pre-checks existence and returns 409, so reaching here
+        // with a duplicate is a race and a 500 is acceptable.
+        tenants
+            .insert_one(doc! {
+                "id": id,
+                "display_name": display_name,
+                "created_at": &created_at,
+            })
+            .await
+            .map_err(|e| internal_error(format!("register_tenant: {}", e)))?;
+        Ok(crate::core::TenantRecord {
+            id: id.to_string(),
+            display_name: display_name.map(str::to_string),
+            created_at,
+        })
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        let db = self.get_database().await?;
+        let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
+        let result = tenants
+            .delete_one(doc! { "id": id })
+            .await
+            .map_err(|e| internal_error(format!("deregister_tenant: {}", e)))?;
+        Ok(result.deleted_count > 0)
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        // Count current-version docs first (soft-deleted included, mirroring the
+        // SQLite purge) so we can report what was removed.
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let removed = resources
+            .count_documents(doc! { "tenant_id": id })
+            .await
+            .map_err(|e| internal_error(format!("purge count: {}", e)))?;
+        for collection in [
+            MongoBackend::SEARCH_INDEX_COLLECTION,
+            MongoBackend::RESOURCE_HISTORY_COLLECTION,
+            MongoBackend::RESOURCES_COLLECTION,
+        ] {
+            db.collection::<Document>(collection)
+                .delete_many(doc! { "tenant_id": id })
+                .await
+                .map_err(|e| internal_error(format!("purge delete ({}): {}", collection, e)))?;
+        }
+        Ok(removed)
+    }
+}
+
+/// Reads a registry document into a [`TenantRecord`](crate::core::TenantRecord).
+fn tenant_record_from_doc(doc: &Document) -> StorageResult<crate::core::TenantRecord> {
+    let id = doc
+        .get_str("id")
+        .map_err(|e| internal_error(format!("tenant record missing id: {}", e)))?
+        .to_string();
+    let created_at = doc
+        .get_str("created_at")
+        .map_err(|e| internal_error(format!("tenant record missing created_at: {}", e)))?
+        .to_string();
+    Ok(crate::core::TenantRecord {
+        id,
+        display_name: doc.get_str("display_name").ok().map(str::to_string),
+        created_at,
+    })
+}
+
+/// Runs a `$group`-by-string aggregation and collects `(_id, n)` pairs, where
+/// `_id` is a string key and `n` a `$sum` count. Shared by `count_all_types`
+/// and `count_by_tenant`.
+async fn grouped_string_counts(
+    collection: mongodb::Collection<Document>,
+    pipeline: Vec<Document>,
+) -> StorageResult<Vec<(String, u64)>> {
+    let mut cursor = collection
+        .aggregate(pipeline)
+        .await
+        .map_err(|e| internal_error(format!("Failed to aggregate grouped counts: {}", e)))?;
+    let mut out = Vec::new();
+    while cursor
+        .advance()
+        .await
+        .map_err(|e| internal_error(format!("grouped counts cursor advance: {}", e)))?
+    {
+        let doc = cursor
+            .deserialize_current()
+            .map_err(|e| internal_error(format!("grouped counts cursor deserialize: {}", e)))?;
+        let key = doc.get_str("_id").unwrap_or_default().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let n = doc
+            .get_i32("n")
+            .map(i64::from)
+            .or_else(|_| doc.get_i64("n"))
+            .unwrap_or(0);
+        out.push((key, n.max(0) as u64));
+    }
+    Ok(out)
 }
 
 impl MongoBackend {
@@ -3015,6 +3420,311 @@ fn resource_field_matches(value: Option<&Value>, expected: &str) -> bool {
         }
         _ => false,
     }
+}
+
+// ============================================================================
+// PurgableStorage
+//
+// MongoDB stores resources across three collections — `resources`,
+// `resource_history`, and `search_index` — the same shape SQLite uses, so purge
+// is the same three deletes keyed by (tenant_id, resource_type, id). Note that
+// the ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
+// tombstone. Purge is the only path that removes the bytes.
+// ============================================================================
+
+#[async_trait]
+impl PurgableStorage for MongoBackend {
+    async fn purge(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<()> {
+        let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type, "id": id };
+
+        // A resource that exists only in history (already purged from the
+        // current collection) is still purgeable; only a resource with no trace
+        // at all is NotFound. Mirrors the SQLite backend.
+        let in_resources = resources
+            .count_documents(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to check resource: {e}")))?;
+        let in_history = history
+            .count_documents(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to check resource history: {e}")))?;
+        if in_resources == 0 && in_history == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        resources
+            .delete_many(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge resource: {e}")))?;
+        history
+            .delete_many(key)
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge resource history: {e}")))?;
+
+        // The search_index collection keys the resource as `resource_id`.
+        search_index
+            .delete_many(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "resource_id": id,
+            })
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge search index: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type };
+
+        // Counted before the delete, and counted over `resources` rather than
+        // `resource_history`, so the returned figure is "resources purged", not
+        // "versions purged".
+        let count = resources
+            .count_documents(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to count resources: {e}")))?;
+
+        resources
+            .delete_many(key.clone())
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge resources: {e}")))?;
+        history
+            .delete_many(key)
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge resource history: {e}")))?;
+        search_index
+            .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+            .await
+            .map_err(|e| internal_error(format!("Failed to purge search index: {e}")))?;
+
+        Ok(count)
+    }
+}
+
+// ============================================================================
+// ReindexSource / ReindexTarget
+//
+// MongoDB is a full primary with its own `search_index` collection, so it is
+// both — it can reindex itself standalone.
+// ============================================================================
+
+#[async_trait]
+impl ReindexSource for MongoBackend {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        let db = self.get_database().await?;
+        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+
+        let types = resources
+            .distinct(
+                "resource_type",
+                doc! { "tenant_id": tenant.tenant_id().as_str(), "is_deleted": false },
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to list resource types: {e}")))?;
+
+        Ok(types
+            .into_iter()
+            .filter_map(|b| b.as_str().map(str::to_string))
+            .collect())
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.count(tenant, Some(resource_type)).await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        let db = self.get_database().await?;
+        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+
+        let mut filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+        };
+
+        // Keyset pagination on (last_updated, id) — the same cursor shape the
+        // bulk-export batcher and the SQLite reindex source use, so a cursor is
+        // stable across pages even as resources are written.
+        if let Some((cur_dt, cur_id)) = cursor.and_then(parse_reindex_cursor) {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
+                    doc! {
+                        "last_updated": chrono_to_bson(cur_dt),
+                        "id": { "$gt": cur_id },
+                    },
+                ],
+            );
+        }
+
+        let opts = FindOptions::builder()
+            .sort(doc! { "last_updated": 1, "id": 1 })
+            .limit(limit as i64)
+            .build();
+
+        let mut stream = resources
+            .find(filter)
+            .with_options(opts)
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+
+        let mut docs = Vec::new();
+        while stream
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+        {
+            docs.push(
+                stream
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
+            );
+        }
+
+        let full_page = docs.len() as u32 == limit;
+        let next_cursor = match (full_page, docs.last()) {
+            (true, Some(last)) => {
+                let ts = last
+                    .get_datetime("last_updated")
+                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                let id = last
+                    .get_str("id")
+                    .map_err(|e| internal_error(format!("Missing id: {e}")))?;
+                Some(format!("{}|{}", bson_to_chrono(ts).to_rfc3339(), id))
+            }
+            _ => None,
+        };
+
+        let resources = docs
+            .iter()
+            .map(|doc| {
+                parse_history_row(doc, Some(resource_type), None)
+                    .map(|row| row.into_stored_resource(tenant))
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+        })
+    }
+}
+
+#[async_trait]
+impl ReindexTarget for MongoBackend {
+    async fn delete_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> StorageResult<u64> {
+        // Honors `is_search_offloaded()`: when Elasticsearch owns search, this
+        // backend keeps no index of its own and there is nothing to delete.
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
+
+        let db = self.get_database().await?;
+        let result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
+            .delete_many(doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+            })
+            .await
+            .map_err(|e| internal_error(format!("Failed to delete search entries: {e}")))?;
+
+        Ok(result.deleted_count)
+    }
+
+    async fn write_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
+
+        let db = self.get_database().await?;
+        let mut no_session: Option<ClientSession> = None;
+
+        // Reuses the CRUD indexing path, so contained resources are indexed the
+        // same way here as they are on create/update.
+        self.index_resource(
+            &db,
+            tenant.tenant_id().as_str(),
+            resource.resource_type(),
+            resource.id(),
+            resource.content(),
+            &mut no_session,
+        )
+        .await?;
+
+        let values = self
+            .search_extractor()
+            .extract(resource.content(), resource.resource_type())
+            .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
+
+        Ok(values.len())
+    }
+
+    async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
+
+        let db = self.get_database().await?;
+        let result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
+            .delete_many(doc! { "tenant_id": tenant.tenant_id().as_str() })
+            .await
+            .map_err(|e| internal_error(format!("Failed to clear search index: {e}")))?;
+
+        Ok(result.deleted_count)
+    }
+}
+
+/// Parses a `{rfc3339}|{id}` keyset-pagination cursor for the reindex source.
+fn parse_reindex_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
+    let (ts, id) = cursor.split_once('|')?;
+    let dt = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+    Some((dt, id.to_string()))
 }
 
 fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, String>) {

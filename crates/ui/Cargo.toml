@@ -1,0 +1,66 @@
+[package]
+name = "helios-ui"
+version.workspace = true
+edition.workspace = true
+description = "Optional server-rendered HTMX web UI for the Helios FHIR Server"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/ui"
+keywords = ["helios-software", "fhir", "ui", "htmx"]
+
+[dependencies]
+# Web framework (matches the version used by helios-hfs / helios-rest)
+axum = "0.8"
+
+# Chart bucket timestamps: formatting x-axis labels, and shaping the placeholder
+# series rendered when no dashboard provider is registered.
+chrono.workspace = true
+
+# Compile-time, type-checked, auto-escaping templates (Jinja2-like).
+# Markup lives in templates/, never in Rust source.
+askama = "0.16"
+
+# Typed htmx header handling: the infallible `HxRequest` extractor for the
+# fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching
+# (`Vary: HX-Request`) so an htmx fragment is never served for a hard navigation.
+axum-htmx = { version = "0.8", features = ["auto-vary"] }
+
+# Static assets (htmx, CSS) embedded into the binary at compile time so the
+# server has no runtime CDN dependency and works in air-gapped deployments.
+# `axum-embed` serves them with precompressed (br/gzip/deflate) negotiation.
+rust-embed = "8"
+axum-embed = "0.1"
+
+# Fluent message catalogs (locales/<locale>/main.ftl at the workspace root),
+# embedded at compile time — same no-runtime-dependency stance as the assets.
+# See docs/multi-language.md for the i18n rules of the road.
+fluent-templates = "0.13"
+unic-langid = { version = "0.9", features = ["macros"] }
+
+# Storage-agnostic dashboard snapshot registry. The server registers a
+# provider (backed by the persistence layer) at startup; this crate reads the
+# latest snapshot to render the "FHIR resources over time" chart without any
+# dependency on the persistence layer itself. Falls back to placeholder data
+# when no provider is registered (e.g. the standalone UI example).
+helios-observability = { path = "../observability", version = "0.2.1" }
+
+# Read path for the tenant-maintenance page: the `ResourceStorage` tenant
+# registry (list/register/deregister) + per-tenant resource counts. The UI
+# depends on the rest of the server, never the reverse.
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Parses the .ftl sources so tests can enforce key-set parity across locales.
+fluent-syntax = "0.11"
+# Drive the mounted router end-to-end (locale middleware included) in tests.
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# A real SQLite-backed store so the tenant-maintenance page tests exercise the
+# actual registry read/write path (the `sqlite` feature is test-only).
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4", "sqlite"] }
+# Seed a FHIR resource in tests so a data-only (unregistered) tenant appears.
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false, features = ["R4"] }
+serde_json = "1"

@@ -22,7 +22,7 @@ use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, 
 use crate::search::extractor::ExtractedValue;
 use crate::search::loader::SearchParameterLoader;
 use crate::search::registry::SearchParameterStatus;
-use crate::search::reindex::{ReindexableStorage, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -63,6 +63,10 @@ fn extract_part_value(part: &Value) -> Option<Value> {
 impl ResourceStorage for SqliteBackend {
     fn backend_name(&self) -> &'static str {
         "sqlite"
+    }
+
+    fn is_cluster_shared(&self) -> bool {
+        false
     }
 
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
@@ -476,6 +480,397 @@ impl ResourceStorage for SqliteBackend {
 
         Ok(count as u64)
     }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        // `last_updated` is stored as an RFC3339 UTC string (Utc::now().to_rfc3339()),
+        // e.g. `2026-06-01T14:30:00.123+00:00` — always `+00:00`, with a fixed-width
+        // `YYYY-MM-DDTHH:MM:SS` prefix. Its first 10 characters are the UTC calendar
+        // day, so we bucket on that prefix in SELECT/GROUP BY. The WHERE filter, by
+        // contrast, ranges over the *raw* column so the `(tenant_id, last_updated)`
+        // index can prune by date (wrapping the column in `substr(...)` would force a
+        // full scan). `since_bound` is the start-of-day timestamp for `since` in the
+        // stored format; since every stored value shares that fixed prefix and any
+        // sub-day suffix (`.` = 0x2E or `+` = 0x2B) sorts at/after `...T00:00:00+00:00`,
+        // the lexicographic `>=` selects exactly the rows the day-prefix filter did.
+        let since_bound = since
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is always a valid time")
+            .and_utc()
+            .to_rfc3339();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT substr(last_updated, 1, 10) AS day, COUNT(*) AS n \
+                 FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                   AND last_updated >= ?3 \
+                 GROUP BY day ORDER BY day",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare count_by_day: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![tenant_id, resource_type, since_bound], |row| {
+                let day: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((day, n))
+            })
+            .map_err(|e| internal_error(format!("Failed to query count_by_day: {}", e)))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (day_str, n) =
+                row.map_err(|e| internal_error(format!("Failed to read count_by_day row: {}", e)))?;
+            if let Ok(day) = chrono::NaiveDate::parse_from_str(&day_str, "%Y-%m-%d") {
+                out.push(crate::core::DailyResourceCount {
+                    day,
+                    count: n.max(0) as u64,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Bound the scan by the raw `last_updated` column so the
+        // `(tenant_id, last_updated)` history index prunes the range (wrapping the
+        // column in `strftime(...)` would force a full scan). The bound is floored
+        // to a bucket boundary, and formatted the same RFC3339 way the rows are
+        // written; because it lands exactly on a whole second it carries no
+        // fractional part, and any stored value in that same second sorts after it
+        // (`.` = 0x2E > `+` = 0x2B), so no row in the first bucket is missed.
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds).to_rfc3339();
+
+        // `strftime('%s', ...)` parses the stored RFC3339 UTC string to epoch
+        // seconds; integer-dividing by the bucket width and multiplying back floors
+        // each version to its epoch-aligned bucket start. The delta rule mirrors the
+        // trait doc: creation `+1`, delete `-1`, plain update `0`.
+        let mut stmt = conn
+            .prepare(
+                "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
+                        SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
+                 GROUP BY bucket HAVING delta != 0 ORDER BY bucket",
+            )
+            .map_err(|e| {
+                internal_error(format!("Failed to prepare count_deltas_by_bucket: {}", e))
+            })?;
+
+        let rows = stmt
+            .query_map(
+                params![tenant_id, resource_type, since_bound, bucket_seconds],
+                |row| {
+                    let bucket: i64 = row.get(0)?;
+                    let delta: i64 = row.get(1)?;
+                    Ok((bucket, delta))
+                },
+            )
+            .map_err(|e| {
+                internal_error(format!("Failed to query count_deltas_by_bucket: {}", e))
+            })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (bucket, delta) = row.map_err(|e| {
+                internal_error(format!("Failed to read count_deltas_by_bucket row: {}", e))
+            })?;
+            if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
+                out.push(crate::core::ResourceCountDelta {
+                    bucket_start,
+                    delta,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<crate::core::ActivityCell>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        // Start-of-day bound for `since` in the stored RFC3339 UTC format; see
+        // `count_by_day` for why a raw-column `last_updated >= ?` range is both
+        // sargable (uses the `(tenant_id, last_updated)` history index) and selects
+        // exactly the same rows the old `substr(last_updated, 1, 10) >= day` filter did.
+        let since_bound = since
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is always a valid time")
+            .and_utc()
+            .to_rfc3339();
+
+        // `strftime` parses the stored RFC3339 UTC string and yields UTC weekday
+        // (`%w`: 0=Sunday..6=Saturday) and hour (`%H`: 00..23).
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST(strftime('%w', last_updated) AS INTEGER) AS wd, \
+                        CAST(strftime('%H', last_updated) AS INTEGER) AS hr, \
+                        COUNT(*) AS n \
+                 FROM resource_history \
+                 WHERE tenant_id = ?1 AND last_updated >= ?2 \
+                 GROUP BY wd, hr",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare activity_histogram: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![tenant_id, since_bound], |row| {
+                let wd: i64 = row.get(0)?;
+                let hr: i64 = row.get(1)?;
+                let n: i64 = row.get(2)?;
+                Ok((wd, hr, n))
+            })
+            .map_err(|e| internal_error(format!("Failed to query activity_histogram: {}", e)))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (wd, hr, n) =
+                row.map_err(|e| internal_error(format!("Failed to read activity row: {}", e)))?;
+            out.push(crate::core::ActivityCell {
+                weekday: wd.clamp(0, 6) as u8,
+                hour: hr.clamp(0, 23) as u8,
+                count: n.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut stmt = conn
+            .prepare(
+                "SELECT resource_type, COUNT(*) FROM resources \
+                 WHERE tenant_id = ?1 AND is_deleted = 0 \
+                 GROUP BY resource_type",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare count_all_types: {}", e)))?;
+        let rows = stmt
+            .query_map(params![tenant_id], |row| {
+                let rt: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((rt, n.max(0) as u64))
+            })
+            .map_err(|e| internal_error(format!("Failed to query count_all_types: {}", e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("count_all_types row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        // An empty `IN ()` is invalid SQL; nothing to count.
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Bind tenant_id as ?1 and each requested type as ?2, ?3, ...; the type
+        // names are bound as parameters, never interpolated into the SQL text.
+        let placeholders = (0..resource_types.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT resource_type, COUNT(*) FROM resources \
+             WHERE tenant_id = ?1 AND is_deleted = 0 AND resource_type IN ({}) \
+             GROUP BY resource_type",
+            placeholders
+        );
+
+        // Positional bind values matching the `?1..?n` order above: tenant first,
+        // then the requested types.
+        let mut binds: Vec<&str> = Vec::with_capacity(resource_types.len() + 1);
+        binds.push(tenant_id);
+        binds.extend_from_slice(resource_types);
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| internal_error(format!("Failed to prepare count_by_types: {}", e)))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds), |row| {
+                let rt: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((rt, n.max(0) as u64))
+            })
+            .map_err(|e| internal_error(format!("Failed to query count_by_types: {}", e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("count_by_types row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT tenant_id, COUNT(*) FROM resources \
+                 WHERE is_deleted = 0 GROUP BY tenant_id",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare count_by_tenant: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let tid: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((tid, n.max(0) as u64))
+            })
+            .map_err(|e| internal_error(format!("Failed to query count_by_tenant: {}", e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("count_by_tenant row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
+    fn supports_tenant_registry(&self) -> bool {
+        true
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, display_name, created_at FROM tenants \
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| internal_error(format!("prepare list_tenants: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::core::TenantRecord {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })
+            .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("list_tenants row: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare("SELECT id, display_name, created_at FROM tenants WHERE id = ?1")
+            .map_err(|e| internal_error(format!("prepare get_tenant: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                Ok(crate::core::TenantRecord {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })
+            .map_err(|e| internal_error(format!("query get_tenant: {e}")))?;
+        match rows.next() {
+            Some(row) => {
+                Ok(Some(row.map_err(|e| {
+                    internal_error(format!("get_tenant row: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        let conn = self.get_connection()?;
+        // Plain INSERT so a duplicate id surfaces as a constraint error; the
+        // admin handler pre-checks existence and returns 409, so reaching here
+        // with a duplicate is a race and a 500 is acceptable.
+        conn.execute(
+            "INSERT INTO tenants (id, display_name, created_at) \
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+            params![id, display_name],
+        )
+        .map_err(|e| internal_error(format!("register_tenant: {e}")))?;
+        let mut stmt = conn
+            .prepare("SELECT id, display_name, created_at FROM tenants WHERE id = ?1")
+            .map_err(|e| internal_error(format!("prepare register read-back: {e}")))?;
+        stmt.query_row(params![id], |row| {
+            Ok(crate::core::TenantRecord {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })
+        .map_err(|e| internal_error(format!("register read-back: {e}")))
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        let conn = self.get_connection()?;
+        let changed = conn
+            .execute("DELETE FROM tenants WHERE id = ?1", params![id])
+            .map_err(|e| internal_error(format!("deregister_tenant: {e}")))?;
+        Ok(changed > 0)
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        let mut conn = self.get_connection()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| internal_error(format!("purge begin: {e}")))?;
+        // Count current-version rows first so we can report what was removed.
+        let removed: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| internal_error(format!("purge count: {e}")))?;
+        // search_index has ON DELETE CASCADE from resources, but delete it
+        // explicitly too in case foreign keys are not enforced on this handle.
+        for sql in [
+            "DELETE FROM search_index WHERE tenant_id = ?1",
+            "DELETE FROM resource_history WHERE tenant_id = ?1",
+            "DELETE FROM resources WHERE tenant_id = ?1",
+        ] {
+            tx.execute(sql, params![id])
+                .map_err(|e| internal_error(format!("purge delete: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        Ok(removed.max(0) as u64)
+    }
 }
 
 // Search Index Helpers
@@ -783,20 +1178,22 @@ impl SqliteBackend {
     }
 
     /// Delete search index entries for a resource.
+    /// Removes a resource's search entries, returning how many `search_index`
+    /// rows were deleted.
     pub(crate) fn delete_search_index(
         &self,
         conn: &rusqlite::Connection,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Delete from main search index
-        conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
             params![tenant_id, resource_type, resource_id],
         )
@@ -808,7 +1205,7 @@ impl SqliteBackend {
             params![tenant_id, resource_type, resource_id],
         );
 
-        Ok(())
+        Ok(deleted as u64)
     }
 
     /// Index minimal fallback search parameters.
@@ -2966,9 +3363,9 @@ fn resolve_bundle_references(
     }
 }
 
-// ReindexableStorage implementation for SQLite backend.
+// ReindexSource: SQLite is a primary, so it is where resources are read from.
 #[async_trait]
-impl ReindexableStorage for SqliteBackend {
+impl ReindexSource for SqliteBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
@@ -3102,14 +3499,21 @@ impl ReindexableStorage for SqliteBackend {
             next_cursor,
         })
     }
+}
 
+// ReindexTarget: SQLite keeps search entries in its own `search_index`
+// table, so it is also a writer and can reindex itself standalone.
+#[async_trait]
+impl ReindexTarget for SqliteBackend {
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         let conn = self.get_connection()?;
+        // Reuses the delete path the CRUD layer uses, so the FTS table is
+        // cleaned up too and the `is_search_offloaded` guard is honored.
         self.delete_search_index(
             &conn,
             tenant.tenant_id().as_str(),
@@ -3121,16 +3525,17 @@ impl ReindexableStorage for SqliteBackend {
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
+        resource: &StoredResource,
     ) -> StorageResult<usize> {
         let conn = self.get_connection()?;
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
 
         // Use the dynamic extraction
         let values = self
             .search_extractor()
-            .extract(resource, resource_type)
+            .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
         let mut count = 0;
@@ -3152,7 +3557,7 @@ impl ReindexableStorage for SqliteBackend {
             tenant.tenant_id().as_str(),
             resource_type,
             resource_id,
-            resource,
+            content,
         )?;
 
         Ok(count)
@@ -3447,6 +3852,296 @@ mod tests {
             1
         );
         assert_eq!(backend.count(&tenant, None).await.unwrap(), 3);
+    }
+
+    // ========================================================================
+    // Console dashboard count_* tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_count_by_types() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        // Seed a small deterministic dataset: 2 Patients, 1 Observation.
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let counts = backend
+            .count_by_types(&tenant, &["Patient", "Observation", "Encounter"])
+            .await
+            .unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get("Patient"), Some(&2));
+        assert_eq!(map.get("Observation"), Some(&1));
+        // A type with zero rows is ABSENT from the result, not a 0 row.
+        assert!(!map.contains_key("Encounter"));
+    }
+
+    #[tokio::test]
+    async fn test_count_all_types() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let counts = backend.count_all_types(&tenant).await.unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get("Patient"), Some(&2));
+        assert_eq!(map.get("Observation"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn test_count_by_day() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // `since` = start of today (UTC midnight), built the same way the handler
+        // does; `today` is derived from the same clock so this stays date-robust.
+        let since = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let today = Utc::now().date_naive();
+
+        let rows = backend
+            .count_by_day(&tenant, "Patient", since)
+            .await
+            .unwrap();
+        let today_row = rows
+            .iter()
+            .find(|r| r.day == today)
+            .expect("today bucket should be present");
+        assert_eq!(today_row.count, 2);
+    }
+
+    /// The delta rule, straight from SQL: a create is `+1`, an update is `0` (it
+    /// must not move the resource into a newer bucket — the whole point of reading
+    /// history rather than `resources.last_updated`), and a delete is `-1`.
+    #[tokio::test]
+    async fn test_count_deltas_by_bucket() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let first = backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        // An update writes a v2 history row, which must contribute nothing.
+        backend
+            .update(&tenant, &first, json!({"active": true}))
+            .await
+            .unwrap();
+
+        // A one-minute bucket, so the writes above all land in the same one.
+        let since = Utc::now() - chrono::Duration::minutes(5);
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|r| r.delta).sum::<i64>(),
+            2,
+            "two creates and one update net to +2"
+        );
+        assert!(
+            rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+            "buckets are epoch-aligned to their width"
+        );
+
+        // Deleting one nets it back out.
+        backend
+            .delete(&tenant, "Patient", first.id())
+            .await
+            .unwrap();
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
+
+        // Buckets narrower than the window still cover it, and a bogus width is
+        // rejected rather than silently dividing by zero.
+        assert!(
+            backend
+                .count_deltas_by_bucket(&tenant, "Patient", since, 0)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_activity_histogram() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        // 3 writes for this tenant -> 3 resource_history rows.
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let since = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+
+        let cells = backend.activity_histogram(&tenant, since).await.unwrap();
+        assert!(!cells.is_empty());
+        // Total across returned cells equals the number of writes seeded.
+        let total: u64 = cells.iter().map(|c| c.count).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn test_count_by_tenant() {
+        let backend = create_test_backend();
+        let tenant_a =
+            TenantContext::new(TenantId::new("tenant-a"), TenantPermissions::full_access());
+        let tenant_b =
+            TenantContext::new(TenantId::new("tenant-b"), TenantPermissions::full_access());
+
+        // tenant-a: 3 resources, tenant-b: 2 resources.
+        backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_b, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // Cross-tenant admin aggregate: takes NO TenantContext.
+        let counts = backend.count_by_tenant().await.unwrap();
+        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        assert_eq!(map.get("tenant-a"), Some(&3));
+        assert_eq!(map.get("tenant-b"), Some(&2));
+    }
+
+    #[test]
+    fn test_is_cluster_shared() {
+        let backend = create_test_backend();
+        assert!(!backend.is_cluster_shared());
+    }
+
+    #[tokio::test]
+    async fn test_tenant_registry_crud() {
+        let backend = create_test_backend();
+        assert!(backend.supports_tenant_registry());
+
+        // Empty to start.
+        assert!(backend.list_tenants().await.unwrap().is_empty());
+        assert!(backend.get_tenant("acme").await.unwrap().is_none());
+
+        // Register two tenants, one with a display name.
+        let acme = backend
+            .register_tenant("acme", Some("Acme Health"))
+            .await
+            .unwrap();
+        assert_eq!(acme.id, "acme");
+        assert_eq!(acme.display_name.as_deref(), Some("Acme Health"));
+        assert!(!acme.created_at.is_empty());
+        backend.register_tenant("beta", None).await.unwrap();
+
+        let all = backend.list_tenants().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(backend.get_tenant("acme").await.unwrap(), Some(acme));
+
+        // Duplicate registration is an error (handler pre-checks for 409).
+        assert!(backend.register_tenant("acme", None).await.is_err());
+
+        // Deregister removes the row; second call reports nothing removed.
+        assert!(backend.deregister_tenant("beta").await.unwrap());
+        assert!(!backend.deregister_tenant("beta").await.unwrap());
+        assert_eq!(backend.list_tenants().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_purge_tenant_data() {
+        let backend = create_test_backend();
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let other = TenantContext::new(TenantId::new("other"), TenantPermissions::full_access());
+
+        for _ in 0..3 {
+            backend
+                .create(&acme, "Patient", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        backend
+            .create(&other, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // Purge removes acme's data only, reporting the row count.
+        let removed = backend.purge_tenant_data("acme").await.unwrap();
+        assert_eq!(removed, 3);
+
+        let counts: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(counts.get("acme"), None);
+        assert_eq!(counts.get("other"), Some(&1));
     }
 
     #[tokio::test]

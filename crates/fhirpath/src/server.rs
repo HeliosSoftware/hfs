@@ -229,16 +229,11 @@ impl From<ServerArgs> for ServerConfig {
 
 /// Run the FHIRPath server
 pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    let filter = format!(
-        "fhirpath_server={},tower_http={}",
-        config.log_level, config.log_level
-    );
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
-        )
-        .init();
+    // Initialize observability: logging/tracing (+ optional OTLP), uptime, and
+    // the Prometheus metrics recorder.
+    helios_observability::uptime::init();
+    helios_observability::telemetry::init("fhirpath-server", &config.log_level);
+    helios_observability::metrics::init("fhirpath-server");
 
     info!("Starting FHIRPath server...");
     info!("Configuration: {:?}", config);
@@ -320,6 +315,13 @@ pub fn create_app(config: &ServerConfig) -> Router {
 
     // Add tracing
     app = app.layer(TraceLayer::new_for_http());
+
+    // Observability: `/metrics` (state-free) + per-request metrics/trace span.
+    app = app
+        .merge(helios_observability::metrics::router())
+        .layer(axum::middleware::from_fn(
+            helios_observability::middleware::track,
+        ));
 
     app
 }

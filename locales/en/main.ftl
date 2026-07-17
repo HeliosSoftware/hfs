@@ -1,0 +1,180 @@
+# Helios FHIR Server — UI message catalog
+# Locale: English (en) — SOURCE LOCALE. Every key defined here is the
+# canonical set; other locales are expected to provide the same keys.
+#
+# Syntax: Project Fluent (https://projectfluent.org/). Terms (prefixed with
+# `-`) are reusable snippets; messages (bare identifiers) are what the UI
+# looks up. Placeables `{ $var }` are interpolated by the caller. Do NOT put
+# markup or logic here — translations are data, the template renders them.
+
+## Brand / shared terms
+
+-app-name = Helios FHIR Server
+-org-name = Helios Software
+
+## Page chrome
+
+app-title = { -app-name }
+app-tagline = A fast, multi-version FHIR server
+
+nav-dashboard = Dashboard
+nav-terminology = Terminology
+nav-resources = Resources
+nav-settings = Settings
+nav-signout = Sign out
+
+## Language switcher
+
+language-label = Language
+language-en = English
+language-es = Spanish
+language-de = German
+
+## Home / landing page
+
+home-lede = Server-rendered, HTMX-first UI. This panel is refreshed as an HTML fragment.
+
+## Status panel
+
+status-last-checked = Last checked: { $timestamp }
+
+## Dashboard / health
+
+dashboard-heading = Server dashboard
+health-status-ok = All systems operational
+health-status-degraded = Some systems are degraded
+health-uptime = Uptime: { $duration }
+
+# Pluralized count — every locale must supply the plural categories its
+# grammar requires (CLDR rules; Fluent selects the branch automatically).
+resource-count = { $count ->
+    [one] { $count } resource
+   *[other] { $count } resources
+}
+
+## Terminology browsing
+
+terminology-search-label = Search CodeSystems and ValueSets
+terminology-search-placeholder = e.g. 73211009, "diabetes", http://snomed.info/sct
+terminology-display-language = Display language
+terminology-no-results = No matching concepts found.
+
+## Common actions
+
+action-search = Search
+action-save = Save
+action-cancel = Cancel
+action-retry = Retry
+
+## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)
+
+error-not-found = The requested resource was not found.
+error-unauthorized = You are not authorized to perform this action.
+error-generic = Something went wrong. Please try again.
+
+## Dashboard shell (Figma "Dashboard V1.1")
+
+nav-section-work = Work
+nav-section-batch-data = Batch & Data
+nav-section-server = Server
+nav-section-conditional = Conditional
+
+nav-home = Home
+nav-search = Search
+nav-resource-editor = Resource Editor
+nav-history-versions = History & Versions
+nav-compartments = Compartments
+nav-batch-transaction = Batch / Transaction
+nav-bulk-export = Bulk Export
+nav-sql-on-fhir = SQL-on-FHIR
+nav-capability-conformance = Capability & Conformance
+nav-admin-ops = Admin / Ops
+nav-subscriptions = Subscriptions
+nav-tenants = Tenants
+nav-toggle = Collapse or expand the navigation
+
+## Tenant maintenance (/ui/tenants)
+
+tenants-title = Tenant Maintenance
+tenants-unavailable = The tenant registry is not available on this storage backend.
+tenants-stat-total = Total tenants
+tenants-stat-total-sub = { $count ->
+    [one] { $count } registered
+   *[other] { $count } registered
+}
+tenants-stat-resources = Resources stored
+tenants-stat-resources-sub = across all tenants
+tenants-search-placeholder = Search by name or tenant id…
+tenants-add = Add tenant
+tenants-add-title = Add a tenant
+tenants-field-id = Tenant id
+tenants-field-id-hint = Used in the API (X-Tenant-ID header, URL prefix, JWT claim).
+tenants-field-name = Display name (optional)
+tenants-field-name-hint = A human-friendly label; not used for routing.
+tenants-add-submit = Provision tenant
+tenants-col-tenant = Tenant
+tenants-col-resources = Resources
+tenants-col-created = Created
+tenants-col-actions = Actions
+tenants-empty = No tenants match.
+tenants-unregistered = unregistered
+tenants-delete = Delete tenant
+tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept unless purged via the API.
+
+tenant-heading = Tenants
+tenant-all = All tenants
+tenant-search-placeholder = Search tenants
+
+theme-label = Theme
+theme-light = Light theme
+theme-dark = Dark theme
+
+fhir-version = FHIR { $version }
+
+card-resource-types = Resource types
+card-resource-types-sub = enabled for { $version }
+card-stored-resources = Stored resources
+card-stored-resources-sub = across active tenant
+card-export-jobs = Export jobs
+card-export-jobs-sub = running ({ $queued } queued)
+card-uptime = Uptime
+card-uptime-sub = last 30 days
+
+chart-title = FHIR resources over time
+chart-expand = Expand chart
+chart-window = Chart time window
+
+## Footer
+
+footer-copyright = © { $year } { -org-name }
+
+## Saved queries (#234)
+
+nav-saved-queries = Saved Queries
+
+queries-heading = Saved queries
+queries-lede = Keep FHIR search queries per resource type, sorted by when you last ran them. Saved to your user settings, so they roam across devices.
+queries-add-heading = Save a query
+queries-type-label = Resource type
+queries-type-placeholder = e.g. Patient
+queries-name-label = Name
+queries-name-placeholder = e.g. Smiths in Boston
+queries-query-label = Query string
+queries-query-placeholder = e.g. name=smith&address-city=Boston
+queries-empty = No saved queries yet. Save one above to get started.
+queries-never-run = Never run
+queries-run = Run
+queries-rename = Rename
+queries-delete = Delete
+queries-rename-prompt = New name
+queries-confirm-delete = Delete "{ $name }"?
+queries-unavailable = Saved queries are unavailable: this server's storage backend does not support per-user settings.
+
+queries-builder-heading = Search builder
+queries-url-label = FHIR search URL
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Edit the GET URL directly. Run opens the search in a new tab and records it under Recent; give it a name to keep it in the saved list below.
+queries-recent = Recent
+queries-recent-heading = Recent searches
+queries-recent-empty = No recent searches yet — Run one to record it here.
+queries-invalid-url = Enter a search like GET /Patient?name=smith — the resource type comes from the path.

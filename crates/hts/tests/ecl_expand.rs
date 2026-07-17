@@ -21,16 +21,26 @@ use common::{TestApp, bundles};
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 /// POST `$expand` for `url`, returning the sorted list of codes in the expansion.
+///
+/// Collects codes recursively through nested `contains[]`: these tests assert
+/// which concepts an ECL / is-a filter selects (the concept *set*), not the
+/// tree shape. An `is-a`/`descendent-of` filter over a hierarchical CS now
+/// expands hierarchically (children nested under their in-result parent), so a
+/// top-level-only walk would miss the descendants.
 async fn expand_codes(app: &TestApp, url: &str) -> Vec<String> {
     let req = TestApp::params(&[("url", "valueUri", url)]);
     let (status, body) = app.post_fhir("/ValueSet/$expand", req).await;
     assert_eq!(status, StatusCode::OK, "expand failed for {url}: {body}");
-    let mut codes: Vec<String> = body["expansion"]["contains"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|e| e["code"].as_str().map(String::from))
-        .collect();
+    fn collect(items: Option<&Vec<serde_json::Value>>, out: &mut Vec<String>) {
+        for e in items.into_iter().flatten() {
+            if let Some(code) = e["code"].as_str() {
+                out.push(code.to_string());
+            }
+            collect(e["contains"].as_array(), out);
+        }
+    }
+    let mut codes: Vec<String> = Vec::new();
+    collect(body["expansion"]["contains"].as_array(), &mut codes);
     codes.sort();
     codes
 }

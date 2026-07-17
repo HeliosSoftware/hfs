@@ -30,9 +30,6 @@ mongodb = ["helios-persistence/mongodb"]
 elasticsearch = ["helios-persistence/elasticsearch"]
 s3 = ["helios-persistence/s3", "dep:aws-sdk-s3", "dep:aws-config"]
 
-# Auth feature (pass through to helios-auth)
-redis = ["helios-auth/redis"]
-
 # Subscriptions
 subscriptions = ["dep:helios-subscriptions"]
 
@@ -40,6 +37,9 @@ subscriptions = ["dep:helios-subscriptions"]
 # `dir` + A128GCM/A256GCM compact-JWE files; without it, encrypted submissions
 # record a `not-supported` manifest-level error (documented non-conformance).
 bulk-submit-jwe = ["dep:aes-gcm"]
+
+# OpenTelemetry OTLP trace export (forwards to helios-observability)
+otel = ["helios-observability/otel"]
 
 [dependencies]
 # Core dependencies
@@ -50,6 +50,7 @@ helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.1" }
 helios-audit = { path = "../audit", version = "0.2.1", default-features = false }
 helios-subscriptions = { path = "../subscriptions", version = "0.2.1", optional = true, default-features = false }
+helios-observability = { path = "../observability", version = "0.2.1" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -111,6 +112,10 @@ aes-gcm = { version = "0.10", optional = true }
 [dev-dependencies]
 # HTTP testing
 axum-test = "18.0"
+
+# Inject synthetic request-log traffic in console-metrics tests (the same
+# in-process request log the handlers read for per-tenant traffic).
+helios-observability = { path = "../observability" }
 
 # gzip test payloads for HTTP compression tests
 flate2 = "1"
