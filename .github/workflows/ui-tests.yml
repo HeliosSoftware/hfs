@@ -4,13 +4,13 @@ name: UI Tests
 # WCAG 2.2 AA via axe-core, theme behavior, progressive enhancement, and the
 # no-CDN invariants — the class of behavior tower::oneshot tests cannot reach.
 #
-# The server is built on the host (it already carries the Rust toolchain, LLD,
-# and the openssl/sqlite build deps). The Playwright suite runs inside the
-# official Playwright container via `docker run` — the same in-a-step Docker
-# pattern the Inferno/HTS jobs use, because this self-hosted runner does not
-# support job-level `container:`. The container ships the browsers and their
-# system libraries, so no `playwright install --with-deps` (and no sudo) is
-# needed.
+# Runner model (matches Inferno/HTS): this self-hosted pool talks to a *remote*
+# Docker daemon over DOCKER_HOST, so there is no local /var/run/docker.sock and
+# bind mounts of the runner's filesystem do not reach the daemon. We therefore
+# build hfs on the host, start the Playwright container on the remote daemon,
+# and `docker cp` the pieces in. hfs and Chromium both run inside that one
+# container, so they share its localhost — no cross-host networking needed. The
+# image ships the browsers and their system libraries (no sudo, no --with-deps).
 
 on:
   pull_request:
@@ -28,8 +28,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
   # Keep in step with @playwright/test in crates/ui/e2e/package.json.
   PLAYWRIGHT_IMAGE: mcr.microsoft.com/playwright:v1.49.1-noble
+  RUN_CONTAINER: ui-e2e-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   ui-tests:
@@ -62,17 +64,26 @@ jobs:
       - name: Build hfs (ui feature)
         run: cargo build -p helios-hfs --features ui
 
-      # The browser ring, inside the Playwright container. boot.mjs starts the
-      # host-built hfs (mounted at /work/target/debug/hfs) and Playwright drives
-      # it — both live in the container, so they share its localhost.
-      - name: Run browser suite (Playwright container)
+      # The browser ring, inside the Playwright container on the remote daemon.
+      # boot.mjs starts the copied-in hfs and Playwright drives it — both live in
+      # the container, sharing its localhost.
+      - name: Run browser suite (Playwright)
         run: |
-          docker run --rm \
-            -e CI=1 \
-            -v "$GITHUB_WORKSPACE":/work \
-            -w /work/crates/ui/e2e \
-            "$PLAYWRIGHT_IMAGE" \
+          set -euo pipefail
+          docker rm -f "$RUN_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$RUN_CONTAINER" -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui
+          docker cp target/debug/hfs "$RUN_CONTAINER":/work/target/debug/hfs
+          docker cp data "$RUN_CONTAINER":/work/data
+          docker cp crates/ui/e2e "$RUN_CONTAINER":/work/crates/ui/e2e
+          docker exec -e CI=1 -w /work/crates/ui/e2e "$RUN_CONTAINER" \
             bash -c "npm ci && npx playwright test"
+
+      - name: Copy Playwright report out
+        if: always()
+        run: |
+          docker cp "$RUN_CONTAINER":/work/crates/ui/e2e/playwright-report \
+            ./crates/ui/e2e/playwright-report 2>/dev/null || true
 
       - name: Upload Playwright report
         if: failure()
@@ -81,3 +92,7 @@ jobs:
           name: playwright-report
           path: crates/ui/e2e/playwright-report/
           retention-days: 7
+
+      - name: Remove Playwright container
+        if: always()
+        run: docker rm -f "$RUN_CONTAINER" 2>/dev/null || true
