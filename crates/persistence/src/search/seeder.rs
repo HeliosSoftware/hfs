@@ -222,7 +222,9 @@ where
         });
     }
 
-    let present = storage.count(&tenant, Some("CompartmentDefinition")).await?;
+    let present = storage
+        .count(&tenant, Some("CompartmentDefinition"))
+        .await?;
     if present as usize >= resources.len() {
         return Ok(SeedOutcome {
             created: 0,

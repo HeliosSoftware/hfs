@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::search::{
-    seed_spec_compartment_definitions, seed_tenant_conformance,
-};
+use helios_persistence::search::{seed_spec_compartment_definitions, seed_tenant_conformance};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::json;
 
@@ -127,9 +125,10 @@ async fn seeding_reports_existing_and_never_clobbers() {
         .await
         .expect("pre-create under a spec id");
 
-    let outcome = seed_spec_compartment_definitions(&backend, FhirVersion::R4, &data_dir, "default")
-        .await
-        .expect("seed over a present spec id");
+    let outcome =
+        seed_spec_compartment_definitions(&backend, FhirVersion::R4, &data_dir, "default")
+            .await
+            .expect("seed over a present spec id");
     assert!(
         outcome.existing >= 1,
         "the pre-existing spec id should be reported existing, got {outcome:?}"

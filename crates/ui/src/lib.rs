@@ -262,9 +262,18 @@ pub fn mount(
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
 ) -> Router {
-    let source: Arc<dyn ConformanceSource> =
-        Arc::new(conformance::HttpConformanceSource::new(self_base_url, outbound_auth));
-    mount_with_conformance_source(fhir_app, hfs_version, data_dir, tenants, source, fhir_version)
+    let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
+        self_base_url,
+        outbound_auth,
+    ));
+    mount_with_conformance_source(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        tenants,
+        source,
+        fhir_version,
+    )
 }
 
 /// Mounts the UI with an injected [`ConformanceSource`], so tests can serve the

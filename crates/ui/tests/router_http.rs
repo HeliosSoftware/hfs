@@ -135,8 +135,8 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         helios_fhir::FhirVersion::R4,
     )
     .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_text(response).await, "fhir handled");
@@ -188,7 +188,11 @@ async fn search_parameters_selection_renders_the_detail_panel() {
 #[tokio::test]
 async fn compartments_page_defaults_to_patient() {
     let response = app()
-        .oneshot(Request::get("/ui/compartments").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/ui/compartments")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 

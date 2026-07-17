@@ -23,8 +23,7 @@ use serde_json::Value;
 pub trait ConformanceSource: Send + Sync {
     /// Returns every resource of `resource_type` the server holds for `version`,
     /// or an `Err` message when the fetch fails (the caller degrades the page).
-    async fn fetch(&self, resource_type: &str, version: FhirVersion)
-    -> Result<Vec<Value>, String>;
+    async fn fetch(&self, resource_type: &str, version: FhirVersion) -> Result<Vec<Value>, String>;
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -115,8 +114,14 @@ impl StaticConformanceSource {
     }
 
     /// Seeds one `(resource_type, version)` slot.
-    pub fn with(mut self, resource_type: &str, version: FhirVersion, resources: Vec<Value>) -> Self {
-        self.map.insert((resource_type.to_string(), version), resources);
+    pub fn with(
+        mut self,
+        resource_type: &str,
+        version: FhirVersion,
+        resources: Vec<Value>,
+    ) -> Self {
+        self.map
+            .insert((resource_type.to_string(), version), resources);
         self
     }
 
@@ -144,11 +149,7 @@ impl StaticConformanceSource {
 
 #[async_trait]
 impl ConformanceSource for StaticConformanceSource {
-    async fn fetch(
-        &self,
-        resource_type: &str,
-        version: FhirVersion,
-    ) -> Result<Vec<Value>, String> {
+    async fn fetch(&self, resource_type: &str, version: FhirVersion) -> Result<Vec<Value>, String> {
         Ok(self
             .map
             .get(&(resource_type.to_string(), version))

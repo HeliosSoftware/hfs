@@ -102,15 +102,27 @@ mod tests {
         // Device, Encounter, Patient, Practitioner, RelatedPerson (questionnaire
         // has no code and is excluded from the bundle).
         assert_eq!(resources.len(), 5);
-        assert!(resources.iter().all(|r| r["resourceType"] == "CompartmentDefinition"));
+        assert!(
+            resources
+                .iter()
+                .all(|r| r["resourceType"] == "CompartmentDefinition")
+        );
         assert!(resources.iter().any(|r| r["code"] == "Patient"));
-        assert!(resources.iter().all(|r| r.get("id").and_then(|i| i.as_str()).is_some()));
+        assert!(
+            resources
+                .iter()
+                .all(|r| r.get("id").and_then(|i| i.as_str()).is_some())
+        );
     }
 
     #[test]
     fn missing_dir_errors() {
         let loader = CompartmentDefinitionLoader::new(FhirVersion::default_enabled());
-        assert!(loader.load_spec_resources(Path::new("/nonexistent/data/dir")).is_err());
+        assert!(
+            loader
+                .load_spec_resources(Path::new("/nonexistent/data/dir"))
+                .is_err()
+        );
     }
 
     /// The shipped `data/compartment-definitions-*.json` bundles must say
@@ -132,7 +144,8 @@ mod tests {
                     .unwrap_or_default();
                 let runtime = crate::get_compartment_params(version, code, rtype);
                 assert_eq!(
-                    runtime, params.as_slice(),
+                    runtime,
+                    params.as_slice(),
                     "{version:?} compartment {code} / {rtype}"
                 );
             }

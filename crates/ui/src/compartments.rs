@@ -72,17 +72,14 @@ impl CompartmentCatalog {
         if let Some(cached) = self.cache.lock().expect("compartment lock").get(&version) {
             return cached.clone();
         }
-        let mut defs: Vec<CompartmentDef> = match self
-            .source
-            .fetch("CompartmentDefinition", version)
-            .await
-        {
-            Ok(resources) => resources
-                .into_iter()
-                .filter_map(|r| serde_json::from_value(r).ok())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let mut defs: Vec<CompartmentDef> =
+            match self.source.fetch("CompartmentDefinition", version).await {
+                Ok(resources) => resources
+                    .into_iter()
+                    .filter_map(|r| serde_json::from_value(r).ok())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
         defs.sort_by(|a, b| a.code.cmp(&b.code));
         let built = Arc::new(defs);
         self.cache
@@ -560,7 +557,13 @@ mod tests {
         let codes: Vec<&str> = defs.iter().map(|d| d.code.as_str()).collect();
         assert_eq!(
             codes,
-            ["Device", "Encounter", "Patient", "Practitioner", "RelatedPerson"]
+            [
+                "Device",
+                "Encounter",
+                "Patient",
+                "Practitioner",
+                "RelatedPerson"
+            ]
         );
         let patient = defs.iter().find(|d| d.code == "Patient").unwrap();
         assert_eq!(patient.resource.len(), 145);
