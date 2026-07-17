@@ -29,7 +29,6 @@ use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::info;
 
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_persistence::core::SettingsStore;
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, DefaultExportWorker, DefaultSubmitWorker,
@@ -37,11 +36,12 @@ use helios_persistence::core::{
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_rest::bulk_export_auth::BearerScopeAuth;
-// Every startup path now goes through one builder. The bundles it takes are all
+// Every startup path goes through one builder. The bundles it takes are all
 // optional, so a backend that lacks a capability passes `None` rather than
-// reaching for a different entry point: S3 has no settings store (tracked
-// follow-up #199) and no search index to reindex, MongoDB rides an embedded
-// SQLite sidecar for bulk-export job state, and so on.
+// reaching for a different entry point: S3 has no search index to reindex,
+// MongoDB rides an embedded SQLite sidecar for bulk-export job state, and so on.
+// Every standalone primary backend (SQLite, PostgreSQL, MongoDB, and now S3)
+// *does* host the per-user settings store, so all of them wire one.
 use helios_rest::OperationsBundle;
 use helios_rest::create_app_with_auth_bulk_settings_and_ops;
 
@@ -2166,13 +2166,31 @@ async fn start_s3(
         )
     })?;
 
-    let serve_audit_state = audit_state.clone();
     let backend = Arc::new(backend);
+    let serve_audit_state = audit_state.clone();
 
     // Second handle to the same backend (S3Backend clones share the client)
     // for the web UI's tenant-maintenance read/write path.
     let ui_tenants: Option<Arc<dyn ResourceStorage>> =
         Some(backend.clone() as Arc<dyn ResourceStorage>);
+
+    // The S3 backend also hosts the per-user settings store (a compare-and-swap
+    // over conditional PutObject). Bulk export/submit are not wired on a
+    // standalone S3 primary, which has no job store.
+    //
+    // A bucket-per-tenant configuration with no `default_system_bucket` has
+    // nowhere tenant-independent to keep a user-global document, so the store is
+    // left unwired and `/_user/settings` reports the explained 501 rather than
+    // failing every request.
+    let settings_store: Option<Arc<dyn SettingsStore>> = if backend.supports_user_settings() {
+        Some(backend.clone())
+    } else {
+        tracing::warn!(
+            "S3 is configured bucket-per-tenant with no default system bucket; \
+             per-user settings (/_user/settings) will report 501 Not Implemented"
+        );
+        None
+    };
 
     // S3 standalone can purge, but it has NO search index of any kind — its
     // SearchProvider reports search unsupported — so `$reindex` has nothing to
@@ -2183,6 +2201,7 @@ async fn start_s3(
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: None,
     };
+
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
         config.clone(),
@@ -2191,7 +2210,7 @@ async fn start_s3(
         audit_state,
         None,
         None,
-        None,
+        settings_store,
         ops,
     );
     serve(app, &config, serve_audit_state, ui_tenants).await
@@ -2384,6 +2403,20 @@ async fn start_s3_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
+    // The per-user settings store lives on the S3 primary (Elasticsearch is
+    // search-only), so it is wired from the underlying `s3` backend even though
+    // the app is served over the composite storage. As in `start_s3`, a tenancy
+    // mode with no tenant-independent bucket leaves it unwired (explained 501).
+    let settings_store: Option<Arc<dyn SettingsStore>> = if s3.supports_user_settings() {
+        Some(s3.clone())
+    } else {
+        tracing::warn!(
+            "S3 is configured bucket-per-tenant with no default system bucket; \
+             per-user settings (/_user/settings) will report 501 Not Implemented"
+        );
+        None
+    };
+
     // Reindex reads from the S3 primary and writes to Elasticsearch, which is
     // the only search index in this deployment — S3 maintains none. The
     // extractor is Elasticsearch's for the same reason.
@@ -2395,28 +2428,20 @@ async fn start_s3_elasticsearch(
         audit_state.as_ref(),
     );
 
-    // S3 primary; embedded SQLite sidecar for job state.
-    #[cfg(feature = "sqlite")]
-    {
-        let jobs = build_embedded_job_store(&config)?;
-        if let Some(bundle) = build_bulk_export(&config, s3.clone(), jobs).await? {
-            let app = create_app_with_auth_bulk_settings_and_ops(
-                composite.clone(),
-                config.clone(),
-                auth_config,
-                auth_state,
-                audit_state,
-                Some(bundle),
-                None,
-                None,
-                ops,
-            );
-            // The UI's tenant-maintenance path goes through the composite (not
-            // the bare primary) so a purge also clears the offloaded search
-            // documents.
-            return serve(app, &config, serve_audit_state, Some(composite)).await;
+    // S3 primary; embedded SQLite sidecar for bulk-export job state. A single
+    // builder call covers both the bulk-enabled and bulk-disabled cases, so
+    // `ops` and `settings_store` are each consumed exactly once.
+    let bulk_export = {
+        #[cfg(feature = "sqlite")]
+        {
+            let jobs = build_embedded_job_store(&config)?;
+            build_bulk_export(&config, s3.clone(), jobs).await?
         }
-    }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            None
+        }
+    };
 
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
@@ -2424,12 +2449,13 @@ async fn start_s3_elasticsearch(
         auth_config,
         auth_state,
         audit_state,
+        bulk_export,
         None,
-        None,
-        None,
+        settings_store,
         ops,
     );
-    // See above: the composite handle keeps purge search-aware in the UI too.
+    // The UI's tenant-maintenance path goes through the composite (not the bare
+    // primary) so a purge also clears the offloaded search documents.
     serve(app, &config, serve_audit_state, Some(composite)).await
 }
 

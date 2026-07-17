@@ -74,6 +74,11 @@ pub struct PostgresConfig {
     #[serde(default = "default_statement_timeout_ms")]
     pub statement_timeout_ms: u64,
 
+    /// How long to wait for a free pooled connection before returning
+    /// `BackendError::Unavailable`.
+    #[serde(default = "default_pool_wait_timeout_secs")]
+    pub pool_wait_timeout_secs: u64,
+
     /// FHIR version for this backend instance.
     #[serde(default = "crate::default_fhir_version")]
     pub fhir_version: FhirVersion,
@@ -120,8 +125,23 @@ fn default_user() -> String {
     "helios".to_string()
 }
 
+/// Default pool size.
+///
+/// FHIR search is dominated by database round-trips rather than local CPU, so
+/// connections spend most of their life waiting on the wire and a pool somewhat
+/// larger than the core count is right. The ceiling matters more than the floor:
+/// past roughly `db_cores * 2` extra connections do not add throughput, they just
+/// move the queue out of the client (cheap: a semaphore) and into Postgres
+/// (expensive: a backend process and its `work_mem`).
+///
+/// The old fixed default of 10 throttled search badly — at 30 concurrent clients
+/// with multi-second queries, two-thirds of every request's latency was spent
+/// waiting for a connection (issue #224).
 fn default_max_connections() -> usize {
-    10
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores * 4).clamp(16, 64)
 }
 
 fn default_connect_timeout_secs() -> u64 {
@@ -130,6 +150,14 @@ fn default_connect_timeout_secs() -> u64 {
 
 fn default_statement_timeout_ms() -> u64 {
     30000
+}
+
+/// How long a caller waits for a pooled connection before giving up.
+///
+/// deadpool's default is to wait forever, which turns database saturation into an
+/// unbounded latency tail instead of an honest rejection.
+fn default_pool_wait_timeout_secs() -> u64 {
+    10
 }
 
 impl Default for PostgresConfig {
@@ -144,10 +172,41 @@ impl Default for PostgresConfig {
             max_connections: default_max_connections(),
             connect_timeout_secs: default_connect_timeout_secs(),
             statement_timeout_ms: default_statement_timeout_ms(),
+            pool_wait_timeout_secs: default_pool_wait_timeout_secs(),
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
             schema_name: None,
+        }
+    }
+}
+
+impl PostgresConfig {
+    /// Applies `HFS_PG_*` tuning overrides.
+    ///
+    /// Called from every construction path, not just `from_env`. The connection-URL
+    /// path (`HFS_DATABASE_URL`, which is how Docker and Kubernetes deployments and
+    /// the benchmark all configure the server) previously started from `Default` and
+    /// only overwrote host/port/user/password/dbname — so the pool size was pinned
+    /// at its default and *no* environment variable could change it (issue #224).
+    fn apply_env_overrides(&mut self) {
+        if let Some(v) = std::env::var("HFS_PG_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.max_connections = v;
+        }
+        if let Some(v) = std::env::var("HFS_PG_STATEMENT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.statement_timeout_ms = v;
+        }
+        if let Some(v) = std::env::var("HFS_PG_POOL_WAIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.pool_wait_timeout_secs = v;
         }
     }
 }
@@ -157,29 +216,20 @@ impl PostgresBackend {
     pub async fn new(config: PostgresConfig) -> StorageResult<Self> {
         let pool = Self::create_pool(&config)?;
 
-        // Verify connectivity
+        // Verify connectivity.
+        //
+        // `statement_timeout` is deliberately NOT set here. It is a session GUC, so
+        // a `SET` on one pooled connection binds only that connection — the others,
+        // created lazily as the pool grows, inherited the server default (usually
+        // 0 = no limit). Under load that meant a runaway query was capped or not
+        // depending on which connection it happened to draw. It is now sent in the
+        // startup packet by `create_pool`, so every connection carries it.
         let client = pool.get().await.map_err(|e| {
             crate::error::StorageError::Backend(BackendError::ConnectionFailed {
                 backend_name: "postgres".to_string(),
                 message: e.to_string(),
             })
         })?;
-
-        // Set statement timeout
-        client
-            .execute(
-                &format!("SET statement_timeout = {}", config.statement_timeout_ms),
-                &[],
-            )
-            .await
-            .map_err(|e| {
-                crate::error::StorageError::Backend(BackendError::Internal {
-                    backend_name: "postgres".to_string(),
-                    message: format!("Failed to set statement_timeout: {}", e),
-                    source: None,
-                })
-            })?;
-
         drop(client);
 
         // Initialize the search parameter registry
@@ -209,9 +259,11 @@ impl PostgresBackend {
     /// - `HFS_PG_DBNAME` (default: "helios")
     /// - `HFS_PG_USER` (default: "helios")
     /// - `HFS_PG_PASSWORD`
-    /// - `HFS_PG_MAX_CONNECTIONS` (default: 10)
+    /// - `HFS_PG_MAX_CONNECTIONS` (default: `cores * 4`, clamped to 16..=64)
+    /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
+    /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
     pub async fn from_env() -> StorageResult<Self> {
-        let config = PostgresConfig {
+        let mut config = PostgresConfig {
             host: std::env::var("HFS_PG_HOST").unwrap_or_else(|_| default_host()),
             port: std::env::var("HFS_PG_PORT")
                 .ok()
@@ -220,12 +272,11 @@ impl PostgresBackend {
             dbname: std::env::var("HFS_PG_DBNAME").unwrap_or_else(|_| default_dbname()),
             user: std::env::var("HFS_PG_USER").unwrap_or_else(|_| default_user()),
             password: std::env::var("HFS_PG_PASSWORD").ok(),
-            max_connections: std::env::var("HFS_PG_MAX_CONNECTIONS")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or_else(default_max_connections),
             ..Default::default()
         };
+        // Pool/timeout knobs are applied through the shared helper so this path and
+        // the connection-URL path cannot drift apart again.
+        config.apply_env_overrides();
         Self::new(config).await
     }
 
@@ -242,6 +293,18 @@ impl PostgresBackend {
             PostgresSslMode::Require => SslMode::Require,
         });
 
+        // Ship `statement_timeout` in the startup packet so it applies to every
+        // connection the pool ever creates — including ones added as the pool grows
+        // and ones replaced after a recycle. A post-connect `SET` on a single
+        // borrowed client cannot make that guarantee (it binds only that session),
+        // and a per-connection hook would cost an extra round-trip.
+        cfg.options = Some(format!(
+            "-c statement_timeout={}",
+            config.statement_timeout_ms
+        ));
+        // Makes HFS connections identifiable in pg_stat_activity.
+        cfg.application_name = Some("hfs".to_string());
+
         let pool = cfg
             .builder(NoTls)
             .map_err(|e| {
@@ -252,6 +315,17 @@ impl PostgresBackend {
                 })
             })?
             .max_size(config.max_connections)
+            // deadpool waits forever by default, so a saturated pool — or a database
+            // that accepts TCP but stalls the startup handshake — becomes an
+            // unbounded latency tail. Bound the wait and surface exhaustion as a
+            // fast `Unavailable` (503) instead of a request that hangs for a minute.
+            .timeouts(deadpool_postgres::Timeouts {
+                wait: Some(std::time::Duration::from_secs(
+                    config.pool_wait_timeout_secs,
+                )),
+                create: Some(std::time::Duration::from_secs(config.connect_timeout_secs)),
+                recycle: Some(std::time::Duration::from_secs(config.connect_timeout_secs)),
+            })
             .runtime(Runtime::Tokio1)
             .build()
             .map_err(|e| {
@@ -266,11 +340,16 @@ impl PostgresBackend {
 
     fn parse_connection_string(url: &str) -> StorageResult<PostgresConfig> {
         // Parse postgres:// URL format
-        // postgres://user:password@host:port/dbname
+        // postgres://user:password@host:port/dbname[?params]
         let url = url
             .strip_prefix("postgres://")
             .or_else(|| url.strip_prefix("postgresql://"))
             .unwrap_or(url);
+
+        // Strip any query string before splitting on '/', otherwise it lands in
+        // `dbname` verbatim (`.../postgres?sslmode=require` → dbname
+        // "postgres?sslmode=require", which no server will resolve).
+        let url = url.split('?').next().unwrap_or(url);
 
         let mut config = PostgresConfig::default();
 
@@ -299,6 +378,7 @@ impl PostgresBackend {
             }
         }
 
+        config.apply_env_overrides();
         Ok(config)
     }
 
@@ -475,11 +555,23 @@ impl PostgresBackend {
 
     /// Get a client from the pool.
     pub(crate) async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
-        self.pool.get().await.map_err(|e| {
-            crate::error::StorageError::Backend(BackendError::ConnectionFailed {
+        use deadpool_postgres::{PoolError, TimeoutType};
+
+        self.pool.get().await.map_err(|e| match e {
+            // Every connection is busy and the wait timeout elapsed. The database
+            // is healthy — we are simply over capacity — so this is a retryable
+            // 503, not an internal error. Reporting it as a 500 (the previous
+            // behavior) both misleads clients and hides saturation in error logs.
+            PoolError::Timeout(TimeoutType::Wait) => {
+                crate::error::StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "postgres".to_string(),
+                    message: "connection pool exhausted".to_string(),
+                })
+            }
+            other => crate::error::StorageError::Backend(BackendError::ConnectionFailed {
                 backend_name: "postgres".to_string(),
-                message: e.to_string(),
-            })
+                message: other.to_string(),
+            }),
         })
     }
 
@@ -791,6 +883,168 @@ impl PostgresBackend {
             SearchParamType::Uri => vec!["contains", "below", "above", "missing"],
             SearchParamType::Composite => vec!["missing"],
             SearchParamType::Special => vec![],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_connection_string ───────────────────────────────────
+
+    #[test]
+    fn parses_full_url() {
+        let cfg = PostgresBackend::parse_connection_string(
+            "postgres://alice:s3cret@db.example.com:5433/clinical",
+        )
+        .unwrap();
+        assert_eq!(cfg.user, "alice");
+        assert_eq!(cfg.password.as_deref(), Some("s3cret"));
+        assert_eq!(cfg.host, "db.example.com");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.dbname, "clinical");
+    }
+
+    #[test]
+    fn strips_query_string_so_it_does_not_leak_into_dbname() {
+        // Regression for #224: a `?sslmode=...` suffix was previously parsed as
+        // part of the database name (`clinical?sslmode=require`), which no server
+        // could resolve.
+        let cfg = PostgresBackend::parse_connection_string(
+            "postgres://alice:s3cret@db.example.com:5433/clinical?sslmode=require&connect_timeout=10",
+        )
+        .unwrap();
+        assert_eq!(cfg.dbname, "clinical");
+        assert_eq!(cfg.host, "db.example.com");
+        assert_eq!(cfg.port, 5433);
+    }
+
+    #[test]
+    fn accepts_postgresql_scheme_and_defaults_port() {
+        let cfg = PostgresBackend::parse_connection_string("postgresql://bob:pw@localhost/helios")
+            .unwrap();
+        assert_eq!(cfg.user, "bob");
+        assert_eq!(cfg.host, "localhost");
+        assert_eq!(cfg.port, 5432); // no explicit port → default
+        assert_eq!(cfg.dbname, "helios");
+    }
+
+    #[test]
+    fn parses_url_without_password() {
+        let cfg =
+            PostgresBackend::parse_connection_string("postgres://svc@10.0.0.5:5432/db").unwrap();
+        assert_eq!(cfg.user, "svc");
+        assert_eq!(cfg.password, None);
+        assert_eq!(cfg.host, "10.0.0.5");
+        assert_eq!(cfg.dbname, "db");
+    }
+
+    #[test]
+    fn invalid_port_falls_back_to_default() {
+        let cfg =
+            PostgresBackend::parse_connection_string("postgres://u:p@host:not-a-port/db").unwrap();
+        assert_eq!(cfg.host, "host");
+        assert_eq!(cfg.port, 5432);
+        assert_eq!(cfg.dbname, "db");
+    }
+
+    #[test]
+    fn parses_host_and_port_without_dbname() {
+        // `rest` has no '/', so the host:port branch is taken and dbname keeps
+        // its default.
+        let cfg = PostgresBackend::parse_connection_string("postgres://u:p@myhost:6000").unwrap();
+        assert_eq!(cfg.host, "myhost");
+        assert_eq!(cfg.port, 6000);
+        assert_eq!(cfg.dbname, default_dbname());
+    }
+
+    #[test]
+    fn parses_bare_host_only() {
+        // No port and no dbname after the host.
+        let cfg = PostgresBackend::parse_connection_string("postgres://u:p@onlyhost").unwrap();
+        assert_eq!(cfg.host, "onlyhost");
+        assert_eq!(cfg.port, default_port());
+    }
+
+    // ── default tuning knobs ──────────────────────────────────────
+
+    #[test]
+    fn default_pool_size_is_bounded() {
+        // Whatever the host's core count, the pool default stays within the band
+        // #224 established as useful — and never the old fixed 10.
+        let n = default_max_connections();
+        assert!((16..=64).contains(&n), "pool default {n} out of band");
+    }
+
+    #[test]
+    fn default_timeouts_match_documented_values() {
+        assert_eq!(default_statement_timeout_ms(), 30_000);
+        assert_eq!(default_pool_wait_timeout_secs(), 10);
+        assert_eq!(default_connect_timeout_secs(), 5);
+    }
+
+    #[test]
+    fn config_default_populates_new_knobs() {
+        let cfg = PostgresConfig::default();
+        assert_eq!(cfg.pool_wait_timeout_secs, default_pool_wait_timeout_secs());
+        assert_eq!(cfg.statement_timeout_ms, default_statement_timeout_ms());
+        assert!((16..=64).contains(&cfg.max_connections));
+    }
+
+    // ── apply_env_overrides ───────────────────────────────────────
+
+    // Serializes the two env-mutating tests below against each other. Other
+    // tests in this module never assert on the env-overridable fields
+    // (max_connections / statement_timeout_ms / pool_wait_timeout_secs), so they
+    // are unaffected by these vars being set transiently.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_overrides_apply_when_set() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: serialized by ENV_GUARD, and every var is removed before the
+        // lock is released, so no other thread observes a partial state.
+        unsafe {
+            std::env::set_var("HFS_PG_MAX_CONNECTIONS", "99");
+            std::env::set_var("HFS_PG_STATEMENT_TIMEOUT_MS", "1234");
+            std::env::set_var("HFS_PG_POOL_WAIT_TIMEOUT_SECS", "7");
+        }
+
+        let mut cfg = PostgresConfig::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.max_connections, 99);
+        assert_eq!(cfg.statement_timeout_ms, 1234);
+        assert_eq!(cfg.pool_wait_timeout_secs, 7);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HFS_PG_MAX_CONNECTIONS");
+            std::env::remove_var("HFS_PG_STATEMENT_TIMEOUT_MS");
+            std::env::remove_var("HFS_PG_POOL_WAIT_TIMEOUT_SECS");
+        }
+    }
+
+    #[test]
+    fn env_overrides_ignore_unparseable_values() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: serialized by ENV_GUARD, removed before releasing the lock.
+        unsafe {
+            std::env::set_var("HFS_PG_MAX_CONNECTIONS", "not-a-number");
+        }
+
+        let mut cfg = PostgresConfig::default();
+        let before = cfg.max_connections;
+        cfg.apply_env_overrides();
+        // A value that fails to parse is ignored (parse → None), leaving the
+        // default untouched rather than zeroing the pool.
+        assert_eq!(cfg.max_connections, before);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HFS_PG_MAX_CONNECTIONS");
         }
     }
 }

@@ -102,6 +102,57 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 
 The standard AWS credential chain applies. For S3-compatible endpoints, set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. One HFS process shares a single AWS credential chain, so a MinIO primary store and real-AWS bulk-export output store cannot be combined in the same process.
 
+### S3 requires conditional writes
+
+The S3 backend depends on **conditional `PutObject`** (`If-Match` and
+`If-None-Match: *`) for correctness — not only for `/_user/settings`, but for
+FHIR resource create, update, and delete, which use it for optimistic locking.
+
+AWS S3, MinIO, Cloudflare R2, and recent Ceph RGW support it. **Google Cloud
+Storage's S3-interop API and Backblaze B2 do not**, and are therefore unsupported
+as an HFS primary store. A store that *rejects* the precondition headers fails
+loudly; one that silently *ignores* them would turn every concurrent write into a
+lost update with no error anywhere, so verify support before pointing HFS at an
+unfamiliar S3-compatible provider.
+
+### S3 key prefixes (IAM)
+
+The backend writes under these prefixes inside `HFS_S3_BUCKET` (each below the
+optional `HFS_S3_PREFIX`):
+
+| Prefix | Contents |
+|---|---|
+| `{tenant}/resources/`, `{tenant}/history/` | FHIR resources and history |
+| `{tenant}/bulk/submit/` | Bulk-submit staging |
+| `tenants/` | Tenant registry |
+| `_system.user-settings/` | Per-user UI settings (`/_user/settings`) |
+
+The last two are **cross-tenant** and sit outside any tenant prefix. A
+least-privilege bucket policy scoped only to the FHIR prefixes will pass startup
+validation (which only issues `HeadBucket`) and then return `AccessDenied` — a
+500 on every affected request. Grant the policy these prefixes too.
+
+Note also that a **bucket-wide** lifecycle rule (expiration or Glacier
+transition) will apply to `_system.user-settings/` as well: expiry silently resets
+users' preferences, and a Glacier transition makes them unreadable. Scope lifecycle
+rules to the FHIR prefixes.
+
+## Per-user UI settings
+
+`GET`/`PUT`/`PATCH /_user/settings` stores an opaque, per-user JSON document (UI
+theme, default tenant, recent queries). It is keyed by user only, never by tenant.
+Responses carry a weak `ETag` (`W/"{version}"`); clients may send `If-Match` on a
+write for optimistic concurrency.
+
+Supported on the **SQLite, PostgreSQL, MongoDB, and S3** backends. Elasticsearch is
+search-only and never a standalone primary, so an Elasticsearch-only deployment
+gets an explained `501 Not Implemented`. On S3 the store is also unavailable (and
+reports the same `501`) in bucket-per-tenant mode with no default system bucket,
+since there is nowhere tenant-independent to keep a user-global document.
+
+When authentication is disabled, every caller resolves to the same fallback user
+key (`local|default`) and therefore **shares one settings document**.
+
 ## Multi-tenancy
 
 | Variable | Default | Description |
