@@ -166,6 +166,7 @@ impl<S: ResourceStorage> AppState<S> {
         let validation = Arc::new(crate::validation::ValidationService::from_config(
             &config.validation,
             config.terminology_server.as_deref(),
+            config.default_fhir_version,
         ));
         Self {
             storage,
@@ -218,6 +219,7 @@ impl<S: ResourceStorage> AppState<S> {
         let validation = Arc::new(crate::validation::ValidationService::from_config(
             &config.validation,
             config.terminology_server.as_deref(),
+            config.default_fhir_version,
         ));
         Self {
             storage,

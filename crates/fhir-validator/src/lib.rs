@@ -68,6 +68,7 @@ pub mod engine;
 pub mod packs;
 pub mod resolver;
 pub mod schema;
+pub mod terminology;
 
 #[cfg(feature = "fhirpath")]
 pub mod fhirpath_effects;
@@ -80,6 +81,7 @@ pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
     EffectHandlers, TerminologyError, TerminologyProvider,
 };
+pub use terminology::{CoreTerminology, core_terminology};
 pub use engine::{
     ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
     Validator, dotted_to_fhirpath,

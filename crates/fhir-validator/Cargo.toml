@@ -53,6 +53,11 @@ path = "src/bin/generate_schema_packs.rs"
 required-features = ["gen-packs"]
 
 [[bin]]
+name = "generate-terminology"
+path = "src/bin/generate_terminology.rs"
+required-features = ["gen-packs"]
+
+[[bin]]
 name = "validator-cli"
 path = "src/bin/validator_cli.rs"
 required-features = ["cli"]
