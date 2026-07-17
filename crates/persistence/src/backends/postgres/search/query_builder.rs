@@ -18,6 +18,32 @@ fn quantity_implicit_precision(num_str: &str) -> f64 {
     crate::search::implicit_precision(num_str)
 }
 
+/// Escapes LIKE metacharacters in a user-supplied search value.
+///
+/// Without this, `?name=100%` is a wildcard rather than a literal — the value is
+/// interpolated straight into the pattern. Paired with `ESCAPE '\'` at the call
+/// site. (`chain_builder.rs` already does this; the main builder did not.)
+fn like_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// The SQL expression a string search matches against.
+///
+/// `value_string_folded` (case- and accent-folded, added in schema v10) is
+/// populated on write but **never backfilled**, so rows written before the v10
+/// upgrade have NULL there and must fall back to the raw column. `lower()` on that
+/// fallback reproduces exactly what the previous `ILIKE` did — both sides of the
+/// comparison end up lowercased — while keeping the whole expression indexable.
+/// Plain `ILIKE` can never use a btree; this expression, matched by
+/// `idx_search_string_folded_pattern` under `text_pattern_ops`, can.
+///
+/// Must stay character-for-character identical to the index definition in
+/// `schema.rs::migrate_v13_to_v14`, or Postgres will not use the index.
+const FOLDED_STRING_EXPR: &str = "COALESCE(value_string_folded, lower(value_string))";
+
 /// Builds the numeric comparison SQL for `col` against the implicit-precision
 /// range `[lo, hi)` per the FHIR prefix semantics, advancing `next` and
 /// returning the SQL plus its bound params. `num` is used only for the `ap`
@@ -599,21 +625,35 @@ impl PostgresQueryBuilder {
                 // implemented here as a substring match (same as `:contains`).
                 // Match the accent-folded column (falling back to the raw column
                 // for not-yet-reindexed rows) against a folded pattern.
+                //
+                // A leading `%` is not btree-sargable; this stays a scan unless the
+                // optional pg_trgm index is present. It is at least now scoped to
+                // one parameter's slice of the index rather than the whole table.
                 Some(SearchModifier::Contains | SearchModifier::Text) => SqlFragment::with_params(
                     format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND COALESCE(value_string_folded, value_string) ILIKE ${})",
-                        param.name, param_num
+                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
+                        param.name, FOLDED_STRING_EXPR, param_num
                     ),
-                    vec![SqlParam::text(&format!("%{}%", fold_text(&value.value)))],
+                    vec![SqlParam::text(&format!(
+                        "%{}%",
+                        like_escape(&fold_text(&value.value))
+                    ))],
                 ),
                 _ => {
                     // Default: starts-with (case- and accent-insensitive).
+                    //
+                    // `LIKE`, not `ILIKE`: `fold_text` already lowercases both the
+                    // stored column and the pattern, so `ILIKE` was doing no work
+                    // that `LIKE` doesn't — but it made the predicate unindexable.
                     SqlFragment::with_params(
                         format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND COALESCE(value_string_folded, value_string) ILIKE ${})",
-                            param.name, param_num
+                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {} LIKE ${} ESCAPE '\\')",
+                            param.name, FOLDED_STRING_EXPR, param_num
                         ),
-                        vec![SqlParam::text(&format!("{}%", fold_text(&value.value)))],
+                        vec![SqlParam::text(&format!(
+                            "{}%",
+                            like_escape(&fold_text(&value.value))
+                        ))],
                     )
                 }
             };
@@ -670,85 +710,75 @@ impl PostgresQueryBuilder {
             return Some(combined);
         }
 
-        let mut conditions = Vec::new();
-
-        // Each value contributes a variable number of bound params: `system|code`
-        // binds 2, every other form (code-only, `|code`, `system|`) binds 1.
-        // Placeholder numbers must be sequential and gap-free because the caller
-        // advances the global offset by `params.len()` (see build_search_query).
-        // Track a running offset rather than assuming a fixed 2-slot stride per
-        // value — the old `offset + i * 2` over-counted single-param values and
-        // produced a placeholder past the end of the bound params (e.g.
-        // `status=finished,in-progress` referenced $3 with only 2 params bound),
-        // which Postgres rejects.
+        // An OR-list (`status=finished,in-progress`) becomes ONE subquery with the
+        // values OR'd inside it, rather than one `id IN (…)` per value OR'd together.
+        //
+        // This is a plan fix, not cosmetics. PostgreSQL only pulls a sublink up into
+        // a semi-join when it sits in the top-level AND-list of the WHERE clause.
+        // Sublinks under an OR stay `SubPlan`s — hashed if the planner's estimate
+        // fits in `work_mem`, and otherwise **re-executed for every outer row**. At
+        // 1.3M index rows that mis-estimate is easy to hit, and it is the second
+        // timeout generator after the composite aggregate. With the OR inside there
+        // is a single sublink, so it becomes a semi-join the planner can drive from
+        // an index scan.
+        //
+        // Each value binds a variable number of params: `system|code` binds 2, every
+        // other form (code-only, `|code`, `system|`) binds 1. Placeholder numbers
+        // must be sequential and gap-free because the caller advances the global
+        // offset by `params.len()`; a fixed 2-slot stride once produced a placeholder
+        // past the end of the bound params, which Postgres rejects.
+        let mut predicates: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
         let mut next = offset;
+
         for value in param.values.iter() {
-            let condition = if let Some((system, code)) = value.value.split_once('|') {
+            if let Some((system, code)) = value.value.split_once('|') {
                 if system.is_empty() {
                     // |code - match any system
-                    let frag = SqlFragment::with_params(
-                        format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_code = ${})",
-                            param.name,
-                            next + 1
-                        ),
-                        vec![SqlParam::text(code)],
-                    );
                     next += 1;
-                    frag
+                    predicates.push(format!("value_token_code = ${}", next));
+                    params.push(SqlParam::text(code));
                 } else if code.is_empty() {
                     // system| - match any code in system
-                    let frag = SqlFragment::with_params(
-                        format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_system = ${})",
-                            param.name,
-                            next + 1
-                        ),
-                        vec![SqlParam::text(system)],
-                    );
                     next += 1;
-                    frag
+                    predicates.push(format!("value_token_system = ${}", next));
+                    params.push(SqlParam::text(system));
                 } else {
                     // system|code - exact match
-                    let frag = SqlFragment::with_params(
-                        format!(
-                            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_system = ${} AND value_token_code = ${})",
-                            param.name,
-                            next + 1,
-                            next + 2
-                        ),
-                        vec![SqlParam::text(system), SqlParam::text(code)],
-                    );
+                    let s = next + 1;
+                    let c = next + 2;
                     next += 2;
-                    frag
+                    predicates.push(format!(
+                        "(value_token_system = ${} AND value_token_code = ${})",
+                        s, c
+                    ));
+                    params.push(SqlParam::text(system));
+                    params.push(SqlParam::text(code));
                 }
             } else {
                 // code only - match any system
-                let frag = SqlFragment::with_params(
-                    format!(
-                        "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND value_token_code = ${})",
-                        param.name,
-                        next + 1
-                    ),
-                    vec![SqlParam::text(&value.value)],
-                );
                 next += 1;
-                frag
-            };
-            conditions.push(condition);
+                predicates.push(format!("value_token_code = ${}", next));
+                params.push(SqlParam::text(&value.value));
+            }
         }
 
-        if conditions.is_empty() {
+        if predicates.is_empty() {
             return None;
         }
-        let mut combined = conditions.remove(0);
-        for cond in conditions {
-            combined = combined.or(cond);
-        }
+
+        let mut combined = SqlFragment::with_params(
+            format!(
+                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND ({}))",
+                param.name,
+                predicates.join(" OR ")
+            ),
+            params,
+        );
 
         // `:not` reverses the match: include resources that have no matching
-        // value (including those with no value at all). Negating the whole
-        // OR-set gives `NOT (id IN (...) OR id IN (...))`.
+        // value (including those with no value at all). Negating the single sublink
+        // is equivalent to negating the OR-set of sublinks it replaced.
         if let Some(SearchModifier::Not) = param.modifier {
             let sql = format!("NOT ({})", combined.sql);
             combined = SqlFragment::with_params(sql, combined.params);
@@ -834,15 +864,24 @@ impl PostgresQueryBuilder {
                 continue;
             }
 
-            let mut havings = Vec::new();
+            // Stage this value's params locally and commit them only once every
+            // component has parsed. A component that fails midway used to leave the
+            // params of its predecessors bound while emitting `1 = 0`, so those
+            // params had no placeholder in the final statement and Postgres rejected
+            // the whole query ("bind message supplies N parameters, but prepared
+            // statement requires M"). e.g. `?code-value-quantity=8867-4$abc` → 500.
+            let mut staged_params: Vec<SqlParam> = Vec::new();
+            let mut predicates: Vec<String> = Vec::new();
+            let mut next = current;
             let mut ok = true;
+
             for (part, component) in parts.iter().zip(param.components.iter()) {
                 let cv = Self::parse_component_value(part);
-                match Self::build_composite_component(&cv, component.param_type, current) {
+                match Self::build_composite_component(&cv, component.param_type, next) {
                     Some((sql, params)) => {
-                        current += params.len();
-                        all_params.extend(params);
-                        havings.push(format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", sql));
+                        next += params.len();
+                        staged_params.extend(params);
+                        predicates.push(sql);
                     }
                     None => {
                         ok = false;
@@ -851,15 +890,89 @@ impl PostgresQueryBuilder {
                 }
             }
 
-            if !ok || havings.is_empty() {
+            if !ok || predicates.is_empty() {
                 value_conditions.push("1 = 0".to_string());
                 continue;
             }
 
+            current = next;
+            all_params.extend(staged_params);
+
+            // Each component of a composite instance is a separate `search_index`
+            // row, so a resource matches only when every component is satisfied by
+            // some row *within the same* `composite_group`. That grouping is what
+            // stops a blood-pressure panel's systolic value from pairing with its
+            // diastolic code, so the GROUP BY / HAVING structure is load-bearing and
+            // is kept exactly as-is.
+            //
+            // What is new is the WHERE prefilter. Previously the subquery had no
+            // value predicate at all: it read every composite row for the parameter
+            // and only then filtered inside the aggregate, which meant a full
+            // aggregation over the resource type's entire composite slice on every
+            // request — the `combo-code-value-quantity` timeout.
+            //
+            // Dropping rows that satisfy *no* component is provably result-
+            // preserving: such a row contributes 0 to every `MAX(CASE …)` in the
+            // HAVING, so it can never turn a 0 into a 1, and a group left empty by
+            // the prefilter could not have satisfied the HAVING anyway.
+            //
+            // Measured on the real benchmark dataset (656,737 Observations,
+            // 1.8M `code-value-quantity` index rows), which is what these numbers
+            // refer to — an earlier, smaller replica gave badly misleading answers
+            // here and every alternative below was ranked wrong by it.
+            //
+            // Three alternatives were tried and REJECTED against real data:
+            //
+            //   • Dropping the prefilter entirely (the pre-#224 form) and reading the
+            //     whole parameter slice index-only from a covering index: 16.5 s. The
+            //     prefilter is load-bearing, not incidental.
+            //
+            //   • A flat self-join of the components correlated on `composite_group`,
+            //     driving from the token. Postgres flattens it, then drives from an
+            //     ordered scan of `resources` and probes — see below for why that is
+            //     fatal here.
+            //
+            //   • A correlated `EXISTS` (`s.resource_id = resources.id`, grouped per
+            //     resource). Only 222 of 656,737 Observations match this composite, so
+            //     an ordered scan that probes per row must walk ~190k resources to
+            //     collect 21 hits: 8.9 s, and 20 s when nothing matches at all.
+            //
+            // The common thread: the composite is extremely *sparse*, so the plan must
+            // build the small candidate set first and probe `resources` by primary key
+            // — never walk `resources` and test each row. The grouped subquery below
+            // cannot be flattened or parameterized, which forces exactly that shape.
+            // Its unflattenability is a feature; do not "optimize" it into an EXISTS.
+            //
+            // What remains: this shape still costs ~1 s cold because the Bitmap Heap
+            // Scan fetches ~113k rows in ~112k buffer reads — close to one random page
+            // per row, since a parameter's rows are scattered across a ~10M-row table.
+            // That is I/O, not CPU, and it is why the shape is still ~12 s at 30 VUs.
+            // A covering index does not fix it (the OR-prefilter forces heap access by
+            // construction). The real fix is a storage change: write one row per
+            // composite group with every component's value column populated, so a
+            // single index answers "code = X AND value > Y within one group" directly.
+            // Tracked separately — it needs a writer change, a migration and a backfill.
+            let havings = predicates
+                .iter()
+                .map(|p| format!("MAX(CASE WHEN {} THEN 1 ELSE 0 END) = 1", p))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            // Parenthesize each component before OR-ing: a token component emits
+            // `sys = $n AND code = $m`, and while SQL's AND-before-OR precedence
+            // happens to group that correctly, relying on it is a trap for the next
+            // component type someone adds.
+            let prefilter = predicates
+                .iter()
+                .map(|p| format!("({})", p))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+
             value_conditions.push(format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' GROUP BY resource_id, composite_group HAVING {})",
-                param.name,
-                havings.join(" AND ")
+                "id IN (SELECT resource_id FROM search_index \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
+                 AND ({}) \
+                 GROUP BY resource_id, composite_group HAVING {})",
+                param.name, prefilter, havings
             ));
         }
 
@@ -1312,7 +1425,8 @@ impl PostgresQueryBuilder {
             return Self::build_reference_identifier_condition(param, offset);
         }
 
-        let mut conditions = Vec::new();
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
         // :contains - case-insensitive substring on the stored reference.
         // :text (contains) / :code-text (starts-with) match the indexed
         // Reference.display text.
@@ -1358,23 +1472,26 @@ impl PostgresQueryBuilder {
             } else {
                 strip_reference_version(&value.value).to_string()
             };
-            conditions.push(SqlFragment::with_params(
-                format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                    param.name, predicate
-                ),
-                vec![SqlParam::text(&bound)],
-            ));
+            conditions.push(predicate);
+            params.push(SqlParam::text(&bound));
         }
 
         if conditions.is_empty() {
             return None;
         }
-        let mut combined = conditions.remove(0);
-        for cond in conditions {
-            combined = combined.or(cond);
-        }
-        Some(combined)
+
+        // One sublink with the values OR'd inside, not one sublink per value OR'd
+        // together — see `build_token_condition` for why (an OR'd sublink is left as
+        // a re-executable SubPlan instead of being pulled up into a semi-join). The
+        // benchmark fires 2- and 3-id reference OR-lists, so this path is hot.
+        Some(SqlFragment::with_params(
+            format!(
+                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND ({}))",
+                param.name,
+                conditions.join(" OR ")
+            ),
+            params,
+        ))
     }
 
     fn build_uri_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
@@ -1578,6 +1695,185 @@ mod tests {
         };
         let query = SearchQuery::new("Observation").with_parameter(param);
         assert!(PostgresQueryBuilder::build_search_query(&query, 2).is_none());
+    }
+
+    #[test]
+    fn composite_prefilters_but_keeps_group_semantics() {
+        // The WHERE gains an OR-prefilter so the subquery stops reading every
+        // composite row for the parameter, but the GROUP BY / HAVING must survive
+        // intact — it is what forces both components into the SAME composite_group.
+        let param = SearchParameter {
+            name: "combo-code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Eq,
+                "http://loinc.org|8480-6$gt140",
+            )],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag =
+            PostgresQueryBuilder::build_search_query(&query, 2).expect("composite condition");
+
+        assert!(
+            frag.sql
+                .contains("GROUP BY resource_id, composite_group HAVING"),
+            "composite_group grouping must be preserved — without it, components \
+             match across different composite groups: {}",
+            frag.sql
+        );
+        assert!(
+            frag.sql.contains("MAX(CASE WHEN"),
+            "per-component HAVING must be preserved: {}",
+            frag.sql
+        );
+        // The prefilter: components OR'd inside the WHERE.
+        assert!(
+            frag.sql.contains(") OR (value_quantity_value"),
+            "expected an OR-prefilter over the components in the WHERE clause: {}",
+            frag.sql
+        );
+    }
+
+    #[test]
+    fn composite_unparseable_component_binds_no_params() {
+        // `8867-4$abc` — the quantity component fails to parse. The value must
+        // collapse to `1 = 0` and contribute ZERO bound params. Previously the token
+        // component's params were already pushed before the quantity component
+        // bailed, leaving them bound with no placeholder to reference them, which
+        // Postgres rejects outright ("bind message supplies N parameters...") — a
+        // 500 on a malformed query rather than an empty result.
+        let param = SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "8867-4$abc")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("unparseable composite still yields a condition");
+
+        assert_eq!(
+            frag.params.len(),
+            0,
+            "a bailed-out composite value must leave no orphaned bind params: {}",
+            frag.sql
+        );
+        assert!(frag.sql.contains("1 = 0"));
+    }
+
+    #[test]
+    fn token_or_list_is_a_single_sublink() {
+        // OR'd sublinks (`id IN (..) OR id IN (..)`) are not pulled up into a
+        // semi-join by Postgres; they stay SubPlans that can be re-executed per
+        // outer row. The OR must live INSIDE one sublink.
+        let param = SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "finished"),
+                SearchValue::new(SearchPrefix::Eq, "in-progress"),
+                SearchValue::new(SearchPrefix::Eq, "planned"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Encounter").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token OR-list");
+
+        assert_eq!(
+            frag.sql.matches("id IN (SELECT").count(),
+            1,
+            "a 3-value OR-list must produce exactly one sublink, not three: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 3);
+    }
+
+    #[test]
+    fn string_search_is_sargable_and_escapes_wildcards() {
+        // `ILIKE` can never use a btree, and the raw `COALESCE(folded, value_string)`
+        // could not be matched by any index. The emitted predicate must be a `LIKE`
+        // against the exact expression the v14 index is built on.
+        let param = SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            // A literal '%' in the search value must not become a wildcard.
+            values: vec![SearchValue::new(SearchPrefix::Eq, "50%Off")],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Organization").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("string condition");
+
+        assert!(
+            frag.sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE $3 ESCAPE"),
+            "string search must LIKE against the indexed folded expression: {}",
+            frag.sql
+        );
+        assert!(
+            !frag.sql.contains("ILIKE"),
+            "ILIKE is not btree-sargable: {}",
+            frag.sql
+        );
+        match &frag.params[0] {
+            SqlParam::Text(p) => assert_eq!(
+                p, "50\\%off%",
+                "the value's own '%' must be escaped; only the trailing \
+                 starts-with wildcard is live"
+            ),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reference_or_list_is_a_single_sublink() {
+        let param = SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![
+                SearchValue::new(SearchPrefix::Eq, "Patient/a"),
+                SearchValue::new(SearchPrefix::Eq, "Patient/b"),
+            ],
+            chain: vec![],
+            components: vec![],
+        };
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("reference OR-list");
+
+        assert_eq!(
+            frag.sql.matches("id IN (SELECT").count(),
+            1,
+            "reference OR-list must be one sublink: {}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 2);
     }
 
     #[test]
