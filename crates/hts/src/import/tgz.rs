@@ -477,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn authority_rank_marks_foreign_canonicals_as_copies() {
+    fn authority_rank_promotes_only_owned_canonicals_else_unknown() {
         use crate::import::bundle_parser::{
             AUTHORITY_OWNER, AUTHORITY_UNKNOWN, authority_rank_for,
         };

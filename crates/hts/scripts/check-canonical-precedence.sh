@@ -12,12 +12,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# A bare version sort is the signature of the old, divergent rule.
-if hits=$(grep -rn --include=*.rs \
-        -e "ORDER BY COALESCE(version, '') DESC" \
-        -e "ORDER BY COALESCE(s.version, '') DESC" \
-        -e "ORDER BY COALESCE(cs.version, '') DESC" \
-        src/ 2>/dev/null); then
+# A bare `COALESCE(<alias>.version, '') DESC` sort is the signature of the old,
+# divergent rule. Match ANY table alias (`version`, `s.version`, `cs.version`,
+# `code_systems.version`, …) so a query cannot dodge the guard by renaming its
+# alias — the earlier three-literal form let exactly that slip through.
+#
+# `backends/mod.rs` is the one sanctioned home of the ordering: the shared
+# helpers there emit `COALESCE({alias}.version, '') DESC` with a `{alias}`
+# placeholder, which does not match the concrete-alias pattern anyway, but it is
+# excluded explicitly so the guard stays correct even if a helper is later
+# rewritten to use a literal alias.
+if hits=$(grep -rnE --include=*.rs \
+        "COALESCE\(([A-Za-z_][A-Za-z0-9_]*\.)?version, ''\) DESC" \
+        src/ 2>/dev/null | grep -v 'src/backends/mod.rs'); then
     echo "ERROR: hand-rolled same-URL ordering found." >&2
     echo "Use crate::backends::cs_precedence_order_by() / vs_precedence_order_by() instead." >&2
     echo "See crates/hts/docs/ig-publisher-compatibility.md §2a (issue #200)." >&2
