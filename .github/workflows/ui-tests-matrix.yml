@@ -1,0 +1,373 @@
+name: UI Tests (backend matrix)
+
+# The heavy ring of the UI test pyramid: the same Playwright + axe-core browser
+# suite that ui-tests.yml runs against SQLite, but replayed against every
+# supported storage backend — because a rendering, search, or history bug can
+# surface on Postgres or Mongo and stay invisible on SQLite. Modeled on the
+# Inferno backend matrix (inferno-subscription.yml): hfs is built once with all
+# backends, runs on the runner host against containerized stores, and the
+# browser (in the Playwright container) drives it over the runner's IP.
+#
+# Manual + nightly only — it needs the remote Docker host and cloud secrets and
+# takes minutes; ui-tests.yml stays the fast per-PR gate.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 06:00 UTC nightly.
+    - cron: "0 6 * * *"
+
+concurrency:
+  group: ui-tests-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+  HFS_S3_BUCKET: ${{ secrets.HFS_S3_BUCKET }}
+  # Keep in step with @playwright/test in crates/ui/e2e/package.json.
+  PLAYWRIGHT_IMAGE: mcr.microsoft.com/playwright:v1.49.1-noble
+
+jobs:
+  build:
+    name: Build HFS (all backends + ui)
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS
+        run: |
+          cargo build -p helios-hfs --no-default-features \
+            --features R4,ui,sqlite,elasticsearch,postgres,mongodb,s3
+
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-ui-matrix-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  ui-matrix:
+    name: helios-ui browser suite (${{ matrix.backend }})
+    needs: build
+    runs-on: [self-hosted, Linux]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        backend: [sqlite, sqlite-elasticsearch, postgres, mongodb, s3-elasticsearch]
+        include:
+          - { backend: sqlite, hfs_port: 19080 }
+          - { backend: sqlite-elasticsearch, hfs_port: 19081 }
+          - { backend: postgres, hfs_port: 19082 }
+          - { backend: mongodb, hfs_port: 19083 }
+          - { backend: s3-elasticsearch, hfs_port: 19084 }
+    env:
+      HFS_PORT: ${{ matrix.hfs_port }}
+      RESULTS_DIR: ui-matrix-results/${{ matrix.backend }}
+      PW_CONTAINER: ui-e2e-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-ui-matrix-binary
+          path: target/debug
+
+      - name: Make HFS binary executable
+        run: chmod +x target/debug/hfs
+
+      - name: Determine runner and Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Validate backend configuration
+        run: |
+          if [ "${{ matrix.backend }}" = "s3-elasticsearch" ] && [ -z "$HFS_S3_BUCKET" ]; then
+            echo "::error::s3-elasticsearch backend requires HFS_S3_BUCKET to be configured"
+            exit 1
+          fi
+
+      - name: Start Elasticsearch
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        run: |
+          ES_CONTAINER="es-ui-matrix-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$ES_CONTAINER" -p 0:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+            elasticsearch:8.15.0
+
+          echo "ES_CONTAINER=$ES_CONTAINER" >> "$GITHUB_ENV"
+
+          echo "Waiting for Elasticsearch to be ready..."
+          for i in {1..30}; do
+            ES_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$ES_PORT" ]; then
+              if curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" > /dev/null 2>&1; then
+                echo "Elasticsearch is ready on port $ES_PORT"
+                echo "ES_PORT=$ES_PORT" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: Elasticsearch not ready yet..."
+            sleep 2
+          done
+
+          echo "Elasticsearch failed to start"
+          docker logs "$ES_CONTAINER"
+          exit 1
+
+      - name: Start PostgreSQL
+        if: matrix.backend == 'postgres'
+        run: |
+          PG_CONTAINER="pg-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+
+          echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios > /dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PostgreSQL is ready on port $PG_PORT"
+                echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          echo "PostgreSQL failed to start"
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Start MongoDB replica set
+        if: matrix.backend == 'mongodb'
+        run: |
+          MONGO_CONTAINER="mongo-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+
+          echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
+
+          READY=0
+          for i in {1..30}; do
+            if docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' > /dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            echo "Attempt $i/30: MongoDB not ready yet..."
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "MongoDB failed to start"
+            docker logs "$MONGO_CONTAINER"
+            exit 1
+          fi
+
+          docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status(); } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] }); }' > /dev/null 2>&1
+
+          echo "Waiting for MongoDB replica set primary..."
+          for i in {1..60}; do
+            PRIMARY_STATE=$(docker exec "$MONGO_CONTAINER" mongosh --quiet --eval 'try { rs.status().myState } catch (e) { 0 }' | tr -d '\r\n ')
+            if [ "$PRIMARY_STATE" = "1" ]; then
+              MONGO_PORT=$(docker port "$MONGO_CONTAINER" 27017 | head -1 | sed 's/.*://')
+              echo "MongoDB replica set is ready on port $MONGO_PORT"
+              echo "MONGO_PORT=$MONGO_PORT" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "Attempt $i/60: MongoDB replica set not primary yet..."
+            sleep 2
+          done
+
+          echo "MongoDB replica set failed to become primary"
+          docker logs "$MONGO_CONTAINER"
+          exit 1
+
+      - name: Configure AWS credentials
+        if: matrix.backend == 's3-elasticsearch'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install AWS CLI
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            if ! /tmp/aws-bin/aws --version &>/dev/null; then
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -qo /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/aws-bin --update
+              rm -rf /tmp/awscliv2.zip /tmp/aws
+            fi
+            echo "/tmp/aws-bin" >> "$GITHUB_PATH"
+          fi
+          aws --version 2>/dev/null || /tmp/aws-bin/aws --version
+
+      - name: Empty S3 prefix
+        if: matrix.backend == 's3-elasticsearch'
+        run: |
+          BUCKET="${{ secrets.HFS_S3_BUCKET }}"
+          PREFIX="ci/ui-matrix/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.backend }}/"
+          echo "Emptying s3://$BUCKET/$PREFIX"
+          aws s3 rm "s3://$BUCKET/$PREFIX" --recursive
+          echo "Prefix emptied"
+
+      - name: Start HFS server
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          HFS_LOG="$RESULTS_DIR/hfs.log"
+          echo "HFS_LOG=$HFS_LOG" >> "$GITHUB_ENV"
+
+          # Shared UI env: serve the vendored SearchParameter specs (production
+          # parity) and advertise natural-language search as configured so its
+          # pane renders. The key is never exercised by the suite.
+          export HFS_DATA_DIR="$GITHUB_WORKSPACE/data"
+          export HFS_NL_SEARCH_API_KEY="e2e-placeholder-not-a-real-key"
+          export HFS_DEFAULT_FHIR_VERSION=R4
+
+          if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=sqlite-elasticsearch \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "postgres" ]; then
+            HFS_STORAGE_BACKEND=postgres \
+            HFS_PG_HOST="$DOCKER_HOST_IP" \
+            HFS_PG_PORT="$PG_PORT" \
+            HFS_PG_DBNAME=helios \
+            HFS_PG_USER=helios \
+            HFS_PG_PASSWORD=helios \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "mongodb" ]; then
+            HFS_STORAGE_BACKEND=mongodb \
+            HFS_DATABASE_URL="mongodb://$DOCKER_HOST_IP:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
+            HFS_MONGODB_DATABASE="helios_ui_matrix_${{ github.run_id }}_${{ github.run_attempt }}" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "s3-elasticsearch" ]; then
+            HFS_STORAGE_BACKEND=s3-elasticsearch \
+            HFS_S3_BUCKET="${{ secrets.HFS_S3_BUCKET }}" \
+            HFS_S3_PREFIX="ci/ui-matrix/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.backend }}/" \
+            HFS_S3_VALIDATE_BUCKETS=false \
+            HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          else
+            HFS_STORAGE_BACKEND=sqlite \
+            ./target/debug/hfs --database-url :memory: --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          fi
+
+          echo $! > /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid
+          echo "HFS_PID=$(cat /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid)" >> "$GITHUB_ENV"
+
+      - name: Wait for HFS to be ready
+        run: |
+          echo "Waiting for HFS /ui..."
+          for i in {1..30}; do
+            if ! kill -0 "$HFS_PID" 2>/dev/null; then
+              echo "HFS process ($HFS_PID) exited"
+              cat "$HFS_LOG"
+              exit 1
+            fi
+            if curl -sf "http://localhost:$HFS_PORT/ui" > /dev/null 2>&1; then
+              echo "HFS UI is ready"
+              exit 0
+            fi
+            echo "Attempt $i/30: HFS not ready yet..."
+            sleep 2
+          done
+
+          echo "HFS failed to start"
+          tail -50 "$HFS_LOG"
+          exit 1
+
+      - name: Run browser suite (Playwright)
+        run: |
+          set -euo pipefail
+          BASE="http://$RUNNER_IP:$HFS_PORT"
+          echo "Driving browser against $BASE"
+          docker rm -f "$PW_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PW_CONTAINER" -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          docker cp crates/ui/e2e "$PW_CONTAINER":/work/e2e
+          docker exec -e CI=1 -e HFS_E2E_BASE_URL="$BASE" -w /work/e2e "$PW_CONTAINER" \
+            bash -c "npm ci && npx playwright test"
+
+      - name: Copy Playwright report out
+        if: always()
+        run: |
+          docker cp "$PW_CONTAINER":/work/e2e/playwright-report \
+            "$RESULTS_DIR/playwright-report" 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-matrix-results-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ui-matrix-results/${{ matrix.backend }}/
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Removing Playwright container..."
+          docker rm -f "$PW_CONTAINER" 2>/dev/null || true
+
+          echo "Stopping HFS..."
+          if [ -f /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid ]; then
+            HFS_PID=$(cat /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid)
+            kill -INT "$HFS_PID" 2>/dev/null || true
+            for _ in {1..50}; do
+              if kill -0 "$HFS_PID" 2>/dev/null; then
+                sleep 0.2
+              else
+                break
+              fi
+            done
+            kill -9 "$HFS_PID" 2>/dev/null || true
+            rm -f /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid
+          fi
+
+          echo "Stopping backend containers..."
+          docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true

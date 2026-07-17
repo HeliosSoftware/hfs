@@ -43,3 +43,18 @@ to force a fresh boot.
 
 The axe gate is strict: **every** WCAG 2.2 AA rule (including `color-contrast`,
 in both themes) is a hard failure.
+
+## Driving an external server
+
+Set `HFS_E2E_BASE_URL` to point the suite at an hfs you started yourself; the
+config then skips `boot.mjs` and drives that server instead:
+
+```bash
+HFS_E2E_BASE_URL=http://127.0.0.1:8080 npx playwright test
+```
+
+This is how the backend matrix runs it: `ui-tests-matrix.yml` builds hfs with
+every storage backend, boots it on the runner host against a containerized
+Postgres / Mongo / Elasticsearch / S3, and runs this suite (in the Playwright
+container) against `http://<runner-ip>:<port>`. The per-PR `ui-tests.yml` stays
+on SQLite for fast feedback; the matrix is manual + nightly.
