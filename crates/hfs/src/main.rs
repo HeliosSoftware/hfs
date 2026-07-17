@@ -46,7 +46,7 @@ use helios_rest::OperationsBundle;
 use helios_rest::create_app_with_auth_bulk_settings_and_ops;
 
 use helios_persistence::core::PurgableStorage;
-use helios_persistence::search::{ReindexOperation, SearchParameterExtractor};
+use helios_persistence::search::ReindexOperation;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -534,7 +534,7 @@ async fn start_mongodb(
 
     let ops = standalone_ops(
         backend.clone(),
-        backend.search_extractor().clone(),
+        backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -878,6 +878,10 @@ async fn seed_conformance_resources<S>(backend: &S, config: &ServerConfig)
 where
     S: helios_persistence::core::ResourceStorage,
 {
+    if !config.seed_conformance {
+        return;
+    }
+
     let data_dir = config
         .data_dir
         .clone()
@@ -1034,7 +1038,7 @@ async fn start_sqlite(
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
         backend.clone(),
-        backend.search_extractor().clone(),
+        backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -1217,7 +1221,7 @@ fn wire_reindex(
 /// (SQLite, PostgreSQL, MongoDB), where resources and search index share a home.
 fn standalone_ops<B>(
     backend: Arc<B>,
-    extractor: Arc<SearchParameterExtractor>,
+    registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
 ) -> OperationsBundle
 where
@@ -1226,7 +1230,7 @@ where
     OperationsBundle {
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::new(backend, extractor),
+            ReindexOperation::new(backend, registries),
             audit_state,
         )),
     }
@@ -1246,13 +1250,13 @@ fn composite_ops(
     composite: Arc<helios_persistence::composite::CompositeStorage>,
     source: Arc<dyn helios_persistence::search::ReindexSource>,
     targets: Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
-    extractor: Arc<SearchParameterExtractor>,
+    registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::with_parts(source, targets, extractor),
+            ReindexOperation::with_parts(source, targets, registries),
             audit_state,
         )),
     }
@@ -1597,7 +1601,7 @@ async fn start_sqlite_elasticsearch(
     // Create ES backend sharing SQLite's search parameter registry
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,
-        sqlite.search_registry().clone(),
+        sqlite.tenant_registries().clone(),
     )?);
 
     // Build composite configuration
@@ -1661,7 +1665,7 @@ async fn start_sqlite_elasticsearch(
         composite.clone(),
         sqlite.clone(),
         vec![sqlite.clone(), es.clone()],
-        sqlite.search_extractor().clone(),
+        sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -1730,7 +1734,7 @@ async fn start_postgres(
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
         backend.clone(),
-        backend.search_extractor().clone(),
+        backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -1848,7 +1852,7 @@ async fn start_postgres_elasticsearch(
     // Create ES backend sharing PostgreSQL's search parameter registry
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,
-        pg.search_registry().clone(),
+        pg.tenant_registries().clone(),
     )?);
 
     // Build composite configuration
@@ -1908,7 +1912,7 @@ async fn start_postgres_elasticsearch(
         composite.clone(),
         pg.clone(),
         vec![pg.clone(), es.clone()],
-        pg.search_extractor().clone(),
+        pg.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -2018,7 +2022,7 @@ async fn start_mongodb_elasticsearch(
     // Create ES backend sharing MongoDB's search parameter registry
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,
-        mongo.search_registry().clone(),
+        mongo.tenant_registries().clone(),
     )?);
 
     // Build composite configuration
@@ -2089,7 +2093,7 @@ async fn start_mongodb_elasticsearch(
         composite.clone(),
         mongo.clone(),
         vec![mongo.clone(), es.clone()],
-        mongo.search_extractor().clone(),
+        mongo.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -2244,13 +2248,15 @@ async fn start_s3(
 fn build_search_registry(
     fhir_version: helios_fhir::FhirVersion,
     data_dir: Option<&std::path::Path>,
-) -> std::sync::Arc<parking_lot::RwLock<helios_persistence::search::SearchParameterRegistry>> {
-    use helios_persistence::search::{SearchParameterLoader, SearchParameterRegistry};
+) -> std::sync::Arc<helios_persistence::search::TenantSearchRegistries> {
+    use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
 
-    let registry = std::sync::Arc::new(parking_lot::RwLock::new(SearchParameterRegistry::new()));
+    // S3 stores no SearchParameter resources of its own, so tenants have no
+    // stored overlay — every tenant sees the shared base (embedded + spec).
+    let registries = std::sync::Arc::new(TenantSearchRegistries::base_only());
     let loader = SearchParameterLoader::new(fhir_version);
     {
-        let mut reg = registry.write();
+        let mut reg = registries.base().write();
         if let Ok(params) = loader.load_embedded() {
             for p in params {
                 let _ = reg.register(p);
@@ -2263,7 +2269,7 @@ fn build_search_registry(
             }
         }
     }
-    registry
+    registries
 }
 
 /// Starts the server with S3 + Elasticsearch composite backend.
@@ -2433,7 +2439,7 @@ async fn start_s3_elasticsearch(
         composite.clone(),
         s3.clone(),
         vec![es.clone()],
-        es.search_extractor().clone(),
+        es.tenant_registries().clone(),
         audit_state.as_ref(),
     );
 
@@ -2559,9 +2565,10 @@ mod tests {
     #[test]
     fn test_build_search_registry_returns_registry() {
         use helios_fhir::FhirVersion;
-        let registry = build_search_registry(FhirVersion::R4, None);
-        // Registry should be a valid Arc<RwLock<…>> and not panic when read.
-        let _guard = registry.read();
+        let registries = build_search_registry(FhirVersion::R4, None);
+        // The container's base should be populated and every tenant resolves.
+        assert!(!registries.base().read().is_empty());
+        let _guard = registries.for_tenant("default");
     }
 
     #[cfg(feature = "mongodb")]

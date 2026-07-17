@@ -416,7 +416,7 @@ impl ElasticsearchBackend {
                 .await?;
         }
 
-        for contained in self.search_extractor().extract_contained(resource) {
+        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
             let doc = build_es_contained_document(
                 tenant_id,
                 container_type,
@@ -488,7 +488,7 @@ impl ResourceStorage for ElasticsearchBackend {
 
         // Extract search parameters
         let extracted_values = self
-            .search_extractor()
+            .tenant_extractor(tenant_id)
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
@@ -606,7 +606,7 @@ impl ResourceStorage for ElasticsearchBackend {
 
         // Extract search parameters
         let extracted_values = self
-            .search_extractor()
+            .tenant_extractor(tenant_id)
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
@@ -749,7 +749,7 @@ impl ResourceStorage for ElasticsearchBackend {
         }
 
         let extracted_values = self
-            .search_extractor()
+            .tenant_extractor(tenant_id)
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
@@ -1067,7 +1067,7 @@ impl ReindexTarget for ElasticsearchBackend {
         let fhir_version = resource.fhir_version();
 
         let extracted_values = self
-            .search_extractor()
+            .tenant_extractor(tenant_id)
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
 

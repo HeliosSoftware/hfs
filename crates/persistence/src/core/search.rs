@@ -277,13 +277,20 @@ pub trait SearchProvider: ResourceStorage {
     async fn search_count(&self, tenant: &TenantContext, query: &SearchQuery)
     -> StorageResult<u64>;
 
-    /// Returns the backend's search parameter registry.
+    /// Returns the search parameter registry **for a tenant**.
     ///
-    /// The registry is the single source of truth for search parameter type
-    /// resolution (see [`crate::search::resolve_param_type`]). REST extractors
-    /// and chained-search builders both consult it so they cannot disagree on
-    /// whether a given param is a Date vs. Token vs. Reference, etc.
-    fn search_param_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>>;
+    /// Search-parameter resolution is tenant-scoped: every tenant sees the shared
+    /// base params (embedded + spec + custom), plus its own stored (POSTed)
+    /// params overlaid on top. So `acme1` and `acme2` may resolve searches
+    /// against different parameter sets. The returned registry is the source of
+    /// truth for param-type resolution (see [`crate::search::resolve_param_type`]);
+    /// REST extractors and chained-search builders both consult it so they cannot
+    /// disagree on whether a given param is a Date vs. Token vs. Reference, etc.
+    ///
+    /// Returns an owned `Arc` (cloned from the per-tenant cache); bind it to a
+    /// local before `.read()`.
+    fn search_param_registry(&self, tenant: &TenantContext)
+    -> Arc<RwLock<SearchParameterRegistry>>;
 
     /// Whether this backend can evaluate `_contained=true|both` searches (which
     /// require contained-resource indexing). Defaults to `false`; backends that
@@ -413,7 +420,8 @@ where
         return Ok(Vec::new());
     }
 
-    let extractor = SearchParameterExtractor::new(provider.search_param_registry().clone());
+    let tenant_registry = provider.search_param_registry(tenant);
+    let extractor = SearchParameterExtractor::new(tenant_registry.clone());
     let key = |r: &StoredResource| format!("{}/{}", r.resource_type(), r.id());
 
     // Don't re-include primary matches.
@@ -443,8 +451,7 @@ where
                         if res.resource_type() != directive.source_type {
                             continue;
                         }
-                        let def = provider
-                            .search_param_registry()
+                        let def = tenant_registry
                             .read()
                             .get_param(res.resource_type(), &directive.search_param);
                         let Some(def) = def else { continue };

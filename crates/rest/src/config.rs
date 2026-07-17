@@ -791,6 +791,13 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
+    /// Seed the spec conformance resources (SearchParameters and
+    /// CompartmentDefinitions) into primary storage for every provisioned tenant
+    /// — at startup and on tenant provisioning. Disable to leave storage
+    /// untouched (e.g. in tests that assert exact resource counts).
+    #[arg(long, env = "HFS_SEED_CONFORMANCE", default_value = "true")]
+    pub seed_conformance: bool,
+
     /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
     #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
     pub export_sink: String,
@@ -924,6 +931,7 @@ impl Default for ServerConfig {
             elasticsearch_username: None,
             elasticsearch_password: None,
             sof_enabled: true,
+            seed_conformance: true,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
@@ -1045,6 +1053,7 @@ impl ServerConfig {
             elasticsearch_username: None,
             elasticsearch_password: None,
             sof_enabled: true,
+            seed_conformance: true,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,

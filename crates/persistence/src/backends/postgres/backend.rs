@@ -1,5 +1,6 @@
 //! PostgreSQL backend implementation.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,23 +15,32 @@ use helios_fhir::FhirVersion;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageResult};
-use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParameterRegistry};
+use crate::search::{
+    SearchParameterDefinition, SearchParameterExtractor, SearchParameterLoader,
+    SearchParameterRegistry, TenantSearchRegistries,
+};
+
+/// Sync in-memory cache of each tenant's stored (POSTed) active SearchParameter
+/// definitions, keyed by tenant id. Postgres queries are async but the per-tenant
+/// registry loader must be sync, so async paths (startup, TTL refresh, and
+/// SearchParameter writes) populate this map and the loader reads it.
+type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
 
 /// PostgreSQL backend for FHIR resource storage.
 pub struct PostgresBackend {
     pool: Pool,
     config: PostgresConfig,
-    /// Search parameter registry (in-memory cache of active parameters).
-    search_registry: Arc<RwLock<SearchParameterRegistry>>,
-    /// Extractor for deriving searchable values from resources.
-    search_extractor: Arc<SearchParameterExtractor>,
+    /// Per-tenant search parameter registries (shared base + per-tenant overlay).
+    registries: Arc<TenantSearchRegistries>,
+    /// Sync cache of each tenant's stored params, read by the registry loader.
+    stored_by_tenant: StoredByTenant,
 }
 
 impl Debug for PostgresBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresBackend")
             .field("config", &self.config)
-            .field("search_registry_len", &self.search_registry.read().len())
+            .field("base_registry_len", &self.registries.base().read().len())
             .finish_non_exhaustive()
     }
 }
@@ -232,16 +242,28 @@ impl PostgresBackend {
         })?;
         drop(client);
 
-        // Initialize the search parameter registry
-        let search_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
-        Self::initialize_search_registry(&search_registry, &config);
-        let search_extractor = Arc::new(SearchParameterExtractor::new(search_registry.clone()));
+        // Initialize the per-tenant search parameter registries. Base params
+        // (embedded + spec + custom) go into the shared base; each tenant's
+        // stored overlay is read from `stored_by_tenant`, populated by
+        // `reload_stored_cache` at startup / refresh / SearchParameter writes.
+        let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
+        let loader_cache = stored_by_tenant.clone();
+        let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
+            move |tenant_id: &str| {
+                loader_cache
+                    .read()
+                    .get(tenant_id)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+        )));
+        Self::initialize_search_registry(registries.base(), &config);
 
         Ok(Self {
             pool,
             config,
-            search_registry,
-            search_extractor,
+            registries,
+            stored_by_tenant,
         })
     }
 
@@ -480,39 +502,23 @@ impl PostgresBackend {
     pub async fn init_schema(&self) -> StorageResult<()> {
         let client = self.get_client().await?;
         super::schema::initialize_schema(&client).await?;
-
-        // Load stored SearchParameters from database
-        let stored_count = self.load_stored_search_parameters().await?;
-        if stored_count > 0 {
-            let registry = self.search_registry.read();
-            tracing::info!(
-                "Loaded {} stored SearchParameters from database (total now: {})",
-                stored_count,
-                registry.len()
-            );
-        }
-
+        // Populate the per-tenant stored-param cache so the registries can build
+        // each tenant's overlay lazily.
+        self.reload_stored_cache().await?;
         Ok(())
     }
 
-    /// Loads SearchParameter resources stored in the database into the registry.
-    async fn load_stored_search_parameters(&self) -> StorageResult<usize> {
-        self.refresh_stored_search_parameters().await
-    }
-
-    /// Rebuilds the registry's `Stored` parameters from what the database
-    /// currently holds, returning how many are registered afterwards.
-    ///
-    /// TTL-cache refresh (#235): rows are fetched and parsed before the
-    /// (sync) write lock is taken, and on any read error the registry is left
-    /// untouched — stale-serve rather than losing search resolution.
-    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+    /// Reloads every tenant's stored active SearchParameters into the sync
+    /// `stored_by_tenant` cache (grouped by tenant), then drops the cached
+    /// per-tenant registries so they rebuild against the fresh overlay.
+    pub(crate) async fn reload_stored_cache(&self) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
         let client = self.get_client().await?;
         let rows = client
             .query(
-                "SELECT data FROM resources WHERE resource_type = 'SearchParameter' AND is_deleted = FALSE",
+                "SELECT tenant_id, data FROM resources \
+                 WHERE resource_type = 'SearchParameter' AND is_deleted = FALSE",
                 &[],
             )
             .await
@@ -525,32 +531,28 @@ impl PostgresBackend {
             })?;
 
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut definitions = Vec::new();
-        for row in rows {
-            let data: serde_json::Value = row.get(0);
-            match loader.parse_resource(&data) {
-                Ok(mut def) => {
-                    if def.status == SearchParameterStatus::Active {
-                        def.source = SearchParameterSource::Stored;
-                        definitions.push(def);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse stored SearchParameter: {}", e);
-                }
-            }
-        }
-
-        let mut registry = self.search_registry.write();
-        registry.unregister_source(SearchParameterSource::Stored);
+        let mut by_tenant: HashMap<String, Vec<SearchParameterDefinition>> = HashMap::new();
         let mut count = 0;
-        for def in definitions {
-            match registry.register(def) {
-                Ok(()) => count += 1,
-                Err(e) => tracing::warn!("Stored SearchParameter not registered: {}", e),
+        for row in rows {
+            let tenant_id: String = row.get(0);
+            let data: serde_json::Value = row.get(1);
+            if let Ok(mut def) = loader.parse_resource(&data) {
+                if def.status == SearchParameterStatus::Active {
+                    def.source = SearchParameterSource::Stored;
+                    by_tenant.entry(tenant_id).or_default().push(def);
+                    count += 1;
+                }
             }
         }
+        *self.stored_by_tenant.write() = by_tenant;
+        self.registries.invalidate_all();
         Ok(count)
+    }
+
+    /// TTL-cache refresh (#235): reload the stored-param cache from storage and
+    /// drop the cached per-tenant registries. Returns the stored-param count.
+    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+        self.reload_stored_cache().await
     }
 
     /// Get a client from the pool.
@@ -575,10 +577,24 @@ impl PostgresBackend {
         })
     }
 
-    /// Get the search parameter registry.
-    #[allow(dead_code)]
-    pub(crate) fn get_search_registry(&self) -> Arc<RwLock<SearchParameterRegistry>> {
-        Arc::clone(&self.search_registry)
+    /// The per-tenant registry container (shared with a co-located ES backend).
+    pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
+        &self.registries
+    }
+
+    /// The shared base registry (embedded + spec + custom), tenant-independent.
+    pub(crate) fn base_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.base()
+    }
+
+    /// The registry for a tenant (base + that tenant's stored overlay).
+    pub(crate) fn tenant_registry(&self, tenant_id: &str) -> Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.for_tenant(tenant_id)
+    }
+
+    /// A value extractor over a tenant's registry.
+    pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
+        SearchParameterExtractor::new(self.tenant_registry(tenant_id))
     }
 
     /// Returns the backend configuration.
@@ -591,16 +607,6 @@ impl PostgresBackend {
     /// `deadpool_postgres::Pool` is `Clone` (Arc-backed), so this is cheap.
     pub(crate) fn pool(&self) -> Pool {
         self.pool.clone()
-    }
-
-    /// Returns a reference to the search parameter registry.
-    pub fn search_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
-        &self.search_registry
-    }
-
-    /// Returns a reference to the search parameter extractor.
-    pub fn search_extractor(&self) -> &Arc<SearchParameterExtractor> {
-        &self.search_extractor
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.
@@ -768,13 +774,13 @@ impl SearchCapabilityProvider for PostgresBackend {
         resource_type: &str,
     ) -> Option<ResourceSearchCapabilities> {
         let params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params(resource_type)
         };
 
         if params.is_empty() {
             let common_params = {
-                let registry = self.search_registry.read();
+                let registry = self.base_registry().read();
                 registry.get_active_params("Resource")
             };
             if common_params.is_empty() {
@@ -795,7 +801,7 @@ impl SearchCapabilityProvider for PostgresBackend {
         }
 
         let common_params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params("Resource")
         };
         for param in &common_params {

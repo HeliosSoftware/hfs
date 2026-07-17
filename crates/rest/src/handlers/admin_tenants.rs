@@ -215,7 +215,9 @@ where
     // `GET /CompartmentDefinition` are populated for it, matching what the
     // server seeds every provisioned tenant with at startup. Best-effort: a
     // failed seed logs and still returns the created tenant.
-    seed_new_tenant(state.storage(), state.config(), &id).await;
+    if state.config().seed_conformance {
+        seed_new_tenant(state.storage(), state.config(), &id).await;
+    }
 
     audit(
         &state,
