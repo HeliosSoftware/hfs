@@ -16,6 +16,10 @@ on:
   schedule:
     # 06:00 UTC nightly.
     - cron: "0 6 * * *"
+  # TEMPORARY: one-shot smoke test of the matrix on this branch. Remove before
+  # merge — the matrix is meant to be manual + nightly, not per-push.
+  push:
+    branches: [feat/249-ui-e2e]
 
 concurrency:
   group: ui-tests-matrix-${{ github.ref }}
