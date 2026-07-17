@@ -90,6 +90,36 @@ nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capability & Conformance
 nav-admin-ops = Admin / Ops
 nav-subscriptions = Subscriptions
+nav-tenants = Tenants
+nav-toggle = Collapse or expand the navigation
+
+## Tenant maintenance (/ui/tenants)
+
+tenants-title = Tenant Maintenance
+tenants-unavailable = The tenant registry is not available on this storage backend.
+tenants-stat-total = Total tenants
+tenants-stat-total-sub = { $count ->
+    [one] { $count } registered
+   *[other] { $count } registered
+}
+tenants-stat-resources = Resources stored
+tenants-stat-resources-sub = across all tenants
+tenants-search-placeholder = Search by name or tenant id…
+tenants-add = Add tenant
+tenants-add-title = Add a tenant
+tenants-field-id = Tenant id
+tenants-field-id-hint = Used in the API (X-Tenant-ID header, URL prefix, JWT claim).
+tenants-field-name = Display name (optional)
+tenants-field-name-hint = A human-friendly label; not used for routing.
+tenants-add-submit = Provision tenant
+tenants-col-tenant = Tenant
+tenants-col-resources = Resources
+tenants-col-created = Created
+tenants-col-actions = Actions
+tenants-empty = No tenants match.
+tenants-unregistered = unregistered
+tenants-delete = Delete tenant
+tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept unless purged via the API.
 
 tenant-heading = Tenants
 tenant-all = All tenants
@@ -111,9 +141,40 @@ card-uptime = Uptime
 card-uptime-sub = last 30 days
 
 chart-title = FHIR resources over time
-chart-unit-patients = patients
 chart-expand = Expand chart
+chart-window = Chart time window
 
 ## Footer
 
 footer-copyright = © { $year } { -org-name }
+
+## Saved queries (#234)
+
+nav-saved-queries = Saved Queries
+
+queries-heading = Saved queries
+queries-lede = Keep FHIR search queries per resource type, sorted by when you last ran them. Saved to your user settings, so they roam across devices.
+queries-add-heading = Save a query
+queries-type-label = Resource type
+queries-type-placeholder = e.g. Patient
+queries-name-label = Name
+queries-name-placeholder = e.g. Smiths in Boston
+queries-query-label = Query string
+queries-query-placeholder = e.g. name=smith&address-city=Boston
+queries-empty = No saved queries yet. Save one above to get started.
+queries-never-run = Never run
+queries-run = Run
+queries-rename = Rename
+queries-delete = Delete
+queries-rename-prompt = New name
+queries-confirm-delete = Delete "{ $name }"?
+queries-unavailable = Saved queries are unavailable: this server's storage backend does not support per-user settings.
+
+queries-builder-heading = Search builder
+queries-url-label = FHIR search URL
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Edit the GET URL directly. Run opens the search in a new tab and records it under Recent; give it a name to keep it in the saved list below.
+queries-recent = Recent
+queries-recent-heading = Recent searches
+queries-recent-empty = No recent searches yet — Run one to record it here.
+queries-invalid-url = Enter a search like GET /Patient?name=smith — the resource type comes from the path.

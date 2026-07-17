@@ -23,6 +23,54 @@
 //!   that increments on every write and is surfaced to clients as a weak ETag
 //!   (`W/"{version}"`). Callers may pass `if_match_version` to make a write
 //!   conditional and avoid lost updates.
+//!
+//! # Document conventions
+//!
+//! The document is schema-less, but keys shared between clients follow agreed
+//! conventions. The established ones:
+//!
+//! - `theme` — `"light"` / `"dark"` (the web UI theme toggle).
+//! - `savedQueries` — per-user saved FHIR queries, grouped by resource type
+//!   and **keyed by query id** so a JSON merge patch can create, update, or
+//!   delete a single entry without clobbering its siblings (RFC 7386 replaces
+//!   arrays wholesale, hence objects, not arrays):
+//!
+//!   ```json
+//!   {
+//!     "savedQueries": {
+//!       "Patient": {
+//!         "01J8ZQ3F9V": {
+//!           "name": "Smiths in Boston",
+//!           "query": "name=smith&address-city=Boston",
+//!           "createdAt": "2026-07-01T12:00:00Z",
+//!           "lastAccessedAt": "2026-07-09T09:14:22Z",
+//!           "accessCount": 12
+//!         }
+//!       }
+//!     }
+//!   }
+//!   ```
+//!
+//!   Clients bump `lastAccessedAt` / `accessCount` with a merge patch when the
+//!   query is run, and sort by `lastAccessedAt` descending, falling back to
+//!   `createdAt` for never-run entries. The REST layer enforces structural
+//!   bounds on this key (entries-per-type and whole-document size caps); see
+//!   `helios-rest`'s user-settings handlers.
+//!
+//! - `recentSearches` — the search-builder's run history, newest first,
+//!   deduped by query and capped by the client (currently 10):
+//!
+//!   ```json
+//!   {
+//!     "recentSearches": [
+//!       { "query": "/Patient?name=smith", "at": "2026-07-11T09:14:22Z" }
+//!     ]
+//!   }
+//!   ```
+//!
+//!   Unlike `savedQueries`, this is an array on purpose: it is a small
+//!   bounded cache rewritten wholesale on every run, not sibling-keyed
+//!   state, so RFC 7386's replace-the-array semantics are exactly right.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -47,7 +95,9 @@ pub struct StoredUserSettings {
 
 /// Storage abstraction for opaque, per-user JSON settings documents.
 ///
-/// Implemented by the SQLite and PostgreSQL backends. The trait is intentionally
+/// Implemented by every standalone primary backend: SQLite, PostgreSQL, and
+/// MongoDB, and S3 (where the read-modify-write is a compare-and-swap over
+/// conditional `PutObject` rather than a transaction). The trait is intentionally
 /// minimal — get the whole document, replace it, or merge-patch it — because the
 /// document body is opaque to the server.
 #[async_trait]

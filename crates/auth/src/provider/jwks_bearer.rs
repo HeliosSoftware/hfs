@@ -7,7 +7,6 @@ use tracing::{debug, warn};
 use super::AuthProvider;
 use crate::config::AuthConfig;
 use crate::error::AuthError;
-use crate::jti::JtiCache;
 use crate::jwks::JwksCache;
 use crate::principal::Principal;
 use crate::scope::ScopeSet;
@@ -16,7 +15,6 @@ use crate::scope::ScopeSet;
 /// using keys from a JWKS endpoint.
 pub struct JwksBearerAuthProvider {
     jwks_cache: Arc<JwksCache>,
-    jti_cache: Arc<dyn JtiCache>,
     expected_audience: Option<String>,
     expected_issuer: Option<String>,
     tenant_claim: String,
@@ -25,11 +23,7 @@ pub struct JwksBearerAuthProvider {
 
 impl JwksBearerAuthProvider {
     /// Create a new JWKS Bearer auth provider.
-    pub fn new(
-        jwks_cache: Arc<JwksCache>,
-        jti_cache: Arc<dyn JtiCache>,
-        config: &AuthConfig,
-    ) -> Self {
+    pub fn new(jwks_cache: Arc<JwksCache>, config: &AuthConfig) -> Self {
         let allowed_algorithms = config
             .allowed_algorithms
             .iter()
@@ -38,7 +32,6 @@ impl JwksBearerAuthProvider {
 
         Self {
             jwks_cache,
-            jti_cache,
             expected_audience: config.expected_audience.clone(),
             expected_issuer: config.expected_issuer.clone(),
             tenant_claim: config.tenant_claim.clone(),
@@ -141,21 +134,7 @@ impl AuthProvider for JwksBearerAuthProvider {
         let expires_at = chrono::DateTime::from_timestamp(exp, 0)
             .ok_or_else(|| AuthError::ValidationError("Invalid 'exp' timestamp".to_string()))?;
 
-        // 8. JTI replay check
-        if let Some(ref jti_value) = jti {
-            let is_replay = self
-                .jti_cache
-                .check_and_store(jti_value, expires_at)
-                .await?;
-            if is_replay {
-                warn!(jti = %jti_value, sub = %subject, "JTI replay detected");
-                return Err(AuthError::ReplayDetected {
-                    jti: jti_value.clone(),
-                });
-            }
-        }
-
-        // 9. Parse scopes — handle both string ("scope") and array ("scp") formats
+        // 8. Parse scopes — handle both string ("scope") and array ("scp") formats
         let scopes = if let Some(scope_str) = claims.get("scope").and_then(|v| v.as_str()) {
             ScopeSet::parse(scope_str)
         } else if let Some(scp_array) = claims.get("scp").and_then(|v| v.as_array()) {
@@ -169,13 +148,13 @@ impl AuthProvider for JwksBearerAuthProvider {
             ScopeSet::empty()
         };
 
-        // 10. Extract tenant from configured claim
+        // 9. Extract tenant from configured claim
         let tenant_id = claims
             .get(&self.tenant_claim)
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        // 11. Build custom claims map (excluding standard claims)
+        // 10. Build custom claims map (excluding standard claims)
         let custom_claims = if let serde_json::Value::Object(map) = claims {
             let standard = [
                 "sub", "iss", "exp", "iat", "nbf", "aud", "jti", "scope", "scp",

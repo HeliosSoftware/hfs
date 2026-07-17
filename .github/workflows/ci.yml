@@ -63,43 +63,107 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Run tests with all features
         run: |
           cargo test --workspace --all-features
 
+      # The MinIO suite as a whole stays opt-in (RUN_MINIO_S3_TESTS) because the
+      # full S3 resource-CRUD tests are slow. The per-user settings subset is not
+      # optional: it is the only thing that proves a *real* S3-compatible store
+      # actually enforces the `If-Match` / `If-None-Match` preconditions that the
+      # settings store's optimistic locking is built on. The mock proves our
+      # logic; only this proves the contract. A store that silently ignored those
+      # preconditions would turn every concurrent settings write into a lost
+      # update, and nothing else in CI would notice.
+      #
+      # Same package and feature set as the step above, so the build is already
+      # cached and this costs only the MinIO container. The harness stamps
+      # `github.run_id`, so `cleanup-test-containers` reaps it.
+      #
+      # This step must not be able to pass vacuously. `cargo test` exits 0 when a
+      # name filter matches nothing ("0 passed; N filtered out"), and the suite
+      # self-skips when RUN_MINIO_S3_TESTS is unset — so a renamed test or a
+      # typo'd variable would leave a green step that verified nothing at all.
+      # Assert the expected number of tests actually ran.
+      - name: Verify S3 conditional writes against MinIO (per-user settings)
+        env:
+          RUN_MINIO_S3_TESTS: "1"
+          EXPECTED_MINIO_SETTINGS_TESTS: "4"
+        run: |
+          set -o pipefail
+          cargo test -p helios-persistence --all-features \
+            --test minio_s3_tests test_minio_settings -- --nocapture \
+            | tee minio-settings.log
+          if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then
+            echo "::error::Expected ${EXPECTED_MINIO_SETTINGS_TESTS} MinIO settings tests to run and pass."
+            echo "::error::A green step here with a different count means the conditional-write"
+            echo "::error::contract was NOT verified. Check the test names and RUN_MINIO_S3_TESTS."
+            exit 1
+          fi
+
   cleanup-test-containers:
     name: Cleanup Test Containers
     runs-on: [self-hosted, Linux]
-    needs: [test-rust]
+    # EVERY job that stands up testcontainers must be listed here. `coverage`
+    # runs a second full ES + Postgres + Mongo suite after `test-rust`; when this
+    # job only needed `test-rust` it fired before `coverage` had even started, so
+    # coverage's containers survived every sweep.
+    needs: [test-rust, coverage]
     if: always()
     env:
-      # Reap any testcontainer older than this many minutes. Must comfortably
-      # exceed the longest CI job runtime so a *concurrent* run's live
-      # containers on the shared docker host are never killed mid-test.
+      # Orphan sweep only. Must comfortably exceed the longest CI job runtime so
+      # a *concurrent* run's live containers on the shared docker host are never
+      # killed mid-test.
       MAX_CONTAINER_AGE_MIN: 90
     steps:
-      - name: Reap leaked testcontainers
+      - name: Reap this run's testcontainers
         run: |
-          # testcontainers-rs cleans up on clean process exit, but a cancelled,
-          # timed-out, or OOM-killed test run leaks its containers. It stamps
-          # every container with `org.testcontainers.managed-by=testcontainers`
-          # (never github.run_id), so we reap by that label + age: anything
-          # older than MAX_CONTAINER_AGE_MIN is a leak from a dead run and is
-          # safe to remove without affecting a live concurrent job.
+          # testcontainers-rs removes a container only from `Drop for
+          # ContainerAsync`, and every suite parks its container in a `static
+          # OnceCell` — statics are never dropped, so even a fully green run
+          # leaks one container per test binary. The `watchdog` feature does not
+          # help: it fires on SIGTERM/SIGINT/SIGQUIT, not on normal exit or on
+          # the SIGKILL an OOM-kill delivers. Reaping here is the only cleanup.
+          #
+          # The test helpers stamp `github.run_id`, which is exactly what makes
+          # them reapable. No age guard: these are *this* run's containers, and
+          # by construction they are only minutes old.
+          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" \
+            | xargs -r docker rm -f || true
+
+      - name: Sweep orphaned testcontainers from dead runs
+        run: |
+          # Backstop for containers the run_id filter cannot see: leaks from runs
+          # that died before reaching this job, and the few suites that don't
+          # stamp github.run_id. testcontainers-rs unconditionally applies
+          # `org.testcontainers.managed-by=testcontainers` to every container, so
+          # that label plus an age guard is a safe net.
           now=$(date +%s)
           reaped=0
           for id in $(docker ps -q --filter "label=org.testcontainers.managed-by=testcontainers"); do
             started=$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null) || continue
             age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
             if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
-              echo "Reaping $id (age ${age_min}m)"
+              echo "Reaping orphan $id (age ${age_min}m)"
               docker rm -f "$id" || true
               reaped=$((reaped + 1))
             fi
           done
-          echo "Reaped ${reaped} leaked testcontainer(s)."
+          echo "Swept ${reaped} orphaned testcontainer(s)."
 
   test-python:
     name: Test Python
@@ -144,7 +208,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Build pysof wheel
         working-directory: crates/pysof
@@ -196,10 +272,25 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Check HTS canonical precedence is centralized (issue #200)
+        run: crates/hts/scripts/check-canonical-precedence.sh
 
       - name: Run clippy
         run: |
@@ -263,7 +354,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
@@ -272,25 +375,6 @@ jobs:
         # Vulnerability-class advisories cannot be ignored via audit.toml
         # (cargo-audit only honors that for warning-class entries), so they
         # are listed here.
-        #
-        # mongodb (via hickory-resolver → hickory-proto 0.25.2). Remove once
-        # mongodb releases a build with hickory >= 0.26.1
-        # (tracked: mongodb/mongo-rust-driver#1682). Neither path is reachable:
-        #   - RUSTSEC-2026-0118 requires the dnssec-ring/dnssec-aws-lc-rs
-        #     hickory features, which we don't enable.
-        #   - RUSTSEC-2026-0119 fires when encoding outbound messages with
-        #     many compressible records; mongodb only encodes single-question
-        #     resolver queries.
-        #
-        # The pyo3 advisories below only affect `pysof`, which is excluded from
-        # the default workspace build and shipped separately as a Python wheel.
-        # The fix (pyo3 >= 0.29) is blocked upstream: pysof depends on
-        # `pythonize`, whose latest release (0.28) only supports pyo3 0.28.
-        # Neither advisory path is reachable in pysof:
-        #   - RUSTSEC-2026-0176 affects `nth`/`nth_back` on PyList/PyTuple
-        #     iterators; pysof never calls those methods.
-        #   - RUSTSEC-2026-0177 affects `PyCFunction::new_closure`; pysof never
-        #     creates closures. Remove once pythonize ships a pyo3 0.29 build.
         #
         # rustls-webpki 0.101.7 (via rustls 0.21.x ← aws-smithy-http-client
         # 1.1.10). The 0.101.x line is no longer patched; AWS SDK pins it.
@@ -301,13 +385,9 @@ jobs:
         #     misissued certificate with name constraints; AWS endpoints
         #     don't use name-constrained intermediates.
         #   - RUSTSEC-2026-0104 (CRL panic): the AWS SDK doesn't parse CRLs.
-        #
-        # quinn-proto 0.11.14 (transitive via reqwest's QUIC/HTTP3 support).
-        # RUSTSEC-2026-0185 is a remote memory-exhaustion DoS triggered by an
-        # attacker feeding unbounded out-of-order QUIC stream fragments to a
-        # quinn endpoint. We only use reqwest as an HTTP/1.1+2 client and never
-        # accept inbound QUIC connections, so the vulnerable reassembly path is
-        # unreachable. Remove once reqwest pulls quinn-proto >= 0.11.15.
+        # This copy is only linked under `--all-features` (the legacy rustls
+        # 0.21 smithy path); the shipped binary disables it via
+        # `default-features = false` on aws-sdk-s3.
         #
         # quick-xml < 0.41 (two transitive copies: 0.37.5 via object_store,
         # 0.38.4 via octofhir-ucum). Both RUSTSEC-2026-0194 (O(N^2) duplicate-
@@ -319,35 +399,28 @@ jobs:
         #     into the shipped binary.
         #   - object_store parses XML responses from configured S3/Azure/GCS
         #     endpoints (trusted cloud infrastructure), not FHIR client input.
+        #     The latest object_store (0.14) still pins quick-xml 0.40, so no
+        #     upgrade reaches 0.41 yet.
         # helios-serde's own quick-xml (client FHIR XML) is already on 0.41 and
         # sits behind the non-default `xml` feature. Remove these once
         # object_store and octofhir-ucum ship builds on quick-xml >= 0.41.
-        #
-        # crossbeam-epoch 0.9.18 (transitive; present on main identically).
-        # RUSTSEC-2026-0204 is an invalid-pointer dereference in the
-        # `fmt::Pointer` impl for `Atomic`/`Shared`, reachable only when
-        # debug-formatting an already-invalid epoch pointer — we never format
-        # these types. 0.9.18 is the latest release; no fixed version exists yet.
-        # Ambient advisory (published 2026-07-06, after main's last green run).
-        # Remove once crossbeam-epoch ships a patched release.
         run: >-
           cargo audit
-          --ignore RUSTSEC-2026-0118
-          --ignore RUSTSEC-2026-0119
-          --ignore RUSTSEC-2026-0176
-          --ignore RUSTSEC-2026-0177
           --ignore RUSTSEC-2026-0098
           --ignore RUSTSEC-2026-0099
           --ignore RUSTSEC-2026-0104
-          --ignore RUSTSEC-2026-0185
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
-          --ignore RUSTSEC-2026-0204
  
   coverage:
     name: Code Coverage
     runs-on: [self-hosted, Unix] # llvm-tools-preview has problems on Windows, so restrict to Unix
-    needs: [lint]
+    # Depend on test-rust (not just lint) so the two container-heavy jobs never
+    # overlap. Both stand up the full ES + Postgres + Mongo testcontainer suite;
+    # run concurrently on the shared remote Docker host they overload it and the
+    # Mongo container gets OOM-killed mid-run (SystemOverloadedError). Serializing
+    # them keeps peak container pressure to a single suite at a time.
+    needs: [lint, test-rust]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -387,7 +460,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
@@ -761,7 +846,19 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-Wl,-dead_strip", "-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]' >> ~/.cargo/config.toml
+          # No custom rustflags on macOS. Two flags that were tried here both
+          # broke the build:
+          #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
+          #     invalid for executables/test binaries. On Apple Silicon it
+          #     yields Mach-O binaries dyld cannot map against the shared cache
+          #     ("syscall to map cache into shared region failed" ->
+          #     SystemConfiguration.framework fails to load -> SIGABRT).
+          #   * `-stack_size` is rejected by ld64 on any non-main-executable
+          #     link ("-stack_size option can only be used when linking a main
+          #     executable"), and cargo applies rustflags to proc-macro/cdylib
+          #     links too (e.g. serde_derive), so it fails the build outright.
+          # The main-thread stack already defaults to 8 MB on macOS, matching
+          # the Linux `-zstack-size=8388608`, so no override is needed.
 
       - name: Build Release (Windows)
         if: matrix.os == 'Windows'

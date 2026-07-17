@@ -48,11 +48,11 @@ use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
     IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatchFormat, PatientExportProvider,
-    ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
+    PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
     StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
     TypeHistoryProvider, VersionedStorage,
 };
-use crate::error::{BackendError, StorageError, StorageResult, TransactionError};
+use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
 use crate::types::{
     IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
@@ -87,6 +87,9 @@ pub type DynBundleProvider = Arc<dyn BundleProvider + Send + Sync>;
 
 /// A dynamically typed group export provider (also covers Patient + System).
 pub type DynGroupExportProvider = Arc<dyn GroupExportProvider + Send + Sync>;
+
+/// Type alias for a purgable backend.
+pub type DynPurgableStorage = Arc<dyn PurgableStorage + Send + Sync>;
 
 /// Composite storage that coordinates multiple backends.
 ///
@@ -142,6 +145,17 @@ pub struct CompositeStorage {
 
     /// Primary as GroupExportProvider (if supported) — covers all export levels.
     export_provider: Option<DynGroupExportProvider>,
+
+    /// Primary as PurgableStorage (if supported).
+    ///
+    /// `secondaries` are typed only as `ResourceStorage`, which cannot reach
+    /// `PurgableStorage`, so the purge fan-out needs its own typed handles.
+    /// Set via [`with_purgable_backends`](Self::with_purgable_backends).
+    purgable_primary: Option<DynPurgableStorage>,
+
+    /// Every secondary that must also be purged, by backend id. The id is
+    /// carried so a failure can name which backend refused.
+    purgable_secondaries: Vec<(String, DynPurgableStorage)>,
 }
 
 /// Health status for a backend.
@@ -301,7 +315,25 @@ impl CompositeStorage {
             system_history_provider: None,
             bundle_provider: None,
             export_provider: None,
+            purgable_primary: None,
+            purgable_secondaries: Vec::new(),
         })
+    }
+
+    /// Wires the typed handles that `$purge` fans out to.
+    ///
+    /// `secondaries` must name every backend that holds a copy of the resource
+    /// — in practice the Elasticsearch search index. Omitting one means `$purge`
+    /// silently leaves the purged resource in that backend, where it stays
+    /// searchable and continues to hold the resource's content.
+    pub fn with_purgable_backends(
+        mut self,
+        primary: DynPurgableStorage,
+        secondaries: Vec<(String, DynPurgableStorage)>,
+    ) -> Self {
+        self.purgable_primary = Some(primary);
+        self.purgable_secondaries = secondaries;
+        self
     }
 
     /// Creates a composite storage with search providers.
@@ -930,6 +962,20 @@ impl ResourceStorage for CompositeStorage {
             .await
     }
 
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        // The history log lives with the authoritative primary store, same as the
+        // counts above and `activity_histogram` below.
+        self.primary
+            .count_deltas_by_bucket(tenant, resource_type, since, bucket_seconds)
+            .await
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -945,6 +991,59 @@ impl ResourceStorage for CompositeStorage {
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         self.primary.count_by_tenant().await
+    }
+
+    // ---- Tenant registry ----------------------------------------------------
+    //
+    // The registry of record is the authoritative primary store; reads and
+    // registration delegate straight to it. Only the data purge fans out: in
+    // search-offloaded modes the purged tenant's search documents live solely
+    // in the secondary, so a primary-only purge would leave them discoverable.
+
+    fn supports_tenant_registry(&self) -> bool {
+        self.primary.supports_tenant_registry()
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        self.primary.list_tenants().await
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        self.primary.get_tenant(id).await
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        self.primary.register_tenant(id, display_name).await
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        self.primary.deregister_tenant(id).await
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        let removed = self.primary.purge_tenant_data(id).await?;
+        for (backend_id, secondary) in &self.secondaries {
+            match secondary.purge_tenant_data(id).await {
+                Ok(_) => {}
+                // A secondary without a purge (the trait default) has no
+                // tenant-scoped data of its own to leak; skip it.
+                Err(StorageError::Backend(BackendError::UnsupportedCapability { .. })) => {
+                    debug!(backend_id = %backend_id, "secondary has no tenant purge; skipping");
+                }
+                // Unlike create/delete sync, a failed purge is surfaced: the
+                // primary data is gone but search documents may still be
+                // discoverable, and the admin must know to retry.
+                Err(e) => {
+                    warn!(backend_id = %backend_id, error = %e, "tenant purge failed on secondary");
+                    return Err(e);
+                }
+            }
+        }
+        Ok(removed)
     }
 }
 
@@ -2246,6 +2345,90 @@ impl PatientExportProvider for CompositeStorage {
     }
 }
 
+/// Purge fans out across the composite, **secondaries first**.
+///
+/// This deliberately inverts the ordering of [`CompositeStorage::delete`], which
+/// writes the primary and then syncs to secondaries best-effort, warning on
+/// failure. That is defensible for a soft delete: a stale Elasticsearch document
+/// is a searchability bug, recoverable by a reindex.
+///
+/// It is not defensible for a purge. The Elasticsearch document holds the full
+/// resource content, so a purge that destroys the primary copy and then fails to
+/// remove the secondary has permanently lost the system of record while leaving
+/// the data searchable — the exact opposite of what the caller asked for, and a
+/// PHI-retention bug. Purging the secondaries first means the worst case is a
+/// resource that is missing from search but still readable, which a `$reindex`
+/// restores.
+///
+/// Any failure aborts and propagates, naming the backend that refused. Purge is
+/// never partially successful.
+#[async_trait]
+impl PurgableStorage for CompositeStorage {
+    async fn purge(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<()> {
+        let Some(primary) = &self.purgable_primary else {
+            return Err(purge_unsupported());
+        };
+
+        for (backend_id, secondary) in &self.purgable_secondaries {
+            secondary
+                .purge(tenant, resource_type, id)
+                .await
+                .map_err(|e| purge_failed(backend_id, e))?;
+        }
+
+        // A resource already absent from the primary but present in a secondary
+        // is the state a previously-failed purge leaves behind. Treating that as
+        // NotFound would make the retry fail forever, so the secondaries above
+        // run first and this tolerates the missing primary copy.
+        match primary.purge(tenant, resource_type, id).await {
+            Err(StorageError::Resource(ResourceError::NotFound { .. }))
+                if !self.purgable_secondaries.is_empty() =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+        let Some(primary) = &self.purgable_primary else {
+            return Err(purge_unsupported());
+        };
+
+        for (backend_id, secondary) in &self.purgable_secondaries {
+            secondary
+                .purge_all(tenant, resource_type)
+                .await
+                .map_err(|e| purge_failed(backend_id, e))?;
+        }
+
+        // The primary is the system of record, so its count is the count.
+        primary.purge_all(tenant, resource_type).await
+    }
+}
+
+/// The composite was built without purge handles — `with_purgable_backends` was
+/// never called, so there is nothing to purge through.
+fn purge_unsupported() -> StorageError {
+    StorageError::Backend(BackendError::UnsupportedCapability {
+        backend_name: "composite".to_string(),
+        capability: "purge".to_string(),
+    })
+}
+
+/// Names the backend that refused a purge, so an operator knows which store is
+/// now inconsistent with the others.
+fn purge_failed(backend_id: &str, source: StorageError) -> StorageError {
+    StorageError::Backend(BackendError::QueryError {
+        message: format!("purge failed on secondary '{backend_id}': {source}"),
+    })
+}
+
 #[async_trait]
 impl GroupExportProvider for CompositeStorage {
     async fn get_group_members(
@@ -2492,6 +2675,148 @@ mod tests {
         }
     }
 
+    /// Mock storage with an in-memory tenant registry and a configurable purge.
+    #[derive(Default)]
+    struct MockRegistryStorage {
+        tenants: std::sync::Mutex<Vec<crate::core::TenantRecord>>,
+        purge_count: u64,
+        fail_purge: bool,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for MockRegistryStorage {
+        fn backend_name(&self) -> &'static str {
+            "registry-mock"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            let id = uuid::Uuid::new_v4().to_string();
+            Ok(StoredResource::new(
+                resource_type,
+                &id,
+                tenant.tenant_id().clone(),
+                resource,
+                fhir_version,
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            Ok((
+                StoredResource::new(
+                    resource_type,
+                    id,
+                    tenant.tenant_id().clone(),
+                    resource,
+                    fhir_version,
+                ),
+                true,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Ok(StoredResource::new(
+                current.resource_type(),
+                current.id(),
+                tenant.tenant_id().clone(),
+                resource,
+                current.fhir_version(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        fn supports_tenant_registry(&self) -> bool {
+            true
+        }
+
+        async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+            Ok(self.tenants.lock().unwrap().clone())
+        }
+
+        async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+            Ok(self
+                .tenants
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == id)
+                .cloned())
+        }
+
+        async fn register_tenant(
+            &self,
+            id: &str,
+            display_name: Option<&str>,
+        ) -> StorageResult<crate::core::TenantRecord> {
+            let record = crate::core::TenantRecord {
+                id: id.to_string(),
+                display_name: display_name.map(str::to_string),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            };
+            self.tenants.lock().unwrap().push(record.clone());
+            Ok(record)
+        }
+
+        async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+            let mut tenants = self.tenants.lock().unwrap();
+            let before = tenants.len();
+            tenants.retain(|t| t.id != id);
+            Ok(tenants.len() < before)
+        }
+
+        async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
+            if self.fail_purge {
+                return Err(StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: self.backend_name().to_string(),
+                    message: "purge failed".to_string(),
+                }));
+            }
+            Ok(self.purge_count)
+        }
+    }
+
     fn make_tenant() -> TenantContext {
         TenantContext::new(TenantId::new("test"), TenantPermissions::full_access())
     }
@@ -2524,6 +2849,215 @@ mod tests {
             .search_backend("es", BackendKind::Elasticsearch)
             .build()
             .unwrap()
+    }
+
+    // ── PurgableStorage fan-out ────────────────────────────────────
+
+    /// Records purge calls, and optionally refuses them.
+    struct SpyPurgable {
+        name: &'static str,
+        calls: Arc<parking_lot::Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl SpyPurgable {
+        fn new(name: &'static str, calls: Arc<parking_lot::Mutex<Vec<String>>>) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                calls,
+                fail: false,
+            })
+        }
+
+        fn failing(name: &'static str, calls: Arc<parking_lot::Mutex<Vec<String>>>) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                calls,
+                fail: true,
+            })
+        }
+    }
+
+    // PurgableStorage: ResourceStorage, so the spy has to be one. Only purge
+    // is exercised; the CRUD surface delegates to MockStorage's behavior.
+    #[async_trait]
+    impl ResourceStorage for SpyPurgable {
+        fn backend_name(&self) -> &'static str {
+            "spy"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            MockStorage
+                .create(tenant, resource_type, resource, fhir_version)
+                .await
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            MockStorage
+                .create_or_update(tenant, resource_type, id, resource, fhir_version)
+                .await
+        }
+
+        async fn read(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            MockStorage.read(tenant, resource_type, id).await
+        }
+
+        async fn update(
+            &self,
+            tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            MockStorage.update(tenant, current, resource).await
+        }
+
+        async fn delete(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<()> {
+            MockStorage.delete(tenant, resource_type, id).await
+        }
+
+        async fn count(
+            &self,
+            tenant: &TenantContext,
+            resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            MockStorage.count(tenant, resource_type).await
+        }
+    }
+
+    #[async_trait]
+    impl PurgableStorage for SpyPurgable {
+        async fn purge(&self, _t: &TenantContext, rt: &str, id: &str) -> StorageResult<()> {
+            self.calls.lock().push(format!("{}:{rt}/{id}", self.name));
+            if self.fail {
+                return Err(StorageError::Backend(BackendError::QueryError {
+                    message: "simulated purge outage".to_string(),
+                }));
+            }
+            Ok(())
+        }
+
+        async fn purge_all(&self, _t: &TenantContext, rt: &str) -> StorageResult<u64> {
+            self.calls.lock().push(format!("{}:{rt}/*", self.name));
+            if self.fail {
+                return Err(StorageError::Backend(BackendError::QueryError {
+                    message: "simulated purge outage".to_string(),
+                }));
+            }
+            Ok(1)
+        }
+    }
+
+    fn purge_tenant() -> TenantContext {
+        TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    fn composite_with_purge(
+        primary: Arc<SpyPurgable>,
+        secondary: Arc<SpyPurgable>,
+    ) -> CompositeStorage {
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), Arc::new(MockStorage) as DynStorage);
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+
+        CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_purgable_backends(
+                primary as DynPurgableStorage,
+                vec![("es".to_string(), secondary as DynPurgableStorage)],
+            )
+    }
+
+    /// The bug this whole fan-out exists to prevent: purging only the primary
+    /// leaves the resource in the Elasticsearch index, where it stays
+    /// searchable and keeps holding the resource's full content.
+    #[tokio::test]
+    async fn test_purge_reaches_every_backend() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let composite = composite_with_purge(
+            SpyPurgable::new("primary", calls.clone()),
+            SpyPurgable::new("es", calls.clone()),
+        );
+
+        composite
+            .purge(&purge_tenant(), "Patient", "p1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *calls.lock(),
+            ["es:Patient/p1", "primary:Patient/p1"],
+            "secondaries must be purged before the primary, and none may be skipped"
+        );
+    }
+
+    /// If a secondary refuses, the primary must be left alone. Destroying the
+    /// system of record and then failing to remove the searchable copy is the
+    /// worst possible outcome: the data is both lost and still exposed.
+    #[tokio::test]
+    async fn test_purge_aborts_before_primary_when_secondary_fails() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let composite = composite_with_purge(
+            SpyPurgable::new("primary", calls.clone()),
+            SpyPurgable::failing("es", calls.clone()),
+        );
+
+        let err = composite
+            .purge(&purge_tenant(), "Patient", "p1")
+            .await
+            .expect_err("a failing secondary must fail the whole purge");
+
+        assert!(
+            err.to_string().contains("es"),
+            "the error must name the backend that refused, got: {err}"
+        );
+        assert_eq!(
+            *calls.lock(),
+            ["es:Patient/p1"],
+            "the primary must not be touched once a secondary has failed"
+        );
+    }
+
+    /// A composite built without purge handles must say so rather than
+    /// silently purging the primary alone.
+    #[tokio::test]
+    async fn test_purge_unsupported_without_handles() {
+        let composite = make_composite_with_secondary();
+        let err = composite
+            .purge(&purge_tenant(), "Patient", "p1")
+            .await
+            .expect_err("purge without wired handles must be unsupported");
+        assert!(matches!(
+            err,
+            StorageError::Backend(BackendError::UnsupportedCapability { .. })
+        ));
     }
 
     // ── BackendHealth ──────────────────────────────────────────────
@@ -3403,6 +3937,85 @@ mod tests {
         let tenant = make_tenant();
         let result = composite.delete(&tenant, "Patient", "1").await;
         assert!(result.is_ok());
+    }
+
+    // ── Tenant registry delegation ────────────────────────────────
+
+    fn make_composite_registry(
+        primary: Arc<MockRegistryStorage>,
+        secondary: Option<DynStorage>,
+    ) -> CompositeStorage {
+        let mut builder = CompositeConfig::builder().primary("primary", BackendKind::Sqlite);
+        if secondary.is_some() {
+            builder = builder.search_backend("es", BackendKind::Elasticsearch);
+        }
+        let config = builder.build().unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary as DynStorage);
+        if let Some(secondary) = secondary {
+            backends.insert("es".to_string(), secondary);
+        }
+        CompositeStorage::new(config, backends).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_tenant_registry_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let primary = Arc::new(MockRegistryStorage::default());
+        let composite = make_composite_registry(primary.clone(), None);
+
+        assert!(composite.supports_tenant_registry());
+
+        let record = composite
+            .register_tenant("acme", Some("Acme Health"))
+            .await
+            .unwrap();
+        assert_eq!(record.id, "acme");
+        assert_eq!(record.display_name.as_deref(), Some("Acme Health"));
+        assert_eq!(primary.tenants.lock().unwrap().len(), 1);
+
+        assert_eq!(
+            composite.get_tenant("acme").await.unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(composite.list_tenants().await.unwrap(), vec![record]);
+
+        assert!(composite.deregister_tenant("acme").await.unwrap());
+        assert!(!composite.deregister_tenant("acme").await.unwrap());
+        assert!(composite.get_tenant("acme").await.unwrap().is_none());
+        assert!(primary.tenants.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_purge_tenant_data_skips_unsupported_secondary() {
+        use crate::core::ResourceStorage;
+        let primary = Arc::new(MockRegistryStorage {
+            purge_count: 7,
+            ..Default::default()
+        });
+        let composite = make_composite_registry(primary, Some(Arc::new(MockStorage) as DynStorage));
+
+        assert_eq!(composite.purge_tenant_data("acme").await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_purge_tenant_data_propagates_secondary_failure() {
+        use crate::core::ResourceStorage;
+        let primary = Arc::new(MockRegistryStorage {
+            purge_count: 3,
+            ..Default::default()
+        });
+        let failing = Arc::new(MockRegistryStorage {
+            fail_purge: true,
+            ..Default::default()
+        });
+        let composite = make_composite_registry(primary, Some(failing as DynStorage));
+
+        let result = composite.purge_tenant_data("acme").await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::ConnectionFailed { .. }))
+        ));
     }
 
     fn make_composite_with_search_provider() -> CompositeStorage {

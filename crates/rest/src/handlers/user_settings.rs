@@ -27,13 +27,33 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ResourceStorage, SettingsStore, StoredUserSettings};
+use helios_persistence::core::{
+    ResourceStorage, SettingsStore, StoredUserSettings, apply_merge_patch,
+};
+use helios_persistence::error::{ConcurrencyError, StorageError};
 use serde_json::Value;
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::UserKey;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::state::AppState;
+
+/// Upper bound on the serialized settings document, applied to every write.
+/// The document lives in a single row/document on every backend, so an
+/// unbounded blob degrades reads of *all* of a user's settings at once.
+///
+/// The only other limit on this endpoint is the server-wide request body limit,
+/// which is sized for FHIR Bundles (10 MB by default, and routinely raised) — far
+/// too generous for a document that holds a theme name and a few recent queries.
+/// A settings document is read back on *every* page load and, on backends whose
+/// write is a read-modify-write, re-read and re-written on every retry, so an
+/// oversized one is paid for repeatedly. 256 KiB is orders of magnitude more than
+/// any legitimate document needs.
+const MAX_SETTINGS_DOCUMENT_BYTES: usize = 256 * 1024;
+
+/// Upper bound on saved queries per resource type under the `savedQueries`
+/// convention (see `helios_persistence::core::user_settings` module docs).
+const MAX_SAVED_QUERIES_PER_TYPE: usize = 100;
 
 /// Handler for `GET /_user/settings`.
 ///
@@ -82,6 +102,7 @@ where
 {
     let store = settings_store(&state)?;
     let document = parse_object_body(&body)?;
+    validate_settings_document(&document)?;
     let if_match = parse_if_match_version(&conditional);
     let stored = store
         .put_settings(user.as_str(), document, if_match)
@@ -107,24 +128,106 @@ where
 {
     let store = settings_store(&state)?;
     let merge_patch = parse_object_body(&body)?;
-    let if_match = parse_if_match_version(&conditional);
-    let stored = store
-        .patch_settings(user.as_str(), merge_patch, if_match)
-        .await?;
-    Ok(settings_response(stored))
+    let caller_if_match = parse_if_match_version(&conditional);
+
+    // The bounds below apply to the *post-merge* document, which only the
+    // backend sees. Compute the merge here against the version we read, pin the
+    // write to that version so what was validated is exactly what lands, and —
+    // only when the caller sent no precondition of their own — absorb a benign
+    // concurrent-writer race with a couple of retries.
+    let mut attempts = 0;
+    loop {
+        let (current, version) = match store.get_settings(user.as_str()).await? {
+            Some(stored) => (stored.document, stored.version),
+            None => (Value::Object(Default::default()), 0),
+        };
+        if let Some(expected) = caller_if_match
+            && expected != version
+        {
+            return Err(RestError::PreconditionFailed {
+                message: format!("Expected settings version {expected}, but found {version}"),
+            });
+        }
+        let merged = apply_merge_patch(current, &merge_patch);
+        validate_settings_document(&merged)?;
+
+        match store
+            .patch_settings(user.as_str(), merge_patch.clone(), Some(version))
+            .await
+        {
+            Ok(stored) => return Ok(settings_response(stored)),
+            Err(e) if is_lock_failure(&e) && caller_if_match.is_none() && attempts < 2 => {
+                attempts += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Whether a storage error is an optimistic-lock (version) conflict.
+fn is_lock_failure(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })
+            | StorageError::Concurrency(ConcurrencyError::VersionConflict { .. })
+    )
+}
+
+/// Enforces the structural bounds the server guarantees on the otherwise
+/// opaque settings document: a whole-document size cap, and — when the
+/// [`savedQueries` convention](helios_persistence::core::user_settings) is
+/// present — that it is an object keyed by resource type, each holding an
+/// object of at most [`MAX_SAVED_QUERIES_PER_TYPE`] entries keyed by query id.
+fn validate_settings_document(document: &Value) -> RestResult<()> {
+    let size = serde_json::to_vec(document).map(|v| v.len()).unwrap_or(0);
+    if size > MAX_SETTINGS_DOCUMENT_BYTES {
+        return Err(RestError::PayloadTooLarge {
+            message: format!(
+                "Settings document is {size} bytes; the limit is {MAX_SETTINGS_DOCUMENT_BYTES}"
+            ),
+        });
+    }
+
+    let Some(saved_queries) = document.get("savedQueries") else {
+        return Ok(());
+    };
+    let Some(by_type) = saved_queries.as_object() else {
+        return Err(RestError::UnprocessableEntity {
+            message: "savedQueries must be an object keyed by FHIR resource type".to_string(),
+        });
+    };
+    for (resource_type, entries) in by_type {
+        let Some(entries) = entries.as_object() else {
+            return Err(RestError::UnprocessableEntity {
+                message: format!(
+                    "savedQueries.{resource_type} must be an object keyed by query id"
+                ),
+            });
+        };
+        if entries.len() > MAX_SAVED_QUERIES_PER_TYPE {
+            return Err(RestError::UnprocessableEntity {
+                message: format!(
+                    "savedQueries.{resource_type} has {} entries; the limit is {}",
+                    entries.len(),
+                    MAX_SAVED_QUERIES_PER_TYPE
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Returns the configured settings store, or a `501 Not Implemented` error when
 /// the active backend does not provide one.
 ///
 /// The per-user settings store is implemented by every standalone *primary*
-/// backend that offers the required read-modify-write + monotonic-version
-/// primitives: SQLite, PostgreSQL, and MongoDB. It is intentionally unavailable
-/// on backends that are not a transactional primary FHIR store — notably the
-/// S3 object store (whose recommended role is archival and whose concurrency /
-/// version story differs; tracked in issue #199) and Elasticsearch (search-only,
-/// never a standalone primary). The message names the supported backends so an
-/// operator on an unsupported one gets an explained `501` rather than a bare one.
+/// backend: SQLite, PostgreSQL, and MongoDB provide the read-modify-write +
+/// monotonic-version primitives directly (a transaction or a version-conditioned
+/// update), and S3 reaches the same semantics with a compare-and-swap over
+/// conditional `PutObject`. It is intentionally unavailable only on
+/// Elasticsearch, which is search-only and never a standalone primary. The
+/// message names the supported backends so an operator on an unsupported one gets
+/// an explained `501` rather than a bare one.
 fn settings_store<S>(state: &AppState<S>) -> RestResult<&Arc<dyn SettingsStore>>
 where
     S: ResourceStorage + Send + Sync,
@@ -132,17 +235,29 @@ where
     state
         .settings_store()
         .ok_or_else(|| RestError::NotImplemented {
-            feature: "per-user settings (supported on the SQLite, PostgreSQL, and MongoDB \
-                      backends; not available on the S3 or Elasticsearch backends)"
+            feature: "per-user settings (supported on the SQLite, PostgreSQL, MongoDB, and S3 \
+                      backends; not available on Elasticsearch, which is search-only and never \
+                      a standalone primary store)"
                 .to_string(),
         })
 }
 
-/// Parses and validates a request body as a JSON object.
+/// Parses and validates a request body as a JSON object of a sane size.
 fn parse_object_body(body: &Bytes) -> RestResult<Value> {
     if body.is_empty() {
         return Err(RestError::BadRequest {
             message: "Request body must be a JSON object".to_string(),
+        });
+    }
+    // A cheap guard on the wire size so an oversized blob is refused before it
+    // is parsed. `validate_settings_document` re-checks the *post-merge*
+    // document, which a small PATCH can still push over the cap.
+    if body.len() > MAX_SETTINGS_DOCUMENT_BYTES {
+        return Err(RestError::PayloadTooLarge {
+            message: format!(
+                "Settings document is {} bytes; the limit is {MAX_SETTINGS_DOCUMENT_BYTES}",
+                body.len()
+            ),
         });
     }
     let value: Value = serde_json::from_slice(body).map_err(|e| RestError::BadRequest {
@@ -202,6 +317,31 @@ mod tests {
     fn parse_object_body_rejects_non_object() {
         let err = parse_object_body(&Bytes::from_static(b"[1, 2, 3]")).unwrap_err();
         assert!(matches!(err, RestError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn parse_object_body_rejects_oversized_document() {
+        let bloated = format!(
+            r#"{{"junk":"{}"}}"#,
+            "x".repeat(MAX_SETTINGS_DOCUMENT_BYTES)
+        );
+        let err = parse_object_body(&Bytes::from(bloated)).unwrap_err();
+        match err {
+            RestError::PayloadTooLarge { message } => assert!(
+                message.contains("the limit is"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected a payload-too-large error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_object_body_accepts_document_at_the_limit() {
+        // Exactly at the limit is fine; only *over* it is rejected.
+        let padding = MAX_SETTINGS_DOCUMENT_BYTES - r#"{"k":""}"#.len();
+        let doc = format!(r#"{{"k":"{}"}}"#, "x".repeat(padding));
+        assert_eq!(doc.len(), MAX_SETTINGS_DOCUMENT_BYTES);
+        assert!(parse_object_body(&Bytes::from(doc)).unwrap().is_object());
     }
 
     #[test]

@@ -99,7 +99,14 @@ fn default_connection_timeout_ms() -> u64 {
 }
 
 fn default_busy_timeout_ms() -> u32 {
-    5000
+    // SQLite serialises writers, so under concurrent write load a connection can
+    // wait behind several in-flight write transactions. 5s was too short for the
+    // FHIR benchmark's 20-VU bulk import (writers gave up with "database is
+    // locked" instead of queueing); 30s lets them wait out the backlog. This only
+    // affects how long a *contended* write blocks before erroring — it never slows
+    // uncontended reads or writes, so it's safe for read-heavy workloads (e.g. the
+    // terminology server) too.
+    30_000
 }
 
 fn default_true() -> bool {
@@ -152,10 +159,26 @@ impl SqliteBackend {
         } else {
             SqliteConnectionManager::file(path.as_ref())
         };
-        // Per-connection initialiser: register the in-DB SOF runner's helper
-        // UDFs (`fhir_last_segment`) so SQL emitted by the FHIRPath compiler
-        // can call them directly without dialect-specific shimming.
-        let manager = manager.with_init(|conn| {
+        // Per-connection initialiser. `busy_timeout` and `foreign_keys` are
+        // PER-CONNECTION settings, so they must be applied to every connection the
+        // pool creates — not just once. Previously they were set on a single
+        // connection in `configure_connection()`, leaving the rest of the pool with
+        // the SQLite default `busy_timeout = 0`; under concurrent writes those
+        // connections failed immediately with "database is locked" instead of
+        // waiting for the lock. (WAL is a persistent DB-level setting and stays in
+        // `configure_connection()` — setting journal_mode concurrently as the pool
+        // warms up can itself contend on the DB lock.)
+        //
+        // This closure also registers the in-DB SOF runner's helper UDFs
+        // (`fhir_last_segment`) so SQL emitted by the FHIRPath compiler can call
+        // them directly without dialect-specific shimming.
+        let busy_timeout_ms = config.busy_timeout_ms;
+        let enable_foreign_keys = config.enable_foreign_keys;
+        let manager = manager.with_init(move |conn| {
+            conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64))?;
+            if enable_foreign_keys {
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
@@ -315,6 +338,19 @@ impl SqliteBackend {
     /// This is called during schema initialization to restore any custom
     /// SearchParameters that were POSTed to the server.
     fn load_stored_search_parameters(&self) -> StorageResult<usize> {
+        self.refresh_stored_search_parameters()
+    }
+
+    /// Rebuilds the registry's `Stored` parameters from what the database
+    /// currently holds, returning how many are registered afterwards.
+    ///
+    /// This is the TTL-cache refresh (#235): storage is the source of truth,
+    /// so a SearchParameter POSTed to a cluster-mate appears here on the next
+    /// pass. All rows are read and parsed **before** the write lock is taken
+    /// (the lock is sync and shared with request paths), and on any read
+    /// error the registry is left untouched — a node serves its stale cache
+    /// rather than losing search resolution.
+    pub fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
         let conn = self.get_connection()?;
@@ -330,10 +366,6 @@ impl SqliteBackend {
                 })
             })?;
 
-        let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut registry = self.search_registry.write();
-        let mut count = 0;
-
         let rows = stmt
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(|e| {
@@ -344,6 +376,8 @@ impl SqliteBackend {
                 })
             })?;
 
+        let loader = SearchParameterLoader::new(self.config.fhir_version);
+        let mut definitions = Vec::new();
         for row in rows {
             let data = match row {
                 Ok(data) => data,
@@ -352,7 +386,6 @@ impl SqliteBackend {
                     continue;
                 }
             };
-
             let json: serde_json::Value = match serde_json::from_slice(&data) {
                 Ok(json) => json,
                 Err(e) => {
@@ -360,15 +393,12 @@ impl SqliteBackend {
                     continue;
                 }
             };
-
             match loader.parse_resource(&json) {
                 Ok(mut def) => {
                     // Only register active parameters
                     if def.status == SearchParameterStatus::Active {
                         def.source = SearchParameterSource::Stored;
-                        if registry.register(def).is_ok() {
-                            count += 1;
-                        }
+                        definitions.push(def);
                     }
                 }
                 Err(e) => {
@@ -377,6 +407,17 @@ impl SqliteBackend {
             }
         }
 
+        // Synchronous rebuild under the existing lock; the Arc identity must
+        // be preserved (extractor/ES/chain builders hold clones).
+        let mut registry = self.search_registry.write();
+        registry.unregister_source(SearchParameterSource::Stored);
+        let mut count = 0;
+        for def in definitions {
+            match registry.register(def) {
+                Ok(()) => count += 1,
+                Err(e) => tracing::warn!("Stored SearchParameter not registered: {}", e),
+            }
+        }
         Ok(count)
     }
 

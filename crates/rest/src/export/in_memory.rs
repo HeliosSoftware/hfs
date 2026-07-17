@@ -311,6 +311,19 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         }
         self.sink.read_shard(job_id, filename)
     }
+
+    fn download_url(&self, tenant_id: &str, job_id: &str, filename: &str) -> Option<String> {
+        if !self.tenant_matches(tenant_id, job_id) {
+            return None;
+        }
+        match self.sink.download_url(job_id, filename) {
+            Ok(url) => Some(url),
+            Err(e) => {
+                warn!(%job_id, %filename, error = %e, "failed to resolve export download URL");
+                None
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -461,14 +474,14 @@ async fn run_views_job<Sink: ExportSink>(
             // single-view case this matches the historical `shard-{N}`
             // numbering exactly.
             let shard_key = completed_files.len();
-            let url = sink
+            let filename = sink
                 .write_shard(jid, shard_key, data, ext)
                 .map_err(|e| format!("view '{}': {e}", named.name))?;
 
-            debug!(job_id = %jid, view = %named.name, shard = shard_key, rows = row_count, url = %url, "shard written");
+            debug!(job_id = %jid, view = %named.name, shard = shard_key, rows = row_count, file = %filename, "shard written");
             completed_files.push(CompletedFile {
                 view_name: named.name.clone(),
-                url,
+                filename,
                 row_count,
             });
         }
@@ -514,14 +527,14 @@ async fn run_sqlquery_job<Sink: ExportSink>(
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
 
             let shard_key = completed_files.len();
-            let url = sink
+            let filename = sink
                 .write_shard(jid, shard_key, data, ext)
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
 
-            debug!(job_id = %jid, query = %query.name, shard = shard_key, rows = row_count, url = %url, "shard written");
+            debug!(job_id = %jid, query = %query.name, shard = shard_key, rows = row_count, file = %filename, "shard written");
             completed_files.push(CompletedFile {
                 view_name: query.name.clone(),
-                url,
+                filename,
                 row_count,
             });
         }
@@ -974,6 +987,90 @@ mod tests {
         assert!(
             jobs.get(&running).is_some(),
             "running job must never be reaped"
+        );
+    }
+
+    /// `write_shard` returns the shard's filename (not a URL), and the sink
+    /// resolves that filename to a stable server-routed URL on demand.
+    #[test]
+    fn in_memory_sink_writes_filename_and_resolves_url() {
+        let sink = InMemorySink::new("http://localhost/");
+        let filename = sink
+            .write_shard("job-1", 0, b"{}\n".to_vec(), "ndjson")
+            .unwrap();
+        assert_eq!(filename, "shard-0.ndjson");
+        assert_eq!(
+            sink.download_url("job-1", &filename).unwrap(),
+            "http://localhost/export/job-1/shard-0.ndjson"
+        );
+    }
+
+    /// An `ExportSink` whose `download_url` returns a different URL on every
+    /// call, standing in for S3's per-poll re-signing.
+    #[derive(Clone)]
+    struct ResigningSink {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ExportSink for ResigningSink {
+        fn write_shard(
+            &self,
+            _job_id: &str,
+            shard_index: usize,
+            _data: Vec<u8>,
+            ext: &str,
+        ) -> Result<String, ExportError> {
+            Ok(format!("shard-{shard_index}.{ext}"))
+        }
+        fn read_shard(&self, _job_id: &str, _filename: &str) -> Option<Vec<u8>> {
+            None
+        }
+        fn download_url(&self, job_id: &str, filename: &str) -> Result<String, ExportError> {
+            // Each call advances the nonce, mimicking a fresh pre-signature.
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(format!(
+                "https://signed.example/{job_id}/{filename}?sig={n}"
+            ))
+        }
+        fn delete_job(&self, _job_id: &str) -> Result<(), ExportError> {
+            Ok(())
+        }
+    }
+
+    /// The controller re-resolves a shard's URL on every call (so each manifest
+    /// poll hands out a freshly signed URL), and gates resolution by tenant.
+    #[tokio::test]
+    async fn controller_download_url_is_fresh_and_tenant_gated() {
+        let sink = ResigningSink {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let runner = Arc::new(BlockingRunner {
+            release: Arc::new(Notify::new()),
+        });
+        let controller = InMemoryController::new(runner, sink, None);
+
+        // Register a job for tenant t1 (download_url only checks ownership).
+        let job_id = "job-1".to_string();
+        controller
+            .job_tenants
+            .insert(job_id.clone(), "t1".to_string());
+
+        // Two polls yield two distinct URLs — proof the URL is resolved fresh
+        // rather than reused from write time.
+        let first = controller
+            .download_url("t1", &job_id, "shard-0.ndjson")
+            .expect("owner should resolve a URL");
+        let second = controller
+            .download_url("t1", &job_id, "shard-0.ndjson")
+            .expect("owner should resolve a URL");
+        assert_ne!(first, second, "each poll must re-resolve the download URL");
+
+        // A different tenant cannot resolve URLs for this job.
+        assert!(
+            controller
+                .download_url("other", &job_id, "shard-0.ndjson")
+                .is_none(),
+            "cross-tenant resolution must be denied"
         );
     }
 }

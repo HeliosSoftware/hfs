@@ -127,6 +127,10 @@ pub(crate) fn build_parsed_code_system(
             content: meta.content.to_owned(),
             concepts: parsed_concepts,
             resource_json: build_code_system_resource(meta, &[]),
+            // Native importers (SNOMED RF2, LOINC, RxNorm, ICD-10-CM, …) load a
+            // terminology from its publisher's own distribution, so they are
+            // authoritative for the URL they claim.
+            authority_rank: crate::import::bundle_parser::AUTHORITY_OWNER,
         }],
         ..Default::default()
     }

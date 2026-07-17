@@ -75,6 +75,10 @@ on:
         description: "Run ID tag to group this run's suites (default: GitHub run id)"
         required: false
         default: ""
+      log_level:
+        description: "HFS_LOG_LEVEL (use 'debug' to log search query params when diagnosing 500s)"
+        required: false
+        default: "info"
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -147,9 +151,22 @@ jobs:
           printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]\n' \
             > ~/.cargo/config.toml
 
-      - name: Build debug binary (R4 + sqlite + postgres)
+      # RELEASE, not debug.
+      #
+      # This benchmark existed to produce numbers comparable to the published
+      # HealthSamurai report, whose entrants (Aidbox, HAPI, Medplum) all run
+      # production builds — while we were timing an unoptimized `cargo build`. A
+      # debug Rust build of a JSON-heavy server carries a large constant-factor CPU
+      # penalty on every request, which inflates every suite and every backend, so
+      # it was silently sitting underneath the latency #224 set out to explain.
+      #
+      # It is not the whole story — a debug build is common-mode across sqlite and
+      # postgres, so it cannot explain why *postgres specifically* collapsed — but
+      # any absolute number taken before this change is not comparable to anything,
+      # including our own earlier runs.
+      - name: Build release binary (R4 + sqlite + postgres)
         run: |
-          cargo build -p helios-hfs \
+          cargo build --release -p helios-hfs \
             --no-default-features \
             --features "R4,sqlite,postgres"
 
@@ -157,7 +174,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: hfs-bench-binary-${{ github.run_id }}
-          path: target/debug/hfs
+          path: target/release/hfs
           retention-days: 1
 
   # ────────────────────────────────────────────────────────────────────────────
@@ -336,10 +353,26 @@ jobs:
           # If that file isn't found, search silently degrades to ~9 global params
           # (only a warning is logged) and nearly every search scenario breaks.
           # Pin it explicitly so coverage never depends on the process CWD.
+          # HFS_REQUEST_TIMEOUT: the default is 30s, but a 1600-entry Synthea
+          # transaction bundle under the import suite's 20 concurrent VUs routinely
+          # takes longer than that, and the timeout middleware would cut the request
+          # mid-transaction (observed: import p95 pinned at ~30s, ~40% of imports
+          # failing with the handler future cancelled before commit). The benchmark
+          # comparators (Aidbox/HAPI/Medplum) impose no such cap and import.js
+          # allows 900s client-side, so match that here for a fair comparison.
+          # HFS_PG_MAX_CONNECTIONS: set explicitly so the pool size is a recorded
+          # input rather than an inferred default. The search suite runs 30 VUs; a
+          # pool smaller than that puts every request behind a connection queue and
+          # the measurement stops being about query cost at all (issue #224 — the
+          # pool was pinned at 10 and, on the HFS_DATABASE_URL path, no environment
+          # variable could change it). 32 covers the 30 VUs while staying within a
+          # few multiples of the container's ~8 cores.
           HFS_SERVER_HOST="127.0.0.1" \
           HFS_SERVER_PORT="${{ matrix.port }}" \
-          HFS_LOG_LEVEL="info" \
+          HFS_LOG_LEVEL="${{ inputs.log_level || 'info' }}" \
           HFS_MAX_BODY_SIZE="209715200" \
+          HFS_REQUEST_TIMEOUT="900" \
+          HFS_PG_MAX_CONNECTIONS="32" \
           HFS_DATA_DIR="$GITHUB_WORKSPACE/data" \
             ./hfs > "/tmp/hfs-bench-${{ matrix.backend }}.log" 2>&1 &
 
@@ -380,6 +413,10 @@ jobs:
           RUN_ID="${{ inputs.run_id }}"
           [ -z "$RUN_ID" ] && RUN_ID="${{ github.run_id }}"
 
+          # Checkout uses clean:false, so wipe any results left by a prior run on
+          # this runner (otherwise a stale sibling backend dir rides along in the
+          # uploaded artifact).
+          rm -rf "$GITHUB_WORKSPACE/bench-results"
           RESULTS_DIR="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}"
           mkdir -p "$RESULTS_DIR"
 
@@ -407,9 +444,54 @@ jobs:
               continue
             fi
 
+            # A freshly bulk-loaded Postgres has no visibility map: `relallvisible`
+            # stays 0 until a VACUUM runs, and until then every index-only scan
+            # degrades to an index scan plus a heap fetch per tuple. ANALYZE alone
+            # does NOT set it — which is why the ANALYZE tried in #224 had no
+            # measurable effect and was reverted. VACUUM also refreshes the planner
+            # statistics (including the extended statistics added in schema v14),
+            # so this subsumes the plain ANALYZE.
+            #
+            # Runs once, after the data is in and before search is measured.
+            if [ "$SUITE" = "search" ] && [ "${{ matrix.backend }}" = "postgres" ] \
+               && [ -n "${PG_CONTAINER:-}" ]; then
+              echo "── VACUUM (ANALYZE) before search (sets the visibility map) ──"
+              docker exec "$PG_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+                -c 'VACUUM (ANALYZE) resources;' \
+                -c 'VACUUM (ANALYZE) search_index;' || \
+                echo "::warning::VACUUM failed — index-only scans will fall back to heap fetches"
+
+              # Capture EXPLAIN (ANALYZE, BUFFERS) for the shapes that are still slow,
+              # against the real imported data and before the load starts.
+              #
+              # The composite shapes measured ~70ms on a synthetic replica but run at
+              # 12-13s here, so the replica's distribution is not representative and
+              # local A/B is not trustworthy for them. This reads the actual plans
+              # instead, and A/Bs the correlated-EXISTS candidate in the same pass.
+              if [ -f "$GITHUB_WORKSPACE/.github/scripts/pg-search-plans.sql" ]; then
+                echo "── Capturing query plans for the slow shapes ──"
+                docker cp "$GITHUB_WORKSPACE/.github/scripts/pg-search-plans.sql" \
+                  "$PG_CONTAINER:/tmp/plans.sql" 2>/dev/null || true
+                docker exec "$PG_CONTAINER" psql -U postgres -d postgres -f /tmp/plans.sql \
+                  > "$RESULTS_DIR/search-plans.txt" 2>&1 || \
+                  echo "::warning::plan capture failed (see search-plans.txt)"
+                echo "Captured $(wc -l < "$RESULTS_DIR/search-plans.txt") lines of plan output"
+              fi
+            fi
+
             echo "=================================================="
             echo "Suite: $SUITE   backend: ${{ matrix.backend }}   run: $RUN_ID"
             echo "=================================================="
+
+            # The search suite tags every request with {name, resourceType,
+            # searchType} (see k6/search.js). The aggregate summary collapses all of
+            # them into one http_req_duration, so a 7s median could be one
+            # pathological shape or twenty mediocre ones — #224 explicitly calls out
+            # that we could not tell. Emit the raw points for `search` so the next
+            # step can break latency down per query shape.
+            POINTS_ARG=""
+            [ "$SUITE" = "search" ] && POINTS_ARG="--out json=$RESULTS_DIR/search-points.json"
+
             k6 run \
               --no-usage-report \
               --tag runid="$RUN_ID" \
@@ -417,10 +499,65 @@ jobs:
               --env BASE_URL="http://localhost:${{ matrix.port }}" \
               --env BUNDLE_URL="$BUNDLE_URL" \
               --env FHIRIMPL=hfs \
+              --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
               --summary-export "$RESULTS_DIR/${SUITE}.json" \
+              $POINTS_ARG \
               $EXTRA_ARGS \
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
           done
+
+      # ── Per-query-shape attribution ──────────────────────────────────────
+      # Without this the search suite reports a single aggregate latency and we
+      # cannot tell which of the ~21 query shapes is slow. Produces a table sorted
+      # by p95 so the worst shape is the first line.
+      - name: Attribute search latency per query shape
+        if: always()
+        run: |
+          set -euo pipefail
+          POINTS="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}/search-points.json"
+          [ -f "$POINTS" ] || { echo "No search points file — search suite did not run."; exit 0; }
+
+          OUT="$GITHUB_WORKSPACE/bench-results/${{ matrix.backend }}/search-by-shape.md"
+
+          # k6's `--out json` emits one JSON object per line. Keep the
+          # http_req_duration points, group by the tags the suite already sets, and
+          # compute count/median/p95/max per shape.
+          jq -rs '
+            [ .[]
+              | select(.type == "Point" and .metric == "http_req_duration")
+              | { shape: ((.data.tags.searchType   // "?") + " " +
+                          (.data.tags.resourceType // "?") + "?" +
+                          (.data.tags.name         // "?")),
+                  v: .data.value } ]
+            | group_by(.shape)
+            | map(
+                (sort_by(.v))    as $s
+                | ($s | length)  as $n
+                | {
+                    shape: $s[0].shape,
+                    n:     $n,
+                    med:   $s[($n / 2 | floor)].v,
+                    # Clamp the percentile index to the last element; with only a
+                    # handful of samples in a shape, floor(n*0.95) can land past the
+                    # end. Bind $n explicitly rather than calling `length` inside the
+                    # index expression — there `.` is the index number, not the
+                    # array, and `length` would silently return the number itself.
+                    p95:   $s[([($n * 0.95 | floor), ($n - 1)] | min)].v,
+                    max:   $s[$n - 1].v
+                  }
+              )
+            | sort_by(-.p95)
+            | "| Query shape | n | median (ms) | p95 (ms) | max (ms) |",
+              "|---|---:|---:|---:|---:|",
+              (.[] | "| `\(.shape)` | \(.n) | \(.med | round) | \(.p95 | round) | \(.max | round) |")
+          ' "$POINTS" > "$OUT" || { echo "::warning::per-shape attribution failed"; exit 0; }
+
+          echo "### Search latency by query shape (${{ matrix.backend }})" >> "$GITHUB_STEP_SUMMARY"
+          cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          cat "$OUT"
+
+          # The raw point stream is large and already distilled into the table.
+          rm -f "$POINTS"
 
       # ── Summary ──────────────────────────────────────────────────────────
       - name: Generate step summary
@@ -447,15 +584,15 @@ jobs:
               sys.exit(0)
 
           print("### Results\n")
-          print("| Suite | RPS | p50 ms | p95 ms | p99 ms | Err% |")
-          print("|-------|----:|-------:|-------:|-------:|-----:|")
+          print("| Suite | RPS | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |")
+          print("|-------|----:|-------:|-------:|-------:|-----:|-----------:|")
           for f in files:
               suite = os.path.basename(f).replace('.json', '')
               try:
                   with open(f) as fh:
                       d = json.load(fh)
               except Exception as e:
-                  print(f"| {suite} | _parse error: {e}_ | | | | |")
+                  print(f"| {suite} | _parse error: {e}_ | | | | | |")
                   continue
               m = d.get('metrics', {})
               rps = m.get('http_reqs', {}).get('rate', 0)
@@ -463,9 +600,15 @@ jobs:
               p50 = dur.get('med', 0)
               p95 = dur.get('p(95)', 0)
               p99 = dur.get('p(99)', 0)
-              err = m.get('http_req_failed', {}).get('rate', 0) * 100
+              # http_req_failed is a k6 Rate metric: the fraction lives in `value`,
+              # NOT `rate` (which only exists on Counter metrics like http_reqs).
+              err = m.get('http_req_failed', {}).get('value', 0) * 100
               err_fmt = f"**{err:.1f}%**" if err > 1 else f"{err:.1f}%"
-              print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} |")
+              chk = m.get('checks', {})
+              chk_fmt = f"{chk.get('passes', 0):,}/{chk.get('fails', 0):,}"
+              if chk.get('fails', 0) > 0:
+                  chk_fmt = f"**{chk_fmt}**"
+              print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
           PYEOF
           } >> "$GITHUB_STEP_SUMMARY"
 

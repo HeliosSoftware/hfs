@@ -1,0 +1,308 @@
+name: HFS Cluster Smoke
+
+# T3 tier of docs/cluster-testing-strategy.md (§3, §7): two hfs processes on
+# separate ports sharing one Postgres, behind an nginx round-robin front.
+#
+# This is the workflow_dispatch skeleton for the cluster-capable-state work
+# (discussion #223). It lands on main ahead of the feature phases because a
+# workflow is only dispatchable once it exists on the default branch; dispatch
+# it with ref=<feature-branch> to run the branch's version of this file and of
+# the smoke script. The skeleton asserts only behavior that is already
+# cluster-safe (shared-Postgres CRUD visibility A→B, round-robin through the
+# front) — it calibrates the two-instance harness. Phase 1 adds the SoF
+# $export A→B round-trip; Phase 3 adds the WebSocket fan-out A→B case; the
+# nightly kill-9 recovery cases (A1/E1) get a schedule trigger when they land.
+#
+# Cloned from bulk-export-smoke.yml: same self-hosted runners, remote Docker
+# host (containers are reached at $DOCKER_HOST_IP, the hfs binaries run on the
+# runner), same container lifecycle and artifact conventions.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
+
+jobs:
+  build:
+    name: Build HFS for cluster smoke
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Build HFS binary
+        run: |
+          cargo build -p helios-hfs --no-default-features \
+            --features R4,postgres
+
+      - name: Upload HFS binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: hfs-cluster-smoke-binary
+          path: target/debug/hfs
+          retention-days: 1
+
+  cluster-smoke:
+    name: Cluster smoke (R4 / postgres)
+    needs: build
+    runs-on: [self-hosted, Linux]
+    env:
+      RESULTS_DIR: cluster-smoke-results/R4/postgres
+      FHIR_VERSION: R4
+      HFS_PORT_A: "18200"
+      HFS_PORT_B: "18201"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download HFS binary
+        uses: actions/download-artifact@v8
+        with:
+          name: hfs-cluster-smoke-binary
+          path: target/debug
+
+      - name: Make executables available
+        run: |
+          chmod +x target/debug/hfs
+          chmod +x crates/hfs/tests/cluster/run_external_cluster_smoke.sh
+
+      - name: Determine runner and Docker host IP
+        run: |
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          if [ -n "${DOCKER_HOST_IP:-}" ]; then
+            EFFECTIVE_DOCKER_HOST_IP="$DOCKER_HOST_IP"
+          else
+            EFFECTIVE_DOCKER_HOST_IP="$RUNNER_IP"
+          fi
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+
+      - name: Start PostgreSQL
+        run: |
+          PG_CONTAINER="pg-cluster-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" -p 0:5432 \
+            -e POSTGRES_USER=helios \
+            -e POSTGRES_PASSWORD=helios \
+            -e POSTGRES_DB=helios \
+            postgres:16
+          echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+
+          for i in {1..30}; do
+            if docker exec "$PG_CONTAINER" pg_isready -U helios >/dev/null 2>&1; then
+              PG_PORT=$(docker port "$PG_CONTAINER" 5432 | head -1 | sed 's/.*://')
+              if timeout 2 bash -c "cat < /dev/null > /dev/tcp/$DOCKER_HOST_IP/$PG_PORT" 2>/dev/null; then
+                echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+                echo "PG_URL=postgresql://helios:helios@$DOCKER_HOST_IP:$PG_PORT/helios" >> "$GITHUB_ENV"
+                echo "PostgreSQL is ready on port $PG_PORT"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/30: PostgreSQL not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$PG_CONTAINER"
+          exit 1
+
+      - name: Start nginx round-robin front
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          NGINX_CONTAINER="nginx-cluster-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker rm -f "$NGINX_CONTAINER" 2>/dev/null || true
+
+          # Upstreams are the two hfs processes on the runner. X-Hfs-Upstream
+          # lets the smoke script prove round-robin. The Upgrade/Connection
+          # plumbing is already in place for the Phase 3 WebSocket fan-out case.
+          cat > "$RESULTS_DIR/nginx.conf" <<EOF
+          events {}
+          http {
+            map \$http_upgrade \$connection_upgrade {
+              default upgrade;
+              ''      close;
+            }
+            upstream hfs_cluster {
+              server $RUNNER_IP:$HFS_PORT_A;
+              server $RUNNER_IP:$HFS_PORT_B;
+            }
+            server {
+              listen 80;
+              location / {
+                proxy_pass http://hfs_cluster;
+                proxy_http_version 1.1;
+                proxy_set_header Host \$host;
+                proxy_set_header Upgrade \$http_upgrade;
+                proxy_set_header Connection \$connection_upgrade;
+                add_header X-Hfs-Upstream \$upstream_addr always;
+              }
+            }
+          }
+          EOF
+
+          # The Docker host may be remote, so inject the config with docker cp
+          # (a bind mount would resolve paths on the Docker host, not here).
+          docker create --name "$NGINX_CONTAINER" -p 0:80 nginx:1.27
+          docker cp "$RESULTS_DIR/nginx.conf" "$NGINX_CONTAINER:/etc/nginx/nginx.conf"
+          docker start "$NGINX_CONTAINER"
+          echo "NGINX_CONTAINER=$NGINX_CONTAINER" >> "$GITHUB_ENV"
+
+          # hfs is not up yet, so accept any HTTP answer (502 included) as
+          # proof that nginx itself is serving.
+          for i in {1..30}; do
+            NGINX_PORT=$(docker port "$NGINX_CONTAINER" 80 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$NGINX_PORT" ] \
+                && curl -s -o /dev/null "http://$DOCKER_HOST_IP:$NGINX_PORT/health"; then
+              echo "NGINX_PORT=$NGINX_PORT" >> "$GITHUB_ENV"
+              echo "FRONT_URL=http://$DOCKER_HOST_IP:$NGINX_PORT" >> "$GITHUB_ENV"
+              echo "nginx front is ready on port $NGINX_PORT"
+              exit 0
+            fi
+            echo "Attempt $i/30: nginx not ready yet..."
+            sleep 2
+          done
+
+          docker logs "$NGINX_CONTAINER"
+          exit 1
+
+      - name: Start HFS instances A and B
+        run: |
+          HFS_DEFAULT_TENANT="cluster-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "HFS_DEFAULT_TENANT=$HFS_DEFAULT_TENANT" >> "$GITHUB_ENV"
+
+          # One logical cluster: both instances share the database and the
+          # public base URL (the nginx front), differing only in port.
+          COMMON_ENV=(
+            HFS_BASE_URL="$FRONT_URL"
+            HFS_DEFAULT_FHIR_VERSION="$FHIR_VERSION"
+            HFS_DEFAULT_TENANT="$HFS_DEFAULT_TENANT"
+            HFS_STORAGE_BACKEND=postgres
+            HFS_DATABASE_URL="$PG_URL"
+            HFS_PG_HOST="$DOCKER_HOST_IP"
+            HFS_PG_PORT="$PG_PORT"
+            HFS_PG_DBNAME=helios
+            HFS_PG_USER=helios
+            HFS_PG_PASSWORD=helios
+          )
+
+          HFS_LOG_A="$RESULTS_DIR/hfs-a.log"
+          HFS_LOG_B="$RESULTS_DIR/hfs-b.log"
+          echo "HFS_LOG_A=$HFS_LOG_A" >> "$GITHUB_ENV"
+          echo "HFS_LOG_B=$HFS_LOG_B" >> "$GITHUB_ENV"
+
+          env "${COMMON_ENV[@]}" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT_A" --host 0.0.0.0 > "$HFS_LOG_A" 2>&1 &
+          echo "HFS_PID_A=$!" >> "$GITHUB_ENV"
+
+          env "${COMMON_ENV[@]}" \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT_B" --host 0.0.0.0 > "$HFS_LOG_B" 2>&1 &
+          echo "HFS_PID_B=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for both HFS instances to be ready
+        run: |
+          wait_ready() {
+            local name="$1" pid="$2" port="$3" log="$4"
+            for i in {1..45}; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "HFS instance $name exited"
+                cat "$log"
+                return 1
+              fi
+              if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
+                echo "HFS instance $name is ready on port $port"
+                return 0
+              fi
+              echo "Attempt $i/45: HFS instance $name not ready yet..."
+              sleep 2
+            done
+            tail -100 "$log"
+            return 1
+          }
+          wait_ready A "$HFS_PID_A" "$HFS_PORT_A" "$HFS_LOG_A"
+          wait_ready B "$HFS_PID_B" "$HFS_PORT_B" "$HFS_LOG_B"
+
+      - name: Run cluster smoke checks
+        run: |
+          BASE_URL_A="http://localhost:$HFS_PORT_A" \
+          BASE_URL_B="http://localhost:$HFS_PORT_B" \
+          FRONT_URL="$FRONT_URL" \
+          FHIR_VERSION="$FHIR_VERSION" \
+          RESULTS_DIR="$RESULTS_DIR" \
+          SMOKE_RUN_SUFFIX="${{ github.run_id }}-${{ github.run_attempt }}" \
+          ./crates/hfs/tests/cluster/run_external_cluster_smoke.sh
+
+      - name: Stop HFS instances gracefully
+        if: always()
+        run: |
+          for pid in "${HFS_PID_A:-}" "${HFS_PID_B:-}"; do
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              kill -INT "$pid" 2>/dev/null || true
+              for _ in {1..50}; do
+                if kill -0 "$pid" 2>/dev/null; then
+                  sleep 0.2
+                else
+                  break
+                fi
+              done
+              kill -9 "$pid" 2>/dev/null || true
+            fi
+          done
+
+      - name: Collect container logs
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR/backend-logs"
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker logs "$PG_CONTAINER" > "$RESULTS_DIR/backend-logs/postgres.log" 2>&1 || true
+          fi
+          if [ -n "${NGINX_CONTAINER:-}" ]; then
+            docker logs "$NGINX_CONTAINER" > "$RESULTS_DIR/backend-logs/nginx.log" 2>&1 || true
+          fi
+
+      - name: Append smoke report to summary
+        if: always()
+        run: |
+          if [ -f "$RESULTS_DIR/summary.md" ]; then
+            cat "$RESULTS_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Cluster Smoke" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No summary produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload cluster smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cluster-smoke-R4-postgres-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cluster-smoke-results/R4/postgres/
+          retention-days: 30
+
+      - name: Cleanup containers
+        if: always()
+        run: |
+          if [ -n "${PG_CONTAINER:-}" ]; then
+            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          fi
+          if [ -n "${NGINX_CONTAINER:-}" ]; then
+            docker rm -f "$NGINX_CONTAINER" 2>/dev/null || true
+          fi

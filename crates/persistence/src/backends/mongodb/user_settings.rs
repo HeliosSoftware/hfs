@@ -16,6 +16,9 @@
 //! lock failure. This yields the same read-modify-write + monotonic-version
 //! semantics as the relational stores without requiring a replica set.
 
+use std::future::Future;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use mongodb::bson::{Document, doc};
@@ -57,10 +60,11 @@ impl MongoBackend {
         let collection = db.collection::<Document>(USER_SETTINGS_COLLECTION);
 
         for _ in 0..=MAX_WRITE_RETRIES {
-            let existing = collection
-                .find_one(doc! { "user_key": user_key })
-                .await
-                .map_err(|e| backend_err(format!("read user_settings: {e}")))?;
+            let existing = retry_transient(|| async {
+                collection.find_one(doc! { "user_key": user_key }).await
+            })
+            .await
+            .map_err(|e| backend_err(format!("read user_settings: {e}")))?;
 
             let current_version = existing
                 .as_ref()
@@ -89,14 +93,17 @@ impl MongoBackend {
                 // No document yet: insert. A unique index on `user_key` makes a
                 // concurrent insert fail with a duplicate-key error, which we
                 // treat as a lost race (retry) or a lock failure (conditional).
-                match collection
-                    .insert_one(doc! {
-                        "user_key": user_key,
-                        "data": &data,
-                        "version": new_version,
-                        "updated_at": now_bson,
-                    })
-                    .await
+                match retry_transient(|| async {
+                    collection
+                        .insert_one(doc! {
+                            "user_key": user_key,
+                            "data": &data,
+                            "version": new_version,
+                            "updated_at": now_bson,
+                        })
+                        .await
+                })
+                .await
                 {
                     Ok(_) => {
                         return Ok(StoredUserSettings {
@@ -121,17 +128,20 @@ impl MongoBackend {
 
             // A document exists: update only if its version is unchanged since we
             // read it, so a concurrent writer's change is never clobbered.
-            let result = collection
-                .update_one(
-                    doc! { "user_key": user_key, "version": current_version },
-                    doc! { "$set": {
-                        "data": &data,
-                        "version": new_version,
-                        "updated_at": now_bson,
-                    }},
-                )
-                .await
-                .map_err(|e| backend_err(format!("write user_settings: {e}")))?;
+            let result = retry_transient(|| async {
+                collection
+                    .update_one(
+                        doc! { "user_key": user_key, "version": current_version },
+                        doc! { "$set": {
+                            "data": &data,
+                            "version": new_version,
+                            "updated_at": now_bson,
+                        }},
+                    )
+                    .await
+            })
+            .await
+            .map_err(|e| backend_err(format!("write user_settings: {e}")))?;
 
             if result.matched_count == 1 {
                 return Ok(StoredUserSettings {
@@ -166,10 +176,10 @@ impl SettingsStore for MongoBackend {
     async fn get_settings(&self, user_key: &str) -> StorageResult<Option<StoredUserSettings>> {
         let db = self.get_database().await?;
         let collection = db.collection::<Document>(USER_SETTINGS_COLLECTION);
-        let row = collection
-            .find_one(doc! { "user_key": user_key })
-            .await
-            .map_err(|e| backend_err(format!("read user_settings: {e}")))?;
+        let row =
+            retry_transient(|| async { collection.find_one(doc! { "user_key": user_key }).await })
+                .await
+                .map_err(|e| backend_err(format!("read user_settings: {e}")))?;
 
         match row {
             None => Ok(None),
@@ -235,15 +245,69 @@ async fn reload_version(
     collection: &mongodb::Collection<Document>,
     user_key: &str,
 ) -> StorageResult<i64> {
-    let row = collection
-        .find_one(doc! { "user_key": user_key })
-        .await
-        .map_err(|e| backend_err(format!("reload user_settings version: {e}")))?;
+    let row =
+        retry_transient(|| async { collection.find_one(doc! { "user_key": user_key }).await })
+            .await
+            .map_err(|e| backend_err(format!("reload user_settings version: {e}")))?;
     Ok(row.and_then(|d| d.get_i64("version").ok()).unwrap_or(0))
 }
 
 fn is_duplicate_key_error(err: &MongoError) -> bool {
     err.to_string().contains("E11000")
+}
+
+/// Bound on retries when a MongoDB operation fails with a *transient* error.
+/// Four attempts with exponential backoff (25/50/100 ms) covers a brief server
+/// blip without stalling a genuine outage for long.
+const MAX_TRANSIENT_RETRIES: u32 = 4;
+
+/// True when a MongoDB error is transient and safe to retry: one the driver has
+/// itself labelled retryable, or a fast network/connection failure (e.g. a
+/// connection reset by a momentarily overloaded server). The driver retries such
+/// errors once; a server that stays busy longer than that outlasts the single
+/// retry, so we add a short bounded retry on top. Non-transient errors
+/// (duplicate key, bad command, decode) are never retried here.
+///
+/// A `ServerSelection` timeout is deliberately *not* treated as transient: it
+/// already means the driver waited its full `server_selection_timeout` and found
+/// no usable server, so a fast backoff-retry would just pay that wait again
+/// (blocking the caller for minutes against a genuinely-down server) without
+/// improving the odds. Such an error is surfaced promptly instead.
+fn is_transient_mongo_error(err: &MongoError) -> bool {
+    use mongodb::error::{ErrorKind, RETRYABLE_ERROR, RETRYABLE_WRITE_ERROR};
+
+    err.contains_label(RETRYABLE_ERROR)
+        || err.contains_label(RETRYABLE_WRITE_ERROR)
+        || matches!(
+            err.kind.as_ref(),
+            ErrorKind::Io(_) | ErrorKind::ConnectionPoolCleared { .. }
+        )
+}
+
+/// Runs a MongoDB operation, retrying it on a [transient error](is_transient_mongo_error)
+/// with exponential backoff.
+///
+/// The settings-store writes are already safe to re-run: reads are pure, and a
+/// re-executed insert/update is caught by the version-conditioned filter and the
+/// duplicate-key path in [`MongoBackend::write_settings`], so a retry after a
+/// lost acknowledgement cannot double-apply.
+async fn retry_transient<T, F, Fut>(mut op: F) -> Result<T, MongoError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, MongoError>>,
+{
+    let mut attempt: u32 = 1;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < MAX_TRANSIENT_RETRIES && is_transient_mongo_error(&err) => {
+                let backoff = Duration::from_millis(25u64 << (attempt - 1));
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// Builds an `OptimisticLockFailure` for a `user_settings` write whose
