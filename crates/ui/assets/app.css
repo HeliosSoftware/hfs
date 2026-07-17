@@ -507,8 +507,10 @@ html[data-nav="collapsed"] .brand__version {
 .theme-toggle button {
   display: grid;
   place-items: center;
-  width: 20px;
-  height: 20px;
+  /* WCAG 2.2 AA, SC 2.5.8 (Target Size Minimum): each toggle is a >=24x24
+     target. The icon inside stays small; only the hit area grows. */
+  width: 24px;
+  height: 24px;
   padding: 0;
   border: 1px solid transparent;
   border-radius: 50%;
@@ -639,6 +641,15 @@ html[data-nav="collapsed"] .brand__version {
   width: 42px;
   padding: 0;
   justify-content: center;
+}
+
+/* A pill rendered as a real <button> (e.g. the chart-expand affordance) keeps
+   the pill look but sheds the native button chrome and inherits type. */
+button.pill {
+  appearance: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
 }
 
 .chart {
