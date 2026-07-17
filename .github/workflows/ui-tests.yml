@@ -1,0 +1,89 @@
+name: UI Tests
+
+# Browser-level conformance for crates/ui (helios-ui), per issue #249:
+# WCAG 2.2 AA via axe-core, theme behavior, progressive enhancement, and the
+# no-CDN invariants — the class of behavior tower::oneshot tests cannot reach.
+#
+# The fast Rust ring (cargo test -p helios-ui) runs first and always. The
+# browser ring boots a freshly built `hfs --features ui` and drives it with
+# Playwright. Everything Node lives under crates/ui/e2e/; the cargo workspace is
+# untouched.
+
+on:
+  pull_request:
+    branches: [main, "feat/**"]
+    paths:
+      - "crates/ui/**"
+      - "locales/**"
+      - ".github/workflows/ui-tests.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ui-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  ui-tests:
+    name: helios-ui browser suite
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
+
+      # The fast inner ring: routing / i18n / headers over tower::oneshot.
+      - name: cargo test -p helios-ui
+        run: cargo test -p helios-ui
+
+      # Only the browser ring needs a built server and Node; skip cleanly if the
+      # e2e harness is absent (e.g. on a branch that predates it).
+      - name: Build hfs (ui feature)
+        if: hashFiles('crates/ui/e2e/package.json') != ''
+        run: cargo build -p helios-hfs --features ui
+
+      - name: Set up Node
+        if: hashFiles('crates/ui/e2e/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install e2e dependencies
+        if: hashFiles('crates/ui/e2e/package.json') != ''
+        working-directory: crates/ui/e2e
+        run: npm ci
+
+      - name: Install Playwright browser
+        if: hashFiles('crates/ui/e2e/package.json') != ''
+        working-directory: crates/ui/e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser suite
+        if: hashFiles('crates/ui/e2e/package.json') != ''
+        working-directory: crates/ui/e2e
+        run: npx playwright test
+
+      - name: Upload Playwright report
+        if: ${{ failure() && hashFiles('crates/ui/e2e/package.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: crates/ui/e2e/playwright-report/
+          retention-days: 7
