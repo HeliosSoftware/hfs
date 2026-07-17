@@ -5,19 +5,37 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ i18n.t("app-title") }}{% endblock %}</title>
   <link rel="stylesheet" href="/ui/assets/app.css">
-  <!-- No `defer`: the theme attribute must land before first paint (see theme.js). -->
+  <!-- No `defer`: these attributes must land on <html> before first paint,
+       or the stored theme / collapsed-nav flashes its default first. -->
   <script src="/ui/assets/theme.js"></script>
+  <script src="/ui/assets/nav.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
 </head>
 <body>
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="brand">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
-      <div>
+      <div class="brand__text">
         <span class="brand__name">{{ i18n.t("app-title") }}</span>
         <span class="brand__version">hfs v{{ status.version }}</span>
       </div>
+      <!--
+        Collapse / expand toggle. A real button (keyboard-operable); nav.js flips
+        the `data-nav` state on <html>, persists it, and keeps aria-expanded in
+        sync. aria-controls points at the sidebar it collapses.
+      -->
+      <button
+        type="button"
+        class="nav-toggle"
+        data-toggle-nav
+        aria-controls="sidebar"
+        aria-expanded="true"
+        aria-label="{{ i18n.t("nav-toggle") }}"
+        title="{{ i18n.t("nav-toggle") }}"
+      >
+        <span class="icon">{% include "icons/panel-left.svg" %}</span>
+      </button>
     </div>
 
     <!--
@@ -60,70 +78,73 @@
 
     <nav class="nav">
       <div class="nav__section">{{ i18n.t("nav-section-work") }}</div>
-      <a class="nav-item" href="/ui" aria-current="page">
+      <a class="nav-item" href="/ui"{% if active_page == "home" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-home") }}">
         <span class="icon">{% include "icons/home.svg" %}</span>
-        {{ i18n.t("nav-home") }}
+        <span class="nav-item__label">{{ i18n.t("nav-home") }}</span>
       </a>
-      <span class="nav-item nav-item--soon">
+      <a class="nav-item" href="/ui/queries"{% if active_page == "queries" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-saved-queries") }}">
+        <span class="icon">{% include "icons/bookmark.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-saved-queries") }}</span>
+      </a>
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-search") }}">
         <span class="icon">{% include "icons/search.svg" %}</span>
-        {{ i18n.t("nav-search") }}
+        <span class="nav-item__label">{{ i18n.t("nav-search") }}</span>
       </span>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-resource-editor") }}">
         <span class="icon">{% include "icons/pencil.svg" %}</span>
-        {{ i18n.t("nav-resource-editor") }}
+        <span class="nav-item__label">{{ i18n.t("nav-resource-editor") }}</span>
       </span>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-history-versions") }}">
         <span class="icon">{% include "icons/history.svg" %}</span>
-        {{ i18n.t("nav-history-versions") }}
+        <span class="nav-item__label">{{ i18n.t("nav-history-versions") }}</span>
       </span>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-compartments") }}">
         <span class="icon">{% include "icons/compartments.svg" %}</span>
-        {{ i18n.t("nav-compartments") }}
+        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
       </span>
 
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-batch-transaction") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
-        {{ i18n.t("nav-batch-transaction") }}
+        <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
       </span>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-bulk-export") }}">
         <span class="icon">{% include "icons/export.svg" %}</span>
-        {{ i18n.t("nav-bulk-export") }}
+        <span class="nav-item__label">{{ i18n.t("nav-bulk-export") }}</span>
       </span>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-sql-on-fhir") }}">
         <span class="icon">{% include "icons/grid.svg" %}</span>
-        {{ i18n.t("nav-sql-on-fhir") }}
+        <span class="nav-item__label">{{ i18n.t("nav-sql-on-fhir") }}</span>
       </span>
 
       <div class="nav__section">{{ i18n.t("nav-section-server") }}</div>
-      <a class="nav-item" href="/ui/tenants">
+      <a class="nav-item" href="/ui/tenants"{% if active_page == "tenants" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-tenants") }}">
         <span class="icon">{% include "icons/building.svg" %}</span>
-        {{ i18n.t("nav-tenants") }}
+        <span class="nav-item__label">{{ i18n.t("nav-tenants") }}</span>
       </a>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-capability-conformance") }}">
         <span class="icon">{% include "icons/shield.svg" %}</span>
-        {{ i18n.t("nav-capability-conformance") }}
+        <span class="nav-item__label">{{ i18n.t("nav-capability-conformance") }}</span>
       </span>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-admin-ops") }}">
         <span class="icon">{% include "icons/sliders.svg" %}</span>
-        {{ i18n.t("nav-admin-ops") }}
+        <span class="nav-item__label">{{ i18n.t("nav-admin-ops") }}</span>
       </span>
 
       <div class="nav__section">{{ i18n.t("nav-section-conditional") }}</div>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-terminology") }}">
         <span class="icon">{% include "icons/book.svg" %}</span>
-        {{ i18n.t("nav-terminology") }}
+        <span class="nav-item__label">{{ i18n.t("nav-terminology") }}</span>
       </span>
-      <span class="nav-item nav-item--soon">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-subscriptions") }}">
         <span class="icon">{% include "icons/sync.svg" %}</span>
-        {{ i18n.t("nav-subscriptions") }}
+        <span class="nav-item__label">{{ i18n.t("nav-subscriptions") }}</span>
       </span>
     </nav>
 
     <!--
-      FHIR version selector — back in its original spot, outline-only so it
-      still pops (Brett, Figma node 34:2). Static until version switching has
-      a server-side read path.
+      FHIR version selector — outline-only so it still pops. Static until
+      version switching has a server-side read path.
     -->
     <div class="sidebar__foot">
       <div class="selector selector--outline">

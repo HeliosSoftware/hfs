@@ -267,6 +267,13 @@ mod shared_mongo {
                     // image default and keeps the mapped port reachable once we
                     // supply our own command.
                     .with_cmd(["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"])
+                    // Every test creates its own uniquely-named database, and
+                    // WiredTiger holds file handles open per collection/index
+                    // across all of them. With 50+ test databases the stock
+                    // container nofile limit is exhausted and index builds die
+                    // with TooManyFilesOpen (error 264) late in the run. 64000
+                    // is mongod's own recommended minimum.
+                    .with_ulimit("nofile", 64000, Some(64000))
                     .with_startup_timeout(std::time::Duration::from_secs(120))
                     .start()
                     .await
@@ -584,8 +591,14 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
     };
 
     let created_during_test = after - before;
+    // `totalCreated` is a server-global counter on the SHARED mongo, so
+    // concurrently running neighbor tests (each with its own client pool)
+    // inflate it — observed spilling past 50 on wide runners. The regression
+    // this guards against (a fresh client per operation) creates at least one
+    // connection per iteration: 8 tasks × 20 ops ≥ 160. A 120 ceiling keeps
+    // that detectable while tolerating neighbor noise.
     assert!(
-        created_during_test <= 50,
+        created_during_test <= 120,
         "MongoDB backend should reuse one client pool; created {} connections during concurrent read/search",
         created_during_test
     );
@@ -1200,6 +1213,56 @@ async fn mongodb_integration_count_by_day() {
         .find(|r| r.day == today)
         .expect("today bucket should be present");
     assert_eq!(today_row.count, 2);
+}
+
+#[tokio::test]
+async fn mongodb_integration_count_deltas_by_bucket() {
+    let Some(backend) = create_backend("console_count_deltas").await else {
+        eprintln!("Skipping mongodb_integration_count_deltas_by_bucket (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-count-deltas");
+
+    let first = backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    // An update writes a v2 history row, which must contribute no delta — the
+    // aggregation pipeline's `$switch` has to agree with the SQL backends' CASE.
+    backend
+        .update(&tenant, &first, json!({"active": true}))
+        .await
+        .unwrap();
+
+    let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let rows = backend
+        .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.iter().map(|r| r.delta).sum::<i64>(),
+        2,
+        "two creates and one update net to +2"
+    );
+    assert!(
+        rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+        "buckets are epoch-aligned to their width"
+    );
+
+    backend
+        .delete(&tenant, "Patient", first.id())
+        .await
+        .unwrap();
+    let rows = backend
+        .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
 }
 
 #[tokio::test]

@@ -35,9 +35,6 @@ mongodb = ["helios-rest/mongodb"]
 elasticsearch = ["helios-rest/elasticsearch"]
 s3 = ["helios-rest/s3"]
 
-# Auth backends
-redis = ["helios-rest/redis", "helios-auth/redis"]
-
 # Subscriptions
 subscriptions = ["helios-rest/subscriptions", "dep:helios-subscriptions"]
 
@@ -56,7 +53,7 @@ reqwest = { version = "0.12", features = ["blocking"] }
 [dependencies]
 helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
 helios-rest = { path = "../rest", version = "0.2.1", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["audit"] }
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false }
 helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.1" }
 helios-audit = { path = "../audit", version = "0.2.1", default-features = false }

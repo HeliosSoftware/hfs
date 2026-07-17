@@ -22,7 +22,7 @@ use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, 
 use crate::search::extractor::ExtractedValue;
 use crate::search::loader::SearchParameterLoader;
 use crate::search::registry::SearchParameterStatus;
-use crate::search::reindex::{ReindexableStorage, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -532,6 +532,76 @@ impl ResourceStorage for SqliteBackend {
                 out.push(crate::core::DailyResourceCount {
                     day,
                     count: n.max(0) as u64,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Bound the scan by the raw `last_updated` column so the
+        // `(tenant_id, last_updated)` history index prunes the range (wrapping the
+        // column in `strftime(...)` would force a full scan). The bound is floored
+        // to a bucket boundary, and formatted the same RFC3339 way the rows are
+        // written; because it lands exactly on a whole second it carries no
+        // fractional part, and any stored value in that same second sorts after it
+        // (`.` = 0x2E > `+` = 0x2B), so no row in the first bucket is missed.
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds).to_rfc3339();
+
+        // `strftime('%s', ...)` parses the stored RFC3339 UTC string to epoch
+        // seconds; integer-dividing by the bucket width and multiplying back floors
+        // each version to its epoch-aligned bucket start. The delta rule mirrors the
+        // trait doc: creation `+1`, delete `-1`, plain update `0`.
+        let mut stmt = conn
+            .prepare(
+                "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
+                        SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
+                 GROUP BY bucket HAVING delta != 0 ORDER BY bucket",
+            )
+            .map_err(|e| {
+                internal_error(format!("Failed to prepare count_deltas_by_bucket: {}", e))
+            })?;
+
+        let rows = stmt
+            .query_map(
+                params![tenant_id, resource_type, since_bound, bucket_seconds],
+                |row| {
+                    let bucket: i64 = row.get(0)?;
+                    let delta: i64 = row.get(1)?;
+                    Ok((bucket, delta))
+                },
+            )
+            .map_err(|e| {
+                internal_error(format!("Failed to query count_deltas_by_bucket: {}", e))
+            })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (bucket, delta) = row.map_err(|e| {
+                internal_error(format!("Failed to read count_deltas_by_bucket row: {}", e))
+            })?;
+            if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
+                out.push(crate::core::ResourceCountDelta {
+                    bucket_start,
+                    delta,
                 });
             }
         }
@@ -1108,20 +1178,22 @@ impl SqliteBackend {
     }
 
     /// Delete search index entries for a resource.
+    /// Removes a resource's search entries, returning how many `search_index`
+    /// rows were deleted.
     pub(crate) fn delete_search_index(
         &self,
         conn: &rusqlite::Connection,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Delete from main search index
-        conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
             params![tenant_id, resource_type, resource_id],
         )
@@ -1133,7 +1205,7 @@ impl SqliteBackend {
             params![tenant_id, resource_type, resource_id],
         );
 
-        Ok(())
+        Ok(deleted as u64)
     }
 
     /// Index minimal fallback search parameters.
@@ -3291,9 +3363,9 @@ fn resolve_bundle_references(
     }
 }
 
-// ReindexableStorage implementation for SQLite backend.
+// ReindexSource: SQLite is a primary, so it is where resources are read from.
 #[async_trait]
-impl ReindexableStorage for SqliteBackend {
+impl ReindexSource for SqliteBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
@@ -3427,14 +3499,21 @@ impl ReindexableStorage for SqliteBackend {
             next_cursor,
         })
     }
+}
 
+// ReindexTarget: SQLite keeps search entries in its own `search_index`
+// table, so it is also a writer and can reindex itself standalone.
+#[async_trait]
+impl ReindexTarget for SqliteBackend {
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         let conn = self.get_connection()?;
+        // Reuses the delete path the CRUD layer uses, so the FTS table is
+        // cleaned up too and the `is_search_offloaded` guard is honored.
         self.delete_search_index(
             &conn,
             tenant.tenant_id().as_str(),
@@ -3446,16 +3525,17 @@ impl ReindexableStorage for SqliteBackend {
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
+        resource: &StoredResource,
     ) -> StorageResult<usize> {
         let conn = self.get_connection()?;
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
 
         // Use the dynamic extraction
         let values = self
             .search_extractor()
-            .extract(resource, resource_type)
+            .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
         let mut count = 0;
@@ -3477,7 +3557,7 @@ impl ReindexableStorage for SqliteBackend {
             tenant.tenant_id().as_str(),
             resource_type,
             resource_id,
-            resource,
+            content,
         )?;
 
         Ok(count)
@@ -3864,6 +3944,66 @@ mod tests {
             .find(|r| r.day == today)
             .expect("today bucket should be present");
         assert_eq!(today_row.count, 2);
+    }
+
+    /// The delta rule, straight from SQL: a create is `+1`, an update is `0` (it
+    /// must not move the resource into a newer bucket — the whole point of reading
+    /// history rather than `resources.last_updated`), and a delete is `-1`.
+    #[tokio::test]
+    async fn test_count_deltas_by_bucket() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let first = backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        // An update writes a v2 history row, which must contribute nothing.
+        backend
+            .update(&tenant, &first, json!({"active": true}))
+            .await
+            .unwrap();
+
+        // A one-minute bucket, so the writes above all land in the same one.
+        let since = Utc::now() - chrono::Duration::minutes(5);
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|r| r.delta).sum::<i64>(),
+            2,
+            "two creates and one update net to +2"
+        );
+        assert!(
+            rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+            "buckets are epoch-aligned to their width"
+        );
+
+        // Deleting one nets it back out.
+        backend
+            .delete(&tenant, "Patient", first.id())
+            .await
+            .unwrap();
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
+
+        // Buckets narrower than the window still cover it, and a bogus width is
+        // rejected rather than silently dividing by zero.
+        assert!(
+            backend
+                .count_deltas_by_bucket(&tenant, "Patient", since, 0)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

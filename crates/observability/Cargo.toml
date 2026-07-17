@@ -40,9 +40,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Date/time for started_at
 chrono.workspace = true
 
+# Object-safe async trait for the process-global dashboard data provider
+# (`dashboard::DashboardProvider`), registered by the server at startup.
+async-trait = "0.1"
+
 # OpenTelemetry (feature-gated). Versions pinned to a mutually compatible set:
 # core 0.32 / tracing-opentelemetry 0.33 (runs one minor ahead of core).
 opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
 tracing-opentelemetry = { version = "0.33", optional = true }
+
+[dev-dependencies]
+# Drives the async `dashboard::snapshot` path in unit tests.
+tokio = { version = "1", features = ["macros", "rt"] }

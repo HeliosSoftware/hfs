@@ -87,6 +87,7 @@ nav-capability-conformance = Capacidad y conformidad
 nav-admin-ops = Administración / Operaciones
 nav-subscriptions = Suscripciones
 nav-tenants = Tenants
+nav-toggle = Contraer o expandir la navegación
 
 ## Mantenimiento de tenants (/ui/tenants)
 
@@ -136,9 +137,40 @@ card-uptime = Disponibilidad
 card-uptime-sub = últimos 30 días
 
 chart-title = Recursos FHIR en el tiempo
-chart-unit-patients = pacientes
 chart-expand = Ampliar el gráfico
+chart-window = Intervalo de tiempo del gráfico
 
 ## Pie de página
 
 footer-copyright = © { $year } { -org-name }
+
+## Saved queries (#234)
+
+nav-saved-queries = Consultas guardadas
+
+queries-heading = Consultas guardadas
+queries-lede = Guarda consultas de búsqueda FHIR por tipo de recurso, ordenadas por su última ejecución. Se guardan en tu configuración de usuario y te siguen entre dispositivos.
+queries-add-heading = Guardar una consulta
+queries-type-label = Tipo de recurso
+queries-type-placeholder = p. ej. Patient
+queries-name-label = Nombre
+queries-name-placeholder = p. ej. Smith en Boston
+queries-query-label = Cadena de consulta
+queries-query-placeholder = p. ej. name=smith&address-city=Boston
+queries-empty = Aún no hay consultas guardadas. Guarda una arriba para empezar.
+queries-never-run = Nunca ejecutada
+queries-run = Ejecutar
+queries-rename = Renombrar
+queries-delete = Eliminar
+queries-rename-prompt = Nuevo nombre
+queries-confirm-delete = ¿Eliminar «{ $name }»?
+queries-unavailable = Las consultas guardadas no están disponibles: el backend de almacenamiento de este servidor no admite configuración por usuario.
+
+queries-builder-heading = Constructor de búsquedas
+queries-url-label = URL de búsqueda FHIR
+queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
+queries-builder-hint = Edita la URL GET directamente. Ejecutar abre la búsqueda en una pestaña nueva y la registra en Recientes; ponle un nombre para conservarla en la lista de abajo.
+queries-recent = Recientes
+queries-recent-heading = Búsquedas recientes
+queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
+queries-invalid-url = Escribe una búsqueda como GET /Patient?name=smith — el tipo de recurso sale de la ruta.

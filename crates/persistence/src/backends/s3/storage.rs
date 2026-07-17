@@ -13,10 +13,11 @@ use crate::core::history::{
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
     SystemHistoryProvider, TypeHistoryProvider,
 };
-use crate::core::{ResourceStorage, VersionedStorage, normalize_etag};
+use crate::core::{PurgableStorage, ResourceStorage, VersionedStorage, normalize_etag};
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, StorageResult,
 };
+use crate::search::reindex::{ReindexSource, ResourcePage};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, Pagination, PaginationMode, ResourceMethod,
@@ -1322,5 +1323,242 @@ mod tests {
         );
         assert_eq!(parse_version_from_history_key("a/b/.json"), None);
         assert_eq!(parse_version_from_history_key("a/b/3"), None);
+    }
+}
+
+// ============================================================================
+// PurgableStorage
+//
+// A resource's bytes are spread across four key families in S3:
+//
+//   resources/{Type}/{id}/current.json            — the current version
+//   resources/{Type}/{id}/_history/{version}.json — every prior version
+//   history/type/{Type}/{ts}_{id}_{ver}_{sfx}.json — type-history index events
+//   history/system/{ts}_{Type}_{id}_{ver}_{sfx}.json — system-history events
+//
+// The first two are id-prefixed and delete cleanly. The history *index event*
+// objects are not: their keys are timestamp-ordered, and the id is embedded in
+// a `sanitize()`d filename segment that is not injective, so two different ids
+// can produce the same segment. Matching on the key text would therefore purge
+// the wrong resource's events (or miss the right one's). They must be resolved
+// by reading each event object and comparing the parsed resource_type/id.
+//
+// That makes purge O(history events for the tenant). It is the correct cost:
+// leaving those objects behind means `_history` keeps returning entries for a
+// purged resource, which is silent PHI retention.
+// ============================================================================
+
+impl S3Backend {
+    /// Deletes every object under `prefix`, returning how many were removed.
+    async fn delete_prefix(&self, bucket: &str, prefix: &str) -> StorageResult<u64> {
+        let objects = self.list_objects_all(bucket, prefix).await?;
+        let mut deleted = 0;
+        // The S3Api trait exposes only single-key deletes (no DeleteObjects
+        // batch), so this is one round trip per object.
+        for object in objects {
+            self.client
+                .delete_object(bucket, &object.key)
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
+    /// Deletes the history index-event objects belonging to `resource_type`,
+    /// optionally narrowed to a single `id`.
+    ///
+    /// Each candidate object is read and matched on its parsed contents rather
+    /// than on its key — see the module comment above for why.
+    async fn purge_history_events(
+        &self,
+        location: &TenantLocation,
+        resource_type: &str,
+        id: Option<&str>,
+    ) -> StorageResult<()> {
+        let prefixes = [
+            location.keyspace.history_type_prefix(resource_type),
+            location.keyspace.history_system_prefix(),
+        ];
+
+        for prefix in prefixes {
+            for object in self.list_objects_all(&location.bucket, &prefix).await? {
+                let Some((event, _)) = self
+                    .get_json_object::<HistoryIndexEvent>(&location.bucket, &object.key)
+                    .await?
+                else {
+                    continue;
+                };
+
+                if event.resource_type != resource_type {
+                    continue;
+                }
+                if let Some(id) = id
+                    && event.id != id
+                {
+                    continue;
+                }
+
+                self.client
+                    .delete_object(&location.bucket, &object.key)
+                    .await
+                    .map_err(|e| self.map_client_error(e))?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PurgableStorage for S3Backend {
+    async fn purge(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<()> {
+        let location = self.tenant_location(tenant)?;
+
+        let current_key = location.keyspace.current_resource_key(resource_type, id);
+        let history_prefix = location.keyspace.history_versions_prefix(resource_type, id);
+
+        let has_current = self
+            .get_json_object::<StoredResource>(&location.bucket, &current_key)
+            .await?
+            .is_some();
+        let history = self
+            .list_objects_all(&location.bucket, &history_prefix)
+            .await?;
+
+        if !has_current && history.is_empty() {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        if has_current {
+            self.client
+                .delete_object(&location.bucket, &current_key)
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+        }
+        self.delete_prefix(&location.bucket, &history_prefix)
+            .await?;
+        self.purge_history_events(&location, resource_type, Some(id))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
+        let location = self.tenant_location(tenant)?;
+
+        // Counted over `current.json` keys, so the figure is "resources purged",
+        // not "objects purged".
+        let count = self
+            .list_current_keys(&location, Some(resource_type))
+            .await?
+            .len() as u64;
+
+        // The type prefix covers both current.json and the nested _history
+        // snapshots for every id of this type.
+        let type_prefix = location.keyspace.resource_type_prefix(resource_type);
+        self.delete_prefix(&location.bucket, &type_prefix).await?;
+        self.purge_history_events(&location, resource_type, None)
+            .await?;
+
+        Ok(count)
+    }
+}
+
+// ============================================================================
+// ReindexSource
+//
+// S3 implements the read half only. It has no search index of any kind — no
+// index namespace in S3Keyspace, and its SearchProvider returns
+// UnsupportedCapability — so it is deliberately NOT a ReindexTarget. On an
+// s3+elasticsearch deployment it is the source and Elasticsearch is the target;
+// on s3-standalone there is no target at all and `$reindex` has nothing to do.
+// ============================================================================
+
+#[async_trait]
+impl ReindexSource for S3Backend {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        let location = self.tenant_location(tenant)?;
+
+        let mut types = std::collections::BTreeSet::new();
+        for key in self.list_current_keys(&location, None).await? {
+            // `…/resources/<type>/<id>/current.json` — the segment after
+            // `resources` is the type.
+            let parts: Vec<&str> = key.split('/').collect();
+            if let Some(pos) = parts.iter().position(|p| *p == "resources")
+                && let Some(resource_type) = parts.get(pos + 1)
+            {
+                types.insert((*resource_type).to_string());
+            }
+        }
+
+        Ok(types.into_iter().collect())
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        ResourceStorage::count(self, tenant, Some(resource_type)).await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        let location = self.tenant_location(tenant)?;
+
+        // S3 has no server-side sort or keyset cursor, so the cursor is an
+        // offset into the lexicographically sorted key list — the same approach
+        // the bulk-export batcher takes. Sorting makes it stable across pages.
+        let mut keys = self
+            .list_current_keys(&location, Some(resource_type))
+            .await?;
+        keys.sort();
+
+        let offset: usize = match cursor {
+            None => 0,
+            Some(raw) => raw.parse().map_err(|_| {
+                StorageError::Backend(BackendError::QueryError {
+                    message: format!("Invalid reindex cursor: {raw}"),
+                })
+            })?,
+        };
+
+        let start = offset.min(keys.len());
+        let end = start.saturating_add(limit as usize).min(keys.len());
+
+        let mut resources = Vec::new();
+        for key in &keys[start..end] {
+            let Some((resource, _)) = self
+                .get_json_object::<StoredResource>(&location.bucket, key)
+                .await?
+            else {
+                continue;
+            };
+            if resource.is_deleted() {
+                continue;
+            }
+            resources.push(resource);
+        }
+
+        let next_cursor = (end < keys.len()).then(|| end.to_string());
+
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+        })
     }
 }

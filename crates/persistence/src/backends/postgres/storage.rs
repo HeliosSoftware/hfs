@@ -20,7 +20,7 @@ use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::search::loader::SearchParameterLoader;
 use crate::search::registry::SearchParameterStatus;
-use crate::search::reindex::{ReindexableStorage, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -507,6 +507,65 @@ impl ResourceStorage for PostgresBackend {
         Ok(out)
     }
 
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds);
+
+        // Floor each version's `last_updated` to its epoch-aligned bucket:
+        // epoch seconds / width, floored, scaled back, then read as a timestamptz.
+        // Epoch arithmetic is timezone-independent, so buckets are stable whatever
+        // the session TimeZone. The `(tenant_id, last_updated)` history index
+        // supports the `>= $3` range scan. Delta rule per the trait doc: creation
+        // `+1`, delete `-1`, plain update `0`.
+        //
+        // `$4::bigint` is cast explicitly: `EXTRACT(EPOCH FROM ...)` is `numeric`, so
+        // without it Postgres infers the parameter as `numeric` too and rejects the
+        // `i64` we bind.
+        let rows = client
+            .query(
+                "SELECT to_timestamp( \
+                          (FLOOR(EXTRACT(EPOCH FROM last_updated) / $4::bigint) * $4::bigint) \
+                          ::double precision \
+                        ) AS bucket, \
+                        SUM(CASE WHEN is_deleted THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END)::bigint AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND last_updated >= $3 \
+                 GROUP BY bucket \
+                 HAVING SUM(CASE WHEN is_deleted THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) <> 0 \
+                 ORDER BY bucket",
+                &[&tenant_id, &resource_type, &since_bound, &bucket_seconds],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to count resource deltas: {}", e)))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let bucket_start: DateTime<Utc> = row.get(0);
+            let delta: i64 = row.get(1);
+            out.push(crate::core::ResourceCountDelta {
+                bucket_start,
+                delta,
+            });
+        }
+        Ok(out)
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -962,20 +1021,22 @@ impl PostgresBackend {
     }
 
     /// Delete search index entries for a resource.
+    /// Removes a resource's search entries, returning how many `search_index`
+    /// rows were deleted.
     pub(crate) async fn delete_search_index(
         &self,
         client: &deadpool_postgres::Client,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Delete from main search index
-        client
+        let deleted = client
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
                 &[&tenant_id, &resource_type, &resource_id],
@@ -991,7 +1052,7 @@ impl PostgresBackend {
             )
             .await;
 
-        Ok(())
+        Ok(deleted)
     }
 }
 
@@ -2934,11 +2995,12 @@ fn resolve_bundle_references(
 }
 
 // ============================================================================
-// ReindexableStorage Implementation
+// ReindexSource Implementation — PostgreSQL is a primary, so it is where
+// resources are read from during a reindex.
 // ============================================================================
 
 #[async_trait]
-impl ReindexableStorage for PostgresBackend {
+impl ReindexSource for PostgresBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
@@ -3056,13 +3118,21 @@ impl ReindexableStorage for PostgresBackend {
             next_cursor,
         })
     }
+}
 
+// ============================================================================
+// ReindexTarget Implementation — PostgreSQL keeps search entries in its own
+// `search_index` table, so it is also a writer and can reindex itself.
+// ============================================================================
+
+#[async_trait]
+impl ReindexTarget for PostgresBackend {
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         let client = self.get_client().await?;
         self.delete_search_index(
             &client,
@@ -3076,17 +3146,18 @@ impl ReindexableStorage for PostgresBackend {
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
+        resource: &StoredResource,
     ) -> StorageResult<usize> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
 
         // Use the dynamic extraction
         let values = self
             .search_extractor()
-            .extract(resource, resource_type)
+            .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
         let mut count = 0;
@@ -3105,7 +3176,7 @@ impl ReindexableStorage for PostgresBackend {
         // Re-index contained resources too, so `$reindex` rebuilds `_contained`
         // search entries.
         count += self
-            .index_contained_resources(&client, tenant_id, resource_type, resource_id, resource)
+            .index_contained_resources(&client, tenant_id, resource_type, resource_id, content)
             .await?;
 
         Ok(count)

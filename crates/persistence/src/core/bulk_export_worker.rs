@@ -114,6 +114,12 @@ pub struct WorkerJobView {
     pub fhir_version: helios_fhir::FhirVersion,
     /// Already-persisted per-type progress, for resuming after a crash.
     pub type_progress: Vec<TypeExportProgress>,
+    /// The authenticated principal that kicked the export off, if any.
+    ///
+    /// Read from the job row rather than passed in, so the terminal audit event
+    /// still names the requester when the job is picked up by a different worker
+    /// (or a different process) than the one that accepted it.
+    pub owner_subject: Option<String>,
 }
 
 /// Strategy for atomically claiming the next available export job.
@@ -252,6 +258,15 @@ pub struct DefaultExportWorker<Js: ?Sized, Dp: ?Sized, Os: ?Sized> {
     /// before `_since` for patients added to the Group after `_since`
     /// (using `Group.member.period.start`).
     pub exclude_since_newly_added: bool,
+    /// Optional audit sink for the job's terminal lifecycle events.
+    audit: Option<WorkerAudit>,
+}
+
+/// Where the worker's `AuditEvent`s are sent.
+#[derive(Clone)]
+struct WorkerAudit {
+    sink: Arc<dyn helios_audit::AuditSink>,
+    source_observer: String,
 }
 
 impl<Js, Dp, Os> DefaultExportWorker<Js, Dp, Os>
@@ -268,6 +283,7 @@ where
             output,
             worker_id,
             exclude_since_newly_added: false,
+            audit: None,
         }
     }
 
@@ -277,16 +293,80 @@ where
         self
     }
 
+    /// Emits a BALP `AuditEvent` when a job reaches a terminal state.
+    ///
+    /// The REST layer audits the kick-off, but only the worker knows how the
+    /// job actually ended — so without this, an export that ran for an hour and
+    /// then failed is indistinguishable in the audit log from one that
+    /// completed.
+    pub fn with_audit(
+        mut self,
+        sink: Arc<dyn helios_audit::AuditSink>,
+        source_observer: impl Into<String>,
+    ) -> Self {
+        self.audit = Some(WorkerAudit {
+            sink,
+            source_observer: source_observer.into(),
+        });
+        self
+    }
+
+    /// Records a terminal lifecycle event for a job.
+    async fn emit_audit(
+        &self,
+        job_id: &ExportJobId,
+        view: Option<&WorkerJobView>,
+        phase: &str,
+        outcome: &str,
+        outcome_desc: Option<&str>,
+    ) {
+        let Some(audit) = &self.audit else {
+            return;
+        };
+        let level = view.map(|v| v.level.clone()).unwrap_or(ExportLevel::System);
+        let types = view
+            .map(|v| v.request.resource_types.clone())
+            .unwrap_or_default();
+
+        crate::core::bulk_export::audit::record_export_event(
+            audit.sink.as_ref(),
+            &audit.source_observer,
+            view.and_then(|v| v.owner_subject.as_deref()),
+            job_id.as_str(),
+            phase,
+            &level,
+            &types,
+            outcome,
+            outcome_desc,
+        )
+        .await;
+    }
+
     /// Runs the export job described by `lease` to completion.
     ///
     /// Every job-state mutation is fenced by `lease.worker_id` +
     /// `lease.fencing_token`; any `LeaseError::LeaseLost` aborts the run
     /// silently (the worker that reclaimed the job now owns it).
     pub async fn run_job(&self, lease: ExportJobLease) -> StorageResult<()> {
-        match self.run_job_inner(&lease).await {
-            Ok(()) => Ok(()),
+        // Captured by `run_job_inner` as soon as it loads the job, so a failure
+        // partway through can still attribute its audit event to the principal
+        // that requested the export.
+        let mut view: Option<WorkerJobView> = None;
+
+        match self.run_job_inner(&lease, &mut view).await {
+            Ok(outcome) => {
+                let (phase, code) = match outcome {
+                    JobOutcome::Completed => ("complete", "0"),
+                    JobOutcome::Cancelled => ("cancelled", "4"),
+                };
+                self.emit_audit(&lease.job_id, view.as_ref(), phase, code, None)
+                    .await;
+                Ok(())
+            }
             Err(LeaseError::LeaseLost { .. }) => {
-                // Another worker owns the job now — stop silently.
+                // Another worker owns the job now — stop silently, and emit
+                // nothing: the worker that reclaimed the job will record its
+                // terminal event, and a second one here would double-count.
                 Ok(())
             }
             Err(LeaseError::Storage(e)) => {
@@ -301,12 +381,24 @@ where
                         &e.to_string(),
                     )
                     .await;
+                self.emit_audit(
+                    &lease.job_id,
+                    view.as_ref(),
+                    "failed",
+                    "8",
+                    Some(&e.to_string()),
+                )
+                .await;
                 Err(e)
             }
         }
     }
 
-    async fn run_job_inner(&self, lease: &ExportJobLease) -> Result<(), LeaseError> {
+    async fn run_job_inner(
+        &self,
+        lease: &ExportJobLease,
+        captured_view: &mut Option<WorkerJobView>,
+    ) -> Result<JobOutcome, LeaseError> {
         let tenant = &lease.tenant;
         let job_id = &lease.job_id;
         let wid = &lease.worker_id;
@@ -316,6 +408,11 @@ where
             .jobs
             .get_export_job_for_worker(tenant, job_id, wid, token)
             .await?;
+        // Handed back to `run_job` immediately, before any work that could
+        // fail, so a failure event still carries the requester and the export
+        // level rather than degrading to an anonymous "something failed".
+        *captured_view = Some(view.clone());
+
         self.jobs
             .mark_export_in_progress(tenant, job_id, wid, token)
             .await?;
@@ -388,7 +485,7 @@ where
                 // Cooperative cancellation check.
                 if let Ok(progress) = self.jobs.get_export_status(tenant, job_id).await {
                     if progress.status == ExportStatus::Cancelled {
-                        return Ok(());
+                        return Ok(JobOutcome::Cancelled);
                     }
                 }
 
@@ -511,8 +608,21 @@ where
         self.jobs
             .finish_export_job(tenant, job_id, wid, token)
             .await?;
-        Ok(())
+        Ok(JobOutcome::Completed)
     }
+}
+
+/// How a worker's run of a job ended.
+///
+/// `run_job_inner` returns `Ok(())` for both a completed export and one that
+/// was cancelled mid-flight, which made the two indistinguishable to the
+/// caller — and so unauditable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobOutcome {
+    /// Every requested type was exported and the job was finished.
+    Completed,
+    /// A cooperative cancellation check saw the job cancelled and stopped.
+    Cancelled,
 }
 
 /// Applies `_elements` projection to an NDJSON line.
@@ -657,6 +767,92 @@ mod tests {
             let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
             let total: u64 = manifest.output.iter().map(|e| e.count).sum();
             assert_eq!(total, 3);
+        }
+
+        /// The REST layer audits the kick-off, but only the worker knows how a
+        /// job actually ended. Without a terminal event, an export that ran and
+        /// then failed is indistinguishable in the audit log from one that
+        /// completed — which is precisely the gap issue #168 is about.
+        #[tokio::test]
+        async fn test_worker_emits_terminal_audit_event_on_completion() {
+            use crate::test_audit::{CollectorSink, detail_map};
+
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system().with_types(vec!["Patient".to_string()]),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("Practitioner/dr-1".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let sink = Arc::new(CollectorSink::new());
+            let worker_id = WorkerId::new("w-audit");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            )
+            .with_audit(sink.clone(), "Device/hfs");
+
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("job claimable");
+            worker.run_job(lease).await.unwrap();
+
+            let events = sink.events();
+            assert_eq!(events.len(), 1, "exactly one terminal event per job run");
+
+            let details = detail_map(&events[0]);
+            assert_eq!(
+                details.get("bulk-export-operation").map(String::as_str),
+                Some("complete")
+            );
+            assert_eq!(
+                details.get("job-id").map(String::as_str),
+                Some(job_id.as_str())
+            );
+            assert_eq!(
+                events[0].outcome.as_ref().and_then(|o| o.value.as_deref()),
+                Some("0")
+            );
+
+            // The agent comes off the job row, not the request, so it survives
+            // the job being picked up by a worker in another process.
+            let agent = events[0].agent.as_ref().expect("event must have an agent");
+            assert_eq!(
+                agent[0]
+                    .who
+                    .as_ref()
+                    .and_then(|w| w.reference.as_ref())
+                    .and_then(|r| r.value.as_deref()),
+                Some("Practitioner/dr-1")
+            );
         }
     }
 }

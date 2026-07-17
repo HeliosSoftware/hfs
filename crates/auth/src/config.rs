@@ -23,10 +23,6 @@ pub struct AuthConfig {
     pub tenant_claim: String,
     /// Comma-separated list of allowed JWT signing algorithms.
     pub allowed_algorithms: Vec<String>,
-    /// JTI cache backend: `"memory"` or `"redis"`.
-    pub jti_backend: String,
-    /// Redis connection URL (required when `jti_backend` is `"redis"`).
-    pub redis_url: Option<String>,
     /// Minimum interval (seconds) between JWKS refreshes.
     pub jwks_min_refresh_interval: u64,
 
@@ -70,8 +66,6 @@ impl AuthConfig {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
-            jti_backend: env::var("HFS_AUTH_JTI_BACKEND").unwrap_or_else(|_| "memory".to_string()),
-            redis_url: env::var("HFS_AUTH_REDIS_URL").ok(),
             jwks_min_refresh_interval: env::var("HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -111,8 +105,6 @@ impl Default for AuthConfig {
                 "ES256".to_string(),
                 "ES384".to_string(),
             ],
-            jti_backend: "memory".to_string(),
-            redis_url: None,
             jwks_min_refresh_interval: 10,
             smart_token_endpoint: None,
             smart_authorize_endpoint: None,
@@ -129,13 +121,54 @@ impl Default for AuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    const AUTH_ENV_KEYS: &[&str] = &[
+        "HFS_AUTH_ENABLED",
+        "HFS_AUTH_JWKS_URL",
+        "HFS_AUTH_ISSUER",
+        "HFS_AUTH_AUDIENCE",
+        "HFS_AUTH_TENANT_CLAIM",
+        "HFS_AUTH_ALGORITHMS",
+        "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL",
+        "HFS_SMART_TOKEN_ENDPOINT",
+        "HFS_SMART_AUTHORIZE_ENDPOINT",
+        "HFS_SMART_JWKS_URL",
+        "HFS_SMART_INTROSPECTION_ENDPOINT",
+        "HFS_SMART_MANAGEMENT_ENDPOINT",
+        "HFS_SMART_REGISTRATION_ENDPOINT",
+        "HFS_SMART_REVOCATION_ENDPOINT",
+        "HFS_OUTBOUND_BEARER_TOKEN",
+    ];
+
+    fn clear_auth_env() {
+        for key in AUTH_ENV_KEYS {
+            unsafe { env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    fn test_from_env_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+
+        let config = AuthConfig::from_env();
+        assert!(!config.enabled);
+        assert_eq!(config.tenant_claim, "tenant_id");
+        assert_eq!(config.jwks_min_refresh_interval, 10);
+        assert_eq!(
+            config.allowed_algorithms,
+            vec!["RS256", "RS384", "ES256", "ES384"]
+        );
+    }
 
     #[test]
     fn test_default_config() {
         let config = AuthConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.tenant_claim, "tenant_id");
-        assert_eq!(config.jti_backend, "memory");
         assert_eq!(config.jwks_min_refresh_interval, 10);
         assert_eq!(config.allowed_algorithms.len(), 4);
     }
