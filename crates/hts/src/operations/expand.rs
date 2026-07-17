@@ -1945,7 +1945,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     let mut resp = match ValueSetOperations::expand(state.backend(), &ctx, req).await {
         Ok(r) => {
             let backend_ms = probe_t_backend.elapsed().as_micros() as f64 / 1000.0;
-            tracing::info!(
+            tracing::debug!(
                 target: "hts::probe",
                 "EX_PROBE: backend_expand took {:.3}ms url={} inline={} filter={} count={:?} contains_n={}",
                 backend_ms,
@@ -3995,7 +3995,7 @@ async fn process_expand_inner<B: TerminologyBackend>(
     // EX_PROBE: total wall time for the whole request including parse + post-
     // processing + serialization.
     let total_ms = probe_t0.elapsed().as_micros() as f64 / 1000.0;
-    tracing::info!(
+    tracing::debug!(
         target: "hts::probe",
         "EX_PROBE: total request took {:.3}ms bytes={}",
         total_ms,

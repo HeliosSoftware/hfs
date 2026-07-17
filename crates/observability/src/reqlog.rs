@@ -21,6 +21,7 @@
 //! endpoints.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Maximum number of request samples retained. At ~20 k samples the buffer
@@ -46,11 +47,37 @@ struct Sample {
 
 static LOG: OnceLock<Mutex<VecDeque<Sample>>> = OnceLock::new();
 
+/// Whether any server has registered a consumer for this buffer.
+///
+/// The buffer is read only by `hfs`'s console traffic/tenants endpoints
+/// (`crates/rest/src/handlers/console_metrics.rs`). A server that mounts no
+/// such reader — `hts`, `sof-server`, `fhirpath-server` — has no use for the
+/// samples, and filling a process-global `Mutex<VecDeque>` on every request at
+/// terminology-server request rates is a contention point paid for nothing.
+/// The request middleware consults [`enabled`] and skips [`record`] when this
+/// is `false`.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Register that this process consumes the reqlog buffer. Call once at startup
+/// from a server that mounts the console traffic endpoints (i.e. `hfs`). Until
+/// then [`crate::middleware::track`] skips recording. Idempotent.
+pub fn enable() {
+    ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Whether a consumer has been [`enable`]d for this buffer.
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 fn log() -> &'static Mutex<VecDeque<Sample>> {
     LOG.get_or_init(|| Mutex::new(VecDeque::with_capacity(1024)))
 }
 
-/// Record one completed request. Called from the request middleware.
+/// Record one completed request. Records unconditionally; the caller decides
+/// whether recording is wanted. [`crate::middleware::track`] gates the call on
+/// [`enabled`] so idle servers pay nothing, while direct callers (tests) always
+/// land a sample.
 ///
 /// `tenant` should be the raw `X-Tenant-ID` value (empty string if absent);
 /// [`per_tenant`] normalises the empty case to `"default"`.

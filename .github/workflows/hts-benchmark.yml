@@ -52,6 +52,40 @@ on:
         description: "Tests to run: 'all' | 'preflight-only' | comma-separated IDs (e.g. LK01,SS01)"
         required: false
         default: "all"
+      # ── Perf-attribution arms (issue #227) ────────────────────────────────
+      # Observability instrumentation is a per-request cost on a server that
+      # serves tens of thousands of req/s. These arms exist to *attribute* that
+      # cost to a component instead of guessing at it: run the same commit on
+      # the same runner with only this input varying, and the delta between
+      # arms is that component's price.
+      #
+      # `obs_mode` maps to HELIOS_OBS_MODE (see crates/observability/src/mode.rs):
+      #   default  — what production ships: metrics only, span iff OTLP is live.
+      #   full     — additionally forces the request span + reqlog ring buffer,
+      #              reproducing the pre-fix cost profile for A/B attribution.
+      #   no-span  — metrics + reqlog, no span.
+      #   off      — middleware present but does no work; the floor.
+      obs_mode:
+        description: "Observability arm: default | full | no-span | off"
+        type: choice
+        required: false
+        default: "default"
+        options:
+          - default
+          - full
+          - no-span
+          - off
+      # Overrides RUST_LOG for the server process. The `hts::probe` developer
+      # probes log at DEBUG; `info,hts::probe=debug` re-enables them to price
+      # the stdout-logging arm without touching code.
+      log_directives:
+        description: "RUST_LOG for the server (blank = HTS_LOG_LEVEL only)"
+        required: false
+        default: ""
+      tx_benchmark_ref:
+        description: "tx-benchmark git ref (blank = pinned SHA; changing it re-baselines)"
+        required: false
+        default: ""
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -163,10 +197,17 @@ jobs:
         with:
           clean: false
 
+      # Pinned to a SHA, not a moving branch. The benchmark test definitions
+      # are an *input* to every perf comparison in this repo: an unpinned
+      # checkout means a baseline recorded weeks ago and a run recorded today
+      # may not have measured the same thing, and no regression claim made
+      # against that baseline is falsifiable. Bump this deliberately, and
+      # re-baseline when you do.
       - name: Checkout tx-benchmark
         uses: actions/checkout@v5
         with:
           repository: HealthSamurai/tx-benchmark
+          ref: ${{ inputs.tx_benchmark_ref || '78bdffa769e21ac5d654f5dad412d1becf9d7e57' }}
           path: tx-benchmark
 
       - name: Download HTS binary
@@ -368,8 +409,15 @@ jobs:
       - name: Start HTS server
         run: |
           # HTS_DATABASE_URL + HTS_STORAGE_BACKEND already exported.
+          #
+          # RUST_LOG, when supplied, takes precedence over HTS_LOG_LEVEL (the
+          # server's EnvFilter reads the environment first). Left blank in the
+          # default arm so the benchmark measures the shipped configuration.
+          echo "obs arm: HELIOS_OBS_MODE=${{ inputs.obs_mode || 'default' }} RUST_LOG='${{ inputs.log_directives }}'"
           HTS_SERVER_PORT="${{ matrix.port }}" \
           HTS_LOG_LEVEL="info" \
+          HELIOS_OBS_MODE="${{ inputs.obs_mode || 'default' }}" \
+          ${{ inputs.log_directives && format('RUST_LOG="{0}"', inputs.log_directives) || '' }} \
             ./hts > "/tmp/hts-bench-${{ matrix.backend }}.log" 2>&1 &
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"

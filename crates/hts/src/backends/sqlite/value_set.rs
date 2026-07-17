@@ -204,19 +204,28 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             ));
         }
         // EX_PROBE: per-call timing to identify which path served the request.
-        // (Stripped after iter11 diagnosis.)
+        // These probes log at the `hts::probe` DEBUG target; when it is not
+        // enabled (the default, and the benchmark) the truncated-URL string is
+        // never built, so the hot expand path pays only this one bool check.
+        // The value is reused across the probe sites below — including the ones
+        // inside `spawn_blocking`, which need an owned copy — so it is bound
+        // once here rather than recomputed per site.
         let _probe_t0 = std::time::Instant::now();
-        let probe_url_short: String = req
-            .url
-            .as_deref()
-            .map(|u| {
-                if u.len() > 80 {
-                    format!("{}…", &u[..80])
-                } else {
-                    u.to_string()
-                }
-            })
-            .unwrap_or_else(|| "<inline>".to_string());
+        let probe_on = tracing::enabled!(target: "hts::probe", tracing::Level::DEBUG);
+        let probe_url_short: String = if probe_on {
+            req.url
+                .as_deref()
+                .map(|u| {
+                    if u.len() > 80 {
+                        format!("{}…", &u[..80])
+                    } else {
+                        u.to_string()
+                    }
+                })
+                .unwrap_or_else(|| "<inline>".to_string())
+        } else {
+            String::new()
+        };
 
         // ── Async hot path: in-memory index already warm ──────────────────────
         // For URL-based implicit ValueSet requests (no inline ValueSet body),
@@ -266,7 +275,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             sql_offset,
                             sql_limit,
                         );
-                        tracing::info!(
+                        tracing::debug!(
                             target: "hts::probe",
                             "EX_PROBE_BACKEND: hit=implicit_index url={} took={:.3}ms n={}",
                             probe_url_short,
@@ -320,7 +329,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             }
                         }
                         let page = page_in_memory(&concept_idx, None, sql_offset, sql_limit);
-                        tracing::info!(
+                        tracing::debug!(
                             target: "hts::probe",
                             "EX_PROBE_BACKEND: hit=inline_compose_index url={} took={:.3}ms n={}",
                             probe_url_short,
@@ -363,7 +372,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             sql_offset,
                             sql_limit,
                         );
-                        tracing::info!(
+                        tracing::debug!(
                             target: "hts::probe",
                             "EX_PROBE_BACKEND: hit=property_result_cache url={} took={:.3}ms n={}",
                             probe_url_short,
@@ -422,7 +431,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             sql_offset,
                                             sql_limit,
                                         );
-                                        tracing::info!(
+                                        tracing::debug!(
                                             target: "hts::probe",
                                             "EX_PROBE_BACKEND: hit=plain_fts_cache url={} took={:.3}ms n={}",
                                             probe_url_short,
@@ -450,7 +459,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         // slow path. This is the hot suspicion for the EX04-after-EX01 stall.
         let probe_url_short_owned = probe_url_short.clone();
         let probe_t_pre_spawn = std::time::Instant::now();
-        tracing::info!(
+        tracing::debug!(
             target: "hts::probe",
             "EX_PROBE_BACKEND: miss_all_caches url={} entering spawn_blocking",
             probe_url_short_owned,
@@ -470,7 +479,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let probe_pre_spawn_ms =
                 probe_t_pre_spawn.elapsed().as_micros() as f64 / 1000.0;
             let conn = pool.get().map_err(|e| {
-                tracing::info!(
+                tracing::debug!(
                     target: "hts::probe",
                     "EX_PROBE_BACKEND: pool_get_FAILED url={} pre_spawn={:.3}ms",
                     probe_url_inner,
@@ -480,7 +489,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             })?;
             let probe_pool_get_ms =
                 probe_t_in_blocking.elapsed().as_micros() as f64 / 1000.0;
-            tracing::info!(
+            tracing::debug!(
                 target: "hts::probe",
                 "EX_PROBE_BACKEND: pool_get url={} pre_spawn={:.3}ms pool_get={:.3}ms",
                 probe_url_inner,
@@ -709,7 +718,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         )?;
                         let probe_compute_ms =
                             probe_t_compute.elapsed().as_micros() as f64 / 1000.0;
-                        tracing::info!(
+                        tracing::debug!(
                             target: "hts::probe",
                             "EX04_PROBE: compute_expansion_with_ctx took={:.3}ms cache_key={} n={} warnings={}",
                             probe_compute_ms,
@@ -737,14 +746,14 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 &cache_key,
                                 &inline_compose_index,
                             );
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "hts::probe",
                                 "EX04_PROBE: populate_caches took={:.3}ms cache_key={}",
                                 probe_t_pop.elapsed().as_micros() as f64 / 1000.0,
                                 cache_key,
                             );
                         } else {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "hts::probe",
                                 "EX04_PROBE: skip_cache cache_key={} warnings={} contained={} tx_resources={}",
                                 cache_key,
@@ -1016,7 +1025,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                         )?;
                                         let probe_bfs_ms =
                                             probe_t_bfs.elapsed().as_micros() as f64 / 1000.0;
-                                        tracing::info!(
+                                        tracing::debug!(
                                             target: "hts::probe",
                                             "EX01_PROBE: bfs_expand_page took={:.3}ms cs_url={} pattern={:?} n={}",
                                             probe_bfs_ms,
@@ -1237,7 +1246,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // i.e. the actual SQLite work (compose evaluation + filtering).
             let probe_compute_ms =
                 probe_t_after_conn.elapsed().as_micros() as f64 / 1000.0;
-            tracing::info!(
+            tracing::debug!(
                 target: "hts::probe",
                 "EX_PROBE_BACKEND: blocking_done url={} pool_get={:.3}ms compute={:.3}ms n={}",
                 probe_url_inner,
