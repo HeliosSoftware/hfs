@@ -2644,14 +2644,15 @@ async fn mongodb_integration_search_parameter_update_status_change() {
         .await
         .unwrap();
 
+    // A per-tenant registry overlays only a tenant's *active* stored params, so
+    // retiring the parameter removes it from that tenant's search resolution.
     let reg = backend.search_param_registry(&tenant);
     let registry = reg.read();
-    let param = registry.get_param("Condition", "mongo-statuschange");
-    assert!(param.is_some(), "Parameter should still exist in registry");
-    assert_eq!(
-        param.unwrap().status,
-        SearchParameterStatus::Retired,
-        "Status should be updated to retired"
+    assert!(
+        registry
+            .get_param("Condition", "mongo-statuschange")
+            .is_none(),
+        "a retired custom parameter should no longer resolve for the tenant"
     );
 }
 
