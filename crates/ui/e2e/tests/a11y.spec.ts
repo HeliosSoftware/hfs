@@ -5,7 +5,7 @@ import AxeBuilder from "@axe-core/playwright";
 // harness. Contrast and target-size verdicts differ per theme, so every route
 // is scanned in both light and dark.
 const WCAG = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
-const ROUTES = ["/ui", "/ui/resources"];
+const ROUTES = ["/ui", "/ui/resources", "/ui/compartments", "/ui/search-parameters"];
 const THEMES = ["light", "dark"] as const;
 
 for (const theme of THEMES) {

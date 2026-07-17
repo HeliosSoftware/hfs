@@ -12,9 +12,10 @@ Everything Node lives here; the cargo workspace is untouched.
 
 | Path | What it covers |
 |------|----------------|
-| `tests/a11y.spec.ts` | axe-core WCAG 2.2 AA over `/ui` and `/ui/resources`, light × dark |
+| `tests/a11y.spec.ts` | axe-core WCAG 2.2 AA over `/ui`, `/ui/resources`, `/ui/compartments`, `/ui/search-parameters`, light × dark |
 | `tests/theme.spec.ts` | FOUC guard, OS-preference precedence, PATCH merge-patch, server-roam, graceful degradation |
 | `tests/no-cdn.spec.ts` | no off-origin requests, no page errors, no inline `<script>` blob |
+| `tests/resources-editor.spec.ts` | Resources edit flows: Create targets the picked type, inline binding validation, Save blocked on invalid, raw-edit round-trips to the FHIR API |
 | `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) |
 
 ## Run it

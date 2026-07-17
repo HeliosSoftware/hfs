@@ -39,6 +39,9 @@ const child = spawn(bin, [], {
     HFS_SERVER_PORT: process.env.HFS_E2E_PORT || "8080",
     HFS_STORAGE_BACKEND: "sqlite",
     HFS_DATABASE_URL: db,
+    // Load the vendored SearchParameter specs (so search works like production),
+    // not the minimal fallback the server drops to when ./data isn't found.
+    HFS_DATA_DIR: join(root, "data"),
     HFS_LOG_LEVEL: "warn",
     // Natural-language search advertises itself as configured so the search
     // area renders its working pane. The key is never used by the tests.
