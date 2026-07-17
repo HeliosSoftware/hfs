@@ -14,7 +14,8 @@
 //! includes) are absent from the map; for those the provider returns `Ok(true)`
 //! — "not disproved here" — so it never blocks on codes it cannot check.
 
-use crate::effects::{CodedValue, TerminologyError, TerminologyProvider};
+use crate::effects::{CodedValue, Deferred, TerminologyError, TerminologyProvider, coded_value};
+use crate::engine::{ErrorKind, ValidationError};
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use helios_fhir::FhirVersion;
@@ -102,6 +103,73 @@ impl CoreTerminology {
             None => Some(true),
         }
     }
+
+    /// `Some(true)` in-set, `Some(false)` definitely out, `None` can't judge
+    /// offline (value set not embedded, or shape not coded). This is the sync
+    /// core both `validate_code` and the editor's binding check share.
+    fn member(&self, value_set: &str, coded: &CodedValue) -> Option<bool> {
+        match coded {
+            CodedValue::Code(code) => self.contains(value_set, None, code),
+            CodedValue::Coding(coding) => {
+                let (system, code) = coding_parts(coding);
+                self.contains(value_set, system, code?)
+            }
+            CodedValue::CodeableConcept(cc) => {
+                let codings = cc
+                    .get("coding")
+                    .and_then(Value::as_array)
+                    .filter(|c| !c.is_empty())?;
+                let mut saw_false = false;
+                for coding in codings {
+                    let (system, code) = coding_parts(coding);
+                    let Some(code) = code else { continue };
+                    match self.contains(value_set, system, code) {
+                        Some(true) => return Some(true),
+                        Some(false) => saw_false = true,
+                        None => return None, // any unembedded coding → can't judge the whole concept
+                    }
+                }
+                saw_false.then_some(false)
+            }
+        }
+    }
+
+    /// Required-binding violations among `deferred`, checked offline against the
+    /// embedded core value sets. Bindings whose value set is not embedded (needs
+    /// a terminology server) are skipped, not guessed. Lets a synchronous caller
+    /// (the resource editor) surface the same binding errors the async effects
+    /// pass would, without a terminology server.
+    pub fn required_binding_errors(&self, deferred: &[Deferred]) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+        for d in deferred {
+            let Deferred::Binding {
+                path,
+                binding,
+                value,
+                type_hint,
+            } = d
+            else {
+                continue;
+            };
+            if binding.strength.as_deref() != Some("required") {
+                continue;
+            }
+            let Some(coded) = coded_value(value, type_hint.as_deref()) else {
+                continue;
+            };
+            if self.member(&binding.value_set, &coded) == Some(false) {
+                errors.push(ValidationError::new(
+                    ErrorKind::TerminologyBinding,
+                    path.clone(),
+                    format!(
+                        "code is not in the required value set '{}'",
+                        strip_version(&binding.value_set)
+                    ),
+                ));
+            }
+        }
+        errors
+    }
 }
 
 /// Strips a `|version` suffix from a canonical URL (`…/administrative-gender|4.0.1`).
@@ -123,34 +191,9 @@ impl TerminologyProvider for CoreTerminology {
         value_set: &str,
         coded: &CodedValue,
     ) -> Result<bool, TerminologyError> {
-        match coded {
-            CodedValue::Code(code) => Ok(self.contains(value_set, None, code).unwrap_or(true)),
-            CodedValue::Coding(coding) => {
-                let (system, code) = coding_parts(coding);
-                let Some(code) = code else { return Ok(true) };
-                Ok(self.contains(value_set, system, code).unwrap_or(true))
-            }
-            CodedValue::CodeableConcept(cc) => {
-                let codings = cc.get("coding").and_then(Value::as_array);
-                let Some(codings) = codings.filter(|c| !c.is_empty()) else {
-                    // Text-only / no codings: structural checks own this shape.
-                    return Ok(true);
-                };
-                // A CodeableConcept binds if any coding is in the set. Unknown
-                // (not-embedded) value sets never disprove it.
-                let mut any_unknown = false;
-                for coding in codings {
-                    let (system, code) = coding_parts(coding);
-                    let Some(code) = code else { continue };
-                    match self.contains(value_set, system, code) {
-                        Some(true) => return Ok(true),
-                        Some(false) => {}
-                        None => any_unknown = true,
-                    }
-                }
-                Ok(any_unknown)
-            }
-        }
+        // Unknown value set / non-coded shape → not disproved here (`Ok(true)`);
+        // only a definite `Some(false)` from `member` is a binding failure.
+        Ok(self.member(value_set, coded).unwrap_or(true))
     }
 }
 

@@ -263,8 +263,16 @@ fn build_body(
     // continuous validation affordable at all.
     let resolver: Arc<dyn helios_fhir_validator::SchemaResolver> = Arc::clone(&registry) as _;
     let validator = Validator::new(resolver);
-    let SyncOutcome { errors, .. } =
+    let SyncOutcome { mut errors, deferred } =
         validator.validate_sync(&document, &ValidationOptions::default());
+
+    // Required-binding checks against the embedded core value sets (offline, no
+    // terminology server), so an out-of-value-set code — e.g. gender
+    // "masculino" — surfaces in the editor exactly as it does at `$validate`.
+    errors.extend(
+        helios_fhir_validator::core_terminology(helios_fhir::FhirVersion::default())
+            .required_binding_errors(&deferred),
+    );
 
     // Anchor each issue to its node. The validator reports `Patient.name.0.given`
     // and our rows are keyed on `name.0.given`, so this is string equality —
