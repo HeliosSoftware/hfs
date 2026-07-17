@@ -120,8 +120,8 @@ pub struct AppState<S> {
 
     /// Tenant ids this process has already tried to auto-register (#240). A
     /// positive, append-only in-memory cache so the write path never pays a
-    /// registry lookup: the first write for an id spawns a best-effort
-    /// `register_tenant`, and every later write just sees the id here and skips.
+    /// registry lookup: the first write for an id registers it (best-effort),
+    /// and every later write just sees the id here and skips.
     seen_tenants: Arc<DashMap<String, ()>>,
 }
 
@@ -408,7 +408,11 @@ impl<S: ResourceStorage> AppState<S> {
         // `insert` returns the previous value; `Some` means this id was already
         // handled. The insert is atomic, so a concurrent first-write for the
         // same id skips here and the registration runs exactly once.
-        if self.seen_tenants.insert(tenant_id.to_string(), ()).is_some() {
+        if self
+            .seen_tenants
+            .insert(tenant_id.to_string(), ())
+            .is_some()
+        {
             return;
         }
         let _ = self.storage.register_tenant(tenant_id, None).await;
