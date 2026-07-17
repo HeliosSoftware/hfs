@@ -202,6 +202,14 @@
   /* ---- save / delete --------------------------------------------------- */
 
   function currentDoc() {
+    // When the raw editor is open its textarea is the source of truth: the
+    // hidden #editor-doc only catches up when you toggle "Edit raw" back off,
+    // so a Save typed directly in raw mode must read the textarea itself.
+    var raw = editorBody.querySelector("#editor-json-raw");
+    var source = editorBody.querySelector("#editor-source");
+    if (raw && !raw.hidden && source) {
+      try { return JSON.parse(source.value); } catch (e) { return null; }
+    }
     var field = editorBody.querySelector("#editor-doc");
     if (!field) return null;
     try { return JSON.parse(field.value); } catch (e) { return null; }

@@ -60,8 +60,14 @@
       });
   }
 
-  /* The in-flight document. It only ever comes from the server's fragment. */
+  /* The in-flight document. Normally the server's fragment (the hidden field),
+     but while the raw editor is open its textarea is the source of truth — the
+     field only catches up when you toggle "Edit raw" back off, so a Save typed
+     directly in raw mode must read the textarea. */
   function currentDocument() {
+    var raw = document.getElementById("editor-json-raw");
+    var source = document.getElementById("editor-source");
+    if (raw && !raw.hidden && source) return source.value;
     var field = document.getElementById("editor-doc");
     return field ? field.value : "{}";
   }
