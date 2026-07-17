@@ -510,6 +510,8 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    seed_search_parameters(&*backend, &config).await;
+    spawn_mongodb_search_param_refresh(backend.clone(), &config);
     let serve_audit_state = audit_state.clone();
 
     // MongoDB is a full standalone primary, so it also hosts the per-user
@@ -841,6 +843,108 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seeds storage with the spec SearchParameters under the default tenant
+/// (#235), making storage the source of truth the registry caches over. A
+/// failed seed logs and boots anyway: the in-memory registry still resolves
+/// searches; only API discovery of the spec parameters is degraded.
+async fn seed_search_parameters<S>(backend: &S, config: &ServerConfig)
+where
+    S: helios_persistence::core::ResourceStorage,
+{
+    let data_dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    if let Err(e) = helios_persistence::search::seed_spec_search_parameters(
+        backend,
+        config.default_fhir_version,
+        &data_dir,
+        &config.default_tenant,
+    )
+    .await
+    {
+        tracing::warn!("SearchParameter seeding failed: {e}");
+    }
+}
+
+/// Spawns the periodic registry refresh from storage for the SQLite backend
+/// (#235). `HFS_SEARCH_PARAM_CACHE_TTL=0` disables it. A failed pass keeps
+/// serving the stale cache; the next tick retries.
+#[cfg(feature = "sqlite")]
+fn spawn_sqlite_search_param_refresh(backend: Arc<SqliteBackend>, config: &ServerConfig) {
+    let ttl = config.search_param_cache_ttl;
+    if ttl == 0 {
+        return;
+    }
+    let interval = std::time::Duration::from_secs(ttl);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let refresh = backend.clone();
+            match tokio::task::spawn_blocking(move || refresh.refresh_stored_search_parameters())
+                .await
+            {
+                Ok(Ok(stored)) => {
+                    tracing::debug!(stored, "SearchParameter registry refreshed from storage")
+                }
+                Ok(Err(e)) => tracing::warn!(
+                    "SearchParameter registry refresh failed; serving the stale cache: {e}"
+                ),
+                Err(e) => tracing::warn!("SearchParameter registry refresh task failed: {e}"),
+            }
+        }
+    });
+}
+
+/// Postgres flavor of the periodic registry refresh (#235).
+#[cfg(feature = "postgres")]
+fn spawn_postgres_search_param_refresh(
+    backend: Arc<helios_persistence::backends::postgres::PostgresBackend>,
+    config: &ServerConfig,
+) {
+    let ttl = config.search_param_cache_ttl;
+    if ttl == 0 {
+        return;
+    }
+    let interval = std::time::Duration::from_secs(ttl);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match backend.refresh_stored_search_parameters().await {
+                Ok(stored) => {
+                    tracing::debug!(stored, "SearchParameter registry refreshed from storage")
+                }
+                Err(e) => tracing::warn!(
+                    "SearchParameter registry refresh failed; serving the stale cache: {e}"
+                ),
+            }
+        }
+    });
+}
+
+/// MongoDB flavor of the periodic registry refresh (#235).
+#[cfg(feature = "mongodb")]
+fn spawn_mongodb_search_param_refresh(backend: Arc<MongoBackend>, config: &ServerConfig) {
+    let ttl = config.search_param_cache_ttl;
+    if ttl == 0 {
+        return;
+    }
+    let interval = std::time::Duration::from_secs(ttl);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match backend.refresh_stored_search_parameters().await {
+                Ok(stored) => {
+                    tracing::debug!(stored, "SearchParameter registry refreshed from storage")
+                }
+                Err(e) => tracing::warn!(
+                    "SearchParameter registry refresh failed; serving the stale cache: {e}"
+                ),
+            }
+        }
+    });
+}
+
 /// Starts the server with SQLite-only backend.
 #[cfg(feature = "sqlite")]
 async fn start_sqlite(
@@ -851,6 +955,8 @@ async fn start_sqlite(
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
+    seed_search_parameters(&*backend, &config).await;
+    spawn_sqlite_search_param_refresh(backend.clone(), &config);
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own). Cheap: the SQLite backend
     // shares one connection pool behind the Arc.
@@ -1380,6 +1486,9 @@ async fn start_sqlite_elasticsearch(
     sqlite.set_search_offloaded(true);
     let sqlite = Arc::new(sqlite);
     info!("SQLite search indexing disabled (offloaded to Elasticsearch)");
+    // Seed/refresh on the primary; the ES backend shares its registry Arc.
+    seed_search_parameters(&*sqlite, &config).await;
+    spawn_sqlite_search_param_refresh(sqlite.clone(), &config);
 
     // Build Elasticsearch configuration from server config
     let es_nodes: Vec<String> = config
@@ -1545,6 +1654,8 @@ async fn start_postgres(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    seed_search_parameters(&*backend, &config).await;
+    spawn_postgres_search_param_refresh(backend.clone(), &config);
 
     let serve_audit_state = audit_state.clone();
     // The PostgreSQL backend also hosts the per-user settings store, so it always
@@ -1626,6 +1737,9 @@ async fn start_postgres_elasticsearch(
     backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
+    // Seed/refresh on the primary; the ES backend shares its registry Arc.
+    seed_search_parameters(&*pg, &config).await;
+    spawn_postgres_search_param_refresh(pg.clone(), &config);
 
     // Build Elasticsearch configuration from server config
     let es_nodes: Vec<String> = config
@@ -1793,6 +1907,9 @@ async fn start_mongodb_elasticsearch(
     // Offload search to Elasticsearch
     let mongo = Arc::new(backend);
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
+    // Seed/refresh on the primary; the ES backend shares its registry Arc.
+    seed_search_parameters(&*mongo, &config).await;
+    spawn_mongodb_search_param_refresh(mongo.clone(), &config);
 
     // Build Elasticsearch configuration from server config
     let es_nodes: Vec<String> = config

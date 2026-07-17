@@ -497,6 +497,16 @@ impl PostgresBackend {
 
     /// Loads SearchParameter resources stored in the database into the registry.
     async fn load_stored_search_parameters(&self) -> StorageResult<usize> {
+        self.refresh_stored_search_parameters().await
+    }
+
+    /// Rebuilds the registry's `Stored` parameters from what the database
+    /// currently holds, returning how many are registered afterwards.
+    ///
+    /// TTL-cache refresh (#235): rows are fetched and parsed before the
+    /// (sync) write lock is taken, and on any read error the registry is left
+    /// untouched — stale-serve rather than losing search resolution.
+    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
         let client = self.get_client().await?;
@@ -515,18 +525,14 @@ impl PostgresBackend {
             })?;
 
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut registry = self.search_registry.write();
-        let mut count = 0;
-
+        let mut definitions = Vec::new();
         for row in rows {
             let data: serde_json::Value = row.get(0);
             match loader.parse_resource(&data) {
                 Ok(mut def) => {
                     if def.status == SearchParameterStatus::Active {
                         def.source = SearchParameterSource::Stored;
-                        if registry.register(def).is_ok() {
-                            count += 1;
-                        }
+                        definitions.push(def);
                     }
                 }
                 Err(e) => {
@@ -535,6 +541,15 @@ impl PostgresBackend {
             }
         }
 
+        let mut registry = self.search_registry.write();
+        registry.unregister_source(SearchParameterSource::Stored);
+        let mut count = 0;
+        for def in definitions {
+            match registry.register(def) {
+                Ok(()) => count += 1,
+                Err(e) => tracing::warn!("Stored SearchParameter not registered: {}", e),
+            }
+        }
         Ok(count)
     }
 
