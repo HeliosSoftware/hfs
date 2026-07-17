@@ -41,6 +41,14 @@ use crate::state::AppState;
 /// Upper bound on the serialized settings document, applied to every write.
 /// The document lives in a single row/document on every backend, so an
 /// unbounded blob degrades reads of *all* of a user's settings at once.
+///
+/// The only other limit on this endpoint is the server-wide request body limit,
+/// which is sized for FHIR Bundles (10 MB by default, and routinely raised) — far
+/// too generous for a document that holds a theme name and a few recent queries.
+/// A settings document is read back on *every* page load and, on backends whose
+/// write is a read-modify-write, re-read and re-written on every retry, so an
+/// oversized one is paid for repeatedly. 256 KiB is orders of magnitude more than
+/// any legitimate document needs.
 const MAX_SETTINGS_DOCUMENT_BYTES: usize = 256 * 1024;
 
 /// Upper bound on saved queries per resource type under the `savedQueries`
@@ -213,13 +221,13 @@ fn validate_settings_document(document: &Value) -> RestResult<()> {
 /// the active backend does not provide one.
 ///
 /// The per-user settings store is implemented by every standalone *primary*
-/// backend that offers the required read-modify-write + monotonic-version
-/// primitives: SQLite, PostgreSQL, and MongoDB. It is intentionally unavailable
-/// on backends that are not a transactional primary FHIR store — notably the
-/// S3 object store (whose recommended role is archival and whose concurrency /
-/// version story differs; tracked in issue #199) and Elasticsearch (search-only,
-/// never a standalone primary). The message names the supported backends so an
-/// operator on an unsupported one gets an explained `501` rather than a bare one.
+/// backend: SQLite, PostgreSQL, and MongoDB provide the read-modify-write +
+/// monotonic-version primitives directly (a transaction or a version-conditioned
+/// update), and S3 reaches the same semantics with a compare-and-swap over
+/// conditional `PutObject`. It is intentionally unavailable only on
+/// Elasticsearch, which is search-only and never a standalone primary. The
+/// message names the supported backends so an operator on an unsupported one gets
+/// an explained `501` rather than a bare one.
 fn settings_store<S>(state: &AppState<S>) -> RestResult<&Arc<dyn SettingsStore>>
 where
     S: ResourceStorage + Send + Sync,
@@ -227,17 +235,29 @@ where
     state
         .settings_store()
         .ok_or_else(|| RestError::NotImplemented {
-            feature: "per-user settings (supported on the SQLite, PostgreSQL, and MongoDB \
-                      backends; not available on the S3 or Elasticsearch backends)"
+            feature: "per-user settings (supported on the SQLite, PostgreSQL, MongoDB, and S3 \
+                      backends; not available on Elasticsearch, which is search-only and never \
+                      a standalone primary store)"
                 .to_string(),
         })
 }
 
-/// Parses and validates a request body as a JSON object.
+/// Parses and validates a request body as a JSON object of a sane size.
 fn parse_object_body(body: &Bytes) -> RestResult<Value> {
     if body.is_empty() {
         return Err(RestError::BadRequest {
             message: "Request body must be a JSON object".to_string(),
+        });
+    }
+    // A cheap guard on the wire size so an oversized blob is refused before it
+    // is parsed. `validate_settings_document` re-checks the *post-merge*
+    // document, which a small PATCH can still push over the cap.
+    if body.len() > MAX_SETTINGS_DOCUMENT_BYTES {
+        return Err(RestError::PayloadTooLarge {
+            message: format!(
+                "Settings document is {} bytes; the limit is {MAX_SETTINGS_DOCUMENT_BYTES}",
+                body.len()
+            ),
         });
     }
     let value: Value = serde_json::from_slice(body).map_err(|e| RestError::BadRequest {
@@ -297,6 +317,31 @@ mod tests {
     fn parse_object_body_rejects_non_object() {
         let err = parse_object_body(&Bytes::from_static(b"[1, 2, 3]")).unwrap_err();
         assert!(matches!(err, RestError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn parse_object_body_rejects_oversized_document() {
+        let bloated = format!(
+            r#"{{"junk":"{}"}}"#,
+            "x".repeat(MAX_SETTINGS_DOCUMENT_BYTES)
+        );
+        let err = parse_object_body(&Bytes::from(bloated)).unwrap_err();
+        match err {
+            RestError::PayloadTooLarge { message } => assert!(
+                message.contains("the limit is"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected a payload-too-large error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_object_body_accepts_document_at_the_limit() {
+        // Exactly at the limit is fine; only *over* it is rejected.
+        let padding = MAX_SETTINGS_DOCUMENT_BYTES - r#"{"k":""}"#.len();
+        let doc = format!(r#"{{"k":"{}"}}"#, "x".repeat(padding));
+        assert_eq!(doc.len(), MAX_SETTINGS_DOCUMENT_BYTES);
+        assert!(parse_object_body(&Bytes::from(doc)).unwrap().is_object());
     }
 
     #[test]

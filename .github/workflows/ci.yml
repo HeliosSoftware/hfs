@@ -75,6 +75,40 @@ jobs:
         run: |
           cargo test --workspace --all-features
 
+      # The MinIO suite as a whole stays opt-in (RUN_MINIO_S3_TESTS) because the
+      # full S3 resource-CRUD tests are slow. The per-user settings subset is not
+      # optional: it is the only thing that proves a *real* S3-compatible store
+      # actually enforces the `If-Match` / `If-None-Match` preconditions that the
+      # settings store's optimistic locking is built on. The mock proves our
+      # logic; only this proves the contract. A store that silently ignored those
+      # preconditions would turn every concurrent settings write into a lost
+      # update, and nothing else in CI would notice.
+      #
+      # Same package and feature set as the step above, so the build is already
+      # cached and this costs only the MinIO container. The harness stamps
+      # `github.run_id`, so `cleanup-test-containers` reaps it.
+      #
+      # This step must not be able to pass vacuously. `cargo test` exits 0 when a
+      # name filter matches nothing ("0 passed; N filtered out"), and the suite
+      # self-skips when RUN_MINIO_S3_TESTS is unset — so a renamed test or a
+      # typo'd variable would leave a green step that verified nothing at all.
+      # Assert the expected number of tests actually ran.
+      - name: Verify S3 conditional writes against MinIO (per-user settings)
+        env:
+          RUN_MINIO_S3_TESTS: "1"
+          EXPECTED_MINIO_SETTINGS_TESTS: "4"
+        run: |
+          set -o pipefail
+          cargo test -p helios-persistence --all-features \
+            --test minio_s3_tests test_minio_settings -- --nocapture \
+            | tee minio-settings.log
+          if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then
+            echo "::error::Expected ${EXPECTED_MINIO_SETTINGS_TESTS} MinIO settings tests to run and pass."
+            echo "::error::A green step here with a different count means the conditional-write"
+            echo "::error::contract was NOT verified. Check the test names and RUN_MINIO_S3_TESTS."
+            exit 1
+          fi
+
   cleanup-test-containers:
     name: Cleanup Test Containers
     runs-on: [self-hosted, Linux]
