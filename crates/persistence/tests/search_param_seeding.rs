@@ -119,6 +119,76 @@ async fn seeding_completes_a_partial_set_without_clobbering() {
     );
 }
 
+/// A resource already stored under a spec bundle id is reported `existing`,
+/// not re-created or clobbered — the idempotency the seeder relies on.
+#[tokio::test]
+async fn seeding_reports_existing_for_present_spec_ids() {
+    let backend = create_backend();
+    let data_dir = workspace_data_dir();
+
+    // Pre-create a resource under a spec bundle id (`Patient-name`) but with a
+    // distinct body, so the seed pass hits the `AlreadyExists` branch for it.
+    let preexisting = json!({
+        "resourceType": "SearchParameter",
+        "id": "Patient-name",
+        "url": "http://acme.health/fhir/SearchParameter/preexisting-patient-name",
+        "name": "preexisting",
+        "status": "active",
+        "code": "name",
+        "base": ["Patient"],
+        "type": "string",
+        "expression": "Patient.name"
+    });
+    backend
+        .create(
+            &tenant("default"),
+            "SearchParameter",
+            preexisting,
+            FhirVersion::R4,
+        )
+        .await
+        .expect("pre-create under a spec id");
+
+    let outcome = seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default")
+        .await
+        .expect("seed over a present spec id");
+    assert!(
+        outcome.existing >= 1,
+        "the pre-existing spec id should be reported existing, got {outcome:?}"
+    );
+    assert_eq!(outcome.failed, 0);
+
+    // The pre-existing resource was left untouched (create never clobbers).
+    let read = backend
+        .read(&tenant("default"), "SearchParameter", "Patient-name")
+        .await
+        .expect("read pre-existing")
+        .expect("still present");
+    assert_eq!(
+        read.content()["url"],
+        json!("http://acme.health/fhir/SearchParameter/preexisting-patient-name")
+    );
+}
+
+/// With no spec bundle in the data directory, seeding still writes the embedded
+/// fallback parameters (a supported minimal deployment).
+#[tokio::test]
+async fn seeding_with_missing_spec_bundle_seeds_only_fallbacks() {
+    let backend = create_backend();
+    let empty_dir = tempfile::tempdir().expect("temp data dir");
+
+    let outcome =
+        seed_spec_search_parameters(&backend, FhirVersion::R4, empty_dir.path(), "default")
+            .await
+            .expect("seed fallbacks");
+    // Only the handful of embedded fallbacks are seeded — no spec set.
+    assert!(
+        outcome.created > 0 && outcome.created <= 9,
+        "expected only embedded fallbacks, got {outcome:?}"
+    );
+    assert_eq!(outcome.failed, 0);
+}
+
 /// The TTL-cache contract: a SearchParameter present in storage (written by
 /// this node or a cluster-mate) enters search resolution on a refresh, and a
 /// deleted one leaves it.

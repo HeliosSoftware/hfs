@@ -81,6 +81,20 @@ where
                 .map(SearchParameterLoader::definition_to_fhir_resource),
         );
     }
+    // Drop entries whose id duplicates one already in the set. Several embedded
+    // fallbacks (`Resource-id`, `Library-url`, …) share an id with a spec
+    // bundle entry, so their `create` always fails `AlreadyExists` and never
+    // adds a row. Left in, they inflate `resources.len()` above the count the
+    // store can ever reach, so `present >= resources.len()` below would never
+    // hold and every boot would re-run the full create scan instead of taking
+    // the single-`count` fast path.
+    let mut seen_ids = std::collections::HashSet::new();
+    resources.retain(|resource| {
+        resource
+            .get("id")
+            .and_then(|id| id.as_str())
+            .is_none_or(|id| seen_ids.insert(id.to_string()))
+    });
     if resources.is_empty() {
         return Ok(SeedOutcome {
             created: 0,
