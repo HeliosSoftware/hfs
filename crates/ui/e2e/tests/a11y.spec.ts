@@ -21,16 +21,7 @@ for (const theme of THEMES) {
       await page.goto(route, { waitUntil: "networkidle" });
       await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
 
-      const { violations } = await new AxeBuilder({ page })
-        .withTags(WCAG)
-        // color-contrast is disabled for now: the muted palette (section
-        // headers, "coming soon" items, the version string) comes straight from
-        // the Figma design, and raising its contrast is a design-level change
-        // across both themes — tracked as a follow-up, not gated here. Every
-        // other WCAG rule (aria-prohibited-attr, target-size, names/roles,
-        // landmarks, …) is a hard failure.
-        .disableRules(["color-contrast"])
-        .analyze();
+      const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
 
       // Name the offenders in the failure message so a red run is actionable.
       const summary = violations

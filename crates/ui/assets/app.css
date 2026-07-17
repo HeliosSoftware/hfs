@@ -46,7 +46,8 @@
   /* Text */
   --text: #101010;
   --text-strong: #000000;
-  --muted: #a0a0a0;
+  /* WCAG 2.2 AA: muted body text must clear 4.5:1 on the light surfaces. */
+  --muted: #6a6a6a;
   /* Embossed dividers: dark line + light line underneath */
   --divider: #e4e4e4;
   --divider-glint: #ffffff;
@@ -56,6 +57,14 @@
   --grid-line: #dcdcdc;
   --accent: #33b8ff;
   --accent-soft: rgb(51 184 255 / 15%);
+  /* A darker cast of the accent for the one place the light celeste can't work:
+     a solid fill behind white text (primary buttons). #33b8ff carries white at
+     only 2.2:1; this clears 4.5:1 while staying in the brand's blue. */
+  --accent-strong: #0f77bd;
+  /* Accent *text* on the soft-accent tint (the selected rail item). Needs the
+     opposite move per theme — darker on the light tint, lighter on the dark —
+     so it is theme-specific (see the dark block). */
+  --accent-text: #0a5f96;
   /* Menu panel input */
   --input-bg: #f5f5f5;
 
@@ -72,6 +81,11 @@
   --surface-border: rgb(255 255 255 / 8%);
   --text: #ffffff;
   --text-strong: #ffffff;
+  /* On the dark surfaces the lighter grey already clears 4.5:1; keep it (the
+     light-theme override above would be too dark to read here). */
+  --muted: #a0a0a0;
+  /* Selected-item accent text on the dark tint: lighter, to clear 4.5:1. */
+  --accent-text: #7cc9ff;
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
   --outline: #353535;
@@ -1169,12 +1183,12 @@ button.pill {
   height: 36px;
   padding: 0 18px;
   color: #ffffff;
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
 }
 
 .btn--primary:hover {
-  background: var(--accent);
+  background: var(--accent-strong);
   filter: brightness(1.08);
 }
 
@@ -3534,7 +3548,7 @@ body.has-nav-panel {
 
 .nav-panel__item--on {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
   font-weight: 600;
 }
 
@@ -3542,7 +3556,7 @@ body.has-nav-panel {
   font-size: 12px;
   color: var(--muted);
 }
-.nav-panel__item--on .count { color: var(--accent); }
+.nav-panel__item--on .count { color: var(--accent-text); }
 
 /* The Create-new primary button (blue + plus), top-right of the page head. */
 .resources-create {

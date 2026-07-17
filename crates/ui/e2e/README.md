@@ -41,9 +41,5 @@ npx playwright show-report       # last HTML report
 Locally the suite reuses a server you already have up on that port; set `CI=1`
 to force a fresh boot.
 
-## Known follow-up
-
-`color-contrast` is disabled in the axe gate: the muted palette (section
-headers, "coming soon" items, the version string) is the Figma design, and
-raising its contrast is a design-level change across both themes — tracked
-separately. Every other WCAG rule is a hard failure.
+The axe gate is strict: **every** WCAG 2.2 AA rule (including `color-contrast`,
+in both themes) is a hard failure.
