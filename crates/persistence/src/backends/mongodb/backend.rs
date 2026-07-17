@@ -362,7 +362,94 @@ impl MongoBackend {
     /// Initializes the MongoDB schema/index bootstrap for this backend.
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
-        schema::initialize_schema_async(&db).await
+        schema::initialize_schema_async(&db).await?;
+
+        // Restore stored (POSTed) SearchParameters into the registry, as the
+        // SQLite and Postgres backends do; previously they only re-entered
+        // the registry through the write hooks, i.e. never after a restart.
+        let stored_count = self.refresh_stored_search_parameters().await?;
+        if stored_count > 0 {
+            tracing::info!(
+                "Loaded {} stored SearchParameters from database",
+                stored_count
+            );
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the registry's `Stored` parameters from what the database
+    /// currently holds, returning how many are registered afterwards.
+    ///
+    /// TTL-cache refresh (#235): documents are fetched and parsed before the
+    /// (sync) write lock is taken, and on any read error the registry is left
+    /// untouched — stale-serve rather than losing search resolution.
+    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
+        use mongodb::bson::{Document, doc};
+
+        let db = self.get_database().await?;
+        let collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let mut cursor = collection
+            .find(doc! { "resource_type": "SearchParameter", "is_deleted": false })
+            .await
+            .map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message: format!("Failed to query SearchParameters: {}", e),
+                    source: None,
+                })
+            })?;
+
+        let loader = SearchParameterLoader::new(self.config.fhir_version);
+        let mut definitions = Vec::new();
+        while cursor.advance().await.map_err(|e| {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("SearchParameter cursor advance: {}", e),
+                source: None,
+            })
+        })? {
+            let document = match cursor.deserialize_current() {
+                Ok(document) => document,
+                Err(e) => {
+                    tracing::warn!("Failed to read SearchParameter document: {}", e);
+                    continue;
+                }
+            };
+            let Ok(payload) = document.get_document("data") else {
+                tracing::warn!("Stored SearchParameter document has no data payload");
+                continue;
+            };
+            let json = match super::storage::document_to_value(payload) {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::warn!("Failed to convert SearchParameter payload: {}", e);
+                    continue;
+                }
+            };
+            match loader.parse_resource(&json) {
+                Ok(mut def) => {
+                    if def.status == SearchParameterStatus::Active {
+                        def.source = SearchParameterSource::Stored;
+                        definitions.push(def);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse stored SearchParameter: {}", e);
+                }
+            }
+        }
+
+        let mut registry = self.search_registry.write();
+        registry.unregister_source(SearchParameterSource::Stored);
+        let mut count = 0;
+        for def in definitions {
+            match registry.register(def) {
+                Ok(()) => count += 1,
+                Err(e) => tracing::warn!("Stored SearchParameter not registered: {}", e),
+            }
+        }
+        Ok(count)
     }
 
     /// Creates a MongoDB client from backend configuration.

@@ -726,6 +726,14 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
+    /// Seconds between refreshes of the in-memory SearchParameter registry
+    /// from storage (#235). In a cluster, a SearchParameter POSTed to one
+    /// node becomes visible to the others within this interval: deliberate
+    /// eventual consistency, trading propagation latency for not hitting the
+    /// database on every search. `0` disables the periodic refresh.
+    #[arg(long, env = "HFS_SEARCH_PARAM_CACHE_TTL", default_value = "3600")]
+    pub search_param_cache_ttl: u64,
+
     /// Default page size for search results.
     #[arg(long, env = "HFS_DEFAULT_PAGE_SIZE", default_value = "20")]
     pub default_page_size: usize,
@@ -891,6 +899,7 @@ impl Default for ServerConfig {
             require_if_match: false,
             default_fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
+            search_param_cache_ttl: 3600,
             default_page_size: 20,
             max_page_size: 1000,
             storage_backend: "sqlite".to_string(),
@@ -1011,6 +1020,7 @@ impl ServerConfig {
             require_if_match: false,
             default_fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
+            search_param_cache_ttl: 3600,
             default_page_size: 10,
             max_page_size: 100,
             storage_backend: "sqlite".to_string(),

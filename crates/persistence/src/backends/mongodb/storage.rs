@@ -75,7 +75,7 @@ fn value_to_document(value: &Value) -> StorageResult<Document> {
     }
 }
 
-fn document_to_value(doc: &Document) -> StorageResult<Value> {
+pub(super) fn document_to_value(doc: &Document) -> StorageResult<Value> {
     bson::from_bson::<Value>(Bson::Document(doc.clone()))
         .map_err(|e| serialization_error(format!("Failed to deserialize resource: {}", e)))
 }

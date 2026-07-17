@@ -150,12 +150,12 @@ impl ConceptMapOperations for PostgresTerminologyBackend {
         let mut groups: Vec<serde_json::Value> = Vec::new();
 
         for (system_url, codes) in &by_system {
+            let sql = format!(
+                "SELECT id FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
             let id_rows = client
-                .query(
-                    "SELECT id FROM code_systems WHERE url = $1 \
-                     ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                    &[system_url],
-                )
+                .query(&sql, &[system_url])
                 .await
                 .map_err(|e| HtsError::StorageError(format!("DB error: {e}")))?;
 

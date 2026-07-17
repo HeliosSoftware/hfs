@@ -26,7 +26,7 @@ cassandra = ["dep:cdrs-tokio", "dep:cdrs-tokio-helpers-derive"]
 mongodb = ["dep:mongodb"]
 neo4j = ["dep:neo4rs"]
 elasticsearch = ["dep:elasticsearch"]
-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:sha2"]
 
 # Configuration advisor binary
 advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
@@ -51,7 +51,10 @@ serde_json.workspace = true
 chrono.workspace = true
 thiserror = "2"
 async-trait = "0.1"
-tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+# "time" backs the backoff between compare-and-swap retries in the settings
+# stores. It was previously reaching us only through feature unification with
+# other dependencies; declare the feature we actually use rather than rely on that.
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -93,6 +96,8 @@ elasticsearch = { version = "8.15.0-alpha.1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
+# Hashes the per-user settings key into an opaque, fixed-length S3 object name.
+sha2 = { version = "0.10", optional = true }
 
 # Audit event integration.
 #
