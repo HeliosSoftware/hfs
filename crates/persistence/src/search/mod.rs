@@ -90,6 +90,9 @@ pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
     ReindexableStorage, ResourcePage,
 };
-pub use seeder::{SeedOutcome, seed_spec_search_parameters};
+pub use seeder::{
+    SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,
+    seed_tenant_conformance,
+};
 pub use text_fold::fold_text;
 pub use writer::SearchIndexWriter;

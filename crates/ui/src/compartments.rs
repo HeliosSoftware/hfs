@@ -1,24 +1,29 @@
 //! Read model for the Compartment viewer & tester (`/ui/compartments`, #237).
 //!
-//! Definition metadata comes from the vendored FHIR spec
-//! `CompartmentDefinition` JSONs under `data/compartments/` — the same files
-//! `helios-fhir-gen` compiles into `get_compartment_params()`. The membership
-//! chips and the tester, however, resolve through
+//! Definition metadata comes from the server's own `GET /CompartmentDefinition`
+//! endpoint (primary storage is the source of truth — the server seeds the spec
+//! definitions there at startup), fetched over HTTP via a [`ConformanceSource`].
+//! The membership chips and the tester, however, resolve through
 //! [`helios_fhir::compartment_params`] — the codegen'd table the REST
 //! compartment handler actually consults — so what this screen shows is what
-//! the server does. A parity test asserts the vendored copies match the
-//! codegen output.
+//! the server does. The seeded bundle is kept in step with the codegen table by
+//! a parity test in `helios_fhir::compartment::loader`.
 //!
-//! The spec's `compartmentdefinition-questionnaire.json` (no `code`, zero
-//! `resource` entries) is not vendored; see open question 4 on the issue.
+//! The spec's degenerate `questionnaire` compartment (no `code`, zero
+//! `resource` entries) is excluded from the shipped bundle.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use helios_fhir::FhirVersion;
 use serde::Deserialize;
 
-/// One vendored CompartmentDefinition, trimmed to the fields the screen shows.
-#[derive(Deserialize)]
+use crate::conformance::ConformanceSource;
+
+/// One CompartmentDefinition, trimmed to the fields the screen shows. Fetched
+/// from the server's `GET /CompartmentDefinition` endpoint (storage is the
+/// source of truth) and deserialized here.
+#[derive(Deserialize, Clone)]
 pub(crate) struct CompartmentDef {
     pub url: String,
     #[serde(default)]
@@ -35,7 +40,7 @@ pub(crate) struct CompartmentDef {
     pub resource: Vec<CompartmentResource>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub(crate) struct CompartmentResource {
     pub code: String,
     /// Only the parity test reads this; the live view resolves linking
@@ -45,56 +50,59 @@ pub(crate) struct CompartmentResource {
     pub param: Vec<String>,
 }
 
-macro_rules! defs {
-    ($dir:literal $(, $extra:literal)?) => {
-        &[
-            include_str!(concat!("../data/compartments/", $dir, "/compartmentdefinition-device.json")),
-            include_str!(concat!("../data/compartments/", $dir, "/compartmentdefinition-encounter.json")),
-            include_str!(concat!("../data/compartments/", $dir, "/compartmentdefinition-patient.json")),
-            include_str!(concat!("../data/compartments/", $dir, "/compartmentdefinition-practitioner.json")),
-            include_str!(concat!("../data/compartments/", $dir, "/compartmentdefinition-relatedperson.json")),
-            $(include_str!(concat!("../data/compartments/", $dir, "/", $extra)),)?
-        ]
-    };
+/// Lazily-fetched, process-lifetime CompartmentDefinitions, one set per enabled
+/// FHIR version. Fetched from the server's own endpoint once per version and
+/// cached; sorted by compartment code.
+pub(crate) struct CompartmentCatalog {
+    source: Arc<dyn ConformanceSource>,
+    cache: Mutex<HashMap<FhirVersion, Arc<Vec<CompartmentDef>>>>,
 }
 
-fn raw_definitions(version: FhirVersion) -> &'static [&'static str] {
-    match version {
-        #[cfg(feature = "R4")]
-        FhirVersion::R4 => defs!("r4"),
-        #[cfg(feature = "R4B")]
-        FhirVersion::R4B => defs!("r4b"),
-        #[cfg(feature = "R5")]
-        FhirVersion::R5 => defs!("r5"),
-        #[cfg(feature = "R6")]
-        FhirVersion::R6 => defs!("r6", "compartmentdefinition-group.json"),
+impl CompartmentCatalog {
+    pub fn new(source: Arc<dyn ConformanceSource>) -> Self {
+        CompartmentCatalog {
+            source,
+            cache: Mutex::new(HashMap::new()),
+        }
     }
-}
 
-/// Parsed definitions for a version, sorted by compartment code. Parsed once
-/// per process; the underlying JSON is compiled in.
-pub(crate) fn definitions(version: FhirVersion) -> &'static [CompartmentDef] {
-    static CACHE: OnceLock<Vec<(FhirVersion, Vec<CompartmentDef>)>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| {
-        crate::search_params::enabled_versions()
-            .into_iter()
-            .map(|v| {
-                let mut defs: Vec<CompartmentDef> = raw_definitions(v)
-                    .iter()
-                    .map(|raw| {
-                        serde_json::from_str(raw).expect("vendored CompartmentDefinition parses")
-                    })
-                    .collect();
-                defs.sort_by(|a, b| a.code.cmp(&b.code));
-                (v, defs)
-            })
-            .collect()
-    });
-    cache
-        .iter()
-        .find(|(v, _)| *v == version)
-        .map(|(_, defs)| defs.as_slice())
-        .unwrap_or(&[])
+    /// The definitions for a version, fetching on first use. A failed fetch
+    /// yields an empty set (the page degrades to a warning).
+    pub async fn definitions(&self, version: FhirVersion) -> Arc<Vec<CompartmentDef>> {
+        if let Some(cached) = self.cache.lock().expect("compartment lock").get(&version) {
+            return cached.clone();
+        }
+        let mut defs: Vec<CompartmentDef> = match self
+            .source
+            .fetch("CompartmentDefinition", version)
+            .await
+        {
+            Ok(resources) => resources
+                .into_iter()
+                .filter_map(|r| serde_json::from_value(r).ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        defs.sort_by(|a, b| a.code.cmp(&b.code));
+        let built = Arc::new(defs);
+        self.cache
+            .lock()
+            .expect("compartment lock")
+            .entry(version)
+            .or_insert_with(|| built.clone())
+            .clone()
+    }
+
+    /// Every resource type of the version, from the first CompartmentDefinition
+    /// (each enumerates the full set — 145 in R4). Used by the queries page's
+    /// resource picker rail.
+    pub async fn resource_type_names(&self, version: FhirVersion) -> Vec<String> {
+        self.definitions(version)
+            .await
+            .first()
+            .map(|def| def.resource.iter().map(|r| r.code.clone()).collect())
+            .unwrap_or_default()
+    }
 }
 
 impl CompartmentDef {
@@ -106,16 +114,6 @@ impl CompartmentDef {
             .filter(|r| !runtime_params(version, &self.code, &r.code).is_empty())
             .count()
     }
-}
-
-/// Every resource type of the version, from the spec CompartmentDefinitions
-/// (each enumerates the full set — 145 in R4). Used by the queries page's
-/// resource picker rail.
-pub(crate) fn resource_type_names(version: FhirVersion) -> Vec<String> {
-    definitions(version)
-        .first()
-        .map(|def| def.resource.iter().map(|r| r.code.clone()).collect())
-        .unwrap_or_default()
 }
 
 /// The codegen'd linking parameters the compartment handler consults.
@@ -302,7 +300,7 @@ impl TesterView {
 pub(crate) struct CmpView {
     pub versions: Vec<crate::search_params::VersionLink>,
     pub rail: Vec<CmpRailItem>,
-    pub def: &'static CompartmentDef,
+    pub def: CompartmentDef,
     pub tab: &'static str,
     pub tabs: Vec<CmpTab>,
     pub member_filters: Vec<CmpFilter>,
@@ -347,9 +345,8 @@ impl CmpQuery {
 
 /// Assembles the whole page state. Returns `None` when the build has no
 /// FHIR version enabled with compartment data (not a supported target).
-pub(crate) fn build_view(query: &CmpQuery) -> Option<CmpView> {
+pub(crate) fn build_view(query: &CmpQuery, defs: &[CompartmentDef]) -> Option<CmpView> {
     let version = query.fhir_version();
-    let defs = definitions(version);
     let def = query
         .def
         .as_deref()
@@ -453,7 +450,7 @@ pub(crate) fn build_view(query: &CmpQuery) -> Option<CmpView> {
     Some(CmpView {
         versions,
         rail,
-        def,
+        def: def.clone(),
         tab: tab.key(),
         tabs,
         member_filters,
@@ -519,25 +516,39 @@ mod tests {
     #[cfg(feature = "R4")]
     const R4: FhirVersion = FhirVersion::R4;
 
-    /// The vendored spec JSONs must say exactly what the codegen'd runtime
-    /// table says — every (compartment, type) slot, every version. This is
-    /// the guard against the vendored copies drifting from
-    /// `crates/fhir-gen/resources/`.
+    /// The R4 compartment definitions, parsed from the shipped `data/` bundle
+    /// exactly as an HTTP fetch would deliver them — keeps the test offline.
+    #[cfg(feature = "R4")]
+    fn r4_defs() -> Vec<CompartmentDef> {
+        let raw = std::fs::read_to_string("../../data/compartment-definitions-r4.json")
+            .expect("r4 compartment bundle in ../../data");
+        let bundle: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mut defs: Vec<CompartmentDef> = bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| serde_json::from_value(e["resource"].clone()).unwrap())
+            .collect();
+        defs.sort_by(|a, b| a.code.cmp(&b.code));
+        defs
+    }
+
+    /// The shipped `data/` bundle must say exactly what the codegen'd runtime
+    /// table says — every (compartment, type) slot. (All-version parity is
+    /// additionally guarded in `helios_fhir::compartment::loader`.)
+    #[cfg(feature = "R4")]
     #[test]
-    fn vendored_definitions_match_codegen_table() {
-        for version in crate::search_params::enabled_versions() {
-            for def in definitions(version) {
-                for resource in &def.resource {
-                    let runtime = runtime_params(version, &def.code, &resource.code);
-                    assert_eq!(
-                        runtime,
-                        resource.param.as_slice(),
-                        "{} compartment {} / {}",
-                        version.as_str(),
-                        def.code,
-                        resource.code
-                    );
-                }
+    fn data_bundle_matches_codegen_table() {
+        for def in &r4_defs() {
+            for resource in &def.resource {
+                let runtime = runtime_params(R4, &def.code, &resource.code);
+                assert_eq!(
+                    runtime,
+                    resource.param.as_slice(),
+                    "R4 compartment {} / {}",
+                    def.code,
+                    resource.code
+                );
             }
         }
     }
@@ -545,12 +556,13 @@ mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn r4_ships_the_five_spec_compartments() {
-        let codes: Vec<&str> = definitions(R4).iter().map(|d| d.code.as_str()).collect();
+        let defs = r4_defs();
+        let codes: Vec<&str> = defs.iter().map(|d| d.code.as_str()).collect();
         assert_eq!(
             codes,
             ["Device", "Encounter", "Patient", "Practitioner", "RelatedPerson"]
         );
-        let patient = definitions(R4).iter().find(|d| d.code == "Patient").unwrap();
+        let patient = defs.iter().find(|d| d.code == "Patient").unwrap();
         assert_eq!(patient.resource.len(), 145);
         assert_eq!(patient.member_count(R4), 66);
     }
@@ -558,7 +570,8 @@ mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn tester_resolves_membership_like_the_handler() {
-        let patient = definitions(R4).iter().find(|d| d.code == "Patient").unwrap();
+        let defs = r4_defs();
+        let patient = defs.iter().find(|d| d.code == "Patient").unwrap();
 
         match run_tester(R4, patient, "example", "Observation") {
             TesterOutcome::Member {
@@ -592,7 +605,8 @@ mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn tester_reports_the_self_definition_case() {
-        let encounter = definitions(R4).iter().find(|d| d.code == "Encounter").unwrap();
+        let defs = r4_defs();
+        let encounter = defs.iter().find(|d| d.code == "Encounter").unwrap();
         match run_tester(R4, encounter, "e1", "Encounter") {
             TesterOutcome::Member {
                 self_def,
@@ -609,7 +623,7 @@ mod tests {
     #[cfg(feature = "R4")]
     #[test]
     fn view_defaults_to_patient_and_builds_all_tabs() {
-        let view = build_view(&CmpQuery::default()).expect("view builds");
+        let view = build_view(&CmpQuery::default(), &r4_defs()).expect("view builds");
         assert_eq!(view.def.code, "Patient");
         assert_eq!(view.rail.len(), 5);
         assert_eq!(view.tabs.len(), 3);

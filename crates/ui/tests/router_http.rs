@@ -12,11 +12,18 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn app() -> Router {
-    helios_ui::mount(
+    // Inject an offline conformance source seeded from the shipped `data/`
+    // bundles, so the SearchParameter/CompartmentDefinition viewers render real
+    // data without a running server (production fetches these over HTTP).
+    helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
         Some(std::path::PathBuf::from("../../data")),
         None,
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
     )
 }
 
@@ -119,11 +126,13 @@ async fn embedded_assets_are_served() {
 async fn non_ui_paths_fall_through_to_the_fhir_app() {
     // Stand-in for the FHIR REST router: proves /ui never shadows it.
     let fhir_app = Router::new().route("/Patient", get(|| async { "fhir handled" }));
-    let response = helios_ui::mount(
+    let response = helios_ui::mount_with_conformance_source(
         fhir_app,
         "9.9.9",
         Some(std::path::PathBuf::from("../../data")),
         None,
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
     )
     .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
         .await

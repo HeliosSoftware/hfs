@@ -141,3 +141,122 @@ where
     );
     Ok(outcome)
 }
+
+/// Seeds one tenant with both spec conformance resource sets — SearchParameters
+/// (#235) and CompartmentDefinitions (#237/#238) — from `data_dir`. Best-effort
+/// per set: an error in one is logged and does not block the other. Returns the
+/// combined outcome. Idempotent; safe to call at startup and on tenant
+/// provisioning.
+pub async fn seed_tenant_conformance<S>(
+    storage: &S,
+    fhir_version: FhirVersion,
+    data_dir: &Path,
+    tenant_id: &str,
+) -> SeedOutcome
+where
+    S: ResourceStorage + ?Sized,
+{
+    let mut total = SeedOutcome {
+        created: 0,
+        existing: 0,
+        failed: 0,
+    };
+    let mut add = |r: StorageResult<SeedOutcome>, kind: &str| match r {
+        Ok(o) => {
+            total.created += o.created;
+            total.existing += o.existing;
+            total.failed += o.failed;
+        }
+        Err(e) => tracing::warn!(tenant = %tenant_id, "{kind} seeding failed: {e}"),
+    };
+    add(
+        seed_spec_search_parameters(storage, fhir_version, data_dir, tenant_id).await,
+        "SearchParameter",
+    );
+    add(
+        seed_spec_compartment_definitions(storage, fhir_version, data_dir, tenant_id).await,
+        "CompartmentDefinition",
+    );
+    total
+}
+
+/// Seeds `storage` with the spec CompartmentDefinition bundle for
+/// `fhir_version`, under `tenant_id`.
+///
+/// The compartment analogue of [`seed_spec_search_parameters`]: storage — not
+/// the codegen'd membership table — is what `GET /CompartmentDefinition` and
+/// the web UI read. Compartment *search* membership is unaffected (it still
+/// resolves through `helios_fhir::get_compartment_params`); these stored copies
+/// exist only for API discovery.
+///
+/// Same idempotency contract: every definition carries its bundle id
+/// (`patient`, `encounter`, …), so a concurrent second writer's `create` fails
+/// `AlreadyExists` and is treated as already-seeded; existing resources are
+/// never clobbered. When the tenant already holds at least the bundle's count,
+/// the pass short-circuits to a single `count`.
+pub async fn seed_spec_compartment_definitions<S>(
+    storage: &S,
+    fhir_version: FhirVersion,
+    data_dir: &Path,
+    tenant_id: &str,
+) -> StorageResult<SeedOutcome>
+where
+    S: ResourceStorage + ?Sized,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
+    let loader = helios_fhir::compartment::CompartmentDefinitionLoader::new(fhir_version);
+
+    let resources: Vec<Value> = match loader.load_spec_resources(data_dir) {
+        Ok(resources) => resources,
+        Err(e) => {
+            // No bundle is a supported minimal deployment; nothing to seed.
+            tracing::warn!("CompartmentDefinition seeding: no spec bundle loaded: {e}");
+            Vec::new()
+        }
+    };
+    if resources.is_empty() {
+        return Ok(SeedOutcome {
+            created: 0,
+            existing: 0,
+            failed: 0,
+        });
+    }
+
+    let present = storage.count(&tenant, Some("CompartmentDefinition")).await?;
+    if present as usize >= resources.len() {
+        return Ok(SeedOutcome {
+            created: 0,
+            existing: resources.len(),
+            failed: 0,
+        });
+    }
+
+    let mut outcome = SeedOutcome {
+        created: 0,
+        existing: 0,
+        failed: 0,
+    };
+    for resource in resources {
+        match storage
+            .create(&tenant, "CompartmentDefinition", resource, fhir_version)
+            .await
+        {
+            Ok(_) => outcome.created += 1,
+            Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {
+                outcome.existing += 1;
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                tracing::warn!("CompartmentDefinition seeding: create failed: {e}");
+            }
+        }
+    }
+    tracing::info!(
+        created = outcome.created,
+        existing = outcome.existing,
+        failed = outcome.failed,
+        tenant = %tenant_id,
+        "Seeded spec CompartmentDefinitions into storage"
+    );
+    Ok(outcome)
+}
