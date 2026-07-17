@@ -243,6 +243,7 @@
 
   /* ---- history tab: version rail + diff (#236) ------------------------- */
 
+  var historyEl = document.getElementById("resource-history");
   var versionsHost = document.getElementById("resource-history-versions");
   var fromSel = document.getElementById("resource-history-from");
   var toSel = document.getElementById("resource-history-to");
@@ -282,7 +283,7 @@
       var row = document.createElement("button");
       row.type = "button";
       row.className = "history-version" + (i === 0 ? " history-version--current" : "");
-      row.textContent = "v" + v.versionId + (i === 0 ? " · " + messages.msgCurrent : "");
+      row.textContent = "v" + v.versionId + (i === 0 ? " · " + historyEl.dataset.msgCurrent : "");
       row.addEventListener("click", function () { toSel.value = String(i); fromSel.value = String(Math.min(i + 1, versions.length - 1)); renderDiff(); });
       versionsHost.appendChild(row);
       fromSel.appendChild(opt(i, "v" + v.versionId));
