@@ -3409,8 +3409,18 @@ button.filter-rail__item {
   font-size: 13px;
 }
 .modal__status:not(:empty) { padding: 10px 18px; }
-.modal__status--ok { color: #1a7f37; }
-.modal__status--error { color: #cf222e; }
+.modal__status--ok {
+  color: #1a7f37;
+  font-weight: 600;
+  background: #eaf6ec;
+}
+.modal__status--error {
+  color: #cf222e;
+  font-weight: 600;
+  background: #ffebe9;
+  border-top: 1px solid #ffcdca;
+  border-bottom: 1px solid #ffcdca;
+}
 
 .modal__body {
   padding: 16px 18px;

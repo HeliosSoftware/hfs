@@ -217,25 +217,33 @@
 
   document.getElementById("resource-save").addEventListener("click", function () {
     var doc = currentDoc();
-    if (!doc) { say(messages.msgLoadError, "error"); return; }
-    var creating = !current.id;
-    var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
-    fetch(url, {
-      method: creating ? "POST" : "PUT",
-      headers: { "Content-Type": "application/fhir+json", Accept: "application/fhir+json" },
-      body: JSON.stringify(doc),
-    })
-      .then(function (r) {
-        return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+    if (!doc) { say(messages.msgSaveInvalid, "error"); return; }
+    // Validate the exact document being saved by re-rendering it (this also
+    // commits a raw edit and leaves raw mode), then block the save if the
+    // editor reports any issue — an invalid resource must not be persisted.
+    editorSend("", { doc: JSON.stringify(doc) }).then(function () {
+      var form = editorBody.querySelector("#editor-form");
+      var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
+      if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
+      var creating = !current.id;
+      var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
+      fetch(url, {
+        method: creating ? "POST" : "PUT",
+        headers: { "Content-Type": "application/fhir+json", Accept: "application/fhir+json" },
+        body: JSON.stringify(doc),
       })
-      .then(function (res) {
-        if (!res.ok) { say(outcomeText(res.body), "error"); return; }
-        current.id = res.body.id || current.id;
-        subject.textContent = current.type + "/" + current.id;
-        say(messages.msgSaved, "ok");
-        renderEditor(res.body);
-      })
-      .catch(function () { say(messages.msgLoadError, "error"); });
+        .then(function (r) {
+          return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+        })
+        .then(function (res) {
+          if (!res.ok) { say(outcomeText(res.body), "error"); return; }
+          current.id = res.body.id || current.id;
+          subject.textContent = current.type + "/" + current.id;
+          say(messages.msgSaved, "ok");
+          renderEditor(res.body);
+        })
+        .catch(function () { say(messages.msgLoadError, "error"); });
+    });
   });
 
   document.getElementById("resource-delete").addEventListener("click", function () {
