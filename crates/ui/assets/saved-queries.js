@@ -415,9 +415,21 @@
     railList.addEventListener("click", function (event) {
       var item = event.target.closest("[data-rail-type]");
       if (!item || !urlInput) return;
-      urlInput.value = "GET /" + item.dataset.railType;
+      var type = item.dataset.railType;
+      // Keep the Resources page's selected type in sync so "Create new" targets
+      // it and the rail shows which type is active. (Both absent on the Saved
+      // Queries page, where this rail only drives the search.)
+      var panel = document.getElementById("resources");
+      if (panel) panel.dataset.selectedType = type;
+      var createBtn = document.getElementById("resource-create");
+      if (createBtn) createBtn.dataset.type = type;
+      railList.querySelectorAll(".nav-panel__item--on").forEach(function (el) {
+        el.classList.remove("nav-panel__item--on");
+      });
+      item.classList.add("nav-panel__item--on");
+      urlInput.value = "GET /" + type;
       renderBuilder();
-      runSearch("/" + encodeURIComponent(item.dataset.railType), false);
+      runSearch("/" + encodeURIComponent(type), false);
     });
   }
   if (railFilter && railList) {
