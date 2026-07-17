@@ -422,14 +422,19 @@ jobs:
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"
 
+          # The sqlite backend warms its in-process hierarchy/closure caches
+          # over the full terminology corpus before it serves, which in a debug
+          # build on a loaded self-hosted runner can take a few minutes — well
+          # past a 60s window. Wait up to 300s so a healthy-but-slow cold start
+          # is not mistaken for a failure; a genuine hang still trips the bound.
           echo "Waiting for HTS to become ready..."
-          for i in $(seq 1 30); do
+          for i in $(seq 1 150); do
             if curl -sf "http://localhost:${{ matrix.port }}/health" > /dev/null 2>&1; then
               echo "HTS ready after $((i * 2))s"
               break
             fi
-            if [ "$i" -eq 30 ]; then
-              echo "ERROR: HTS did not start within 60s"
+            if [ "$i" -eq 150 ]; then
+              echo "ERROR: HTS did not start within 300s"
               cat "/tmp/hts-bench-${{ matrix.backend }}.log"
               exit 1
             fi
