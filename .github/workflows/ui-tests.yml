@@ -70,10 +70,15 @@ jobs:
         working-directory: crates/ui/e2e
         run: npm ci
 
+      # No `--with-deps`: it shells out to sudo apt-get, which the self-hosted
+      # runner can't do non-interactively. Just fetch the pinned browser; the
+      # runner is expected to carry the shared libraries. If a runner lacks
+      # them, run this job in the `mcr.microsoft.com/playwright` container
+      # instead (issue #249's noted fallback), which ships browsers + deps.
       - name: Install Playwright browser
         if: hashFiles('crates/ui/e2e/package.json') != ''
         working-directory: crates/ui/e2e
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
 
       - name: Run browser suite
         if: hashFiles('crates/ui/e2e/package.json') != ''
