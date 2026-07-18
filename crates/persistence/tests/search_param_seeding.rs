@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::search::seed_spec_search_parameters;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use serde_json::json;
@@ -189,15 +189,12 @@ async fn seeding_with_missing_spec_bundle_seeds_only_fallbacks() {
     assert_eq!(outcome.failed, 0);
 }
 
-/// The TTL-cache contract: a SearchParameter present in storage (written by
-/// this node or a cluster-mate) enters search resolution on a refresh, and a
-/// deleted one leaves it.
+/// Per-tenant registries: a tenant's stored SearchParameter enters that
+/// tenant's search resolution (write-hook invalidation + lazy rebuild), stays
+/// isolated from other tenants, and leaves on delete.
 #[tokio::test]
-async fn refresh_rebuilds_stored_parameters_from_storage() {
-    use helios_persistence::search::registry::SearchParameterSource;
-
+async fn stored_parameters_are_per_tenant() {
     let backend = create_backend();
-    let registry = backend.search_registry();
 
     let nickname = json!({
         "resourceType": "SearchParameter",
@@ -210,44 +207,78 @@ async fn refresh_rebuilds_stored_parameters_from_storage() {
         "type": "string",
         "expression": "Patient.name.where(use='nickname').given"
     });
+
+    // Before it exists, no tenant resolves it — but every tenant has the base.
+    let acme1 = tenant("acme1");
+    let acme2 = tenant("acme2");
+    assert!(
+        backend
+            .search_param_registry(&acme1)
+            .read()
+            .get_param("Patient", "nickname")
+            .is_none()
+    );
+    assert!(
+        backend
+            .search_param_registry(&acme1)
+            .read()
+            .get_param("Patient", "name")
+            .is_some(),
+        "shared base param present"
+    );
+
+    // POST it under acme1 only.
     backend
-        .create(
-            &tenant("default"),
-            "SearchParameter",
-            nickname,
-            FhirVersion::R4,
-        )
+        .create(&acme1, "SearchParameter", nickname, FhirVersion::R4)
         .await
         .expect("store the parameter");
 
-    // Simulate a freshly booted cluster-mate: its storage holds the parameter
-    // but its registry has never seen it (drop the write-hook registration).
-    registry
-        .write()
-        .unregister_source(SearchParameterSource::Stored);
+    // Visible to acme1, isolated from acme2.
     assert!(
-        registry.read().get_param("Patient", "nickname").is_none(),
-        "not visible before the refresh"
+        backend
+            .search_param_registry(&acme1)
+            .read()
+            .get_param("Patient", "nickname")
+            .is_some(),
+        "visible to acme1 after the write"
+    );
+    assert!(
+        backend
+            .search_param_registry(&acme2)
+            .read()
+            .get_param("Patient", "nickname")
+            .is_none(),
+        "isolated from acme2"
     );
 
-    let stored = backend.refresh_stored_search_parameters().expect("refresh");
-    assert_eq!(stored, 1);
-    assert!(
-        registry.read().get_param("Patient", "nickname").is_some(),
-        "visible after the refresh"
-    );
-
-    // Delete it from storage; the next refresh drops it from resolution.
+    // Delete removes it from acme1's resolution.
     backend
-        .delete(&tenant("default"), "SearchParameter", "acme-nickname")
+        .delete(&acme1, "SearchParameter", "acme-nickname")
         .await
         .expect("delete the parameter");
-    let stored = backend
-        .refresh_stored_search_parameters()
-        .expect("refresh after delete");
-    assert_eq!(stored, 0);
     assert!(
-        registry.read().get_param("Patient", "nickname").is_none(),
-        "gone after the refresh"
+        backend
+            .search_param_registry(&acme1)
+            .read()
+            .get_param("Patient", "nickname")
+            .is_none(),
+        "gone from acme1 after delete"
     );
+}
+
+/// The TTL-cache contract: `refresh_stored_search_parameters` drops the cached
+/// per-tenant registries so the next access re-reads storage (how a
+/// cluster-mate's write becomes visible).
+#[tokio::test]
+async fn refresh_invalidates_cached_tenant_registries() {
+    let backend = create_backend();
+
+    // Warm two tenants' caches.
+    let _ = backend.search_param_registry(&tenant("acme1"));
+    let _ = backend.search_param_registry(&tenant("acme2"));
+    assert_eq!(backend.tenant_registries().cached_tenant_count(), 2);
+
+    let cleared = backend.refresh_stored_search_parameters().expect("refresh");
+    assert_eq!(cleared, 2, "refresh reports the tenants it invalidated");
+    assert_eq!(backend.tenant_registries().cached_tenant_count(), 0);
 }

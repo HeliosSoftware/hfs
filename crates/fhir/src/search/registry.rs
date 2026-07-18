@@ -241,6 +241,12 @@ impl SearchParameterDefinition {
 /// unregistering, or re-statusing a *shadowed* parameter therefore never
 /// changes which definition answers a query, and removing the winner
 /// re-points the slot at the next candidate instead of leaving a hole (#239).
+///
+/// `Clone` is cheap: both indexes hold `Arc<SearchParameterDefinition>`, so a
+/// clone copies the HashMap structure and bumps Arc refcounts — the definitions
+/// themselves are shared. The per-tenant registry container relies on this to
+/// materialize a tenant's registry as `base.clone()` plus that tenant's overlay.
+#[derive(Clone)]
 pub struct SearchParameterRegistry {
     /// Parameters indexed by (resource_type, param_code). Each slot holds the
     /// candidates in descending precedence order; the first entry wins.

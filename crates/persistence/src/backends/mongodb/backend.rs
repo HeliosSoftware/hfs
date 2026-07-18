@@ -15,7 +15,16 @@ use helios_fhir::FhirVersion;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
-use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParameterRegistry};
+use crate::search::{
+    SearchParameterDefinition, SearchParameterExtractor, SearchParameterLoader,
+    SearchParameterRegistry, TenantSearchRegistries,
+};
+
+/// Sync in-memory cache of each tenant's stored active SearchParameter
+/// definitions. MongoDB queries are async but the registry loader must be sync,
+/// so async paths populate this map and the loader reads it.
+type StoredByTenant =
+    Arc<RwLock<std::collections::HashMap<String, Vec<SearchParameterDefinition>>>>;
 
 use super::schema;
 
@@ -76,17 +85,17 @@ pub struct MongoBackend {
     /// `Arc` so the in-DB SOF runner can share the same pooled client (it is
     /// constructed from `&self` but outlives the borrow).
     client: Arc<OnceCell<Client>>,
-    /// Search parameter registry (in-memory cache of active parameters).
-    search_registry: Arc<RwLock<SearchParameterRegistry>>,
-    /// Extractor for deriving searchable values from resources.
-    search_extractor: Arc<SearchParameterExtractor>,
+    /// Per-tenant search parameter registries (shared base + per-tenant overlay).
+    registries: Arc<TenantSearchRegistries>,
+    /// Sync cache of each tenant's stored params, read by the registry loader.
+    stored_by_tenant: StoredByTenant,
 }
 
 impl Debug for MongoBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MongoBackend")
             .field("config", &self.config)
-            .field("search_registry_len", &self.search_registry.read().len())
+            .field("base_registry_len", &self.registries.base().read().len())
             .finish_non_exhaustive()
     }
 }
@@ -163,15 +172,25 @@ impl MongoBackend {
     pub fn new(config: MongoBackendConfig) -> StorageResult<Self> {
         Self::validate_connection_string(&config.connection_string)?;
 
-        let search_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
-        Self::initialize_search_registry(&search_registry, &config);
-        let search_extractor = Arc::new(SearchParameterExtractor::new(search_registry.clone()));
+        let stored_by_tenant: StoredByTenant =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let loader_cache = stored_by_tenant.clone();
+        let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
+            move |tenant_id: &str| {
+                loader_cache
+                    .read()
+                    .get(tenant_id)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+        )));
+        Self::initialize_search_registry(registries.base(), &config);
 
         Ok(Self {
             config,
             client: Arc::new(OnceCell::new()),
-            search_registry,
-            search_extractor,
+            registries,
+            stored_by_tenant,
         })
     }
 
@@ -346,27 +365,16 @@ impl MongoBackend {
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;
-
-        // Restore stored (POSTed) SearchParameters into the registry, as the
-        // SQLite and Postgres backends do; previously they only re-entered
-        // the registry through the write hooks, i.e. never after a restart.
-        let stored_count = self.refresh_stored_search_parameters().await?;
-        if stored_count > 0 {
-            tracing::info!(
-                "Loaded {} stored SearchParameters from database",
-                stored_count
-            );
-        }
+        // Populate the per-tenant stored-param cache so the registries can build
+        // each tenant's overlay lazily.
+        self.reload_stored_cache().await?;
         Ok(())
     }
 
-    /// Rebuilds the registry's `Stored` parameters from what the database
-    /// currently holds, returning how many are registered afterwards.
-    ///
-    /// TTL-cache refresh (#235): documents are fetched and parsed before the
-    /// (sync) write lock is taken, and on any read error the registry is left
-    /// untouched — stale-serve rather than losing search resolution.
-    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+    /// Reloads every tenant's stored active SearchParameters into the sync
+    /// `stored_by_tenant` cache (grouped by tenant), then drops the cached
+    /// per-tenant registries so they rebuild against the fresh overlay.
+    pub(crate) async fn reload_stored_cache(&self) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
         use mongodb::bson::{Document, doc};
 
@@ -384,7 +392,9 @@ impl MongoBackend {
             })?;
 
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut definitions = Vec::new();
+        let mut by_tenant: std::collections::HashMap<String, Vec<SearchParameterDefinition>> =
+            std::collections::HashMap::new();
+        let mut count = 0;
         while cursor.advance().await.map_err(|e| {
             crate::error::StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_string(),
@@ -399,6 +409,10 @@ impl MongoBackend {
                     continue;
                 }
             };
+            let tenant_id = document
+                .get_str("tenant_id")
+                .unwrap_or("default")
+                .to_string();
             let Ok(payload) = document.get_document("data") else {
                 tracing::warn!("Stored SearchParameter document has no data payload");
                 continue;
@@ -410,29 +424,24 @@ impl MongoBackend {
                     continue;
                 }
             };
-            match loader.parse_resource(&json) {
-                Ok(mut def) => {
-                    if def.status == SearchParameterStatus::Active {
-                        def.source = SearchParameterSource::Stored;
-                        definitions.push(def);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse stored SearchParameter: {}", e);
+            if let Ok(mut def) = loader.parse_resource(&json) {
+                if def.status == SearchParameterStatus::Active {
+                    def.source = SearchParameterSource::Stored;
+                    by_tenant.entry(tenant_id).or_default().push(def);
+                    count += 1;
                 }
             }
         }
 
-        let mut registry = self.search_registry.write();
-        registry.unregister_source(SearchParameterSource::Stored);
-        let mut count = 0;
-        for def in definitions {
-            match registry.register(def) {
-                Ok(()) => count += 1,
-                Err(e) => tracing::warn!("Stored SearchParameter not registered: {}", e),
-            }
-        }
+        *self.stored_by_tenant.write() = by_tenant;
+        self.registries.invalidate_all();
         Ok(count)
+    }
+
+    /// TTL-cache refresh (#235): reload the stored-param cache and drop the
+    /// cached per-tenant registries.
+    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+        self.reload_stored_cache().await
     }
 
     /// Creates a MongoDB client from backend configuration.
@@ -462,14 +471,24 @@ impl MongoBackend {
         &self.config
     }
 
-    /// Returns a reference to the search parameter registry.
-    pub fn search_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
-        &self.search_registry
+    /// The per-tenant registry container (shared with a co-located ES backend).
+    pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
+        &self.registries
     }
 
-    /// Returns a reference to the search parameter extractor.
-    pub fn search_extractor(&self) -> &Arc<SearchParameterExtractor> {
-        &self.search_extractor
+    /// The shared base registry (embedded + spec + custom), tenant-independent.
+    pub(crate) fn base_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.base()
+    }
+
+    /// The registry for a tenant (base + that tenant's stored overlay).
+    pub(crate) fn tenant_registry(&self, tenant_id: &str) -> Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.for_tenant(tenant_id)
+    }
+
+    /// A value extractor over a tenant's registry.
+    pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
+        SearchParameterExtractor::new(self.tenant_registry(tenant_id))
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.
@@ -659,11 +678,11 @@ impl SearchCapabilityProvider for MongoBackend {
         resource_type: &str,
     ) -> Option<ResourceSearchCapabilities> {
         let params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params(resource_type)
         };
         let common_params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params("Resource")
         };
         if params.is_empty() && common_params.is_empty() {

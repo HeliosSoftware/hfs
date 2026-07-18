@@ -46,7 +46,7 @@ use helios_rest::OperationsBundle;
 use helios_rest::create_app_with_auth_bulk_settings_and_ops;
 
 use helios_persistence::core::PurgableStorage;
-use helios_persistence::search::{ReindexOperation, SearchParameterExtractor};
+use helios_persistence::search::ReindexOperation;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
@@ -510,7 +510,7 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
-    seed_search_parameters(&*backend, &config).await;
+    seed_conformance_resources(&*backend, &config).await;
     spawn_mongodb_search_param_refresh(backend.clone(), &config);
     let serve_audit_state = audit_state.clone();
 
@@ -534,7 +534,7 @@ async fn start_mongodb(
 
     let ops = standalone_ops(
         backend.clone(),
-        backend.search_extractor().clone(),
+        backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -575,7 +575,32 @@ async fn serve(
     ui_tenants: Option<Arc<dyn ResourceStorage>>,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "ui", not(feature = "headless")))]
-    let app = helios_ui::mount(app, env!("CARGO_PKG_VERSION"), ui_tenants.clone());
+    let app = {
+        // The UI reads SearchParameter/CompartmentDefinition from the server's
+        // own FHIR API over HTTP. It calls itself on the loopback address, with
+        // the configured outbound service token (HFS_OUTBOUND_BEARER_TOKEN) when
+        // set, or no credentials when auth is disabled.
+        //
+        // TODO(service-token): when auth is enabled, this relies on an operator
+        // provisioning a valid, non-expiring bearer via HFS_OUTBOUND_BEARER_TOKEN;
+        // without one the self-call is rejected and the conformance pages degrade
+        // to a warning. The follow-up is to mint a short-lived, auto-refreshed
+        // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
+        // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
+        // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
+        // configured from HFS_UI_* client credentials.
+        let self_base_url = format!("http://127.0.0.1:{}", config.port);
+        let outbound_auth = AuthConfig::from_env().outbound_provider();
+        helios_ui::mount(
+            app,
+            env!("CARGO_PKG_VERSION"),
+            config.data_dir.clone(),
+            ui_tenants.clone(),
+            self_base_url,
+            outbound_auth,
+            config.default_fhir_version,
+        )
+    };
     #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
     let _ = &ui_tenants;
 
@@ -854,28 +879,72 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Seeds storage with the spec SearchParameters under the default tenant
-/// (#235), making storage the source of truth the registry caches over. A
-/// failed seed logs and boots anyway: the in-memory registry still resolves
-/// searches; only API discovery of the spec parameters is degraded.
-async fn seed_search_parameters<S>(backend: &S, config: &ServerConfig)
+/// Seeds storage with the spec SearchParameters (#235) and CompartmentDefinitions
+/// (#237/#238), making primary storage the source of truth the FHIR routes and
+/// web UI read. Seeds every provisioned tenant — auto-provisioning the default
+/// tenant first — so `GET /SearchParameter` and `GET /CompartmentDefinition` are
+/// populated for each valid tenant. A failed seed logs and boots anyway: the
+/// in-memory registry still resolves searches; only API discovery is degraded.
+async fn seed_conformance_resources<S>(backend: &S, config: &ServerConfig)
 where
     S: helios_persistence::core::ResourceStorage,
 {
+    if !config.seed_conformance {
+        return;
+    }
+
     let data_dir = config
         .data_dir
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-    if let Err(e) = helios_persistence::search::seed_spec_search_parameters(
-        backend,
-        config.default_fhir_version,
-        &data_dir,
-        &config.default_tenant,
-    )
-    .await
-    {
-        tracing::warn!("SearchParameter seeding failed: {e}");
+
+    for tenant_id in provisioned_tenants(backend, config).await {
+        helios_persistence::search::seed_tenant_conformance(
+            backend,
+            config.default_fhir_version,
+            &data_dir,
+            &tenant_id,
+        )
+        .await;
     }
+}
+
+/// The set of tenants to seed: the auto-provisioned default tenant plus every
+/// registered tenant. Tenants are provisioned-only, so this is the complete set
+/// of valid tenants. Falls back to just the default tenant when the backend has
+/// no tenant registry (e.g. a minimal deployment).
+async fn provisioned_tenants<S>(backend: &S, config: &ServerConfig) -> Vec<String>
+where
+    S: helios_persistence::core::ResourceStorage,
+{
+    let default = config.default_tenant.clone();
+    if !backend.supports_tenant_registry() {
+        return vec![default];
+    }
+
+    // Auto-provision the default tenant so it is a valid, enumerable tenant
+    // (single-tenant and unauthenticated deployments read it).
+    match backend.get_tenant(&default).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(e) = backend.register_tenant(&default, None).await {
+                tracing::warn!(tenant = %default, "Auto-provisioning default tenant failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!(tenant = %default, "Checking default tenant failed: {e}"),
+    }
+
+    let mut ids: Vec<String> = match backend.list_tenants().await {
+        Ok(records) => records.into_iter().map(|r| r.id).collect(),
+        Err(e) => {
+            tracing::warn!("Listing tenants for seeding failed: {e}");
+            Vec::new()
+        }
+    };
+    if !ids.iter().any(|id| id == &default) {
+        ids.push(default);
+    }
+    ids
 }
 
 /// Spawns the periodic registry refresh from storage for the SQLite backend
@@ -966,7 +1035,7 @@ async fn start_sqlite(
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
-    seed_search_parameters(&*backend, &config).await;
+    seed_conformance_resources(&*backend, &config).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own). Cheap: the SQLite backend
@@ -980,7 +1049,7 @@ async fn start_sqlite(
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
         backend.clone(),
-        backend.search_extractor().clone(),
+        backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -1163,7 +1232,7 @@ fn wire_reindex(
 /// (SQLite, PostgreSQL, MongoDB), where resources and search index share a home.
 fn standalone_ops<B>(
     backend: Arc<B>,
-    extractor: Arc<SearchParameterExtractor>,
+    registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
 ) -> OperationsBundle
 where
@@ -1172,7 +1241,7 @@ where
     OperationsBundle {
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::new(backend, extractor),
+            ReindexOperation::new(backend, registries),
             audit_state,
         )),
     }
@@ -1192,13 +1261,13 @@ fn composite_ops(
     composite: Arc<helios_persistence::composite::CompositeStorage>,
     source: Arc<dyn helios_persistence::search::ReindexSource>,
     targets: Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
-    extractor: Arc<SearchParameterExtractor>,
+    registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::with_parts(source, targets, extractor),
+            ReindexOperation::with_parts(source, targets, registries),
             audit_state,
         )),
     }
@@ -1498,7 +1567,7 @@ async fn start_sqlite_elasticsearch(
     let sqlite = Arc::new(sqlite);
     info!("SQLite search indexing disabled (offloaded to Elasticsearch)");
     // Seed/refresh on the primary; the ES backend shares its registry Arc.
-    seed_search_parameters(&*sqlite, &config).await;
+    seed_conformance_resources(&*sqlite, &config).await;
     spawn_sqlite_search_param_refresh(sqlite.clone(), &config);
 
     // Build Elasticsearch configuration from server config
@@ -1543,7 +1612,7 @@ async fn start_sqlite_elasticsearch(
     // Create ES backend sharing SQLite's search parameter registry
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,
-        sqlite.search_registry().clone(),
+        sqlite.tenant_registries().clone(),
     )?);
 
     // Build composite configuration
@@ -1607,7 +1676,7 @@ async fn start_sqlite_elasticsearch(
         composite.clone(),
         sqlite.clone(),
         vec![sqlite.clone(), es.clone()],
-        sqlite.search_extractor().clone(),
+        sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -1665,7 +1734,7 @@ async fn start_postgres(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
-    seed_search_parameters(&*backend, &config).await;
+    seed_conformance_resources(&*backend, &config).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
 
     let serve_audit_state = audit_state.clone();
@@ -1676,7 +1745,7 @@ async fn start_postgres(
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
         backend.clone(),
-        backend.search_extractor().clone(),
+        backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -1749,7 +1818,7 @@ async fn start_postgres_elasticsearch(
     let pg = Arc::new(backend);
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Seed/refresh on the primary; the ES backend shares its registry Arc.
-    seed_search_parameters(&*pg, &config).await;
+    seed_conformance_resources(&*pg, &config).await;
     spawn_postgres_search_param_refresh(pg.clone(), &config);
 
     // Build Elasticsearch configuration from server config
@@ -1794,7 +1863,7 @@ async fn start_postgres_elasticsearch(
     // Create ES backend sharing PostgreSQL's search parameter registry
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,
-        pg.search_registry().clone(),
+        pg.tenant_registries().clone(),
     )?);
 
     // Build composite configuration
@@ -1854,7 +1923,7 @@ async fn start_postgres_elasticsearch(
         composite.clone(),
         pg.clone(),
         vec![pg.clone(), es.clone()],
-        pg.search_extractor().clone(),
+        pg.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -1919,7 +1988,7 @@ async fn start_mongodb_elasticsearch(
     let mongo = Arc::new(backend);
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
     // Seed/refresh on the primary; the ES backend shares its registry Arc.
-    seed_search_parameters(&*mongo, &config).await;
+    seed_conformance_resources(&*mongo, &config).await;
     spawn_mongodb_search_param_refresh(mongo.clone(), &config);
 
     // Build Elasticsearch configuration from server config
@@ -1964,7 +2033,7 @@ async fn start_mongodb_elasticsearch(
     // Create ES backend sharing MongoDB's search parameter registry
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,
-        mongo.search_registry().clone(),
+        mongo.tenant_registries().clone(),
     )?);
 
     // Build composite configuration
@@ -2035,7 +2104,7 @@ async fn start_mongodb_elasticsearch(
         composite.clone(),
         mongo.clone(),
         vec![mongo.clone(), es.clone()],
-        mongo.search_extractor().clone(),
+        mongo.tenant_registries().clone(),
         audit_state.as_ref(),
     );
     let app = create_app_with_auth_bulk_settings_and_ops(
@@ -2190,13 +2259,15 @@ async fn start_s3(
 fn build_search_registry(
     fhir_version: helios_fhir::FhirVersion,
     data_dir: Option<&std::path::Path>,
-) -> std::sync::Arc<parking_lot::RwLock<helios_persistence::search::SearchParameterRegistry>> {
-    use helios_persistence::search::{SearchParameterLoader, SearchParameterRegistry};
+) -> std::sync::Arc<helios_persistence::search::TenantSearchRegistries> {
+    use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
 
-    let registry = std::sync::Arc::new(parking_lot::RwLock::new(SearchParameterRegistry::new()));
+    // S3 stores no SearchParameter resources of its own, so tenants have no
+    // stored overlay — every tenant sees the shared base (embedded + spec).
+    let registries = std::sync::Arc::new(TenantSearchRegistries::base_only());
     let loader = SearchParameterLoader::new(fhir_version);
     {
-        let mut reg = registry.write();
+        let mut reg = registries.base().write();
         if let Ok(params) = loader.load_embedded() {
             for p in params {
                 let _ = reg.register(p);
@@ -2209,7 +2280,7 @@ fn build_search_registry(
             }
         }
     }
-    registry
+    registries
 }
 
 /// Starts the server with S3 + Elasticsearch composite backend.
@@ -2379,7 +2450,7 @@ async fn start_s3_elasticsearch(
         composite.clone(),
         s3.clone(),
         vec![es.clone()],
-        es.search_extractor().clone(),
+        es.tenant_registries().clone(),
         audit_state.as_ref(),
     );
 
@@ -2505,9 +2576,10 @@ mod tests {
     #[test]
     fn test_build_search_registry_returns_registry() {
         use helios_fhir::FhirVersion;
-        let registry = build_search_registry(FhirVersion::R4, None);
-        // Registry should be a valid Arc<RwLock<…>> and not panic when read.
-        let _guard = registry.read();
+        let registries = build_search_registry(FhirVersion::R4, None);
+        // The container's base should be populated and every tenant resolves.
+        assert!(!registries.base().read().is_empty());
+        let _guard = registries.for_tenant("default");
     }
 
     #[cfg(feature = "mongodb")]

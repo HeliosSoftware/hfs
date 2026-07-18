@@ -333,8 +333,10 @@ impl SearchProvider for ElasticsearchBackend {
 
     fn search_param_registry(
         &self,
-    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        self.search_registry()
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registries()
+            .for_tenant(tenant.tenant_id().as_str())
     }
 
     fn supports_contained_search(&self) -> bool {
