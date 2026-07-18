@@ -14,7 +14,7 @@
   <subject>
     <reference/>
   </subject>
-  <!--  example product is contraindicated with Hepatic disease  -->
+  <!-- example product is contraindicated with Hepatic disease -->
   <contraindication>
     <diseaseSymptomProcedure>
       <concept>

@@ -32,14 +32,14 @@
   <operationalStatus value="on"/>
   <color>
     <coding>
-      <system value="http://hl7.org/fhir/color-names"/>
+      <system value="http://terminology.hl7.org/CodeSystem/color-names"/>
       <code value="blue"/>
       <display value="Blue"/>
     </coding>
   </color>
   <category>
     <coding>
-      <system value="http://hl7.org/fhir/metric-category"/>
+      <system value="http://terminology.hl7.org/CodeSystem/metric-category"/>
       <code value="measurement"/>
       <display value="Measurement"/>
     </coding>
@@ -54,7 +54,7 @@
     <type/>
     <state>
       <coding>
-        <system value="http://hl7.org/fhir/metric-calibration-state"/>
+        <system value="http://terminology.hl7.org/CodeSystem/metric-calibration-state"/>
         <code value="calibrated"/>
         <display value="Calibrated"/>
       </coding>

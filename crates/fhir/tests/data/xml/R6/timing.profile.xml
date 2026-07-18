@@ -106,9 +106,9 @@
             <br/>
             <span style="font-style: italic" title="tim-10">+ Rule: If there's a timeOfDay, there cannot be a when, or vice versa</span>
             <br/>
-            <span style="font-style: italic" title="tim-11">+ Rule: Only use startOffset when frequency is present and &gt; 1</span>
+            <span style="font-style: italic" title="tim-11">+ Rule: Only use startOffset when frequency is present and &gt; 1, and period is present</span>
             <br/>
-            <span style="font-style: italic" title="tim-12">+ Rule: Only use endOffset when frequency is present and &gt; 1</span>
+            <span style="font-style: italic" title="tim-12">+ Rule: Only use endOffset when frequency is present and &gt; 1, and period is present</span>
             <br/>
           </td>
         </tr>
@@ -402,7 +402,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <a href="datatypes-definitions.html#Timing.repeat.startOffset" title="Timing.repeat.startOffset : Indicates that the events within the period of the repeat do not start until startOffset has elapsed.">startOffset</a>
+            <a href="datatypes-definitions.html#Timing.repeat.startOffset" title="Timing.repeat.startOffset : Indicates that the events within the period of the repeat do not start until startOffset has elapsed. Requires both frequency and period to define the repeat cycle. See notes: Periods with start or end offsets.">startOffset</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -422,7 +422,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <a href="datatypes-definitions.html#Timing.repeat.endOffset" title="Timing.repeat.endOffset : Indicates that the events within the period of the repeat step endOffset before the period ends.">endOffset</a>
+            <a href="datatypes-definitions.html#Timing.repeat.endOffset" title="Timing.repeat.endOffset : Indicates that the events within the period of the repeat stop endOffset before the period ends. Requires both frequency and period to define the repeat cycle. See notes: Periods with start or end offsets.">endOffset</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -431,7 +431,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#SimpleQuantity">SimpleQuantity</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Events within the repeat period step once endOffset before the end of the period
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Events within the repeat period stop once endOffset before the end of the period
             <br/>
           </td>
         </tr>
@@ -572,7 +572,7 @@
   <name value="Timing"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -709,6 +709,14 @@
     </element>
     <element id="Timing.modifierExtension">
       <path value="Timing.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -858,15 +866,15 @@
       <constraint>
         <key value="tim-11"/>
         <severity value="error"/>
-        <human value="Only use startOffset when frequency is present and &gt; 1"/>
-        <expression value="startOffset.exists() implies (frequency &gt; 1)"/>
+        <human value="Only use startOffset when frequency is present and &gt; 1, and period is present"/>
+        <expression value="startOffset.exists() implies (frequency &gt; 1 and period.exists())"/>
         <source value="http://hl7.org/fhir/StructureDefinition/Timing"/>
       </constraint>
       <constraint>
         <key value="tim-12"/>
         <severity value="error"/>
-        <human value="Only use endOffset when frequency is present and &gt; 1"/>
-        <expression value="endOffset.exists() implies (frequency &gt; 1)"/>
+        <human value="Only use endOffset when frequency is present and &gt; 1, and period is present"/>
+        <expression value="endOffset.exists() implies (frequency &gt; 1 and period.exists())"/>
         <source value="http://hl7.org/fhir/StructureDefinition/Timing"/>
       </constraint>
       <isModifier value="false"/>
@@ -1300,7 +1308,7 @@
     <element id="Timing.repeat.startOffset">
       <path value="Timing.repeat.startOffset"/>
       <short value="Events within the repeat period do not start until startOffset has elapsed"/>
-      <definition value="Indicates that the events within the period of the repeat do not start until startOffset has elapsed."/>
+      <definition value="Indicates that the events within the period of the repeat do not start until startOffset has elapsed. Requires both frequency and period to define the repeat cycle. See notes: Periods with start or end offsets."/>
       <comment value="This element is defined to support interlaced schedules, e.g. for different actions that happen on different days, but that have repeat cycles that are tied together by the context. This is a usually encountered in Dosages."/>
       <min value="0"/>
       <max value="1"/>
@@ -1329,8 +1337,8 @@
     </element>
     <element id="Timing.repeat.endOffset">
       <path value="Timing.repeat.endOffset"/>
-      <short value="Events within the repeat period step once endOffset before the end of the period"/>
-      <definition value="Indicates that the events within the period of the repeat step endOffset before the period ends."/>
+      <short value="Events within the repeat period stop once endOffset before the end of the period"/>
+      <definition value="Indicates that the events within the period of the repeat stop endOffset before the period ends. Requires both frequency and period to define the repeat cycle. See notes: Periods with start or end offsets."/>
       <comment value="This element is defined for medication schedules that cycle like 'do something for X days, and then stop for Y days'. This can only apply where the window for repeats has a defined or known end time."/>
       <min value="0"/>
       <max value="1"/>
@@ -1631,8 +1639,8 @@
       <constraint>
         <key value="tim-11"/>
         <severity value="error"/>
-        <human value="Only use startOffset when frequency is present and &gt; 1"/>
-        <expression value="startOffset.exists() implies (frequency &gt; 1)"/>
+        <human value="Only use startOffset when frequency is present and &gt; 1, and period is present"/>
+        <expression value="startOffset.exists() implies (frequency &gt; 1 and period.exists())"/>
         <source value="http://hl7.org/fhir/StructureDefinition/Timing"/>
       </constraint>
       <constraint>
@@ -1645,8 +1653,8 @@
       <constraint>
         <key value="tim-12"/>
         <severity value="error"/>
-        <human value="Only use endOffset when frequency is present and &gt; 1"/>
-        <expression value="endOffset.exists() implies (frequency &gt; 1)"/>
+        <human value="Only use endOffset when frequency is present and &gt; 1, and period is present"/>
+        <expression value="endOffset.exists() implies (frequency &gt; 1 and period.exists())"/>
         <source value="http://hl7.org/fhir/StructureDefinition/Timing"/>
       </constraint>
       <constraint>
@@ -1877,7 +1885,7 @@
     <element id="Timing.repeat.startOffset">
       <path value="Timing.repeat.startOffset"/>
       <short value="Events within the repeat period do not start until startOffset has elapsed"/>
-      <definition value="Indicates that the events within the period of the repeat do not start until startOffset has elapsed."/>
+      <definition value="Indicates that the events within the period of the repeat do not start until startOffset has elapsed. Requires both frequency and period to define the repeat cycle. See notes: Periods with start or end offsets."/>
       <comment value="This element is defined to support interlaced schedules, e.g. for different actions that happen on different days, but that have repeat cycles that are tied together by the context. This is a usually encountered in Dosages."/>
       <min value="0"/>
       <max value="1"/>
@@ -1893,8 +1901,8 @@
     </element>
     <element id="Timing.repeat.endOffset">
       <path value="Timing.repeat.endOffset"/>
-      <short value="Events within the repeat period step once endOffset before the end of the period"/>
-      <definition value="Indicates that the events within the period of the repeat step endOffset before the period ends."/>
+      <short value="Events within the repeat period stop once endOffset before the end of the period"/>
+      <definition value="Indicates that the events within the period of the repeat stop endOffset before the period ends. Requires both frequency and period to define the repeat cycle. See notes: Periods with start or end offsets."/>
       <comment value="This element is defined for medication schedules that cycle like 'do something for X days, and then stop for Y days'. This can only apply where the window for repeats has a defined or known end time."/>
       <min value="0"/>
       <max value="1"/>

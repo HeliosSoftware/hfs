@@ -56,18 +56,6 @@
     ],
     "text": "Burnt Ear"
   },
-  "bodySite": [
-    {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "49521004",
-          "display": "Left external ear structure"
-        }
-      ],
-      "text": "Left Ear"
-    }
-  ],
   "subject": {
     "reference": "Patient/example"
   },

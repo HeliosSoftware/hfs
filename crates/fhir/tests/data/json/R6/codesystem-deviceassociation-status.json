@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "deviceassociation-status",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -20,7 +20,7 @@
   ],
   "url": "http://hl7.org/fhir/deviceassociation-status",
   "version": "6.0.0-ballot4",
-  "name": "DeviceAssociation",
+  "name": "DeviceAssociationStatus",
   "title": "DeviceAssociation Status Codes",
   "status": "active",
   "experimental": false,

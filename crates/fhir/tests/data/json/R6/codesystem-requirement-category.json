@@ -1,0 +1,149 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "requirement-category",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem requirement-category\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"requirement-category\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcrequirement-category\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/requirement-category\u003c/code\u003e defines the following codes in a Is-A hierarchy:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eLvl\u003c/b\u003e\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e1\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ebehavioral\u003ca name\u003d\"requirement-category-behavioral\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd/\u003e\u003ctd\u003eCategories related to how the system behaves\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  business\u003ca name\u003d\"requirement-category-business\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBusiness\u003c/td\u003e\u003ctd\u003eRequirements relating to the business operations of the entities responsible for a system\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  functional\u003ca name\u003d\"requirement-category-functional\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFunctional\u003c/td\u003e\u003ctd\u003eRequirements related to what the system does (inputs turned into outputs)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    exchange\u003ca name\u003d\"requirement-category-exchange\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eExchange\u003c/td\u003e\u003ctd\u003eRequirements relating to when, how, or what data is exchanged with other systems\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    processing\u003ca name\u003d\"requirement-category-processing\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProcessing\u003c/td\u003e\u003ctd\u003eRequirements related to how data must be analyzed, transformed, considered, or otherwise used within a system\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    storage\u003ca name\u003d\"requirement-category-storage\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStorage\u003c/td\u003e\u003ctd\u003eRequirements related to if or how data is persisted in a system\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  non-functional\u003ca name\u003d\"requirement-category-non-functional\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNon-functional\u003c/td\u003e\u003ctd\u003eRequirements related to how the system accomplishes functional requirements\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    availability\u003ca name\u003d\"requirement-category-availability\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAvailability\u003c/td\u003e\u003ctd\u003eRequirements related to how and when a system needs to be reachable and useable\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    ui\u003ca name\u003d\"requirement-category-ui\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eUser Interface\u003c/td\u003e\u003ctd\u003eRequirements related to how information is collected from and exposed to humans (or animals)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e4\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e      ui-accessibility\u003ca name\u003d\"requirement-category-ui-accessibility\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eUI Accessibility\u003c/td\u003e\u003ctd\u003eRequirements around user interface that ensure a satisfactory experience for users from different backgrounds or with varying physical, cognitive, and/or sensory abilities\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e4\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e      ui-consistency\u003ca name\u003d\"requirement-category-ui-consistency\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eUI Consistency\u003c/td\u003e\u003ctd\u003eRequirements around ensuring that different implementations have sufficiently aligned appearance and mechanisms of interaction\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e4\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e      ui-usability\u003ca name\u003d\"requirement-category-ui-usability\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eUI Usability\u003c/td\u003e\u003ctd\u003eRequirements related to the intuitiveness, simplicity, and ease-of-use of a user-interface\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    security\u003ca name\u003d\"requirement-category-security\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSecurity/Privacy\u003c/td\u003e\u003ctd\u003eRequirements that ensure that data is appropriately protected from threats and respects rules around what parties are permitted to access or manipulate\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    safety\u003ca name\u003d\"requirement-category-safety\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSafety\u003c/td\u003e\u003ctd\u003eRequirements that ensure that system operation does not negatively impact the wellbeing of people or assets\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    performance\u003ca name\u003d\"requirement-category-performance\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePerformance/Scalability\u003c/td\u003e\u003ctd\u003eRequirements that deal with timeliness of processing and/or responsiveness under differing levels of load/volume\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e1\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esource\u003ca name\u003d\"requirement-category-source\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd/\u003e\u003ctd\u003eCategories related to where the requirement came from\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  user\u003ca name\u003d\"requirement-category-user\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eUser\u003c/td\u003e\u003ctd\u003eRequirements originating from the community of individuals expected to use the system/solution\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  legal\u003ca name\u003d\"requirement-category-legal\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLegal\u003c/td\u003e\u003ctd\u003eRequirements originating from regulation or law\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  design\u003ca name\u003d\"requirement-category-design\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDesign decision\u003c/td\u003e\u003ctd\u003eRequirements documenting decisions made in the design of the solution\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "normative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    }
+  ],
+  "url": "http://hl7.org/fhir/requirement-category",
+  "version": "6.0.0-ballot4",
+  "name": "RequirementCategory",
+  "title": "Requirement Category",
+  "status": "active",
+  "experimental": false,
+  "publisher": "HL7 International",
+  "description": "Requirement Category",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "hierarchyMeaning": "is-a",
+  "content": "complete",
+  "count": 19,
+  "concept": [
+    {
+      "code": "behavioral",
+      "definition": "Categories related to how the system behaves",
+      "concept": [
+        {
+          "code": "business",
+          "display": "Business",
+          "definition": "Requirements relating to the business operations of the entities responsible for a system"
+        },
+        {
+          "code": "functional",
+          "display": "Functional",
+          "definition": "Requirements related to what the system does (inputs turned into outputs)",
+          "concept": [
+            {
+              "code": "exchange",
+              "display": "Exchange",
+              "definition": "Requirements relating to when, how, or what data is exchanged with other systems"
+            },
+            {
+              "code": "processing",
+              "display": "Processing",
+              "definition": "Requirements related to how data must be analyzed, transformed, considered, or otherwise used within a system"
+            },
+            {
+              "code": "storage",
+              "display": "Storage",
+              "definition": "Requirements related to if or how data is persisted in a system"
+            }
+          ]
+        },
+        {
+          "code": "non-functional",
+          "display": "Non-functional",
+          "definition": "Requirements related to how the system accomplishes functional requirements",
+          "concept": [
+            {
+              "code": "availability",
+              "display": "Availability",
+              "definition": "Requirements related to how and when a system needs to be reachable and useable"
+            },
+            {
+              "code": "ui",
+              "display": "User Interface",
+              "definition": "Requirements related to how information is collected from and exposed to humans (or animals)",
+              "concept": [
+                {
+                  "code": "ui-accessibility",
+                  "display": "UI Accessibility",
+                  "definition": "Requirements around user interface that ensure a satisfactory experience for users from different backgrounds or with varying physical, cognitive, and/or sensory abilities"
+                },
+                {
+                  "code": "ui-consistency",
+                  "display": "UI Consistency",
+                  "definition": "Requirements around ensuring that different implementations have sufficiently aligned appearance and mechanisms of interaction"
+                },
+                {
+                  "code": "ui-usability",
+                  "display": "UI Usability",
+                  "definition": "Requirements related to the intuitiveness, simplicity, and ease-of-use of a user-interface"
+                }
+              ]
+            },
+            {
+              "code": "security",
+              "display": "Security/Privacy",
+              "definition": "Requirements that ensure that data is appropriately protected from threats and respects rules around what parties are permitted to access or manipulate"
+            },
+            {
+              "code": "safety",
+              "display": "Safety",
+              "definition": "Requirements that ensure that system operation does not negatively impact the wellbeing of people or assets"
+            },
+            {
+              "code": "performance",
+              "display": "Performance/Scalability",
+              "definition": "Requirements that deal with timeliness of processing and/or responsiveness under differing levels of load/volume"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "source",
+      "definition": "Categories related to where the requirement came from",
+      "concept": [
+        {
+          "code": "user",
+          "display": "User",
+          "definition": "Requirements originating from the community of individuals expected to use the system/solution"
+        },
+        {
+          "code": "legal",
+          "display": "Legal",
+          "definition": "Requirements originating from regulation or law"
+        },
+        {
+          "code": "design",
+          "display": "Design decision",
+          "definition": "Requirements documenting decisions made in the design of the solution"
+        }
+      ]
+    }
+  ]
+}

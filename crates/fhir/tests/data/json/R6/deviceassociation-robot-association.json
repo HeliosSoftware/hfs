@@ -58,21 +58,30 @@
   "device": {
     "reference": "#surgical-robot"
   },
-  "status": "active",
-  "associationStatus": {
+  "relationship": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/CodeSystem/deviceassociation-association-status",
-        "code": "attached",
-        "display": "Attached"
+        "system": "http://hl7.org/fhir/deviceassociation-relationship",
+        "code": "used-by",
+        "display": "Used By"
+      }
+    ]
+  },
+  "status": "active",
+  "relationshipStatus": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/deviceassociation-relationship-status",
+        "code": "ended",
+        "display": "Ended"
       }
     ]
   },
   "subject": {
-    "reference": "#example-practitioner"
+    "reference": "#example-patient"
   },
   "focus": {
-    "reference": "#example-patient"
+    "reference": "#example-practitioner"
   },
   "period": {
     "start": "2025-07-01T08:00:00Z",

@@ -60,7 +60,7 @@
   ],
   "focus": [
     {
-      "reference": "ImagingSelection/example-basic-image-selection"
+      "reference": "ImagingSelection/example-single-frame-image-selection"
     }
   ],
   "instance": [

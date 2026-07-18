@@ -2,11 +2,11 @@
   "resourceType": "CodeSystem",
   "id": "actordefinition-actor-code",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem actordefinition-actor-code\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"actordefinition-actor-code\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcactordefinition-actor-code\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eProperties\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eThis code system defines the following properties for its concepts\u003c/b\u003e\u003c/p\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eName\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eURI\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eType\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003eNot Selectable\u003c/td\u003e\u003ctd\u003eabstract\u003c/td\u003e\u003ctd\u003ehttp://hl7.org/fhir/concept-properties#notSelectable\u003c/td\u003e\u003ctd\u003eboolean\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cp\u003e\u003cb\u003eConcepts\u003c/b\u003e\u003c/p\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/actordefinition-actor-code\u003c/code\u003e defines the following codes in a Is-A hierarchy:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eLvl\u003c/b\u003e\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eNot Selectable\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e1\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003enon-system\u003ca name\u003d\"actordefinition-actor-code-non-system\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNon System\u003c/td\u003e\u003ctd\u003eA person, animal, (non-software) device, organization or other entity\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  individual\u003ca name\u003d\"actordefinition-actor-code-individual\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eIndividual\u003c/td\u003e\u003ctd\u003eA person or animal\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    patient\u003ca name\u003d\"actordefinition-actor-code-patient\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePatient\u003c/td\u003e\u003ctd/\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    practitioner\u003ca name\u003d\"actordefinition-actor-code-practitioner\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePractitioner\u003c/td\u003e\u003ctd/\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    related-person\u003ca name\u003d\"actordefinition-actor-code-related-person\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRelated Person\u003c/td\u003e\u003ctd/\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  device\u003ca name\u003d\"actordefinition-actor-code-device\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDevice\u003c/td\u003e\u003ctd\u003eA physical device acting in non-software capacity\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  collective\u003ca name\u003d\"actordefinition-actor-code-collective\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCollective\u003c/td\u003e\u003ctd\u003eA group of people or animals\u003c/td\u003e\u003ctd\u003etrue\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    care-team\u003ca name\u003d\"actordefinition-actor-code-care-team\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCare Team\u003c/td\u003e\u003ctd/\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    group\u003ca name\u003d\"actordefinition-actor-code-group\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGroup\u003c/td\u003e\u003ctd/\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    healthcare-service\u003ca name\u003d\"actordefinition-actor-code-healthcare-service\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHealthcare Service\u003c/td\u003e\u003ctd/\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    organization\u003ca name\u003d\"actordefinition-actor-code-organization\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOrganization\u003c/td\u003e\u003ctd/\u003e\u003ctd/\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem actordefinition-actor-code\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"actordefinition-actor-code\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcactordefinition-actor-code\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eProperties\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eThis code system defines the following properties for its concepts\u003c/b\u003e\u003c/p\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eName\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eURI\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eType\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003eNot Selectable\u003c/td\u003e\u003ctd\u003eabstract\u003c/td\u003e\u003ctd\u003ehttp://hl7.org/fhir/concept-properties#notSelectable\u003c/td\u003e\u003ctd\u003eboolean\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cp\u003e\u003cb\u003eConcepts\u003c/b\u003e\u003c/p\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/actordefinition-actor-code\u003c/code\u003e defines the following codes in a Is-A hierarchy:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eLvl\u003c/b\u003e\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eNot Selectable\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e1\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003enon-system\u003ca name\u003d\"actordefinition-actor-code-non-system\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNon System\u003c/td\u003e\u003ctd\u003eA person, animal, (non-software) device, organization or other entity\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  individual\u003ca name\u003d\"actordefinition-actor-code-individual\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eIndividual\u003c/td\u003e\u003ctd\u003eA person or animal\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    patient\u003ca name\u003d\"actordefinition-actor-code-patient\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePatient\u003c/td\u003e\u003ctd\u003eAn individual or animal that is the subject of health-related care, services, or processes\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    practitioner\u003ca name\u003d\"actordefinition-actor-code-practitioner\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePractitioner\u003c/td\u003e\u003ctd\u003eA person who is directly or indirectly involved in the provisioning of healthcare or related services\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    related-person\u003ca name\u003d\"actordefinition-actor-code-related-person\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRelated Person\u003c/td\u003e\u003ctd\u003eA person involved in a patient\u0027s health or care, but who is not the primary target of healthcare\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  device\u003ca name\u003d\"actordefinition-actor-code-device\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDevice\u003c/td\u003e\u003ctd\u003eA physical device acting in non-software capacity\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e2\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e  collective\u003ca name\u003d\"actordefinition-actor-code-collective\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCollective\u003c/td\u003e\u003ctd\u003eA group of people or animals\u003c/td\u003e\u003ctd\u003etrue\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    care-team\u003ca name\u003d\"actordefinition-actor-code-care-team\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCare Team\u003c/td\u003e\u003ctd\u003eThe people, organizations, and care teams who participate or plan to participate in the coordination and delivery of care\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    group\u003ca name\u003d\"actordefinition-actor-code-group\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGroup\u003c/td\u003e\u003ctd\u003eA collection of entities that may be discussed or acted upon collectively, but which are not typically expected to act collectively\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    healthcare-service\u003ca name\u003d\"actordefinition-actor-code-healthcare-service\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHealthcare Service\u003c/td\u003e\u003ctd\u003eA healthcare service available at a location\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e3\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e    organization\u003ca name\u003d\"actordefinition-actor-code-organization\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOrganization\u003c/td\u003e\u003ctd\u003eA formally or informally recognized grouping of people or organizations formed to achieve some form of collective action\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e1\u003c/td\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esystem\u003ca name\u003d\"actordefinition-actor-code-system\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSystem\u003c/td\u003e\u003ctd\u003eSoftware and/or hardware involved in data exchange\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -80,15 +80,18 @@
           "concept": [
             {
               "code": "patient",
-              "display": "Patient"
+              "display": "Patient",
+              "definition": "An individual or animal that is the subject of health-related care, services, or processes"
             },
             {
               "code": "practitioner",
-              "display": "Practitioner"
+              "display": "Practitioner",
+              "definition": "A person who is directly or indirectly involved in the provisioning of healthcare or related services"
             },
             {
               "code": "related-person",
-              "display": "Related Person"
+              "display": "Related Person",
+              "definition": "A person involved in a patient\u0027s health or care, but who is not the primary target of healthcare"
             }
           ]
         },
@@ -110,23 +113,32 @@
           "concept": [
             {
               "code": "care-team",
-              "display": "Care Team"
+              "display": "Care Team",
+              "definition": "The people, organizations, and care teams who participate or plan to participate in the coordination and delivery of care"
             },
             {
               "code": "group",
-              "display": "Group"
+              "display": "Group",
+              "definition": "A collection of entities that may be discussed or acted upon collectively, but which are not typically expected to act collectively"
             },
             {
               "code": "healthcare-service",
-              "display": "Healthcare Service"
+              "display": "Healthcare Service",
+              "definition": "A healthcare service available at a location"
             },
             {
               "code": "organization",
-              "display": "Organization"
+              "display": "Organization",
+              "definition": "A formally or informally recognized grouping of people or organizations formed to achieve some form of collective action"
             }
           ]
         }
       ]
+    },
+    {
+      "code": "system",
+      "display": "System",
+      "definition": "Software and/or hardware involved in data exchange"
     }
   ]
 }

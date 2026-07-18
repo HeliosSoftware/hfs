@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Observation xmlns="http://hl7.org/fhir">
   <id value="alcohol-type"/>
-  <!--   the mandatory quality flags:   -->
+  <!-- the mandatory quality flags: -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -9,13 +9,11 @@
     </security>
   </meta>
   <status value="final"/>
-  <!--  
-    Observations are often coded in multiple code systems.
+  <!-- Observations are often coded in multiple code systems.
       - LOINC
 		- or SNOMED
       -and/or the source system may provides its own "local" code, which may be less or more granular than LOINC.
-	In this example there is only local codes
-    -->
+	In this example there is only local codes -->
   <category>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/observation-category"/>
@@ -25,7 +23,7 @@
     <text value="Social History"/>
   </category>
   <code>
-    <!--   Local - unable to identify a proper LOINC code   -->
+    <!-- Local - unable to identify a proper LOINC code -->
     <coding>
       <system value="http://acme-rehab.org"/>
       <code value="alcohol-type"/>
@@ -38,20 +36,19 @@
     <display value="Peter James Chalmers"/>
   </subject>
   <effectiveDateTime value="2014-12-11T04:44:16Z"/>
-  <!--   When the code is the same as component.code the value element must be empty per invariant obs-7
-     -->
-  <!--  Using components since multi-select values/answers share the same attributes (such as id, performer, effective date, status, comment..  -->
-  <!--  answer 1  -->
+  <!-- When the code is the same as component.code the value element must be empty per invariant obs-7 -->
+  <!-- Using components since multi-select values/answers share the same attributes (such as id, performer, effective date, status, comment.. -->
+  <!-- answer 1 -->
   <component>
-    <!--  component.code is same as code  -->
+    <!-- component.code is same as code -->
     <code>
-      <!--   Local - unable to identify a proper LOINC code   -->
+      <!-- Local - unable to identify a proper LOINC code -->
       <coding>
         <system value="http://acme-rehab.org"/>
         <code value="alcohol-type"/>
       </coding>
     </code>
-    <!--  coded value using SNONED-CT, could also use a local code here or only text  -->
+    <!-- coded value using SNONED-CT, could also use a local code here or only text -->
     <valueCodeableConcept>
       <coding>
         <system value="http://snomed.info/sct"/>
@@ -61,17 +58,17 @@
       <text value="Wine"/>
     </valueCodeableConcept>
   </component>
-  <!--  answer 2  -->
+  <!-- answer 2 -->
   <component>
-    <!--  component.code is same as code  -->
+    <!-- component.code is same as code -->
     <code>
-      <!--   Local - unable to identify a proper LOINC code   -->
+      <!-- Local - unable to identify a proper LOINC code -->
       <coding>
         <system value="http://acme-rehab.org"/>
         <code value="alcohol-type"/>
       </coding>
     </code>
-    <!--  coded value using SNONED-CT, could also use a local code here or only text  -->
+    <!-- coded value using SNONED-CT, could also use a local code here or only text -->
     <valueCodeableConcept>
       <coding>
         <system value="http://snomed.info/sct"/>
@@ -81,17 +78,17 @@
       <text value="Beer"/>
     </valueCodeableConcept>
   </component>
-  <!--  answer 3  -->
+  <!-- answer 3 -->
   <component>
-    <!--  component.code is same as code  -->
+    <!-- component.code is same as code -->
     <code>
-      <!--   Local - unable to identify a proper LOINC code   -->
+      <!-- Local - unable to identify a proper LOINC code -->
       <coding>
         <system value="http://acme-rehab.org"/>
         <code value="alcohol-type"/>
       </coding>
     </code>
-    <!--  coded value using SNONED-CT, could also use a local code here or only text  -->
+    <!-- coded value using SNONED-CT, could also use a local code here or only text -->
     <valueCodeableConcept>
       <coding>
         <system value="http://snomed.info/sct"/>

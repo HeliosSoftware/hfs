@@ -69,7 +69,7 @@
             <a href="types.html#Element" title="Unique id for the element within a resource (for internal references). This may be any string value that does not contain spaces.">id</a>, 
             <a href="types.html#Element" title="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension.">extension</a>, 
             <a href="datatypes.html#Quantity" title="The value of the measured amount. The value includes an implicit precision in the presentation of the value.">value</a>, 
-            <a href="datatypes.html#Quantity" title="How the value should be understood and represented - whether the actual value is greater or less than the stated value due to measurement issues; e.g. if the comparator is &quot;&lt;&quot; , then the real value is &lt; stated value.">comparator</a>, 
+            <a href="datatypes.html#Quantity" title="How the value should be understood and represented - whether the actual value is greater than, less than, or approximately equal to the stated value due to measurement issues; e.g. if the comparator is &quot;&lt;&quot; , then the real value is &lt; stated value.">comparator</a>, 
             <a href="datatypes.html#Quantity" title="A human-readable form of the unit.">unit</a>, 
             <a href="datatypes.html#Quantity" title="The identification of the system that provides the coded form of the unit.">system</a>, 
             <a href="datatypes.html#Quantity" title="A computer processable form of the unit in some unit representation system.">code</a>
@@ -107,7 +107,7 @@
   <name value="Age"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -319,8 +319,8 @@
     </element>
     <element id="Age.comparator">
       <path value="Age.comparator"/>
-      <short value="&lt; | &lt;= | &gt;= | &gt; | ad - how to understand the value"/>
-      <definition value="How the value should be understood and represented - whether the actual value is greater or less than the stated value due to measurement issues; e.g. if the comparator is &quot;&lt;&quot; , then the real value is &lt; stated value."/>
+      <short value="&lt; | &lt;= | &gt;= | &gt; | ~ | ad - how to understand the value"/>
+      <definition value="How the value should be understood and represented - whether the actual value is greater than, less than, or approximately equal to the stated value due to measurement issues; e.g. if the comparator is &quot;&lt;&quot; , then the real value is &lt; stated value."/>
       <requirements value="Need a framework for handling measures where the value is &lt;5ug/L or &gt;400mg/L due to the limitations of measuring methodology."/>
       <min value="0"/>
       <max value="1"/>

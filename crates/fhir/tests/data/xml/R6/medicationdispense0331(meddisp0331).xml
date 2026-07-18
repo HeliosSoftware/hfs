@@ -11,7 +11,7 @@
     <Medication>
       <id value="med0352"/>
       <code>
-        <!--  <display value="Coumadin 2mg tablet"/>  -->
+        <!-- <display value="Coumadin 2mg tablet"/> -->
         <coding>
           <system value="http://hl7.org/fhir/sid/ndc"/>
           <code value="0056-0170-70"/>
@@ -23,8 +23,8 @@
   </contained>
   <status value="in-progress"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
-    <!--  <display value="Coumadin 2mg tablet"/>  -->
+    <!-- Linked to a RESOURCE Medication -->
+    <!-- <display value="Coumadin 2mg tablet"/> -->
     <reference>
       <reference value="#med0352"/>
       <display value="COUMADIN, 1 BOTTLE in 1 CARTON (0056-0170-70) &gt; 100 TABLET in 1 BOTTLE (package)"/>

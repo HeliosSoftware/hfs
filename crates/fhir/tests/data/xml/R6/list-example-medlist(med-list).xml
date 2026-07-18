@@ -27,15 +27,14 @@
   <source>
     <reference value="Patient/example"/>
   </source>
-  <!--  
-      in a real medications list, we'd actually have medication resources.
+  <!-- in a real medications list, we'd actually have medication resources.
       but this an example to demonstrate a changes list, so we'll just use 
-      display  -->
+      display -->
   <entry>
-    <!--  patient was prescribed hydroxocobalamin. the flag marks this 
+    <!-- patient was prescribed hydroxocobalamin. the flag marks this 
        as a prescription. Note that healthcare workers will now get into
        a long debate the exact implication of "prescribed". That's why the
-       spec does not fix the flag values  -->
+       spec does not fix the flag values -->
     <flag>
       <coding>
         <system value="http://nehta.gov.au/codes/medications/changetype"/>
@@ -47,12 +46,10 @@
       <display value="hydroxocobalamin"/>
     </item>
   </entry>
-  <!-- 
-     on this one, we record that the patient was taken off morphine sulfate.
+  <!-- on this one, we record that the patient was taken off morphine sulfate.
      because not every system knows the flags, and the ensure there's no confusion,
      if the flag implies that something was removed from the list, then the
-     deleted element must also be set 
-   -->
+     deleted element must also be set -->
   <entry>
     <flag>
       <coding>
