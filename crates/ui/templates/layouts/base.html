@@ -98,10 +98,10 @@
         <span class="icon">{% include "icons/history.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-history-versions") }}</span>
       </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-compartments") }}">
+      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %}>
         <span class="icon">{% include "icons/compartments.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
-      </span>
+        {{ i18n.t("nav-compartments") }}
+      </a>
 
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-batch-transaction") }}">
@@ -126,6 +126,10 @@
         <span class="icon">{% include "icons/shield.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-capability-conformance") }}</span>
       </span>
+      <a class="nav-item" href="/ui/search-parameters"{% if active_page == "search-parameters" %} aria-current="page"{% endif %}>
+        <span class="icon">{% include "icons/search.svg" %}</span>
+        {{ i18n.t("nav-search-parameters") }}
+      </a>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-admin-ops") }}">
         <span class="icon">{% include "icons/sliders.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-admin-ops") }}</span>
@@ -182,7 +186,7 @@
         <span class="topbar__avatar">K</span>
       </div>
     </header>
-    <main class="content">
+    <main class="content{% block content_class %}{% endblock %}">
       {% block content %}{% endblock %}
     </main>
   </div>

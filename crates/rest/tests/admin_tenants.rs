@@ -45,6 +45,9 @@ async fn create_test_server() -> TestServer {
         },
         base_url: "http://localhost:8080".to_string(),
         default_tenant: "default-tenant".to_string(),
+        // These tests assert exact per-tenant resource counts, so don't let
+        // provisioning seed the conformance set on top.
+        seed_conformance: false,
         ..ServerConfig::for_testing()
     };
 

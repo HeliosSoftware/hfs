@@ -36,13 +36,19 @@
 //! selector. Both selectors are plain links, so the dashboard stays navigable
 //! without JavaScript.
 
+mod compartments;
+mod conformance;
 mod i18n;
+mod search_params;
 mod tenants;
+
+#[doc(hidden)]
+pub use conformance::{ConformanceSource, StaticConformanceSource};
 
 use askama::Template;
 use axum::{
     Router,
-    extract::{RawQuery, State},
+    extract::{Query, RawQuery, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
@@ -57,6 +63,8 @@ use helios_observability::dashboard::{
 use helios_persistence::core::ResourceStorage;
 use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
+use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,10 +79,21 @@ struct Assets;
 #[derive(Clone)]
 struct WebState {
     version: &'static str,
+    /// Lazily-fetched SearchParameter snapshot per FHIR version (#238), read
+    /// from the server's own `/SearchParameter` endpoint.
+    sp_catalog: Arc<search_params::SpCatalog>,
+    /// Lazily-fetched CompartmentDefinitions per FHIR version (#237), read from
+    /// the server's own `/CompartmentDefinition` endpoint.
+    compartments: Arc<compartments::CompartmentCatalog>,
     /// Read/write path for the tenant-maintenance page. `None` when the host did
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
+    /// tenant's conformance resources from the tenant-maintenance page.
+    data_dir: Option<PathBuf>,
+    /// The server's default FHIR version, used when seeding a new tenant.
+    fhir_version: helios_fhir::FhirVersion,
 }
 
 /// A small, self-contained system-status snapshot — the "real read path" the
@@ -169,6 +188,34 @@ struct QueriesPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The version's resource types for the picker rail, from the spec
+    /// CompartmentDefinitions already vendored for the compartment viewer.
+    /// Counts hydrate client-side via `_summary=count`.
+    resource_types: Vec<String>,
+}
+
+/// SearchParameter viewer (#238). Read-only against the same snapshot the
+/// storage backends seed their registries from; the write half lands
+/// behind #235.
+#[derive(Template)]
+#[template(path = "pages/search-parameters.html")]
+struct SearchParametersPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    view: search_params::SpView,
+}
+
+/// Compartment viewer & route tester (#237). Read-only: the base definitions
+/// are codegen'd into the binary; a tenant-scoped override layer is open
+/// question 1 on the issue.
+#[derive(Template)]
+#[template(path = "pages/compartments.html")]
+struct CompartmentsPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    view: compartments::CmpView,
 }
 
 #[derive(Template)]
@@ -178,16 +225,69 @@ struct StatusPartial {
     i18n: I18n,
 }
 
+/// One `<option>` in the search-builder's parameter datalist.
+struct ParamOption {
+    code: String,
+    type_label: String,
+}
+
+/// Parameter suggestions for the search builder (`/ui/queries/params`),
+/// rendered from the same registry snapshot the SearchParameter viewer
+/// reads. An HTML fragment the page swaps per resource type — hypermedia,
+/// not a UI-facing JSON API.
+#[derive(Template)]
+#[template(path = "partials/param-options.html")]
+struct ParamOptionsPartial {
+    params: Vec<ParamOption>,
+}
+
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
 /// other path. The UI depends on the rest of the server, never the reverse.
 ///
-/// `tenants` is the storage handle the tenant-maintenance page reads and writes
-/// (the same backend the FHIR API uses); pass `None` to render the UI without a
-/// live registry (the page then reports it as unavailable).
+/// The SearchParameter and CompartmentDefinition viewers read the server's own
+/// FHIR API over HTTP (storage is the source of truth): `self_base_url` is the
+/// loopback base URL the UI calls itself at, and `outbound_auth` supplies the
+/// credentials for that self-call (a service token when auth is enabled, a
+/// no-op otherwise). `data_dir` (`HFS_DATA_DIR`) and `fhir_version` are used to
+/// seed a newly-provisioned tenant from the tenant-maintenance page. `tenants`
+/// is the storage handle that page reads and writes; pass `None` to render the
+/// UI without a live registry (the page then reports it as unavailable).
+#[allow(clippy::too_many_arguments)]
 pub fn mount(
     fhir_app: Router,
     hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
     tenants: Option<Arc<dyn ResourceStorage>>,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    fhir_version: helios_fhir::FhirVersion,
+) -> Router {
+    let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
+        self_base_url,
+        outbound_auth,
+    ));
+    mount_with_conformance_source(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        tenants,
+        source,
+        fhir_version,
+    )
+}
+
+/// Mounts the UI with an injected [`ConformanceSource`], so tests can serve the
+/// SearchParameter/CompartmentDefinition data offline instead of standing up a
+/// real HTTP server. Production callers use [`mount`], which wires an HTTP
+/// source pointed at the server's own loopback address.
+#[doc(hidden)]
+pub fn mount_with_conformance_source(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
 ) -> Router {
     // Embedded, pinned htmx + CSS/JS + fonts, served with br/gzip/deflate
     // negotiation. `Cache-Control: no-cache` forces the browser to revalidate
@@ -201,6 +301,9 @@ pub fn mount(
     Router::new()
         .route("/ui", get(index))
         .route("/ui/queries", get(queries))
+        .route("/ui/queries/params", get(query_params_catalog))
+        .route("/ui/search-parameters", get(search_parameters))
+        .route("/ui/compartments", get(compartments_page))
         .route("/ui/status", get(status))
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
@@ -214,7 +317,11 @@ pub fn mount(
         .layer(middleware::from_fn(i18n::negotiate_locale))
         .with_state(WebState {
             version: hfs_version,
+            sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
+            compartments: Arc::new(compartments::CompartmentCatalog::new(source)),
             tenants,
+            data_dir,
+            fhir_version,
         })
         .fallback_service(fhir_app)
 }
@@ -250,11 +357,126 @@ async fn index(
 
 /// Saved FHIR queries page.
 async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    let resource_types = state
+        .compartments
+        .resource_type_names(helios_fhir::FhirVersion::default())
+        .await;
     render(QueriesPage {
         status: current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "queries",
+        resource_types,
     })
+}
+
+#[derive(Deserialize, Default)]
+struct ParamsCatalogQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
+}
+
+/// Parameter datalist for the search builder: the active parameters that
+/// apply to the given resource type (including `Resource` /
+/// `DomainResource`-level ones), from the default-version snapshot.
+async fn query_params_catalog(
+    State(state): State<WebState>,
+    Query(raw): Query<ParamsCatalogQuery>,
+) -> Response {
+    let snapshot = state
+        .sp_catalog
+        .snapshot(helios_fhir::FhirVersion::default())
+        .await;
+    let resource_type = raw.resource_type.unwrap_or_default();
+    let mut params: Vec<ParamOption> = snapshot
+        .params
+        .iter()
+        .filter(|p| p.applies_to(&resource_type))
+        .map(|p| ParamOption {
+            code: p.code.clone(),
+            type_label: p.param_type.to_string(),
+        })
+        .collect();
+    params.sort_by(|a, b| a.code.cmp(&b.code));
+    params.dedup_by(|a, b| a.code == b.code);
+    render(ParamOptionsPartial { params })
+}
+
+/// Query string for the SearchParameter viewer. Every filter is a link and
+/// the search box is a GET form, so the page works without JavaScript.
+#[derive(Deserialize, Default)]
+struct SearchParametersQuery {
+    version: Option<String>,
+    base: Option<String>,
+    #[serde(rename = "type")]
+    ptype: Option<String>,
+    source: Option<String>,
+    #[serde(default)]
+    q: String,
+    page: Option<usize>,
+    sel: Option<String>,
+}
+
+/// SearchParameter viewer page.
+async fn search_parameters(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    Query(raw): Query<SearchParametersQuery>,
+) -> Response {
+    let query = search_params::SpQuery {
+        version: raw.version,
+        base: raw.base.filter(|b| !b.is_empty()),
+        ptype: raw.ptype.filter(|t| !t.is_empty()),
+        source: raw.source.filter(|s| !s.is_empty()),
+        q: raw.q,
+        page: raw.page.unwrap_or(1),
+        sel: raw.sel.filter(|s| !s.is_empty()),
+    };
+    let snapshot = state.sp_catalog.snapshot(query.fhir_version()).await;
+    render(SearchParametersPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "search-parameters",
+        view: search_params::build_view(&snapshot, &query),
+    })
+}
+
+/// Query string for the compartment viewer & tester.
+#[derive(Deserialize, Default)]
+struct CompartmentsQuery {
+    version: Option<String>,
+    def: Option<String>,
+    tab: Option<String>,
+    filter: Option<String>,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    target: String,
+}
+
+/// Compartment viewer & tester page.
+async fn compartments_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    Query(raw): Query<CompartmentsQuery>,
+) -> Response {
+    let query = compartments::CmpQuery {
+        version: raw.version,
+        def: raw.def,
+        tab: raw.tab,
+        filter: raw.filter,
+        id: raw.id,
+        target: raw.target,
+    };
+    let defs = state.compartments.definitions(query.fhir_version()).await;
+    match compartments::build_view(&query, &defs) {
+        Some(view) => render(CompartmentsPage {
+            status: current_status(state.version),
+            i18n: I18n::new(locale),
+            active_page: "compartments",
+            view,
+        }),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Status read path. Returns a fragment to htmx (`HX-Request`) and a full page
@@ -761,6 +983,7 @@ mod tests {
             },
             i18n: i18n("en"),
             active_page: "queries",
+            resource_types: vec!["Patient".to_string(), "Observation".to_string()],
         }
         .render()
         .expect("queries page renders");
@@ -774,6 +997,11 @@ mod tests {
         assert!(html.contains(r#"data-intent="run""#));
         assert!(html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
+        // Resource picker rail: the version's full type list, with count
+        // slots the script hydrates via _summary=count.
+        assert!(html.contains(r#"data-rail-type="Patient""#));
+        assert!(html.contains(r#"data-rail-type="Observation""#));
+        assert!(html.contains(r#"data-count-for="Patient""#));
         // This page, not Home, carries aria-current in the sidebar.
         assert!(html.contains(r#"href="/ui/queries" aria-current="page""#));
         assert!(!html.contains(r#"href="/ui" aria-current="page""#));
@@ -790,6 +1018,7 @@ mod tests {
             },
             i18n: i18n("es"),
             active_page: "queries",
+            resource_types: vec!["Patient".to_string()],
         }
         .render()
         .expect("queries page renders");
@@ -816,6 +1045,34 @@ mod tests {
         assert!(source.contains("lastAccessedAt"));
         // Every run is recorded to the roaming recent-searches list.
         assert!(source.contains("recentSearches"));
+        // Results render in-page from the FHIR API itself, and the builder's
+        // parameter suggestions come from the server-rendered datalist.
+        assert!(source.contains("application/fhir+json"));
+        assert!(source.contains("/ui/queries/params"));
+    }
+
+    /// The builder's datalist fragment is fed by the SearchParameter
+    /// registry and scoped to the requested resource type.
+    #[test]
+    fn param_options_partial_renders_datalist() {
+        let html = ParamOptionsPartial {
+            params: vec![
+                ParamOption {
+                    code: "birthdate".into(),
+                    type_label: "date".into(),
+                },
+                ParamOption {
+                    code: "name".into(),
+                    type_label: "string".into(),
+                },
+            ],
+        }
+        .render()
+        .expect("partial renders");
+
+        assert!(html.contains(r#"<datalist id="param-options">"#));
+        assert!(html.contains(r#"<option value="birthdate" label="date">"#));
+        assert!(!html.contains("<html"), "fragment, not a page");
     }
 
     /// Both theme buttons render, and icons are inlined (so `currentColor`

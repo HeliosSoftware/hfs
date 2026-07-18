@@ -65,6 +65,28 @@ fn require_registry<S: ResourceStorage>(storage: &S) -> RestResult<()> {
     }
 }
 
+/// Seeds a newly-provisioned tenant with the spec conformance resources
+/// (SearchParameters and CompartmentDefinitions), mirroring the per-tenant
+/// startup seed. Best-effort: failures are logged, never surfaced to the caller
+/// (the tenant is registered regardless; the next startup seed completes it).
+async fn seed_new_tenant<S: ResourceStorage>(
+    storage: &S,
+    config: &crate::config::ServerConfig,
+    tenant_id: &str,
+) {
+    let data_dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    helios_persistence::search::seed_tenant_conformance(
+        storage,
+        config.default_fhir_version,
+        &data_dir,
+        tenant_id,
+    )
+    .await;
+}
+
 /// Validates a tenant id: non-empty, within length, no whitespace, a
 /// conservative identifier charset, and never the internal system sentinel.
 fn validate_tenant_id(id: &str) -> RestResult<()> {
@@ -187,6 +209,16 @@ where
 
     let record = state.storage().register_tenant(&id, display_name).await?;
     debug!(tenant = %id, "Registered tenant");
+
+    // Seed the new tenant with the conformance resources (spec SearchParameters
+    // and CompartmentDefinitions) so `GET /SearchParameter` and
+    // `GET /CompartmentDefinition` are populated for it, matching what the
+    // server seeds every provisioned tenant with at startup. Best-effort: a
+    // failed seed logs and still returns the created tenant.
+    if state.config().seed_conformance {
+        seed_new_tenant(state.storage(), state.config(), &id).await;
+    }
+
     audit(
         &state,
         AuditAction::Create,
