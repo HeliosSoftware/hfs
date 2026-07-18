@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use helios_auth::{AuthConfig, AuthProvider, InMemoryJtiCache, JwksBearerAuthProvider, JwksCache};
+use helios_auth::{AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -74,8 +74,7 @@ async fn provider_with_audience() -> (JwksBearerAuthProvider, MockServer) {
         ..AuthConfig::default()
     };
 
-    let provider =
-        JwksBearerAuthProvider::new(jwks_cache, Arc::new(InMemoryJtiCache::new()), &config);
+    let provider = JwksBearerAuthProvider::new(jwks_cache, &config);
     (provider, server)
 }
 
