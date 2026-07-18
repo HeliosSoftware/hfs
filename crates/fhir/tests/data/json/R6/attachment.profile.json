@@ -24,7 +24,7 @@
   "name": "Attachment",
   "status": "active",
   "experimental": false,
-  "date": "2026-06-13T17:13:29+00:00",
+  "date": "2026-07-17T03:44:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -390,7 +390,7 @@
         "path": "Attachment.url",
         "short": "Uri where the data can be found",
         "definition": "A location where the data can be accessed.",
-        "comment": "If both data and url are provided, the url SHALL point to the same content as the data contains. Urls may be relative references or may reference transient locations such as a wrapping envelope using cid: though this has ramifications for using signatures. Relative URLs are interpreted relative to the service url, like a resource reference, rather than relative to the resource itself. Urls may also be URIs only resolvable within a Bundle containing the resource with the attachment type. If a URL is provided, it SHALL resolve to actual data.",
+        "comment": "If both data and url are provided, the url SHALL point to the same content as the data contains. Urls may be relative references or may reference transient locations such as a wrapping envelope using cid: though this has ramifications for using signatures. Relative URLs are interpreted relative to the service base URL, like a resource reference, rather than relative to the resource itself; for example, Patient/123 (relative) rather than http://someserver.org/Patient/123 (absolute). Urls may also be URIs only resolvable within a Bundle containing the resource with the attachment type. If a URL is provided, it SHALL resolve to actual data.",
         "requirements": "The data needs to be transmitted by reference.",
         "min": 0,
         "max": "1",
@@ -932,7 +932,7 @@
         "path": "Attachment.url",
         "short": "Uri where the data can be found",
         "definition": "A location where the data can be accessed.",
-        "comment": "If both data and url are provided, the url SHALL point to the same content as the data contains. Urls may be relative references or may reference transient locations such as a wrapping envelope using cid: though this has ramifications for using signatures. Relative URLs are interpreted relative to the service url, like a resource reference, rather than relative to the resource itself. Urls may also be URIs only resolvable within a Bundle containing the resource with the attachment type. If a URL is provided, it SHALL resolve to actual data.",
+        "comment": "If both data and url are provided, the url SHALL point to the same content as the data contains. Urls may be relative references or may reference transient locations such as a wrapping envelope using cid: though this has ramifications for using signatures. Relative URLs are interpreted relative to the service base URL, like a resource reference, rather than relative to the resource itself; for example, Patient/123 (relative) rather than http://someserver.org/Patient/123 (absolute). Urls may also be URIs only resolvable within a Bundle containing the resource with the attachment type. If a URL is provided, it SHALL resolve to actual data.",
         "requirements": "The data needs to be transmitted by reference.",
         "min": 0,
         "max": "1",

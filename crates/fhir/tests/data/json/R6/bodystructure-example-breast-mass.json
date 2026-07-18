@@ -1,0 +1,89 @@
+{
+  "resourceType": "BodyStructure",
+  "id": "breast-mass",
+  "includedStructure": [
+    {
+      "structure": {
+        "coding": [
+          {
+            "code": "76752008",
+            "system": "http://snomed.info/sct",
+            "display": "Breast"
+          }
+        ]
+      },
+      "laterality": {
+        "coding": [
+          {
+            "code": "7771000",
+            "system": "http://snomed.info/sct",
+            "display": "Left"
+          }
+        ]
+      },
+      "bodyLandmarkOrientation": [
+        {
+          "clockFacePosition": [
+            {
+              "coding": [
+                {
+                  "code": "260328008",
+                  "system": "http://snomed.info/sct",
+                  "display": "2 o\u0027clock position"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "landmarkDescription": [
+            {
+              "coding": [
+                {
+                  "code": "24142002",
+                  "system": "http://snomed.info/sct",
+                  "display": "Nipple"
+                }
+              ]
+            }
+          ],
+          "distanceFromLandmark": [
+            {
+              "value": [
+                {
+                  "value": 3,
+                  "code": "cm",
+                  "unit": "cm",
+                  "system": "http://unitsofmeasure.org"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "morphology": [
+        {
+          "coding": [
+            {
+              "code": "89164003",
+              "system": "http://snomed.info/sct",
+              "display": "Breast mass"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "patient": {
+    "reference": "Patient/genetics-example1"
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

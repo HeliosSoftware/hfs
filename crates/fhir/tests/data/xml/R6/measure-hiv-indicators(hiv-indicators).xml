@@ -40,7 +40,7 @@
     </document>
   </relatedArtifact>
   <library value="http://ohie.org/Library/hiv-indicators"/>
-  <!--  Option 1: Mashup  -->
+  <!-- Option 1: Mashup -->
   <group>
     <code>
       <coding>
@@ -101,7 +101,7 @@
       </criteria>
     </stratifier>
   </group>
-  <!--  Option 2: Represent Using Stratifier Components  -->
+  <!-- Option 2: Represent Using Stratifier Components -->
   <group>
     <code>
       <coding>

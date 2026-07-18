@@ -40,12 +40,12 @@
   <author>
     <reference value="Device/example"/>
   </author>
-  <!--  test 1  -->
+  <!-- test 1 -->
   <implicated>
     <reference value="ServiceRequest/di"/>
     <display value="Chest CT - ordered May 8, 2013 by Dr. Adam Careful"/>
   </implicated>
-  <!--  test 2  -->
+  <!-- test 2 -->
   <implicated>
     <reference value="ImagingStudy/example"/>
     <display value="Image 1 from Series 3: CT Images on Patient MINT (MINT1234) taken at 1-Jan 2011 01:20 AM"/>

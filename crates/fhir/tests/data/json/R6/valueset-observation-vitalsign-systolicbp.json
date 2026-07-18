@@ -2,11 +2,11 @@
   "resourceType": "ValueSet",
   "id": "observation-vitalsign-systolicbp",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet observation-vitalsign-systolicbp\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"observation-vitalsign-systolicbp\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcobservation-vitalsign-systolicbp\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where COMPONENT  in LP72836-7,LP304522-8,LP304524-4,LP304523-6,LP304513-7, PROPERTY  \u003d LP6847-0 (Pres), TIME_ASPCT  \u003d LP6960-1 (Pt), SYSTEM  \u003d LP7034-4 (Arterial system) and SCALE_TYP  \u003d LP7753-9 (Qn)\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet observation-vitalsign-systolicbp\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"observation-vitalsign-systolicbp\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcobservation-vitalsign-systolicbp\"\u003e \u003c/a\u003e\u003cp\u003eThis value set includes codes based on the following rules:\u003c/p\u003e\u003cul\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where COMPONENT  in LP72836-7,LP304522-8,LP304524-4,LP304523-6,LP304513-7, PROPERTY  \u003d LP6847-0 (Pres), TIME_ASPCT  \u003d LP6960-1 (Pt), SYSTEM  \u003d LP7034-4 (Arterial system) and SCALE_TYP  \u003d LP7753-9 (Qn)\u003c/li\u003e\u003c/ul\u003e\u003cp\u003eThis value set excludes codes based on the following rules:\u003c/p\u003e\u003cul\u003e\u003cli\u003eExclude these codes as defined in \u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/8479-8/\"\u003e8479-8\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSystolic blood pressure by palpation\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -77,6 +77,17 @@
             "property": "SCALE_TYP",
             "op": "\u003d",
             "value": "LP7753-9"
+          }
+        ]
+      }
+    ],
+    "exclude": [
+      {
+        "system": "http://loinc.org",
+        "concept": [
+          {
+            "code": "8479-8",
+            "display": "Systolic blood pressure by palpation"
           }
         ]
       }

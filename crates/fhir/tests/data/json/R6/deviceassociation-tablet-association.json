@@ -46,13 +46,22 @@
   "device": {
     "reference": "#tablet-device"
   },
-  "status": "active",
-  "associationStatus": {
+  "relationship": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/CodeSystem/deviceassociation-association-status",
-        "code": "attached",
-        "display": "Attached"
+        "system": "http://hl7.org/fhir/deviceassociation-relationship",
+        "code": "assigned-to",
+        "display": "Assigned To"
+      }
+    ]
+  },
+  "status": "active",
+  "relationshipStatus": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/deviceassociation-relationship-status",
+        "code": "active",
+        "display": "Active"
       }
     ]
   },

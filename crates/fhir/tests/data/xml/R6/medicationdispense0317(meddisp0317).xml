@@ -32,7 +32,7 @@
   </contained>
   <status value="unfulfilled"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0306"/>
       <display value="Brentixumab Vedotin (Adcetris)"/>

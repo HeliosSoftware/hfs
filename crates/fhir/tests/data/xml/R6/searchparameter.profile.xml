@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="SearchParameter"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -58,6 +58,8 @@
             <span style="font-style: italic" title="spd-4">+ Rule: Search parameter codes SHALL NOT contain '.', '$', '|', or whitespace characters</span>
             <br/>
             <span style="font-style: italic" title="spd-5">+ Rule: Search parameter aliases SHALL NOT contain '.', '$', '|', or whitespace characters</span>
+            <br/>
+            <span style="font-style: italic" title="spd-6">+ Warning: Values for multipleOr and multipleAnd should be provided for clarity</span>
             <br/>
             <br/>Elements defined in Ancestors: 
             <a href="resource.html#Resource" title="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes.">id</a>, 
@@ -417,7 +419,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the search parameter (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -532,7 +534,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="SearchParameter.base : The base resource type(s) that this search parameter can be used against.">base</span>
+            <span title="SearchParameter.base : The base resource type(s) that this search parameter can be used against. This must be a resource, or a type with a [[[http://hl7.org/fhir/StructureDefinition/structuredefinition-type-characteristics]]] of [[[http://hl7.org/fhir/type-characteristics-code#can-be-target]]].">base</span>
             <a name="SearchParameter.base"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -540,28 +542,12 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">1..*</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a href="datatypes.html#code">code</a>
+            <a href="datatypes.html#uri">uri</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The resource type(s) this search parameter applies to
             <br/>Binding: 
-            <a href="valueset-version-independent-all-resource-types.html">Version Independent Resource Types (All)</a> (
-            <a href="terminologies.html#required" title="To be conformant, the concept in this element SHALL be from the specified value set.">Required</a>)
-            <table class="binding grid">
-              <tr>
-                <td style="font-size: 11px">
-                  <b>Additional Bindings</b>
-                </td>
-                <td style="font-size: 11px">Purpose</td>
-              </tr>
-              <tr>
-                <td style="font-size: 11px">
-                  <a href="valueset-all-resource-types.html">All Resource Types</a>
-                </td>
-                <td style="font-size: 11px">
-                  <a href="valueset-additional-binding-purpose.html#additional-binding-purpose-ui" title="This value set is provided to user look up in a given context">UI Binding</a>
-                </td>
-              </tr>
-            </table>
+            <a href="valueset-version-independent-resource-types.html">Version Independent Resource Types</a> (
+            <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
           </td>
@@ -657,34 +643,18 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="SearchParameter.target : Types of resource (if a resource is referenced).">target</span>
+            <span title="SearchParameter.target : Types of resource (if a resource is referenced). This must be a resource, or a type with a [[[http://hl7.org/fhir/StructureDefinition/structuredefinition-type-characteristics]]] of [[[http://hl7.org/fhir/type-characteristics-code#can-be-target]]].">target</span>
             <a name="SearchParameter.target"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..*</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a href="datatypes.html#code">code</a>
+            <a href="datatypes.html#uri">uri</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Types of resource (if a resource reference)
             <br/>Binding: 
-            <a href="valueset-version-independent-all-resource-types.html">Version Independent Resource Types (All)</a> (
-            <a href="terminologies.html#required" title="To be conformant, the concept in this element SHALL be from the specified value set.">Required</a>)
-            <table class="binding grid">
-              <tr>
-                <td style="font-size: 11px">
-                  <b>Additional Bindings</b>
-                </td>
-                <td style="font-size: 11px">Purpose</td>
-              </tr>
-              <tr>
-                <td style="font-size: 11px">
-                  <a href="valueset-all-resource-types.html">All Resource Types</a>
-                </td>
-                <td style="font-size: 11px">
-                  <a href="valueset-additional-binding-purpose.html#additional-binding-purpose-ui" title="This value set is provided to user look up in a given context">UI Binding</a>
-                </td>
-              </tr>
-            </table>
+            <a href="valueset-version-independent-resource-types.html">Version Independent Resource Types</a> (
+            <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
           </td>
@@ -882,7 +852,7 @@
   <name value="SearchParameter"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -979,6 +949,13 @@
         <expression value="aliasCode.empty() or aliasCode.all(matches('^[^.\\$\\|\\s]+$')).allTrue()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/SearchParameter"/>
       </constraint>
+      <constraint>
+        <key value="spd-6"/>
+        <severity value="warning"/>
+        <human value="Values for multipleOr and multipleAnd should be provided for clarity"/>
+        <expression value="multipleOr.exists() and multipleAnd.exists()"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/SearchParameter"/>
+      </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -999,7 +976,7 @@
       <path value="SearchParameter.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1178,6 +1155,14 @@
     </element>
     <element id="SearchParameter.extension">
       <path value="SearchParameter.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1210,6 +1195,14 @@
     </element>
     <element id="SearchParameter.modifierExtension">
       <path value="SearchParameter.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1682,7 +1675,7 @@
       <path value="SearchParameter.jurisdiction"/>
       <short value="Jurisdiction of the authority that maintains the search parameter (if applicable)"/>
       <definition value="A legal or geographic region in which the authority that maintains the resource is operating.  In general, the jurisdiction is also found in the useContext.  The useContext may reference additional jurisdictions because the defining jurisdiction does not necessarily limit the jurisdictions of use."/>
-      <comment value="It may be possible for the search parameter to be used in jurisdictions other than those for which it was originally designed or intended.&#xA;&#xA;DEPRECATION NOTE: For consistency, implementations are encouraged to migrate to using the new 'jurisdiction' code in the useContext element.  (I.e. useContext.code indicating http://terminology.hl7.org/CodeSystem/usage-context-type#jurisdiction and useContext.valueCodeableConcept indicating the jurisdiction.)"/>
+      <comment value="It may be possible for the search parameter to be used in jurisdictions other than those for which it was originally designed or intended."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -1881,7 +1874,7 @@
     <element id="SearchParameter.base">
       <path value="SearchParameter.base"/>
       <short value="The resource type(s) this search parameter applies to"/>
-      <definition value="The base resource type(s) that this search parameter can be used against."/>
+      <definition value="The base resource type(s) that this search parameter can be used against. This must be a resource, or a type with a [Structure Type Characterstics (Constraint Control)](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-structuredefinition-type-characteristics.html) of [can-be-target (Can Be Target)](https://build.fhir.org/ig/HL7/fhir-extensions/CodeSystem-type-characteristics-code.html#type-characteristics-code-can-be-target)."/>
       <comment value="A search parameter must always apply to at least one resource type. When search parameters apply to more than one resource type, they can be used against any of the listed resource types, or in a cross-type search (see [Cross Resource Search](http.html#xres-search))."/>
       <min value="1"/>
       <max value="*"/>
@@ -1891,7 +1884,7 @@
         <max value="*"/>
       </base>
       <type>
-        <code value="code"/>
+        <code value="uri"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -1907,19 +1900,16 @@
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
           <valueString value="FHIRTypes"/>
         </extension>
-        <strength value="required"/>
-        <description value="A type of resource, or a Reference (from all versions)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-all-resource-types|6.0.0-ballot4"/>
-        <additional>
-          <purpose value="ui"/>
-          <valueSet value="http://hl7.org/fhir/ValueSet/all-resource-types"/>
-        </additional>
+        <strength value="extensible"/>
+        <description value="Either a resource or a data type, including logical model types."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-resource-types"/>
       </binding>
     </element>
     <element id="SearchParameter.type">
       <path value="SearchParameter.type"/>
       <short value="number | date | string | token | reference | composite | quantity | uri | special | resource"/>
       <definition value="The type of value that a search parameter may contain, and how the content is interpreted."/>
+      <comment value="If pre-adopting a new type from a future FHIR version, use the 'special' code and communicate the alternate type as an extension."/>
       <min value="1"/>
       <max value="1"/>
       <base>
@@ -2043,7 +2033,7 @@
     <element id="SearchParameter.target">
       <path value="SearchParameter.target"/>
       <short value="Types of resource (if a resource reference)"/>
-      <definition value="Types of resource (if a resource is referenced)."/>
+      <definition value="Types of resource (if a resource is referenced). This must be a resource, or a type with a [Structure Type Characterstics (Constraint Control)](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-structuredefinition-type-characteristics.html) of [can-be-target (Can Be Target)](https://build.fhir.org/ig/HL7/fhir-extensions/CodeSystem-type-characteristics-code.html#type-characteristics-code-can-be-target)."/>
       <comment value="In some cases, targets may exist for a search parameter that do not exist for the specified FHIRPath for all of the resources identified in SearchParameter.base.  For example, the core clinical-encounter search parameter allows both Encounter and EpisodeOfCare as targets, even though not all of the base resources have EpisodeOfCare as a valid target.&#xA;&#xA;However, the list of targets SHOULD cover all targets that might appear that are permitted by the specified FHIRPath."/>
       <min value="0"/>
       <max value="*"/>
@@ -2053,7 +2043,7 @@
         <max value="*"/>
       </base>
       <type>
-        <code value="code"/>
+        <code value="uri"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -2069,13 +2059,9 @@
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
           <valueString value="FHIRTypes"/>
         </extension>
-        <strength value="required"/>
-        <description value="A type of resource, or a Reference (from all versions)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-all-resource-types|6.0.0-ballot4"/>
-        <additional>
-          <purpose value="ui"/>
-          <valueSet value="http://hl7.org/fhir/ValueSet/all-resource-types"/>
-        </additional>
+        <strength value="extensible"/>
+        <description value="Either a resource or a data type, including logical model types."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-resource-types"/>
       </binding>
     </element>
     <element id="SearchParameter.multipleOr">
@@ -2279,6 +2265,14 @@
     </element>
     <element id="SearchParameter.component.extension">
       <path value="SearchParameter.component.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2310,6 +2304,14 @@
     </element>
     <element id="SearchParameter.component.modifierExtension">
       <path value="SearchParameter.component.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2443,6 +2445,13 @@
         <severity value="error"/>
         <human value="Search parameter aliases SHALL NOT contain '.', '$', '|', or whitespace characters"/>
         <expression value="aliasCode.empty() or aliasCode.all(matches('^[^.\\$\\|\\s]+$')).allTrue()"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/SearchParameter"/>
+      </constraint>
+      <constraint>
+        <key value="spd-6"/>
+        <severity value="warning"/>
+        <human value="Values for multipleOr and multipleAnd should be provided for clarity"/>
+        <expression value="multipleOr.exists() and multipleAnd.exists()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/SearchParameter"/>
       </constraint>
       <mustSupport value="false"/>
@@ -2732,7 +2741,7 @@
       <path value="SearchParameter.jurisdiction"/>
       <short value="Jurisdiction of the authority that maintains the search parameter (if applicable)"/>
       <definition value="A legal or geographic region in which the authority that maintains the resource is operating.  In general, the jurisdiction is also found in the useContext.  The useContext may reference additional jurisdictions because the defining jurisdiction does not necessarily limit the jurisdictions of use."/>
-      <comment value="It may be possible for the search parameter to be used in jurisdictions other than those for which it was originally designed or intended.&#xA;&#xA;DEPRECATION NOTE: For consistency, implementations are encouraged to migrate to using the new 'jurisdiction' code in the useContext element.  (I.e. useContext.code indicating http://terminology.hl7.org/CodeSystem/usage-context-type#jurisdiction and useContext.valueCodeableConcept indicating the jurisdiction.)"/>
+      <comment value="It may be possible for the search parameter to be used in jurisdictions other than those for which it was originally designed or intended."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -2859,12 +2868,12 @@
     <element id="SearchParameter.base">
       <path value="SearchParameter.base"/>
       <short value="The resource type(s) this search parameter applies to"/>
-      <definition value="The base resource type(s) that this search parameter can be used against."/>
+      <definition value="The base resource type(s) that this search parameter can be used against. This must be a resource, or a type with a [Structure Type Characterstics (Constraint Control)](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-structuredefinition-type-characteristics.html) of [can-be-target (Can Be Target)](https://build.fhir.org/ig/HL7/fhir-extensions/CodeSystem-type-characteristics-code.html#type-characteristics-code-can-be-target)."/>
       <comment value="A search parameter must always apply to at least one resource type. When search parameters apply to more than one resource type, they can be used against any of the listed resource types, or in a cross-type search (see [Cross Resource Search](http.html#xres-search))."/>
       <min value="1"/>
       <max value="*"/>
       <type>
-        <code value="code"/>
+        <code value="uri"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
@@ -2873,19 +2882,16 @@
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
           <valueString value="FHIRTypes"/>
         </extension>
-        <strength value="required"/>
-        <description value="A type of resource, or a Reference (from all versions)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-all-resource-types|6.0.0-ballot4"/>
-        <additional>
-          <purpose value="ui"/>
-          <valueSet value="http://hl7.org/fhir/ValueSet/all-resource-types"/>
-        </additional>
+        <strength value="extensible"/>
+        <description value="Either a resource or a data type, including logical model types."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-resource-types"/>
       </binding>
     </element>
     <element id="SearchParameter.type">
       <path value="SearchParameter.type"/>
       <short value="number | date | string | token | reference | composite | quantity | uri | special | resource"/>
       <definition value="The type of value that a search parameter may contain, and how the content is interpreted."/>
+      <comment value="If pre-adopting a new type from a future FHIR version, use the 'special' code and communicate the alternate type as an extension."/>
       <min value="1"/>
       <max value="1"/>
       <type>
@@ -2961,12 +2967,12 @@
     <element id="SearchParameter.target">
       <path value="SearchParameter.target"/>
       <short value="Types of resource (if a resource reference)"/>
-      <definition value="Types of resource (if a resource is referenced)."/>
+      <definition value="Types of resource (if a resource is referenced). This must be a resource, or a type with a [Structure Type Characterstics (Constraint Control)](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-structuredefinition-type-characteristics.html) of [can-be-target (Can Be Target)](https://build.fhir.org/ig/HL7/fhir-extensions/CodeSystem-type-characteristics-code.html#type-characteristics-code-can-be-target)."/>
       <comment value="In some cases, targets may exist for a search parameter that do not exist for the specified FHIRPath for all of the resources identified in SearchParameter.base.  For example, the core clinical-encounter search parameter allows both Encounter and EpisodeOfCare as targets, even though not all of the base resources have EpisodeOfCare as a valid target.&#xA;&#xA;However, the list of targets SHOULD cover all targets that might appear that are permitted by the specified FHIRPath."/>
       <min value="0"/>
       <max value="*"/>
       <type>
-        <code value="code"/>
+        <code value="uri"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
@@ -2975,13 +2981,9 @@
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
           <valueString value="FHIRTypes"/>
         </extension>
-        <strength value="required"/>
-        <description value="A type of resource, or a Reference (from all versions)"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-all-resource-types|6.0.0-ballot4"/>
-        <additional>
-          <purpose value="ui"/>
-          <valueSet value="http://hl7.org/fhir/ValueSet/all-resource-types"/>
-        </additional>
+        <strength value="extensible"/>
+        <description value="Either a resource or a data type, including logical model types."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/version-independent-resource-types"/>
       </binding>
     </element>
     <element id="SearchParameter.multipleOr">

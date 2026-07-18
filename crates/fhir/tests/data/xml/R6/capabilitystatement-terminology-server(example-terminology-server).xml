@@ -221,7 +221,7 @@
       <div class="panel panel-default">
         <div class="panel-heading">
           <h4 class="panel-title" id="CodeSystem1-1">
-            <span style="float: right;">Resource Conformance: SHALL </span>CodeSystem
+            <span style="float: right;">Resource Conformance: unspecified </span>CodeSystem
           </h4>
         </div>
         <div class="panel-body">
@@ -390,7 +390,7 @@
       <div class="panel panel-default">
         <div class="panel-heading">
           <h4 class="panel-title" id="ValueSet1-2">
-            <span style="float: right;">Resource Conformance: SHALL </span>ValueSet
+            <span style="float: right;">Resource Conformance: unspecified </span>ValueSet
           </h4>
         </div>
         <div class="panel-body">
@@ -548,7 +548,7 @@
       <div class="panel panel-default">
         <div class="panel-heading">
           <h4 class="panel-title" id="ConceptMap1-3">
-            <span style="float: right;">Resource Conformance: SHALL </span>ConceptMap
+            <span style="float: right;">Resource Conformance: unspecified </span>ConceptMap
           </h4>
         </div>
         <div class="panel-body">

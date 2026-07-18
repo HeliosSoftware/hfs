@@ -56,7 +56,7 @@
     </contentCodeableConcept>
   </payload>
   <payload>
-    <!-- Reference to the lab result  -->
+    <!-- Reference to the lab result -->
     <contentReference>
       <display value="Serum Potassium Observation"/>
     </contentReference>

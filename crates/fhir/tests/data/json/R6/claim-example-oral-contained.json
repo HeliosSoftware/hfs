@@ -199,12 +199,14 @@
   "diagnosis": [
     {
       "sequence": 1,
-      "diagnosisCodeableConcept": {
-        "coding": [
-          {
-            "code": "123456"
-          }
-        ]
+      "diagnosis": {
+        "concept": {
+          "coding": [
+            {
+              "code": "123456"
+            }
+          ]
+        }
       }
     }
   ],

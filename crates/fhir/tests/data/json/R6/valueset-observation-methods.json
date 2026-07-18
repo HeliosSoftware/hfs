@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "observation-methods",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -55,7 +55,7 @@
       ]
     }
   ],
-  "description": "Observation Method codes from [SNOMED CT](http://snomed.info/sct) where concept is-a 272394005 (Technique (qualifier value)) or is-a 129264002 (Action (qualifier value)) or is-a 386053000 (Evaluation procedure(procedure))",
+  "description": "Observation Method codes from [SNOMED CT](http://snomed.info/sct/) where concept is-a 272394005 (Technique (qualifier value)) or is-a 129264002 (Action (qualifier value)) or is-a 386053000 (Evaluation procedure(procedure))",
   "jurisdiction": [
     {
       "coding": [

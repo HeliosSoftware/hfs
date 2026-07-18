@@ -1,0 +1,79 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "detectedissue-management-code-example",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem detectedissue-management-code-example\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"detectedissue-management-code-example\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdetectedissue-management-code-example\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/detectedissue-management-code-example\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eintervention-required\u003ca name\u003d\"detectedissue-management-code-example-intervention-required\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProfessional Intervention Required\u003c/td\u003e\u003ctd\u003eIndicates the issue requires professional intervention.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ereview-suggested\u003ca name\u003d\"detectedissue-management-code-example-review-suggested\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProfessional Review Suggested\u003c/td\u003e\u003ctd\u003eIndicates professional review of the issue is suggested.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epotential-risk\u003ca name\u003d\"detectedissue-management-code-example-potential-risk\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePotential Risk\u003c/td\u003e\u003ctd\u003eIndicates the issue represents a potential risk.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/detectedissue-management-code-example",
+  "version": "6.0.0-ballot4",
+  "name": "DetectedIssueManagementCodeExample",
+  "title": "Detected Issue Management Code Example",
+  "status": "active",
+  "experimental": true,
+  "date": "2021-01-05T10:01:24+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Example code system illustrating the type action (management) required.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/detectedissue-management-code-example",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "intervention-required",
+      "display": "Professional Intervention Required",
+      "definition": "Indicates the issue requires professional intervention."
+    },
+    {
+      "code": "review-suggested",
+      "display": "Professional Review Suggested",
+      "definition": "Indicates professional review of the issue is suggested."
+    },
+    {
+      "code": "potential-risk",
+      "display": "Potential Risk",
+      "definition": "Indicates the issue represents a potential risk."
+    }
+  ]
+}
