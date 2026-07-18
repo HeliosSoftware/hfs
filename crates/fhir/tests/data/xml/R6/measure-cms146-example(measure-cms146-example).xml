@@ -81,6 +81,12 @@
     <start value="2017-01-01"/>
     <end value="2017-12-31"/>
   </effectivePeriod>
+  <topic>
+    <coding>
+      <system value="http://loinc.org"/>
+      <code value="57024-2"/>
+    </coding>
+  </topic>
   <author>
     <name value="National Committee for Quality Assurance"/>
   </author>

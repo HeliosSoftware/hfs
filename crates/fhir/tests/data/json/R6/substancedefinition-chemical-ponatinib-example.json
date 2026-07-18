@@ -1,0 +1,193 @@
+{
+  "resourceType": "SubstanceDefinition",
+  "id": "ponatinib-hcl",
+  "identifier": [
+    {
+      "system": "http://example.europa.eu/fhir/SMSId",
+      "value": "PONA4321C"
+    }
+  ],
+  "status": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/publication-status",
+        "code": "active",
+        "display": "Active"
+      }
+    ]
+  },
+  "classification": [
+    {
+      "coding": [
+        {
+          "system": "http://example.europa.eu/fhir/SubstanceType",
+          "code": "chemical",
+          "display": "Chemical"
+        }
+      ]
+    }
+  ],
+  "domain": {
+    "coding": [
+      {
+        "system": "http://example.europa.eu/fhir/Domain",
+        "code": "human",
+        "display": "Human use"
+      }
+    ]
+  },
+  "description": "Ponatinib hydrochloride — a small-molecule tyrosine kinase inhibitor (TKI) used in the treatment of chronic myeloid leukemia (CML) and Philadelphia chromosome-positive acute lymphoblastic leukemia (Ph+ ALL). Hydrochloride salt of ponatinib.",
+  "code": [
+    {
+      "code": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/Substance",
+            "code": "PONA4321C"
+          }
+        ]
+      }
+    }
+  ],
+  "name": [
+    {
+      "name": "Ponatinib Hydrochloride",
+      "preferred": true,
+      "language": [
+        {
+          "coding": [
+            {
+              "system": "urn:ietf:bcp:47",
+              "code": "en",
+              "display": "English"
+            }
+          ]
+        }
+      ],
+      "official": [
+        {
+          "authority": {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/substance-name-authority",
+                "code": "USAN",
+                "display": "USAN"
+              }
+            ]
+          },
+          "status": {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/publication-status",
+                "code": "active",
+                "display": "Active"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "molecularWeight": [
+    {
+      "type": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/WeightType",
+            "code": "exact",
+            "display": "Exact"
+          }
+        ]
+      },
+      "amount": {
+        "value": 569.04,
+        "unit": "g/mol",
+        "system": "http://unitsofmeasure.org",
+        "code": "g/mol"
+      }
+    }
+  ],
+  "moiety": [
+    {
+      "role": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/MoietyRole",
+            "code": "active-moiety",
+            "display": "Active moiety"
+          }
+        ]
+      },
+      "name": "Ponatinib",
+      "molecularFormula": "C29H27F3N6O"
+    },
+    {
+      "role": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/MoietyRole",
+            "code": "counter-ion",
+            "display": "Counter-ion (salt)"
+          }
+        ]
+      },
+      "name": "Hydrochloride",
+      "molecularFormula": "HCl"
+    }
+  ],
+  "relationship": [
+    {
+      "substanceDefinitionCodeableConcept": {
+        "coding": [
+          {
+            "system": "https://www.uniprot.org",
+            "code": "A9UF07",
+            "display": "BCR-ABL1 fusion kinase"
+          }
+        ]
+      },
+      "type": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-relationship-type",
+            "code": "TherapeuticTarget",
+            "display": "Therapeutic target"
+          }
+        ]
+      },
+      "interaction": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-interaction-type",
+            "code": "inhibition",
+            "display": "Inhibition"
+          }
+        ]
+      },
+      "measurementType": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/substance-measurement-type",
+            "code": "ic50",
+            "display": "IC50"
+          }
+        ]
+      },
+      "amountQuantity": {
+        "value": 0.37,
+        "unit": "nM",
+        "system": "http://unitsofmeasure.org",
+        "code": "nmol/L"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

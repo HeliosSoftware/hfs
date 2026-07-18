@@ -1,0 +1,99 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "oligo-nucleotide-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem oligo-nucleotide-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"oligo-nucleotide-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcoligo-nucleotide-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/oligo-nucleotide-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eantisense\u003ca name\u003d\"oligo-nucleotide-type-antisense\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAntisense oligonucleotide\u003c/td\u003e\u003ctd\u003eAn antisense oligonucleotide (ASO) that binds to a complementary mRNA sequence to inhibit gene expression.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esirna\u003ca name\u003d\"oligo-nucleotide-type-sirna\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSmall interfering RNA (siRNA)\u003c/td\u003e\u003ctd\u003eA short double-stranded RNA that triggers degradation of a target mRNA through the RNA interference pathway.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emirna\u003ca name\u003d\"oligo-nucleotide-type-mirna\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMicroRNA (miRNA)\u003c/td\u003e\u003ctd\u003eA short non-coding RNA that regulates gene expression by base-pairing with target mRNAs.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eaptamer\u003ca name\u003d\"oligo-nucleotide-type-aptamer\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAptamer\u003c/td\u003e\u003ctd\u003eA short single-stranded oligonucleotide that binds a specific target through its three-dimensional structure.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003edecoy\u003ca name\u003d\"oligo-nucleotide-type-decoy\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDecoy oligonucleotide\u003c/td\u003e\u003ctd\u003eAn oligonucleotide that mimics a regulatory binding site to sequester a transcription factor or other binding protein.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eribozyme\u003ca name\u003d\"oligo-nucleotide-type-ribozyme\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRibozyme / DNAzyme\u003c/td\u003e\u003ctd\u003eA catalytic oligonucleotide capable of cleaving a target nucleic acid.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003egene-fragment\u003ca name\u003d\"oligo-nucleotide-type-gene-fragment\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGene fragment\u003c/td\u003e\u003ctd\u003eA fragment of a gene such as a promoter, enhancer, coding region or silencer.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/oligo-nucleotide-type",
+  "version": "6.0.0-ballot4",
+  "name": "OligoNucleotideTypeExample",
+  "title": "Oligonucleotide Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-21",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The class of oligonucleotide, where relevant (e.g. antisense, siRNA, aptamer).",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/oligo-nucleotide-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "antisense",
+      "display": "Antisense oligonucleotide",
+      "definition": "An antisense oligonucleotide (ASO) that binds to a complementary mRNA sequence to inhibit gene expression."
+    },
+    {
+      "code": "sirna",
+      "display": "Small interfering RNA (siRNA)",
+      "definition": "A short double-stranded RNA that triggers degradation of a target mRNA through the RNA interference pathway."
+    },
+    {
+      "code": "mirna",
+      "display": "MicroRNA (miRNA)",
+      "definition": "A short non-coding RNA that regulates gene expression by base-pairing with target mRNAs."
+    },
+    {
+      "code": "aptamer",
+      "display": "Aptamer",
+      "definition": "A short single-stranded oligonucleotide that binds a specific target through its three-dimensional structure."
+    },
+    {
+      "code": "decoy",
+      "display": "Decoy oligonucleotide",
+      "definition": "An oligonucleotide that mimics a regulatory binding site to sequester a transcription factor or other binding protein."
+    },
+    {
+      "code": "ribozyme",
+      "display": "Ribozyme / DNAzyme",
+      "definition": "A catalytic oligonucleotide capable of cleaving a target nucleic acid."
+    },
+    {
+      "code": "gene-fragment",
+      "display": "Gene fragment",
+      "definition": "A fragment of a gene such as a promoter, enhancer, coding region or silencer."
+    }
+  ]
+}

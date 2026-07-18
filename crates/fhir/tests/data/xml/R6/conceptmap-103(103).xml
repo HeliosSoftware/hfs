@@ -19,8 +19,7 @@
         <a href="https://browser.ihtsdotools.org/">All Codes SCT ValueSet</a> to (not specified)
       </p>
       <br/>
-      <p>
-        <b>Group 1 </b>Mapping from 
+      <p>Mapping from 
         <code>http://snomed.info/sct</code> (SNOMED CT International Edition) to 
         <code>http://hl7.org/fhir/sid/icd-10-cm</code> (International Classification of Diseases, 10th Revision, Clinical Modification (ICD-10-CM))
       </p>

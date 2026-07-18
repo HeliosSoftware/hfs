@@ -18,6 +18,5 @@
     <details>
       <text value="The &#34;name&#34; parameter has the modifier &#34;exact&#34; which is not supported by this server"/>
     </details>
-    <location value="http.name:exact"/>
   </issue>
 </OperationOutcome>

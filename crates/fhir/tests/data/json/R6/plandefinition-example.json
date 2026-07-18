@@ -50,44 +50,6 @@
       "productReference": {
         "reference": "#citalopramMedication"
       },
-      "dosage": [
-        {
-          "text": "1 tablet oral 1 time daily",
-          "timing": {
-            "repeat": {
-              "frequency": 1,
-              "period": 1,
-              "periodUnit": "d"
-            }
-          },
-          "route": {
-            "coding": [
-              {
-                "code": "26643006",
-                "display": "Oral route (qualifier value)"
-              }
-            ],
-            "text": "Oral route (qualifier value)"
-          },
-          "doseAndRate": [
-            {
-              "type": {
-                "coding": [
-                  {
-                    "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                    "code": "ordered",
-                    "display": "Ordered"
-                  }
-                ]
-              },
-              "doseQuantity": {
-                "value": 1,
-                "unit": "{tbl}"
-              }
-            }
-          ]
-        }
-      ],
       "dynamicValue": [
         {
           "path": "dispenseRequest.numberOfRepeatsAllowed",

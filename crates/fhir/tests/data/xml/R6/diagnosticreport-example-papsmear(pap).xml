@@ -16,7 +16,7 @@
 		</div>
   </text>
   <status value="final"/>
-  <!--     all this report is final     -->
+  <!-- all this report is final -->
   <code>
     <coding>
       <system value="http://loinc.org"/>

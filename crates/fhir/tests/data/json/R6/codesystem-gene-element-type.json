@@ -1,0 +1,104 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "gene-element-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem gene-element-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"gene-element-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcgene-element-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/gene-element-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epromoter\u003ca name\u003d\"gene-element-type-promoter\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePromoter\u003c/td\u003e\u003ctd\u003eA DNA sequence that initiates and regulates transcription of a gene.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eenhancer\u003ca name\u003d\"gene-element-type-enhancer\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eEnhancer\u003c/td\u003e\u003ctd\u003eA DNA sequence that increases the rate of transcription.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esilencer\u003ca name\u003d\"gene-element-type-silencer\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSilencer\u003c/td\u003e\u003ctd\u003eA DNA sequence that reduces or prevents transcription.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eterminator\u003ca name\u003d\"gene-element-type-terminator\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eTerminator\u003c/td\u003e\u003ctd\u003eA DNA sequence that signals the end of transcription.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003erepressor\u003ca name\u003d\"gene-element-type-repressor\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRepressor binding site\u003c/td\u003e\u003ctd\u003eA DNA sequence to which a repressor protein binds to inhibit transcription.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecoding-sequence\u003ca name\u003d\"gene-element-type-coding-sequence\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCoding sequence (CDS)\u003c/td\u003e\u003ctd\u003eThe portion of a gene that encodes a protein.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eintron\u003ca name\u003d\"gene-element-type-intron\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eIntron\u003c/td\u003e\u003ctd\u003eA non-coding sequence within a gene that is spliced out during mRNA processing.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eribozyme\u003ca name\u003d\"gene-element-type-ribozyme\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRibozyme\u003c/td\u003e\u003ctd\u003eA catalytic RNA element.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/gene-element-type",
+  "version": "6.0.0-ballot4",
+  "name": "GeneElementTypeExample",
+  "title": "Gene Element Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-23",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The functional role of a DNA element within a gene therapy construct.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/gene-element-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "promoter",
+      "display": "Promoter",
+      "definition": "A DNA sequence that initiates and regulates transcription of a gene."
+    },
+    {
+      "code": "enhancer",
+      "display": "Enhancer",
+      "definition": "A DNA sequence that increases the rate of transcription."
+    },
+    {
+      "code": "silencer",
+      "display": "Silencer",
+      "definition": "A DNA sequence that reduces or prevents transcription."
+    },
+    {
+      "code": "terminator",
+      "display": "Terminator",
+      "definition": "A DNA sequence that signals the end of transcription."
+    },
+    {
+      "code": "repressor",
+      "display": "Repressor binding site",
+      "definition": "A DNA sequence to which a repressor protein binds to inhibit transcription."
+    },
+    {
+      "code": "coding-sequence",
+      "display": "Coding sequence (CDS)",
+      "definition": "The portion of a gene that encodes a protein."
+    },
+    {
+      "code": "intron",
+      "display": "Intron",
+      "definition": "A non-coding sequence within a gene that is spliced out during mRNA processing."
+    },
+    {
+      "code": "ribozyme",
+      "display": "Ribozyme",
+      "definition": "A catalytic RNA element."
+    }
+  ]
+}

@@ -46,14 +46,6 @@
       <display value="Bacterial sepsis"/>
     </coding>
   </code>
-  <bodySite>
-    <!-- Location is intravascular pulmonary -->
-    <coding>
-      <system value="http://snomed.info/sct"/>
-      <code value="281158006"/>
-      <display value="Pulmonary vascular structure"/>
-    </coding>
-  </bodySite>
   <subject>
     <!-- It entails Roel's problem -->
     <reference value="Patient/f201"/>

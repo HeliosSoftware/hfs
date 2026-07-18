@@ -37,6 +37,11 @@
       "reference": "Organization/f203"
     }
   ],
+  "manager": [
+    {
+      "reference": "Organization/f203"
+    }
+  ],
   "sourceAttachment": [
     {
       "title": "The terms of the consent in lawyer speak."

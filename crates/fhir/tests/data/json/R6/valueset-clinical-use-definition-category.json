@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "clinical-use-definition-category",
   "meta": {
-    "lastUpdated": "2026-06-14T04:13:29.148+11:00"
+    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
   },
   "text": {
     "status": "generated",
@@ -30,8 +30,8 @@
     }
   ],
   "version": "6.0.0-ballot4",
-  "name": "ClinicalUseDefinitionCategory",
-  "title": "Clinical Use Definition Category",
+  "name": "ClinicalUseDefinitionCategoryExample",
+  "title": "Clinical Use Definition Category Example",
   "status": "active",
   "experimental": false,
   "date": "2020-12-28T16:55:11+11:00",

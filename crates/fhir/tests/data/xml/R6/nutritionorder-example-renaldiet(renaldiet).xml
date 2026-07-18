@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  id = renaldiet  file name = nutritionorder-example-renaldiet.xml Name= Renal Diet  Description = Nutrition Order Renal Diet Example
-edited by Eric Haas Health eData Inc
- -->
-  <!--  EH: use oral Diet element  -->
+  <!-- id = renaldiet  file name = nutritionorder-example-renaldiet.xml Name= Renal Diet  Description = Nutrition Order Renal Diet Example
+edited by Eric Haas Health eData Inc -->
+  <!-- EH: use oral Diet element -->
   <id value="renaldiet"/>
   <meta>
     <security>
@@ -27,7 +26,7 @@ edited by Eric Haas Health eData Inc
   </encounter>
   <dateTime value="2014-09-17"/>
   <allergyIntolerance>
-    <!-- EH  Show all the elements in this examples for preference, and intolerance  -->
+    <!-- EH  Show all the elements in this examples for preference, and intolerance -->
     <reference value="AllergyIntolerance/example"/>
     <display value="Cashew Nuts"/>
   </allergyIntolerance>
@@ -79,7 +78,7 @@ edited by Eric Haas Health eData Inc
         <display value="Fluid restricted diet (regime/therapy)"/>
       </coding>
     </type>
-    <!--  EH example of three times a day starting on 2/10  -->
+    <!-- EH example of three times a day starting on 2/10 -->
     <schedule>
       <timing>
         <repeat>
@@ -93,7 +92,7 @@ edited by Eric Haas Health eData Inc
       </timing>
     </schedule>
     <nutrient>
-      <!--  list nutrients and amounts here  -->
+      <!-- list nutrients and amounts here -->
       <modifier>
         <coding>
           <system value="http://snomed.info/sct"/>

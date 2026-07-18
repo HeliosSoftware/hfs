@@ -1,0 +1,99 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "substance-target-organism-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem substance-target-organism-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"substance-target-organism-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsubstance-target-organism-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/substance-target-organism-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ebacterial\u003ca name\u003d\"substance-target-organism-type-bacterial\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBacterial\u003c/td\u003e\u003ctd\u003eBacterial organism.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eviral\u003ca name\u003d\"substance-target-organism-type-viral\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eViral\u003c/td\u003e\u003ctd\u003eViral organism.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efungal\u003ca name\u003d\"substance-target-organism-type-fungal\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFungal\u003c/td\u003e\u003ctd\u003eFungal organism.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eparasitic\u003ca name\u003d\"substance-target-organism-type-parasitic\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eParasitic\u003c/td\u003e\u003ctd\u003eParasitic organism.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehelminthic\u003ca name\u003d\"substance-target-organism-type-helminthic\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHelminthic\u003c/td\u003e\u003ctd\u003eHelminthic (worm) organism.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eprion\u003ca name\u003d\"substance-target-organism-type-prion\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePrion\u003c/td\u003e\u003ctd\u003ePrion.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eprotozoan\u003ca name\u003d\"substance-target-organism-type-protozoan\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProtozoan\u003c/td\u003e\u003ctd\u003eProtozoan organism.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/substance-target-organism-type",
+  "version": "6.0.0-ballot4",
+  "name": "SubstanceTargetOrganismTypeExample",
+  "title": "Substance Target Organism Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-23",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The high-level type of organism that a substance is targeted against.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/substance-target-organism-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "bacterial",
+      "display": "Bacterial",
+      "definition": "Bacterial organism."
+    },
+    {
+      "code": "viral",
+      "display": "Viral",
+      "definition": "Viral organism."
+    },
+    {
+      "code": "fungal",
+      "display": "Fungal",
+      "definition": "Fungal organism."
+    },
+    {
+      "code": "parasitic",
+      "display": "Parasitic",
+      "definition": "Parasitic organism."
+    },
+    {
+      "code": "helminthic",
+      "display": "Helminthic",
+      "definition": "Helminthic (worm) organism."
+    },
+    {
+      "code": "prion",
+      "display": "Prion",
+      "definition": "Prion."
+    },
+    {
+      "code": "protozoan",
+      "display": "Protozoan",
+      "definition": "Protozoan organism."
+    }
+  ]
+}

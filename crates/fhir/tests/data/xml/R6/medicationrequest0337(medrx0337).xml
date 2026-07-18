@@ -75,14 +75,14 @@
   <status value="completed"/>
   <intent value="order"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0337"/>
       <display value="Dopamine 400mg in 500mL D5W"/>
     </reference>
   </medication>
   <subject>
-    <!--  Linked to the resource patient who needs the medication  -->
+    <!-- Linked to the resource patient who needs the medication -->
     <reference value="Patient/pat1"/>
     <display value="Donald Duck"/>
   </subject>

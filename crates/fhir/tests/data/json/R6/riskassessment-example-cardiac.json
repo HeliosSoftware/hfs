@@ -13,6 +13,20 @@
     }
   ],
   "status": "final",
+  "code": {
+    "coding": [
+      {
+        "system": "http://snomed.info/sct",
+        "code": "709510001",
+        "display": "Assessment of risk for disease (procedure)"
+      },
+      {
+        "system": "http://hl7.org/fhir/risk-assessment-type-example",
+        "code": "cardiovascular-risk",
+        "display": "Cardiovascular Risk"
+      }
+    ]
+  },
   "subject": {
     "reference": "Patient/pat2"
   },

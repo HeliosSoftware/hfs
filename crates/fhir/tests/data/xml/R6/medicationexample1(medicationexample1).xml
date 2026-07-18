@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Medication xmlns="http://hl7.org/fhir">
   <id value="medicationexample1"/>
-  <!--  this example includes the code text element only  -->
+  <!-- this example includes the code text element only -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
