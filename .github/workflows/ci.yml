@@ -17,8 +17,24 @@ env:
 jobs:
   test-rust:
     name: Test Rust
-    runs-on: [self-hosted]
+    # TEMPORARY (diag/macos-runner-dyld): pinned to the macOS runner
+    # (github-agent5) to reproduce the intermittent dyld shared-cache
+    # failure in the helios-rest lib test. Revert to [self-hosted]
+    # before merging.
+    runs-on: [self-hosted, macOS]
     steps:
+      - name: Runner diagnostics (TEMPORARY)
+        run: |
+          echo "=== runner ==="
+          uname -a; sw_vers || true
+          echo "=== disk ==="
+          df -h
+          echo "=== memory ==="
+          vm_stat || true
+          sysctl hw.memsize vm.swapusage || true
+          echo "=== stale helios_rest test binaries ==="
+          ls -la target/debug/deps/helios_rest-* 2>/dev/null || echo "(none present)"
+
       - name: Verify DOCKER_HOST is set
         if: env.DOCKER_HOST == ''
         run: |
