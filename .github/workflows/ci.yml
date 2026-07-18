@@ -2,7 +2,9 @@ name: HFS Continuous Integration
 
 on:
   push:
-    branches: [main, develop]
+    # TEMPORARY (diag/macos-runner-dyld): added to trigger CI on the
+    # diagnostic branch without opening a PR. Revert before merging.
+    branches: [main, develop, diag/macos-runner-dyld]
     tags:
       - "v*"
   pull_request:
