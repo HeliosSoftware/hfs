@@ -19,8 +19,8 @@
   <destination>
     <endpointUrl value="llp:10.11.12.14:5432"/>
     <name value="Acme Message Gateway"/>
-    <!--  this is to indicate to the Acme Message Gateway that this particular message 
-       is intended for Practitioner "xcda"  -->
+    <!-- this is to indicate to the Acme Message Gateway that this particular message 
+       is intended for Practitioner "xcda" -->
     <receiver>
       <reference value="http://acme.com/ehr/fhir/Practitioner/2323-33-4"/>
     </receiver>
@@ -50,7 +50,7 @@
     </identifier>
     <code value="ok"/>
   </response>
-  <!--  Here's the payload, the resource that this admin-update concerns  -->
+  <!-- Here's the payload, the resource that this admin-update concerns -->
   <focus>
     <reference value="Patient/example"/>
   </focus>

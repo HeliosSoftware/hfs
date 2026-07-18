@@ -40,7 +40,7 @@
   "name": "MoneyQuantity",
   "status": "active",
   "experimental": false,
-  "date": "2026-06-13T17:13:29+00:00",
+  "date": "2026-07-17T03:44:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -294,8 +294,8 @@
       {
         "id": "Quantity.comparator",
         "path": "Quantity.comparator",
-        "short": "\u003c | \u003c\u003d | \u003e\u003d | \u003e | ad - how to understand the value",
-        "definition": "How the value should be understood and represented - whether the actual value is greater or less than the stated value due to measurement issues; e.g. if the comparator is \"\u003c\" , then the real value is \u003c stated value.",
+        "short": "\u003c | \u003c\u003d | \u003e\u003d | \u003e | ~ | ad - how to understand the value",
+        "definition": "How the value should be understood and represented - whether the actual value is greater than, less than, or approximately equal to the stated value due to measurement issues; e.g. if the comparator is \"\u003c\" , then the real value is \u003c stated value.",
         "requirements": "Need a framework for handling measures where the value is \u003c5ug/L or \u003e400mg/L due to the limitations of measuring methodology.",
         "min": 0,
         "max": "1",

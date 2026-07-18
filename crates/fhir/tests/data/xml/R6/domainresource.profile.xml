@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="DomainResource"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -176,7 +176,7 @@
   <name value="DomainResource"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -268,7 +268,7 @@
       <path value="DomainResource.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>

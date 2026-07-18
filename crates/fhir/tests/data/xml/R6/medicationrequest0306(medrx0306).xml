@@ -34,13 +34,13 @@
     </reference>
   </medication>
   <subject>
-    <!--  Linked to the resource patient who needs the medication  -->
+    <!-- Linked to the resource patient who needs the medication -->
     <reference value="Patient/pat1"/>
     <display value="Donald Duck"/>
   </subject>
   <authoredOn value="2015-01-15"/>
   <requester>
-    <!--  Linked to the practitioner who treats patient  -->
+    <!-- Linked to the practitioner who treats patient -->
     <reference value="Practitioner/f007"/>
     <display value="Patrick Pump"/>
   </requester>

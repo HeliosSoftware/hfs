@@ -19,11 +19,9 @@
       <code value="FIXDATA"/>
     </coding>
   </activity>
-  <!-- 
-  <basedOn>
+  <!-- <basedOn>
     <reference value="DocumentReference/ex-documentation-immunization-correction"/>
-  </basedOn>
-   -->
+  </basedOn> -->
   <patient>
     <reference value="Patient/example"/>
   </patient>

@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "risk-assessment-method-example",
   "meta": {
-    "lastUpdated": "2026-06-14T04:13:29.148+11:00"
+    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
   },
   "text": {
     "status": "generated",
@@ -56,7 +56,7 @@
     }
   ],
   "caseSensitive": true,
-  "valueSet": "http://hl7.org/fhir/ValueSet/risk-assessment-method",
+  "valueSet": "http://hl7.org/fhir/ValueSet/risk-assessment-method-example",
   "content": "complete",
   "concept": [
     {

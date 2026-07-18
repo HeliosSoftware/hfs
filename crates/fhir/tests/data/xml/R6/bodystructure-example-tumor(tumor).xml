@@ -23,7 +23,7 @@
   </includedStructure>
   <description value="7 cm maximum diameter"/>
   <image>
-    <!--    The actual image could be anywhere. This is a WADO example using a ficitious url   -->
+    <!-- The actual image could be anywhere. This is a WADO example using a ficitious url -->
     <contentType value="application/dicom"/>
     <url value="http://imaging.acme.com/wado/server?requestType=WADO&amp;amp;wado_details"/>
   </image>

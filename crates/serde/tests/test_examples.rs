@@ -329,6 +329,10 @@ fn json_skip_list(_version: &str) -> &'static [(&'static str, &'static str)] {
             "provenance-example-bundle-allergyintolerance.json",
             "Contains null in AllergyIntolerance.category array - invalid FHIR JSON",
         ),
+        (
+            "terminologycapabilities-terminology-server.json",
+            "Contains null in codeSystem.version array where struct TempTerminologyCapabilitiesCodeSystemVersion expected - invalid FHIR JSON",
+        ),
     ];
 
     JSON_SKIPS

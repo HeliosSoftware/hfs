@@ -82,11 +82,11 @@
     <name value="Platinum"/>
   </class>
   <order value="2"/>
-  <!--  Second after the national medical coverage  -->
-  <network value="5"/>
+  <!-- Second after the national medical coverage -->
+  <network/>
   <costToBeneficiary>
     <type>
-      <!--  normally $40.00  -->
+      <!-- normally $40.00 -->
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/coverage-copay-type"/>
         <code value="gpvisit"/>
@@ -109,7 +109,4 @@
       </period>
     </exception>
   </costToBeneficiary>
-  <contract>
-    <reference value="Contract/INS-101"/>
-  </contract>
 </Coverage>

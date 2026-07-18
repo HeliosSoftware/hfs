@@ -43,18 +43,16 @@
       <text value="Dark lesion l) forearm. getting darker last 3 months."/>
     </concept>
   </reason>
-  <!--  
-  <bodySite>
+  <!-- <bodySite>
       <coding>
         <system value="http://snomed.info/sct"/>
         <code value="368225008"/>
         <display value="Entire Left Forearm"/>
       </coding>
       <text value="Left forearm"/>
-  </bodySite>
-   -->
+  </bodySite> -->
   <bodyStructure>
-    <reference value="BodyStructure/skin-patch"/>
+    <reference/>
   </bodyStructure>
   <complication>
     <concept>

@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ActivityDefinition"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -113,7 +113,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="ActivityDefinition.version : The identifier that is used to identify this version of the activity definition when it is referenced in a specification, model, design or instance. This is an arbitrary value managed by the activity definition author and is not expected to be globally unique. For example, it might be a timestamp (e.g. yyyymmdd) if a managed version is not available. There is also no expectation that versions can be placed in a lexicographical sequence. To provide a version consistent with the Decision Support Service specification, use the format Major.Minor.Revision (e.g. 1.0.0). For more information on versioning knowledge assets, refer to the Decision Support Service specification. Note that a version is required for non-experimental active assets.">version</span>
+            <span title="ActivityDefinition.version : The identifier that is used to identify this version of the activity definition when it is referenced in a specification, model, design or instance. This is an arbitrary value managed by the activity definition author and is not expected to be globally unique. For example, it might be a timestamp (e.g. yyyymmdd) if a managed version is not available. There is also no expectation that versions can be placed in a lexicographical sequence. For more information on versioning knowledge artifacts, refer to the Canonical Resource Management Infrastructure (CRMI) implementation guide artifact versioning discussion (http://hl7.org/fhir/uv/crmi/artifact-lifecycle.html#artifact-versioning).">version</span>
             <a name="ActivityDefinition.version"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -480,7 +480,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Jurisdiction of the authority that maintains the activity definition (if applicable)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-jurisdiction.html">Jurisdiction ValueSet</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
             <br/>
@@ -650,7 +650,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="ActivityDefinition.author : An individiual or organization primarily involved in the creation and maintenance of the content.">author</span>
+            <span title="ActivityDefinition.author : An individual or organization primarily involved in the creation and maintenance of the content.">author</span>
             <a name="ActivityDefinition.author"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -1179,7 +1179,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">E.g. Nurse, Surgeon, Parent, etc
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-action-participant-role.html">Action Participant Role</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-action-participant-role.html">Action Participant Role</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1284,16 +1284,15 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="ActivityDefinition.dosage : Provides detailed dosage instructions in the same way that they are described for MedicationRequest resources.">dosage</span>
-            <a name="ActivityDefinition.dosage"> </a>
+            <span title="ActivityDefinition.dosageInstruction : Provides detailed dosage instructions in the same way that they are described for MedicationRequest resources.">dosageInstruction</span>
+            <a name="ActivityDefinition.dosageInstruction"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..*</td>
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a href="dosage.html#Dosage">Dosage</a>
+            <a href="dosage.html#DosageDetails">DosageDetails</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Detailed dosage instructions
-            <br/>
             <br/>
           </td>
         </tr>
@@ -1391,8 +1390,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a href="datatypes.html#canonical">canonical</a>(
-            <a href="structuremap.html">StructureMap</a>)
+            <a href="datatypes.html#canonical">canonical</a>()
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Transform to apply the template
             <br/>
@@ -1480,14 +1478,14 @@
     <valueInteger value="4"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-security-category">
-    <valueCode value="anonymous"/>
+    <valueCode value="business"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/ActivityDefinition"/>
   <version value="6.0.0-ballot4"/>
   <name value="ActivityDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Clinical Decision Support"/>
   <contact>
     <telecom>
@@ -1574,7 +1572,7 @@
       <path value="ActivityDefinition.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1753,6 +1751,14 @@
     </element>
     <element id="ActivityDefinition.extension">
       <path value="ActivityDefinition.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1785,6 +1791,14 @@
     </element>
     <element id="ActivityDefinition.modifierExtension">
       <path value="ActivityDefinition.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1908,7 +1922,7 @@
     <element id="ActivityDefinition.version">
       <path value="ActivityDefinition.version"/>
       <short value="Business version of the activity definition"/>
-      <definition value="The identifier that is used to identify this version of the activity definition when it is referenced in a specification, model, design or instance. This is an arbitrary value managed by the activity definition author and is not expected to be globally unique. For example, it might be a timestamp (e.g. yyyymmdd) if a managed version is not available. There is also no expectation that versions can be placed in a lexicographical sequence. To provide a version consistent with the Decision Support Service specification, use the format Major.Minor.Revision (e.g. 1.0.0). For more information on versioning knowledge assets, refer to the Decision Support Service specification. Note that a version is required for non-experimental active assets."/>
+      <definition value="The identifier that is used to identify this version of the activity definition when it is referenced in a specification, model, design or instance. This is an arbitrary value managed by the activity definition author and is not expected to be globally unique. For example, it might be a timestamp (e.g. yyyymmdd) if a managed version is not available. There is also no expectation that versions can be placed in a lexicographical sequence. For more information on versioning knowledge artifacts, refer to the Canonical Resource Management Infrastructure (CRMI) implementation guide artifact versioning discussion (http://hl7.org/fhir/uv/crmi/artifact-lifecycle.html#artifact-versioning)."/>
       <comment value="There may be different activity definition instances that have the same identifier but different versions.  The version can be appended to the url in a reference to allow a reference to a particular business version of the activity definition with the format [url]|[version]. The version SHOULD NOT contain a '#' - see [Business Version](resource.html#bv-format)."/>
       <min value="0"/>
       <max value="1"/>
@@ -2433,7 +2447,7 @@
       <path value="ActivityDefinition.jurisdiction"/>
       <short value="Jurisdiction of the authority that maintains the activity definition (if applicable)"/>
       <definition value="A legal or geographic region in which the authority that maintains the resource is operating.  In general, the jurisdiction is also found in the useContext.  The useContext may reference additional jurisdictions because the defining jurisdiction does not necessarily limit the jurisdictions of use."/>
-      <comment value="It may be possible for the activity definition to be used in jurisdictions other than those for which it was originally designed or intended.&#xA;&#xA;DEPRECATION NOTE: For consistency, implementations are encouraged to migrate to using the new 'jurisdiction' code in the useContext element.  (I.e. useContext.code indicating http://terminology.hl7.org/CodeSystem/usage-context-type#jurisdiction and useContext.valueCodeableConcept indicating the jurisdiction.)"/>
+      <comment value="It may be possible for the activity definition to be used in jurisdictions other than those for which it was originally designed or intended."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2757,7 +2771,6 @@
       <path value="ActivityDefinition.topic"/>
       <short value="E.g. Education, Treatment, Assessment, etc"/>
       <definition value="Descriptive topics related to the content of the activity. Topics provide a high-level categorization of the activity that can be useful for filtering and searching."/>
-      <comment value="DEPRECATION NOTE: For consistency, implementations are encouraged to migrate to using the new 'topic' code in the useContext element.  (I.e. useContext.code indicating http://terminology.hl7.org/CodeSystem/usage-context-type#topic and useContext.valueCodeableConcept indicating the topic)"/>
       <requirements value="Repositories must be able to determine how to categorize the activity definition so that it can be found by topical searches."/>
       <min value="0"/>
       <max value="*"/>
@@ -2795,7 +2808,7 @@
     <element id="ActivityDefinition.author">
       <path value="ActivityDefinition.author"/>
       <short value="Who authored the content"/>
-      <definition value="An individiual or organization primarily involved in the creation and maintenance of the content."/>
+      <definition value="An individual or organization primarily involved in the creation and maintenance of the content."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2930,7 +2943,7 @@
         <key value="adf-2"/>
         <severity value="warning"/>
         <human value="Dependencies of an ActivityDefinition should reference a resource"/>
-        <expression value="type in ('depends-on' | 'part-of') implies ((resource.exists() xor resourceReference.exists()) or (artifact is canonical xor artifact is Reference))"/>
+        <expression value="type in ('depends-on' | 'part-of') implies ((resource.exists() xor resourceReference.exists()))"/>
         <source value="http://hl7.org/fhir/StructureDefinition/ActivityDefinition"/>
       </constraint>
       <constraint>
@@ -3375,6 +3388,14 @@
     </element>
     <element id="ActivityDefinition.participant.extension">
       <path value="ActivityDefinition.participant.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3406,6 +3427,14 @@
     </element>
     <element id="ActivityDefinition.participant.modifierExtension">
       <path value="ActivityDefinition.participant.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3704,20 +3733,20 @@
         <map value=".quantity {for classCode=SPLY}"/>
       </mapping>
     </element>
-    <element id="ActivityDefinition.dosage">
-      <path value="ActivityDefinition.dosage"/>
+    <element id="ActivityDefinition.dosageInstruction">
+      <path value="ActivityDefinition.dosageInstruction"/>
       <short value="Detailed dosage instructions"/>
       <definition value="Provides detailed dosage instructions in the same way that they are described for MedicationRequest resources."/>
       <comment value="If a dosage instruction is used, the definition should not specify timing or quantity."/>
       <min value="0"/>
-      <max value="*"/>
+      <max value="1"/>
       <base>
-        <path value="ActivityDefinition.dosage"/>
+        <path value="ActivityDefinition.dosageInstruction"/>
         <min value="0"/>
-        <max value="*"/>
+        <max value="1"/>
       </base>
       <type>
-        <code value="Dosage"/>
+        <code value="DosageDetails"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -3879,7 +3908,6 @@
       </base>
       <type>
         <code value="canonical"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/StructureMap"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -3955,6 +3983,14 @@
     </element>
     <element id="ActivityDefinition.dynamicValue.extension">
       <path value="ActivityDefinition.dynamicValue.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3986,6 +4022,14 @@
     </element>
     <element id="ActivityDefinition.dynamicValue.modifierExtension">
       <path value="ActivityDefinition.dynamicValue.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -4175,7 +4219,7 @@
     <element id="ActivityDefinition.version">
       <path value="ActivityDefinition.version"/>
       <short value="Business version of the activity definition"/>
-      <definition value="The identifier that is used to identify this version of the activity definition when it is referenced in a specification, model, design or instance. This is an arbitrary value managed by the activity definition author and is not expected to be globally unique. For example, it might be a timestamp (e.g. yyyymmdd) if a managed version is not available. There is also no expectation that versions can be placed in a lexicographical sequence. To provide a version consistent with the Decision Support Service specification, use the format Major.Minor.Revision (e.g. 1.0.0). For more information on versioning knowledge assets, refer to the Decision Support Service specification. Note that a version is required for non-experimental active assets."/>
+      <definition value="The identifier that is used to identify this version of the activity definition when it is referenced in a specification, model, design or instance. This is an arbitrary value managed by the activity definition author and is not expected to be globally unique. For example, it might be a timestamp (e.g. yyyymmdd) if a managed version is not available. There is also no expectation that versions can be placed in a lexicographical sequence. For more information on versioning knowledge artifacts, refer to the Canonical Resource Management Infrastructure (CRMI) implementation guide artifact versioning discussion (http://hl7.org/fhir/uv/crmi/artifact-lifecycle.html#artifact-versioning)."/>
       <comment value="There may be different activity definition instances that have the same identifier but different versions.  The version can be appended to the url in a reference to allow a reference to a particular business version of the activity definition with the format [url]|[version]. The version SHOULD NOT contain a '#' - see [Business Version](resource.html#bv-format)."/>
       <min value="0"/>
       <max value="1"/>
@@ -4544,7 +4588,7 @@
       <path value="ActivityDefinition.jurisdiction"/>
       <short value="Jurisdiction of the authority that maintains the activity definition (if applicable)"/>
       <definition value="A legal or geographic region in which the authority that maintains the resource is operating.  In general, the jurisdiction is also found in the useContext.  The useContext may reference additional jurisdictions because the defining jurisdiction does not necessarily limit the jurisdictions of use."/>
-      <comment value="It may be possible for the activity definition to be used in jurisdictions other than those for which it was originally designed or intended.&#xA;&#xA;DEPRECATION NOTE: For consistency, implementations are encouraged to migrate to using the new 'jurisdiction' code in the useContext element.  (I.e. useContext.code indicating http://terminology.hl7.org/CodeSystem/usage-context-type#jurisdiction and useContext.valueCodeableConcept indicating the jurisdiction.)"/>
+      <comment value="It may be possible for the activity definition to be used in jurisdictions other than those for which it was originally designed or intended."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -4772,7 +4816,6 @@
       <path value="ActivityDefinition.topic"/>
       <short value="E.g. Education, Treatment, Assessment, etc"/>
       <definition value="Descriptive topics related to the content of the activity. Topics provide a high-level categorization of the activity that can be useful for filtering and searching."/>
-      <comment value="DEPRECATION NOTE: For consistency, implementations are encouraged to migrate to using the new 'topic' code in the useContext element.  (I.e. useContext.code indicating http://terminology.hl7.org/CodeSystem/usage-context-type#topic and useContext.valueCodeableConcept indicating the topic)"/>
       <requirements value="Repositories must be able to determine how to categorize the activity definition so that it can be found by topical searches."/>
       <min value="0"/>
       <max value="*"/>
@@ -4798,7 +4841,7 @@
     <element id="ActivityDefinition.author">
       <path value="ActivityDefinition.author"/>
       <short value="Who authored the content"/>
-      <definition value="An individiual or organization primarily involved in the creation and maintenance of the content."/>
+      <definition value="An individual or organization primarily involved in the creation and maintenance of the content."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -4887,7 +4930,7 @@
         <key value="adf-2"/>
         <severity value="warning"/>
         <human value="Dependencies of an ActivityDefinition should reference a resource"/>
-        <expression value="type in ('depends-on' | 'part-of') implies ((resource.exists() xor resourceReference.exists()) or (artifact is canonical xor artifact is Reference))"/>
+        <expression value="type in ('depends-on' | 'part-of') implies ((resource.exists() xor resourceReference.exists()))"/>
         <source value="http://hl7.org/fhir/StructureDefinition/ActivityDefinition"/>
       </constraint>
       <mustSupport value="false"/>
@@ -5339,15 +5382,15 @@
         <map value=".quantity {for classCode=SPLY}"/>
       </mapping>
     </element>
-    <element id="ActivityDefinition.dosage">
-      <path value="ActivityDefinition.dosage"/>
+    <element id="ActivityDefinition.dosageInstruction">
+      <path value="ActivityDefinition.dosageInstruction"/>
       <short value="Detailed dosage instructions"/>
       <definition value="Provides detailed dosage instructions in the same way that they are described for MedicationRequest resources."/>
       <comment value="If a dosage instruction is used, the definition should not specify timing or quantity."/>
       <min value="0"/>
-      <max value="*"/>
+      <max value="1"/>
       <type>
-        <code value="Dosage"/>
+        <code value="DosageDetails"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
@@ -5449,7 +5492,6 @@
       <max value="1"/>
       <type>
         <code value="canonical"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/StructureMap"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>

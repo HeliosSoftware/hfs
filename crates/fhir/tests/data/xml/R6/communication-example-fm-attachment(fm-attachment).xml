@@ -10,9 +10,8 @@
   <text>
     <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml">Attachment which is unsolicited</div>
   </text>
-  <!--  insert contents here  -->
-  <!-- 
-   <contained>
+  <!-- insert contents here -->
+  <!-- <contained>
     <Organization>
       <id value="provider"/>
       <identifier>
@@ -59,9 +58,8 @@
       </identifier>
 	  <status value="draft"/>
     </ClaimResponse>
-  </contained> 
-   -->
-  <!--  body of the resource  -->
+  </contained> -->
+  <!-- body of the resource -->
   <identifier>
     <system value="http://www.providerco.com/communication"/>
     <value value="12345"/>
@@ -76,16 +74,16 @@
   <subject>
     <reference value="Patient/1"/>
   </subject>
-  <!--  Example using about 0..* Resource(Any) to provide focal resources  -->
+  <!-- Example using about 0..* Resource(Any) to provide focal resources -->
   <about>
-    <!--  reference value="#claim"/  -->
+    <!-- reference value="#claim"/ -->
     <identifier>
       <system value="http://happyvalley.com/claim"/>
       <value value="12345"/>
     </identifier>
   </about>
   <about>
-    <!--  reference value="#claimresponse"/  -->
+    <!-- reference value="#claimresponse"/ -->
     <identifier>
       <system value="http://www.BenefitsInc.com/fhir/claimresponse"/>
       <value value="R3500"/>
@@ -93,14 +91,14 @@
   </about>
   <sent value="2016-06-12T18:01:10-08:00"/>
   <recipient>
-    <!--  reference value="#payor"/  -->
+    <!-- reference value="#payor"/ -->
     <identifier>
       <system value="http://www.jurisdiction.com/insurer"/>
       <value value="123456"/>
     </identifier>
   </recipient>
   <sender>
-    <!--  reference value="#provider"/  -->
+    <!-- reference value="#provider"/ -->
     <identifier>
       <system value="http://www.jurisdiction.com/provideroffices"/>
       <value value="3456"/>

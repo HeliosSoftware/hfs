@@ -21,14 +21,14 @@
     <linkId value="1.1"/>
     <answer>
       <valueCoding>
-        <!--    This example has the extension which maps a numeric score to the code this may already be known and unecessary in the Observation resource   -->
-        <!--   0..1 Value of extension   -->
+        <!-- This example has the extension which maps a numeric score to the code this may already be known and unecessary in the Observation resource -->
+        <!-- 0..1 Value of extension -->
         <extension url="http://hl7.org/fhir/StructureDefinition/itemWeight">
-          <!--   from Element: extension   -->
+          <!-- from Element: extension -->
           <valueDecimal value="4"/>
         </extension>
         <system value="http://loinc.org"/>
-        <!--  technicallly the code is '5' and the LA is the identifier to do hav e both  would require an extention  -->
+        <!-- technicallly the code is '5' and the LA is the identifier to do hav e both  would require an extention -->
         <code value="LA6560-2"/>
         <display value="Confused"/>
       </valueCoding>
@@ -38,10 +38,10 @@
     <linkId value="1.2"/>
     <answer>
       <valueCoding>
-        <!--    This example has the extension which maps a numeric score to the code this may already be known and unecessary in the Observation resource   -->
-        <!--   0..1 Value of extension   -->
+        <!-- This example has the extension which maps a numeric score to the code this may already be known and unecessary in the Observation resource -->
+        <!-- 0..1 Value of extension -->
         <extension url="http://hl7.org/fhir/StructureDefinition/itemWeight">
-          <!--   from Element: extension   -->
+          <!-- from Element: extension -->
           <valueDecimal value="5"/>
         </extension>
         <system value="http://loinc.org"/>
@@ -54,14 +54,14 @@
     <linkId value="1.3"/>
     <answer>
       <valueCoding>
-        <!--    This example has the extension which maps a numeric score to the code this may already be known and unecessary in the Observation resource   -->
-        <!--   0..1 Value of extension   -->
+        <!-- This example has the extension which maps a numeric score to the code this may already be known and unecessary in the Observation resource -->
+        <!-- 0..1 Value of extension -->
         <extension url="http://hl7.org/fhir/StructureDefinition/itemWeight">
-          <!--   from Element: extension   -->
+          <!-- from Element: extension -->
           <valueDecimal value="4"/>
         </extension>
         <system value="http://loinc.org"/>
-        <!--  technicallly the code is '4' and the LA is the identifier to do hav e both  would require an extention  -->
+        <!-- technicallly the code is '4' and the LA is the identifier to do hav e both  would require an extention -->
         <code value="LA6556-0"/>
         <display value="Eyes open spontaneously"/>
       </valueCoding>

@@ -98,8 +98,6 @@
             <a href="resource.html#Meta">Bundle.meta.security</a>)) as a whole, based on an analysis of the resources contained within the document
           </li>
 
-          <li>this operation definition does not resolve the question how document signatures are created. This is an open issue during the period of trial use, and feedback is requested regarding this question</li>
-
         </ul>
 
       </div>
@@ -121,7 +119,7 @@
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Structured Documents"/>
   <contact>
     <telecom>
@@ -149,7 +147,7 @@
   </jurisdiction>
   <affectsState value="false"/>
   <code value="document"/>
-  <comment value="Notes:&#xA;&#xA;* The server implementing the operation SHOULD determine a 'high-level water-mark' for the document security tags ([Bundle.meta.security](resource.html#Meta))) as a whole, based on an analysis of the resources contained within the document&#xA;* this operation definition does not resolve the question how document signatures are created. This is an open issue during the period of trial use, and feedback is requested regarding this question"/>
+  <comment value="Notes:&#xA;&#xA;* The server implementing the operation SHOULD determine a 'high-level water-mark' for the document security tags ([Bundle.meta.security](resource.html#Meta))) as a whole, based on an analysis of the resources contained within the document"/>
   <resource value="Composition"/>
   <system value="false"/>
   <type value="false"/>

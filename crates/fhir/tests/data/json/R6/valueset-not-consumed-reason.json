@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "not-consumed-reason",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -45,7 +45,7 @@
       ]
     }
   ],
-  "description": "This value set represents codes for types of edible substances and is provided as a suggestive example.  It include codes from [SNOMED CT](http://snomed.info/sct) where concept is-a 762766007 Edible Substance (substance).",
+  "description": "This value set represents codes for types of edible substances and is provided as a suggestive example.  It include codes from [SNOMED CT](http://snomed.info/sct/) where concept is-a 762766007 Edible Substance (substance).",
   "jurisdiction": [
     {
       "coding": [

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Patient xmlns="http://hl7.org/fhir">
   <id value="example"/>
-  <!--   MRN assigned by ACME healthcare on 6-May 2001   -->
+  <!-- MRN assigned by ACME healthcare on 6-May 2001 -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -26,7 +26,7 @@
     </assigner>
   </identifier>
   <active value="true"/>
-  <!--   Peter James Chalmers, but called "Jim"   -->
+  <!-- Peter James Chalmers, but called "Jim" -->
   <name>
     <use value="official"/>
     <family value="Chalmers"/>
@@ -38,7 +38,7 @@
     <given value="Jim"/>
   </name>
   <name>
-    <!--  Maiden names apply for anyone whose name changes as a result of marriage - irrespective of gender  -->
+    <!-- Maiden names apply for anyone whose name changes as a result of marriage - irrespective of gender -->
     <use value="maiden"/>
     <family value="Windsor"/>
     <given value="Peter"/>
@@ -47,7 +47,7 @@
       <end value="2002"/>
     </period>
   </name>
-  <!--   home communication details aren't known   -->
+  <!-- home communication details aren't known -->
   <telecom>
     <use value="home"/>
   </telecom>
@@ -71,7 +71,7 @@
       <end value="2014"/>
     </period>
   </telecom>
-  <!--   use FHIR code system for male / female   -->
+  <!-- use FHIR code system for male / female -->
   <gender value="male"/>
   <birthDate value="1974-12-25">
     <extension url="http://hl7.org/fhir/StructureDefinition/patient-birthTime">
@@ -101,7 +101,7 @@
     </relationship>
     <name>
       <family value="du Marché">
-        <!--   the "du" part is a family name prefix (VV in iso 21090)   -->
+        <!-- the "du" part is a family name prefix (VV in iso 21090) -->
         <extension url="http://hl7.org/fhir/StructureDefinition/humanname-own-prefix">
           <valueString value="VV"/>
         </extension>
@@ -137,7 +137,7 @@
     </additionalAddress>
     <gender value="female"/>
     <period>
-      <!--   The contact relationship started in 2012   -->
+      <!-- The contact relationship started in 2012 -->
       <start value="2012"/>
     </period>
   </contact>

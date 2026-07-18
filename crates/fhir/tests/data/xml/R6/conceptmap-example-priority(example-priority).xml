@@ -19,8 +19,7 @@
         <a href="https://browser.ihtsdotools.org/">All Codes SCT ValueSet</a> to (not specified)
       </p>
       <br/>
-      <p>
-        <b>Group 1 </b>Mapping from 
+      <p>Mapping from 
         <code>http://snomed.info./sct</code> to 
         <a href="http://tx.fhir.org/r5/ValueSet/icd10-2019">ICD-10-EN</a>
       </p>

@@ -17,11 +17,6 @@
           }
         ]
       },
-      "type": {
-        "system": "http://hl7.org/fhir/encounter-businessstatus-type",
-        "code": "emergency",
-        "display": "Emergency"
-      },
       "effectiveDate": "2017-02-01T08:00:00+10:00"
     },
     {
@@ -33,11 +28,6 @@
             "display": "Admitted"
           }
         ]
-      },
-      "type": {
-        "system": "http://hl7.org/fhir/encounter-businessstatus-type",
-        "code": "inpatient",
-        "display": "Inpatient"
       },
       "effectiveDate": "2017-02-01T09:27:00+10:00"
     }

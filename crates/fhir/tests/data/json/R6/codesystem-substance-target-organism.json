@@ -1,0 +1,114 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "substance-target-organism",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem substance-target-organism\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"substance-target-organism\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsubstance-target-organism\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/substance-target-organism\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ee-coli\u003ca name\u003d\"substance-target-organism-e-coli\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eEscherichia coli\u003c/td\u003e\u003ctd\u003eEscherichia coli.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003es-aureus\u003ca name\u003d\"substance-target-organism-s-aureus\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStaphylococcus aureus\u003c/td\u003e\u003ctd\u003eStaphylococcus aureus.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003em-tuberculosis\u003ca name\u003d\"substance-target-organism-m-tuberculosis\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMycobacterium tuberculosis\u003c/td\u003e\u003ctd\u003eMycobacterium tuberculosis.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ep-aeruginosa\u003ca name\u003d\"substance-target-organism-p-aeruginosa\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePseudomonas aeruginosa\u003c/td\u003e\u003ctd\u003ePseudomonas aeruginosa.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecandida-albicans\u003ca name\u003d\"substance-target-organism-candida-albicans\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCandida albicans\u003c/td\u003e\u003ctd\u003eCandida albicans.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehiv\u003ca name\u003d\"substance-target-organism-hiv\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHIV\u003c/td\u003e\u003ctd\u003eHuman Immunodeficiency Virus.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehbv\u003ca name\u003d\"substance-target-organism-hbv\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHBV\u003c/td\u003e\u003ctd\u003eHepatitis B Virus.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehcv\u003ca name\u003d\"substance-target-organism-hcv\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHCV\u003c/td\u003e\u003ctd\u003eHepatitis C Virus.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esars-cov-2\u003ca name\u003d\"substance-target-organism-sars-cov-2\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSARS-CoV-2\u003c/td\u003e\u003ctd\u003eSevere Acute Respiratory Syndrome Coronavirus 2.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ep-falciparum\u003ca name\u003d\"substance-target-organism-p-falciparum\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePlasmodium falciparum\u003c/td\u003e\u003ctd\u003ePlasmodium falciparum.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/substance-target-organism",
+  "version": "6.0.0-ballot4",
+  "name": "SubstanceTargetOrganismExample",
+  "title": "Substance Target Organism",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-23",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The specific organism that an anti-infective substance is targeted against.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/substance-target-organism",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "e-coli",
+      "display": "Escherichia coli",
+      "definition": "Escherichia coli."
+    },
+    {
+      "code": "s-aureus",
+      "display": "Staphylococcus aureus",
+      "definition": "Staphylococcus aureus."
+    },
+    {
+      "code": "m-tuberculosis",
+      "display": "Mycobacterium tuberculosis",
+      "definition": "Mycobacterium tuberculosis."
+    },
+    {
+      "code": "p-aeruginosa",
+      "display": "Pseudomonas aeruginosa",
+      "definition": "Pseudomonas aeruginosa."
+    },
+    {
+      "code": "candida-albicans",
+      "display": "Candida albicans",
+      "definition": "Candida albicans."
+    },
+    {
+      "code": "hiv",
+      "display": "HIV",
+      "definition": "Human Immunodeficiency Virus."
+    },
+    {
+      "code": "hbv",
+      "display": "HBV",
+      "definition": "Hepatitis B Virus."
+    },
+    {
+      "code": "hcv",
+      "display": "HCV",
+      "definition": "Hepatitis C Virus."
+    },
+    {
+      "code": "sars-cov-2",
+      "display": "SARS-CoV-2",
+      "definition": "Severe Acute Respiratory Syndrome Coronavirus 2."
+    },
+    {
+      "code": "p-falciparum",
+      "display": "Plasmodium falciparum",
+      "definition": "Plasmodium falciparum."
+    }
+  ]
+}

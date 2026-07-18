@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?><Bundle xmlns="http://hl7.org/fhir">
   <id value="example-anon0"/>
-  <!--  a search bundle on anon0 patient by a HIGHLY Priviliaged User that is authorized to see linkage  -->
+  <!-- a search bundle on anon0 patient by a HIGHLY Priviliaged User that is authorized to see linkage -->
   <meta>
     <lastUpdated value="2014-08-18T01:43:30Z"/>
     <security>
-      <!--  Bundle confidentiality at high water mark of most sensitive  -->
+      <!-- Bundle confidentiality at high water mark of most sensitive -->
       <system value="http://terminology.hl7.org/CodeSystem/v3-Confidentiality"/>
       <code value="V"/>
     </security>
@@ -28,11 +28,11 @@
     <fullUrl value="http://example.org/fhir/Provenance/anon0"/>
     <resource>
       <Provenance>
-        <!--  This Provenance shows a link between real-world and anon for a given patient  -->
+        <!-- This Provenance shows a link between real-world and anon for a given patient -->
         <id value="anon0"/>
         <meta>
           <security>
-            <!--  Provenance is the link between real-world and anon, so is highest possible confidentiality  -->
+            <!-- Provenance is the link between real-world and anon, so is highest possible confidentiality -->
             <system value="http://terminology.hl7.org/CodeSystem/v3-Confidentiality"/>
             <code value="V"/>
           </security>
@@ -42,13 +42,13 @@
           </security>
         </meta>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Provenance anon0</b></p><a name="anon0"> </a><a name="hcanon0"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px"/><p style="margin-bottom: 0px">Security Labels: very restricted (Details: Confidentiality code V = 'very restricted'), pseudonymized (Details: ObservationValue code PSEUDED = 'pseudonymized')</p></div><p>Provenance for <a href="broken-link.html">http://example.org/fhir/Patient/anon0</a></p><p>Summary</p><table class="grid"><tr><td>Recorded</td><td>2015-06-27T08:39:24+10:00</td></tr><tr><td>Policy</td><td><a href="broken-link.html">http://example.org/policies/666</a></td></tr><tr><td>Activity</td><td><span title="Codes:{http://terminology.hl7.org/CodeSystem/iso-21089-lifecycle deidentify}">De-Identify (Anononymize) Record Lifecycle Event</span></td></tr></table><p><b>Agents</b></p><table class="grid"><tr><td><b>Type</b></td><td><b>who</b></td></tr><tr><td><span title="Codes:{http://terminology.hl7.org/CodeSystem/provenance-participant-type assembler}">Assembler</span></td><td>Device/software</td></tr></table></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Provenance anon0</b></p><a name="anon0"> </a><a name="hcanon0"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px"/><p style="margin-bottom: 0px">Security Labels: <a href="http://terminology.hl7.org/7.2.0/CodeSystem-v3-Confidentiality.html">very restricted (Details: Confidentiality code V = 'very restricted')</a>, <a href="http://terminology.hl7.org/7.2.0/CodeSystem-v3-ObservationValue.html">pseudonymized (Details: ObservationValue code PSEUDED = 'pseudonymized')</a></p></div><p>Provenance for <a href="broken-link.html">http://example.org/fhir/Patient/anon0</a></p><p>Summary</p><table class="grid"><tr><td>Recorded</td><td>2015-06-27T08:39:24+10:00</td></tr><tr><td>Policy</td><td><a href="broken-link.html">http://example.org/policies/666</a></td></tr><tr><td>Activity</td><td><span title="Codes:{http://terminology.hl7.org/CodeSystem/iso-21089-lifecycle deidentify}">De-Identify (Anononymize) Record Lifecycle Event</span></td></tr></table><p><b>Agents</b></p><table class="grid"><tr><td><b>Type</b></td><td><b>who</b></td></tr><tr><td><span title="Codes:{http://terminology.hl7.org/CodeSystem/provenance-participant-type assembler}">Assembler</span></td><td>Device/software</td></tr></table></div>
         </text>
         <target>
           <reference value="http://example.org/fhir/Patient/anon0"/>
         </target>
         <recorded value="2015-06-27T08:39:24+10:00"/>
-        <!--  policy would indicate the rules used for De-Identification, and appropriate purposes of use of the data  -->
+        <!-- policy would indicate the rules used for De-Identification, and appropriate purposes of use of the data -->
         <policy value="http://example.org/policies/666"/>
         <activity>
           <coding>
@@ -56,7 +56,7 @@
             <code value="deidentify"/>
           </coding>
         </activity>
-        <!--  not identified in original patient compartment as SHOULD NOT show up there (confidentiatltyCode V protected too)  -->
+        <!-- not identified in original patient compartment as SHOULD NOT show up there (confidentiatltyCode V protected too) -->
         <agent>
           <type>
             <coding>
@@ -85,7 +85,7 @@
     <resource>
       <Patient>
         <id value="anon0"/>
-        <!--  De-Identifed equivilant, removing all direct identifiers, and keeping only minimally necessary indirect identifiers  -->
+        <!-- De-Identifed equivilant, removing all direct identifiers, and keeping only minimally necessary indirect identifiers -->
         <meta>
           <security>
             <system value="http://terminology.hl7.org/CodeSystem/v3-Confidentiality"/>
@@ -97,16 +97,16 @@
           </security>
         </meta>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Patient anon0</b></p><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px"/><p style="margin-bottom: 0px">Security Labels: low (Details: Confidentiality code L = 'low'), pseudonymized (Details: ObservationValue code PSEUDED = 'pseudonymized')</p></div><p style="border: 1px #661aff solid; background-color: #e6e6ff; padding: 10px;">First-0 Anon-0  Male, DoB: 1974-12-01</p><hr/></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Patient anon0</b></p><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px"/><p style="margin-bottom: 0px">Security Labels: <a href="http://terminology.hl7.org/7.2.0/CodeSystem-v3-Confidentiality.html">low (Details: Confidentiality code L = 'low')</a>, <a href="http://terminology.hl7.org/7.2.0/CodeSystem-v3-ObservationValue.html">pseudonymized (Details: ObservationValue code PSEUDED = 'pseudonymized')</a></p></div><p style="border: 1px #661aff solid; background-color: #e6e6ff; padding: 10px;">First-0 Anon-0  Male, DoB: 1974-12-01</p><hr/></div>
         </text>
         <name>
-          <!--  some made up name  -->
+          <!-- some made up name -->
           <family value="Anon-0"/>
           <given value="First-0"/>
         </name>
-        <!--  male/female gender is needed, and group is big enough.   -->
+        <!-- male/female gender is needed, and group is big enough. -->
         <gender value="male"/>
-        <!--  birthdate is generalized to 1st of month of the birth year  -->
+        <!-- birthdate is generalized to 1st of month of the birth year -->
         <birthDate value="1974-12-01"/>
       </Patient>
     </resource>
@@ -119,7 +119,7 @@
     <resource>
       <Condition>
         <id value="anon0"/>
-        <!--  De-Identified data, change reference to Patient, eliminate free-text, and fuzz dates  -->
+        <!-- De-Identified data, change reference to Patient, eliminate free-text, and fuzz dates -->
         <meta>
           <security>
             <system value="http://terminology.hl7.org/CodeSystem/v3-Confidentiality"/>
@@ -131,7 +131,7 @@
           </security>
         </meta>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Condition anon0</b></p><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px"/><p style="margin-bottom: 0px">Security Labels: low (Details: Confidentiality code L = 'low'), pseudonymized (Details: ObservationValue code PSEUDED = 'pseudonymized')</p></div><p><b>clinicalStatus</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/condition-clinical active}">Active</span></p><p><b>verificationStatus</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/condition-ver-status confirmed}">Confirmed</span></p><p><b>category</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/condition-category encounter-diagnosis}, {http://snomed.info/sct 439401001}">Encounter Diagnosis</span></p><p><b>severity</b>: <span title="Codes:{http://snomed.info/sct 24484000}">Severe</span></p><p><b>code</b>: <span title="Codes:{http://snomed.info/sct 39065001}">Burn of ear</span></p><p><b>bodySite</b>: <span title="Codes:{http://snomed.info/sct 49521004}">Left external ear structure</span></p><p><b>subject</b>: <a href="broken-link.html">Patient/anon0</a></p><p><b>onset</b>: 2012-05-01</p></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Condition anon0</b></p><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px"/><p style="margin-bottom: 0px">Security Labels: <a href="http://terminology.hl7.org/7.2.0/CodeSystem-v3-Confidentiality.html">low (Details: Confidentiality code L = 'low')</a>, <a href="http://terminology.hl7.org/7.2.0/CodeSystem-v3-ObservationValue.html">pseudonymized (Details: ObservationValue code PSEUDED = 'pseudonymized')</a></p></div><p><b>clinicalStatus</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/condition-clinical active}">Active</span></p><p><b>verificationStatus</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/condition-ver-status confirmed}">Confirmed</span></p><p><b>category</b>: <span title="Codes:{http://terminology.hl7.org/CodeSystem/condition-category encounter-diagnosis}, {http://snomed.info/sct 439401001}">Encounter Diagnosis</span></p><p><b>severity</b>: <span title="Codes:{http://snomed.info/sct 24484000}">Severe</span></p><p><b>code</b>: <span title="Codes:{http://snomed.info/sct 39065001}">Burn of ear</span></p><p><b>subject</b>: <a href="broken-link.html">Patient/anon0</a></p><p><b>onset</b>: 2012-05-01</p></div>
         </text>
         <clinicalStatus>
           <coding>
@@ -151,7 +151,7 @@
             <code value="encounter-diagnosis"/>
             <display value="Encounter Diagnosis"/>
           </coding>
-          <!--    and also a SNOMED CT coding    -->
+          <!-- and also a SNOMED CT coding -->
           <coding>
             <system value="http://snomed.info/sct"/>
             <code value="439401001"/>
@@ -172,18 +172,11 @@
             <display value="Burn of ear"/>
           </coding>
         </code>
-        <bodySite>
-          <coding>
-            <system value="http://snomed.info/sct"/>
-            <code value="49521004"/>
-            <display value="Left external ear structure"/>
-          </coding>
-        </bodySite>
         <subject>
-          <!--  patient as anon0 id  -->
+          <!-- patient as anon0 id -->
           <reference value="Patient/anon0"/>
         </subject>
-        <!--  dates aligned to first of month  -->
+        <!-- dates aligned to first of month -->
         <onsetDateTime value="2012-05-01"/>
       </Condition>
     </resource>

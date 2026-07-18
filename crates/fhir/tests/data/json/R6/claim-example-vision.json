@@ -58,12 +58,14 @@
   "diagnosis": [
     {
       "sequence": 1,
-      "diagnosisCodeableConcept": {
-        "coding": [
-          {
-            "code": "654321"
-          }
-        ]
+      "diagnosis": {
+        "concept": {
+          "coding": [
+            {
+              "code": "654321"
+            }
+          ]
+        }
       }
     }
   ],
