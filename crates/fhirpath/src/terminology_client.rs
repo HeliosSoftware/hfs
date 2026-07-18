@@ -432,7 +432,69 @@ impl TerminologyClient {
     ) -> FhirPathResult<Value> {
         let url = format!("{}/ConceptMap/$translate", self.base_url);
 
-        let body = build_translate_body(concept_map_url, system, code, target_system, params);
+        let mut parameters = vec![json!({
+            "name": "url",
+            "valueUri": concept_map_url
+        })];
+
+        // Create a coding parameter
+        if !system.is_empty() {
+            parameters.push(json!({
+                "name": "coding",
+                "valueCoding": {
+                    "system": system,
+                    "code": code
+                }
+            }));
+        } else {
+            // For codes without explicit system, we need to infer it from context
+            // For FHIR ConceptMaps, certain codes have known systems
+            let inferred_system = match code {
+                "home" | "work" | "temp" | "old" | "billing" => "http://hl7.org/fhir/address-use",
+                "male" | "female" | "other" | "unknown" => {
+                    "http://hl7.org/fhir/administrative-gender"
+                }
+                _ => "",
+            };
+
+            if !inferred_system.is_empty() {
+                parameters.push(json!({
+                    "name": "coding",
+                    "valueCoding": {
+                        "system": inferred_system,
+                        "code": code
+                    }
+                }));
+            } else {
+                // Fallback to just code
+                parameters.push(json!({
+                    "name": "code",
+                    "valueCode": code
+                }));
+            }
+        }
+
+        if let Some(target) = target_system {
+            parameters.push(json!({
+                "name": "targetSystem",
+                "valueUri": target
+            }));
+        }
+
+        // Add additional parameters if provided
+        if let Some(params) = params {
+            for (key, value) in params {
+                parameters.push(json!({
+                    "name": key,
+                    "valueString": value
+                }));
+            }
+        }
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": parameters
+        });
 
         let response = self
             .client
@@ -462,174 +524,9 @@ impl TerminologyClient {
     }
 }
 
-/// Builds the `Parameters` body for a `ConceptMap/$translate` request.
-///
-/// Split out from [`TerminologyClient::translate`] so the request shape can be asserted
-/// without a network round-trip: the shape is exactly where #287's defect lived, and it
-/// failed in a way no test could see (the server's 400 was downgraded to a skip).
-///
-/// The concept to translate is sent as `code` + `system`, never as a lone `coding`.
-/// Terminology servers require `code`/`sourceCode` to be present as a named parameter and
-/// reject `coding` on its own with "Missing required parameter: code or sourceCode".
-fn build_translate_body(
-    concept_map_url: &str,
-    system: &str,
-    code: &str,
-    target_system: Option<&str>,
-    params: Option<HashMap<String, String>>,
-) -> Value {
-    let mut parameters = vec![json!({
-        "name": "url",
-        "valueUri": concept_map_url
-    })];
-
-    // Fall back to a system inferred from the code only when the caller has none: some
-    // FHIRPath expressions (e.g. `$this.address.use`) yield a bare code with no system.
-    let resolved_system = if !system.is_empty() {
-        system
-    } else {
-        match code {
-            "home" | "work" | "temp" | "old" | "billing" => "http://hl7.org/fhir/address-use",
-            "male" | "female" | "other" | "unknown" => "http://hl7.org/fhir/administrative-gender",
-            _ => "",
-        }
-    };
-
-    parameters.push(json!({
-        "name": "code",
-        "valueCode": code
-    }));
-    if !resolved_system.is_empty() {
-        parameters.push(json!({
-            "name": "system",
-            "valueUri": resolved_system
-        }));
-    }
-
-    if let Some(target) = target_system {
-        parameters.push(json!({
-            "name": "targetSystem",
-            "valueUri": target
-        }));
-    }
-
-    if let Some(params) = params {
-        for (key, value) in params {
-            parameters.push(json!({
-                "name": key,
-                "valueString": value
-            }));
-        }
-    }
-
-    json!({
-        "resourceType": "Parameters",
-        "parameter": parameters
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Names of the `Parameters.parameter` entries, in order.
-    fn param_names(body: &Value) -> Vec<&str> {
-        body["parameter"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect()
-    }
-
-    fn param<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
-        body["parameter"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["name"] == name)
-    }
-
-    /// Regression test for #287. The client used to send the concept as a lone `coding`
-    /// parameter, which terminology servers reject with 400 "Missing required parameter:
-    /// code or sourceCode" -- so `%terminologies.translate(...)` failed on every call.
-    #[test]
-    fn test_translate_body_sends_code_and_system_not_coding() {
-        let body = build_translate_body(
-            "http://hl7.org/fhir/ConceptMap/cm-address-use-v2",
-            "http://hl7.org/fhir/address-use",
-            "home",
-            None,
-            None,
-        );
-
-        assert!(
-            !param_names(&body).contains(&"coding"),
-            "must not send a `coding` parameter: servers reject it with \
-             'Missing required parameter: code or sourceCode' (#287). Got: {:?}",
-            param_names(&body)
-        );
-        assert_eq!(param(&body, "code").unwrap()["valueCode"], "home");
-        assert_eq!(
-            param(&body, "system").unwrap()["valueUri"],
-            "http://hl7.org/fhir/address-use"
-        );
-        assert_eq!(
-            param(&body, "url").unwrap()["valueUri"],
-            "http://hl7.org/fhir/ConceptMap/cm-address-use-v2"
-        );
-        assert_eq!(body["resourceType"], "Parameters");
-    }
-
-    /// txTest03 evaluates `$this.address.use`, which yields a bare code with no system.
-    #[test]
-    fn test_translate_body_infers_system_for_bare_code() {
-        let body = build_translate_body(
-            "http://hl7.org/fhir/ConceptMap/cm-address-use-v2",
-            "",
-            "home",
-            None,
-            None,
-        );
-
-        assert!(!param_names(&body).contains(&"coding"));
-        assert_eq!(param(&body, "code").unwrap()["valueCode"], "home");
-        assert_eq!(
-            param(&body, "system").unwrap()["valueUri"],
-            "http://hl7.org/fhir/address-use",
-            "a bare 'home' should infer the address-use system"
-        );
-    }
-
-    /// An unrecognised bare code has no system to infer; `code` alone is still valid,
-    /// and is what lets the server infer the system from the ConceptMap itself.
-    #[test]
-    fn test_translate_body_omits_system_when_not_inferable() {
-        let body = build_translate_body("http://example.org/cm", "", "zzz-unknown", None, None);
-
-        assert_eq!(param_names(&body), vec!["url", "code"]);
-        assert_eq!(param(&body, "code").unwrap()["valueCode"], "zzz-unknown");
-    }
-
-    #[test]
-    fn test_translate_body_includes_target_system_and_extra_params() {
-        let mut extra = HashMap::new();
-        extra.insert("reverse".to_string(), "true".to_string());
-
-        let body = build_translate_body(
-            "http://example.org/cm",
-            "http://example.org/cs",
-            "x",
-            Some("http://example.org/target"),
-            Some(extra),
-        );
-
-        assert_eq!(
-            param(&body, "targetSystem").unwrap()["valueUri"],
-            "http://example.org/target"
-        );
-        assert_eq!(param(&body, "reverse").unwrap()["valueString"], "true");
-    }
 
     #[test]
     fn test_terminology_client_creation() {

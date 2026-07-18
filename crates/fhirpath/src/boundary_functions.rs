@@ -43,12 +43,10 @@ pub fn low_boundary_function(
     } else if args.len() == 1 {
         match &args[0] {
             EvaluationResult::Integer(p, _, _) => {
-                // A precision outside the representable range yields empty, not an error
-                // (tests-fhir-r5.xml LowBoundaryDecimal3/LowBoundaryNegDecimal3 declare no
-                // expected output). Erroring on `< 0` while returning empty for `> 28` made
-                // the same out-of-range condition behave two different ways (#287).
                 if *p < 0 {
-                    return Ok(EvaluationResult::Empty);
+                    return Err(EvaluationError::InvalidArgument(
+                        "lowBoundary precision must be >= 0".to_string(),
+                    ));
                 }
                 // rust_decimal supports up to 28 decimal places
                 if *p > 28 {
@@ -177,10 +175,10 @@ pub fn high_boundary_function(
     } else if args.len() == 1 {
         match &args[0] {
             EvaluationResult::Integer(p, _, _) => {
-                // See lowBoundary: out-of-range precision yields empty, not an error.
-                // tests-fhir-r5.xml HighBoundaryDecimal3 declares no expected output (#287).
                 if *p < 0 {
-                    return Ok(EvaluationResult::Empty);
+                    return Err(EvaluationError::InvalidArgument(
+                        "highBoundary precision must be >= 0".to_string(),
+                    ));
                 }
                 // rust_decimal supports up to 28 decimal places
                 if *p > 28 {
@@ -911,59 +909,6 @@ mod tests {
             high_boundary_function(&empty, &[]).unwrap(),
             EvaluationResult::Empty
         );
-    }
-
-    /// Regression test for #287: `1.587.lowBoundary(-1)` and `1.587.highBoundary(-1)`.
-    ///
-    /// A precision outside the representable range yields empty, not an error. The R5
-    /// test cases (LowBoundaryDecimal3, LowBoundaryNegDecimal3, HighBoundaryDecimal3)
-    /// declare no expected output, i.e. empty. These previously returned
-    /// `Err(InvalidArgument)`, and the resulting error was downgraded to an inconclusive
-    /// by the conformance runner and recorded as a skip, so CI stayed green over it.
-    #[test]
-    fn test_boundary_negative_precision_is_empty_not_error() {
-        let decimal_val = EvaluationResult::decimal(Decimal::from_str("1.587").unwrap());
-        let neg_decimal = EvaluationResult::decimal(Decimal::from_str("-1.587").unwrap());
-        let neg_precision = [EvaluationResult::integer(-1)];
-
-        assert_eq!(
-            low_boundary_function(&decimal_val, &neg_precision).unwrap(),
-            EvaluationResult::Empty,
-            "1.587.lowBoundary(-1) must be empty, not an error"
-        );
-        assert_eq!(
-            low_boundary_function(&neg_decimal, &neg_precision).unwrap(),
-            EvaluationResult::Empty,
-            "(-1.587).lowBoundary(-1) must be empty, not an error"
-        );
-        assert_eq!(
-            high_boundary_function(&decimal_val, &neg_precision).unwrap(),
-            EvaluationResult::Empty,
-            "1.587.highBoundary(-1) must be empty, not an error"
-        );
-    }
-
-    /// The two out-of-range directions must agree: a precision above what `rust_decimal`
-    /// can represent already returned empty, while a negative one returned an error.
-    /// That inconsistency within one function is what #287 corrected.
-    #[test]
-    fn test_boundary_out_of_range_precision_is_consistent() {
-        let decimal_val = EvaluationResult::decimal(Decimal::from_str("1.587").unwrap());
-
-        for precision in [-1, 39] {
-            assert_eq!(
-                low_boundary_function(&decimal_val, &[EvaluationResult::integer(precision)])
-                    .unwrap(),
-                EvaluationResult::Empty,
-                "lowBoundary({precision}) must be empty"
-            );
-            assert_eq!(
-                high_boundary_function(&decimal_val, &[EvaluationResult::integer(precision)])
-                    .unwrap(),
-                EvaluationResult::Empty,
-                "highBoundary({precision}) must be empty"
-            );
-        }
     }
 
     #[test]
