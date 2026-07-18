@@ -343,8 +343,16 @@ fn calculate_decimal_low_boundary(value: Decimal, precision: u32) -> Decimal {
         // First check if the value rounds to 0
         let rounded = value.round_dp(precision);
         if rounded == Decimal::ZERO {
-            // Special case: if rounds to 0, return 0
-            return Decimal::ZERO;
+            // Rounds to zero at this precision. The boundary is still reported at
+            // the requested scale, and keeps the sign of the input: the low
+            // boundary of a negative value lies below zero, so `-0.0034` at
+            // precision 1 yields `-0.0` rather than `0.0`.
+            let mut zero = Decimal::ZERO;
+            if is_negative {
+                zero.set_sign_negative(true);
+            }
+            zero.rescale(precision);
+            return zero;
         }
 
         // For both positive and negative, use floor for low boundary
@@ -360,10 +368,15 @@ fn calculate_decimal_low_boundary(value: Decimal, precision: u32) -> Decimal {
 
 /// Calculates the high boundary for a decimal value based on its precision
 fn calculate_decimal_high_boundary(value: Decimal, precision: u32) -> Decimal {
-    // Special case: check if value rounds to 0 at given precision
+    // Special case: check if value rounds to 0 at given precision.
+    // The high boundary of such a value approaches zero from below (for a
+    // negative input) or from above (for a positive one), so it is reported as
+    // positive zero — but at the requested scale, not as a bare `0`.
     let rounded = value.round_dp(precision);
     if rounded == Decimal::ZERO {
-        return Decimal::ZERO;
+        let mut zero = Decimal::ZERO;
+        zero.rescale(precision);
+        return zero;
     }
 
     if precision == 0 {
@@ -401,7 +414,12 @@ fn calculate_decimal_high_boundary(value: Decimal, precision: u32) -> Decimal {
             // This moves the value towards zero (less negative)
             // We need to subtract 0.00050000 from the absolute value
             let padding_value = Decimal::from(5) / Decimal::from(10_i64.pow(actual_decimals + 1));
-            value + padding_value // Adding to negative makes it less negative (towards zero)
+            let mut result = value + padding_value; // Adding to negative makes it less negative (towards zero)
+            // Pad out to the requested precision: the trailing zeros are the
+            // precision information these functions exist to convey, so
+            // -1.587 at precision 8 must be -1.58650000, not -1.5865.
+            result.rescale(precision);
+            result
         } else {
             // For positive numbers, pad normally
             let mut result = value_str.clone();
@@ -965,6 +983,92 @@ mod tests {
                 EvaluationResult::Empty,
                 "highBoundary({precision}) must be empty"
             );
+        }
+    }
+
+    /// Renders a boundary result the way the scale-sensitive assertions below need it.
+    ///
+    /// `Decimal`'s `PartialEq` compares numerically, so `assert_eq!` against a parsed
+    /// `Decimal` treats `-1.5865` and `-1.58650000` as equal and would let a scale
+    /// regression through -- the same blind spot that hid these defects in the R5
+    /// conformance runner. Comparing the rendered string is what makes the trailing
+    /// zeros load-bearing.
+    fn rendered(result: EvaluationResult) -> String {
+        match result {
+            EvaluationResult::Decimal(d, _, _) => d.to_string(),
+            other => panic!("expected a decimal, got {other:?}"),
+        }
+    }
+
+    fn low(value: &str, precision: i64) -> String {
+        let val = EvaluationResult::decimal(Decimal::from_str(value).unwrap());
+        rendered(low_boundary_function(&val, &[EvaluationResult::integer(precision)]).unwrap())
+    }
+
+    fn high(value: &str, precision: i64) -> String {
+        let val = EvaluationResult::decimal(Decimal::from_str(value).unwrap());
+        rendered(high_boundary_function(&val, &[EvaluationResult::integer(precision)]).unwrap())
+    }
+
+    /// `highBoundary` on a negative decimal returned the shortened `-1.5865` instead of
+    /// padding out to the requested scale. The trailing zeros are the precision
+    /// information these functions exist to convey, so dropping them loses the answer.
+    #[test]
+    fn test_high_boundary_negative_decimal_pads_to_precision() {
+        assert_eq!(high("-1.587", 8), "-1.58650000");
+        assert_eq!(high("-1.587", 6), "-1.586500");
+        // Already at or beyond the requested scale: unchanged.
+        assert_eq!(high("-1.587", 2), "-1.58");
+    }
+
+    /// A value that rounds to zero at the requested precision returned a bare `0`,
+    /// dropping the scale, and gave the sign inconsistent treatment between the two
+    /// functions. The low boundary of a negative value lies below zero (`-0.0`); the
+    /// high boundary approaches zero from below and is reported as `0.0`.
+    #[test]
+    fn test_boundary_rounding_to_zero_keeps_scale_and_sign() {
+        assert_eq!(low("0.0034", 1), "0.0");
+        assert_eq!(low("-0.0034", 1), "-0.0");
+        assert_eq!(high("0.0034", 1), "0.0");
+        assert_eq!(high("-0.0034", 1), "0.0");
+        // Scale follows the requested precision, not the input.
+        assert_eq!(low("0.0034", 3), "0.003");
+        assert_eq!(high("-0.00034", 2), "0.00");
+    }
+
+    /// The R5 conformance corpus, asserted on rendered scale rather than numeric value.
+    #[test]
+    fn test_boundary_r5_decimal_corpus_scale() {
+        for (expr, want) in [
+            ("1.587.lowBoundary(6)", "1.586500"),
+            ("1.587.lowBoundary(2)", "1.58"),
+            ("1.587.lowBoundary(0)", "1"),
+            ("-1.587.lowBoundary(6)", "-1.587500"),
+            ("-1.587.lowBoundary(0)", "-2"),
+            ("1.lowBoundary(5)", "0.50000"),
+            ("12.500.lowBoundary(4)", "12.4995"),
+            ("120.lowBoundary(2)", "119.50"),
+            ("-120.lowBoundary(2)", "-120.50"),
+        ] {
+            let (value, precision) = expr.split_once(".lowBoundary(").unwrap();
+            let precision: i64 = precision.trim_end_matches(')').parse().unwrap();
+            assert_eq!(low(value, precision), want, "{expr}");
+        }
+
+        for (expr, want) in [
+            ("1.587.highBoundary(2)", "1.59"),
+            ("1.587.highBoundary(6)", "1.587500"),
+            ("1.587.highBoundary(8)", "1.58750000"),
+            ("-1.587.highBoundary(2)", "-1.58"),
+            ("-1.587.highBoundary(6)", "-1.586500"),
+            ("1.highBoundary(0)", "2"),
+            ("1.highBoundary(5)", "1.50000"),
+            ("12.500.highBoundary(4)", "12.5005"),
+            ("120.highBoundary(2)", "120.50"),
+        ] {
+            let (value, precision) = expr.split_once(".highBoundary(").unwrap();
+            let precision: i64 = precision.trim_end_matches(')').parse().unwrap();
+            assert_eq!(high(value, precision), want, "{expr}");
         }
     }
 
