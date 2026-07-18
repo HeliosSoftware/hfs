@@ -431,10 +431,6 @@ jobs:
       # Job-level, not step-level: the pre-flight probe and the server must agree on
       # the target, and two definitions would drift.
       FHIRPATH_TERMINOLOGY_SERVER: https://hts.heliossoftware.com
-      # Pinned deliberately. With getLatestRelease, cutting a release in the validator
-      # repo changed this job's verdict with no commit here to review or bisect to.
-      # A test oracle must be a stable reference; bump this in a reviewed PR (#287).
-      FHIRPATH_VALIDATOR_TAG: v0.1.15
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -448,16 +444,16 @@ jobs:
           script: |
             const fs = require('fs');
 
-            const tag = process.env.FHIRPATH_VALIDATOR_TAG;
-            console.log(`Fetching pinned FhirPath Validator release ${tag}...`);
+            console.log('Fetching latest FhirPath Validator release...');
 
-            const { data: release } = await github.rest.repos.getReleaseByTag({
+            // Intentionally unpinned: we own the validator fork, so tracking its latest
+            // release avoids a tag bump here every time we cut one there.
+            const { data: release } = await github.rest.repos.getLatestRelease({
               owner: 'HeliosSoftware',
-              repo: 'Hl7.Fhir.FhirPath.Validator',
-              tag
+              repo: 'Hl7.Fhir.FhirPath.Validator'
             });
 
-            console.log(`FhirPath Validator release: ${release.tag_name}`);
+            console.log(`Latest FhirPath Validator release: ${release.tag_name}`);
 
             // Find the Windows executable archive
             const asset = release.assets.find(asset =>
