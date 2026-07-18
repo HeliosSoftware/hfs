@@ -15,8 +15,7 @@
         <a href="valueset-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <br/>
-      <p>
-        <b>Group 1 </b>Mapping from 
+      <p>Mapping from 
         <a href="codesystem-questionnaire-answers-status.html">Questionnaire Response Status</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
@@ -66,6 +65,13 @@
             <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>complete</td>
+        </tr>
+        <tr>
+          <td>unknown</td>
+          <td>
+            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+          </td>
+          <td>unknown</td>
         </tr>
       </table>
     </div>
@@ -133,6 +139,13 @@
       <code value="completed"/>
       <target>
         <code value="complete"/>
+        <relationship value="equivalent"/>
+      </target>
+    </element>
+    <element>
+      <code value="unknown"/>
+      <target>
+        <code value="unknown"/>
         <relationship value="equivalent"/>
       </target>
     </element>

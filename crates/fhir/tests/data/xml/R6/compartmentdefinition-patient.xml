@@ -153,13 +153,6 @@ The following resources may be in this compartment:
  
         <tr>
           <td>
-            <a href="contract.html">Contract</a>
-          </td>
-          <td>patient</td>
-        </tr>
- 
-        <tr>
-          <td>
             <a href="coverage.html">Coverage</a>
           </td>
           <td>policy-holder, subscriber, beneficiary, paymentby-party</td>
@@ -224,20 +217,6 @@ The following resources may be in this compartment:
         <tr>
           <td>
             <a href="encounter.html">Encounter</a>
-          </td>
-          <td>patient</td>
-        </tr>
- 
-        <tr>
-          <td>
-            <a href="enrollmentrequest.html">EnrollmentRequest</a>
-          </td>
-          <td>patient</td>
-        </tr>
- 
-        <tr>
-          <td>
-            <a href="enrollmentresponse.html">EnrollmentResponse</a>
           </td>
           <td>patient</td>
         </tr>
@@ -310,13 +289,6 @@ The following resources may be in this compartment:
             <a href="immunization.html">Immunization</a>
           </td>
           <td>patient</td>
-        </tr>
- 
-        <tr>
-          <td>
-            <a href="invoice.html">Invoice</a>
-          </td>
-          <td>subject, patient, recipient</td>
         </tr>
  
         <tr>
@@ -585,14 +557,6 @@ The following resources are never in this compartment:
         </li>
  
         <li>
-          <a href="insuranceplan.html">InsurancePlan</a>
-        </li>
- 
-        <li>
-          <a href="insuranceproduct.html">InsuranceProduct</a>
-        </li>
- 
-        <li>
           <a href="library.html">Library</a>
         </li>
  
@@ -709,10 +673,6 @@ The following resources are never in this compartment:
         </li>
  
         <li>
-          <a href="structuremap.html">StructureMap</a>
-        </li>
- 
-        <li>
           <a href="subscription.html">Subscription</a>
         </li>
  
@@ -751,7 +711,7 @@ The following resources are never in this compartment:
   <name value="Base FHIR compartment definition for Patient"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -910,10 +870,6 @@ The following resources are never in this compartment:
     <endParam value="period"/>
   </resource>
   <resource>
-    <code value="Contract"/>
-    <param value="patient"/>
-  </resource>
-  <resource>
     <code value="Coverage"/>
     <param value="policy-holder"/>
     <param value="subscriber"/>
@@ -995,14 +951,6 @@ The following resources are never in this compartment:
     <code value="Endpoint"/>
   </resource>
   <resource>
-    <code value="EnrollmentRequest"/>
-    <param value="patient"/>
-  </resource>
-  <resource>
-    <code value="EnrollmentResponse"/>
-    <param value="patient"/>
-  </resource>
-  <resource>
     <code value="EpisodeOfCare"/>
     <param value="subject"/>
     <startParam value="date"/>
@@ -1079,20 +1027,6 @@ The following resources are never in this compartment:
   </resource>
   <resource>
     <code value="Ingredient"/>
-  </resource>
-  <resource>
-    <code value="InsurancePlan"/>
-  </resource>
-  <resource>
-    <code value="InsuranceProduct"/>
-  </resource>
-  <resource>
-    <code value="Invoice"/>
-    <param value="subject"/>
-    <param value="patient"/>
-    <param value="recipient"/>
-    <startParam value="date"/>
-    <endParam value="date"/>
   </resource>
   <resource>
     <code value="Library"/>
@@ -1319,9 +1253,6 @@ The following resources are never in this compartment:
   </resource>
   <resource>
     <code value="StructureDefinition"/>
-  </resource>
-  <resource>
-    <code value="StructureMap"/>
   </resource>
   <resource>
     <code value="Subscription"/>

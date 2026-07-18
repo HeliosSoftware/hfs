@@ -176,7 +176,7 @@
         "path": "Composition.id",
         "short": "Logical id of this artifact",
         "definition": "The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes.",
-        "comment": "Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case.",
+        "comment": "Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case.",
         "min": 0,
         "max": "1",
         "base": {
@@ -404,11 +404,16 @@
               "path": "url"
             }
           ],
-          "ordered": false,
+          "description": "Extensions are always sliced by (at least) url",
           "rules": "open"
         },
-        "short": "Extension",
-        "definition": "An Extension",
+        "short": "Additional content defined by implementations",
+        "definition": "May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension.",
+        "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
+        "alias": [
+          "extensions",
+          "user content"
+        ],
         "min": 1,
         "max": "*",
         "base": {
@@ -432,7 +437,13 @@
         ],
         "mustSupport": false,
         "isModifier": false,
-        "isSummary": false
+        "isSummary": false,
+        "mapping": [
+          {
+            "identity": "rim",
+            "map": "N/A"
+          }
+        ]
       },
       {
         "id": "Composition.extension:ValidityPeriod",
@@ -462,13 +473,6 @@
             "human": "All FHIR elements must have a @value or children",
             "expression": "hasValue() or (children().count() \u003e id.count())",
             "source": "http://hl7.org/fhir/StructureDefinition/Element"
-          },
-          {
-            "key": "ext-1",
-            "severity": "error",
-            "human": "Must have either extensions or value[x], not both",
-            "expression": "extension.exists() !\u003d value.exists()",
-            "source": "http://hl7.org/fhir/StructureDefinition/Extension"
           }
         ],
         "mustSupport": false,
@@ -478,6 +482,16 @@
       {
         "id": "Composition.modifierExtension",
         "path": "Composition.modifierExtension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Extensions that cannot be ignored",
         "definition": "May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element\u0027s descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.\n\nModifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself).",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -614,7 +628,7 @@
         "path": "Composition.version",
         "short": "An explicitly assigned identifier of a variation of the content in the Composition",
         "definition": "An explicitly assigned identifier of a variation of the content in the Composition.",
-        "comment": "While each resource, including the composition itself, has its own version identifier, this is a formal identifier for the logical version of the Composition as a whole. It would remain constant if the resources were moved to a new server, and all got new individual resource versions, for example.",
+        "comment": "This element is the author-assigned business version of the Composition (analogous to CDA ClinicalDocument.versionNumber). It is distinct from Resource.meta.versionId, which is a server-assigned technical version that every resource carries and that may change whenever the resource is updated on a server. Composition.version reflects the version of a logical document\u0027s content and remains constant even if the Composition or its referenced resources are moved between servers and receive new meta.versionId values.",
         "min": 0,
         "max": "1",
         "base": {
@@ -720,7 +734,6 @@
               "http://hl7.org/fhir/StructureDefinition/CommunicationRequest",
               "http://hl7.org/fhir/StructureDefinition/CoverageEligibilityRequest",
               "http://hl7.org/fhir/StructureDefinition/DeviceRequest",
-              "http://hl7.org/fhir/StructureDefinition/EnrollmentRequest",
               "http://hl7.org/fhir/StructureDefinition/MedicationRequest",
               "http://hl7.org/fhir/StructureDefinition/NutritionOrder",
               "http://hl7.org/fhir/StructureDefinition/RequestOrchestration",
@@ -762,7 +775,7 @@
         "path": "Composition.status",
         "short": "registered | partial | preliminary | final | amended | corrected | appended | cancelled | entered-in-error | deprecated | unknown",
         "definition": "The workflow/clinical status of this composition. The status is a marker for the clinical standing of the document.",
-        "comment": "If a composition is marked as withdrawn, the compositions/documents in the series, or data from the composition or document series, should never be displayed to a user without being clearly marked as untrustworthy. The flag \"entered-in-error\" is why this element is labeled as a modifier of other elements.   \n\nSome reporting work flows require that the original narrative of a final document never be altered; instead, only new narrative can be added. The composition resource has no explicit status for explicitly noting whether this business rule is in effect. This would be handled by an extension if required.",
+        "comment": "See section 2.8.3.2, The workflow/clinical status of the composition, for guidance.  Because the entered-in-error flag changes how this resource and its related elements must be interpreted, status is labeled as a modifier element. Some reporting workflows require that the original narrative of a final document never be altered; instead, only new narrative can be added. The Composition resource has no explicit status for noting whether this business rule is in effect; this would be handled by an extension if required.",
         "requirements": "Need to be able to mark interim, amended, or withdrawn compositions or documents.",
         "min": 1,
         "max": "1",
@@ -1069,7 +1082,7 @@
         "path": "Composition.date",
         "short": "When the Catalog was created",
         "definition": "When the Catalog was created.",
-        "comment": "The Last Modified Date on the composition may be after the date of the document was attested without being changed. This means that the date on an amended document is the date of the amendment, not the date of original authorship.",
+        "comment": "The Last Modified Date on the composition may be after the date the document was attested without being changed. This means that the date on an amended document is the date of the amendment, not the date of original authorship.",
         "requirements": "dateTime is used for tracking, organizing versions and searching. Note that this is the time of authoring this version of the Composition. When packaged in a document, [Bundle.timestamp](bundle-definitions.html#Bundle.timestamp) is the date of packaging.",
         "alias": [
           "IssueDate"
@@ -1287,6 +1300,16 @@
       {
         "id": "Composition.participant.extension",
         "path": "Composition.participant.extension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Additional content defined by implementations",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension.",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -1327,6 +1350,16 @@
       {
         "id": "Composition.participant.modifierExtension",
         "path": "Composition.participant.modifierExtension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Extensions that cannot be ignored even if unrecognized",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element\u0027s descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.\n\nModifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself).",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -1499,7 +1532,9 @@
               "http://hl7.org/fhir/StructureDefinition/Patient",
               "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
               "http://hl7.org/fhir/StructureDefinition/Device",
-              "http://hl7.org/fhir/StructureDefinition/Organization"
+              "http://hl7.org/fhir/StructureDefinition/Organization",
+              "http://hl7.org/fhir/StructureDefinition/CareTeam",
+              "http://hl7.org/fhir/StructureDefinition/Group"
             ]
           }
         ],
@@ -1519,9 +1554,9 @@
       {
         "id": "Composition.name",
         "path": "Composition.name",
-        "short": "Name for this Composition (computer friendly)",
-        "definition": "A natural language name identifying the {{title}}. This name should be usable as an identifier for the module by machine processing applications such as code generation.",
-        "comment": "The name is not expected to be globally unique. The name should be a simple alphanumeric type name to ensure that it is machine-processing friendly.",
+        "short": "Computer friendly name",
+        "definition": "A machine-friendly identifier suitable for code generation. For example, \u0027ClinicalDocument\u0027 or \u0027Composition_v2\u0027. See the Constraint description.",
+        "comment": "The name is not expected to be globally unique. This field is used primarily by computers while the title field includes information for human-display. Composition.type is used to provide a CodeableConcept for the document type when available while Composition.name is an uncoded string. Composition.identifier is used to identify the specific instance of a document.",
         "requirements": "Support human navigation and code generation.",
         "min": 0,
         "max": "1",
@@ -1535,7 +1570,17 @@
             "code": "string"
           }
         ],
+        "condition": [
+          "cmp-4"
+        ],
         "constraint": [
+          {
+            "key": "cmp-4",
+            "severity": "warning",
+            "human": "Name should start with an uppercase letter (A–Z), be 2 to 255 characters long, and contain only letters, digits, and underscores. Whitespace, hyphens, and other punctuation are not permitted",
+            "expression": "%resource.name.exists() implies %resource.name.matches(\u0027^[A-Z]([A-Za-z0-9_]){1,254}$\u0027)",
+            "source": "http://hl7.org/fhir/StructureDefinition/Composition"
+          },
           {
             "key": "ele-1",
             "severity": "error",
@@ -1553,7 +1598,7 @@
         "path": "Composition.title",
         "short": "Human Readable name/title",
         "definition": "Official human-readable label for the composition.",
-        "comment": "For many compositions, the title is the same as the text or a display name of Composition.type (e.g. a \"consultation\" or \"progress note\"). Note that CDA does not make title mandatory, but there are no known cases where it is useful for title to be omitted, so it is mandatory here. Feedback on this requirement is welcome during the trial use period.",
+        "comment": "For many compositions, the title is the same as the text or a display name of Composition.type (e.g. a \"consultation\" or \"progress note\").",
         "min": 0,
         "max": "1",
         "base": {
@@ -1695,6 +1740,16 @@
       {
         "id": "Composition.classification.extension",
         "path": "Composition.classification.extension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Additional content defined by implementations",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension.",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -1735,6 +1790,16 @@
       {
         "id": "Composition.classification.modifierExtension",
         "path": "Composition.classification.modifierExtension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Extensions that cannot be ignored even if unrecognized",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element\u0027s descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.\n\nModifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself).",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -1948,6 +2013,16 @@
       {
         "id": "Composition.attester.extension",
         "path": "Composition.attester.extension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Additional content defined by implementations",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension.",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -1988,6 +2063,16 @@
       {
         "id": "Composition.attester.modifierExtension",
         "path": "Composition.attester.modifierExtension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Extensions that cannot be ignored even if unrecognized",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element\u0027s descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.\n\nModifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself).",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -2067,7 +2152,7 @@
           ],
           "strength": "preferred",
           "description": "The way in which a person authenticated a composition.",
-          "valueSet": "http://hl7.org/fhir/ValueSet/composition-attestation-mode"
+          "valueSet": "http://terminology.hl7.org/ValueSet/composition-attestation-mode"
         },
         "mapping": [
           {
@@ -2089,7 +2174,7 @@
         "path": "Composition.attester.time",
         "short": "When the composition was attested",
         "definition": "When the composition was attested by the party.",
-        "requirements": "Identifies when the information in the composition was deemed accurate.  (Things may have changed since then.).",
+        "requirements": "Identifies when the information in the composition was deemed accurate. (Things may have changed since then.)",
         "min": 0,
         "max": "1",
         "base": {
@@ -2323,6 +2408,16 @@
       {
         "id": "Composition.relatesTo.extension",
         "path": "Composition.relatesTo.extension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Additional content defined by implementations",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension.",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -2363,6 +2458,16 @@
       {
         "id": "Composition.relatesTo.modifierExtension",
         "path": "Composition.relatesTo.modifierExtension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Extensions that cannot be ignored even if unrecognized",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element\u0027s descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.\n\nModifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself).",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -2497,7 +2602,7 @@
         "path": "Composition.event",
         "short": "The clinical service(s) being documented",
         "definition": "The clinical service, such as a colonoscopy or an appendectomy, being documented.",
-        "comment": "The event needs to be consistent with the type element, though can provide further information if desired.",
+        "comment": "The event needs to be consistent with the type element, though it can provide further information if desired.",
         "requirements": "Provides context for the composition and creates a linkage between a resource describing an event and the composition created describing the event.",
         "min": 0,
         "max": "*",
@@ -2575,6 +2680,16 @@
       {
         "id": "Composition.event.extension",
         "path": "Composition.event.extension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Additional content defined by implementations",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension.",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -2615,6 +2730,16 @@
       {
         "id": "Composition.event.modifierExtension",
         "path": "Composition.event.modifierExtension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Extensions that cannot be ignored even if unrecognized",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element\u0027s descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.\n\nModifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself).",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -2703,7 +2828,7 @@
         "id": "Composition.event.detail",
         "path": "Composition.event.detail",
         "short": "The event(s) being documented, as code(s), reference(s), or both",
-        "definition": "Represents the main clinical acts, such as a colonoscopy or an appendectomy, being documented. In some cases, the event is inherent in the typeCode, such as a \"History and Physical Report\" in which case the procedure being documented is necessarily a \"History and Physical\" act. The events may be included as a code or as a reference to an other resource.",
+        "definition": "Represents the main clinical acts, such as a colonoscopy or an appendectomy, being documented. In some cases, the event is inherent in the typeCode, such as a \"History and Physical Report\" in which case the procedure being documented is necessarily a \"History and Physical\" act. The events may be included as a code or as a reference to another resource.",
         "comment": "An event can further specialize the act inherent in Composition.type, such as where it is simply \"Procedure Report\" and the procedure was a \"colonoscopy\". If one or more events are included, they SHALL NOT conflict with the values inherent in Composition.type as such a conflict would create an ambiguous situation. This short list of codes is provided to be used as key words for certain types of queries.",
         "min": 0,
         "max": "*",
@@ -2863,6 +2988,16 @@
       {
         "id": "Composition.section.extension",
         "path": "Composition.section.extension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Additional content defined by implementations",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension.",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -2903,6 +3038,16 @@
       {
         "id": "Composition.section.modifierExtension",
         "path": "Composition.section.modifierExtension",
+        "slicing": {
+          "discriminator": [
+            {
+              "type": "value",
+              "path": "url"
+            }
+          ],
+          "description": "Extensions are always sliced by (at least) url",
+          "rules": "open"
+        },
         "short": "Extensions that cannot be ignored even if unrecognized",
         "definition": "May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element\u0027s descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.\n\nModifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself).",
         "comment": "There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone.",
@@ -2948,7 +3093,7 @@
         "path": "Composition.section.title",
         "short": "Label for section (e.g. for ToC)",
         "definition": "The label for this particular section.  This will be part of the rendered content for the document, and is often used to build a table of contents.",
-        "comment": "The title identifies the section for a human reader. The title must be consistent with the narrative of the resource that is the target of the section.content reference. Generally, sections SHOULD have titles, but in some documents, it is unnecessary or inappropriate. Typically, this is where a section has subsections that have their own adequately distinguishing title,  or documents that only have a single section. Most Implementation Guides will make section title to be a required element.",
+        "comment": "The title identifies the section for a human reader. The title must be consistent with the narrative of the resource that is the target of the section.content reference. Generally, sections SHOULD have titles, but in some documents, it is unnecessary or inappropriate. Typically, this is where a section has subsections that have their own adequately distinguishing title,  or documents that only have a single section. Most Implementation Guides will make section title a required element.",
         "requirements": "Section headings are often standardized for different types of documents.  They give guidance to humans on how the document is organized.",
         "alias": [
           "header",
@@ -2995,7 +3140,7 @@
         "path": "Composition.section.code",
         "short": "Classification of section (recommended)",
         "definition": "A code identifying the kind of content contained within the section. This must be consistent with the section title.",
-        "comment": "The code identifies the section for an automated processor of the document. This is particularly relevant when using profiles to control the structure of the document.   \n\nIf the section has content (instead of sub-sections), the section.code does not change the meaning or interpretation of the resource that is the content of the section in the comments for the section.code.",
+        "comment": "The code identifies the section for an automated processor of the document. This is particularly relevant when using profiles to control the structure of the document.   \n\nIf the section has content (instead of sub-sections), the section.code does not change the meaning or interpretation of the resource that is the content of the section.",
         "requirements": "Provides computable standardized labels to topics within the document.",
         "min": 0,
         "max": "1",
@@ -3100,9 +3245,9 @@
       {
         "id": "Composition.section.focus",
         "path": "Composition.section.focus",
-        "short": "Who/what the section is about, when it is not about the subject of composition",
-        "definition": "The actual focus of the section when it is not the subject of the composition, but instead represents something or someone associated with the subject such as (for a patient subject) a spouse, parent, fetus, or donor. If not focus is specified, the focus is assumed to be focus of the parent section, or, for a section in the Composition itself, the subject of the composition. Sections with a focus SHALL only include resources where the logical subject (patient, subject, focus, etc.) matches the section focus, or the resources have no logical subject (few resources).",
-        "comment": "Typically, sections in a doument are about the subject of the document, whether that is a  patient, or group of patients, location, or device, or whatever. For some kind of documents, some sections actually contain data about related entities. Typical examples are  a section in a newborn discharge summary concerning the mother, or family history documents, with a section about each family member, though there are many other examples.",
+        "short": "Who/what the section is about, when it is not about the subject of the composition",
+        "definition": "The actual focus of the section when it is not the subject of the composition, but instead represents something or someone associated with the subject such as (for a patient subject) a spouse, parent, fetus, or donor. If no focus is specified, the focus is assumed to be focus of the parent section, or, for a section in the Composition itself, the subject of the composition. Sections with a focus SHALL only include resources where the logical subject (patient, subject, focus, etc.) matches the section focus, or the resources have no logical subject (few resources).",
+        "comment": "Typically, sections in a document are about the subject of the document, whether that is a  patient, or group of patients, location, or device, or whatever. For some kinds of documents, some sections actually contain data about related entities. Typical examples are  a section in a newborn discharge summary concerning the mother, or family history documents, with a section about each family member, though there are many other examples.",
         "min": 0,
         "max": "1",
         "base": {
@@ -3156,7 +3301,8 @@
           }
         ],
         "condition": [
-          "cmp-1"
+          "cmp-1",
+          "cmp-3"
         ],
         "constraint": [
           {
@@ -3318,7 +3464,7 @@
         "path": "Composition.section.emptyReason",
         "short": "Why the section is empty",
         "definition": "If the section is empty, why the list is empty. An empty section typically has some text explaining the empty reason.",
-        "comment": "The various reasons for an empty section make a significant interpretation to its interpretation. Note that this code is for use when the entire section content has been suppressed, and not for when individual items are omitted - implementers may consider using a text note or a flag on an entry in these cases.",
+        "comment": "The various reasons for an empty section make a significant difference to its interpretation. Note that this code is for use when the entire section content has been suppressed, and not for when individual items are omitted - implementers may consider using a text note or a flag on an entry in these cases.",
         "requirements": "Allows capturing things like \"none exist\" or \"not asked\" which can be important for most lists.",
         "min": 0,
         "max": "1",

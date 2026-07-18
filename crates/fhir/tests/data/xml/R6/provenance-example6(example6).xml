@@ -1,13 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?><Provenance xmlns="http://hl7.org/fhir">
   <id value="example6"/>
-  <!--  
-    Use path when the target resource doesn't have an id to point to
+  <!-- Use path when the target resource doesn't have an id to point to
     Note that the path is constrained to simple FHIRPath - see 
     https://hl7.org/fhir/fhirpath.html#simple
     
     This asserts that the follow up note came from a different author than
-    the rest of the Procedure (see Provenance/example)
-   -->
+    the rest of the Procedure (see Provenance/example) -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

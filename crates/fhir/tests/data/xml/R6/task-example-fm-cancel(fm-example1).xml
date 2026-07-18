@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?><Task xmlns="http://hl7.org/fhir">
-  <!--    This is an example to demonstrate using task for actioning a claim reversal  -->
+  <!-- This is an example to demonstrate using task for actioning a claim reversal -->
   <id value="fm-example1"/>
   <meta>
     <security>
@@ -23,8 +23,8 @@
   <status value="requested"/>
   <intent value="order"/>
   <priority value="stat"/>
-  <!--  real time request and response required  -->
-  <!--    fictive code and description elements populated for this example     -->
+  <!-- real time request and response required -->
+  <!-- fictive code and description elements populated for this example -->
   <code>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/financialtaskcode"/>

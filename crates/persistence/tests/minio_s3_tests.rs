@@ -22,7 +22,7 @@ use helios_persistence::core::bulk_submit::{
 use helios_persistence::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
-use helios_persistence::core::{ResourceStorage, VersionedStorage};
+use helios_persistence::core::{ResourceStorage, SettingsStore, VersionedStorage};
 use helios_persistence::error::{ConcurrencyError, ResourceError, SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{CursorValue, PageCursor, Pagination, PaginationMode};
@@ -914,4 +914,199 @@ async fn test_minio_s3_output_store_round_trip() {
     store.delete_job_outputs(&tenant, &job_id).await.unwrap();
     store.delete_job_outputs(&tenant, &job_id).await.unwrap();
     assert!(store.open_reader(&key).await.is_err());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-user settings store
+//
+// The mock-backed unit tests prove the store's *logic*. These prove the thing
+// the mock cannot: that a real S3-compatible service actually enforces the
+// conditional-write preconditions the store's optimistic locking is built on.
+// Conditional PutObject is a comparatively recent S3 feature, so this is the
+// whole risk of the design — if the store silently ignored `If-Match`, every
+// concurrent settings write would be a lost update, with no error anywhere.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A user key unique to one test run, so tests never share a settings object.
+fn unique_user_key(scope: &str) -> String {
+    format!(
+        "https://idp.example.com/realms/test|{scope}-{}",
+        Uuid::new_v4()
+    )
+}
+
+#[tokio::test]
+async fn test_minio_settings_round_trip() {
+    if skip_if_disabled("test_minio_settings_round_trip") {
+        return;
+    }
+
+    let harness = make_prefix_backend("settings-round-trip").await;
+    let user = unique_user_key("round-trip");
+
+    assert!(harness.backend.get_settings(&user).await.unwrap().is_none());
+
+    let doc = json!({"theme": "dark", "defaultTenant": "acme"});
+    let stored = harness
+        .backend
+        .put_settings(&user, doc.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(stored.version, 1);
+
+    let fetched = harness.backend.get_settings(&user).await.unwrap().unwrap();
+    assert_eq!(fetched.document, doc);
+    assert_eq!(fetched.version, 1);
+
+    let patched = harness
+        .backend
+        .patch_settings(
+            &user,
+            json!({"theme": "light", "defaultTenant": null}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.document, json!({"theme": "light"}));
+    assert_eq!(patched.version, 2);
+
+    let refetched = harness.backend.get_settings(&user).await.unwrap().unwrap();
+    assert_eq!(refetched.document, json!({"theme": "light"}));
+    assert_eq!(refetched.version, 2);
+}
+
+/// `If-None-Match: *` really is enforced: of N concurrent "create if absent"
+/// writes, exactly one wins and the rest see an optimistic-lock failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_settings_create_only_single_winner() {
+    if skip_if_disabled("test_minio_settings_create_only_single_winner") {
+        return;
+    }
+
+    let harness = make_prefix_backend("settings-create-race").await;
+    let user = unique_user_key("create-race");
+    let attempts = 8usize;
+    let mut tasks = Vec::new();
+
+    for i in 0..attempts {
+        let backend = harness.backend.clone();
+        let user = user.clone();
+        tasks.push(tokio::spawn(async move {
+            // `Some(0)` asserts "this user has no settings yet".
+            backend
+                .put_settings(&user, json!({"writer": i}), Some(0))
+                .await
+        }));
+    }
+
+    let mut winners = 0usize;
+    let mut lock_failures = 0usize;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(stored) => {
+                assert_eq!(stored.version, 1);
+                winners += 1;
+            }
+            Err(StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })) => {
+                lock_failures += 1;
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    assert_eq!(winners, 1, "create-if-absent admitted more than one winner");
+    assert_eq!(lock_failures, attempts - 1);
+
+    let stored = harness.backend.get_settings(&user).await.unwrap().unwrap();
+    assert_eq!(stored.version, 1);
+}
+
+/// `If-Match` really is enforced: a write pinned to a stale version is rejected,
+/// and one pinned to the live version succeeds.
+#[tokio::test]
+async fn test_minio_settings_stale_if_match_conflicts() {
+    if skip_if_disabled("test_minio_settings_stale_if_match_conflicts") {
+        return;
+    }
+
+    let harness = make_prefix_backend("settings-if-match").await;
+    let user = unique_user_key("if-match");
+
+    harness
+        .backend
+        .put_settings(&user, json!({"a": 1}), None)
+        .await
+        .unwrap(); // version 1
+
+    // Stale precondition: asserts "not yet created", but it now exists.
+    let err = harness
+        .backend
+        .put_settings(&user, json!({"a": 2}), Some(0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })
+    ));
+
+    // Live precondition succeeds.
+    let updated = harness
+        .backend
+        .put_settings(&user, json!({"a": 2}), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(updated.version, 2);
+
+    // The rejected write left nothing behind.
+    let stored = harness.backend.get_settings(&user).await.unwrap().unwrap();
+    assert_eq!(stored.document, json!({"a": 2}));
+    assert_eq!(stored.version, 2);
+}
+
+/// The canonical lost-update proof, against a real object store: concurrent
+/// unconditional merge-patches each adding a distinct key must all survive.
+/// Every writer that loses the compare-and-swap re-reads the winner's document
+/// and merges onto it, so no key may go missing and the version must equal the
+/// number of writers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_minio_settings_concurrent_patches_never_lose_an_update() {
+    if skip_if_disabled("test_minio_settings_concurrent_patches_never_lose_an_update") {
+        return;
+    }
+
+    let harness = make_prefix_backend("settings-lost-update").await;
+    let user = unique_user_key("lost-update");
+    let writers = 4usize;
+    let mut tasks = Vec::new();
+
+    for i in 0..writers {
+        let backend = harness.backend.clone();
+        let user = user.clone();
+        tasks.push(tokio::spawn(async move {
+            // Each writer merges in a key of its own, so a lost update is
+            // visible as a missing key rather than an overwritten value.
+            let mut patch = serde_json::Map::new();
+            patch.insert(format!("key{i}"), json!(i));
+            backend
+                .patch_settings(&user, serde_json::Value::Object(patch), None)
+                .await
+        }));
+    }
+
+    for task in tasks {
+        task.await
+            .unwrap()
+            .expect("an unconditional patch must retry on conflict, not fail");
+    }
+
+    let stored = harness.backend.get_settings(&user).await.unwrap().unwrap();
+    for i in 0..writers {
+        assert_eq!(
+            stored.document.get(format!("key{i}")),
+            Some(&json!(i)),
+            "writer {i}'s update was lost: {:?}",
+            stored.document
+        );
+    }
+    assert_eq!(stored.version, writers as i64);
 }

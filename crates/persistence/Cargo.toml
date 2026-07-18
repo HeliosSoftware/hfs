@@ -26,19 +26,16 @@ cassandra = ["dep:cdrs-tokio", "dep:cdrs-tokio-helpers-derive"]
 mongodb = ["dep:mongodb"]
 neo4j = ["dep:neo4rs"]
 elasticsearch = ["dep:elasticsearch"]
-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:sha2"]
 
 # Configuration advisor binary
 advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
 
-# Audit event integration
-audit = ["dep:helios-audit"]
-
-# FHIR version features (pass through to helios-fhir, helios-fhirpath, helios-sof)
-R4 = ["helios-fhir/R4", "helios-fhirpath/R4", "helios-sof/R4", "helios-audit?/R4"]
-R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B", "helios-sof/R4B", "helios-audit?/R4B"]
-R5 = ["helios-fhir/R5", "helios-fhirpath/R5", "helios-sof/R5", "helios-audit?/R5"]
-R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-sof/R6", "helios-audit?/R6"]
+# FHIR version features (pass through to helios-fhir, helios-fhirpath, helios-sof, helios-audit)
+R4 = ["helios-fhir/R4", "helios-fhirpath/R4", "helios-sof/R4", "helios-audit/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B", "helios-sof/R4B", "helios-audit/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath/R5", "helios-sof/R5", "helios-audit/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath/R6", "helios-sof/R6", "helios-audit/R6"]
 
 [dependencies]
 # Core dependencies (always included)
@@ -54,7 +51,10 @@ serde_json.workspace = true
 chrono.workspace = true
 thiserror = "2"
 async-trait = "0.1"
-tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+# "time" backs the backoff between compare-and-swap retries in the settings
+# stores. It was previously reaching us only through feature unification with
+# other dependencies; declare the feature we actually use rather than rely on that.
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -96,9 +96,18 @@ elasticsearch = { version = "8.15.0-alpha.1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
+# Hashes the per-user settings key into an opaque, fixed-length S3 object name.
+sha2 = { version = "0.10", optional = true }
 
-# Audit event integration
-helios-audit = { path = "../audit", version = "0.2.1", optional = true, default-features = false }
+# Audit event integration.
+#
+# Deliberately NOT optional. The persistence layer emits BALP AuditEvents from
+# the purge path, the reindex driver, and the bulk-export worker. Gating that
+# behind a cargo feature meant every call site needed a `#[cfg]` arm, and
+# `helios-rest` — which does not enable the feature — could not call the shared
+# emit helpers at all, so it grew a hand-rolled duplicate that silently drifted.
+# helios-audit only depends on helios-fhir, so this introduces no cycle.
+helios-audit = { path = "../audit", version = "0.2.1", default-features = false }
 
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }

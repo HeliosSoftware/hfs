@@ -193,7 +193,7 @@
   <name value="Expression"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -362,6 +362,7 @@
       <path value="Expression.name"/>
       <short value="Short name assigned to expression for reuse"/>
       <definition value="A short name assigned to the expression to allow for multiple reuse of the expression in the context where it is defined."/>
+      <comment value="This element is defined with a data type of code because of its behavior, not because of any expectation it will be bound to a value set."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -516,6 +517,7 @@
       <path value="Expression.name"/>
       <short value="Short name assigned to expression for reuse"/>
       <definition value="A short name assigned to the expression to allow for multiple reuse of the expression in the context where it is defined."/>
+      <comment value="This element is defined with a data type of code because of its behavior, not because of any expectation it will be bound to a value set."/>
       <min value="0"/>
       <max value="1"/>
       <type>

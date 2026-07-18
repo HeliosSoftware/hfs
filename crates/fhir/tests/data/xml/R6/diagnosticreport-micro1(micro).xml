@@ -12,14 +12,14 @@
     <fullUrl value="https://example.com/base/DiagnosticReport/micro"/>
     <resource>
       <DiagnosticReport>
-        <!--    start of the main resource    -->
+        <!-- start of the main resource -->
         <id value="micro"/>
         <text>
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: DiagnosticReport micro</b></p><a name="micro"> </a><a name="hcmicro"> </a><h2><span title="Codes:{http://loinc.org 632-0}">Bacteria identified in Wound by Aerobe culture</span> (<span title="Codes:{http://terminology.hl7.org/CodeSystem/v2-0074 MB}">Microbiology</span>) </h2><table class="grid"><tr><td>Subject</td><td>Jim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --&gt; (ongoing)))</td></tr><tr><td>Reported</td><td>2009-08-10T08:25:44+10:00</td></tr><tr><td>Performer</td><td> Todd Ashby</td></tr><tr><td>Identifier</td><td> <code>http://hnam.org/identifiers/orders</code>/290741144</td></tr></table><p><b>Report Details</b></p><table class="grid"><tr><td><b>Code</b></td><td><b>Value</b></td></tr><tr><td colspan="2"><i>Observation</i></td></tr></table></div>
         </text>
         <identifier>
           <system value="http://hnam.org/identifiers/orders"/>
-          <!--    seems like a likely choice    -->
+          <!-- seems like a likely choice -->
           <value value="290741144"/>
         </identifier>
         <basedOn>
@@ -39,7 +39,7 @@
             <display value="Bacteria identified in Wound by Aerobe culture"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
@@ -68,16 +68,16 @@
             <code value="ORGANISM"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
         <valueCodeableConcept>
-          <!--    CE    -->
+          <!-- CE -->
           <coding>
             <system value="http://acme.org/lab/codes/organisms"/>
             <code value="Staaur"/>
@@ -102,11 +102,11 @@
             <code value="CULTPOSNEG"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -135,11 +135,11 @@
             <display value="Ampicillin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -168,11 +168,11 @@
             <display value="Cefazolin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -205,11 +205,11 @@
             <display value="Cefoxitin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -242,11 +242,11 @@
             <display value="Clindamycin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -279,11 +279,11 @@
             <display value="Daptomycin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -316,11 +316,11 @@
             <display value="Doxycycline"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -353,11 +353,11 @@
             <display value="Erythromycin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -390,11 +390,11 @@
             <display value="Gentamicin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -427,11 +427,11 @@
             <display value="Levofloxacin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -464,11 +464,11 @@
             <display value="Linezolid"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -500,11 +500,11 @@
             <display value="Moxifloxacin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -537,11 +537,11 @@
             <display value="Oxacillin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -573,11 +573,11 @@
             <display value="Penicillin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -610,11 +610,11 @@
             <display value="Quinupristin/Dalfopristin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -646,11 +646,11 @@
             <display value="Rifampin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -683,11 +683,11 @@
             <display value="Tetracycline"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -720,17 +720,17 @@
             <display value="Trimethoprim/Sulfamethoxazole"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
         <valueQuantity>
           <value value="0.0526"/>
-          <!--    not sure what to do with <=1/19    -->
+          <!-- not sure what to do with <=1/19 -->
           <comparator value="&lt;="/>
         </valueQuantity>
         <interpretation>
@@ -758,11 +758,11 @@
             <display value="Vancomycin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -794,11 +794,11 @@
             <display value="D-Test"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -822,11 +822,11 @@
             <display value="Oxacillin"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
@@ -848,7 +848,7 @@
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Observation obr-2</b></p><a name="obr-2"> </a><a name="hcobr-2"> </a><p><b>status</b>: Final</p><p><b>code</b>: <span title="Codes:{http://acme.org/lab/codes/panels 60790}">Susceptibility - Automated broth dilution (Billed)</span></p><p><b>subject</b>: <a href="patient-example.html">Jim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --&gt; (ongoing)))</a></p><p><b>performer</b>: Todd Ashby</p><p><b>hasMember</b>: </p><ul><li><a href="broken-link.html">Observation/obx2-1</a></li><li><a href="broken-link.html">Observation/obx2-2</a></li><li><a href="broken-link.html">Observation/obx2-4</a></li><li><a href="broken-link.html">Observation/obx2-6</a></li><li><a href="broken-link.html">Observation/obx2-8</a></li><li><a href="broken-link.html">Observation/obx2-10</a></li><li><a href="broken-link.html">Observation/obx2-12</a></li><li><a href="broken-link.html">Observation/obx2-14</a></li><li><a href="broken-link.html">Observation/obx2-16</a></li><li><a href="broken-link.html">Observation/obx2-18</a></li><li><a href="broken-link.html">Observation/obx2-20</a></li><li><a href="broken-link.html">Observation/obx2-22</a></li><li><a href="broken-link.html">Observation/obx2-24</a></li><li><a href="broken-link.html">Observation/obx2-26</a></li><li><a href="broken-link.html">Observation/obx2-28</a></li><li><a href="broken-link.html">Observation/obx2-30</a></li><li><a href="broken-link.html">Observation/obx2-32</a></li><li><a href="broken-link.html">Observation/obx2-34</a></li><li><a href="broken-link.html">Observation/nte-1</a></li></ul></div>
         </text>
         <status value="final"/>
-        <!--    OBR 2    -->
+        <!-- OBR 2 -->
         <code>
           <coding>
             <system value="http://acme.org/lab/codes/panels"/>
@@ -856,15 +856,15 @@
             <display value="Susceptibility - Automated broth dilution (Billed)"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
-        <!--    of course, in practive, this would be a real reference    -->
+        <!-- of course, in practive, this would be a real reference -->
         <performer>
           <display value="Todd Ashby"/>
         </performer>
-        <!--    now, references to the OBXs. for reader convenience, we take keep the OBX identification, though this is not required in practice. Note that many of the oBX segments are pairs that get collapsed    -->
+        <!-- now, references to the OBXs. for reader convenience, we take keep the OBX identification, though this is not required in practice. Note that many of the oBX segments are pairs that get collapsed -->
         <hasMember>
           <reference value="Observation/obx2-1"/>
         </hasMember>
@@ -934,7 +934,7 @@
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Observation obr-3</b></p><a name="obr-3"> </a><a name="hcobr-3"> </a><p><b>status</b>: Final</p><p><b>code</b>: <span title="Codes:{http://acme.org/lab/codes/panels 60418}">Susceptibility - Disk diffusion (Billed)</span></p><p><b>subject</b>: <a href="patient-example.html">Jim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --&gt; (ongoing)))</a></p><p><b>hasMember</b>: <a href="broken-link.html">Observation/obx3-1</a></p></div>
         </text>
         <status value="final"/>
-        <!--    OBR 3    -->
+        <!-- OBR 3 -->
         <code>
           <coding>
             <system value="http://acme.org/lab/codes/panels"/>
@@ -942,7 +942,7 @@
             <display value="Susceptibility - Disk diffusion (Billed)"/>
           </coding>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
@@ -961,7 +961,7 @@
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Observation org1</b></p><a name="org1"> </a><a name="hcorg1"> </a><p><b>status</b>: Final</p><p><b>code</b>: <span title="Codes:{http://acme.org/lab/codes/organisms Staaur}">Staphylococcus aureus Panel</span></p><p><b>subject</b>: <a href="patient-example.html">Jim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --&gt; (ongoing)))</a></p><p><b>hasMember</b>: </p><ul><li><a href="broken-link.html">Observation/obx1-4</a></li><li><a href="broken-link.html">Observation/obx1-5</a></li><li><a href="broken-link.html">Observation/obr-2</a></li><li><a href="broken-link.html">Observation/obr-3</a></li></ul></div>
         </text>
         <status value="final"/>
-        <!--    OBR 1    -->
+        <!-- OBR 1 -->
         <code>
           <coding>
             <system value="http://acme.org/lab/codes/organisms"/>
@@ -969,7 +969,7 @@
           </coding>
           <text value="Staphylococcus aureus Panel"/>
         </code>
-        <!--    patient chosen at random    -->
+        <!-- patient chosen at random -->
         <subject>
           <reference value="Patient/example"/>
         </subject>
@@ -979,11 +979,11 @@
         <hasMember>
           <reference value="Observation/obx1-5"/>
         </hasMember>
-        <!--    group - automated broth dilution. This is unusual - usually, there's just one level of group, and this group would be skipped    -->
+        <!-- group - automated broth dilution. This is unusual - usually, there's just one level of group, and this group would be skipped -->
         <hasMember>
           <reference value="Observation/obr-2"/>
         </hasMember>
-        <!--    group - Disk diffusion    -->
+        <!-- group - Disk diffusion -->
         <hasMember>
           <reference value="Observation/obr-3"/>
         </hasMember>

@@ -12,7 +12,7 @@ use crate::error::{BackendError, StorageError, StorageResult};
 use super::backend::MongoBackendConfig;
 
 /// Current MongoDB schema version.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -44,6 +44,7 @@ pub async fn initialize_schema_async(database: &Database) -> StorageResult<()> {
     ensure_history_indexes(database).await?;
     ensure_search_indexes(database).await?;
     ensure_user_settings_indexes(database).await?;
+    ensure_tenants_indexes(database).await?;
     set_schema_version(database, SCHEMA_VERSION).await?;
     Ok(())
 }
@@ -56,6 +57,7 @@ pub async fn migrate_schema_async(database: &Database) -> StorageResult<()> {
         ensure_history_indexes(database).await?;
         ensure_search_indexes(database).await?;
         ensure_user_settings_indexes(database).await?;
+        ensure_tenants_indexes(database).await?;
         set_schema_version(database, SCHEMA_VERSION).await?;
     }
     Ok(())
@@ -269,6 +271,19 @@ async fn ensure_user_settings_indexes(database: &Database) -> StorageResult<()> 
         true,
     )
     .await?;
+
+    Ok(())
+}
+
+/// Index for the tenant registry (schema v6). One document per registered
+/// tenant, keyed by a unique `id`, so a concurrent double-register surfaces as
+/// a duplicate-key error instead of two rows. See the SQLite `tenants` table
+/// (schema v14) for the canonical shape: `id`, optional `display_name`, and an
+/// RFC 3339 `created_at`.
+async fn ensure_tenants_indexes(database: &Database) -> StorageResult<()> {
+    let tenants = database.collection::<Document>("tenants");
+
+    create_index(&tenants, doc! { "id": 1_i32 }, "idx_tenants_id", true).await?;
 
     Ok(())
 }

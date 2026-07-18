@@ -33,7 +33,7 @@
   "color": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/color-names",
+        "system": "http://terminology.hl7.org/CodeSystem/color-names",
         "code": "blue",
         "display": "Blue"
       }
@@ -42,7 +42,7 @@
   "category": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/metric-category",
+        "system": "http://terminology.hl7.org/CodeSystem/metric-category",
         "code": "measurement",
         "display": "Measurement"
       }
@@ -59,7 +59,7 @@
       "state": {
         "coding": [
           {
-            "system": "http://hl7.org/fhir/metric-calibration-state",
+            "system": "http://terminology.hl7.org/CodeSystem/metric-calibration-state",
             "code": "calibrated",
             "display": "Calibrated"
           }

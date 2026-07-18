@@ -267,6 +267,13 @@ mod shared_mongo {
                     // image default and keeps the mapped port reachable once we
                     // supply our own command.
                     .with_cmd(["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"])
+                    // Every test creates its own uniquely-named database, and
+                    // WiredTiger holds file handles open per collection/index
+                    // across all of them. With 50+ test databases the stock
+                    // container nofile limit is exhausted and index builds die
+                    // with TooManyFilesOpen (error 264) late in the run. 64000
+                    // is mongod's own recommended minimum.
+                    .with_ulimit("nofile", 64000, Some(64000))
                     .with_startup_timeout(std::time::Duration::from_secs(120))
                     .start()
                     .await
@@ -584,8 +591,14 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
     };
 
     let created_during_test = after - before;
+    // `totalCreated` is a server-global counter on the SHARED mongo, so
+    // concurrently running neighbor tests (each with its own client pool)
+    // inflate it — observed spilling past 50 on wide runners. The regression
+    // this guards against (a fresh client per operation) creates at least one
+    // connection per iteration: 8 tasks × 20 ops ≥ 160. A 120 ceiling keeps
+    // that detectable while tolerating neighbor noise.
     assert!(
-        created_during_test <= 50,
+        created_during_test <= 120,
         "MongoDB backend should reuse one client pool; created {} connections during concurrent read/search",
         created_during_test
     );
@@ -1203,6 +1216,56 @@ async fn mongodb_integration_count_by_day() {
 }
 
 #[tokio::test]
+async fn mongodb_integration_count_deltas_by_bucket() {
+    let Some(backend) = create_backend("console_count_deltas").await else {
+        eprintln!("Skipping mongodb_integration_count_deltas_by_bucket (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-count-deltas");
+
+    let first = backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    // An update writes a v2 history row, which must contribute no delta — the
+    // aggregation pipeline's `$switch` has to agree with the SQL backends' CASE.
+    backend
+        .update(&tenant, &first, json!({"active": true}))
+        .await
+        .unwrap();
+
+    let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let rows = backend
+        .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.iter().map(|r| r.delta).sum::<i64>(),
+        2,
+        "two creates and one update net to +2"
+    );
+    assert!(
+        rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+        "buckets are epoch-aligned to their width"
+    );
+
+    backend
+        .delete(&tenant, "Patient", first.id())
+        .await
+        .unwrap();
+    let rows = backend
+        .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
+}
+
+#[tokio::test]
 async fn mongodb_integration_activity_histogram() {
     let Some(backend) = create_backend("console_activity_histogram").await else {
         eprintln!("Skipping mongodb_integration_activity_histogram (set HFS_TEST_MONGODB_URL)");
@@ -1275,6 +1338,108 @@ async fn mongodb_integration_count_by_tenant() {
     let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
     assert_eq!(map.get("tenant-a"), Some(&3));
     assert_eq!(map.get("tenant-b"), Some(&2));
+}
+
+#[tokio::test]
+async fn mongodb_integration_tenant_registry_crud() {
+    let Some(backend) = create_backend("tenant_registry_crud").await else {
+        eprintln!("Skipping mongodb_integration_tenant_registry_crud (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    assert!(backend.supports_tenant_registry());
+
+    // Register in id order so the (created_at, id) sort is deterministic even
+    // when both inserts land in the same second.
+    let alpha = backend
+        .register_tenant("tenant-alpha", Some("Acme Corp"))
+        .await
+        .unwrap();
+    assert_eq!(alpha.id, "tenant-alpha");
+    assert_eq!(alpha.display_name.as_deref(), Some("Acme Corp"));
+    assert!(!alpha.created_at.is_empty());
+
+    let beta = backend.register_tenant("tenant-beta", None).await.unwrap();
+    assert_eq!(beta.id, "tenant-beta");
+    assert_eq!(beta.display_name, None);
+    assert!(!beta.created_at.is_empty());
+
+    // get_tenant round-trips the registered records.
+    let fetched_alpha = backend.get_tenant("tenant-alpha").await.unwrap().unwrap();
+    assert_eq!(fetched_alpha, alpha);
+    let fetched_beta = backend.get_tenant("tenant-beta").await.unwrap().unwrap();
+    assert_eq!(fetched_beta, beta);
+    assert_eq!(backend.get_tenant("tenant-missing").await.unwrap(), None);
+
+    // Each test gets a fresh database, so the listing is exhaustive.
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(listed, vec![alpha.clone(), beta.clone()]);
+
+    // Duplicate id hits the unique index on `id`.
+    let duplicate = backend.register_tenant("tenant-alpha", None).await;
+    assert!(duplicate.is_err());
+
+    // Deregister removes the row once; repeating reports nothing deleted.
+    assert!(backend.deregister_tenant("tenant-alpha").await.unwrap());
+    assert!(!backend.deregister_tenant("tenant-alpha").await.unwrap());
+    assert_eq!(backend.get_tenant("tenant-alpha").await.unwrap(), None);
+
+    let remaining = backend.list_tenants().await.unwrap();
+    assert_eq!(remaining, vec![beta]);
+}
+
+#[tokio::test]
+async fn mongodb_integration_purge_tenant_data() {
+    let Some(backend) = create_backend("purge_tenant_data").await else {
+        eprintln!("Skipping mongodb_integration_purge_tenant_data (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+
+    let tenant_a = create_tenant("tenant-purge-a");
+    let tenant_b = create_tenant("tenant-purge-b");
+
+    let a1 = backend
+        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let a2 = backend
+        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let b1 = backend
+        .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+
+    let removed = backend.purge_tenant_data("tenant-purge-a").await.unwrap();
+    assert_eq!(removed, 2);
+
+    // Tenant A's resources are hard-deleted (not merely soft-deleted).
+    assert!(
+        backend
+            .read(&tenant_a, "Patient", a1.id())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .read(&tenant_a, "Patient", a2.id())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 0);
+
+    // Tenant B is untouched.
+    assert!(
+        backend
+            .read(&tenant_b, "Patient", b1.id())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -2288,6 +2453,92 @@ async fn mongodb_integration_search_parameter_create_registers_active() {
         "http://example.org/fhir/SearchParameter/mongo-custom-patient-nickname"
     );
     assert_eq!(param.status, SearchParameterStatus::Active);
+}
+
+/// The TTL-cache refresh (#235) rebuilds the registry's stored parameters from
+/// what the database currently holds: a parameter written by a cluster-mate
+/// enters resolution on the next refresh, and a deleted one leaves it. This is
+/// the SQLite integration test's contract exercised over the Mongo cursor path.
+#[tokio::test]
+async fn mongodb_integration_refresh_rebuilds_stored_parameters() {
+    use helios_persistence::search::registry::SearchParameterSource;
+
+    let Some(backend) = create_backend("search_param_refresh").await else {
+        eprintln!(
+            "Skipping mongodb_integration_refresh_rebuilds_stored_parameters (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-search-param-refresh");
+
+    backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "mongo-refresh-nickname",
+                "url": "http://example.org/fhir/SearchParameter/mongo-refresh-nickname",
+                "name": "MongoRefreshNickname",
+                "status": "active",
+                "code": "mongo-refresh-nickname",
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.where(use='nickname').given"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Simulate a freshly booted cluster-mate: storage holds the parameter but
+    // its registry has never seen it (drop the write-hook registration).
+    backend
+        .search_registry()
+        .write()
+        .unregister_source(SearchParameterSource::Stored);
+    assert!(
+        backend
+            .search_registry()
+            .read()
+            .get_param("Patient", "mongo-refresh-nickname")
+            .is_none(),
+        "not visible before the refresh"
+    );
+
+    let stored = backend
+        .refresh_stored_search_parameters()
+        .await
+        .expect("refresh from storage");
+    assert_eq!(stored, 1);
+    assert!(
+        backend
+            .search_registry()
+            .read()
+            .get_param("Patient", "mongo-refresh-nickname")
+            .is_some(),
+        "visible after the refresh"
+    );
+
+    // Delete it from storage; the next refresh drops it from resolution.
+    backend
+        .delete(&tenant, "SearchParameter", "mongo-refresh-nickname")
+        .await
+        .unwrap();
+    let stored = backend
+        .refresh_stored_search_parameters()
+        .await
+        .expect("refresh after delete");
+    assert_eq!(stored, 0);
+    assert!(
+        backend
+            .search_registry()
+            .read()
+            .get_param("Patient", "mongo-refresh-nickname")
+            .is_none(),
+        "gone after the refresh"
+    );
 }
 
 #[tokio::test]

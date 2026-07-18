@@ -1,0 +1,230 @@
+{
+  "resourceType": "SubstanceDefinition",
+  "id": "peg3350",
+  "identifier": [
+    {
+      "system": "http://example.europa.eu/fhir/SMSId",
+      "value": "PEG3350P"
+    }
+  ],
+  "status": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/publication-status",
+        "code": "active",
+        "display": "Active"
+      }
+    ]
+  },
+  "classification": [
+    {
+      "coding": [
+        {
+          "system": "http://example.europa.eu/fhir/SubstanceType",
+          "code": "polymer",
+          "display": "Polymer"
+        }
+      ]
+    }
+  ],
+  "domain": {
+    "coding": [
+      {
+        "system": "http://example.europa.eu/fhir/Domain",
+        "code": "human",
+        "display": "Human use"
+      }
+    ]
+  },
+  "description": "Polyethylene Glycol 3350 (PEG 3350, Macrogol 3350) — a synthetic polyether of ethylene oxide with number-average molecular weight approximately 3350 Da. Linear homopolymer used as an osmotic laxative and a pharmaceutical excipient.",
+  "code": [
+    {
+      "code": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/Substance",
+            "code": "PEG3350P"
+          }
+        ]
+      }
+    }
+  ],
+  "name": [
+    {
+      "name": "Polyethylene Glycol 3350",
+      "preferred": true,
+      "language": [
+        {
+          "coding": [
+            {
+              "system": "urn:ietf:bcp:47",
+              "code": "en",
+              "display": "English"
+            }
+          ]
+        }
+      ],
+      "official": [
+        {
+          "authority": {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/substance-name-authority",
+                "code": "USAN",
+                "display": "USAN"
+              }
+            ]
+          },
+          "status": {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/publication-status",
+                "code": "active",
+                "display": "Active"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Macrogol 3350",
+      "preferred": false
+    }
+  ],
+  "molecularWeight": [
+    {
+      "type": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/WeightType",
+            "code": "number-average",
+            "display": "Number average (Mn)"
+          }
+        ]
+      },
+      "amount": {
+        "value": 3350,
+        "unit": "g/mol",
+        "system": "http://unitsofmeasure.org",
+        "code": "g/mol"
+      }
+    }
+  ],
+  "polymer": {
+    "class": {
+      "coding": [
+        {
+          "system": "http://hl7.org/fhir/polymer-class",
+          "code": "homopolymer",
+          "display": "Homopolymer"
+        }
+      ]
+    },
+    "geometry": {
+      "coding": [
+        {
+          "system": "http://hl7.org/fhir/polymer-geometry",
+          "code": "linear",
+          "display": "Linear"
+        }
+      ]
+    },
+    "monomerSet": [
+      {
+        "ratioType": {
+          "coding": [
+            {
+              "system": "http://hl7.org/fhir/polymer-monomer-ratio-type",
+              "code": "monomer-polymer-ratio",
+              "display": "Monomer/Polymer ratio"
+            }
+          ]
+        },
+        "startingMaterial": [
+          {
+            "code": {
+              "concept": {
+                "coding": [
+                  {
+                    "system": "http://example.europa.eu/fhir/Substance",
+                    "code": "ethylene-oxide",
+                    "display": "Ethylene oxide"
+                  }
+                ]
+              }
+            },
+            "category": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/polymer-starting-material-category",
+                  "code": "chemical-substance",
+                  "display": "Chemical substance"
+                }
+              ]
+            },
+            "isDefining": true,
+            "amount": {
+              "value": 76,
+              "unit": "monomers per polymer"
+            }
+          }
+        ]
+      }
+    ],
+    "repeat": [
+      {
+        "averageMolecularFormula": "(C2H4O)76",
+        "repeatUnitAmountType": {
+          "coding": [
+            {
+              "system": "http://hl7.org/fhir/polymer-monomer-ratio-type",
+              "code": "sru-polymer-ratio",
+              "display": "SRU/Polymer ratio"
+            }
+          ]
+        },
+        "repeatUnit": [
+          {
+            "unit": "-CH2-CH2-O-",
+            "orientation": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/polymerisation-orientation",
+                  "code": "head-tail",
+                  "display": "Head-to-tail"
+                }
+              ]
+            },
+            "amount": 76,
+            "degreeOfPolymerisation": [
+              {
+                "type": {
+                  "coding": [
+                    {
+                      "system": "http://hl7.org/fhir/degree-of-polymerisation-type",
+                      "code": "number-average",
+                      "display": "Number average"
+                    }
+                  ]
+                },
+                "average": 76,
+                "low": 70,
+                "high": 82
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

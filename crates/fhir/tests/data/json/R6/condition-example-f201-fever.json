@@ -55,17 +55,6 @@
       }
     ]
   },
-  "bodySite": [
-    {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "38266002",
-          "display": "Entire body as a whole"
-        }
-      ]
-    }
-  ],
   "subject": {
     "reference": "Patient/f201",
     "display": "Roel"

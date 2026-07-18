@@ -29,7 +29,7 @@
     </coding>
   </category>
   <criticality value="high"/>
-  <!--  subtance, coded from RxNorm  -->
+  <!-- subtance, coded from RxNorm -->
   <code>
     <coding>
       <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
@@ -37,13 +37,13 @@
       <display value="Penicillin G"/>
     </coding>
   </code>
-  <!--  the patient that actually has the risk of adverse reaction  -->
+  <!-- the patient that actually has the risk of adverse reaction -->
   <patient>
     <reference value="Patient/example"/>
   </patient>
-  <!--  the date that this entry was recorded  -->
+  <!-- the date that this entry was recorded -->
   <recordedDate value="2010-03-01"/>
-  <!--  who made the record / last updated it  -->
+  <!-- who made the record / last updated it -->
   <recorder>
     <reference value="Practitioner/example"/>
   </recorder>

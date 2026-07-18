@@ -15,8 +15,7 @@
         <a href="valueset-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <br/>
-      <p>
-        <b>Group 1 </b>Mapping from 
+      <p>Mapping from 
         <a href="codesystem-deviceassociation-status.html">DeviceAssociation Status Codes</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
@@ -65,17 +64,11 @@
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-deviceassociation-status"/>
   <version value="6.0.0-ballot4"/>
-  <name value="DeviceAssociationCodesCanonicalMap"/>
+  <name value="DeviceAssociationStatusCodesCanonicalMap"/>
   <title value="Canonical Mapping for &quot;DeviceAssociation Status Codes&quot;"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <publisher value="FHIR Project team"/>
-  <contact>
-    <telecom>
-      <system value="url"/>
-      <value value="http://hl7.org/fhir"/>
-    </telecom>
-  </contact>
+  <publisher value="HL7 International"/>
   <description value="Canonical Mapping for &quot;DeviceAssociation Status Codes&quot;"/>
   <jurisdiction>
     <coding>

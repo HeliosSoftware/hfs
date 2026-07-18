@@ -121,7 +121,7 @@
       </table>
       <div>
         <p>The response from an &quot;mpi&quot; query is a bundle containing patient records, ordered from most likely to least likely. If there are no patient matches, the MPI SHALL return an empty search set with no error, but may include an operation outcome with further advice regarding patient selection. All patient records SHALL have a search score from 0 to 1, where 1 is the most certain match, along with an extension &quot;
-          <a href="https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-match-grade.html">http://hl7.org/fhir/StructureDefinition/match-grade</a>&quot; that indicates the MPI's position on the match quality.
+          <a href="https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-match-grade.html">Bundle Match Grade</a>&quot; that indicates the MPI's position on the match quality.
         </p>
 
       </div>
@@ -143,7 +143,7 @@
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Patient Administration"/>
   <contact>
     <telecom>
@@ -171,7 +171,7 @@
   </jurisdiction>
   <affectsState value="false"/>
   <code value="match"/>
-  <comment value="The response from an &quot;mpi&quot; query is a bundle containing patient records, ordered from most likely to least likely. If there are no patient matches, the MPI SHALL return an empty search set with no error, but may include an operation outcome with further advice regarding patient selection. All patient records SHALL have a search score from 0 to 1, where 1 is the most certain match, along with an extension &quot;[http://hl7.org/fhir/StructureDefinition/match-grade](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-match-grade.html)&quot; that indicates the MPI's position on the match quality."/>
+  <comment value="The response from an &quot;mpi&quot; query is a bundle containing patient records, ordered from most likely to least likely. If there are no patient matches, the MPI SHALL return an empty search set with no error, but may include an operation outcome with further advice regarding patient selection. All patient records SHALL have a search score from 0 to 1, where 1 is the most certain match, along with an extension &quot;[Bundle Match Grade](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-match-grade.html)&quot; that indicates the MPI's position on the match quality."/>
   <resource value="Patient"/>
   <system value="false"/>
   <type value="true"/>

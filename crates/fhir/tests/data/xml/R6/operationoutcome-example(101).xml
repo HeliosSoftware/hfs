@@ -19,7 +19,6 @@
       <text value="The code &#34;W&#34; is not known and not legal in this context"/>
     </details>
     <diagnostics value="Acme.Interop.FHIRProcessors.Patient.processGender line 2453"/>
-    <location value="/f:Patient/f:gender"/>
     <expression value="Patient.gender"/>
   </issue>
 </OperationOutcome>
