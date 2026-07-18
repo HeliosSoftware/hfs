@@ -28,8 +28,12 @@ use helios_persistence::{BackendKind, ResourceStorage, TenantContext};
 use helios_rest::{AuthMiddlewareState, ServerConfig, StorageBackendMode};
 use tracing::{info, warn};
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::core::SettingsStore;
+// Bulk export/submit is only wired on backends that can host (or sidecar) job
+// state; the imports are unused in standalone MongoDB/S3-only builds.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, DefaultExportWorker, DefaultSubmitWorker,
     ExportOutputStore, SubmitInputFetcher, WorkerId,
@@ -46,6 +50,14 @@ use helios_rest::OperationsBundle;
 use helios_rest::create_app_with_auth_bulk_settings_and_ops;
 
 use helios_persistence::core::PurgableStorage;
+// Only the reindex-capable ops bundles use these; the S3-only build has no
+// reindex path.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
 use helios_persistence::search::{ReindexOperation, SearchParameterExtractor};
 
 #[cfg(feature = "sqlite")]
@@ -160,6 +172,7 @@ where
     }
 }
 
+#[cfg(feature = "sqlite")]
 fn validate_shared_sqlite_audit_path(path: &str, dedicated: bool) -> anyhow::Result<()> {
     if !dedicated && path == ":memory:" {
         anyhow::bail!(
@@ -858,6 +871,10 @@ async fn main() -> anyhow::Result<()> {
 /// (#235), making storage the source of truth the registry caches over. A
 /// failed seed logs and boots anyway: the in-memory registry still resolves
 /// searches; only API discovery of the spec parameters is degraded.
+///
+/// Only the self-indexing standalone backends (SQLite/Postgres/MongoDB) seed;
+/// the S3 primary has no search index to seed.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 async fn seed_search_parameters<S>(backend: &S, config: &ServerConfig)
 where
     S: helios_persistence::core::ResourceStorage,
@@ -1010,7 +1027,13 @@ async fn start_sqlite(
 ///    one of the persistent options above.
 ///
 /// Isolated from FHIR resource data either way.
-#[cfg(feature = "sqlite")]
+///
+/// Only compiled for backends that can't host job state themselves and so need
+/// the sidecar (MongoDB, S3); pure-SQLite/Postgres deployments never call it.
+#[cfg(all(
+    feature = "sqlite",
+    any(feature = "mongodb", all(feature = "s3", feature = "elasticsearch"))
+))]
 fn build_embedded_job_store(config: &ServerConfig) -> anyhow::Result<Arc<dyn BulkExportJobStore>> {
     let job_db = config
         .bulk_export
@@ -1145,6 +1168,14 @@ where
 }
 
 /// Attaches the audit sink to a reindex driver and hands back a shared handle.
+/// Used by both the standalone and composite ops bundles; the S3-only build has
+/// no reindex target and so never calls it.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
 fn wire_reindex(
     op: ReindexOperation,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
@@ -1161,6 +1192,7 @@ fn wire_reindex(
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
 /// (SQLite, PostgreSQL, MongoDB), where resources and search index share a home.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 fn standalone_ops<B>(
     backend: Arc<B>,
     extractor: Arc<SearchParameterExtractor>,
@@ -1188,6 +1220,10 @@ where
 /// which must include the Elasticsearch secondary, since that is what actually
 /// serves search here. Rebuilding only the primary's index would leave search
 /// untouched by `$reindex`.
+///
+/// Composite deployments always pair a primary with the Elasticsearch
+/// secondary, so this is only reachable when `elasticsearch` is enabled.
+#[cfg(feature = "elasticsearch")]
 fn composite_ops(
     composite: Arc<helios_persistence::composite::CompositeStorage>,
     source: Arc<dyn helios_persistence::search::ReindexSource>,
@@ -2186,7 +2222,10 @@ async fn start_s3(
 }
 
 /// Builds a search parameter registry independently (for backends that don't own one).
-#[cfg(feature = "elasticsearch")]
+///
+/// Only the composite S3 + Elasticsearch starter needs this; the other composite
+/// starters get their registry from the primary backend.
+#[cfg(all(feature = "s3", feature = "elasticsearch"))]
 fn build_search_registry(
     fhir_version: helios_fhir::FhirVersion,
     data_dir: Option<&std::path::Path>,
@@ -2501,7 +2540,7 @@ mod tests {
 
     // ── build_search_registry() ───────────────────────────────────
 
-    #[cfg(feature = "elasticsearch")]
+    #[cfg(all(feature = "s3", feature = "elasticsearch"))]
     #[test]
     fn test_build_search_registry_returns_registry() {
         use helios_fhir::FhirVersion;
@@ -2654,6 +2693,7 @@ mod tests {
         assert!(is_database_audit_dedicated(&s3_only, BackendKind::S3));
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_validate_shared_sqlite_audit_path_guard() {
         let shared = validate_shared_sqlite_audit_path(":memory:", false);
