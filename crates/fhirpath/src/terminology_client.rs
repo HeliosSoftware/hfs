@@ -449,41 +449,40 @@ impl TerminologyClient {
             "valueUri": concept_map_url
         })];
 
-        // Create a coding parameter
-        if !system.is_empty() {
-            parameters.push(json!({
-                "name": "coding",
-                "valueCoding": {
-                    "system": system,
-                    "code": code
-                }
-            }));
-        } else {
-            // For codes without explicit system, we need to infer it from context
-            // For FHIR ConceptMaps, certain codes have known systems
-            let inferred_system = match code {
+        // Send the source concept as separate `code` + `system` parameters rather
+        // than a single `coding`.
+        //
+        // This used to send `coding`/`valueCoding`, which HTS rejects outright with
+        // `400 Missing required parameter: code or sourceCode` (#287). The R5 spelling
+        // `sourceCoding` is no better -- HTS rejects that too, which is a spec
+        // violation on its side tracked in #288. Until that is fixed, `code` +
+        // `system` is the only form the server accepts, and it is valid in every
+        // version of the $translate spec.
+        parameters.push(json!({
+            "name": "code",
+            "valueCode": code
+        }));
+
+        // The system may be absent when the source is a bare code (e.g. `Patient.address.use`).
+        // Infer it for the FHIR-defined value sets the conformance suite exercises;
+        // otherwise let the server resolve it from the ConceptMap's source scope.
+        let system = if system.is_empty() {
+            match code {
                 "home" | "work" | "temp" | "old" | "billing" => "http://hl7.org/fhir/address-use",
                 "male" | "female" | "other" | "unknown" => {
                     "http://hl7.org/fhir/administrative-gender"
                 }
                 _ => "",
-            };
-
-            if !inferred_system.is_empty() {
-                parameters.push(json!({
-                    "name": "coding",
-                    "valueCoding": {
-                        "system": inferred_system,
-                        "code": code
-                    }
-                }));
-            } else {
-                // Fallback to just code
-                parameters.push(json!({
-                    "name": "code",
-                    "valueCode": code
-                }));
             }
+        } else {
+            system
+        };
+
+        if !system.is_empty() {
+            parameters.push(json!({
+                "name": "system",
+                "valueUri": system
+            }));
         }
 
         if let Some(target) = target_system {
