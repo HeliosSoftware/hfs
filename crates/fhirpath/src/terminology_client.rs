@@ -601,8 +601,8 @@ mod tests {
             .await
             .expect("stub answers 200");
 
-        let names = seen.lock().unwrap().clone();
-        names
+        // Cloned out of the guard so the lock is released with the temporary.
+        seen.lock().unwrap().clone()
     }
 
     /// HTS rejects a lone `coding` with `400 Missing required parameter: code or
