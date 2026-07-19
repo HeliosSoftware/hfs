@@ -148,6 +148,13 @@ pub enum RestError {
         message: String,
     },
 
+    /// Backend temporarily over capacity — e.g. the database connection pool is
+    /// exhausted (HTTP 503). Retryable: the server is healthy, just saturated.
+    ServiceUnavailable {
+        /// Error message.
+        message: String,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
@@ -248,6 +255,9 @@ impl fmt::Display for RestError {
             }
             RestError::TooManyRequests { message } => {
                 write!(f, "Too many requests: {}", message)
+            }
+            RestError::ServiceUnavailable { message } => {
+                write!(f, "Service unavailable: {}", message)
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
@@ -353,6 +363,11 @@ impl RestError {
             RestError::TooManyRequests { message } => {
                 (StatusCode::TOO_MANY_REQUESTS, "throttled", message.clone())
             }
+            RestError::ServiceUnavailable { message } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient",
+                message.clone(),
+            ),
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
@@ -679,6 +694,9 @@ impl From<BackendError> for RestError {
             BackendError::UnsupportedCapability { capability, .. } => RestError::NotImplemented {
                 feature: capability,
             },
+            // Over capacity, not broken — the client should retry rather than treat
+            // this as a server fault.
+            BackendError::Unavailable { message, .. } => RestError::ServiceUnavailable { message },
             _ => RestError::InternalError {
                 message: err.to_string(),
             },
@@ -976,5 +994,92 @@ mod tests {
             message: "db down".to_string(),
         });
         assert_eq!(status_of(err), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── ServiceUnavailable (503) — over-capacity / pool exhaustion ─
+
+    #[test]
+    fn test_service_unavailable_display() {
+        let err = RestError::ServiceUnavailable {
+            message: "connection pool exhausted".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Service unavailable: connection pool exhausted"
+        );
+    }
+
+    #[test]
+    fn test_service_unavailable_client_response_preserves_message() {
+        // 503 with a `transient` issue code. Unlike InternalError, the message is
+        // preserved: it carries no backend/SQL detail, and the client needs it to
+        // understand the failure is retryable.
+        let err = RestError::ServiceUnavailable {
+            message: "connection pool exhausted".to_string(),
+        };
+        let (status, code, message) = err.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert_eq!(message, "connection pool exhausted");
+    }
+
+    #[tokio::test]
+    async fn test_service_unavailable_into_response_body() {
+        let err = RestError::ServiceUnavailable {
+            message: "connection pool exhausted".to_string(),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let outcome: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["severity"], "error");
+        assert_eq!(outcome["issue"][0]["code"], "transient");
+        assert_eq!(
+            outcome["issue"][0]["details"]["text"],
+            "connection pool exhausted"
+        );
+    }
+
+    // ── From<BackendError> → RestError (all three arms) ────────────
+
+    #[test]
+    fn test_backend_unavailable_maps_to_503_transient() {
+        // A saturated-but-healthy backend must surface as a retryable 503, not a
+        // 500 that reads as a server fault (issue #224).
+        let err = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "postgres".to_string(),
+            message: "connection pool exhausted".to_string(),
+        });
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert_eq!(message, "connection pool exhausted");
+    }
+
+    #[test]
+    fn test_backend_unsupported_capability_maps_to_501() {
+        let err = StorageError::Backend(BackendError::UnsupportedCapability {
+            backend_name: "postgres".to_string(),
+            capability: "GraphQL".to_string(),
+        });
+        assert_eq!(status_of(err), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn test_backend_other_error_maps_to_500_and_is_sanitized() {
+        // Every other backend error collapses to a generic 500 whose body must
+        // not leak the raw driver/SQL detail carried in the message.
+        let err = StorageError::Backend(BackendError::QueryError {
+            message: "relation \"resources\" does not exist".to_string(),
+        });
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "exception");
+        assert!(!message.contains("resources"), "leaked detail: {message}");
     }
 }

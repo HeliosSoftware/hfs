@@ -228,7 +228,7 @@
       </packaging>
     </PackagedProductDefinition>
   </contained>
-  <!--  would normally go on to have ingredients here (see other examples)  -->
+  <!-- would normally go on to have ingredients here (see other examples) -->
   <contained>
     <ManufacturedItemDefinition>
       <id value="tabletItem"/>
@@ -241,7 +241,7 @@
       </manufacturedDoseForm>
     </ManufacturedItemDefinition>
   </contained>
-  <!--  would normally go on to have ingredients here (see other examples)  -->
+  <!-- would normally go on to have ingredients here (see other examples) -->
   <contained>
     <ManufacturedItemDefinition>
       <id value="creamItem"/>

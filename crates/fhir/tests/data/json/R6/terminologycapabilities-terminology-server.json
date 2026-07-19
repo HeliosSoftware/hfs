@@ -39,17 +39,15 @@
       "uri": "http://snomed.info/sct",
       "version": [
         {
-          "code": "http://snomed.info/sct/32506021000036107/version/20220831"
+          "value": "http://snomed.info/sct/32506021000036107/version/20220831",
+          "content": "complete"
         }
-      ],
-      "content": "complete"
+      ]
     },
     {
       "uri": "http://loinc.org",
       "version": [
-        {
-          "code": "2.73"
-        }
+        null
       ],
       "content": "complete"
     }

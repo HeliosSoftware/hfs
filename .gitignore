@@ -25,3 +25,7 @@ off
 /docs/cluster-capable-state-roadmap.md
 /docs/cluster-testing-methodology.md
 /docs/cluster-testing-strategy.md
+
+# Python bytecode (e.g. audit test helpers under crates/hfs/tests/audit)
+__pycache__/
+*.pyc

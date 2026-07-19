@@ -46,17 +46,6 @@
       }
     ]
   },
-  "bodySite": [
-    {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "51185008",
-          "display": "Thorax"
-        }
-      ]
-    }
-  ],
   "subject": {
     "reference": "Patient/f001",
     "display": "P. van de Heuvel"

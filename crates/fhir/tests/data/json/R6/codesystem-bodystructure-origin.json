@@ -1,0 +1,108 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "bodystructure-origin",
+  "meta": {
+    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem bodystructure-origin\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"bodystructure-origin\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcbodystructure-origin\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2021-01-05T10:01:24.148+11:00\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/bodystructure-origin\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eautologous\u003ca name\u003d\"bodystructure-origin-autologous\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAutologous\u003c/td\u003e\u003ctd\u003eTissue, cells, or biological substances taken from the same individual.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003enon-autologous\u003ca name\u003d\"bodystructure-origin-non-autologous\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNon-autologous\u003c/td\u003e\u003ctd\u003eTissue, cells, or materials that are not taken from the same individual; they may come from a donor or be artificially created.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehomologous\u003ca name\u003d\"bodystructure-origin-homologous\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHomologous\u003c/td\u003e\u003ctd\u003eTissue or cells taken from a donor of the same species.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eallogeneic\u003ca name\u003d\"bodystructure-origin-allogeneic\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAllogeneic\u003c/td\u003e\u003ctd\u003eTissue or cells from another genetically different individual of the same species.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esyngeneic\u003ca name\u003d\"bodystructure-origin-syngeneic\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSyngeneic\u003c/td\u003e\u003ctd\u003eTissue or cells taken from a genetically identical individual, such as an identical twin.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eheterologous\u003ca name\u003d\"bodystructure-origin-heterologous\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHeterologous\u003c/td\u003e\u003ctd\u003eTissue, cells, or materials from a genetically dissimilar source, commonly from a different species.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ezooplastic\u003ca name\u003d\"bodystructure-origin-zooplastic\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eZooplastic\u003c/td\u003e\u003ctd\u003eTissue or graft material taken from a non-human animal species.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esynthetic\u003ca name\u003d\"bodystructure-origin-synthetic\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSynthetic\u003c/td\u003e\u003ctd\u003eMaterials created through chemical or other artificial processes rather than derived from living organisms.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emixed-source\u003ca name\u003d\"bodystructure-origin-mixed-source\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMixed Source\u003c/td\u003e\u003ctd\u003eA graft, transplant, or product that combines the patient\u0027s own biological materials with donor, animal, or synthetic sources.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 0
+    }
+  ],
+  "url": "http://hl7.org/fhir/bodystructure-origin",
+  "version": "6.0.0-ballot4",
+  "name": "BodyStructureOrigin",
+  "title": "Body Structure Origin Codes",
+  "status": "active",
+  "experimental": true,
+  "date": "2021-01-05T10:01:24+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Codes describing the origin of an included body structure.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "content": "complete",
+  "concept": [
+    {
+      "code": "autologous",
+      "display": "Autologous",
+      "definition": "Tissue, cells, or biological substances taken from the same individual."
+    },
+    {
+      "code": "non-autologous",
+      "display": "Non-autologous",
+      "definition": "Tissue, cells, or materials that are not taken from the same individual; they may come from a donor or be artificially created."
+    },
+    {
+      "code": "homologous",
+      "display": "Homologous",
+      "definition": "Tissue or cells taken from a donor of the same species."
+    },
+    {
+      "code": "allogeneic",
+      "display": "Allogeneic",
+      "definition": "Tissue or cells from another genetically different individual of the same species."
+    },
+    {
+      "code": "syngeneic",
+      "display": "Syngeneic",
+      "definition": "Tissue or cells taken from a genetically identical individual, such as an identical twin."
+    },
+    {
+      "code": "heterologous",
+      "display": "Heterologous",
+      "definition": "Tissue, cells, or materials from a genetically dissimilar source, commonly from a different species."
+    },
+    {
+      "code": "zooplastic",
+      "display": "Zooplastic",
+      "definition": "Tissue or graft material taken from a non-human animal species."
+    },
+    {
+      "code": "synthetic",
+      "display": "Synthetic",
+      "definition": "Materials created through chemical or other artificial processes rather than derived from living organisms."
+    },
+    {
+      "code": "mixed-source",
+      "display": "Mixed Source",
+      "definition": "A graft, transplant, or product that combines the patient\u0027s own biological materials with donor, animal, or synthetic sources."
+    }
+  ]
+}

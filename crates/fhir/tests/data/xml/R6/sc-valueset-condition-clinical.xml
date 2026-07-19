@@ -15,9 +15,8 @@
         <a href="valueset-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <br/>
-      <p>
-        <b>Group 1 </b>Mapping from 
-        <a href="http://terminology.hl7.org/7.1.0/CodeSystem-condition-clinical.html">Condition Clinical Status Codes</a> to 
+      <p>Mapping from 
+        <a href="http://terminology.hl7.org/7.2.0/CodeSystem-condition-clinical.html">Condition Clinical Status Codes</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <table class="grid">

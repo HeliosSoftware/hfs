@@ -11,7 +11,7 @@
     <Medication>
       <id value="med0314"/>
       <code>
-        <!--  <display value="Alprazolam 0.25mg (Xanax)"/>  -->
+        <!-- <display value="Alprazolam 0.25mg (Xanax)"/> -->
         <coding>
           <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
           <code value="562721"/>
@@ -22,8 +22,8 @@
   </contained>
   <status value="in-progress"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
-    <!--  <display value="Alprazolam 0.25mg (Xanax)"/>  -->
+    <!-- Linked to a RESOURCE Medication -->
+    <!-- <display value="Alprazolam 0.25mg (Xanax)"/> -->
     <reference>
       <reference value="#med0314"/>
       <display value="amylase / cellulase / hyoscyamine / lipase / phenyltoloxamine / protease Oral Capsule"/>

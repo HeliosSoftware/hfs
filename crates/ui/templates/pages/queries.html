@@ -2,12 +2,39 @@
 
 {% block title %}{{ i18n.t("queries-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
+{% block content_class %} content--wide{% endblock %}
+
 {% block content %}
 <section class="page-head">
   <h1 class="page-head__title">{{ i18n.t("queries-heading") }}</h1>
   <p class="page-head__lede">{{ i18n.t("queries-lede") }}</p>
 </section>
 
+<div class="queries-layout">
+  <!--
+    Resource picker rail (hi-fi Search screen): the version's resource types
+    from the spec, with live counts hydrated client-side via the standard
+    _summary=count search. Picking a type re-keys the builder.
+  -->
+  <aside class="card filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}">
+    <div class="filter-rail__search">
+      <span class="icon">{% include "icons/search.svg" %}</span>
+      <input type="search" id="type-rail-filter"
+             placeholder="{{ i18n.t("queries-rail-filter") }}"
+             aria-label="{{ i18n.t("queries-rail-filter") }}">
+    </div>
+    <div class="filter-rail__heading">{{ i18n.t("queries-rail-heading") }}</div>
+    <div class="filter-rail__list" id="type-rail-list">
+      {% for t in resource_types %}
+      <button type="button" class="filter-rail__item" data-rail-type="{{ t }}">
+        <span>{{ t }}</span>
+        <span class="count" data-count-for="{{ t }}"></span>
+      </button>
+      {% endfor %}
+    </div>
+  </aside>
+
+  <div class="queries-main">
 <!--
   Search Builder (hi-fi console design): a featured, editable GET URL is the
   primary control — Run opens the search and records it under Recent; naming
@@ -37,6 +64,39 @@
       </details>
       <button class="btn btn--primary" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
     </div>
+
+    <!--
+      Visual builder: condition / include / result-control rows kept in
+      two-way sync with the GET URL above. The parameter suggestions come
+      from the server's SearchParameter registry — the datalist below is
+      swapped per resource type from /ui/queries/params (an HTML fragment,
+      not a JSON API). Hidden until the script hydrates it; the URL input
+      alone is the no-JS baseline.
+    -->
+    <datalist id="param-options"></datalist>
+    <div class="builder-sections" id="builder-sections" hidden
+         data-msg-param="{{ i18n.t("queries-param-placeholder") }}"
+         data-msg-value="{{ i18n.t("queries-value-placeholder") }}"
+         data-msg-remove="{{ i18n.t("queries-remove") }}">
+      <div class="builder-section">
+        <h3 class="builder-section__title">{{ i18n.t("queries-conditions") }}</h3>
+        <div class="builder-rows" id="builder-conditions"></div>
+        <button class="btn builder-add" type="button" data-add="condition">+ {{ i18n.t("queries-add-condition") }}</button>
+      </div>
+      <div class="builder-grid">
+        <div class="builder-section">
+          <h3 class="builder-section__title">{{ i18n.t("queries-includes") }}</h3>
+          <div class="builder-rows" id="builder-includes"></div>
+          <button class="btn builder-add" type="button" data-add="include">+ _include</button>
+        </div>
+        <div class="builder-section">
+          <h3 class="builder-section__title">{{ i18n.t("queries-result-controls") }}</h3>
+          <div class="builder-rows" id="builder-controls"></div>
+          <button class="btn builder-add" type="button" data-add="control">+ _count</button>
+        </div>
+      </div>
+    </div>
+
     <div class="query-builder__save">
       <label class="query-form__field query-builder__name">
         <span>{{ i18n.t("queries-name-label") }}</span>
@@ -46,6 +106,36 @@
       <p class="query-builder__hint">{{ i18n.t("queries-builder-hint") }}</p>
     </div>
   </form>
+</section>
+
+<!--
+  Results render in-page from the FHIR search response itself (the existing
+  REST API; no UI-facing endpoint) — Bundle.total, columns honoring
+  _elements, and paging over Bundle.link. Hidden until the first run.
+-->
+<section class="card query-results" id="query-results" hidden
+         data-msg-total="{{ i18n.t_arg("queries-results-total", "count", "{count}".to_string()) }}"
+         data-msg-included="{{ i18n.t_arg("queries-results-included", "count", "{count}".to_string()) }}"
+         data-msg-empty="{{ i18n.t("queries-results-empty") }}"
+         data-msg-updated="{{ i18n.t("queries-col-updated") }}">
+  <div class="query-results__head">
+    <h2 class="query-group__type">{{ i18n.t("queries-results") }}</h2>
+    <span class="query-results__meta" id="query-results-meta"></span>
+    <a class="btn query-results__open" id="query-results-open" target="_blank" rel="noopener">{{ i18n.t("queries-open-tab") }}</a>
+  </div>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead id="query-results-head"></thead>
+      <tbody id="query-results-body"></tbody>
+    </table>
+  </div>
+  <div class="table-foot">
+    <span id="query-results-note"></span>
+    <nav class="pagination">
+      <button class="btn" type="button" id="query-results-prev" hidden>{{ i18n.t("queries-prev") }}</button>
+      <button class="btn" type="button" id="query-results-next" hidden>{{ i18n.t("queries-next") }}</button>
+    </nav>
+  </div>
 </section>
 
 <!--
@@ -66,6 +156,8 @@
      data-msg-invalid-url="{{ i18n.t("queries-invalid-url") }}"
      data-msg-unavailable="{{ i18n.t("queries-unavailable") }}"
      data-msg-error="{{ i18n.t("error-generic") }}">
+</div>
+  </div>
 </div>
 
 <script src="/ui/assets/saved-queries.js" defer></script>

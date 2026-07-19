@@ -1,0 +1,85 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "observation-status-reason",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem observation-status-reason\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"observation-status-reason\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcobservation-status-reason\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/CodeSystem/observation-status-reason\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epatient-mismatch\u003ca name\u003d\"observation-status-reason-patient-mismatch\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePatient Mismatch\u003c/td\u003e\u003ctd\u003eThe patient identity or subject context did not match the expected patient or subject.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esample-mismatch\u003ca name\u003d\"observation-status-reason-sample-mismatch\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSample Mismatch\u003c/td\u003e\u003ctd\u003eThe specimen, sample, or referenced result did not match the expected subject, order, container, or report.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003einvalid-calibration\u003ca name\u003d\"observation-status-reason-invalid-calibration\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInvalid Calibration\u003c/td\u003e\u003ctd\u003eThe device, instrument, or analyzer calibration used for referenced results was invalid, expired, or otherwise unreliable.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ereagent-issue\u003ca name\u003d\"observation-status-reason-reagent-issue\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eReagent issue\u003c/td\u003e\u003ctd\u003eAn incorrect, invalid, expired, recalled, or otherwise unsuitable reagent or reagent lot was used or identified for referenced results.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eduplicate\u003ca name\u003d\"observation-status-reason-duplicate\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDuplicate\u003c/td\u003e\u003ctd\u003eThe observation duplicates another observation.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/CodeSystem/observation-status-reason",
+  "version": "6.0.0-ballot4",
+  "name": "ObservationStatusReasonCodes",
+  "title": "Observation Status Reason Codes",
+  "status": "active",
+  "experimental": true,
+  "publisher": "HL7 International - Orders and Observations",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/orders/index.cfm"
+        }
+      ]
+    }
+  ],
+  "description": "Codes indicating why an observation is in its current status.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "copyright": "Copyright HL7. Licensed under creative commons public domain",
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/observation-status-reason",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "patient-mismatch",
+      "display": "Patient Mismatch",
+      "definition": "The patient identity or subject context did not match the expected patient or subject."
+    },
+    {
+      "code": "sample-mismatch",
+      "display": "Sample Mismatch",
+      "definition": "The specimen, sample, or referenced result did not match the expected subject, order, container, or report."
+    },
+    {
+      "code": "invalid-calibration",
+      "display": "Invalid Calibration",
+      "definition": "The device, instrument, or analyzer calibration used for referenced results was invalid, expired, or otherwise unreliable."
+    },
+    {
+      "code": "reagent-issue",
+      "display": "Reagent issue",
+      "definition": "An incorrect, invalid, expired, recalled, or otherwise unsuitable reagent or reagent lot was used or identified for referenced results."
+    },
+    {
+      "code": "duplicate",
+      "display": "Duplicate",
+      "definition": "The observation duplicates another observation."
+    }
+  ]
+}

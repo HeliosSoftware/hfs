@@ -67,20 +67,20 @@
   <author>
     <reference value="Practitioner/1"/>
   </author>
-  <!--  end of regimen options  -->
+  <!-- end of regimen options -->
   <action>
-    <!--  list of regimen options. in this case only one  -->
+    <!-- list of regimen options. in this case only one -->
     <selectionBehavior value="exactly-one"/>
-    <!--  end of regimen parts  -->
+    <!-- end of regimen parts -->
     <action>
-      <!--  list of regimen parts. in this case only one  -->
+      <!-- list of regimen parts. in this case only one -->
       <selectionBehavior value="all"/>
-      <!--  end of cycle definitions  -->
+      <!-- end of cycle definitions -->
       <action>
-        <!--  list of cycle definitions. in this case only one  -->
+        <!-- list of cycle definitions. in this case only one -->
         <groupingBehavior value="sentence-group"/>
         <selectionBehavior value="exactly-one"/>
-        <!--  end of regimen entries  -->
+        <!-- end of regimen entries -->
         <action id="cycle-definition-1">
           <textEquivalent value="21-day cycle for 6 cycles"/>
           <timingTiming>
@@ -90,8 +90,8 @@
               <durationUnit value="d"/>
             </repeat>
           </timingTiming>
-          <!--  list of regimen entry references for this regimen part  -->
-          <!--  references would duplicated in each cycle definition option
+          <!-- list of regimen entry references for this regimen part -->
+          <!-- references would duplicated in each cycle definition option
           (see codesystem-action-grouping-behavior.html#sentence-group) -->
           <action id="action-1">
             <extension url="http://hl7.org/fhir/StructureDefinition/timing-daysOfCycle">

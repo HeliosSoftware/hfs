@@ -30,7 +30,7 @@
     <function>
       <coding>
         <system value="urn:oid:2.16.840.1.113883.2.4.15.111"/>
-        <!--  "AssignedRoleType" coding system  -->
+        <!-- "AssignedRoleType" coding system -->
         <code value="01.000"/>
         <display value="Arts"/>
       </coding>
@@ -50,13 +50,6 @@
       <text value="Malignant tumor of lung"/>
     </concept>
   </reason>
-  <bodySite>
-    <coding>
-      <system value="http://snomed.info/sct"/>
-      <code value="39607008"/>
-      <display value="Lung structure"/>
-    </coding>
-  </bodySite>
   <outcome>
     <concept>
       <text value="improved blood circulation"/>

@@ -199,7 +199,8 @@ where
         // also apply to reference/uri, which resolve locally — only reject those
         // when the parameter is a token. See assessment item A2c.
         {
-            let registry = state.storage().search_param_registry().read();
+            let reg = state.storage().search_param_registry(tenant.context());
+            let registry = reg.read();
             for (key, _) in &pairs {
                 let Some((base, modifier)) = key.split_once(':') else {
                     continue;
@@ -232,7 +233,8 @@ where
     // guard tightly so it doesn't span any await — parking_lot guards aren't
     // Send by default, which would make this async fn !Send.
     let mut query = {
-        let registry = state.storage().search_param_registry().read();
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
         // Under `Prefer: handling=strict`, reject unknown search parameters
         // (the lenient default ignores them).
         if strict {
@@ -424,7 +426,8 @@ where
     // system search — parameters there are interpreted across many resource
     // types, so a per-"Resource" registry check would false-positive.
     let mut query = {
-        let registry = state.storage().search_param_registry().read();
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
         build_search_query("Resource", &search_params, &registry)?
     };
 

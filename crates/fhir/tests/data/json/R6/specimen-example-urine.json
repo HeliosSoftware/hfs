@@ -61,14 +61,24 @@
         ]
       },
       "additive": [
-        null
+        {
+          "type": {
+            "concept": {
+              "text": "6 N HCl"
+            }
+          }
+        }
       ],
       "timeDateTime": "2015-08-18T08:10:00Z"
     }
   ],
   "container": [
     {
-      "deviceCanonical": "http://hl7.org/fhir/Device/device-example-specimen-container-polycup",
+      "device": {
+        "reference": {
+          "reference": "Device/device-example-specimen-container-polycup"
+        }
+      },
       "specimenQuantity": {
         "value": 10,
         "unit": "mls"

@@ -10,7 +10,7 @@
   <contained>
     <Observation>
       <id value="fasting"/>
-      <!--     the mandatory quality flag:     -->
+      <!-- the mandatory quality flag: -->
       <status value="final"/>
       <code>
         <coding>

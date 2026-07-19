@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "knownFailures": [
     {
-      "groupName": "TerminologyTests", 
+      "groupName": "TerminologyTests",
       "testName": "txTest03",
-      "reason": "ConceptMap cm-address-use-v2 not available on test server"
+      "reason": "Output type fidelity: '.value.code' returns FHIR type 'string' instead of 'code' ('Mismatch at index 0: expected type code, got string'). The translation itself succeeds and returns the expected 'H'. Same limitation as testContainedId. The previous reason ('ConceptMap cm-address-use-v2 not available on test server') was wrong on both servers: tx.fhir.org and hts.heliossoftware.com each resolve this ConceptMap."
     },
     {
       "groupName": "Precision",
@@ -15,7 +15,12 @@
     {
       "groupName": "testConformsTo",
       "testName": "*",
-      "reason": "conformsTo not yet implemented"
+      "reason": "conformsTo not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures."
+    },
+    {
+      "groupName": "HTMLChecks",
+      "testName": "*",
+      "reason": "htmlChecks() not yet implemented. The server answers 501, so these tests are absent from the results JSON rather than recorded as failures. Previously undeclared: they were invisible because the runner's exit code ignores not-implemented tests (#287)."
     },
     {
       "groupName": "miscEngineTests",

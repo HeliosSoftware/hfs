@@ -94,31 +94,6 @@
         </coding>
         <text value="gemcitabine"/>
       </productCodeableConcept>
-      <dosage>
-        <text value="1250 mg/m² IV over 30 minutes"/>
-        <timing>
-          <repeat>
-            <duration value="30"/>
-            <durationUnit value="min"/>
-          </repeat>
-        </timing>
-        <route>
-          <text value="IV"/>
-        </route>
-        <doseAndRate>
-          <type>
-            <coding>
-              <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-              <code value="ordered"/>
-              <display value="Ordered"/>
-            </coding>
-          </type>
-          <doseQuantity>
-            <value value="1250"/>
-            <unit value="mg/m²"/>
-          </doseQuantity>
-        </doseAndRate>
-      </dosage>
     </ActivityDefinition>
   </contained>
   <contained>
@@ -133,32 +108,6 @@
         </coding>
         <text value="CARBOplatin"/>
       </productCodeableConcept>
-      <dosage>
-        <text value="AUC 5 IV over 30 minutes"/>
-        <timing>
-          <repeat>
-            <duration value="30"/>
-            <durationUnit value="min"/>
-          </repeat>
-        </timing>
-        <route>
-          <text value="IV"/>
-        </route>
-        <doseAndRate>
-          <type>
-            <coding>
-              <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-              <code value="ordered"/>
-              <display value="Ordered"/>
-            </coding>
-          </type>
-          <doseQuantity>
-            <extension url="http://example.org/fhir/AUC-dose">
-              <valueInteger value="5"/>
-            </extension>
-          </doseQuantity>
-        </doseAndRate>
-      </dosage>
     </ActivityDefinition>
   </contained>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">

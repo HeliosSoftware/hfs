@@ -19,6 +19,8 @@ use crate::backends::s3::client::{
     ListObjectItem, ListObjectsResult, ObjectData, ObjectMetadata, S3Api, S3ClientError,
 };
 use crate::backends::s3::config::{S3BackendConfig, S3TenancyMode};
+use crate::backends::s3::keyspace::S3Keyspace;
+use crate::backends::s3::user_settings::settings_object_id;
 use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
 use crate::core::bulk_submit::{
     BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
@@ -28,6 +30,7 @@ use crate::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use crate::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
+use crate::core::user_settings::SettingsStore;
 use crate::core::{ResourceStorage, VersionedStorage};
 use crate::error::{
     BackendError, BulkSubmitError, ConcurrencyError, ResourceError, SearchError, StorageError,
@@ -47,8 +50,26 @@ struct MockObject {
     last_modified: DateTime<Utc>,
 }
 
+/// The preconditions a single `put_object` call carried, recorded so tests can
+/// assert that a write was conditional (never a blind overwrite).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedPut {
+    /// Key the put targeted.
+    key: String,
+    /// Value of the `If-Match` precondition, if any.
+    if_match: Option<String>,
+    /// Value of the `If-None-Match` precondition, if any.
+    if_none_match: Option<String>,
+}
+
+/// A one-shot "thief" run at the start of a `put_object` call, *before* its
+/// preconditions are evaluated, simulating a concurrent writer that lands between
+/// a caller's read and its write. This is what makes the compare-and-swap retry
+/// paths deterministically testable.
+type StealHook = Box<dyn FnOnce(&mut MockState) + Send>;
+
 /// Shared mutable state backing `MockS3Client`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct MockState {
     /// Set of buckets that exist in the mock store.
     buckets: HashSet<String>,
@@ -62,6 +83,27 @@ struct MockState {
     fail_put_after: Option<u64>,
     /// When true, all `delete_object` calls return an internal error.
     fail_deletes: bool,
+    /// When true, every `put_object` fails its precondition, simulating a writer
+    /// that loses the compare-and-swap race on every attempt.
+    fail_all_puts_with_precondition: bool,
+    /// Preconditions carried by each `put_object` call, in order.
+    recorded_puts: Vec<RecordedPut>,
+    /// A [`StealHook`] to run before the next `put_object` evaluates its
+    /// preconditions, if one has been armed.
+    steal_hook: Option<StealHook>,
+}
+
+// `steal_hook` holds a boxed closure, which has no `Debug`, so `MockState` is
+// formatted without it.
+impl std::fmt::Debug for MockState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MockState")
+            .field("buckets", &self.buckets)
+            .field("objects", &self.objects)
+            .field("put_count", &self.put_count)
+            .field("recorded_puts", &self.recorded_puts)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An in-process S3 mock implementing `S3Api`.
@@ -97,6 +139,47 @@ impl MockS3Client {
     fn bucket_object_count(&self, bucket: &str) -> usize {
         let state = self.state.lock().unwrap();
         state.objects.keys().filter(|(b, _)| b == bucket).count()
+    }
+
+    /// Total number of `put_object` calls received so far.
+    fn put_count(&self) -> u64 {
+        self.state.lock().unwrap().put_count
+    }
+
+    /// The preconditions carried by every `put_object` call so far, in order.
+    fn recorded_puts(&self) -> Vec<RecordedPut> {
+        self.state.lock().unwrap().recorded_puts.clone()
+    }
+
+    /// Makes every subsequent `put_object` fail its precondition, simulating a
+    /// writer that loses the compare-and-swap race on every single attempt.
+    fn fail_all_puts_with_precondition(&self) {
+        self.state.lock().unwrap().fail_all_puts_with_precondition = true;
+    }
+
+    /// Arranges for a concurrent writer to overwrite `key` with `body` exactly
+    /// once, immediately before the next `put_object` call evaluates its
+    /// preconditions.
+    ///
+    /// This lands the "thief" inside the caller's read-then-write window, which
+    /// is the only way to deterministically drive the compare-and-swap conflict
+    /// paths: the mock is synchronous, so genuinely concurrent tasks would
+    /// otherwise run to completion one after another without interleaving.
+    fn steal_once(&self, bucket: &str, key: &str, body: Vec<u8>) {
+        let entry_key = (bucket.to_string(), key.to_string());
+        let mut state = self.state.lock().unwrap();
+        state.steal_hook = Some(Box::new(move |state: &mut MockState| {
+            state.etag_counter += 1;
+            let etag = format!("etag-{}", state.etag_counter);
+            state.objects.insert(
+                entry_key,
+                MockObject {
+                    body,
+                    etag,
+                    last_modified: Utc::now(),
+                },
+            );
+        }));
     }
 }
 
@@ -160,10 +243,26 @@ impl S3Api for MockS3Client {
             return Err(S3ClientError::NotFound);
         }
         state.put_count += 1;
+        state.recorded_puts.push(RecordedPut {
+            key: key.to_string(),
+            if_match: if_match.map(str::to_string),
+            if_none_match: if_none_match.map(str::to_string),
+        });
         if let Some(fail_after) = state.fail_put_after {
             if state.put_count > fail_after {
                 return Err(S3ClientError::Internal("forced put failure".to_string()));
             }
+        }
+
+        if state.fail_all_puts_with_precondition {
+            return Err(S3ClientError::PreconditionFailed);
+        }
+
+        // A concurrent writer landing between the caller's read and this write.
+        // It runs before the preconditions below are evaluated, so a caller whose
+        // ETag is now stale correctly sees `PreconditionFailed`.
+        if let Some(steal) = state.steal_hook.take() {
+            steal(&mut state);
         }
 
         let entry_key = (bucket.to_string(), key.to_string());
@@ -1226,4 +1325,549 @@ async fn purge_tenant_data_sweeps_resources_and_history() {
 
     assert!(backend.read(&tb, "Patient", "p2").await.unwrap().is_some());
     assert_eq!(backend.count(&tb, None).await.unwrap(), 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-user settings store
+//
+// The settings store maps the trait's read-modify-write + monotonic-version
+// contract onto S3 conditional writes. These tests cover both the semantics
+// shared with the SQLite/PostgreSQL/MongoDB suites and the S3-specific
+// compare-and-swap and object-naming behaviour that has no analogue there.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds a settings-store backend over a mock holding `test-bucket`.
+fn settings_backend() -> (S3Backend, Arc<MockS3Client>) {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    (make_prefix_backend(mock.clone()), mock)
+}
+
+/// The S3 key a user's settings object lives at, for tests that need to reach
+/// past the store and manipulate the raw object.
+fn settings_key(user_key: &str) -> String {
+    S3Keyspace::new(None).user_settings_key(&settings_object_id(user_key))
+}
+
+/// Serialises a settings object exactly as the store does, for seeding the mock
+/// with a "concurrent writer's" document.
+fn settings_body(user_key: &str, document: serde_json::Value, version: i64) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "user_key": user_key,
+        "document": document,
+        "version": version,
+        "updated_at": Utc::now().to_rfc3339(),
+    }))
+    .expect("serialize settings object")
+}
+
+#[tokio::test]
+async fn settings_get_returns_none_for_unknown_user() {
+    let (backend, _mock) = settings_backend();
+    assert!(backend.get_settings("ghost").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn settings_put_then_get_round_trips_document() {
+    let (backend, _mock) = settings_backend();
+    let doc = json!({"theme": "dark", "recentQueries": {"Patient": ["name=smith"]}});
+
+    let stored = backend.put_settings("u1", doc.clone(), None).await.unwrap();
+    assert_eq!(stored.version, 1);
+
+    let fetched = backend.get_settings("u1").await.unwrap().unwrap();
+    assert_eq!(fetched.document, doc);
+    assert_eq!(fetched.version, 1);
+    assert_eq!(fetched.user_key, "u1");
+}
+
+#[tokio::test]
+async fn settings_version_increments_on_each_write() {
+    let (backend, _mock) = settings_backend();
+    backend
+        .put_settings("u1", json!({"a": 1}), None)
+        .await
+        .unwrap();
+    let second = backend
+        .put_settings("u1", json!({"a": 2}), None)
+        .await
+        .unwrap();
+    assert_eq!(second.version, 2);
+}
+
+#[tokio::test]
+async fn settings_patch_merges_and_deletes_keys() {
+    let (backend, _mock) = settings_backend();
+    backend
+        .put_settings(
+            "u1",
+            json!({"theme": "dark", "defaultTenant": "acme"}),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let patched = backend
+        .patch_settings("u1", json!({"theme": "light", "defaultTenant": null}), None)
+        .await
+        .unwrap();
+
+    assert_eq!(patched.document, json!({"theme": "light"}));
+    assert_eq!(patched.version, 2);
+}
+
+#[tokio::test]
+async fn settings_patch_on_missing_user_creates_document() {
+    let (backend, _mock) = settings_backend();
+    let patched = backend
+        .patch_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert_eq!(patched.document, json!({"theme": "dark"}));
+    assert_eq!(patched.version, 1);
+}
+
+#[tokio::test]
+async fn settings_stale_if_match_is_rejected() {
+    let (backend, _mock) = settings_backend();
+    backend
+        .put_settings("u1", json!({"a": 1}), None)
+        .await
+        .unwrap(); // version 1
+
+    // `Some(0)` asserts "does not exist yet", which is now false.
+    let err = backend
+        .put_settings("u1", json!({"a": 2}), Some(0))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure { .. })
+    ));
+}
+
+#[tokio::test]
+async fn settings_matching_if_match_succeeds() {
+    let (backend, _mock) = settings_backend();
+    // `Some(0)` asserts "does not exist yet" for the first write.
+    backend
+        .put_settings("u1", json!({"a": 1}), Some(0))
+        .await
+        .unwrap();
+    let updated = backend
+        .put_settings("u1", json!({"a": 2}), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(updated.version, 2);
+}
+
+/// Every settings write must carry a precondition. An unconditional `PutObject`
+/// on this path is exactly what a silent lost update looks like, so this is a
+/// regression guard, not a style check.
+#[tokio::test]
+async fn settings_writes_are_never_unconditional() {
+    let (backend, mock) = settings_backend();
+    backend
+        .put_settings("u1", json!({"a": 1}), None)
+        .await
+        .unwrap();
+    backend
+        .patch_settings("u1", json!({"b": 2}), None)
+        .await
+        .unwrap();
+
+    let puts = mock.recorded_puts();
+    assert_eq!(puts.len(), 2);
+
+    // The create asserts the object does not exist; the update pins the ETag it
+    // read. Neither is a blind overwrite.
+    assert_eq!(puts[0].if_none_match.as_deref(), Some("*"));
+    assert!(puts[0].if_match.is_none());
+    assert!(puts[1].if_match.is_some());
+    assert!(puts[1].if_none_match.is_none());
+
+    for put in puts {
+        assert!(
+            put.if_match.is_some() || put.if_none_match.is_some(),
+            "settings write to {} carried no precondition",
+            put.key
+        );
+    }
+}
+
+/// An unconditional write that loses the compare-and-swap must re-read and retry
+/// on top of the winner's document — never clobber it.
+#[tokio::test]
+async fn settings_unconditional_write_retries_and_preserves_concurrent_update() {
+    let (backend, mock) = settings_backend();
+    backend
+        .put_settings("u1", json!({"a": 1}), None)
+        .await
+        .unwrap(); // version 1
+
+    // A concurrent writer lands version 2 inside our read-then-write window.
+    mock.steal_once(
+        "test-bucket",
+        &settings_key("u1"),
+        settings_body("u1", json!({"a": 1, "thief": true}), 2),
+    );
+
+    let patched = backend
+        .patch_settings("u1", json!({"mine": true}), None)
+        .await
+        .unwrap();
+
+    // We lost the first CAS, re-read the thief's document, and merged onto it.
+    assert_eq!(patched.version, 3);
+    assert_eq!(patched.document["thief"], json!(true), "lost update");
+    assert_eq!(patched.document["mine"], json!(true));
+}
+
+/// A *conditional* write that loses the race must fail the precondition rather
+/// than retry: the caller asked to write only if the version was still `n`.
+#[tokio::test]
+async fn settings_conditional_write_does_not_retry_on_lost_race() {
+    let (backend, mock) = settings_backend();
+    backend
+        .put_settings("u1", json!({"a": 1}), None)
+        .await
+        .unwrap(); // version 1
+    let puts_before = mock.put_count();
+
+    mock.steal_once(
+        "test-bucket",
+        &settings_key("u1"),
+        settings_body("u1", json!({"a": 99}), 2),
+    );
+
+    let err = backend
+        .put_settings("u1", json!({"a": 2}), Some(1))
+        .await
+        .unwrap_err();
+
+    match err {
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+            expected_etag,
+            actual_etag,
+            ..
+        }) => {
+            assert_eq!(expected_etag, "W/\"1\"");
+            assert_eq!(actual_etag.as_deref(), Some("W/\"2\""));
+        }
+        other => panic!("expected an optimistic-lock failure, got {other:?}"),
+    }
+
+    // Exactly one write attempt: a conditional write must not loop.
+    assert_eq!(mock.put_count() - puts_before, 1);
+}
+
+#[tokio::test]
+async fn settings_get_surfaces_backend_error_for_corrupt_object() {
+    let (backend, mock) = settings_backend();
+    mock.put_object(
+        "test-bucket",
+        &settings_key("u1"),
+        b"not json".to_vec(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    match backend.get_settings("u1").await.unwrap_err() {
+        StorageError::Backend(BackendError::SerializationError { message }) => assert!(
+            message.starts_with("read user_settings:"),
+            "error should name the operation, got: {message}"
+        ),
+        other => panic!("expected a serialization error, got {other:?}"),
+    }
+}
+
+/// The object body records its owner. If the key derivation ever regressed so
+/// that two users shared an object, the read must fail rather than hand back
+/// another user's settings.
+#[tokio::test]
+async fn settings_get_rejects_object_owned_by_another_user() {
+    let (backend, mock) = settings_backend();
+    mock.put_object(
+        "test-bucket",
+        &settings_key("u1"),
+        settings_body("someone-else", json!({"theme": "dark"}), 1),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    match backend.get_settings("u1").await.unwrap_err() {
+        StorageError::Backend(BackendError::Internal { message, .. }) => assert!(
+            message.contains("belongs to a different user"),
+            "the tripwire should say why it fired, got: {message}"
+        ),
+        other => panic!("expected an internal error, got {other:?}"),
+    }
+}
+
+/// The user key is hashed, never embedded. Keys that a lossy sanitiser would
+/// collapse together must map to distinct objects — a collision here would let
+/// one user read and overwrite another's settings.
+#[test]
+fn settings_object_id_is_injective_for_keys_a_sanitiser_would_collide() {
+    // `sanitize()` maps both '/' and ' ' to '_', so these three would collide.
+    let a = settings_object_id("https://idp.example.com/realms/x|alice");
+    let b = settings_object_id("https:__idp.example.com_realms_x|alice");
+    let c = settings_object_id("https://idp.example.com realms x|alice");
+    assert_ne!(a, b);
+    assert_ne!(a, c);
+    assert_ne!(b, c);
+
+    // Fixed-length, path-safe: no separator can be smuggled into the key, and no
+    // user key — however long — can exceed S3's 1024-byte key limit.
+    for id in [&a, &b, &c] {
+        assert_eq!(id.len(), 64);
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+    }
+
+    // A traversal attempt cannot escape the settings namespace.
+    let traversal = settings_key("../../resources/Patient/p1/current");
+    assert!(!traversal.contains(".."));
+    assert!(traversal.starts_with("_system.user-settings/"));
+}
+
+/// Settings are user-global: the key must not sit under any tenant prefix, and
+/// must not collide with the FHIR resource or history keyspaces.
+#[tokio::test]
+async fn settings_key_is_tenant_independent_and_outside_the_fhir_keyspace() {
+    let (backend, mock) = settings_backend();
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+
+    let keyspace = S3Keyspace::new(None);
+    let key = settings_key("u1");
+
+    assert!(!key.starts_with(&keyspace.resources_prefix()));
+    assert!(!key.starts_with("history/"));
+    assert!(!key.starts_with("bulk/"));
+
+    // The object really is where we think it is, and it is the only one written.
+    assert_eq!(mock.bucket_object_count("test-bucket"), 1);
+    assert!(
+        mock.get_object("test-bucket", &key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // The adversarial case: even a tenant named after the settings namespace
+    // itself cannot reach these objects, because its keys live under a
+    // `resources/`/`history/` sub-prefix while a settings object is a
+    // `{digest}.json` leaf. This is the structural invariant the key shape
+    // relies on — it does NOT depend on tenant-ID validation.
+    let hostile = keyspace.with_tenant_prefix("_system.user-settings");
+    assert!(!key.starts_with(&hostile.resources_prefix()));
+    assert!(!key.starts_with(&hostile.history_type_prefix("Patient")));
+    let benign = keyspace.with_tenant_prefix("default");
+    assert!(!key.starts_with(&benign.resources_prefix()));
+}
+
+/// In bucket-per-tenant mode the settings object has no tenant to key off, so it
+/// lands in the tenant-independent system bucket.
+#[tokio::test]
+async fn settings_bucket_per_tenant_uses_the_system_bucket() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+
+    assert_eq!(mock.bucket_object_count("system-bucket"), 1);
+    assert_eq!(mock.bucket_object_count("bucket-a"), 0);
+    assert_eq!(mock.bucket_object_count("bucket-b"), 0);
+}
+
+/// Bucket-per-tenant without a system bucket has nowhere tenant-independent to
+/// put settings. That must be an actionable configuration error, not a panic and
+/// not a silent write into some arbitrary tenant's bucket.
+#[tokio::test]
+async fn settings_bucket_per_tenant_without_system_bucket_is_a_config_error() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["bucket-a"]));
+    let mut tenant_bucket_map = HashMap::new();
+    tenant_bucket_map.insert("tenant-a".to_string(), "bucket-a".to_string());
+
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map,
+            default_system_bucket: None,
+        },
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend = S3Backend::with_client(config, mock.clone()).expect("backend");
+
+    match backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap_err()
+    {
+        StorageError::Backend(BackendError::Internal { message, .. }) => assert!(
+            message.contains("default_system_bucket"),
+            "the error must name the config key to set, got: {message}"
+        ),
+        other => panic!("expected an internal error, got {other:?}"),
+    }
+    assert_eq!(mock.bucket_object_count("bucket-a"), 0);
+
+    // And the server must not advertise the store at all in this configuration,
+    // so `/_user/settings` reports the explained 501 instead of failing.
+    assert!(!backend.supports_user_settings());
+}
+
+/// A create that loses the race must retry and update the winner's document
+/// rather than fail — the `If-None-Match: *` branch of the compare-and-swap,
+/// which the update-path tests never reach.
+#[tokio::test]
+async fn settings_unconditional_create_retries_when_another_writer_creates_first() {
+    let (backend, mock) = settings_backend();
+
+    // No object exists, so our first attempt will be a create. A concurrent
+    // writer creates one first, inside our read-then-write window.
+    mock.steal_once(
+        "test-bucket",
+        &settings_key("u1"),
+        settings_body("u1", json!({"first": true}), 1),
+    );
+
+    let patched = backend
+        .patch_settings("u1", json!({"second": true}), None)
+        .await
+        .unwrap();
+
+    // We lost the create, re-read, and merged onto the winner's document.
+    assert_eq!(patched.version, 2);
+    assert_eq!(patched.document["first"], json!(true), "lost update");
+    assert_eq!(patched.document["second"], json!(true));
+
+    let puts = mock.recorded_puts();
+    assert_eq!(puts[0].if_none_match.as_deref(), Some("*"));
+    assert!(
+        puts[1].if_match.is_some(),
+        "retry must pin the winner's ETag"
+    );
+}
+
+/// A `Some(0)` ("must not exist") create that loses the race must surface an
+/// optimistic-lock failure and must not overwrite the winner.
+#[tokio::test]
+async fn settings_create_only_write_losing_the_race_does_not_overwrite() {
+    let (backend, mock) = settings_backend();
+
+    mock.steal_once(
+        "test-bucket",
+        &settings_key("u1"),
+        settings_body("u1", json!({"winner": true}), 1),
+    );
+
+    let err = backend
+        .put_settings("u1", json!({"loser": true}), Some(0))
+        .await
+        .unwrap_err();
+
+    match err {
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+            expected_etag,
+            actual_etag,
+            ..
+        }) => {
+            assert_eq!(expected_etag, "W/\"0\"");
+            assert_eq!(actual_etag.as_deref(), Some("W/\"1\""));
+        }
+        other => panic!("expected an optimistic-lock failure, got {other:?}"),
+    }
+
+    // The winner's document is intact.
+    let stored = backend.get_settings("u1").await.unwrap().unwrap();
+    assert_eq!(stored.document, json!({"winner": true}));
+    assert_eq!(stored.version, 1);
+}
+
+/// A writer that loses every race must give up after a bounded number of
+/// attempts with a concurrency error, rather than looping forever.
+///
+/// `start_paused` lets tokio auto-advance its clock through the retry backoffs,
+/// so this exercises all 8 attempts without actually sleeping through them.
+#[tokio::test(start_paused = true)]
+async fn settings_write_gives_up_after_bounded_attempts() {
+    let (backend, mock) = settings_backend();
+    mock.fail_all_puts_with_precondition();
+
+    let err = backend
+        .put_settings("u1", json!({"a": 1}), None)
+        .await
+        .unwrap_err();
+
+    match err {
+        StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+            expected_etag,
+            actual_etag,
+            ..
+        }) => {
+            assert_eq!(expected_etag, "W/\"*\"");
+            assert!(actual_etag.is_none());
+        }
+        other => panic!("expected an optimistic-lock failure, got {other:?}"),
+    }
+
+    // Bounded: it tried, and stopped.
+    assert_eq!(mock.put_count(), 8);
+}
+
+/// The settings key must sit under the configured global prefix. Without this,
+/// a regression that dropped the prefix would pass every other test, since they
+/// all run with no prefix configured.
+#[tokio::test]
+async fn settings_key_respects_the_configured_global_prefix() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant {
+            bucket: "test-bucket".to_string(),
+        },
+        prefix: Some("hfs-data".to_string()),
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend = S3Backend::with_client(config, mock.clone()).expect("backend");
+
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+
+    let expected = format!(
+        "hfs-data/_system.user-settings/{}.json",
+        settings_object_id("u1")
+    );
+    assert!(
+        mock.get_object("test-bucket", &expected)
+            .await
+            .unwrap()
+            .is_some(),
+        "settings object not found at the prefixed key {expected}"
+    );
+
+    // Round-trips through the same prefixed key.
+    let stored = backend.get_settings("u1").await.unwrap().unwrap();
+    assert_eq!(stored.document, json!({"theme": "dark"}));
 }

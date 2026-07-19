@@ -395,13 +395,12 @@ fn closure_sync(conn: &Connection, req: &ClosureRequest) -> Result<ClosureRespon
     for (system_url, codes) in &by_system {
         // Look up the internal code_system.id, picking the latest version when
         // a URL has multiple stored revisions.
+        let sql = format!(
+            "SELECT id FROM code_systems WHERE url = ?1 ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
         let system_id_opt: Option<String> = conn
-            .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1 \
-                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                rusqlite::params![system_url],
-                |row| row.get(0),
-            )
+            .query_row(&sql, rusqlite::params![system_url], |row| row.get(0))
             .optional()
             .map_err(|e| HtsError::StorageError(format!("DB error: {e}")))?;
 

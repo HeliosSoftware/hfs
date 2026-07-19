@@ -37,9 +37,6 @@
       <code value="stat"/>
     </coding>
   </priority>
-  <prescription>
-    <reference value="http://pharmacy.org/MedicationRequest/AB1234G"/>
-  </prescription>
   <originalPrescription>
     <reference value="http://pharmacy.org/MedicationRequest/AB1202B"/>
   </originalPrescription>
@@ -106,11 +103,13 @@
   </supportingInfo>
   <diagnosis>
     <sequence value="1"/>
-    <diagnosisCodeableConcept>
-      <coding>
-        <code value="654456"/>
-      </coding>
-    </diagnosisCodeableConcept>
+    <diagnosis>
+      <concept>
+        <coding>
+          <code value="654456"/>
+        </coding>
+      </concept>
+    </diagnosis>
   </diagnosis>
   <insurance>
     <sequence value="1"/>
@@ -125,9 +124,9 @@
     <informationSequence value="1"/>
     <informationSequence value="2"/>
     <informationSequence value="3"/>
-    <!--  type=packagemedication  -->
+    <!-- type=packagemedication -->
     <productOrService>
-      <!--  <display value="Alprazolam 0.25mg (Xanax)"/>  -->
+      <!-- <display value="Alprazolam 0.25mg (Xanax)"/> -->
       <coding>
         <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
         <code value="562721"/>
@@ -147,7 +146,7 @@
     </net>
     <detail>
       <sequence value="1"/>
-      <!--  type=costitem  -->
+      <!-- type=costitem -->
       <productOrService>
         <coding>
           <system value="http://hl7.org/fhir/ex-pharmaservice"/>
@@ -161,7 +160,7 @@
     </detail>
     <detail>
       <sequence value="2"/>
-      <!--  type=costitem  -->
+      <!-- type=costitem -->
       <productOrService>
         <coding>
           <system value="http://hl7.org/fhir/ex-pharmaservice"/>
@@ -175,7 +174,7 @@
     </detail>
     <detail>
       <sequence value="3"/>
-      <!--  type=costitem  -->
+      <!-- type=costitem -->
       <productOrService>
         <coding>
           <system value="http://hl7.org/fhir/ex-pharmaservice"/>

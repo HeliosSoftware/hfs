@@ -161,7 +161,8 @@ where
     // Per-link target types, resolved from the registry (single-target params)
     // with a heuristic fallback for ambiguous references.
     let target_types: Vec<String> = {
-        let registry = storage.search_param_registry().read();
+        let reg = storage.search_param_registry(tenant);
+        let registry = reg.read();
         let mut types = Vec::with_capacity(parts.len() - 1);
         let mut current = base_type.to_string();
         for ref_param in parts.iter().take(parts.len() - 1) {
@@ -187,7 +188,8 @@ where
     let terminal_param = parts[parts.len() - 1];
     let deepest_type = target_types.last().map(String::as_str).unwrap_or(base_type);
     let terminal_type = {
-        let registry = storage.search_param_registry().read();
+        let reg = storage.search_param_registry(tenant);
+        let registry = reg.read();
         resolve_param_type(
             &registry,
             deepest_type,
@@ -297,7 +299,8 @@ where
             None => vec![],
         };
         let search_param_type = {
-            let registry = storage.search_param_registry().read();
+            let reg = storage.search_param_registry(tenant);
+            let registry = reg.read();
             resolve_param_type(
                 &registry,
                 &reverse_chain.source_type,
@@ -317,12 +320,13 @@ where
 
     let result = storage.search(tenant, &source_query).await?;
 
-    let extractor = SearchParameterExtractor::new(storage.search_param_registry().clone());
+    let extractor = SearchParameterExtractor::new(storage.search_param_registry(tenant));
     let mut ids = Vec::new();
     for resource in result.resources.items {
         let refs = extract_references(
             &extractor,
             storage,
+            tenant,
             &resource,
             &reverse_chain.reference_param,
         );
@@ -342,6 +346,7 @@ where
 fn extract_references<S>(
     extractor: &SearchParameterExtractor,
     storage: &S,
+    tenant: &TenantContext,
     resource: &crate::types::StoredResource,
     search_param: &str,
 ) -> Vec<String>
@@ -352,7 +357,8 @@ where
     let resource_type = resource.resource_type();
 
     let registered = {
-        let registry = storage.search_param_registry().read();
+        let reg = storage.search_param_registry(tenant);
+        let registry = reg.read();
         registry
             .get_param(resource_type, search_param)
             .or_else(|| registry.get_param("Resource", search_param))

@@ -82,6 +82,7 @@ Options:
 | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
 | `DATABASE_URL` | fhir.db | Database connection string |
 | `HFS_DATA_DIR` | ./data | Path to FHIR data directory (search parameters) |
+| `HFS_SEARCH_PARAM_CACHE_TTL` | 3600 | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_ENABLE_CORS` | true | Enable CORS |

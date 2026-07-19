@@ -396,8 +396,9 @@ impl SearchProvider for SqliteBackend {
 
     fn search_param_registry(
         &self,
-    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        self.search_registry()
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registry(tenant.tenant_id().as_str())
     }
 
     fn supports_contained_search(&self) -> bool {
@@ -733,7 +734,7 @@ impl ChainedSearchProvider for SqliteBackend {
         }
 
         // Create the chain query builder with registry access
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.get_search_registry())
+        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
             .with_param_offset(2); // After ?1 (tenant) and ?2 (resource_type)
 
         // Parse the chain
@@ -807,7 +808,7 @@ impl ChainedSearchProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
 
         // Create the chain query builder with registry access
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.get_search_registry())
+        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
             .with_param_offset(2); // After ?1 (tenant) and ?2 (resource_type)
 
         // Build the SQL fragment for reverse chain

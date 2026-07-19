@@ -9,7 +9,7 @@
   </meta>
   <status value="final"/>
   <code>
-    <!--  Kind of observation = Blood culture  -->
+    <!-- Kind of observation = Blood culture -->
     <coding>
       <system value="http://acmelabs.org"/>
       <code value="104177"/>
@@ -21,7 +21,7 @@
       <display value="Bacteria identified in Blood by Culture"/>
     </coding>
   </code>
-  <!--  No identifier could be provided to this observation  -->
+  <!-- No identifier could be provided to this observation -->
   <subject>
     <reference value="Patient/f201"/>
     <display value="Roel"/>
@@ -44,7 +44,7 @@
       <code value="POS"/>
     </coding>
   </interpretation>
-  <!--  BodySite not relevant  -->
+  <!-- BodySite not relevant -->
   <method>
     <coding>
       <system value="http://snomed.info/sct"/>

@@ -112,7 +112,7 @@
       </manufacturedDoseForm>
     </ManufacturedItemDefinition>
   </contained>
-  <!--  Schema appears to be broken, deviceName is not present in XSD  -->
+  <!-- Schema appears to be broken, deviceName is not present in XSD -->
   <!-- deviceName>
 				<name value="WonderSyringe"/>
 				<type value="manufacturer-name"/>

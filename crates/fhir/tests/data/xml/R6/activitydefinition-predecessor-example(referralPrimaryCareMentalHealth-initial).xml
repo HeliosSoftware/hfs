@@ -256,7 +256,7 @@
     <type value="successor"/>
     <resource value="http://example.org/fhir/ActivityDefinition/referralPrimaryCareMentalHealth"/>
   </relatedArtifact>
-  <!--  Kind indicates the type of resource that is defined by this activity, a ServiceRequest in this case  -->
+  <!-- Kind indicates the type of resource that is defined by this activity, a ServiceRequest in this case -->
   <kind value="ServiceRequest"/>
   <code>
     <coding>
@@ -267,8 +267,8 @@
   </code>
   <timingTiming>
     <event>
-      <!--  The expression here specifies the value for the timing of the resulting resource.
-		   In this case, ServiceRequest.fulfillmentTime.start  -->
+      <!-- The expression here specifies the value for the timing of the resulting resource.
+		   In this case, ServiceRequest.fulfillmentTime.start -->
       <extension url="http://hl7.org/fhir/StructureDefinition/cqf-expression">
         <valueExpression>
           <language value="text/cql-expression"/>

@@ -2,11 +2,11 @@
   "resourceType": "CodeSystem",
   "id": "substance-relationship-type",
   "meta": {
-    "lastUpdated": "2026-06-14T04:13:29.148+11:00"
+    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem substance-relationship-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"substance-relationship-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsubstance-relationship-type\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2021-01-05T10:01:24.148+11:00\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/substance-relationship-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eSalt\u003ca name\u003d\"substance-relationship-type-Salt\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSalt to parent\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eActiveMoiety\u003ca name\u003d\"substance-relationship-type-ActiveMoiety\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eActive moiety\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eStartingMaterial\u003ca name\u003d\"substance-relationship-type-StartingMaterial\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStarting material for\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ePolymorph\u003ca name\u003d\"substance-relationship-type-Polymorph\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePolymorph of\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eImpurity\u003ca name\u003d\"substance-relationship-type-Impurity\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eImpurity of\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem substance-relationship-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"substance-relationship-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsubstance-relationship-type\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2021-01-05T10:01:24.148+11:00\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/substance-relationship-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eSalt\u003ca name\u003d\"substance-relationship-type-Salt\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSalt to parent\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eActiveMoiety\u003ca name\u003d\"substance-relationship-type-ActiveMoiety\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eActive moiety\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eStartingMaterial\u003ca name\u003d\"substance-relationship-type-StartingMaterial\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStarting material for\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ePolymorph\u003ca name\u003d\"substance-relationship-type-Polymorph\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePolymorph of\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eImpurity\u003ca name\u003d\"substance-relationship-type-Impurity\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eImpurity of\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eTherapeuticTarget\u003ca name\u003d\"substance-relationship-type-TherapeuticTarget\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eTherapeutic target\u003c/td\u003e\u003ctd\u003eThe substance acts therapeutically on the target.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eMetabolicTarget\u003ca name\u003d\"substance-relationship-type-MetabolicTarget\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMetabolic target\u003c/td\u003e\u003ctd\u003eThe substance is metabolised by or interacts with the target as part of metabolism.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eToxicityTarget\u003ca name\u003d\"substance-relationship-type-ToxicityTarget\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eToxicity target\u003c/td\u003e\u003ctd\u003eThe substance interacts with the target in a way that contributes to toxicity.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eTargetUnknownEffect\u003ca name\u003d\"substance-relationship-type-TargetUnknownEffect\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eTarget (unknown effect)\u003c/td\u003e\u003ctd\u003eThe substance is known to interact with the target, but the effect is not characterised.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eGeneOfOrigin\u003ca name\u003d\"substance-relationship-type-GeneOfOrigin\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGene of origin\u003c/td\u003e\u003ctd\u003eThe substance was derived from this gene (used e.g. for recombinant proteins and nucleic acid products).\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eComponent\u003ca name\u003d\"substance-relationship-type-Component\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eComponent\u003c/td\u003e\u003ctd\u003eThe substance is a component (constituent) of a mixture substance. Used to relate a mixture\u0027s component substances to the mixture itself.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -30,10 +30,10 @@
     }
   ],
   "version": "6.0.0-ballot4",
-  "name": "SubstanceRelationshipType",
+  "name": "SubstanceRelationshipTypeExample",
   "title": "Substance Relationship Type",
   "status": "active",
-  "experimental": false,
+  "experimental": true,
   "date": "2021-01-05T10:01:24+11:00",
   "publisher": "HL7 (FHIR Project)",
   "contact": [
@@ -85,6 +85,36 @@
     {
       "code": "Impurity",
       "display": "Impurity of"
+    },
+    {
+      "code": "TherapeuticTarget",
+      "display": "Therapeutic target",
+      "definition": "The substance acts therapeutically on the target."
+    },
+    {
+      "code": "MetabolicTarget",
+      "display": "Metabolic target",
+      "definition": "The substance is metabolised by or interacts with the target as part of metabolism."
+    },
+    {
+      "code": "ToxicityTarget",
+      "display": "Toxicity target",
+      "definition": "The substance interacts with the target in a way that contributes to toxicity."
+    },
+    {
+      "code": "TargetUnknownEffect",
+      "display": "Target (unknown effect)",
+      "definition": "The substance is known to interact with the target, but the effect is not characterised."
+    },
+    {
+      "code": "GeneOfOrigin",
+      "display": "Gene of origin",
+      "definition": "The substance was derived from this gene (used e.g. for recombinant proteins and nucleic acid products)."
+    },
+    {
+      "code": "Component",
+      "display": "Component",
+      "definition": "The substance is a component (constituent) of a mixture substance. Used to relate a mixture\u0027s component substances to the mixture itself."
     }
   ]
 }

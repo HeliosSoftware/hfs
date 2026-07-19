@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><DocumentReference xmlns="http://hl7.org/fhir">
   <id value="1.2.840.11361907579238403408700.3.1.04.19970327150033"/>
-  <!-- 
-    This example demonstrates how to represent an image
+  <!-- This example demonstrates how to represent an image
     originally sourced by a DICOM acquisition device
     as a DocumentReference resource. Whether this is appropriate depends
     on the complexity of the image - the DocumentReference resource only
@@ -9,8 +8,7 @@
     pixels. This is suitable for the bulk of simple images
     shared as summaries with consumers, but not at all suitable
     for other kinds of images, or for internal radiology
-    reporting usage
-   -->
+    reporting usage -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -25,10 +23,8 @@
 
     </div>
   </text>
-  <!-- 
-    this is added to demonstrate the use of DICOM extensions.
-    0002,0010 is the DICOM transfer syntax of the referenced image
-    -->
+  <!-- this is added to demonstrate the use of DICOM extensions.
+    0002,0010 is the DICOM transfer syntax of the referenced image -->
   <extension url="http://nema.org/fhir/extensions#0002-0010">
     <valueUri value="urn:oid:1.2.840.10008.1.2.1"/>
   </extension>
@@ -36,7 +32,7 @@
     <type>
       <text value="accessionNo"/>
     </type>
-    <!--  the imaging department accession number. (they recycle numbers each year)  -->
+    <!-- the imaging department accession number. (they recycle numbers each year) -->
     <system value="http://acme-imaging.com/accession/2012"/>
     <value value="1234567"/>
   </identifier>
@@ -64,7 +60,7 @@
   </identifier>
   <status value="current"/>
   <modality>
-    <!--  modality  -->
+    <!-- modality -->
     <coding>
       <system value="http://dicom.nema.org/resources/ontology/DCM"/>
       <code value="US"/>
@@ -75,7 +71,7 @@
   </subject>
   <event>
     <concept>
-      <!--  view  -->
+      <!-- view -->
       <coding>
         <system value="http://snomed.info/sct"/>
         <code value="399067008"/>
@@ -86,11 +82,11 @@
   <author>
     <display value="G.E. Medical Systems"/>
   </author>
-  <!--  and a reference to the image data  -->
+  <!-- and a reference to the image data -->
   <content>
     <attachment>
       <contentType value="application/dicom"/>
-      <!--  The actual image could be anywhere. This is a WADO example  -->
+      <!-- The actual image could be anywhere. This is a WADO example -->
       <url value="http://imaging.acme.com/wado/server?requestType=WADO&amp;contentType=application%2Fdicom&amp;studyUid=1.2.840.113619.2.21.848.34082.0.538976288.3&amp;seriesUid=1.2.840.113619.2.21.3408.700.0.757923840.3.0&amp;objectUid=1.2.840.11361907579238403408700.3.1.04.19970327150033"/>
       <height value="480"/>
       <width value="640"/>

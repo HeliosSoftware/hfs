@@ -1,0 +1,266 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "medicinal-product-manufacturing-activity",
+  "meta": {
+    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem medicinal-product-manufacturing-activity\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"medicinal-product-manufacturing-activity\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcmedicinal-product-manufacturing-activity\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2021-01-05T10:01:24.148+11:00\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/medicinal-product-manufacturing-activity\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160407\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160407\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacturer responsible for batch certification\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160408\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160408\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eQuality control testing of medicinal product\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160409\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160409\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMicrobiological testing: sterility\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160410\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160410\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMicrobiological testing: non-sterility\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160411\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160411\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eChemical/Physical testing\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160412\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160412\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBiological testing1\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160413\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160413\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProcessing operations for the medicinal product\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160414\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160414\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacturer of finished products intermediate\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160415\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160415\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacture of solvent / diluent\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160448\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160448\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eQuality control testing of active substance\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160449\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160449\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMicrobiological testing: sterility\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160450\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160450\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMicrobiological testing: non-sterility\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160451\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160451\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eChemical/Physical testing\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160452\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160452\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBiological testing\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160453\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160453\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacture of active substance intermediate\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160454\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160454\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePackaging of active substance\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160455\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160455\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStorage and/or distribution of active substance\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160456\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160456\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSterilisation\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160457\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160457\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFiltration\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160458\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160458\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDry heat\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160459\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160459\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMoist heat\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160460\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160460\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eChemical\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160461\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160461\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGamma irradiation\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160462\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160462\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eElectron beam\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160463\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160463\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePrimary packaging\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160464\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160464\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSecondary packaging\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160465\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160465\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePhysical Importation\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160466\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160466\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStorage and/or distribution of medicinal product\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160467\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160467\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacture of active substance\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160476\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160476\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePreparation of Working Cell Bank\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160477\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160477\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStorage of Master Cell Bank and/or Working Cell Bank\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160478\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160478\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBioequivalence Contract Research Organisation (CRO)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160479\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160479\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacturer of ancillary medicinal product\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160480\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160480\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacturer of medical device\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160481\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160481\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacturer of ancillary substance used in medical device\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160482\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160482\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOfficial Medicine Control Laboratory (OMCL)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000160483\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000160483\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNotified Body of medical device\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163618\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163618\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProcessing of non-sterile medicinal product\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163709\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163709\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProcessing of sterile medicinal product - aseptically prepared\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163713\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163713\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacture of active substance intermediate by chemical synthesis\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163714\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163714\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacture of active substance intermediate using biological processes\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163715\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163715\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eActive substance intermediate physical processing\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163716\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163716\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePrimary Packaging of active substance\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163717\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163717\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSecondary Packaging of active substance\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163737\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163737\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProcessing of sterile medicinal product - terminally sterilised\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163843\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163843\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacture of active substance by chemical synthesis\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163844\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163844\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eExtraction of active substance from natural sources\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163845\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163845\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eManufacture of active substance using biological processes\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e100000163846\u003ca name\u003d\"medicinal-product-manufacturing-activity-100000163846\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eActive substance physical processing\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "normative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/medicinal-product-manufacturing-activity",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.4.1920"
+    }
+  ],
+  "version": "6.0.0-ballot4",
+  "name": "MedicinalProductManufacturingActivityExample",
+  "title": "Medicinal Product Manufacturing Activity",
+  "status": "active",
+  "experimental": true,
+  "date": "2021-01-05T10:01:24+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The type of manufacturing or business operation for a medicinal product.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/medicinal-product-manufacturing-activity",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "100000160407",
+      "display": "Manufacturer responsible for batch certification"
+    },
+    {
+      "code": "100000160408",
+      "display": "Quality control testing of medicinal product"
+    },
+    {
+      "code": "100000160409",
+      "display": "Microbiological testing: sterility"
+    },
+    {
+      "code": "100000160410",
+      "display": "Microbiological testing: non-sterility"
+    },
+    {
+      "code": "100000160411",
+      "display": "Chemical/Physical testing"
+    },
+    {
+      "code": "100000160412",
+      "display": "Biological testing1"
+    },
+    {
+      "code": "100000160413",
+      "display": "Processing operations for the medicinal product"
+    },
+    {
+      "code": "100000160414",
+      "display": "Manufacturer of finished products intermediate"
+    },
+    {
+      "code": "100000160415",
+      "display": "Manufacture of solvent / diluent"
+    },
+    {
+      "code": "100000160448",
+      "display": "Quality control testing of active substance"
+    },
+    {
+      "code": "100000160449",
+      "display": "Microbiological testing: sterility"
+    },
+    {
+      "code": "100000160450",
+      "display": "Microbiological testing: non-sterility"
+    },
+    {
+      "code": "100000160451",
+      "display": "Chemical/Physical testing"
+    },
+    {
+      "code": "100000160452",
+      "display": "Biological testing"
+    },
+    {
+      "code": "100000160453",
+      "display": "Manufacture of active substance intermediate"
+    },
+    {
+      "code": "100000160454",
+      "display": "Packaging of active substance"
+    },
+    {
+      "code": "100000160455",
+      "display": "Storage and/or distribution of active substance"
+    },
+    {
+      "code": "100000160456",
+      "display": "Sterilisation"
+    },
+    {
+      "code": "100000160457",
+      "display": "Filtration"
+    },
+    {
+      "code": "100000160458",
+      "display": "Dry heat"
+    },
+    {
+      "code": "100000160459",
+      "display": "Moist heat"
+    },
+    {
+      "code": "100000160460",
+      "display": "Chemical"
+    },
+    {
+      "code": "100000160461",
+      "display": "Gamma irradiation"
+    },
+    {
+      "code": "100000160462",
+      "display": "Electron beam"
+    },
+    {
+      "code": "100000160463",
+      "display": "Primary packaging"
+    },
+    {
+      "code": "100000160464",
+      "display": "Secondary packaging"
+    },
+    {
+      "code": "100000160465",
+      "display": "Physical Importation"
+    },
+    {
+      "code": "100000160466",
+      "display": "Storage and/or distribution of medicinal product"
+    },
+    {
+      "code": "100000160467",
+      "display": "Manufacture of active substance"
+    },
+    {
+      "code": "100000160476",
+      "display": "Preparation of Working Cell Bank"
+    },
+    {
+      "code": "100000160477",
+      "display": "Storage of Master Cell Bank and/or Working Cell Bank"
+    },
+    {
+      "code": "100000160478",
+      "display": "Bioequivalence Contract Research Organisation (CRO)"
+    },
+    {
+      "code": "100000160479",
+      "display": "Manufacturer of ancillary medicinal product"
+    },
+    {
+      "code": "100000160480",
+      "display": "Manufacturer of medical device"
+    },
+    {
+      "code": "100000160481",
+      "display": "Manufacturer of ancillary substance used in medical device"
+    },
+    {
+      "code": "100000160482",
+      "display": "Official Medicine Control Laboratory (OMCL)"
+    },
+    {
+      "code": "100000160483",
+      "display": "Notified Body of medical device"
+    },
+    {
+      "code": "100000163618",
+      "display": "Processing of non-sterile medicinal product"
+    },
+    {
+      "code": "100000163709",
+      "display": "Processing of sterile medicinal product - aseptically prepared"
+    },
+    {
+      "code": "100000163713",
+      "display": "Manufacture of active substance intermediate by chemical synthesis"
+    },
+    {
+      "code": "100000163714",
+      "display": "Manufacture of active substance intermediate using biological processes"
+    },
+    {
+      "code": "100000163715",
+      "display": "Active substance intermediate physical processing"
+    },
+    {
+      "code": "100000163716",
+      "display": "Primary Packaging of active substance"
+    },
+    {
+      "code": "100000163717",
+      "display": "Secondary Packaging of active substance"
+    },
+    {
+      "code": "100000163737",
+      "display": "Processing of sterile medicinal product - terminally sterilised"
+    },
+    {
+      "code": "100000163843",
+      "display": "Manufacture of active substance by chemical synthesis"
+    },
+    {
+      "code": "100000163844",
+      "display": "Extraction of active substance from natural sources"
+    },
+    {
+      "code": "100000163845",
+      "display": "Manufacture of active substance using biological processes"
+    },
+    {
+      "code": "100000163846",
+      "display": "Active substance physical processing"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Task xmlns="http://hl7.org/fhir">
   <!-- This is an example to demonstrate using task for actioning a filler generated servicerequest and to illustrate how to populate many of the task elements - this is the child task from task example1 to grab the specimen
-example1 action lipid panel -in progress =>. example2 specimen collection subtask -accepted => example4  specimen collection subtask - completed  with output Specimen=>example 5 action lipid panel -in progress specimen collected with output Specimen => example 6 action lipid panel - completed with output Specimen and DiagnosticReport  -->
+example1 action lipid panel -in progress =>. example2 specimen collection subtask -accepted => example4  specimen collection subtask - completed  with output Specimen=>example 5 action lipid panel -in progress specimen collected with output Specimen => example 6 action lipid panel - completed with output Specimen and DiagnosticReport -->
   <id value="example2"/>
   <meta>
     <security>
@@ -19,8 +19,7 @@ example1 action lipid panel -in progress =>. example2 specimen collection subtas
     <system value="http:/goodhealth.org/accession/identifiers"/>
     <value value="G20170201-001"/>
   </groupIdentifier>
-  <!-- 	This Task is a child task of the submitted lipid panel requet
- -->
+  <!-- This Task is a child task of the submitted lipid panel requet -->
   <partOf>
     <reference value="Task/example1"/>
     <display value="Lipid Panel"/>
@@ -32,19 +31,18 @@ example1 action lipid panel -in progress =>. example2 specimen collection subtas
   </businessStatus>
   <intent value="filler-order"/>
   <priority value="routine"/>
-  <!-- fictive code and description elements populated for this example  -->
+  <!-- fictive code and description elements populated for this example -->
   <code>
     <coding>
       <system value="http://hl7.org/fhir/CodeSystem/task-code"/>
       <code value="fulfill"/>
     </coding>
   </code>
-  <!-- 	Filler generated order using a fictive  servicerequest to complete the loop -->
+  <!-- Filler generated order using a fictive  servicerequest to complete the loop -->
   <focus>
     <valueCanonical value="http://hl7.org/fhir/ServiceRequest/BloodDrawf201"/>
   </focus>
-  <!-- 	who the task is for
- -->
+  <!-- who the task is for -->
   <for>
     <reference value="Patient/example"/>
     <display value="Peter James Chalmers"/>
@@ -53,7 +51,7 @@ example1 action lipid panel -in progress =>. example2 specimen collection subtas
     <reference value="Encounter/example"/>
     <display value="Example In-Patient Encounter"/>
   </encounter>
-  <!-- 	Lots of dates  -->
+  <!-- Lots of dates -->
   <executionPeriod>
     <start value="2016-10-31T08:45:05+10:00"/>
   </executionPeriod>

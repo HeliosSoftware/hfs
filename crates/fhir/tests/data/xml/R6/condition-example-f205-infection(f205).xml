@@ -20,7 +20,7 @@
     </coding>
   </verificationStatus>
   <code>
-    <!-- The problem is a bacterial infection  -->
+    <!-- The problem is a bacterial infection -->
     <coding>
       <system value="http://snomed.info/sct"/>
       <code value="87628006"/>
@@ -28,7 +28,7 @@
     </coding>
   </code>
   <bodyStructure>
-    <reference value="BodyStructure/skin-patch"/>
+    <reference/>
   </bodyStructure>
   <subject>
     <reference value="Patient/f201"/>

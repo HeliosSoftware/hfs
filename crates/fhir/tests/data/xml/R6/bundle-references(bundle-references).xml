@@ -8,7 +8,7 @@
     </security>
   </meta>
   <type value="collection"/>
-  <!--  A patient that already has an id on a server  -->
+  <!-- A patient that already has an id on a server -->
   <entry>
     <fullUrl value="http://example.org/fhir/Patient/23"/>
     <resource>
@@ -24,8 +24,8 @@
       </Patient>
     </resource>
   </entry>
-  <!--  A patient that does not have a persistent home - but it does have 
-      a UUID assigned for this bundle "locally identified"  -->
+  <!-- A patient that does not have a persistent home - but it does have 
+      a UUID assigned for this bundle "locally identified" -->
   <entry>
     <fullUrl value="urn:uuid:04121321-4af5-424c-a0e1-ed3aab1c349d"/>
     <resource>
@@ -37,7 +37,7 @@
       </Patient>
     </resource>
   </entry>
-  <!--  a relative resource reference  -->
+  <!-- a relative resource reference -->
   <entry>
     <fullUrl value="http://example.org/fhir/Observation/123"/>
     <resource>
@@ -55,13 +55,13 @@
           </coding>
         </code>
         <subject>
-          <!--  this is reference to the first patient above  -->
+          <!-- this is reference to the first patient above -->
           <reference value="Patient/23"/>
         </subject>
       </Observation>
     </resource>
   </entry>
-  <!--  an absolute reference  -->
+  <!-- an absolute reference -->
   <entry>
     <fullUrl value="http://example.org/fhir/Observation/124"/>
     <resource>
@@ -79,13 +79,13 @@
           </coding>
         </code>
         <subject>
-          <!--  this is reference to the first patient above  -->
+          <!-- this is reference to the first patient above -->
           <reference value="http://example.org/fhir/Patient/23"/>
         </subject>
       </Observation>
     </resource>
   </entry>
-  <!--  reference to a locally identified resource  -->
+  <!-- reference to a locally identified resource -->
   <entry>
     <fullUrl value="http://example.org/fhir/Observation/12"/>
     <resource>
@@ -103,13 +103,13 @@
           </coding>
         </code>
         <subject>
-          <!--  reference to the second patient above  -->
+          <!-- reference to the second patient above -->
           <reference value="urn:uuid:04121321-4af5-424c-a0e1-ed3aab1c349d"/>
         </subject>
       </Observation>
     </resource>
   </entry>
-  <!--  reference that does not resolve in this bundle and is resolved externally  -->
+  <!-- reference that does not resolve in this bundle and is resolved externally -->
   <entry>
     <fullUrl value="http://example.org/fhir/Observation/14"/>
     <resource>
@@ -127,13 +127,13 @@
           </coding>
         </code>
         <subject>
-          <!--  reference to a patient not found in this bundle  -->
+          <!-- reference to a patient not found in this bundle -->
           <reference value="http://example.org/fhir-2/Patient/1"/>
         </subject>
       </Observation>
     </resource>
   </entry>
-  <!--  nor does this one (FullUrl base is different)  -->
+  <!-- nor does this one (FullUrl base is different) -->
   <entry>
     <fullUrl value="http://example.org/fhir-2/Observation/14"/>
     <resource>
@@ -151,13 +151,13 @@
           </coding>
         </code>
         <subject>
-          <!--  reference to a patient not found in this bundle  -->
+          <!-- reference to a patient not found in this bundle -->
           <reference value="Patient/23"/>
         </subject>
       </Observation>
     </resource>
   </entry>
-  <!--  A duplicate patient (#1)  -->
+  <!-- A duplicate patient (#1) -->
   <entry>
     <fullUrl value="http://example.org/fhir/Patient/45"/>
     <resource>
@@ -175,7 +175,7 @@
       </Patient>
     </resource>
   </entry>
-  <!--  A duplicate patient (#2)  -->
+  <!-- A duplicate patient (#2) -->
   <entry>
     <fullUrl value="http://example.org/fhir/Patient/45"/>
     <resource>
@@ -193,7 +193,7 @@
       </Patient>
     </resource>
   </entry>
-  <!--  ambiguous reference .. commented out because the validator calls it an error
+  <!-- ambiguous reference .. commented out because the validator calls it an error
   <entry>
     <fullUrl value="http://example.org/fhir/Observation/46"/>
     <resource>
@@ -212,9 +212,8 @@
         </subject>
       </Observation>
     </resource>
-  </entry>
-   -->
-  <!--  unambiguous reference  -->
+  </entry> -->
+  <!-- unambiguous reference -->
   <entry>
     <fullUrl value="http://example.org/fhir/Observation/47"/>
     <resource>
@@ -237,7 +236,7 @@
       </Observation>
     </resource>
   </entry>
-  <!--  identifier based reference, resolves to first patient  -->
+  <!-- identifier based reference, resolves to first patient -->
   <entry>
     <fullUrl value="http://example.org/fhir/Observation/48"/>
     <resource>

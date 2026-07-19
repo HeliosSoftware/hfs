@@ -334,6 +334,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Conditional Operations](https://build.fhir.org/http.html#cond-update)      | ✓      | ✓          | ✓       | ✗         | ○     | ○             | ✗   |
 | [Conditional Patch](https://build.fhir.org/http.html#patch)                 | ✓      | ✓          | ○       | ✗         | ○     | ○             | ✗   |
 | [Delete History](https://build.fhir.org/http.html#delete)                   | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
+| Per-User Settings (`/_user/settings`)                                       | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ✓   |
 | **Multitenancy**                                                            |
 | Shared Schema                                                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ✓   |
 | Schema-per-Tenant                                                           | ✗      | ○          | ○       | ✗         | ✗     | ✗             | ✗   |

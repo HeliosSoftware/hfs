@@ -15,8 +15,7 @@
         <a href="valueset-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <br/>
-      <p>
-        <b>Group 1 </b>Mapping from 
+      <p>Mapping from 
         <a href="codesystem-encounter-location-status.html">Encounter Location Status</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>

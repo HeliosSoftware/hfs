@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ImagingSelection"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -191,7 +191,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Imaging Selection purpose text or code
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-image-reference-type.html">Image Reference Type</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-image-reference-type.html">Image Reference Type</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -608,7 +608,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="ImagingSelection.instance.frameNumber : A list of frame numbers selected from a multiframe SOP Instance (See [DICOM PS 3.3 Table 10.3](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_10.3.html#table_10-3)).">frameNumber</span>
+            <span title="ImagingSelection.instance.frameNumber : A list of frame numbers selected from a multiframe SOP Instance (See [DICOM PS3.3 Table 10.3](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_10.3.html#table_10-3)).">frameNumber</span>
             <a name="ImagingSelection.instance.frameNumber"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -630,7 +630,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="ImagingSelection.instance.referencedContentItemIdentifier : A list of Referenced Content Item Identifier values selected from a DICOM SR or other structured document SOP Instance (See [DICOM PS 3.3 C.17.3.2.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.17.3.2.5.html)).">referencedContentItemIdentifier</span>
+            <span title="ImagingSelection.instance.referencedContentItemIdentifier : A list of Referenced Content Item Identifier values selected from a DICOM SR or other structured document SOP Instance (See [DICOM PS3.3 C.17.3.2.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.17.3.2.5.html)).">referencedContentItemIdentifier</span>
             <a name="ImagingSelection.instance.referencedContentItemIdentifier"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -652,7 +652,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="ImagingSelection.instance.segmentNumber : A list of segment numbers selected from a segmentation SOP Instance (See [DICOM PS 3.3 Table C.8.20-4](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.20.4.html#table_C.8.20-4)).">segmentNumber</span>
+            <span title="ImagingSelection.instance.segmentNumber : A list of segment numbers selected from a segmentation SOP Instance (See [DICOM PS3.3 Table C.8.20-4](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.20.4.html#table_C.8.20-4)).">segmentNumber</span>
             <a name="ImagingSelection.instance.segmentNumber"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -674,7 +674,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="ImagingSelection.instance.regionOfInterest : A list of Region of Interest (ROI) numbers selected from a radiotherapy structure set SOP Instance (See [DICOM PS 3.3 C.8.8.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.8.5.html)).">regionOfInterest</span>
+            <span title="ImagingSelection.instance.regionOfInterest : A list of Region of Interest (ROI) numbers selected from a radiotherapy structure set SOP Instance (See [DICOM PS3.3 C.8.8.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.8.5.html)).">regionOfInterest</span>
             <a name="ImagingSelection.instance.regionOfInterest"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -696,7 +696,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="ImagingSelection.instance.waveFormChannel : A list of channels in a Waveform selected from an instance of a waveform SOP Class.&#xA;Each channel is specified as a pair of values where the first value is the Multiplex Group Number, and the second value is the Channel Number within the multiplex group (See [DICOM PS 3.3 C.18.5.1.1](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.5.html#sect_C.18.5.1.1)).">waveFormChannel</span>
+            <span title="ImagingSelection.instance.waveFormChannel : A list of channels in a Waveform selected from an instance of a waveform SOP Class.&#xA;Each channel is specified as a pair of values where the first value is the Multiplex Group Number, and the second value is the Channel Number within the multiplex group (See [DICOM PS3.3 C.18.5.1.1](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.5.html#sect_C.18.5.1.1)).">waveFormChannel</span>
             <a name="ImagingSelection.instance.waveFormChannel"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -873,7 +873,7 @@
   <name value="ImagingSelection"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Imaging Integration"/>
   <contact>
     <telecom>
@@ -1075,7 +1075,7 @@
       <path value="ImagingSelection.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1254,6 +1254,14 @@
     </element>
     <element id="ImagingSelection.extension">
       <path value="ImagingSelection.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1286,6 +1294,14 @@
     </element>
     <element id="ImagingSelection.modifierExtension">
       <path value="ImagingSelection.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1666,6 +1682,14 @@
     </element>
     <element id="ImagingSelection.performer.extension">
       <path value="ImagingSelection.performer.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1697,6 +1721,14 @@
     </element>
     <element id="ImagingSelection.performer.modifierExtension">
       <path value="ImagingSelection.performer.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2184,6 +2216,14 @@
     </element>
     <element id="ImagingSelection.instance.extension">
       <path value="ImagingSelection.instance.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2215,6 +2255,14 @@
     </element>
     <element id="ImagingSelection.instance.modifierExtension">
       <path value="ImagingSelection.instance.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2353,7 +2401,7 @@
     <element id="ImagingSelection.instance.frameNumber">
       <path value="ImagingSelection.instance.frameNumber"/>
       <short value="Selected frames"/>
-      <definition value="A list of frame numbers selected from a multiframe SOP Instance (See [DICOM PS 3.3 Table 10.3](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_10.3.html#table_10-3))."/>
+      <definition value="A list of frame numbers selected from a multiframe SOP Instance (See [DICOM PS3.3 Table 10.3](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_10.3.html#table_10-3))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a multiframe SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -2380,7 +2428,7 @@
     <element id="ImagingSelection.instance.referencedContentItemIdentifier">
       <path value="ImagingSelection.instance.referencedContentItemIdentifier"/>
       <short value="Selected content items"/>
-      <definition value="A list of Referenced Content Item Identifier values selected from a DICOM SR or other structured document SOP Instance (See [DICOM PS 3.3 C.17.3.2.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.17.3.2.5.html))."/>
+      <definition value="A list of Referenced Content Item Identifier values selected from a DICOM SR or other structured document SOP Instance (See [DICOM PS3.3 C.17.3.2.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.17.3.2.5.html))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a DICOM SR or other structured document SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -2407,7 +2455,7 @@
     <element id="ImagingSelection.instance.segmentNumber">
       <path value="ImagingSelection.instance.segmentNumber"/>
       <short value="Selected segments"/>
-      <definition value="A list of segment numbers selected from a segmentation SOP Instance (See [DICOM PS 3.3 Table C.8.20-4](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.20.4.html#table_C.8.20-4))."/>
+      <definition value="A list of segment numbers selected from a segmentation SOP Instance (See [DICOM PS3.3 Table C.8.20-4](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.20.4.html#table_C.8.20-4))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a segmentation SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -2434,7 +2482,7 @@
     <element id="ImagingSelection.instance.regionOfInterest">
       <path value="ImagingSelection.instance.regionOfInterest"/>
       <short value="Selected regions of interest"/>
-      <definition value="A list of Region of Interest (ROI) numbers selected from a radiotherapy structure set SOP Instance (See [DICOM PS 3.3 C.8.8.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.8.5.html))."/>
+      <definition value="A list of Region of Interest (ROI) numbers selected from a radiotherapy structure set SOP Instance (See [DICOM PS3.3 C.8.8.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.8.5.html))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a radiotherapy structure set SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -2461,7 +2509,7 @@
     <element id="ImagingSelection.instance.waveFormChannel">
       <path value="ImagingSelection.instance.waveFormChannel"/>
       <short value="Selected waveform channel"/>
-      <definition value="A list of channels in a Waveform selected from an instance of a waveform SOP Class.&#xA;Each channel is specified as a pair of values where the first value is the Multiplex Group Number, and the second value is the Channel Number within the multiplex group (See [DICOM PS 3.3 C.18.5.1.1](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.5.html#sect_C.18.5.1.1))."/>
+      <definition value="A list of channels in a Waveform selected from an instance of a waveform SOP Class.&#xA;Each channel is specified as a pair of values where the first value is the Multiplex Group Number, and the second value is the Channel Number within the multiplex group (See [DICOM PS3.3 C.18.5.1.1](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.5.html#sect_C.18.5.1.1))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a waveform  structure set SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -2546,6 +2594,14 @@
     </element>
     <element id="ImagingSelection.instance.imageRegion2D.extension">
       <path value="ImagingSelection.instance.imageRegion2D.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2577,6 +2633,14 @@
     </element>
     <element id="ImagingSelection.instance.imageRegion2D.modifierExtension">
       <path value="ImagingSelection.instance.imageRegion2D.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2652,7 +2716,7 @@
       <path value="ImagingSelection.instance.imageRegion2D.coordinate"/>
       <short value="The coordinates that define the image region"/>
       <definition value="The coordinates defining the image region. Encoded as a set of (column, row) pairs that denote positions in the selected image / frames specified with sub-pixel resolution.&#xA;The origin at the TLHC of the TLHC pixel is 0.0\0.0, the BRHC of the TLHC pixel is 1.0\1.0, and the BRHC of the BRHC pixel is the number of columns\rows in the image / frames. The values SHALL be within the range 0\0 to the number of columns\rows in the image / frames."/>
-      <comment value="For a description of how 2D coordinates are encoded, see [DICOM PS 3.3 C.18.6](http://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.6.html)."/>
+      <comment value="For a description of how 2D coordinates are encoded, see [DICOM PS3.3 C.18.6](http://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.6.html)."/>
       <requirements value="The number of values SHALL be a multiple of two."/>
       <alias value="GraphicData"/>
       <min value="1"/>
@@ -2744,6 +2808,14 @@
     </element>
     <element id="ImagingSelection.imageRegion3D.extension">
       <path value="ImagingSelection.imageRegion3D.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2775,6 +2847,14 @@
     </element>
     <element id="ImagingSelection.imageRegion3D.modifierExtension">
       <path value="ImagingSelection.imageRegion3D.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3555,7 +3635,7 @@
     <element id="ImagingSelection.instance.frameNumber">
       <path value="ImagingSelection.instance.frameNumber"/>
       <short value="Selected frames"/>
-      <definition value="A list of frame numbers selected from a multiframe SOP Instance (See [DICOM PS 3.3 Table 10.3](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_10.3.html#table_10-3))."/>
+      <definition value="A list of frame numbers selected from a multiframe SOP Instance (See [DICOM PS3.3 Table 10.3](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_10.3.html#table_10-3))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a multiframe SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -3570,7 +3650,7 @@
     <element id="ImagingSelection.instance.referencedContentItemIdentifier">
       <path value="ImagingSelection.instance.referencedContentItemIdentifier"/>
       <short value="Selected content items"/>
-      <definition value="A list of Referenced Content Item Identifier values selected from a DICOM SR or other structured document SOP Instance (See [DICOM PS 3.3 C.17.3.2.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.17.3.2.5.html))."/>
+      <definition value="A list of Referenced Content Item Identifier values selected from a DICOM SR or other structured document SOP Instance (See [DICOM PS3.3 C.17.3.2.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.17.3.2.5.html))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a DICOM SR or other structured document SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -3585,7 +3665,7 @@
     <element id="ImagingSelection.instance.segmentNumber">
       <path value="ImagingSelection.instance.segmentNumber"/>
       <short value="Selected segments"/>
-      <definition value="A list of segment numbers selected from a segmentation SOP Instance (See [DICOM PS 3.3 Table C.8.20-4](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.20.4.html#table_C.8.20-4))."/>
+      <definition value="A list of segment numbers selected from a segmentation SOP Instance (See [DICOM PS3.3 Table C.8.20-4](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.20.4.html#table_C.8.20-4))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a segmentation SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -3600,7 +3680,7 @@
     <element id="ImagingSelection.instance.regionOfInterest">
       <path value="ImagingSelection.instance.regionOfInterest"/>
       <short value="Selected regions of interest"/>
-      <definition value="A list of Region of Interest (ROI) numbers selected from a radiotherapy structure set SOP Instance (See [DICOM PS 3.3 C.8.8.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.8.5.html))."/>
+      <definition value="A list of Region of Interest (ROI) numbers selected from a radiotherapy structure set SOP Instance (See [DICOM PS3.3 C.8.8.5](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.8.5.html))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a radiotherapy structure set SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -3615,7 +3695,7 @@
     <element id="ImagingSelection.instance.waveFormChannel">
       <path value="ImagingSelection.instance.waveFormChannel"/>
       <short value="Selected waveform channel"/>
-      <definition value="A list of channels in a Waveform selected from an instance of a waveform SOP Class.&#xA;Each channel is specified as a pair of values where the first value is the Multiplex Group Number, and the second value is the Channel Number within the multiplex group (See [DICOM PS 3.3 C.18.5.1.1](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.5.html#sect_C.18.5.1.1))."/>
+      <definition value="A list of channels in a Waveform selected from an instance of a waveform SOP Class.&#xA;Each channel is specified as a pair of values where the first value is the Multiplex Group Number, and the second value is the Channel Number within the multiplex group (See [DICOM PS3.3 C.18.5.1.1](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.5.html#sect_C.18.5.1.1))."/>
       <requirements value="Only allowed if the value of `instance.sopClass` corresponds to a waveform  structure set SOP Class."/>
       <min value="0"/>
       <max value="*"/>
@@ -3678,7 +3758,7 @@
       <path value="ImagingSelection.instance.imageRegion2D.coordinate"/>
       <short value="The coordinates that define the image region"/>
       <definition value="The coordinates defining the image region. Encoded as a set of (column, row) pairs that denote positions in the selected image / frames specified with sub-pixel resolution.&#xA;The origin at the TLHC of the TLHC pixel is 0.0\0.0, the BRHC of the TLHC pixel is 1.0\1.0, and the BRHC of the BRHC pixel is the number of columns\rows in the image / frames. The values SHALL be within the range 0\0 to the number of columns\rows in the image / frames."/>
-      <comment value="For a description of how 2D coordinates are encoded, see [DICOM PS 3.3 C.18.6](http://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.6.html)."/>
+      <comment value="For a description of how 2D coordinates are encoded, see [DICOM PS3.3 C.18.6](http://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.18.6.html)."/>
       <requirements value="The number of values SHALL be a multiple of two."/>
       <alias value="GraphicData"/>
       <min value="1"/>

@@ -1,43 +1,41 @@
 {
   "resourceType": "DeviceAssociation",
   "id": "example",
-  "device": {
-    "reference": "Device/prod1"
-  },
-  "status": "active",
   "identifier": [
     {
       "system": "http://acme.com/deviceassociations/id",
       "value": "DA12345"
     }
   ],
-  "relationship": [
-    {
-      "coding": [
-        {
-          "system": "http://hl7.org/fhir/CodeSystem/deviceassociation-relationship",
-          "code": "patient",
-          "display": "Patient"
-        }
-      ]
-    }
-  ],
-  "period": {
-    "start": "2023-01-01T08:00:00Z",
-    "end": "2023-12-31T17:00:00Z"
+  "device": {
+    "reference": "Device/prod1"
   },
-  "associationStatus": {
+  "relationship": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/CodeSystem/deviceassociation-association-status",
-        "code": "implanted",
-        "display": "Implanted"
+        "system": "http://hl7.org/fhir/deviceassociation-relationship",
+        "code": "implanted-in",
+        "display": "Implanted In"
+      }
+    ]
+  },
+  "status": "inactive",
+  "relationshipStatus": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/deviceassociation-relationship-status",
+        "code": "removed",
+        "display": "Removed"
       }
     ]
   },
   "subject": {
     "reference": "Patient/pat1",
     "display": "Donald Duck"
+  },
+  "period": {
+    "start": "2023-01-01T08:00:00Z",
+    "end": "2023-12-31T17:00:00Z"
   },
   "meta": {
     "tag": [

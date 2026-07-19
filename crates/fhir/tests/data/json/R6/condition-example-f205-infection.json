@@ -26,9 +26,9 @@
       }
     ]
   },
-  "bodyStructure": {
-    "reference": "BodyStructure/skin-patch"
-  },
+  "bodyStructure": [
+    {}
+  ],
   "subject": {
     "reference": "Patient/f201",
     "display": "Roel"

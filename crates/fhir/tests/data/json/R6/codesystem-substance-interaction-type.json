@@ -1,0 +1,99 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "substance-interaction-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem substance-interaction-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"substance-interaction-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsubstance-interaction-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/substance-interaction-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ebinding\u003ca name\u003d\"substance-interaction-type-binding\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBinding\u003c/td\u003e\u003ctd\u003eThe substance binds to its target.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003einhibition\u003ca name\u003d\"substance-interaction-type-inhibition\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInhibition\u003c/td\u003e\u003ctd\u003eThe substance inhibits the activity of its target.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eactivation\u003ca name\u003d\"substance-interaction-type-activation\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eActivation\u003c/td\u003e\u003ctd\u003eThe substance activates its target.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eagonist\u003ca name\u003d\"substance-interaction-type-agonist\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAgonist\u003c/td\u003e\u003ctd\u003eThe substance acts as an agonist of its target.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eantagonist\u003ca name\u003d\"substance-interaction-type-antagonist\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAntagonist\u003c/td\u003e\u003ctd\u003eThe substance acts as an antagonist of its target.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esubstrate\u003ca name\u003d\"substance-interaction-type-substrate\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSubstrate\u003c/td\u003e\u003ctd\u003eThe substance is a substrate of its target.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eallosteric-modulator\u003ca name\u003d\"substance-interaction-type-allosteric-modulator\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAllosteric modulator\u003c/td\u003e\u003ctd\u003eThe substance acts as an allosteric modulator of its target.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/substance-interaction-type",
+  "version": "6.0.0-ballot4",
+  "name": "SubstanceInteractionTypeExample",
+  "title": "Substance Interaction Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-23",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The kind of interaction between a substance and its target, e.g. binding, inhibition, agonism.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/substance-interaction-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "binding",
+      "display": "Binding",
+      "definition": "The substance binds to its target."
+    },
+    {
+      "code": "inhibition",
+      "display": "Inhibition",
+      "definition": "The substance inhibits the activity of its target."
+    },
+    {
+      "code": "activation",
+      "display": "Activation",
+      "definition": "The substance activates its target."
+    },
+    {
+      "code": "agonist",
+      "display": "Agonist",
+      "definition": "The substance acts as an agonist of its target."
+    },
+    {
+      "code": "antagonist",
+      "display": "Antagonist",
+      "definition": "The substance acts as an antagonist of its target."
+    },
+    {
+      "code": "substrate",
+      "display": "Substrate",
+      "definition": "The substance is a substrate of its target."
+    },
+    {
+      "code": "allosteric-modulator",
+      "display": "Allosteric modulator",
+      "definition": "The substance acts as an allosteric modulator of its target."
+    }
+  ]
+}

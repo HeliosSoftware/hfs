@@ -412,8 +412,9 @@ pub struct ReindexOperation {
     source: Arc<dyn ReindexSource>,
     /// Every search index that must be rebuilt. More than one on a composite.
     writers: Vec<Arc<dyn ReindexTarget>>,
-    /// The search parameter extractor.
-    extractor: Arc<SearchParameterExtractor>,
+    /// The per-tenant search parameter registries; the extractor is built from
+    /// the reindexed tenant's registry so a tenant's stored params are honored.
+    registries: Arc<crate::search::TenantSearchRegistries>,
     /// Active jobs.
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     /// Owning tenant of each in-memory job, for tenant-checked reads.
@@ -435,9 +436,9 @@ impl ReindexOperation {
     /// the search index live in the same place.
     pub fn new<S: ReindexableStorage + 'static>(
         storage: Arc<S>,
-        extractor: Arc<SearchParameterExtractor>,
+        registries: Arc<crate::search::TenantSearchRegistries>,
     ) -> Self {
-        Self::with_parts(storage.clone(), vec![storage], extractor)
+        Self::with_parts(storage.clone(), vec![storage], registries)
     }
 
     /// Creates a reindex manager that reads from `source` and rebuilds every
@@ -451,12 +452,12 @@ impl ReindexOperation {
     pub fn with_parts(
         source: Arc<dyn ReindexSource>,
         writers: Vec<Arc<dyn ReindexTarget>>,
-        extractor: Arc<SearchParameterExtractor>,
+        registries: Arc<crate::search::TenantSearchRegistries>,
     ) -> Self {
         Self {
             source,
             writers,
-            extractor,
+            registries,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             job_tenants: Arc::new(RwLock::new(HashMap::new())),
             cancel_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -581,7 +582,7 @@ impl ReindexOperation {
         // Clone references for the background task
         let source = self.source.clone();
         let writers = self.writers.clone();
-        let extractor = self.extractor.clone();
+        let registries = self.registries.clone();
         let jobs = self.jobs.clone();
         let audit = self.audit.clone();
         let job_id_clone = job_id.clone();
@@ -594,7 +595,7 @@ impl ReindexOperation {
                 request,
                 source,
                 writers,
-                extractor,
+                registries,
                 jobs.clone(),
                 cancel_rx,
             )
@@ -851,7 +852,7 @@ impl ReindexOperation {
             request.clone(),
             self.source.clone(),
             self.writers.clone(),
-            self.extractor.clone(),
+            self.registries.clone(),
             Arc::clone(&local_jobs),
             cancel_rx,
         )
@@ -1072,10 +1073,13 @@ async fn run_reindex(
     request: ReindexRequest,
     source: Arc<dyn ReindexSource>,
     writers: Vec<Arc<dyn ReindexTarget>>,
-    extractor: Arc<SearchParameterExtractor>,
+    registries: Arc<crate::search::TenantSearchRegistries>,
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     mut cancel_rx: mpsc::Receiver<()>,
 ) {
+    // Extract with the reindexed tenant's registry (base + that tenant's overlay).
+    let extractor =
+        SearchParameterExtractor::new(registries.for_tenant(tenant.tenant_id().as_str()));
     // Mark as started
     {
         let mut jobs_guard = jobs.write();

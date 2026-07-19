@@ -29,7 +29,14 @@ fn test_postgres_config_defaults() {
     assert_eq!(config.dbname, "helios");
     assert_eq!(config.user, "helios");
     assert!(config.password.is_none());
-    assert_eq!(config.max_connections, 10);
+    // Derived from the core count (cores * 4, clamped) rather than a fixed 10, which
+    // throttled search badly under concurrent load — see #224. Assert the contract
+    // (the clamp bounds), not the machine-dependent value.
+    assert!(
+        (16..=64).contains(&config.max_connections),
+        "pool size {} outside the 16..=64 clamp",
+        config.max_connections
+    );
     assert_eq!(config.connect_timeout_secs, 5);
     assert_eq!(config.statement_timeout_ms, 30000);
     assert!(!config.search_offloaded);
@@ -157,8 +164,18 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Default string search is starts-with (case-insensitive via ILIKE)
-        assert!(fragment.sql.contains("ILIKE"));
+        // Default string search is starts-with. `LIKE`, not `ILIKE`: both the stored
+        // column and the bound pattern are already case-folded by `fold_text`, and
+        // `ILIKE` cannot use a btree index (#224). The raw-column fallback is wrapped
+        // in `lower()` so un-backfilled rows keep matching case-insensitively.
+        assert!(
+            fragment
+                .sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE"),
+            "string search must target the indexed folded expression: {}",
+            fragment.sql
+        );
+        assert!(!fragment.sql.contains("ILIKE"));
         assert!(fragment.sql.contains("param_name = 'name'"));
         // Parameter should be "Smith%"
         match &fragment.params[0] {
@@ -203,7 +220,12 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        assert!(fragment.sql.contains("ILIKE"));
+        assert!(
+            fragment
+                .sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE")
+        );
+        assert!(!fragment.sql.contains("ILIKE"));
         // Parameter should be "%mit%"
         match &fragment.params[0] {
             SqlParam::Text(s) => {
@@ -284,9 +306,14 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Accent-folded substring match: COALESCE(folded, raw) ILIKE %mit%
+        // Accent-folded substring match against the indexed folded expression.
         assert!(fragment.sql.contains("value_string_folded"));
-        assert!(fragment.sql.contains("ILIKE"));
+        assert!(
+            fragment
+                .sql
+                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE")
+        );
+        assert!(!fragment.sql.contains("ILIKE"));
         // Substring match: param wrapped as %mit%
         match &fragment.params[0] {
             SqlParam::Text(s) => {
@@ -2156,6 +2183,244 @@ mod postgres_integration {
             .await
             .unwrap();
         assert!(result.resources.items.is_empty(), "code mismatch → no hit");
+    }
+
+    /// A composite must match only when every component is satisfied *within the
+    /// same* `composite_group`.
+    ///
+    /// `Observation.component` yields one composite group per component entry, so
+    /// a blood-pressure panel indexes systolic (8480-6, 120) as group 0 and
+    /// diastolic (8462-4, 80) as group 1 — each with its own code row and value
+    /// row. A query for "diastolic > 100" must NOT match: the resource has a code
+    /// row for 8462-4 (group 1) and a value row > 100 (group 0, the systolic 120),
+    /// but never both in one group.
+    ///
+    /// Any rewrite that pushes the component predicates into the WHERE clause
+    /// without correlating on `composite_group` returns this resource — a silent
+    /// false positive that ships as a 100x speedup and returns the wrong patients.
+    /// The single-group fixture in the test above cannot detect that class of bug.
+    #[tokio::test]
+    async fn postgres_integration_composite_components_must_share_a_group() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Blood-pressure panel: systolic 120, diastolic 80 — two composite groups.
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "obs-bp-panel",
+            "status": "final",
+            "code": { "coding": [{ "system": "http://loinc.org", "code": "85354-9" }] },
+            "component": [
+                {
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+                    "valueQuantity": { "value": 120, "unit": "mm[Hg]", "system": "http://unitsofmeasure.org" }
+                },
+                {
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8462-4" }] },
+                    "valueQuantity": { "value": 80, "unit": "mm[Hg]", "system": "http://unitsofmeasure.org" }
+                }
+            ]
+        });
+        backend
+            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .await
+            .unwrap();
+
+        let query = |value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "component-code-value-quantity".to_string(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "component-code".to_string(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "component-value-quantity".to_string(),
+                    },
+                ],
+            })
+        };
+
+        // The cross-group false positive: diastolic's code (group 1) + systolic's
+        // value (group 0). Must NOT match.
+        let result = backend
+            .search(&tenant, &query("8462-4$gt100"))
+            .await
+            .unwrap();
+        assert!(
+            result.resources.items.is_empty(),
+            "diastolic is 80, not >100 — a match here means component predicates \
+             leaked across composite groups (systolic's 120 satisfied the value \
+             while diastolic satisfied the code)"
+        );
+
+        // Both components satisfied within group 0 (systolic 120 > 100) → match.
+        let result = backend
+            .search(&tenant, &query("8480-6$gt100"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "systolic 8480-6 = 120 > 100, both components in group 0 → 1 hit"
+        );
+        assert_eq!(result.resources.items[0].id(), "obs-bp-panel");
+
+        // Both components satisfied within group 1 (diastolic 80 < 100) → match.
+        let result = backend
+            .search(&tenant, &query("8462-4$lt100"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "diastolic 8462-4 = 80 < 100, both components in group 1 → 1 hit"
+        );
+    }
+
+    /// Each value of a composite OR-list must be satisfied on its own; components
+    /// must not pair up *across* values.
+    ///
+    /// The fixture's only component is (8480-6, 250). For
+    /// `8480-6$lt60,8462-4$gt200`: value 1 needs code 8480-6 AND value < 60 (it is
+    /// 250 — no); value 2 needs code 8462-4 (absent — no). Collapsing both values
+    /// into one subquery with a merged HAVING lets value 1's code satisfy the token
+    /// leg while value 2's `>200` is satisfied by the same row's 250 → false positive.
+    #[tokio::test]
+    async fn postgres_integration_composite_or_list_values_are_isolated() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let observation = json!({
+            "resourceType": "Observation",
+            "id": "obs-single-high",
+            "status": "final",
+            "code": { "coding": [{ "system": "http://loinc.org", "code": "85354-9" }] },
+            "component": [{
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6" }] },
+                "valueQuantity": { "value": 250, "unit": "mm[Hg]", "system": "http://unitsofmeasure.org" }
+            }]
+        });
+        backend
+            .create(&tenant, "Observation", observation, FhirVersion::default())
+            .await
+            .unwrap();
+
+        let multi_value = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "component-code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("8480-6$lt60"),
+                SearchValue::eq("8462-4$gt200"),
+            ],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "component-code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "component-value-quantity".to_string(),
+                },
+            ],
+        });
+
+        let result = backend.search(&tenant, &multi_value).await.unwrap();
+        assert!(
+            result.resources.items.is_empty(),
+            "neither OR-value is satisfied on its own (8480-6 is 250 not <60; there \
+             is no 8462-4) — a match means components paired across OR-values"
+        );
+    }
+
+    /// String search must still match rows whose `value_string_folded` is NULL.
+    ///
+    /// That column arrived in schema v10 and is populated **only on write** — the
+    /// migration never backfilled it (there is no `UPDATE search_index` anywhere),
+    /// so every row indexed before the upgrade has NULL there. The search predicate
+    /// therefore falls back to the raw `value_string`, and that fallback must stay
+    /// case-insensitive.
+    ///
+    /// This is a tripwire, not a feature test: it is green today and must stay
+    /// green. It fails the moment someone "optimizes" the predicate to
+    /// `value_string_folded LIKE $n` (NULL never matches → patients silently vanish
+    /// from results) or to `COALESCE(value_string_folded, value_string) LIKE $n`
+    /// (the raw branch loses its case-folding → `name=smith` stops finding "Smith").
+    /// Both are silent wrong-results bugs, not errors.
+    #[tokio::test]
+    async fn postgres_integration_string_search_matches_unbackfilled_rows() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unbackfilled");
+        // `create_tenant` suffixes a UUID for isolation, so the effective tenant id
+        // must be read back off the context — the literal passed in is only a prefix.
+        // Seeding `search_index` with the bare literal violates the FK to `resources`.
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // No `name` element, so the writer indexes no `name` row for this Patient —
+        // leaving the field clear for the hand-written legacy row below.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "id": "legacy-p1", "gender": "female" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // A pre-v10 row: raw value only, `value_string_folded` left NULL.
+        insert_search_index(
+            tenant_id,
+            "Patient",
+            "legacy-p1",
+            "name",
+            "value_string",
+            "Smith",
+        )
+        .await;
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            // Lowercase query against a capitalized stored value: only the
+            // case-insensitive fallback can match this.
+            values: vec![SearchValue::eq("smith")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "a row with value_string='Smith' and value_string_folded=NULL (i.e. \
+             written before the v10 migration) must still match name=smith — the \
+             COALESCE fallback and its case-folding are load-bearing"
+        );
+        assert_eq!(result.resources.items[0].id(), "legacy-p1");
     }
 
     // ========================================================================
@@ -5166,7 +5431,7 @@ mod postgres_integration {
         async fn instance() -> (Arc<PostgresBackend>, ReindexOperation) {
             let backend = Arc::new(create_backend().await);
             let store = store_of(backend.as_ref());
-            let op = ReindexOperation::new(backend.clone(), backend.search_extractor().clone())
+            let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone())
                 .with_cluster_store(store);
             (backend, op)
         }

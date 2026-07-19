@@ -447,7 +447,7 @@
           <display value="natural sister"/>
         </coding>
       </relationship>
-      <!-- Age was 31 in source, but 36 in diagram  -->
+      <!-- Age was 31 in source, but 36 in diagram -->
       <ageAge>
         <value value="36"/>
         <unit value="years"/>
@@ -607,7 +607,7 @@
       <condition>
         <code>
           <coding>
-            <!-- No system or OID for NCBI Entrez yet  -->
+            <!-- No system or OID for NCBI Entrez yet -->
             <code value="657"/>
             <display value="BRCA2"/>
           </coding>
@@ -1094,7 +1094,7 @@
       <display value="History of family member diseases"/>
     </coding>
   </code>
-  <!-- Age said 33, but diagram shows 42, so adjusted DOB  -->
+  <!-- Age said 33, but diagram shows 42, so adjusted DOB -->
   <subject>
     <reference value="Patient/proband"/>
     <display value="Annie Proband, female, born 1966"/>

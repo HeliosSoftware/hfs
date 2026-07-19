@@ -13,9 +13,6 @@
         "text": "The code \"W\" is not known and not legal in this context"
       },
       "diagnostics": "Acme.Interop.FHIRProcessors.Patient.processGender line 2453",
-      "location": [
-        "/f:Patient/f:gender"
-      ],
       "expression": [
         "Patient.gender"
       ]

@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "measurement-property",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -45,7 +45,7 @@
       ]
     }
   ],
-  "description": "This value set represents codes for properties that can be measured and is provided as a suggestive example.  It include codes from [SNOMED CT](http://snomed.info/sct) where concept has a parent of 118598001 Property of measurement (qualifier value).",
+  "description": "This value set represents codes for properties that can be measured and is provided as a suggestive example.  It include codes from [SNOMED CT](http://snomed.info/sct/) where concept has a parent of 118598001 Property of measurement (qualifier value).",
   "jurisdiction": [
     {
       "coding": [
