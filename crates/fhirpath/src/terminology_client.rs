@@ -449,18 +449,14 @@ impl TerminologyClient {
             "valueUri": concept_map_url
         })];
 
-        // Send `code` + `system` rather than a `coding` parameter. Terminology servers
-        // require one of `code`/`sourceCode` to be present as a named parameter: a lone
-        // `coding` is rejected with "Missing required parameter: code or sourceCode",
-        // which surfaced as txTest03 silently skipping in CI (#287).
+        // Create a coding parameter
         if !system.is_empty() {
             parameters.push(json!({
-                "name": "code",
-                "valueCode": code
-            }));
-            parameters.push(json!({
-                "name": "system",
-                "valueUri": system
+                "name": "coding",
+                "valueCoding": {
+                    "system": system,
+                    "code": code
+                }
             }));
         } else {
             // For codes without explicit system, we need to infer it from context
@@ -475,12 +471,11 @@ impl TerminologyClient {
 
             if !inferred_system.is_empty() {
                 parameters.push(json!({
-                    "name": "code",
-                    "valueCode": code
-                }));
-                parameters.push(json!({
-                    "name": "system",
-                    "valueUri": inferred_system
+                    "name": "coding",
+                    "valueCoding": {
+                        "system": inferred_system,
+                        "code": code
+                    }
                 }));
             } else {
                 // Fallback to just code

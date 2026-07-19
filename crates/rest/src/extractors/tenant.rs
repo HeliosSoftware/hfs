@@ -136,6 +136,24 @@ where
         parts: &mut Parts,
         state: &AppState<S>,
     ) -> Result<Self, Self::Rejection> {
+        let extractor = Self::resolve(parts, state).await?;
+        enforce_provisioned(state, &extractor).await?;
+        Ok(extractor)
+    }
+}
+
+impl TenantExtractor {
+    /// Resolves the tenant for a request from JWT claim / header / URL / default,
+    /// applying strict-validation consistency checks. Provisioned-tenant
+    /// enforcement is applied separately by the extractor
+    /// ([`enforce_provisioned`]).
+    async fn resolve<S>(
+        parts: &mut Parts,
+        state: &AppState<S>,
+    ) -> Result<Self, (StatusCode, String)>
+    where
+        S: helios_persistence::core::ResourceStorage + Send + Sync,
+    {
         let config = state.config();
 
         // If auth is enabled and a Principal with a tenant_id is present,
@@ -227,6 +245,42 @@ where
         }
 
         Ok(TenantExtractor::from_resolved(resolved))
+    }
+}
+
+/// Rejects a resolved tenant that is not provisioned, when
+/// `HFS_TENANT_REQUIRE_PROVISIONED` is set and the backend maintains a tenant
+/// registry. The internal system tenant is always allowed; backends without a
+/// registry (mock stores, minimal deployments) are never enforced, so the
+/// common single-tenant and test configurations are unaffected.
+async fn enforce_provisioned<S>(
+    state: &AppState<S>,
+    extractor: &TenantExtractor,
+) -> Result<(), (StatusCode, String)>
+where
+    S: helios_persistence::core::ResourceStorage + Send + Sync,
+{
+    if !state.config().multitenancy.require_provisioned_tenant {
+        return Ok(());
+    }
+    let storage = state.storage();
+    if !storage.supports_tenant_registry() {
+        return Ok(());
+    }
+    let id = extractor.tenant_id();
+    if id == helios_persistence::tenant::SYSTEM_TENANT {
+        return Ok(());
+    }
+    match storage.get_tenant(id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            format!("Unknown tenant '{id}': tenants must be provisioned via the admin API"),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Tenant lookup failed: {e}"),
+        )),
     }
 }
 

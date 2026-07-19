@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  id = infantenteral  file name = nutritionorder-infantenteral-example.xml  Name= Infant Enteral  Description = Nutrition Order Infant Enteral Feeding Canonical Example
-edited by Eric Haas Health eData Inc
- -->
+  <!-- id = infantenteral  file name = nutritionorder-infantenteral-example.xml  Name= Infant Enteral  Description = Nutrition Order Infant Enteral Feeding Canonical Example
+edited by Eric Haas Health eData Inc -->
   <id value="infantenteral"/>
   <meta>
     <security>
@@ -42,7 +41,7 @@ edited by Eric Haas Health eData Inc
       </coding>
     </routeOfAdministration>
     <administration>
-      <!--  scheduled 4 oz every 3hrs not to exceed 32 oz/day -->
+      <!-- scheduled 4 oz every 3hrs not to exceed 32 oz/day -->
       <schedule>
         <timing>
           <repeat>
@@ -62,7 +61,7 @@ edited by Eric Haas Health eData Inc
         <code value="[foz_us]"/>
       </quantity>
     </administration>
-    <!--  EH infant feeding instruction and additional instructions  -->
+    <!-- EH infant feeding instruction and additional instructions -->
     <administrationInstruction value="Add high calorie high carbohydrate additive to increase cal/oz from 24 cal/oz to 27 cal/oz."/>
   </enteralFormula>
   <additive>

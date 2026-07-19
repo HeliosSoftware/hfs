@@ -422,9 +422,9 @@
     {
       "coding": [
         {
-          "system": "http://terminology.hl7.org/CodeSystem/research-study-prim-purp-type",
+          "system": "http://terminology.hl7.org/CodeSystem/research-study-purpose-type",
           "code": "treatment",
-          "display": "Treatment"
+          "display": "Treatment Study"
         }
       ]
     }

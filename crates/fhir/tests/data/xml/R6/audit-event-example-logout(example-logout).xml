@@ -48,7 +48,7 @@
     <networkString value="127.0.0.1"/>
   </agent>
   <agent>
-    <!--  Source active participant, the software making the . AlternativeUserId - Process ID  -->
+    <!-- Source active participant, the software making the . AlternativeUserId - Process ID -->
     <extension url="http://hl7.org/fhir/StructureDefinition/auditevent-AlternativeUserID">
       <valueIdentifier>
         <type>

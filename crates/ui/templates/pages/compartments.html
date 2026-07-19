@@ -1,0 +1,152 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("cmp-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content_class %} content--wide{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("cmp-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("cmp-lede") }}</p>
+  {% if view.versions.len() > 1 %}
+  <nav class="version-switch" aria-label="{{ i18n.t("sp-version-label") }}">
+    {% for v in view.versions %}
+    <a href="{{ v.href }}"{% if v.current %} aria-current="true"{% endif %}>{{ v.label }}</a>
+    {% endfor %}
+  </nav>
+  {% endif %}
+</section>
+
+<div class="filter-layout filter-layout--two" hx-boost="true">
+  <aside class="card filter-rail" aria-label="{{ i18n.t("cmp-rail-label") }}">
+    <div class="filter-rail__heading">{{ i18n.t("cmp-rail-heading") }}</div>
+    <div class="filter-rail__list">
+      {% for item in view.rail %}
+      <a class="filter-rail__item" href="{{ item.href }}"{% if item.current %} aria-current="true"{% endif %}>
+        <span>{{ item.code }}</span>
+        <span class="count">{{ item.members }} / {{ item.total }}</span>
+      </a>
+      {% endfor %}
+    </div>
+    <p class="filter-rail__note">{{ i18n.t("cmp-rail-note") }}</p>
+  </aside>
+
+  <div class="filter-center">
+    <nav class="card tabs" aria-label="{{ i18n.t("cmp-tabs-label") }}">
+      {% for tab in view.tabs %}
+      <a class="tab" href="{{ tab.href }}"{% if tab.current %} aria-current="true"{% endif %}>
+        {% if tab.key == "definition" %}{{ i18n.t("cmp-tab-definition") }}
+        {% else if tab.key == "members" %}{{ i18n.t("cmp-tab-members") }}
+        {% else %}{{ i18n.t("cmp-tab-tester") }}{% endif %}
+      </a>
+      {% endfor %}
+    </nav>
+
+    <section class="card panel">
+      {% if view.tab == "definition" %}
+      <!-- Definition: read-only metadata. The base definitions are codegen'd
+           into the binary; an editor implies the override layer of issue
+           question 1, so every field states its value instead of inviting
+           an edit that cannot persist. -->
+      <div class="kv-grid">
+        <div class="detail__field"><span>{{ i18n.t("cmp-field-code") }}</span><div>{{ view.def.code }}</div></div>
+        <div class="detail__field"><span>{{ i18n.t("cmp-field-status") }}</span><div>{{ view.def.status }}</div></div>
+        <div class="detail__field detail__field--wide"><span>{{ i18n.t("cmp-field-url") }}</span><code>{{ view.def.url }}</code></div>
+        <div class="detail__field"><span>{{ i18n.t("cmp-field-version") }}</span><div>{{ view.def.version }}</div></div>
+        <div class="detail__field"><span>{{ i18n.t("cmp-field-publisher") }}</span><div>{{ view.def.publisher }}</div></div>
+        <div class="detail__field detail__field--wide"><span>{{ i18n.t("cmp-field-description") }}</span><div>{{ view.def.description }}</div></div>
+        <div class="detail__field">
+          <span>{{ i18n.t("cmp-field-search") }}</span>
+          <div>
+            {% if view.def.search %}<span class="tag tag--member">{{ i18n.t("cmp-on") }}</span>{% else %}<span class="tag tag--excluded">{{ i18n.t("cmp-off") }}</span>{% endif %}
+            <span class="detail__hint-inline">{{ i18n.t("cmp-search-why") }}</span>
+          </div>
+        </div>
+        <div class="detail__field">
+          <span>{{ i18n.t("cmp-field-experimental") }}</span>
+          <div>{% if view.def.experimental %}{{ i18n.t("cmp-yes") }}{% else %}{{ i18n.t("cmp-no") }}{% endif %}</div>
+        </div>
+      </div>
+      <p class="detail__hint">{{ i18n.t("cmp-readonly-note") }}</p>
+
+      {% else if view.tab == "members" %}
+      <div class="facets facets--bare">
+        {% for f in view.member_filters %}
+        <a class="chip" href="{{ f.href }}"{% if f.current %} aria-current="true"{% endif %}>
+          <span>
+            {% if f.key == "members" %}{{ i18n.t("cmp-filter-members") }}
+            {% else if f.key == "all" %}{{ i18n.t("cmp-filter-all") }}
+            {% else %}{{ i18n.t("cmp-filter-excluded") }}{% endif %}
+          </span>
+          <span class="count">{{ f.count }}</span>
+        </a>
+        {% endfor %}
+      </div>
+      <div class="members">
+        {% for row in view.members %}
+        <div class="member">
+          <span class="member__name">{{ row.name }}</span>
+          {% if row.member %}
+          <span class="tag tag--member">{{ i18n.t("cmp-member") }}</span>
+          {% else %}
+          <span class="tag tag--excluded">{{ i18n.t("cmp-excluded") }}</span>
+          {% endif %}
+          <span class="member__params">
+            {% for p in row.params %}<span class="tag tag--param">{{ p }}</span>{% endfor %}
+          </span>
+        </div>
+        {% endfor %}
+      </div>
+
+      {% else %}
+      <!-- Tester: resolves against the same codegen'd table the compartment
+           handler consults, so the answer here is the answer the API gives. -->
+      <form class="tester" method="get" action="/ui/compartments">
+        {% for field in view.hidden_fields %}
+        <input type="hidden" name="{{ field.0 }}" value="{{ field.1 }}">
+        {% endfor %}
+        <label class="detail__field">
+          <span>{{ i18n.t("cmp-tester-id") }}</span>
+          <input name="id" value="{{ view.tester.id }}">
+        </label>
+        <label class="detail__field">
+          <span>{{ i18n.t("cmp-tester-target") }}</span>
+          <input name="target" value="{{ view.tester.target }}" list="cmp-type-options">
+        </label>
+        <datalist id="cmp-type-options">
+          <option value="*"></option>
+          {% for row in view.members %}<option value="{{ row.name }}"></option>{% endfor %}
+        </datalist>
+        <button class="btn btn--primary" type="submit">{{ i18n.t("cmp-tester-run") }}</button>
+      </form>
+
+      <div class="tester-result">
+        {% if view.tester.kind == "member" %}
+        <h3 class="tester-result__title tester-result__title--ok">{{ i18n.t_arg("cmp-result-member", "params", view.tester.params.clone()) }}</h3>
+        <pre class="detail__code">{{ view.tester.route }}
+
+{{ i18n.t("cmp-result-flat") }}
+{{ view.tester.body }}</pre>
+        <p class="detail__hint">{{ i18n.t("cmp-result-member-note") }}</p>
+        {% else if view.tester.kind == "self" %}
+        <h3 class="tester-result__title tester-result__title--ok">{{ i18n.t("cmp-result-self") }}</h3>
+        <pre class="detail__code">{{ view.tester.route }}
+
+{{ view.tester.body }}</pre>
+        <p class="detail__hint">{{ i18n.t("cmp-result-self-note") }}</p>
+        {% else if view.tester.kind == "notmember" %}
+        <h3 class="tester-result__title tester-result__title--danger">{{ i18n.t_arg("cmp-result-notmember", "type", view.tester.target.clone()) }}</h3>
+        <pre class="detail__code">{{ view.tester.body }}</pre>
+        <p class="detail__hint">{{ i18n.t("cmp-result-notmember-note") }}</p>
+        {% else %}
+        <h3 class="tester-result__title">{{ i18n.t_arg("cmp-result-fanout", "count", view.tester.total) }}</h3>
+        <pre class="detail__code">{{ view.tester.route }}</pre>
+        <p class="detail__hint">{{ view.tester.member_types }}</p>
+        <p class="detail__hint">{{ i18n.t("cmp-result-fanout-note") }}</p>
+        {% endif %}
+      </div>
+      {% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

@@ -116,11 +116,13 @@
   </supportingInfo>
   <diagnosis>
     <sequence value="1"/>
-    <diagnosisCodeableConcept>
-      <coding>
-        <code value="654456"/>
-      </coding>
-    </diagnosisCodeableConcept>
+    <diagnosis>
+      <concept>
+        <coding>
+          <code value="654456"/>
+        </coding>
+      </concept>
+    </diagnosis>
     <type>
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/ex-diagnosistype"/>

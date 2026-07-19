@@ -55,24 +55,12 @@
       },
       "preference": "preferred",
       "container": {
-        "material": {
-          "text": "glass"
-        },
-        "type": {
+        "deviceCodeableConcept": {
           "coding": [
             {
               "system": "http://snomed.info/sct",
               "code": "702281005",
               "display": "Evacuated blood collection tube with thrombin and clot activator and gel separator"
-            }
-          ]
-        },
-        "cap": {
-          "coding": [
-            {
-              "system": "http://terminology.hl7.org/5.1.0/CodeSystem-container-cap.html",
-              "code": "yellow",
-              "display": "yellow cap"
             }
           ]
         },

@@ -58,7 +58,7 @@
       </coding>
     </language>
   </name>
-  <!--  <name>
+  <!-- <name>
       <name value="ΠΑΡΑΚΕΤΑΜΌΛΗ"/>
       <status>
          <coding>
@@ -75,7 +75,7 @@
             <display value="Modern Greek (1453-)"/>
          </coding>
       </language>
-   </name>  -->
+   </name> -->
   <name>
     <name value="ПАРАЦЕТАМОЛ"/>
     <status>

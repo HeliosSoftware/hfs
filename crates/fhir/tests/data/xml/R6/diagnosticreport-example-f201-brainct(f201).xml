@@ -18,9 +18,9 @@
     </ImagingStudy>
   </contained>
   <status value="final"/>
-  <!--  No identifier or request details were available  -->
+  <!-- No identifier or request details were available -->
   <category>
-    <!--  The request was honored by the Department of Radiology  -->
+    <!-- The request was honored by the Department of Radiology -->
     <coding>
       <system value="http://snomed.info/sct"/>
       <code value="394914008"/>
@@ -49,7 +49,7 @@
     <reference value="Organization/f203"/>
     <display value="Blijdorp MC"/>
   </performer>
-  <!--  The actual CT imagenot available -  following reference used to demonstrate the usage of the element -->
+  <!-- The actual CT imagenot available -  following reference used to demonstrate the usage of the element -->
   <study>
     <reference value="#is1"/>
   </study>

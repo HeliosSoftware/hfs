@@ -15,8 +15,7 @@
         <a href="valueset-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
       <br/>
-      <p>
-        <b>Group 1 </b>Mapping from 
+      <p>Mapping from 
         <a href="codesystem-request-status.html">RequestStatus</a> to 
         <a href="codesystem-resource-status.html">Canonical Status Codes for FHIR Resources</a>
       </p>
@@ -97,7 +96,7 @@
   <title value="Canonical Mapping for &quot;RequestStatus&quot;"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>

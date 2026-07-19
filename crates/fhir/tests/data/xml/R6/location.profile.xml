@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Location"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -121,7 +121,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The operational status of the location (typically only for a bed/room)
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0116.html">hl7VS-bedStatus</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-v2-0116.html">hl7VS-bedStatus</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -142,9 +142,9 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Codes that identify this location
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Codes that represent this location
             <br/>Binding: 
-            <a href="valueset-iso3166-1-2.html">Iso 3166 Part 1: 2 Letter Codes</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-v3-Country2.html">Country2</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -250,7 +250,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Types of services available at this location
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-service-type.html">Service type</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-service-type.html">Service type</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -299,7 +299,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="Location.form : Physical form of the location, e.g. building, room, vehicle, road, virtual.">form</span>
+            <span title="Location.form : Form of the location, e.g. building, room, vehicle, road, virtual.">form</span>
             <a name="Location.form"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -309,7 +309,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Physical form of the location
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Form of the location
             <br/>Binding: 
             <a href="valueset-location-form.html">Location Form</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
@@ -539,7 +539,7 @@
   <name value="Location"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Patient Administration"/>
   <contact>
     <telecom>
@@ -655,7 +655,7 @@
       <path value="Location.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -834,6 +834,14 @@
     </element>
     <element id="Location.extension">
       <path value="Location.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -866,6 +874,14 @@
     </element>
     <element id="Location.modifierExtension">
       <path value="Location.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1025,7 +1041,7 @@
     </element>
     <element id="Location.code">
       <path value="Location.code"/>
-      <short value="Codes that identify this location"/>
+      <short value="Codes that represent this location"/>
       <definition value="A coded representation of this Location, where the codes may be found in a geospatial system."/>
       <comment value="`Location.code` may be used when there are existing code sets for geospatial or administrative regions, such as states, districts, municipalities, etc., where the code represents the geospatial identity of the Location. When indicating that a Location is located within some broader geospatial or administrative Location. When representing unique identifiers for intra-facility locations like rooms, beds, etc., Location.identifier is preferable. Further details will be available in the Administration Incubator."/>
       <min value="0"/>
@@ -1054,7 +1070,7 @@
         </extension>
         <strength value="example"/>
         <description value="Codes for representing locations, such as country codes."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/iso3166-1-2"/>
+        <valueSet value="http://terminology.hl7.org/ValueSet/v3-Country2"/>
       </binding>
     </element>
     <element id="Location.name">
@@ -1303,8 +1319,9 @@
     </element>
     <element id="Location.form">
       <path value="Location.form"/>
-      <short value="Physical form of the location"/>
-      <definition value="Physical form of the location, e.g. building, room, vehicle, road, virtual."/>
+      <short value="Form of the location"/>
+      <definition value="Form of the location, e.g. building, room, vehicle, road, virtual."/>
+      <comment value="Locations with a virtual form can be used to represent virtual locations, for example for telehealth visits, and can contain additional related details in virtualService."/>
       <requirements value="For purposes of showing relevant locations in queries, we need to categorize locations."/>
       <min value="0"/>
       <max value="1"/>
@@ -1347,7 +1364,7 @@
       <path value="Location.position"/>
       <short value="The absolute geographic location"/>
       <definition value="The absolute geographic location of the Location, expressed using the WGS84 datum (This is the same co-ordinate system used in KML)."/>
-      <comment value="To define a boundary shape for this location use the standard extension `[http://hl7.org/fhir/StructureDefinition/location-boundary-geojson](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-location-boundary-geojson.html)`, and search using the `contains` special search parameter."/>
+      <comment value="To define a boundary shape for this location use the standard extension `[Location Boundary (GeoJSON)](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-location-boundary-geojson.html)`, and search using the `contains` special search parameter."/>
       <requirements value="For mobile applications and automated route-finding knowing the exact location of the Location is required."/>
       <min value="0"/>
       <max value="1"/>
@@ -1403,6 +1420,14 @@
     </element>
     <element id="Location.position.extension">
       <path value="Location.position.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1434,6 +1459,14 @@
     </element>
     <element id="Location.position.modifierExtension">
       <path value="Location.position.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1862,7 +1895,7 @@
     </element>
     <element id="Location.code">
       <path value="Location.code"/>
-      <short value="Codes that identify this location"/>
+      <short value="Codes that represent this location"/>
       <definition value="A coded representation of this Location, where the codes may be found in a geospatial system."/>
       <comment value="`Location.code` may be used when there are existing code sets for geospatial or administrative regions, such as states, districts, municipalities, etc., where the code represents the geospatial identity of the Location. When indicating that a Location is located within some broader geospatial or administrative Location. When representing unique identifiers for intra-facility locations like rooms, beds, etc., Location.identifier is preferable. Further details will be available in the Administration Incubator."/>
       <min value="0"/>
@@ -1879,7 +1912,7 @@
         </extension>
         <strength value="example"/>
         <description value="Codes for representing locations, such as country codes."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/iso3166-1-2"/>
+        <valueSet value="http://terminology.hl7.org/ValueSet/v3-Country2"/>
       </binding>
     </element>
     <element id="Location.name">
@@ -2044,8 +2077,9 @@
     </element>
     <element id="Location.form">
       <path value="Location.form"/>
-      <short value="Physical form of the location"/>
-      <definition value="Physical form of the location, e.g. building, room, vehicle, road, virtual."/>
+      <short value="Form of the location"/>
+      <definition value="Form of the location, e.g. building, room, vehicle, road, virtual."/>
+      <comment value="Locations with a virtual form can be used to represent virtual locations, for example for telehealth visits, and can contain additional related details in virtualService."/>
       <requirements value="For purposes of showing relevant locations in queries, we need to categorize locations."/>
       <min value="0"/>
       <max value="1"/>
@@ -2076,7 +2110,7 @@
       <path value="Location.position"/>
       <short value="The absolute geographic location"/>
       <definition value="The absolute geographic location of the Location, expressed using the WGS84 datum (This is the same co-ordinate system used in KML)."/>
-      <comment value="To define a boundary shape for this location use the standard extension `[http://hl7.org/fhir/StructureDefinition/location-boundary-geojson](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-location-boundary-geojson.html)`, and search using the `contains` special search parameter."/>
+      <comment value="To define a boundary shape for this location use the standard extension `[Location Boundary (GeoJSON)](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-location-boundary-geojson.html)`, and search using the `contains` special search parameter."/>
       <requirements value="For mobile applications and automated route-finding knowing the exact location of the Location is required."/>
       <min value="0"/>
       <max value="1"/>

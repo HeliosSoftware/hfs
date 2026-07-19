@@ -87,7 +87,7 @@
     </coding>
   </category>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0309"/>
     </reference>

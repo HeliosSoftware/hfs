@@ -123,29 +123,24 @@ fn resolve_system_id_with_version_cached(
     //      even when a fully-loaded row exists alongside.
     //   2. Prefer rows with at least one concept (EXISTS subquery; constant
     //      time, short-circuited on first match).
-    //   3. Highest version DESC.
-    //   4. id ASC.
+    //   3. Prefer the original over a re-published copy (authority_rank).
+    //   4. Highest version DESC.
+    //   5. id ASC.
     // Tier 1 alone fixes the `r4.core stub + RF2 import` case observed in the
     // benchmark. Tier 2 is kept as a safety net for IGs that omit `content`.
+    // The full rule lives in `backends::cs_precedence_order_by` and is shared
+    // verbatim with the Postgres resolver.
     // The cache memoises the resolved `(id, version)` so the SQL runs once
     // per URL per process.
+    let sql = format!(
+        "SELECT id, version FROM code_systems WHERE url = ?1 \
+         ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let row: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT cs.id, cs.version FROM code_systems cs WHERE cs.url = ?1 \
-             ORDER BY (CASE COALESCE(cs.content, 'complete') \
-                            WHEN 'complete'   THEN 0 \
-                            WHEN 'supplement' THEN 0 \
-                            WHEN 'fragment'   THEN 1 \
-                            WHEN 'example'    THEN 1 \
-                            WHEN 'not-present' THEN 2 \
-                            ELSE 1 END), \
-                      (CASE WHEN EXISTS \
-                          (SELECT 1 FROM concepts c WHERE c.system_id = cs.id) \
-                          THEN 0 ELSE 1 END), \
-                      COALESCE(cs.version, '') DESC, cs.id LIMIT 1",
-            [url],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-        )
+        .query_row(&sql, [url], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
         .optional()
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -1262,6 +1257,24 @@ impl ValueSetOperations for SqliteTerminologyBackend {
     /// Triggers expansion if needed, then checks set membership.
     /// Returns `result = false` (not an error) when the value set or code is
     /// not found.
+    async fn value_set_version_for_url(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let backend = self.clone();
+        let url = url.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = backend
+                .pool()
+                .get()
+                .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            Ok(lookup_value_set_version(&backend, &conn, &url))
+        })
+        .await
+        .map_err(|e| HtsError::StorageError(format!("Task panicked: {e}")))?
+    }
+
     async fn validate_code(
         &self,
         _ctx: &TenantContext,
@@ -2228,13 +2241,15 @@ fn resolve_value_set_versioned(
 ) -> Result<(String, Option<String>), HtsError> {
     // Fetch every (id, compose, version) candidate ordered with the highest
     // version first so the version=None path picks the latest.
+    let sql = format!(
+        "SELECT id, compose_json, version FROM value_sets \
+         WHERE url = ?1 \
+           AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2) \
+         ORDER BY {}",
+        crate::backends::vs_precedence_order_by("value_sets")
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id, compose_json, version FROM value_sets \
-             WHERE url = ?1 \
-               AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2) \
-             ORDER BY COALESCE(version, '') DESC",
-        )
+        .prepare(&sql)
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
     let rows: Vec<(String, Option<String>, Option<String>)> = stmt
         .query_map(rusqlite::params![url, date], |row| {
@@ -5981,22 +5996,12 @@ fn resolve_compose_system_id(
     // agrees with the unpinned hot-path on which row to prefer when multiple
     // candidates share the same canonical URL (e.g. r4.core stub plus
     // RF2 import for SNOMED).
+    let sql = format!(
+        "SELECT id, version FROM code_systems WHERE url = ?1 ORDER BY {}",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id, version FROM code_systems \
-             WHERE url = ?1 \
-             ORDER BY (CASE COALESCE(content, 'complete') \
-                            WHEN 'complete'   THEN 0 \
-                            WHEN 'supplement' THEN 0 \
-                            WHEN 'fragment'   THEN 1 \
-                            WHEN 'example'    THEN 1 \
-                            WHEN 'not-present' THEN 2 \
-                            ELSE 1 END), \
-                      (CASE WHEN EXISTS \
-                          (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
-                          THEN 0 ELSE 1 END), \
-                      COALESCE(version, '') DESC",
-        )
+        .prepare(&sql)
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     let rows: Vec<(String, Option<String>)> = stmt
@@ -6092,13 +6097,12 @@ fn build_hierarchical_expansion(
     let system_urls: HashSet<String> = flat.iter().map(|c| c.system.clone()).collect();
     let mut system_id_map: HashMap<String, String> = HashMap::new();
     for sys_url in &system_urls {
+        let sql = format!(
+            "SELECT id FROM code_systems WHERE url = ?1 ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
         if let Some(id) = conn
-            .query_row(
-                "SELECT id FROM code_systems WHERE url = ?1 \
-                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                [sys_url],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row(&sql, [sys_url], |row| row.get::<_, String>(0))
             .optional()
             .map_err(|e| HtsError::StorageError(e.to_string()))?
         {
@@ -6379,14 +6383,14 @@ fn lookup_value_set_version(
     // Pick the highest stored version for this URL — matches the
     // resolve_value_set_versioned default-when-no-pin behaviour, so $expand
     // and $validate-code echoes converge on the same row.
+    let sql = format!(
+        "SELECT version FROM value_sets WHERE url = ?1 ORDER BY {} LIMIT 1",
+        crate::backends::vs_precedence_order_by("value_sets")
+    );
     let v: Option<String> = conn
-        .query_row(
-            "SELECT version FROM value_sets \
-             WHERE url = ?1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            rusqlite::params![url],
-            |row| row.get::<_, Option<String>>(0),
-        )
+        .query_row(&sql, rusqlite::params![url], |row| {
+            row.get::<_, Option<String>>(0)
+        })
         .ok()
         .flatten();
     if let Ok(mut w) = cache.write() {
@@ -6470,14 +6474,14 @@ fn cs_version_for_msg(
             return v.clone();
         }
     }
+    let sql = format!(
+        "SELECT version FROM code_systems WHERE url = ?1 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let v: Option<String> = conn
-        .query_row(
-            "SELECT version FROM code_systems \
-             WHERE url = ?1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            rusqlite::params![system_url],
-            |row| row.get::<_, Option<String>>(0),
-        )
+        .query_row(&sql, rusqlite::params![system_url], |row| {
+            row.get::<_, Option<String>>(0)
+        })
         .ok()
         .flatten();
     if let Ok(mut w) = cache.write() {
@@ -6502,14 +6506,14 @@ fn cs_content_for_url(
             return v.clone();
         }
     }
+    let sql = format!(
+        "SELECT content FROM code_systems WHERE url = ?1 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let v: Option<String> = conn
-        .query_row(
-            "SELECT content FROM code_systems \
-             WHERE url = ?1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            rusqlite::params![system_url],
-            |row| row.get::<_, Option<String>>(0),
-        )
+        .query_row(&sql, rusqlite::params![system_url], |row| {
+            row.get::<_, Option<String>>(0)
+        })
         .ok()
         .flatten();
     if let Ok(mut w) = cache.write() {
@@ -6526,14 +6530,16 @@ fn cs_content_for_url(
 /// `CODE_CASE_DIFFERENCE` informational issue when the caller's code differs
 /// from the canonical form by case.
 fn cs_is_case_insensitive(conn: &Connection, system_url: &str) -> bool {
-    conn.query_row(
+    let sql = format!(
         "SELECT json_extract(resource_json, '$.caseSensitive') \
          FROM code_systems \
          WHERE url = ?1 \
-         ORDER BY COALESCE(version, '') DESC LIMIT 1",
-        rusqlite::params![system_url],
-        |row| row.get::<_, Option<i64>>(0),
-    )
+         ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
+    conn.query_row(&sql, rusqlite::params![system_url], |row| {
+        row.get::<_, Option<i64>>(0)
+    })
     .ok()
     .flatten()
     .map(|v| v == 0)
@@ -6773,15 +6779,14 @@ fn detect_cs_version_mismatch(
     Option<String>,
     Option<String>,
 )> {
-    // Build (id, version) candidate list sorted desc so the first entry is the
-    // highest version — used for both resolution and picking the "actual" ver.
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, version FROM code_systems \
-             WHERE url = ?1 \
-             ORDER BY COALESCE(version, '') DESC",
-        )
-        .ok()?;
+    // Candidate (id, version) list in precedence order, so the first entry is the
+    // row the server would RESOLVE — not merely the highest version string. The
+    // reported version must name the row validation actually ran against.
+    let sql = format!(
+        "SELECT id, version FROM code_systems WHERE url = ?1 ORDER BY {}",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
+    let mut stmt = conn.prepare_cached(&sql).ok()?;
     let candidates: Vec<(String, Option<String>)> = stmt
         .query_map(rusqlite::params![system_url], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -7052,13 +7057,11 @@ fn detect_vs_pin_unknown(
         .and_then(|pin| pin)?; // only when the include has an explicit version
 
     // Build candidates for resolution
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, version FROM code_systems \
-             WHERE url = ?1 \
-             ORDER BY COALESCE(version, '') DESC",
-        )
-        .ok()?;
+    let sql = format!(
+        "SELECT id, version FROM code_systems WHERE url = ?1 ORDER BY {}",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
+    let mut stmt = conn.prepare_cached(&sql).ok()?;
     let candidates: Vec<(String, Option<String>)> = stmt
         .query_map(rusqlite::params![system_url], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))

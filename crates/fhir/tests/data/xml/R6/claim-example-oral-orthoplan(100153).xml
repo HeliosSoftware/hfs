@@ -57,13 +57,15 @@
   </careTeam>
   <diagnosis>
     <sequence value="1"/>
-    <diagnosisCodeableConcept>
-      <coding>
-        <system value="http://hl7.org/fhir/sid/icd-10"/>
-        <!--  <code value="123457"/>  -->
-        <code value="K07.3"/>
-      </coding>
-    </diagnosisCodeableConcept>
+    <diagnosis>
+      <concept>
+        <coding>
+          <system value="http://hl7.org/fhir/sid/icd-10"/>
+          <!-- <code value="123457"/> -->
+          <code value="K07.3"/>
+        </coding>
+      </concept>
+    </diagnosis>
   </diagnosis>
   <insurance>
     <sequence value="1"/>
@@ -83,7 +85,7 @@
       </coding>
     </productOrService>
     <servicedDate value="2015-05-16"/>
-    <!--  Start Date  -->
+    <!-- Start Date -->
     <unitPrice>
       <value value="9000.00"/>
       <currency value="USD"/>
@@ -94,7 +96,7 @@
     </net>
     <detail>
       <sequence value="1"/>
-      <!--  Exam Fee  -->
+      <!-- Exam Fee -->
       <productOrService>
         <coding>
           <system value="http://example.org/fhir/oralservicecodes"/>
@@ -112,7 +114,7 @@
     </detail>
     <detail>
       <sequence value="2"/>
-      <!--  Diagnostic Fee  -->
+      <!-- Diagnostic Fee -->
       <productOrService>
         <coding>
           <system value="http://example.org/fhir/oralservicecodes"/>
@@ -130,7 +132,7 @@
     </detail>
     <detail>
       <sequence value="3"/>
-      <!--  Initial Payment  -->
+      <!-- Initial Payment -->
       <productOrService>
         <coding>
           <system value="http://example.org/fhir/oralservicecodes"/>
@@ -148,7 +150,7 @@
     </detail>
     <detail>
       <sequence value="4"/>
-      <!--  Duration in Months  -->
+      <!-- Duration in Months -->
       <productOrService>
         <coding>
           <system value="http://example.org/fhir/oralservicecodes"/>
@@ -161,7 +163,7 @@
     </detail>
     <detail>
       <sequence value="5"/>
-      <!--  Periodic Payments  -->
+      <!-- Periodic Payments -->
       <productOrService>
         <coding>
           <system value="http://example.org/fhir/oralservicecodes"/>

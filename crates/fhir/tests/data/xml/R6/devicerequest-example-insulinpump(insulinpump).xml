@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><DeviceRequest xmlns="http://hl7.org/fhir">
   <id value="insulinpump"/>
-  <!-- 	<extension url="http://hl7.org/fhir/StructureDefinition/bodysitecode">
+  <!-- <extension url="http://hl7.org/fhir/StructureDefinition/bodysitecode">
   <valueCodeableConcept>
     <coding>
       <system value="http://snomed.info/sct"/>
@@ -8,7 +8,7 @@
       <display value="Thoracic structure"/>
     </coding>
   </valueCodeableConcept>
-</extension>	 -->
+</extension> -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

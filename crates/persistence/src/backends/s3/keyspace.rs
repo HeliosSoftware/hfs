@@ -242,6 +242,42 @@ impl S3Keyspace {
         self.join(&["bulk", "submit/"])
     }
 
+    /// Key for a single user's per-user settings object.
+    ///
+    /// `object_id` **must** be an opaque, injective digest of the user key (see
+    /// `settings_object_id` in the `user_settings` module), never the raw key.
+    /// The raw key is `"{issuer}|{subject}"` built from unvalidated JWT claims: it
+    /// can contain `/`, `..`, or be empty, and `sanitize` below is *lossy*, so
+    /// embedding it here would let two distinct users collide on one object — a
+    /// cross-user settings leak.
+    ///
+    /// This key is deliberately built from the *base* keyspace, without
+    /// [`with_tenant_prefix`](Self::with_tenant_prefix): settings are user-global,
+    /// not per-tenant (see [`crate::core::user_settings`]).
+    ///
+    /// # Why a tenant cannot reach these objects
+    ///
+    /// The guarantee is **structural, not lexical**. A settings object sits
+    /// *directly* under the `_system.user-settings/` segment as `{digest}.json`,
+    /// whereas every tenant-scoped key lives under a `resources/`, `history/`, or
+    /// `bulk/` **sub**-prefix of its tenant segment. So even a tenant somehow
+    /// named `_system.user-settings` would write to
+    /// `_system.user-settings/resources/…`, which can never equal a
+    /// `{digest}.json` leaf — and `purge_tenant_data` sweeps only those
+    /// sub-prefixes, so it cannot delete a settings object either.
+    ///
+    /// Do **not** weaken this to "tenant IDs cannot contain `.`". That is true of
+    /// the routing validators (`is_valid_tenant_id`), but *not* of
+    /// `admin_tenants::validate_tenant_id`, which permits `.` and `/`, nor of the
+    /// JWT tenant extractor, which validates nothing. The name is dotted to keep
+    /// it unroutable, but the safety of this namespace must not depend on that.
+    /// In particular, a future change that widened a tenant purge to sweep the
+    /// whole tenant prefix would break the structural argument above and must
+    /// exclude this namespace explicitly.
+    pub fn user_settings_key(&self, object_id: &str) -> String {
+        self.join(&["_system.user-settings", &format!("{object_id}.json")])
+    }
+
     /// Joins `parts` with `/`, prepending the base prefix when set.
     ///
     /// Trailing slashes are preserved only when the final part itself ends with
@@ -273,6 +309,14 @@ impl S3Keyspace {
 /// Slashes, backslashes, and spaces are replaced with underscores so that
 /// resource IDs and type names can be embedded in key paths without
 /// accidentally splitting path segments.
+///
+/// This mapping is **lossy and therefore not injective** — `"a/b"` and `"a_b"`
+/// both collapse to `"a_b"`. It is only sound for the history *index* keys here,
+/// where the filename also carries a timestamp, version, and random suffix and a
+/// collision merely duplicates an index entry. Never use it to derive a key that
+/// establishes *identity* or *ownership*: two principals colliding on one key is
+/// a cross-user data leak. See `S3Keyspace::user_settings_key`, which hashes
+/// instead.
 fn sanitize(value: &str) -> String {
     value
         .chars()
