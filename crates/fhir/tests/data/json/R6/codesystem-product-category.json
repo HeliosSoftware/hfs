@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "product-category",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -33,7 +33,7 @@
   "name": "BiologicallyDerivedProductCategory",
   "title": "Biologically Derived Product Category",
   "status": "active",
-  "experimental": false,
+  "experimental": true,
   "date": "2021-01-05T10:01:24+11:00",
   "publisher": "HL7 (FHIR Project)",
   "contact": [

@@ -347,8 +347,9 @@ impl SearchProvider for PostgresBackend {
 
     fn search_param_registry(
         &self,
-    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        self.search_registry()
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registry(tenant.tenant_id().as_str())
     }
 
     fn supports_contained_search(&self) -> bool {
@@ -626,7 +627,7 @@ impl ChainedSearchProvider for PostgresBackend {
         // The builder produces a `r.id IN (... nested SELECTs ...)` fragment
         // that handles arbitrary chain depth (was previously stubbed for >2
         // segments).
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.search_registry().clone())
+        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
             .with_param_offset(1);
         let parsed = builder
             .parse_chain(chain)
@@ -678,7 +679,7 @@ impl ChainedSearchProvider for PostgresBackend {
         // Use the registry-driven builder so we handle nested `_has` chains
         // and any param type (was previously single-level only with hardcoded
         // token-or-string-or-empty fallback).
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.search_registry().clone())
+        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
             .with_param_offset(1);
         let fragment = builder.build_reverse_chain_sql(reverse_chain)?;
 

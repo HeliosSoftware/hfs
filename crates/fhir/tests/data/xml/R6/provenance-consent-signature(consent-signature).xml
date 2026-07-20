@@ -10,8 +10,8 @@
   <target>
     <reference value="Consent/consent-example-basic/_history/1"/>
   </target>
-  <!--  the provenance is recorded at the same time as 
-    the resource - batched together  -->
+  <!-- the provenance is recorded at the same time as 
+    the resource - batched together -->
   <recorded value="2016-05-26T00:41:10-04:00"/>
   <activity>
     <coding>

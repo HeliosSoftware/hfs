@@ -19,11 +19,7 @@
         <display value="Triaged"/>
       </coding>
     </code>
-    <type>
-      <system value="http://hl7.org/fhir/encounter-businessstatus-type"/>
-      <code value="emergency"/>
-      <display value="Emergency"/>
-    </type>
+    <type/>
     <effectiveDate value="2017-02-01T08:00:00+10:00"/>
   </businessStatus>
   <businessStatus>
@@ -34,11 +30,7 @@
         <display value="Admitted"/>
       </coding>
     </code>
-    <type>
-      <system value="http://hl7.org/fhir/encounter-businessstatus-type"/>
-      <code value="inpatient"/>
-      <display value="Inpatient"/>
-    </type>
+    <type/>
     <effectiveDate value="2017-02-01T09:27:00+10:00"/>
   </businessStatus>
   <class>

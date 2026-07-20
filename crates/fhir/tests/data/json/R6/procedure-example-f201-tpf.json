@@ -47,17 +47,6 @@
       }
     }
   ],
-  "bodySite": [
-    {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "272676008",
-          "display": "Entire sphenoid bone (body structure)"
-        }
-      ]
-    }
-  ],
   "note": [
     {
       "text": "Eerste neo-adjuvante TPF-kuur bij groot proces in sphenoid met intracraniale uitbreiding."

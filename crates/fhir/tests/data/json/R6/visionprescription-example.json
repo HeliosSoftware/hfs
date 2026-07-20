@@ -12,6 +12,7 @@
     }
   ],
   "status": "active",
+  "intent": "order",
   "created": "2014-06-15",
   "patient": {
     "reference": "Patient/example"

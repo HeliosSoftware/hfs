@@ -12,7 +12,7 @@
     <fullUrl value="https://example.com/base/DiagnosticReport/f202"/>
     <resource>
       <DiagnosticReport>
-        <!--  No identifier was available  -->
+        <!-- No identifier was available -->
         <id value="f202"/>
         <text>
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: DiagnosticReport f202</b></p><a name="f202"> </a><a name="hcf202"> </a><h2><span title="Codes:{http://snomed.info/sct 104177005}">Blood culture for bacteria, including anaerobic screen</span> (<span title="Codes:{http://snomed.info/sct 15220000}, {http://terminology.hl7.org/CodeSystem/v2-0074 LAB}">Laboratory test</span>) </h2><table class="grid"><tr><td>Subject</td><td>Roel(official) Male, DoB: 1960-03-13 ( BSN: 123456789 (use: official, ))</td></tr><tr><td>Reported</td><td>2013-03-11T10:28:00+01:00</td></tr><tr><td>Performer</td><td> <a href="organization-example-f201-aumc.html">AUMC</a></td></tr></table><p><b>Report Details</b></p><table class="grid"><tr><td><b>Code</b></td><td><b>Value</b></td><td><b>Flags</b></td></tr><tr><td><a href="observation-example-f206-staphylococcus.html"><span title="Codes:{http://acmelabs.org 104177}, {http://loinc.org 600-7}">Blood culture</span></a></td><td><span title="Codes:{http://snomed.info/sct 3092008}">Staphylococcus aureus</span></td><td>Final, <span title="Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation POS}">Positive</span></td></tr></table><div><p>Blood culture tested positive on staphylococcus aureus</p>
@@ -23,7 +23,7 @@
         </basedOn>
         <status value="final"/>
         <category>
-          <!--  Lab test  -->
+          <!-- Lab test -->
           <coding>
             <system value="http://snomed.info/sct"/>
             <code value="15220000"/>

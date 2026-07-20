@@ -267,6 +267,13 @@ mod shared_mongo {
                     // image default and keeps the mapped port reachable once we
                     // supply our own command.
                     .with_cmd(["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"])
+                    // Every test creates its own uniquely-named database, and
+                    // WiredTiger holds file handles open per collection/index
+                    // across all of them. With 50+ test databases the stock
+                    // container nofile limit is exhausted and index builds die
+                    // with TooManyFilesOpen (error 264) late in the run. 64000
+                    // is mongod's own recommended minimum.
+                    .with_ulimit("nofile", 64000, Some(64000))
                     .with_startup_timeout(std::time::Duration::from_secs(120))
                     .start()
                     .await
@@ -584,8 +591,14 @@ async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
     };
 
     let created_during_test = after - before;
+    // `totalCreated` is a server-global counter on the SHARED mongo, so
+    // concurrently running neighbor tests (each with its own client pool)
+    // inflate it — observed spilling past 50 on wide runners. The regression
+    // this guards against (a fresh client per operation) creates at least one
+    // connection per iteration: 8 tasks × 20 ops ≥ 160. A 120 ceiling keeps
+    // that detectable while tolerating neighbor noise.
     assert!(
-        created_during_test <= 50,
+        created_during_test <= 120,
         "MongoDB backend should reuse one client pool; created {} connections during concurrent read/search",
         created_during_test
     );
@@ -2427,7 +2440,8 @@ async fn mongodb_integration_search_parameter_create_registers_active() {
         .await
         .unwrap();
 
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     let param = registry.get_param("Patient", "mongo-nickname");
     assert!(
         param.is_some(),
@@ -2440,6 +2454,89 @@ async fn mongodb_integration_search_parameter_create_registers_active() {
         "http://example.org/fhir/SearchParameter/mongo-custom-patient-nickname"
     );
     assert_eq!(param.status, SearchParameterStatus::Active);
+}
+
+/// The TTL-cache refresh (#235) rebuilds the registry's stored parameters from
+/// what the database currently holds: a parameter written by a cluster-mate
+/// enters resolution on the next refresh, and a deleted one leaves it. This is
+/// the SQLite integration test's contract exercised over the Mongo cursor path.
+#[tokio::test]
+async fn mongodb_integration_refresh_rebuilds_stored_parameters() {
+    let Some(backend) = create_backend("search_param_refresh").await else {
+        eprintln!(
+            "Skipping mongodb_integration_refresh_rebuilds_stored_parameters (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-search-param-refresh");
+    let other = create_tenant("tenant-search-param-other");
+
+    backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "mongo-refresh-nickname",
+                "url": "http://example.org/fhir/SearchParameter/mongo-refresh-nickname",
+                "name": "MongoRefreshNickname",
+                "status": "active",
+                "code": "mongo-refresh-nickname",
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.where(use='nickname').given"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // The write refreshes the stored-param cache: the parameter resolves for its
+    // tenant and is isolated from others.
+    {
+        let reg = backend.search_param_registry(&tenant);
+        assert!(
+            reg.read()
+                .get_param("Patient", "mongo-refresh-nickname")
+                .is_some(),
+            "visible to the owning tenant after the write"
+        );
+    }
+    {
+        let reg = backend.search_param_registry(&other);
+        assert!(
+            reg.read()
+                .get_param("Patient", "mongo-refresh-nickname")
+                .is_none(),
+            "isolated from other tenants"
+        );
+    }
+
+    // The TTL refresh drops the cached per-tenant registries; the next access
+    // re-reads storage (how a cluster-mate's write becomes visible).
+    let _ = backend
+        .search_param_registry(&tenant)
+        .read()
+        .get_param("Patient", "mongo-refresh-nickname");
+    backend
+        .refresh_stored_search_parameters()
+        .await
+        .expect("refresh from storage");
+    assert_eq!(backend.tenant_registries().cached_tenant_count(), 0);
+
+    // Delete it from storage; it leaves the owning tenant's resolution.
+    backend
+        .delete(&tenant, "SearchParameter", "mongo-refresh-nickname")
+        .await
+        .unwrap();
+    let reg = backend.search_param_registry(&tenant);
+    assert!(
+        reg.read()
+            .get_param("Patient", "mongo-refresh-nickname")
+            .is_none(),
+        "gone after the delete"
+    );
 }
 
 #[tokio::test]
@@ -2473,7 +2570,8 @@ async fn mongodb_integration_search_parameter_create_draft_not_registered() {
         .await
         .unwrap();
 
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     let param = registry.get_param("Patient", "mongo-draft");
     assert!(
         param.is_none(),
@@ -2513,7 +2611,8 @@ async fn mongodb_integration_search_parameter_update_status_change() {
         .unwrap();
 
     {
-        let registry = backend.search_registry().read();
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
         let param = registry.get_param("Condition", "mongo-statuschange");
         assert!(
             param.is_some(),
@@ -2545,13 +2644,15 @@ async fn mongodb_integration_search_parameter_update_status_change() {
         .await
         .unwrap();
 
-    let registry = backend.search_registry().read();
-    let param = registry.get_param("Condition", "mongo-statuschange");
-    assert!(param.is_some(), "Parameter should still exist in registry");
-    assert_eq!(
-        param.unwrap().status,
-        SearchParameterStatus::Retired,
-        "Status should be updated to retired"
+    // A per-tenant registry overlays only a tenant's *active* stored params, so
+    // retiring the parameter removes it from that tenant's search resolution.
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
+    assert!(
+        registry
+            .get_param("Condition", "mongo-statuschange")
+            .is_none(),
+        "a retired custom parameter should no longer resolve for the tenant"
     );
 }
 
@@ -2587,7 +2688,8 @@ async fn mongodb_integration_search_parameter_delete_unregisters() {
         .unwrap();
 
     {
-        let registry = backend.search_registry().read();
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
         assert!(
             registry
                 .get_param("Observation", "mongo-todelete")
@@ -2600,7 +2702,8 @@ async fn mongodb_integration_search_parameter_delete_unregisters() {
         .await
         .unwrap();
 
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     assert!(
         registry
             .get_param("Observation", "mongo-todelete")
@@ -2744,7 +2847,8 @@ async fn mongodb_integration_search_parameter_registry_updates_when_offloaded() 
         .unwrap();
 
     {
-        let registry = backend.search_registry().read();
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
         let param = registry.get_param("Patient", "mongo-offloaded-code");
         assert!(
             param.is_some(),
@@ -2765,7 +2869,8 @@ async fn mongodb_integration_search_parameter_registry_updates_when_offloaded() 
         .await
         .unwrap();
 
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     assert!(
         registry
             .get_param("Patient", "mongo-offloaded-code")

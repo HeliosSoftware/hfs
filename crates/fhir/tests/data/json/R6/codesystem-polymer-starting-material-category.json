@@ -1,0 +1,74 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "polymer-starting-material-category",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem polymer-starting-material-category\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"polymer-starting-material-category\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcpolymer-starting-material-category\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/polymer-starting-material-category\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003echemical-substance\u003ca name\u003d\"polymer-starting-material-category-chemical-substance\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eChemical substance\u003c/td\u003e\u003ctd\u003eA chemical (synthetic) starting material.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ebiological-substance\u003ca name\u003d\"polymer-starting-material-category-biological-substance\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBiological substance\u003c/td\u003e\u003ctd\u003eA biological (natural) starting material.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/polymer-starting-material-category",
+  "version": "6.0.0-ballot4",
+  "name": "PolymerStartingMaterialCategoryExample",
+  "title": "Polymer Starting Material Category",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-19",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "High-level category of polymer starting material substance.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/polymer-starting-material-category",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "chemical-substance",
+      "display": "Chemical substance",
+      "definition": "A chemical (synthetic) starting material."
+    },
+    {
+      "code": "biological-substance",
+      "display": "Biological substance",
+      "definition": "A biological (natural) starting material."
+    }
+  ]
+}

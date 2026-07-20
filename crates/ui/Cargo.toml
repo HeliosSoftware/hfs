@@ -9,7 +9,39 @@ repository.workspace = true
 homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/ui"
 keywords = ["helios-software", "fhir", "ui", "htmx"]
 
+[features]
+# FHIR version features forward to helios-fhir so the viewer read paths
+# (SearchParameter + CompartmentDefinition fetched from the FHIR API) cover
+# exactly the versions the server is built with. R4 is the workspace default.
+default = ["R4"]
+R4 = ["helios-fhir/R4"]
+R4B = ["helios-fhir/R4B"]
+R5 = ["helios-fhir/R5"]
+R6 = ["helios-fhir/R6"]
+
 [dependencies]
+# Read paths into the rest of the workspace: the SearchParameter spec loader
+# and registry types (#238) and the per-version compartment-params table
+# (#237). Data flows one way — the UI depends on the workspace, never the
+# reverse.
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
+
+# Deserializes the FHIR resources fetched from the server's own
+# `/SearchParameter` and `/CompartmentDefinition` endpoints, and derives the
+# query-string extractors. Both already in the workspace dependency graph.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The UI reads conformance data (SearchParameter, CompartmentDefinition) from
+# the server's own FHIR API over HTTP — storage is the source of truth. Plain
+# HTTP against a loopback URL, so no TLS backend is needed.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+async-trait = "0.1"
+
+# `OutboundAuthProvider`: the credentials the UI attaches to its server-to-server
+# self-calls (a service token when auth is enabled; a no-op when it is not).
+helios-auth = { path = "../auth", version = "0.2.1" }
+
 # Web framework (matches the version used by helios-hfs / helios-rest)
 axum = "0.8"
 
@@ -49,7 +81,6 @@ helios-observability = { path = "../observability", version = "0.2.1" }
 # registry (list/register/deregister) + per-tenant resource counts. The UI
 # depends on the rest of the server, never the reverse.
 helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
-serde = { version = "1", features = ["derive"] }
 
 # History & Versions diff rendering (#236, decision recorded in
 # docs/history-diff-rendering.md). Two layers, both server-side:
@@ -58,7 +89,6 @@ serde = { version = "1", features = ["derive"] }
 #    weight; it is the exact inverse of the RFC 6902 PATCH the server applies.
 #  - similar: the textual word-level view over pretty-printed JSON. No HTML
 #    formatter of its own — we iterate its changes into an Askama template.
-serde_json = "1"
 json-patch = "3"
 similar = { version = "2", features = ["inline"] }
 

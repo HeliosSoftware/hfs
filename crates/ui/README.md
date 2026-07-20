@@ -163,6 +163,20 @@ Mounted under `/ui` when running `hfs` (the `ui` feature is on by default; the
 `headless` feature disables it):
 
 - `GET /ui` — full landing page (`pages/index.html` → `layouts/base.html`).
+- `GET /ui/queries` — saved FHIR queries per resource type (#234), hydrated
+  client-side from the per-user settings document.
+- `GET /ui/search-parameters` — read-only SearchParameter viewer (#238):
+  Resource Filter rail, type/source facet rows, paginated table, and a detail
+  panel, over the same snapshot the storage backends seed their registries
+  from (embedded fallback + the spec bundle in `HFS_DATA_DIR`). Every filter
+  is a link, so the whole screen works without JavaScript; the write half
+  lands behind #235.
+- `GET /ui/compartments` — Compartment viewer & route tester (#237): the
+  vendored spec `CompartmentDefinition`s (`data/compartments/`, parity-tested
+  against the codegen'd `get_compartment_params()` table), a Members tab, and
+  a tester that answers "is this type in this compartment, via which
+  parameters, and what search does the server run?" — resolved through the
+  same table the REST compartment handler consults.
 - `GET /ui/status` — a system-status read path. Returns the
   `partials/status.html` **fragment** on `HX-Request`, and the **full page** on
   a hard navigation — demonstrating the same URL working with and without JS.

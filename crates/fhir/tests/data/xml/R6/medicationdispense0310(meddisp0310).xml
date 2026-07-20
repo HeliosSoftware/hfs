@@ -22,7 +22,7 @@
   </contained>
   <status value="in-progress"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0308"/>
       <display value="Percocet"/>

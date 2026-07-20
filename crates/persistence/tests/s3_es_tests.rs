@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use helios_fhir::FhirVersion;
-use parking_lot::RwLock;
 use serde_json::json;
 
 use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
@@ -28,7 +27,7 @@ use helios_persistence::composite::{
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::{Backend, BackendKind, ResourceStorage};
 use helios_persistence::error::{ResourceError, StorageError};
-use helios_persistence::search::{SearchParameterLoader, SearchParameterRegistry};
+use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
@@ -198,7 +197,7 @@ async fn ensure_bucket(client: &Client, bucket: &str) {
         .expect("failed to create test bucket");
 }
 
-fn build_search_registry() -> Arc<RwLock<SearchParameterRegistry>> {
+fn build_search_registry() -> Arc<TenantSearchRegistries> {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -206,20 +205,21 @@ fn build_search_registry() -> Arc<RwLock<SearchParameterRegistry>> {
         .unwrap_or_else(|| PathBuf::from("data"));
 
     let loader = SearchParameterLoader::new(FhirVersion::default());
-    let mut registry = SearchParameterRegistry::new();
-
-    if let Ok(params) = loader.load_embedded() {
-        for p in params {
-            let _ = registry.register(p);
+    let registries = Arc::new(TenantSearchRegistries::base_only());
+    {
+        let mut registry = registries.base().write();
+        if let Ok(params) = loader.load_embedded() {
+            for p in params {
+                let _ = registry.register(p);
+            }
+        }
+        if let Ok(params) = loader.load_from_spec_file(&data_dir) {
+            for p in params {
+                let _ = registry.register(p);
+            }
         }
     }
-    if let Ok(params) = loader.load_from_spec_file(&data_dir) {
-        for p in params {
-            let _ = registry.register(p);
-        }
-    }
-
-    Arc::new(RwLock::new(registry))
+    registries
 }
 
 // ============================================================================

@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "task-reason",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -27,7 +27,7 @@
   "name": "TaskReason",
   "title": "Task Reason",
   "status": "active",
-  "experimental": false,
+  "experimental": true,
   "date": "2025-03-12T10:00:00+08:00",
   "publisher": "HL7 (FHIR Project)",
   "contact": [

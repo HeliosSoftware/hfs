@@ -36,12 +36,15 @@
   <controller>
     <reference value="Organization/f203"/>
   </controller>
-  <!--  the text terms of the consent in lawyer speak  -->
-  <!--  likely use url pointer to common text  -->
+  <manager>
+    <reference value="Organization/f203"/>
+  </manager>
+  <!-- the text terms of the consent in lawyer speak -->
+  <!-- likely use url pointer to common text -->
   <sourceAttachment>
     <title value="The terms of the consent in lawyer speak."/>
   </sourceAttachment>
-  <!--  this is opt-out - e.g. nothing approved unless otherwise stated  -->
+  <!-- this is opt-out - e.g. nothing approved unless otherwise stated -->
   <regulatoryBasis>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>

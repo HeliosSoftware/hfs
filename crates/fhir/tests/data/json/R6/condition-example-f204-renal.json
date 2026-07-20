@@ -50,17 +50,6 @@
       }
     ]
   },
-  "bodySite": [
-    {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "181414000",
-          "display": "Entire kidney"
-        }
-      ]
-    }
-  ],
   "subject": {
     "reference": "Patient/f201",
     "display": "Roel"

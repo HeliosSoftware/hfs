@@ -14,6 +14,7 @@ mod keyspace;
 mod models;
 mod output_store;
 mod storage;
+mod user_settings;
 
 pub use backend::S3Backend;
 pub use client::{AwsS3Client, AwsS3ClientOptions, S3Api};

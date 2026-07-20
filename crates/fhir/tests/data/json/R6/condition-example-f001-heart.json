@@ -46,18 +46,6 @@
       }
     ]
   },
-  "bodySite": [
-    {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "40768004",
-          "display": "Left thorax"
-        }
-      ],
-      "text": "heart structure"
-    }
-  ],
   "subject": {
     "reference": "Patient/f001",
     "display": "P. van de Heuvel"

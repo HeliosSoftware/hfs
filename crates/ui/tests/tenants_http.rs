@@ -27,7 +27,14 @@ fn store() -> Arc<dyn ResourceStorage> {
 /// Builds the UI router over the given store. A fresh router per request is
 /// fine — they all share the same backend `Arc`, so state persists.
 fn app(store: &Arc<dyn ResourceStorage>) -> Router {
-    helios_ui::mount(Router::new(), "9.9.9", Some(Arc::clone(store)))
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        None,
+        Some(Arc::clone(store)),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        FhirVersion::R4,
+    )
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -134,9 +141,12 @@ async fn delete_deregisters_a_tenant() {
     let store = store();
     post_form(&store, "id=acme&display_name=Acme").await;
 
+    // Provisioning a tenant seeds it with conformance resources (the embedded
+    // fallback SearchParameters at minimum), so a plain deregister leaves it
+    // data-discovered. Purge to remove the tenant entirely.
     let res = app(&store)
         .oneshot(
-            Request::delete("/ui/tenants/acme")
+            Request::delete("/ui/tenants/acme?purge=true")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -144,7 +154,7 @@ async fn delete_deregisters_a_tenant() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    // Gone from the registry (no data seeded, so it disappears entirely).
+    // Gone from the registry and its seeded data purged, so it disappears.
     let (_, rows) = get(&store, "/ui/tenants/rows").await;
     assert!(!rows.contains(">acme<") && !rows.contains("Acme"));
 }
@@ -152,10 +162,17 @@ async fn delete_deregisters_a_tenant() {
 #[tokio::test]
 async fn page_reports_registry_unavailable_without_a_store() {
     // No storage handle → the page renders the "unavailable" notice, not a crash.
-    let res = helios_ui::mount(Router::new(), "9.9.9", None)
-        .oneshot(Request::get("/ui/tenants").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+    let res = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        None,
+        None,
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        FhirVersion::R4,
+    )
+    .oneshot(Request::get("/ui/tenants").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let html = body_text(res).await;
     assert!(html.contains("not available"));

@@ -160,13 +160,6 @@ The following resources may be in this compartment:
  
         <tr>
           <td>
-            <a href="invoice.html">Invoice</a>
-          </td>
-          <td>participant</td>
-        </tr>
- 
-        <tr>
-          <td>
             <a href="list.html">List</a>
           </td>
           <td>subject, source</td>
@@ -343,10 +336,6 @@ The following resources are never in this compartment:
         </li>
  
         <li>
-          <a href="contract.html">Contract</a>
-        </li>
- 
-        <li>
           <a href="coverage.html">Coverage</a>
         </li>
  
@@ -368,14 +357,6 @@ The following resources are never in this compartment:
  
         <li>
           <a href="endpoint.html">Endpoint</a>
-        </li>
- 
-        <li>
-          <a href="enrollmentrequest.html">EnrollmentRequest</a>
-        </li>
- 
-        <li>
-          <a href="enrollmentresponse.html">EnrollmentResponse</a>
         </li>
  
         <li>
@@ -432,14 +413,6 @@ The following resources are never in this compartment:
  
         <li>
           <a href="ingredient.html">Ingredient</a>
-        </li>
- 
-        <li>
-          <a href="insuranceplan.html">InsurancePlan</a>
-        </li>
- 
-        <li>
-          <a href="insuranceproduct.html">InsuranceProduct</a>
         </li>
  
         <li>
@@ -599,10 +572,6 @@ The following resources are never in this compartment:
         </li>
  
         <li>
-          <a href="structuremap.html">StructureMap</a>
-        </li>
- 
-        <li>
           <a href="subscription.html">Subscription</a>
         </li>
  
@@ -649,7 +618,7 @@ The following resources are never in this compartment:
   <name value="Base FHIR compartment definition for Device"/>
   <status value="draft"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -791,9 +760,6 @@ The following resources are never in this compartment:
     <endParam value="period"/>
   </resource>
   <resource>
-    <code value="Contract"/>
-  </resource>
-  <resource>
     <code value="Coverage"/>
     <startParam value="period"/>
     <endParam value="period"/>
@@ -872,12 +838,6 @@ The following resources are never in this compartment:
     <code value="Endpoint"/>
   </resource>
   <resource>
-    <code value="EnrollmentRequest"/>
-  </resource>
-  <resource>
-    <code value="EnrollmentResponse"/>
-  </resource>
-  <resource>
     <code value="EpisodeOfCare"/>
     <startParam value="date"/>
     <endParam value="date"/>
@@ -949,18 +909,6 @@ The following resources are never in this compartment:
   </resource>
   <resource>
     <code value="Ingredient"/>
-  </resource>
-  <resource>
-    <code value="InsurancePlan"/>
-  </resource>
-  <resource>
-    <code value="InsuranceProduct"/>
-  </resource>
-  <resource>
-    <code value="Invoice"/>
-    <param value="participant"/>
-    <startParam value="date"/>
-    <endParam value="date"/>
   </resource>
   <resource>
     <code value="Library"/>
@@ -1169,9 +1117,6 @@ The following resources are never in this compartment:
   </resource>
   <resource>
     <code value="StructureDefinition"/>
-  </resource>
-  <resource>
-    <code value="StructureMap"/>
   </resource>
   <resource>
     <code value="Subscription"/>

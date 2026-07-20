@@ -1,0 +1,139 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "gene-sequence-origin",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem gene-sequence-origin\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"gene-sequence-origin\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcgene-sequence-origin\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/gene-sequence-origin\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehuman\u003ca name\u003d\"gene-sequence-origin-human\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHuman\u003c/td\u003e\u003ctd\u003eHuman-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehumanised-mouse\u003ca name\u003d\"gene-sequence-origin-humanised-mouse\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHumanised mouse\u003c/td\u003e\u003ctd\u003eHumanised mouse-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehumanised-rat\u003ca name\u003d\"gene-sequence-origin-humanised-rat\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHumanised rat\u003c/td\u003e\u003ctd\u003eHumanised rat-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003echimeric-mouse-human\u003ca name\u003d\"gene-sequence-origin-chimeric-mouse-human\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eChimeric mouse-human\u003c/td\u003e\u003ctd\u003eChimeric mouse-human gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003echimeric-rat-human\u003ca name\u003d\"gene-sequence-origin-chimeric-rat-human\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eChimeric rat-human\u003c/td\u003e\u003ctd\u003eChimeric rat-human gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emouse\u003ca name\u003d\"gene-sequence-origin-mouse\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMouse\u003c/td\u003e\u003ctd\u003eMouse-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003erat\u003ca name\u003d\"gene-sequence-origin-rat\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRat\u003c/td\u003e\u003ctd\u003eRat-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003erabbit\u003ca name\u003d\"gene-sequence-origin-rabbit\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRabbit\u003c/td\u003e\u003ctd\u003eRabbit-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ebovine\u003ca name\u003d\"gene-sequence-origin-bovine\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBovine\u003c/td\u003e\u003ctd\u003eBovine-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eporcine\u003ca name\u003d\"gene-sequence-origin-porcine\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePorcine\u003c/td\u003e\u003ctd\u003ePorcine-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ebacterial\u003ca name\u003d\"gene-sequence-origin-bacterial\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBacterial\u003c/td\u003e\u003ctd\u003eBacterial-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eviral\u003ca name\u003d\"gene-sequence-origin-viral\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eViral\u003c/td\u003e\u003ctd\u003eViral-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efungal\u003ca name\u003d\"gene-sequence-origin-fungal\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFungal\u003c/td\u003e\u003ctd\u003eFungal-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eplant\u003ca name\u003d\"gene-sequence-origin-plant\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePlant\u003c/td\u003e\u003ctd\u003ePlant-origin gene sequence.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esynthetic\u003ca name\u003d\"gene-sequence-origin-synthetic\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSynthetic\u003c/td\u003e\u003ctd\u003eSynthetic gene sequence (not from a natural organism).\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/gene-sequence-origin",
+  "version": "6.0.0-ballot4",
+  "name": "GeneSequenceOriginExample",
+  "title": "Gene Sequence Origin",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-23",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The species or lineage from which a gene sequence originates, used e.g. for recombinant biologics.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/gene-sequence-origin",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "human",
+      "display": "Human",
+      "definition": "Human-origin gene sequence."
+    },
+    {
+      "code": "humanised-mouse",
+      "display": "Humanised mouse",
+      "definition": "Humanised mouse-origin gene sequence."
+    },
+    {
+      "code": "humanised-rat",
+      "display": "Humanised rat",
+      "definition": "Humanised rat-origin gene sequence."
+    },
+    {
+      "code": "chimeric-mouse-human",
+      "display": "Chimeric mouse-human",
+      "definition": "Chimeric mouse-human gene sequence."
+    },
+    {
+      "code": "chimeric-rat-human",
+      "display": "Chimeric rat-human",
+      "definition": "Chimeric rat-human gene sequence."
+    },
+    {
+      "code": "mouse",
+      "display": "Mouse",
+      "definition": "Mouse-origin gene sequence."
+    },
+    {
+      "code": "rat",
+      "display": "Rat",
+      "definition": "Rat-origin gene sequence."
+    },
+    {
+      "code": "rabbit",
+      "display": "Rabbit",
+      "definition": "Rabbit-origin gene sequence."
+    },
+    {
+      "code": "bovine",
+      "display": "Bovine",
+      "definition": "Bovine-origin gene sequence."
+    },
+    {
+      "code": "porcine",
+      "display": "Porcine",
+      "definition": "Porcine-origin gene sequence."
+    },
+    {
+      "code": "bacterial",
+      "display": "Bacterial",
+      "definition": "Bacterial-origin gene sequence."
+    },
+    {
+      "code": "viral",
+      "display": "Viral",
+      "definition": "Viral-origin gene sequence."
+    },
+    {
+      "code": "fungal",
+      "display": "Fungal",
+      "definition": "Fungal-origin gene sequence."
+    },
+    {
+      "code": "plant",
+      "display": "Plant",
+      "definition": "Plant-origin gene sequence."
+    },
+    {
+      "code": "synthetic",
+      "display": "Synthetic",
+      "definition": "Synthetic gene sequence (not from a natural organism)."
+    }
+  ]
+}

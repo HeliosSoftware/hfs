@@ -51,7 +51,7 @@
   </contained>
   <status value="completed"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0313"/>
     </reference>

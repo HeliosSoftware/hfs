@@ -2,12 +2,8 @@
 
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="bodytemp"/>
-  <text>
-    <status value="generated"/>
-    <div xmlns="http://www.w3.org/1999/xhtml">to do</div>
-  </text>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-summary">
-    <valueMarkdown value="#### Complete Summary of the Mandatory Requirements&#xD;&#xD;1.  One code in `Observation.category` which must have&#xD;    -   a fixed `Observation.category.coding.system`=**'http ://loinc.org'**&#xD;    -   a fixed  `Observation.category.coding.code`= **'8310-5'**&#xD;    -   The code (or codes) for the measurement obtained  in `Observation.code`. All codes&#xD;        SHALL have a system value&#xD;1. Either one Observation.valueQuantity or, if there is no value, one code in Observation.DataAbsentReason&#xD;   - Each Observation.valueQuantity must have:&#xD;     - One numeric value in Observation.valueQuantity.value&#xD;     - a fixed Observation.valueQuantity.system=&quot;http://unitsofmeasure.org&quot;&#xD;     - a UCUM unit code in Observation.valueQuantity.code = **'Cel', or '[degF]'**"/>
+    <valueMarkdown value="#### Summary of the Mandatory Requirements&#xD;&#xD;1.  One instance of `Observation.code.coding` which must have&#xD;    -   a fixed `Observation.code.coding.system` = **'http://loinc.org'**&#xD;    -   a fixed  `Observation.code.coding.code` = **'8310-5'**&#xD;    -   additional Coding repetitions representing a more specific code for the measurement obtained MAY be included in `Observation.code`.&#xD;1. Either one `Observation.valueQuantity` or, if there is no value, one code in `Observation.dataAbsentReason`&#xD;   - Each `Observation.valueQuantity` must have:&#xD;     - one numeric value in `Observation.valueQuantity.value`&#xD;     - a fixed `Observation.valueQuantity.system` = **'http://unitsofmeasure.org'**&#xD;     - a UCUM unit code in `Observation.valueQuantity.code` = **'Cel'**, or **'[degF]'**"/>
   </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm">
     <valueInteger value="4"/>
@@ -19,7 +15,7 @@
     <valueCode value="normative"/>
   </extension>
   <extension url="http://hl7.org/fhir/tools/StructureDefinition/profile-summary">
-    <valueString value="#### Complete Summary of the Mandatory Requirements&#xD;&#xD;1.  One code in `Observation.category` which must have&#xD;    -   a fixed `Observation.category.coding.system`=**'http ://loinc.org'**&#xD;    -   a fixed  `Observation.category.coding.code`= **'8310-5'**&#xD;    -   The code (or codes) for the measurement obtained  in `Observation.code`. All codes&#xD;        SHALL have a system value&#xD;1. Either one Observation.valueQuantity or, if there is no value, one code in Observation.DataAbsentReason&#xD;   - Each Observation.valueQuantity must have:&#xD;     - One numeric value in Observation.valueQuantity.value&#xD;     - a fixed Observation.valueQuantity.system=&quot;http://unitsofmeasure.org&quot;&#xD;     - a UCUM unit code in Observation.valueQuantity.code = **'Cel', or '[degF]'**"/>
+    <valueString value="#### Summary of the Mandatory Requirements&#xD;&#xD;1.  One instance of `Observation.code.coding` which must have&#xD;    -   a fixed `Observation.code.coding.system` = **'http://loinc.org'**&#xD;    -   a fixed  `Observation.code.coding.code` = **'8310-5'**&#xD;    -   additional Coding repetitions representing a more specific code for the measurement obtained MAY be included in `Observation.code`.&#xD;1. Either one `Observation.valueQuantity` or, if there is no value, one code in `Observation.dataAbsentReason`&#xD;   - Each `Observation.valueQuantity` must have:&#xD;     - one numeric value in `Observation.valueQuantity.value`&#xD;     - a fixed `Observation.valueQuantity.system` = **'http://unitsofmeasure.org'**&#xD;     - a UCUM unit code in `Observation.valueQuantity.code` = **'Cel'**, or **'[degF]'**"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/bodytemp"/>
   <identifier>
@@ -224,7 +220,7 @@
       <path value="Observation.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -399,6 +395,14 @@
     </element>
     <element id="Observation.extension">
       <path value="Observation.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -431,6 +435,14 @@
     </element>
     <element id="Observation.modifierExtension">
       <path value="Observation.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -610,6 +622,14 @@
     </element>
     <element id="Observation.triggeredBy.extension">
       <path value="Observation.triggeredBy.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -641,6 +661,14 @@
     </element>
     <element id="Observation.triggeredBy.modifierExtension">
       <path value="Observation.triggeredBy.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -819,7 +847,7 @@
         <valueString value="default: final"/>
       </extension>
       <path value="Observation.status"/>
-      <short value="registered | specimen-in-process | preliminary | final | amended | corrected | appended | cancelled | entered-in-error | unknown | cannot-be-obtained"/>
+      <short value="registered | in-process | specimen-in-process | preliminary | final | amended | corrected | appended | cancelled | entered-in-error | unknown | cannot-be-obtained"/>
       <definition value="The status of the result value."/>
       <comment value="This element is labeled as a modifier because the status contains codes that mark the resource as not currently valid."/>
       <requirements value="Need to track the status of individual results. Some results are finalized before the whole report is finalized."/>
@@ -871,6 +899,44 @@
       <mapping>
         <identity value="sct-concept"/>
         <map value="&lt; 445584004 |Report by finality status|"/>
+      </mapping>
+    </element>
+    <element id="Observation.statusReason">
+      <path value="Observation.statusReason"/>
+      <short value="Reason for current status"/>
+      <definition value="Captures the reason for the current state of the Observation."/>
+      <comment value="This is generally only used for &quot;exception&quot; statuses such as &quot;not-done&quot;, &quot;suspended&quot; or &quot;cancelled&quot;."/>
+      <min value="0"/>
+      <max value="1"/>
+      <base>
+        <path value="Observation.statusReason"/>
+        <min value="0"/>
+        <max value="1"/>
+      </base>
+      <type>
+        <code value="CodeableConcept"/>
+      </type>
+      <constraint>
+        <key value="ele-1"/>
+        <severity value="error"/>
+        <human value="All FHIR elements must have a @value or children"/>
+        <expression value="hasValue() or (children().count() &gt; id.count())"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/Element"/>
+      </constraint>
+      <mustSupport value="false"/>
+      <isModifier value="false"/>
+      <isSummary value="false"/>
+      <binding>
+        <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
+          <valueString value="ObservationStatusReason"/>
+        </extension>
+        <strength value="example"/>
+        <description value="Codes identifying the reason for the current state of an observation."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/observation-status-reason"/>
+      </binding>
+      <mapping>
+        <identity value="workflow"/>
+        <map value="Event.statusReason"/>
       </mapping>
     </element>
     <element id="Observation.category">
@@ -1354,7 +1420,7 @@
       </slicing>
       <short value="The quantity for the vital sign being observed."/>
       <definition value="The quantity for the vital sign being observed."/>
-      <comment value="- An observation may have:&#xA;  1.  a single value here&#xA;  1.  both a value and a set of related or component values&#xA;  1.  only a set of related or component values.&#xA;-  If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- For additional guidance, see the [Notes section](observation.html#notes) below. &#xA;- See [Interoperability Issues using code value pairs in FHIR](observation.html#code-interop) for additional information."/>
+      <comment value="- An observation may have:&#xA;  1.  a single value here&#xA;  1.  both a value and a set of related or component values&#xA;  1.  only a set of related or component values.&#xA;-  If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- For additional guidance, see the [Notes section](observation.html#notes) below. &#xA;- See [Interoperability Issues using code value pairs in FHIR](observation.html#code-interop) for additional information."/>
       <requirements value="An observation exists to have a value, though it might not if it is in error, or if it represents a group of observations."/>
       <min value="0"/>
       <max value="1"/>
@@ -1410,7 +1476,7 @@
       <sliceName value="valueQuantity"/>
       <short value="The quantity for the vital sign being observed."/>
       <definition value="The quantity for the vital sign being observed."/>
-      <comment value="- An observation may have:&#xA;  1.  a single value here&#xA;  1.  both a value and a set of related or component values&#xA;  1.  only a set of related or component values.&#xA;-  If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- For additional guidance, see the [Notes section](observation.html#notes) below. &#xA;- See [Interoperability Issues using code value pairs in FHIR](observation.html#code-interop) for additional information."/>
+      <comment value="- An observation may have:&#xA;  1.  a single value here&#xA;  1.  both a value and a set of related or component values&#xA;  1.  only a set of related or component values.&#xA;-  If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- For additional guidance, see the [Notes section](observation.html#notes) below. &#xA;- See [Interoperability Issues using code value pairs in FHIR](observation.html#code-interop) for additional information."/>
       <requirements value="An observation exists to have a value, though it might not if it is in error, or if it represents a group of observations."/>
       <min value="0"/>
       <max value="1"/>
@@ -1564,15 +1630,15 @@
         <map value="&lt; 260245000 |Findings values|"/>
       </mapping>
     </element>
-    <element id="Observation.interpretationContext">
-      <path value="Observation.interpretationContext"/>
+    <element id="Observation.context">
+      <path value="Observation.context"/>
       <short value="Context for understanding the observation"/>
-      <definition value="Other preceding or concurrent information that is critical to understand the context and significance of the observation."/>
-      <comment value="This element provides essential contextual information that affects how the observation should be interpreted. For example, knowing that a patient is diabetic, fasting, or paraplegic may be critical to properly understanding lab results or other observations."/>
+      <definition value="Contextual information that is relevant to understanding the observation value or interpretation.  The referenced information may be concurrent or precede the observation."/>
+      <comment value="This element provides essential contextual information that affects how the observation should be interpreted. For example, knowing that a patient is diabetic, fasting, or paraplegic may be critical to properly understanding lab results or other observations. Similarly, information about the timing, view, or imaging mode may be relevant to understanding an imaging measurement. This element is intended for interpretive context and not for conveying order, request, or fulfillment workflow information."/>
       <min value="0"/>
       <max value="*"/>
       <base>
-        <path value="Observation.interpretationContext"/>
+        <path value="Observation.context"/>
         <min value="0"/>
         <max value="*"/>
       </base>
@@ -1592,11 +1658,11 @@
       <isSummary value="false"/>
       <binding>
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
-          <valueString value="ObservationInterpretationContext"/>
+          <valueString value="ObservationContext"/>
         </extension>
         <strength value="example"/>
         <description value="Codes identifying contextual factors that affect interpretation of observations."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/observation-interpretation-context"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/observation-context"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -1861,6 +1927,40 @@
         <map value="&lt; 49062001 |Device|"/>
       </mapping>
     </element>
+    <element id="Observation.supportingDevice">
+      <path value="Observation.supportingDevice"/>
+      <short value="Device supporting generation of the measurement"/>
+      <definition value="A reference to additional devices, kits, or reagents (e.g., Test Kit, Calibration Kit, QC materials) used to support the generation of the measurement."/>
+      <min value="0"/>
+      <max value="*"/>
+      <base>
+        <path value="Observation.supportingDevice"/>
+        <min value="0"/>
+        <max value="*"/>
+      </base>
+      <type>
+        <code value="CodeableReference"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
+      </type>
+      <constraint>
+        <key value="ele-1"/>
+        <severity value="error"/>
+        <human value="All FHIR elements must have a @value or children"/>
+        <expression value="hasValue() or (children().count() &gt; id.count())"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/Element"/>
+      </constraint>
+      <mustSupport value="false"/>
+      <isModifier value="false"/>
+      <isSummary value="false"/>
+      <binding>
+        <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
+          <valueString value="DeviceType"/>
+        </extension>
+        <strength value="example"/>
+        <description value="Type of device supporting the generation of the measurement."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/device-type"/>
+      </binding>
+    </element>
     <element id="Observation.referenceRange">
       <path value="Observation.referenceRange"/>
       <short value="Provides guide for interpretation"/>
@@ -1931,6 +2031,14 @@
     </element>
     <element id="Observation.referenceRange.extension">
       <path value="Observation.referenceRange.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1962,6 +2070,14 @@
     </element>
     <element id="Observation.referenceRange.modifierExtension">
       <path value="Observation.referenceRange.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2122,7 +2238,7 @@
     <element id="Observation.referenceRange.type">
       <path value="Observation.referenceRange.type"/>
       <short value="Reference range qualifier"/>
-      <definition value="Codes to indicate the what part of the targeted reference population it applies to. For example, the normal or therapeutic range."/>
+      <definition value="Codes to indicate what part of the targeted reference population it applies to. For example, the normal or therapeutic range."/>
       <comment value="This SHOULD be populated if there is more than one range.  If this element is not present then the normal range is assumed."/>
       <requirements value="Need to be able to say what kind of reference range this is - normal, recommended, therapeutic, etc.,  - for proper interpretation."/>
       <min value="0"/>
@@ -2414,6 +2530,14 @@
     </element>
     <element id="Observation.component.extension">
       <path value="Observation.component.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2445,6 +2569,14 @@
     </element>
     <element id="Observation.component.modifierExtension">
       <path value="Observation.component.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2541,7 +2673,7 @@
       </slicing>
       <short value="The value for the vital sign component being observed."/>
       <definition value="The value for the vital sign component being observed."/>
-      <comment value="Used when observation has a set of component observations:&#xA;-  An observation may have both a value (e.g. an  Apgar score) and component observations (the observations from which the Apgar score was derived). &#xA;-  If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- For additional guidance, see the [Notes section](observation.html#notes) below."/>
+      <comment value="Used when observation has a set of component observations:&#xA;-  An observation may have both a value (e.g. an  Apgar score) and component observations (the observations from which the Apgar score was derived). &#xA;-  If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- For additional guidance, see the [Notes section](observation.html#notes) below."/>
       <requirements value="An observation exists to have a value, though it might not if it is in error, or if it represents a group of observations."/>
       <min value="0"/>
       <max value="1"/>
@@ -2619,7 +2751,7 @@
       <sliceName value="valueQuantity"/>
       <short value="Vital Sign component value recorded as a component with UCUM (preferred)"/>
       <definition value="Vital Sign component value recorded as a component with UCUM (preferred)."/>
-      <comment value="Used when observation has a set of component observations:&#xA;-  An observation may have both a value (e.g. an  Apgar score) and component observations (the observations from which the Apgar score was derived). &#xA;-  If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- For additional guidance, see the [Notes section](observation.html#notes) below."/>
+      <comment value="Used when observation has a set of component observations:&#xA;-  An observation may have both a value (e.g. an  Apgar score) and component observations (the observations from which the Apgar score was derived). &#xA;-  If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- If a value is present, the datatype for this element should be determined by the `code`.&#xA;-  *CodeableConcept* with just a text would be used instead of a string if the field was usually coded, or if the type associated with the `code` defines a coded value.&#xA;-  *Attachment* is used if the observation result value is a binary file such as an image.  If the observation result value is derived from the binary file (for example 'X' detected and here is the proof in this image), the binary file may be directly represented using *DocumentReference* and referenced by `derivedFrom`.&#xA;- For additional guidance, see the [Notes section](observation.html#notes) below."/>
       <requirements value="An observation exists to have a value, though it might not if it is in error, or if it represents a group of observations."/>
       <min value="0"/>
       <max value="1"/>

@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "package-material",
   "meta": {
-    "lastUpdated": "2026-06-14T04:13:29.148+11:00"
+    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
   },
   "text": {
     "status": "generated",
@@ -30,10 +30,10 @@
     }
   ],
   "version": "6.0.0-ballot4",
-  "name": "PackageMaterial",
+  "name": "PackageMaterialExample",
   "title": "Package Material",
   "status": "active",
-  "experimental": false,
+  "experimental": true,
   "date": "2021-01-05T10:01:24+11:00",
   "publisher": "HL7 (FHIR Project)",
   "contact": [

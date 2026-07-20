@@ -78,12 +78,14 @@
   "diagnosis": [
     {
       "sequence": 1,
-      "diagnosisCodeableConcept": {
-        "coding": [
-          {
-            "code": "654456"
-          }
-        ]
+      "diagnosis": {
+        "concept": {
+          "coding": [
+            {
+              "code": "654456"
+            }
+          ]
+        }
       }
     }
   ],
@@ -100,13 +102,15 @@
         }
       ],
       "date": "2014-08-16",
-      "procedureCodeableConcept": {
-        "coding": [
-          {
-            "code": "SDI9901"
-          }
-        ],
-        "text": "Subcutaneous diagnostic implant"
+      "procedure": {
+        "concept": {
+          "coding": [
+            {
+              "code": "SDI9901"
+            }
+          ],
+          "text": "Subcutaneous diagnostic implant"
+        }
       },
       "udi": [
         {

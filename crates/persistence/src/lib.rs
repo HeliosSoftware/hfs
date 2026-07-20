@@ -161,6 +161,15 @@ pub mod types;
 /// `Default` impl for `FhirVersion` that is gated on `feature = "R4"` — this
 /// resolves to [`helios_fhir::FhirVersion::default_enabled`], which is available in
 /// any single-version-minimal build (e.g. R4B-only).
+///
+/// Only the backends whose `Config` carries a `fhir_version` field reference it
+/// (SQLite/Postgres/MongoDB/Elasticsearch); the S3 config does not.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
 pub(crate) fn default_fhir_version() -> helios_fhir::FhirVersion {
     helios_fhir::FhirVersion::default_enabled()
 }
