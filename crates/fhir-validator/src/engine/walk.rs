@@ -89,13 +89,16 @@ pub(super) struct WalkCtx<'a> {
 
 impl WalkCtx<'_> {
     pub(super) fn error(&mut self, kind: ErrorKind, message: String) {
-        self.errors.push(ValidationError::new(kind, self.path.render_dotted(), message));
+        self.errors.push(ValidationError::new(
+            kind,
+            self.path.render_dotted(),
+            message,
+        ));
     }
 
     fn error_with_severity(&mut self, kind: ErrorKind, message: String, severity: Severity) {
         self.errors.push(
-            ValidationError::new(kind, self.path.render_dotted(), message)
-                .with_severity(severity),
+            ValidationError::new(kind, self.path.render_dotted(), message).with_severity(severity),
         );
     }
 }
@@ -140,7 +143,10 @@ pub(super) fn validate(
 
     validate_node(&mut ctx, &set, resource);
 
-    SyncOutcome { errors: ctx.errors, deferred: ctx.deferred }
+    SyncOutcome {
+        errors: ctx.errors,
+        deferred: ctx.deferred,
+    }
 }
 
 /// `meta.profile` entries, in document order.
@@ -172,9 +178,10 @@ fn add_profile(
                 errors::msg_unknown_profile(profile),
                 Severity::Warning,
             ),
-            UnknownProfilePolicy::Error => {
-                ctx.error(ErrorKind::UnknownProfile, errors::msg_unknown_profile(profile))
-            }
+            UnknownProfilePolicy::Error => ctx.error(
+                ErrorKind::UnknownProfile,
+                errors::msg_unknown_profile(profile),
+            ),
             UnknownProfilePolicy::Ignore => {}
         },
     }
@@ -196,22 +203,26 @@ pub(super) fn add_schemas_to_set(
     }
 
     if let Some(base) = schema.base.clone()
-        && !set.contains_key(&base) {
-            match ctx.resolver.resolve(&base) {
-                Some(base_schema) => add_schemas_to_set(ctx, set, base_schema, &base),
-                None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&base)),
-            }
+        && !set.contains_key(&base)
+    {
+        match ctx.resolver.resolve(&base) {
+            Some(base_schema) => add_schemas_to_set(ctx, set, base_schema, &base),
+            None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&base)),
         }
+    }
 
     if let Some(type_ref) = schema.type_.clone()
-        && !schema.is_primitive() && !set.contains_key(&type_ref) {
-            match ctx.resolver.resolve(&type_ref) {
-                Some(type_schema) => add_schemas_to_set(ctx, set, type_schema, &type_ref),
-                None => {
-                    ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&type_ref))
-                }
-            }
+        && !schema.is_primitive()
+        && !set.contains_key(&type_ref)
+    {
+        match ctx.resolver.resolve(&type_ref) {
+            Some(type_schema) => add_schemas_to_set(ctx, set, type_schema, &type_ref),
+            None => ctx.error(
+                ErrorKind::UnknownSchema,
+                errors::msg_unknown_schema(&type_ref),
+            ),
         }
+    }
 
     // `elementReference` pulls another element's schema into the set —
     // the mechanism behind recursive structures like Questionnaire.item.
@@ -220,7 +231,10 @@ pub(super) fn add_schemas_to_set(
         let ref_key = segments.join(".");
         match resolve_element_reference(ctx.resolver, &segments) {
             Some(target) => add_schemas_to_set(ctx, set, target, &ref_key),
-            None => ctx.error(ErrorKind::UnknownSchema, errors::msg_unknown_schema(&ref_key)),
+            None => ctx.error(
+                ErrorKind::UnknownSchema,
+                errors::msg_unknown_schema(&ref_key),
+            ),
         }
     }
 
@@ -318,13 +332,18 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
             super::primitives::validate_primitive(ctx, schema, data);
         }
         if let Some(fixed) = &schema.fixed
-            && data != fixed {
-                ctx.error(ErrorKind::FixedValue, errors::msg_fixed_value(fixed, data));
-            }
+            && data != fixed
+        {
+            ctx.error(ErrorKind::FixedValue, errors::msg_fixed_value(fixed, data));
+        }
         if let Some(pattern) = &schema.pattern
-            && !is_partial_match(data, pattern) {
-                ctx.error(ErrorKind::PatternValue, errors::msg_pattern_value(pattern, data));
-            }
+            && !is_partial_match(data, pattern)
+        {
+            ctx.error(
+                ErrorKind::PatternValue,
+                errors::msg_pattern_value(pattern, data),
+            );
+        }
         if let Some(constraints) = &schema.constraints {
             let path = ctx.path.render_dotted();
             for (id, c) in constraints {
@@ -361,10 +380,11 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
             // Runs when a choice-group declarer joins a branch element's
             // set; the branch key is the last named path segment.
             if let Some(branch) = ctx.path.last_key()
-                && !choices.iter().any(|c| c == branch) {
-                    let message = errors::msg_choice_excluded(branch);
-                    ctx.error(ErrorKind::ChoiceExcluded, message);
-                }
+                && !choices.iter().any(|c| c == branch)
+            {
+                let message = errors::msg_choice_excluded(branch);
+                ctx.error(ErrorKind::ChoiceExcluded, message);
+            }
         }
     }
 }
@@ -455,13 +475,15 @@ fn eval_element(
         let schemas: Vec<Arc<FhirSchema>> = elset.schemas().cloned().collect();
         for schema in &schemas {
             if let Some(min) = schema.min
-                && (items.len() as u64) < min {
-                    ctx.error(ErrorKind::Min, errors::msg_min(min, items.len()));
-                }
+                && (items.len() as u64) < min
+            {
+                ctx.error(ErrorKind::Min, errors::msg_min(min, items.len()));
+            }
             if let Some(max) = schema.max
-                && (items.len() as u64) > max {
-                    ctx.error(ErrorKind::Max, errors::msg_max(max, items.len()));
-                }
+                && (items.len() as u64) > max
+            {
+                ctx.error(ErrorKind::Max, errors::msg_max(max, items.len()));
+            }
         }
 
         // Slicing (mark/sweep). Items validated cooperatively with their
@@ -645,7 +667,11 @@ fn compile_extensions(
 
     if !slices.is_empty() {
         let synthetic = FhirSchema {
-            slicing: Some(Slicing { slices, rules: None, ordered: None }),
+            slicing: Some(Slicing {
+                slices,
+                rules: None,
+                ordered: None,
+            }),
             ..Default::default()
         };
         add_schemas_to_set(ctx, elset, Arc::new(synthetic), "extension");
@@ -674,9 +700,33 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         };
     }
     overlay!(
-        url, name, base, kind, derivation, type_, array, scalar, min, max, elements, required,
-        excluded, element_reference, choices, choice_of, fixed, pattern, binding, constraints,
-        refers, slicing, extensions, modifier, must_support, summary, regex,
+        url,
+        name,
+        base,
+        kind,
+        derivation,
+        type_,
+        array,
+        scalar,
+        min,
+        max,
+        elements,
+        required,
+        excluded,
+        element_reference,
+        choices,
+        choice_of,
+        fixed,
+        pattern,
+        binding,
+        constraints,
+        refers,
+        slicing,
+        extensions,
+        modifier,
+        must_support,
+        summary,
+        regex,
     );
     out
 }
@@ -690,9 +740,9 @@ pub(crate) fn is_partial_match(data: &Value, pattern: &Value) -> bool {
             let Some(data_map) = data.as_object() else {
                 return false;
             };
-            pattern_map.iter().all(|(k, pv)| {
-                data_map.get(k).is_some_and(|dv| is_partial_match(dv, pv))
-            })
+            pattern_map
+                .iter()
+                .all(|(k, pv)| data_map.get(k).is_some_and(|dv| is_partial_match(dv, pv)))
         }
         Value::Array(pattern_items) => {
             let Some(data_items) = data.as_array() else {
@@ -715,10 +765,19 @@ mod tests {
 
     #[test]
     fn partial_match_semantics() {
-        assert!(is_partial_match(&json!({"use": "home", "city": "X"}), &json!({"use": "home"})));
-        assert!(!is_partial_match(&json!({"use": "work"}), &json!({"use": "home"})));
+        assert!(is_partial_match(
+            &json!({"use": "home", "city": "X"}),
+            &json!({"use": "home"})
+        ));
+        assert!(!is_partial_match(
+            &json!({"use": "work"}),
+            &json!({"use": "home"})
+        ));
         assert!(!is_partial_match(&json!("home"), &json!({"use": "home"})));
-        assert!(is_partial_match(&json!({"a": {"b": 1, "c": 2}}), &json!({"a": {"b": 1}})));
+        assert!(is_partial_match(
+            &json!({"a": {"b": 1, "c": 2}}),
+            &json!({"a": {"b": 1}})
+        ));
         assert!(is_partial_match(&json!([1, 2, 3]), &json!([1, 2])));
         assert!(!is_partial_match(&json!([2, 1]), &json!([1])));
         assert!(is_partial_match(&json!(5), &json!(5)));

@@ -43,7 +43,10 @@ pub(super) fn validate_primitive(ctx: &mut WalkCtx<'_>, schema: &FhirSchema, dat
         && let Some(re) = compiled(pattern)
         && !re.is_match(s)
     {
-        ctx.error(ErrorKind::PrimitiveValue, errors::msg_primitive_regex(type_name, s));
+        ctx.error(
+            ErrorKind::PrimitiveValue,
+            errors::msg_primitive_regex(type_name, s),
+        );
     }
 }
 
@@ -75,9 +78,7 @@ fn expected_json_class(type_name: &str) -> Option<JsonClass> {
         // Everything else — string, uri, code, dateTime, base64Binary, ... —
         // is a JSON string. Unknown primitive names get no class check.
         "string" | "uri" | "url" | "canonical" | "oid" | "uuid" | "id" | "code" | "markdown"
-        | "base64Binary" | "instant" | "date" | "dateTime" | "time" | "xhtml" => {
-            JsonClass::String
-        }
+        | "base64Binary" | "instant" | "date" | "dateTime" | "time" | "xhtml" => JsonClass::String,
         _ => return None,
     })
 }

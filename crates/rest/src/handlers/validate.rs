@@ -135,7 +135,11 @@ fn unwrap_inputs(body: Option<Value>, query: &ValidateQuery) -> Result<ValidateI
         });
     }
 
-    Ok(ValidateInputs { resource, mode, profiles })
+    Ok(ValidateInputs {
+        resource,
+        mode,
+        profiles,
+    })
 }
 
 /// Shared tail: run validation and shape the 200 OperationOutcome response.
@@ -155,12 +159,20 @@ where
     // Delete validation: no content checks yet (no referential integrity).
     if inputs.mode == ValidateMode::Delete {
         let outcome = OperationOutcomeBuilder::new()
-            .information(IssueType::Informational, "Delete validation not performed: no checks configured")
+            .information(
+                IssueType::Informational,
+                "Delete validation not performed: no checks configured",
+            )
             .build();
-        return format_resource_response(StatusCode::OK, HeaderMap::new(), &outcome, negotiated.format)
-            .map_err(|_| RestError::InternalError {
-                message: "Failed to serialize response".to_string(),
-            });
+        return format_resource_response(
+            StatusCode::OK,
+            HeaderMap::new(),
+            &outcome,
+            negotiated.format,
+        )
+        .map_err(|_| RestError::InternalError {
+            message: "Failed to serialize response".to_string(),
+        });
     }
 
     let Some(resource) = inputs.resource else {
@@ -193,8 +205,15 @@ where
     );
 
     let outcome = validation_outcome(&issues);
-    format_resource_response(StatusCode::OK, HeaderMap::new(), &outcome, negotiated.format)
-        .map_err(|_| RestError::InternalError { message: "Failed to serialize response".to_string() })
+    format_resource_response(
+        StatusCode::OK,
+        HeaderMap::new(),
+        &outcome,
+        negotiated.format,
+    )
+    .map_err(|_| RestError::InternalError {
+        message: "Failed to serialize response".to_string(),
+    })
 }
 
 /// `POST [base]/[type]/$validate`

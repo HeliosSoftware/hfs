@@ -66,9 +66,10 @@ pub fn core_registry(version: FhirVersion) -> Arc<SchemaRegistry> {
 fn load_pack(bytes: &[u8]) -> SchemaRegistry {
     let mut decoder = GzDecoder::new(bytes);
     let mut json = Vec::new();
-    decoder.read_to_end(&mut json).expect("embedded pack decompresses");
-    let schemas: Vec<FhirSchema> =
-        serde_json::from_slice(&json).expect("embedded pack parses");
+    decoder
+        .read_to_end(&mut json)
+        .expect("embedded pack decompresses");
+    let schemas: Vec<FhirSchema> = serde_json::from_slice(&json).expect("embedded pack parses");
 
     let mut registry = SchemaRegistry::new();
     let (profiles, core): (Vec<_>, Vec<_>) = schemas

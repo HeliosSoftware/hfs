@@ -249,7 +249,7 @@ pub async fn page(
         available: true,
         error,
         active_page: "tenants",
-            nl_enabled: state.nl.enabled,
+        nl_enabled: state.nl.enabled,
     })
 }
 

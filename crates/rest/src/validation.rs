@@ -21,11 +21,11 @@ use dashmap::DashMap;
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::fhirpath_effects::FhirPathConstraintEvaluator;
 use helios_fhir_validator::{
-    dotted_to_fhirpath, CodedValue, CompositeResolver, EffectHandlers, ErrorKind, SchemaRegistry,
-    SchemaResolver, Severity, TerminologyError, TerminologyProvider, UnknownProfilePolicy,
-    ValidationError, ValidationOptions, Validator,
+    CodedValue, CompositeResolver, EffectHandlers, ErrorKind, SchemaRegistry, SchemaResolver,
+    Severity, TerminologyError, TerminologyProvider, UnknownProfilePolicy, ValidationError,
+    ValidationOptions, Validator, dotted_to_fhirpath,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -163,7 +163,9 @@ impl ValidationService {
             suppress_constraints: &self.suppress_constraints,
             terminology_fail_closed: self.terminology_fail_closed,
         };
-        validator.validate(resource, version, &opts, &handlers).await
+        validator
+            .validate(resource, version, &opts, &handlers)
+            .await
     }
 
     /// Write-path gate. `Ok(())` = proceed with the write; `Err` = reject
@@ -208,7 +210,9 @@ impl ValidationService {
                         issues = issues.len(),
                         "rejecting write: validation failed"
                     );
-                    Err(RestError::ValidationFailed { outcome: validation_outcome(&issues) })
+                    Err(RestError::ValidationFailed {
+                        outcome: validation_outcome(&issues),
+                    })
                 } else {
                     // Warnings only: proceed, but leave a trace.
                     for issue in &issues {
@@ -276,7 +280,10 @@ struct LockedRegistryResolver(Arc<RwLock<SchemaRegistry>>);
 
 impl SchemaResolver for LockedRegistryResolver {
     fn resolve(&self, reference: &str) -> Option<Arc<helios_fhir_validator::FhirSchema>> {
-        self.0.read().expect("tenant profile registry lock").resolve(reference)
+        self.0
+            .read()
+            .expect("tenant profile registry lock")
+            .resolve(reference)
     }
 }
 

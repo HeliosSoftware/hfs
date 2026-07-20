@@ -217,7 +217,9 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
         .and_then(|s| s.get("element"))
         .or_else(|| sd.get("differential").and_then(|d| d.get("element")))
         .and_then(Value::as_array)
-        .ok_or(ConvertError::Missing("snapshot.element or differential.element"))?;
+        .ok_or(ConvertError::Missing(
+            "snapshot.element or differential.element",
+        ))?;
 
     let elements: Vec<Ed> = element_values
         .iter()
@@ -232,7 +234,12 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
     // Primitive types produce a leaf schema with a value regex.
     if kind_raw == "primitive-type" {
         let schema = primitives::convert_primitive(
-            url, name, &sd_type, derivation, &elements, &mut warnings,
+            url,
+            name,
+            &sd_type,
+            derivation,
+            &elements,
+            &mut warnings,
         );
         return Ok(Conversion { schema, warnings });
     }

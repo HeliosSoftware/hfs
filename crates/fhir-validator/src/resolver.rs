@@ -49,13 +49,15 @@ impl SchemaRegistry {
         let schema = Arc::new(schema);
         let key = key.into();
         if let Some(url) = schema.url.clone()
-            && url != key {
-                self.map.insert(url, Arc::clone(&schema));
-            }
+            && url != key
+        {
+            self.map.insert(url, Arc::clone(&schema));
+        }
         if let Some(name) = schema.name.clone()
-            && name != key {
-                self.map.insert(name, Arc::clone(&schema));
-            }
+            && name != key
+        {
+            self.map.insert(name, Arc::clone(&schema));
+        }
         self.map.insert(key, schema);
     }
 
@@ -143,12 +145,23 @@ mod tests {
     #[test]
     fn composite_earlier_layer_wins() {
         let mut base = SchemaRegistry::new();
-        base.insert_named("Patient", FhirSchema { kind: Some("resource".into()), ..Default::default() });
+        base.insert_named(
+            "Patient",
+            FhirSchema {
+                kind: Some("resource".into()),
+                ..Default::default()
+            },
+        );
         let mut overlay = SchemaRegistry::new();
-        overlay.insert_named("Patient", FhirSchema { kind: Some("constraint".into()), ..Default::default() });
+        overlay.insert_named(
+            "Patient",
+            FhirSchema {
+                kind: Some("constraint".into()),
+                ..Default::default()
+            },
+        );
 
-        let composite =
-            CompositeResolver::new(vec![Arc::new(overlay), Arc::new(base)]);
+        let composite = CompositeResolver::new(vec![Arc::new(overlay), Arc::new(base)]);
         assert_eq!(
             composite.resolve("Patient").unwrap().kind.as_deref(),
             Some("constraint")

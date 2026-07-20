@@ -25,7 +25,14 @@ fn all_enabled_packs_load_and_validate() {
     ];
     for version in versions {
         let registry = core_registry(version);
-        for name in ["Patient", "Observation", "Bundle", "Resource", "Element", "string"] {
+        for name in [
+            "Patient",
+            "Observation",
+            "Bundle",
+            "Resource",
+            "Element",
+            "string",
+        ] {
             assert!(
                 registry.resolve(name).is_some(),
                 "{version:?}: core schema '{name}' must resolve"
@@ -36,12 +43,19 @@ fn all_enabled_packs_load_and_validate() {
             &json!({ "resourceType": "Patient", "active": true }),
             &ValidationOptions::default(),
         );
-        assert_eq!(outcome.errors, vec![], "{version:?}: minimal Patient must be clean");
+        assert_eq!(
+            outcome.errors,
+            vec![],
+            "{version:?}: minimal Patient must be clean"
+        );
         let outcome = validator.validate_sync(
             &json!({ "resourceType": "Patient", "bogus": 1 }),
             &ValidationOptions::default(),
         );
-        assert!(!outcome.errors.is_empty(), "{version:?}: unknown element must be caught");
+        assert!(
+            !outcome.errors.is_empty(),
+            "{version:?}: unknown element must be caught"
+        );
     }
 }
 
@@ -79,21 +93,40 @@ fn structural_validation_latency_smoke() {
     println!("structural validation: {per_run:?} per typical Patient");
     // Generous ceiling so debug builds pass; release comfortably beats the
     // 5ms plan target (verified manually).
-    assert!(per_run.as_millis() < 50, "structural validation too slow: {per_run:?}");
+    assert!(
+        per_run.as_millis() < 50,
+        "structural validation too slow: {per_run:?}"
+    );
 }
 
 #[test]
 #[ignore = "whole-pack parse; run with -- --ignored"]
 fn r4_pack_loads_and_resolves_core_schemas() {
     let registry = core_registry(FhirVersion::R4);
-    for name in ["Patient", "Observation", "Bundle", "Resource", "DomainResource", "Element",
-        "Extension", "HumanName", "string", "boolean", "dateTime", "Questionnaire"]
-    {
-        assert!(registry.resolve(name).is_some(), "core schema '{name}' must resolve");
+    for name in [
+        "Patient",
+        "Observation",
+        "Bundle",
+        "Resource",
+        "DomainResource",
+        "Element",
+        "Extension",
+        "HumanName",
+        "string",
+        "boolean",
+        "dateTime",
+        "Questionnaire",
+    ] {
+        assert!(
+            registry.resolve(name).is_some(),
+            "core schema '{name}' must resolve"
+        );
     }
     // Canonical URLs resolve to the same schemas.
     let by_name = registry.resolve("Patient").unwrap();
-    let by_url = registry.resolve("http://hl7.org/fhir/StructureDefinition/Patient").unwrap();
+    let by_url = registry
+        .resolve("http://hl7.org/fhir/StructureDefinition/Patient")
+        .unwrap();
     assert!(std::sync::Arc::ptr_eq(&by_name, &by_url));
     // Primitives carry their value regexes.
     assert!(registry.resolve("string").unwrap().regex.is_some());
@@ -103,7 +136,13 @@ fn r4_pack_loads_and_resolves_core_schemas() {
     let nested = &item.elements.as_ref().unwrap()["item"];
     assert_eq!(
         nested.element_reference.as_deref(),
-        Some(&["Questionnaire".to_string(), "elements".to_string(), "item".to_string()][..])
+        Some(
+            &[
+                "Questionnaire".to_string(),
+                "elements".to_string(),
+                "item".to_string()
+            ][..]
+        )
     );
 }
 
@@ -164,10 +203,22 @@ fn r4_pack_validates_known_good_and_bad_resources() {
     let kinds: Vec<String> = outcome
         .errors
         .iter()
-        .map(|e| serde_json::to_value(e.kind).unwrap().as_str().unwrap().to_string())
+        .map(|e| {
+            serde_json::to_value(e.kind)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
-    assert!(kinds.contains(&"unknown-element".to_string()), "kinds: {kinds:?}");
-    assert!(kinds.contains(&"not-singular".to_string()), "kinds: {kinds:?}");
+    assert!(
+        kinds.contains(&"unknown-element".to_string()),
+        "kinds: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"not-singular".to_string()),
+        "kinds: {kinds:?}"
+    );
     assert!(kinds.contains(&"not-array".to_string()), "kinds: {kinds:?}");
     assert!(kinds.contains(&"choice".to_string()), "kinds: {kinds:?}");
 
@@ -179,7 +230,10 @@ fn r4_pack_validates_known_good_and_bad_resources() {
     });
     let outcome = validator.validate_sync(&bundle, &opts);
     assert!(
-        outcome.errors.iter().any(|e| e.path == "Bundle.entry.0.resource.wrong"),
+        outcome
+            .errors
+            .iter()
+            .any(|e| e.path == "Bundle.entry.0.resource.wrong"),
         "dynamic resolution must reach the nested Patient, got: {}",
         serde_json::to_string_pretty(&outcome.errors).unwrap()
     );
