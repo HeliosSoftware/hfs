@@ -21,6 +21,7 @@
 //! | `HFS_DEFAULT_FHIR_VERSION` | R4 | Default FHIR version (R4, R4B, R5, R6) |
 //! | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode (header_only, url_path, both) |
 //! | `HFS_TENANT_STRICT_VALIDATION` | false | Error if URL and header tenant disagree |
+//! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
 //! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
 //! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
 //!
@@ -202,6 +203,15 @@ pub struct MultitenancyConfig {
     pub strict_validation: bool,
     /// JWT claim name containing tenant ID (for future JWT-based tenant resolution).
     pub jwt_tenant_claim: String,
+    /// If true, only tenants provisioned through the admin API are valid: a
+    /// request resolving to a tenant absent from the registry is rejected rather
+    /// than implicitly created. The default (`"default"`) tenant is
+    /// auto-provisioned at startup, so single-tenant/unauthenticated deployments
+    /// keep working. Only enforced on backends that maintain a tenant registry.
+    ///
+    /// Defaults to `false` for backward compatibility (ad-hoc tenant ids keep
+    /// working); set `HFS_TENANT_REQUIRE_PROVISIONED=true` for the strict model.
+    pub require_provisioned_tenant: bool,
 }
 
 impl Default for MultitenancyConfig {
@@ -210,6 +220,7 @@ impl Default for MultitenancyConfig {
             routing_mode: TenantRoutingMode::HeaderOnly,
             strict_validation: false,
             jwt_tenant_claim: "tenant_id".to_string(),
+            require_provisioned_tenant: false,
         }
     }
 }
@@ -229,10 +240,15 @@ impl MultitenancyConfig {
         let jwt_tenant_claim =
             std::env::var("HFS_JWT_TENANT_CLAIM").unwrap_or_else(|_| "tenant_id".to_string());
 
+        let require_provisioned_tenant = std::env::var("HFS_TENANT_REQUIRE_PROVISIONED")
+            .map(|s| s.to_lowercase() == "true" || s == "1")
+            .unwrap_or(false);
+
         Self {
             routing_mode,
             strict_validation,
             jwt_tenant_claim,
+            require_provisioned_tenant,
         }
     }
 }
@@ -775,6 +791,13 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
+    /// Seed the spec conformance resources (SearchParameters and
+    /// CompartmentDefinitions) into primary storage for every provisioned tenant
+    /// — at startup and on tenant provisioning. Disable to leave storage
+    /// untouched (e.g. in tests that assert exact resource counts).
+    #[arg(long, env = "HFS_SEED_CONFORMANCE", default_value = "true")]
+    pub seed_conformance: bool,
+
     /// Export sink type: "fs" (default, local filesystem) or "s3" (AWS S3).
     #[arg(long, env = "HFS_EXPORT_SINK", default_value = "fs")]
     pub export_sink: String,
@@ -908,6 +931,7 @@ impl Default for ServerConfig {
             elasticsearch_username: None,
             elasticsearch_password: None,
             sof_enabled: true,
+            seed_conformance: true,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
@@ -1029,6 +1053,7 @@ impl ServerConfig {
             elasticsearch_username: None,
             elasticsearch_password: None,
             sof_enabled: true,
+            seed_conformance: true,
             export_sink: "fs".to_string(),
             export_dir: "./exports".to_string(),
             export_s3_bucket: None,
@@ -1497,6 +1522,7 @@ mod tests {
             routing_mode: TenantRoutingMode::UrlPath,
             strict_validation: true,
             jwt_tenant_claim: "custom_claim".to_string(),
+            ..Default::default()
         };
         assert_eq!(config.routing_mode, TenantRoutingMode::UrlPath);
         assert!(config.strict_validation);

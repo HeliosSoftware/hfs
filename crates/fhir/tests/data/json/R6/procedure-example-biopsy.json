@@ -48,9 +48,9 @@
       }
     }
   ],
-  "bodyStructure": {
-    "reference": "BodyStructure/skin-patch"
-  },
+  "bodyStructure": [
+    {}
+  ],
   "complication": [
     {
       "concept": {

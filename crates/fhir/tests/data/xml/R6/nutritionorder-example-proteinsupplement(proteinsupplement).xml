@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  id = proteinsupplement  file name = nutritionorder-example-proteinsupplement.xml  Name= Protein Supplement  Description = Nutrition Order Protein Supplement Canonical Example
-edited by Eric Haas Health eData Inc
- -->
-  <!--  EH: This example has no food exclusions or preferences  -->
-  <!--  EH: use supplement element  -->
+  <!-- id = proteinsupplement  file name = nutritionorder-example-proteinsupplement.xml  Name= Protein Supplement  Description = Nutrition Order Protein Supplement Canonical Example
+edited by Eric Haas Health eData Inc -->
+  <!-- EH: This example has no food exclusions or preferences -->
+  <!-- EH: use supplement element -->
   <id value="proteinsupplement"/>
   <meta>
     <security>

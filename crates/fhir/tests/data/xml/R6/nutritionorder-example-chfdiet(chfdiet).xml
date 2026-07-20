@@ -40,7 +40,7 @@
     </coding>
   </excludeFoodModifier>
   <oralDiet>
-    <!--  EH:  list type of diet showing standard code and local codes  -->
+    <!-- EH:  list type of diet showing standard code and local codes -->
     <type>
       <coding>
         <system value="http://snomed.info/sct"/>
@@ -67,7 +67,7 @@
       </coding>
       <text value="Fluid restricted diet"/>
     </type>
-    <!--  list nutrients and amounts here  -->
+    <!-- list nutrients and amounts here -->
     <nutrient>
       <modifier>
         <coding>
@@ -98,7 +98,7 @@
         <code value="mL"/>
       </amount>
     </nutrient>
-    <!-- instructions as free text  -->
+    <!-- instructions as free text -->
     <instruction value="Starting on 2/10 breakfast, maximum 400 ml fluids per meal"/>
   </oralDiet>
 </NutritionOrder>

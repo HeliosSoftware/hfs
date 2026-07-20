@@ -70,7 +70,7 @@
   <status value="unfulfilled"/>
   <medication>
     <reference>
-      <!--  Linked to a RESOURCE Medication  -->
+      <!-- Linked to a RESOURCE Medication -->
       <reference value="#med0317"/>
       <display value="Potassium Chloride 20mEq in 1L Normal Saline"/>
     </reference>

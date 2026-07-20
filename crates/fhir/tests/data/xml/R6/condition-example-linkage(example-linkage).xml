@@ -28,7 +28,7 @@
       <code value="encounter-diagnosis"/>
       <display value="Encounter Diagnosis"/>
     </coding>
-    <!--  and also a SNOMED CT coding  -->
+    <!-- and also a SNOMED CT coding -->
     <coding>
       <system value="http://snomed.info/sct"/>
       <code value="439401001"/>
@@ -50,14 +50,6 @@
     </coding>
     <text value="Burnt Ear"/>
   </code>
-  <bodySite>
-    <coding>
-      <system value="http://snomed.info/sct"/>
-      <code value="49521004"/>
-      <display value="Left external ear structure"/>
-    </coding>
-    <text value="Left Ear"/>
-  </bodySite>
   <subject>
     <reference value="Patient/example"/>
   </subject>

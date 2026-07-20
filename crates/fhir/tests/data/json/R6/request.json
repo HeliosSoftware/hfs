@@ -21,7 +21,7 @@
   "title": "request",
   "status": "draft",
   "experimental": false,
-  "date": "2026-06-13T17:13:29+00:00",
+  "date": "2026-07-17T03:44:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -116,7 +116,7 @@
         "path": "Request.identifier",
         "short": "Business Identifier for {{title}}",
         "definition": "Business identifiers assigned to this {{title}} by the author and/or other systems.  These identifiers remain constant as the resource is updated and propagates from server to server.",
-        "comment": "The identifier.type element is used to distinguish between the identifiers assigned by the requester/placer and the performer/filler.\n\nNote: This is a business identifier, not a resource identifier (see [discussion](resource.html#identifiers)).  It is best practice for the identifier to only appear on a single resource instance, however business practices may occasionally dictate that multiple resource instances with the same identifier can exist - possibly even with different resource types.  For example, multiple Patient and a Person resource instance might share the same social insurance number.",
+        "comment": "The identifier.type element is used to distinguish between the identifiers assigned by the requester/placer and the performer/filler.\n\nNote: This is a business identifier, not a resource identifier (see [general discussion](resource.html#identifiers) and [request-specific discussion](request.html#identifier)).  It is best practice for the identifier to only appear on a single resource instance, however business practices may occasionally dictate that multiple resource instances with the same identifier can exist - possibly even with different resource types.  For example, multiple Patient and a Person resource instance might share the same social insurance number.",
         "requirements": "Allows identification of the {{title}} as it is known by various participating systems and in a way that remains consistent across servers.",
         "min": 0,
         "max": "*",
@@ -183,7 +183,6 @@
               "http://hl7.org/fhir/StructureDefinition/CommunicationRequest",
               "http://hl7.org/fhir/StructureDefinition/CoverageEligibilityRequest",
               "http://hl7.org/fhir/StructureDefinition/DeviceRequest",
-              "http://hl7.org/fhir/StructureDefinition/EnrollmentRequest",
               "http://hl7.org/fhir/StructureDefinition/MedicationRequest",
               "http://hl7.org/fhir/StructureDefinition/NutritionOrder",
               "http://hl7.org/fhir/StructureDefinition/RequestOrchestration",
@@ -244,7 +243,6 @@
               "http://hl7.org/fhir/StructureDefinition/CommunicationRequest",
               "http://hl7.org/fhir/StructureDefinition/CoverageEligibilityRequest",
               "http://hl7.org/fhir/StructureDefinition/DeviceRequest",
-              "http://hl7.org/fhir/StructureDefinition/EnrollmentRequest",
               "http://hl7.org/fhir/StructureDefinition/MedicationRequest",
               "http://hl7.org/fhir/StructureDefinition/NutritionOrder",
               "http://hl7.org/fhir/StructureDefinition/RequestOrchestration",
@@ -504,6 +502,7 @@
         "path": "Request.priority",
         "short": "routine | urgent | asap | stat",
         "definition": "Indicates how quickly the {{title}} should be addressed with respect to other requests.",
+        "comment": "Different systems, organizations, and/or jurisdictions may have differing business expectations around the same priority code.  For timing critical requests, it is best to make the timing requirement explicit in Request.effective[x] rather than relying on a priority code to indicate performance timing expectations.",
         "min": 0,
         "max": "1",
         "base": {
@@ -516,7 +515,6 @@
             "code": "code"
           }
         ],
-        "meaningWhenMissing": "If missing, this task should be performed with normal priority",
         "constraint": [
           {
             "key": "ele-1",
@@ -891,11 +889,12 @@
       {
         "id": "Request.authoredOn",
         "path": "Request.authoredOn",
-        "short": "When request was created/transitioned to active",
+        "short": "When request was created/transitioned to active (e.g. signed/authorized)",
         "definition": "For draft {{title}}s, indicates the date of initial creation.  For requests with other statuses, indicates the date of activation.",
         "alias": [
           "createdOn",
-          "signedOn"
+          "signedOn",
+          "authorizedOn"
         ],
         "min": 0,
         "max": "1",

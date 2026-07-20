@@ -101,7 +101,10 @@
       "text": "impact"
     },
     "offsetDuration": {
-      "value": 0
+      "value": 0,
+      "unit": "s",
+      "system": "http://unitsofmeasure.org",
+      "code": "s"
     },
     "text": "on impact"
   }

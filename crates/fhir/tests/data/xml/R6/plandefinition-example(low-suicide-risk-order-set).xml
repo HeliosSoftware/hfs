@@ -646,7 +646,7 @@
       <id value="referralToMentalHealthCare"/>
       <status value="draft"/>
       <description value="refer to primary care mental-health integrated care program for evaluation and treatment of mental health conditions now"/>
-      <!--  Kind indicates the type of resource that is defined by this activity, a ServiceRequest in this case  -->
+      <!-- Kind indicates the type of resource that is defined by this activity, a ServiceRequest in this case -->
       <kind value="ServiceRequest"/>
       <code>
         <coding>
@@ -657,7 +657,7 @@
       </code>
       <timingTiming>
         <event>
-          <!--  The expression here specifies the value for the timing of the resulting resource. In this case, referralRequest.fulfillmentTime.start  -->
+          <!-- The expression here specifies the value for the timing of the resulting resource. In this case, referralRequest.fulfillmentTime.start -->
           <extension url="http://hl7.org/fhir/StructureDefinition/cqf-expression">
             <valueExpression>
               <language value="text/cql-expression"/>
@@ -679,36 +679,6 @@
       <productReference>
         <reference value="#citalopramMedication"/>
       </productReference>
-      <dosage>
-        <text value="1 tablet oral 1 time daily"/>
-        <timing>
-          <repeat>
-            <frequency value="1"/>
-            <period value="1"/>
-            <periodUnit value="d"/>
-          </repeat>
-        </timing>
-        <route>
-          <coding>
-            <code value="26643006"/>
-            <display value="Oral route (qualifier value)"/>
-          </coding>
-          <text value="Oral route (qualifier value)"/>
-        </route>
-        <doseAndRate>
-          <type>
-            <coding>
-              <system value="http://terminology.hl7.org/CodeSystem/dose-rate-type"/>
-              <code value="ordered"/>
-              <display value="Ordered"/>
-            </coding>
-          </type>
-          <doseQuantity>
-            <value value="1"/>
-            <unit value="{tbl}"/>
-          </doseQuantity>
-        </doseAndRate>
-      </dosage>
       <dynamicValue>
         <path value="dispenseRequest.numberOfRepeatsAllowed"/>
         <expression>
@@ -941,7 +911,7 @@
     <resource value="http://example.org/fhir/ActivityDefinition/citalopramPrescription"/>
   </relatedArtifact>
   <library value="http://example.org/fhir/Library/suiciderisk-orderset-logic"/>
-  <!--  Actions  -->
+  <!-- Actions -->
   <action>
     <title value="Suicide Risk Assessment and Outpatient Management"/>
     <action>
@@ -951,7 +921,7 @@
       <action>
         <textEquivalent value="Refer to outpatient mental health program for evaluation and treatment of mental health conditions now"/>
         <definitionCanonical value="#referralToMentalHealthCare"/>
-        <!--  These expressions will be evaluated with the library referenced above as an include  -->
+        <!-- These expressions will be evaluated with the library referenced above as an include -->
         <dynamicValue>
           <path value="timing.event"/>
           <expression>
@@ -961,14 +931,14 @@
         </dynamicValue>
         <dynamicValue>
           <path value="specialty"/>
-          <!--  This expression is code selector syntax in CQL, returning the code from the NPI provider taxonomy  -->
+          <!-- This expression is code selector syntax in CQL, returning the code from the NPI provider taxonomy -->
           <expression>
             <language value="text/cql-expression"/>
             <expression value="Code '261QM0850X' from SuicideRiskLogic.&#34;NUCC Provider Taxonomy&#34; display 'Adult Mental Health'"/>
           </expression>
         </dynamicValue>
         <dynamicValue>
-          <!--  The fulfillmentTime element of the resulting ServiceRequest will be set to the result of the ServiceRequestFulfillmentTime expression defined in the SuicideRiskLogic library  -->
+          <!-- The fulfillmentTime element of the resulting ServiceRequest will be set to the result of the ServiceRequestFulfillmentTime expression defined in the SuicideRiskLogic library -->
           <path value="occurrenceDateTime"/>
           <expression>
             <language value="text/cql-expression"/>
@@ -1081,32 +1051,32 @@
               </expression>
             </dynamicValue>
           </action>
-          <!--  Follows pattern established above  -->
+          <!-- Follows pattern established above -->
           <action>
             <textEquivalent value="escitalopram 10 mg tablet 1 tablet oral 1 time daily now (30 tablet; 3 refills)"/>
           </action>
-          <!--  Follows pattern established above  -->
+          <!-- Follows pattern established above -->
           <action>
             <textEquivalent value="fluoxetine 20 mg capsule 1 capsule oral 1 time daily now (30 tablet; 3 refills)"/>
           </action>
-          <!--  Follows pattern established above  -->
+          <!-- Follows pattern established above -->
           <action>
             <textEquivalent value="paroxetine 20 mg tablet 1 tablet oral 1 time daily now (30 tablet; 3 refills)"/>
           </action>
-          <!--  Follows pattern established above  -->
+          <!-- Follows pattern established above -->
           <action>
             <textEquivalent value="sertraline 50 mg tablet 1 tablet oral 1 time daily now (30 tablet; 3 refills)"/>
           </action>
         </action>
-        <!--  Follows pattern established above  -->
+        <!-- Follows pattern established above -->
         <action>
           <textEquivalent value="Dopamine Norepinephrine Reuptake Inhibitors (Choose a maximum of one or document reasons for exception)"/>
         </action>
-        <!--  Follows pattern established above  -->
+        <!-- Follows pattern established above -->
         <action>
           <textEquivalent value="Serotonin Norepinephrine Reuptake Inhibitors (Choose a maximum of one or doument reasons for exception)"/>
         </action>
-        <!--  Follows pattern established above  -->
+        <!-- Follows pattern established above -->
         <action>
           <textEquivalent value="Norepinephrine-Serotonin Modulators (Choose a maximum of one or document reasons for exception)"/>
         </action>

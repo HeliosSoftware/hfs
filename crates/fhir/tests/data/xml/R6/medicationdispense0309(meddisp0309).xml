@@ -21,7 +21,7 @@
   </contained>
   <status value="entered-in-error"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0312"/>
       <display value="Product containing precisely nystatin 100000 unit/1 milliliter conventional release oral suspension (clinical drug)"/>

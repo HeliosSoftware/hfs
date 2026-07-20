@@ -159,7 +159,7 @@ fn server_with_ops() -> (TestServer, Arc<SqliteBackend>, CollectorSink) {
     // reindex driver emits its own lifecycle events from the background job, so
     // it needs the sink directly — unlike purge, which the handler audits.
     let reindex = Arc::new(
-        ReindexOperation::new(backend.clone(), backend.search_extractor().clone())
+        ReindexOperation::new(backend.clone(), backend.tenant_registries().clone())
             .with_audit(Arc::new(sink.clone()) as Arc<dyn AuditSink>, "Device/hfs"),
     );
 
@@ -194,7 +194,7 @@ fn server_with_principal(scopes: &str) -> (TestServer, Arc<SqliteBackend>) {
 
     let reindex = Arc::new(ReindexOperation::new(
         backend.clone(),
-        backend.search_extractor().clone(),
+        backend.tenant_registries().clone(),
     ));
     let state = helios_rest::AppState::new(
         backend.clone(),

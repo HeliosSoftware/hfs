@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><Patient xmlns="http://hl7.org/fhir">
   <id value="ihe-pcd"/>
-  <!--   MRN assigned by ACME healthcare on 6-May 2001   -->
+  <!-- MRN assigned by ACME healthcare on 6-May 2001 -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -15,7 +15,7 @@
     <value value="AB60001"/>
   </identifier>
   <active value="true"/>
-  <!--   Peter James Chalmers, but called "Jim"   -->
+  <!-- Peter James Chalmers, but called "Jim" -->
   <name>
     <family value="BROOKS"/>
     <given value="ALBERT"/>

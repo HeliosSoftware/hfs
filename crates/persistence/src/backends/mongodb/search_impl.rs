@@ -324,8 +324,9 @@ impl SearchProvider for MongoBackend {
 
     fn search_param_registry(
         &self,
-    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        self.search_registry()
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registry(tenant.tenant_id().as_str())
     }
 
     fn supports_contained_search(&self) -> bool {
@@ -1370,7 +1371,7 @@ impl MongoBackend {
             return Ok(Vec::new());
         }
 
-        let search_params = self.build_search_parameters(resource_type, &parsed_params);
+        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params);
 
         let query = SearchQuery {
             resource_type: resource_type.to_string(),
@@ -1385,10 +1386,12 @@ impl MongoBackend {
 
     fn build_search_parameters(
         &self,
+        tenant: &TenantContext,
         resource_type: &str,
         params: &[(String, String)],
     ) -> Vec<SearchParameter> {
-        let registry = self.search_registry().read();
+        let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
+        let registry = registry_arc.read();
 
         params
             .iter()

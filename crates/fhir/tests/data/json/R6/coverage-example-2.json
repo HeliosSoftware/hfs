@@ -93,7 +93,6 @@
     }
   ],
   "order": 2,
-  "network": "5",
   "costToBeneficiary": [
     {
       "type": {
@@ -124,11 +123,6 @@
           }
         }
       ]
-    }
-  ],
-  "contract": [
-    {
-      "reference": "Contract/INS-101"
     }
   ],
   "meta": {

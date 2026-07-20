@@ -1,0 +1,104 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "copolymer-connectivity",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem copolymer-connectivity\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"copolymer-connectivity\"\u003e \u003c/a\u003e\u003ca name\u003d\"hccopolymer-connectivity\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/copolymer-connectivity\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003erandom\u003ca name\u003d\"copolymer-connectivity-random\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRandom\u003c/td\u003e\u003ctd\u003eMonomers arranged randomly.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ealternating\u003ca name\u003d\"copolymer-connectivity-alternating\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAlternating\u003c/td\u003e\u003ctd\u003eMonomers arranged in alternating order.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eblock\u003ca name\u003d\"copolymer-connectivity-block\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBlock\u003c/td\u003e\u003ctd\u003eBlock copolymer.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003egraft\u003ca name\u003d\"copolymer-connectivity-graft\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGraft\u003c/td\u003e\u003ctd\u003eGraft copolymer.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003estatistical\u003ca name\u003d\"copolymer-connectivity-statistical\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStatistical\u003c/td\u003e\u003ctd\u003eStatistical copolymer.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eperiodic\u003ca name\u003d\"copolymer-connectivity-periodic\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePeriodic\u003c/td\u003e\u003ctd\u003ePeriodic copolymer.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emixed\u003ca name\u003d\"copolymer-connectivity-mixed\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMixed\u003c/td\u003e\u003ctd\u003eMixed connectivity copolymer.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecross\u003ca name\u003d\"copolymer-connectivity-cross\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCross\u003c/td\u003e\u003ctd\u003eCrosslinked copolymer.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/copolymer-connectivity",
+  "version": "6.0.0-ballot4",
+  "name": "CopolymerConnectivityExample",
+  "title": "Copolymer Connectivity",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-19",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Describes the copolymer sequence type (polymer connectivity).",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/copolymer-connectivity",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "random",
+      "display": "Random",
+      "definition": "Monomers arranged randomly."
+    },
+    {
+      "code": "alternating",
+      "display": "Alternating",
+      "definition": "Monomers arranged in alternating order."
+    },
+    {
+      "code": "block",
+      "display": "Block",
+      "definition": "Block copolymer."
+    },
+    {
+      "code": "graft",
+      "display": "Graft",
+      "definition": "Graft copolymer."
+    },
+    {
+      "code": "statistical",
+      "display": "Statistical",
+      "definition": "Statistical copolymer."
+    },
+    {
+      "code": "periodic",
+      "display": "Periodic",
+      "definition": "Periodic copolymer."
+    },
+    {
+      "code": "mixed",
+      "display": "Mixed",
+      "definition": "Mixed connectivity copolymer."
+    },
+    {
+      "code": "cross",
+      "display": "Cross",
+      "definition": "Crosslinked copolymer."
+    }
+  ]
+}

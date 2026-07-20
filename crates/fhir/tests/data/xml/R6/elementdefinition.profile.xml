@@ -1515,7 +1515,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <a href="elementdefinition-definitions.html#ElementDefinition.valueAlternatives" title="ElementDefinition.valueAlternatives : Specifies a list of extensions that can appear in place of a primitive value.">valueAlternatives</a>
+            <a href="elementdefinition-definitions.html#ElementDefinition.valueAlternatives" title="ElementDefinition.valueAlternatives : Specifies a list of extensions that can appear in place of a value (for primitive types) or non-extension child elements (for complex types and backbone elements).">valueAlternatives</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -1526,7 +1526,7 @@
             <a href="datatypes.html#canonical">canonical</a>(
             <a href="structuredefinition.html">StructureDefinition</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Extensions that are allowed to replace a primitive value
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Extensions that are allowed to replace the value or content
             <br/>
             <br/>
           </td>
@@ -2008,7 +2008,7 @@
   <name value="ElementDefinition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -2300,6 +2300,14 @@
     </element>
     <element id="ElementDefinition.modifierExtension">
       <path value="ElementDefinition.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2504,7 +2512,7 @@
       <path value="ElementDefinition.label"/>
       <short value="String to display with or prompt for element"/>
       <definition value="A single preferred label which is the text to display beside the element indicating its meaning or to use to prompt for the element in a user display or form."/>
-      <comment value="See also the extension [http://hl7.org/fhir/StructureDefinition/elementdefinition-question](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-elementdefinition-question.html)."/>
+      <comment value="See also the extension [Question](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-elementdefinition-question.html)."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -3667,7 +3675,7 @@
       <path value="ElementDefinition.type.profile"/>
       <short value="Profiles (StructureDefinition or IG) - one must apply"/>
       <definition value="Identifies a profile structure or implementation Guide that applies to the datatype this element refers to. If any profiles are specified, then the content must conform to at least one of them. The URL can be a local reference - to a contained StructureDefinition, or a reference to another StructureDefinition or Implementation Guide by a canonical URL. When an implementation guide is specified, the type SHALL conform to at least one profile defined in the implementation guide."/>
-      <comment value="It is possible to profile  backbone element (e.g. part of a resource), using the [http://hl7.org/fhir/StructureDefinition/elementdefinition-profile-element](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-elementdefinition-profile-element.html) extension."/>
+      <comment value="It is possible to profile  backbone element (e.g. part of a resource), using the [Profile Element](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-elementdefinition-profile-element.html) extension."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -4905,7 +4913,7 @@
     <element id="ElementDefinition.maxLength">
       <path value="ElementDefinition.maxLength"/>
       <short value="Max length for string type data"/>
-      <definition value="Indicates the maximum length in characters that is permitted to be present in conformant instances and which is expected to be supported by conformant consumers that support the element. ```maxLength``` SHOULD only be used on primitive data types that have a have a length (see [Tupe Characteristics](datatypes.html#other) and [http://hl7.org/fhir/StructureDefinition/structuredefinition-type-characteristics](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-structuredefinition-type-characteristics.html))."/>
+      <definition value="Indicates the maximum length in characters that is permitted to be present in conformant instances and which is expected to be supported by conformant consumers that support the element. ```maxLength``` SHOULD only be used on primitive data types that have a have a length (see [Tupe Characteristics](datatypes.html#other) and [Structure Type Characterstics (Constraint Control)](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-structuredefinition-type-characteristics.html))."/>
       <comment value="Receivers are not required to reject instances that exceed the maximum length.  The full length could be stored.  In some cases, data might be truncated, though truncation should be undertaken with care and an understanding of the consequences of doing so. If not specified, there is no conformance expectation for length support."/>
       <min value="0"/>
       <max value="1"/>
@@ -5308,7 +5316,7 @@
       <path value="ElementDefinition.mustHaveValue"/>
       <short value="For primitives, that a value must be present - not replaced by an extension"/>
       <definition value="Specifies for a primitive data type that the value of the data type cannot be replaced by an extension."/>
-      <comment value="Typical extensions that can be provided in place of a the value are [http://hl7.org/fhir/StructureDefinition/data-absent-reason](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-data-absent-reason.html),  [http://hl7.org/fhir/StructureDefinition/iso21090-nullFlavor](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-iso21090-nullFlavor.html),  [http://hl7.org/fhir/StructureDefinition/originalText](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-originalText.html), and [http://hl7.org/fhir/StructureDefinition/cqf-expression](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-cqf-expression.html). Note that this element has no meaning when a value is provided, and extensions can be provided in addition to a value."/>
+      <comment value="Typical extensions that can be provided in place of a the value are [Data Absent Reason](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-data-absent-reason.html),  [Null flavor](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-iso21090-nullFlavor.html),  [Original Text](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-originalText.html), and [CQF Expression](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-cqf-expression.html). Note that this element has no meaning when a value is provided, and extensions can be provided in addition to a value."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -5332,9 +5340,9 @@
     </element>
     <element id="ElementDefinition.valueAlternatives">
       <path value="ElementDefinition.valueAlternatives"/>
-      <short value="Extensions that are allowed to replace a primitive value"/>
-      <definition value="Specifies a list of extensions that can appear in place of a primitive value."/>
-      <comment value="If mustHaveValue is true, then this element should not be present, since no extensions are allowed in place of the value. Note that this element has no impact if the value is present. When valueAlternatives is present, it means that if the element is present, it SHALL have either a value or at least one of the listed extensions. This element is only permitted on elements with primitive types."/>
+      <short value="Extensions that are allowed to replace the value or content"/>
+      <definition value="Specifies a list of extensions that can appear in place of a value (for primitive types) or non-extension child elements (for complex types and backbone elements)."/>
+      <comment value="If mustHaveValue is true, then this element should not be present, since no extensions are allowed in place of the value. Note that this element has no impact if the value is present. When valueAlternatives is present, it means that if the element is present, it SHALL have at least one of the listed extensions, a value (if primitive), or a non-extension child element (if a complex type or backbone element). valueAlternatives applies only to the elements it is declared on.  It does not propagate to child elements."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -6570,7 +6578,7 @@
       <path value="ElementDefinition.label"/>
       <short value="String to display with or prompt for element"/>
       <definition value="A single preferred label which is the text to display beside the element indicating its meaning or to use to prompt for the element in a user display or form."/>
-      <comment value="See also the extension [http://hl7.org/fhir/StructureDefinition/elementdefinition-question](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-elementdefinition-question.html)."/>
+      <comment value="See also the extension [Question](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-elementdefinition-question.html)."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -7170,7 +7178,7 @@
       <path value="ElementDefinition.type.profile"/>
       <short value="Profiles (StructureDefinition or IG) - one must apply"/>
       <definition value="Identifies a profile structure or implementation Guide that applies to the datatype this element refers to. If any profiles are specified, then the content must conform to at least one of them. The URL can be a local reference - to a contained StructureDefinition, or a reference to another StructureDefinition or Implementation Guide by a canonical URL. When an implementation guide is specified, the type SHALL conform to at least one profile defined in the implementation guide."/>
-      <comment value="It is possible to profile  backbone element (e.g. part of a resource), using the [http://hl7.org/fhir/StructureDefinition/elementdefinition-profile-element](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-elementdefinition-profile-element.html) extension."/>
+      <comment value="It is possible to profile  backbone element (e.g. part of a resource), using the [Profile Element](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-elementdefinition-profile-element.html) extension."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -8160,7 +8168,7 @@
     <element id="ElementDefinition.maxLength">
       <path value="ElementDefinition.maxLength"/>
       <short value="Max length for string type data"/>
-      <definition value="Indicates the maximum length in characters that is permitted to be present in conformant instances and which is expected to be supported by conformant consumers that support the element. ```maxLength``` SHOULD only be used on primitive data types that have a have a length (see [Tupe Characteristics](datatypes.html#other) and [http://hl7.org/fhir/StructureDefinition/structuredefinition-type-characteristics](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-structuredefinition-type-characteristics.html))."/>
+      <definition value="Indicates the maximum length in characters that is permitted to be present in conformant instances and which is expected to be supported by conformant consumers that support the element. ```maxLength``` SHOULD only be used on primitive data types that have a have a length (see [Tupe Characteristics](datatypes.html#other) and [Structure Type Characterstics (Constraint Control)](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-structuredefinition-type-characteristics.html))."/>
       <comment value="Receivers are not required to reject instances that exceed the maximum length.  The full length could be stored.  In some cases, data might be truncated, though truncation should be undertaken with care and an understanding of the consequences of doing so. If not specified, there is no conformance expectation for length support."/>
       <min value="0"/>
       <max value="1"/>
@@ -8367,7 +8375,7 @@
       <path value="ElementDefinition.mustHaveValue"/>
       <short value="For primitives, that a value must be present - not replaced by an extension"/>
       <definition value="Specifies for a primitive data type that the value of the data type cannot be replaced by an extension."/>
-      <comment value="Typical extensions that can be provided in place of a the value are [http://hl7.org/fhir/StructureDefinition/data-absent-reason](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-data-absent-reason.html),  [http://hl7.org/fhir/StructureDefinition/iso21090-nullFlavor](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-iso21090-nullFlavor.html),  [http://hl7.org/fhir/StructureDefinition/originalText](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-originalText.html), and [http://hl7.org/fhir/StructureDefinition/cqf-expression](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-cqf-expression.html). Note that this element has no meaning when a value is provided, and extensions can be provided in addition to a value."/>
+      <comment value="Typical extensions that can be provided in place of a the value are [Data Absent Reason](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-data-absent-reason.html),  [Null flavor](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-iso21090-nullFlavor.html),  [Original Text](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-originalText.html), and [CQF Expression](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-cqf-expression.html). Note that this element has no meaning when a value is provided, and extensions can be provided in addition to a value."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -8378,9 +8386,9 @@
     </element>
     <element id="ElementDefinition.valueAlternatives">
       <path value="ElementDefinition.valueAlternatives"/>
-      <short value="Extensions that are allowed to replace a primitive value"/>
-      <definition value="Specifies a list of extensions that can appear in place of a primitive value."/>
-      <comment value="If mustHaveValue is true, then this element should not be present, since no extensions are allowed in place of the value. Note that this element has no impact if the value is present. When valueAlternatives is present, it means that if the element is present, it SHALL have either a value or at least one of the listed extensions. This element is only permitted on elements with primitive types."/>
+      <short value="Extensions that are allowed to replace the value or content"/>
+      <definition value="Specifies a list of extensions that can appear in place of a value (for primitive types) or non-extension child elements (for complex types and backbone elements)."/>
+      <comment value="If mustHaveValue is true, then this element should not be present, since no extensions are allowed in place of the value. Note that this element has no impact if the value is present. When valueAlternatives is present, it means that if the element is present, it SHALL have at least one of the listed extensions, a value (if primitive), or a non-extension child element (if a complex type or backbone element). valueAlternatives applies only to the elements it is declared on.  It does not propagate to child elements."/>
       <min value="0"/>
       <max value="*"/>
       <type>

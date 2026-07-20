@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  id = enteralbolus  file name = nutritionorder-example-enteralbolus.xml Name= Enteral Bolus  Description = Nutrition Order Enteral Bolus Feeding  Example
-Tube feedings are given in boluses several times a day   edited by Eric Haas Health eData Inc
- -->
-  <!-- EH  Show all the elements in this examples for preference, and intolerance  -->
+  <!-- id = enteralbolus  file name = nutritionorder-example-enteralbolus.xml Name= Enteral Bolus  Description = Nutrition Order Enteral Bolus Feeding  Example
+Tube feedings are given in boluses several times a day   edited by Eric Haas Health eData Inc -->
+  <!-- EH  Show all the elements in this examples for preference, and intolerance -->
   <id value="enteralbolus"/>
   <meta>
     <security>

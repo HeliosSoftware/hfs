@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "fhir-old-types",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -15,7 +15,7 @@
     },
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
-      "valueCode": "fhir"
+      "valueCode": "inm"
     },
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
@@ -34,7 +34,7 @@
   "title": "Old FHIR Types",
   "status": "active",
   "experimental": false,
-  "publisher": "HL7 International / FHIR Infrastructure",
+  "publisher": "HL7 International / Infrastructure And Messaging",
   "contact": [
     {
       "telecom": [
@@ -53,6 +53,14 @@
         {
           "system": "url",
           "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    },
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/inm"
         }
       ]
     }

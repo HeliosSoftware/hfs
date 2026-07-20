@@ -196,7 +196,7 @@
     <resource>
       <PackagedProductDefinition>
         <id value="packageCombo"/>
-        <!--  text not needed here  -->
+        <!-- text not needed here -->
         <text>
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml">
 						(left blank to stop example creating something automatically)
@@ -251,11 +251,11 @@
   </entry>
   <entry>
     <fullUrl value="urn:uuid:4b9d12e2-c4c3-4533-85d0-7f78a6b91a53"/>
-    <!--  would normally go on to have ingredients here (see other examples)  -->
+    <!-- would normally go on to have ingredients here (see other examples) -->
     <resource>
       <ManufacturedItemDefinition>
         <id value="tabletItem"/>
-        <!--  text not needed here  -->
+        <!-- text not needed here -->
         <text>
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml">
 						(left blank to stop example creating something automatically)
@@ -273,11 +273,11 @@
   </entry>
   <entry>
     <fullUrl value="urn:uuid:9a66d8b9-1793-4e43-8cc3-89af55d86d0c"/>
-    <!--  would normally go on to have ingredients here (see other examples)  -->
+    <!-- would normally go on to have ingredients here (see other examples) -->
     <resource>
       <ManufacturedItemDefinition>
         <id value="creamItem"/>
-        <!--  text not needed here  -->
+        <!-- text not needed here -->
         <text>
           <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml">
 						(left blank to stop example creating something automatically)

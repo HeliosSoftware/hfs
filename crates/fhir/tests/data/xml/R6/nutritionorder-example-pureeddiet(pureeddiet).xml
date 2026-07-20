@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  id = pureediet  file name = nutritionorder-example-pureeddiet.xml Name= Pureed Diet  Description = Nutrition Order Pureed Diet Canonical Example
-edited by Eric Haas Health eData Inc
- -->
-  <!-- EH  Show all the elements in this examples for preference, and intolerance  -->
-  <!--  EH: use oral Diet element  -->
+  <!-- id = pureediet  file name = nutritionorder-example-pureeddiet.xml Name= Pureed Diet  Description = Nutrition Order Pureed Diet Canonical Example
+edited by Eric Haas Health eData Inc -->
+  <!-- EH  Show all the elements in this examples for preference, and intolerance -->
+  <!-- EH: use oral Diet element -->
   <id value="pureeddiet"/>
   <meta>
     <security>
@@ -45,7 +44,7 @@ edited by Eric Haas Health eData Inc
     </coding>
   </excludeFoodModifier>
   <oralDiet>
-    <!--  EH:  list type of diet showing standard code and local codes  -->
+    <!-- EH:  list type of diet showing standard code and local codes -->
     <type>
       <coding>
         <system value="http://snomed.info/sct"/>
@@ -59,7 +58,7 @@ edited by Eric Haas Health eData Inc
       </coding>
       <text value="Pureed diet"/>
     </type>
-    <!--  EH example of three times a day starting on 2/10   -->
+    <!-- EH example of three times a day starting on 2/10 -->
     <schedule>
       <timing>
         <repeat>

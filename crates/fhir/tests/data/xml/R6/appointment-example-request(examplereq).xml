@@ -45,7 +45,7 @@
       <text value="Clinical Review"/>
     </concept>
   </reason>
-  <!--  <priority value="5" />  -->
+  <!-- <priority value="5" /> -->
   <description value="Discussion on the results of your recent MRI"/>
   <minutesDuration value="15"/>
   <requestedPeriod>
@@ -86,7 +86,7 @@
       <reference value="Location/1"/>
       <display value="South Wing, second floor"/>
     </actor>
-    <!--  This resource auto accepts, so doesn't need negotiation  -->
+    <!-- This resource auto accepts, so doesn't need negotiation -->
     <required value="true"/>
     <status value="accepted"/>
   </participant>

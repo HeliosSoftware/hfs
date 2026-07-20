@@ -49,18 +49,6 @@
       }
     }
   ],
-  "bodySite": [
-    {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "410737007",
-          "display": "Joint structure of sixth cervical vertebra (body structure)"
-        }
-      ],
-      "text": "Cervical spine C6 joint"
-    }
-  ],
   "outcome": [
     {
       "concept": {

@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "edible-substance-type",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -45,7 +45,7 @@
       ]
     }
   ],
-  "description": "This value set represents codes for types of edible substances.  It include codes from [SNOMED CT](http://snomed.info/sct) where concept 762766007 Edible Substance (substance) and its sub-concepts, Infant Formula (412413001) and its sub-concepts, Enteral and Supplement Feeds (346415002) and its sub-concepts, Water (11713004), Potable Water (890302005) and its sub-concepts, and Tap Water (444923006).",
+  "description": "This value set represents codes for types of edible substances.  It include codes from [SNOMED CT](http://snomed.info/sct/) where concept 762766007 Edible Substance (substance) and its sub-concepts, Infant Formula (412413001) and its sub-concepts, Enteral and Supplement Feeds (346415002) and its sub-concepts, Water (11713004), Potable Water (890302005) and its sub-concepts, and Tap Water (444923006).",
   "jurisdiction": [
     {
       "coding": [
