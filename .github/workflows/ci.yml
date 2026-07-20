@@ -100,6 +100,11 @@ jobs:
       # typo'd variable would leave a green step that verified nothing at all.
       # Assert the expected number of tests actually ran.
       - name: Verify S3 conditional writes against MinIO (per-user settings)
+        # `runs-on: [self-hosted]` includes the Windows runner, where `run:`
+        # defaults to PowerShell. This block is bash (`\` continuation, `| tee`,
+        # `if ! grep`, `set -o pipefail`), which PowerShell cannot parse. Pin it
+        # to bash so the identical script runs under Git Bash on Windows too.
+        shell: bash
         env:
           RUN_MINIO_S3_TESTS: "1"
           EXPECTED_MINIO_SETTINGS_TESTS: "4"

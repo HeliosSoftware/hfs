@@ -1,8 +1,10 @@
 //! Handler for `POST /ConceptMap/$translate`.
 //!
-//! Accepts a FHIR Parameters resource containing `code` (required) and optional
-//! `system`, `url` (ConceptMap URL), and `reverse`. Returns a FHIR Parameters
-//! resource with a `result` boolean and zero or more `match` parts.
+//! Accepts a FHIR Parameters resource naming the source concept — as `code` +
+//! `system`, a `coding`, or a `codeableConcept` (R5: the `source*` spellings, and
+//! the `target*` ones for reverse translation) — plus optional `url` (ConceptMap
+//! URL) and `reverse`. Returns a FHIR Parameters resource with a `result` boolean
+//! and zero or more `match` parts.
 //!
 //! # FHIR specification
 //! <https://hl7.org/fhir/conceptmap-operation-translate.html>
@@ -23,15 +25,36 @@ use crate::types::TranslateRequest;
 
 use super::format::{fhir_respond, negotiate_format};
 use super::params::{
-    extract_parameter_array, find_str_param, parse_query_string, query_params_to_fhir_params,
+    extract_codeable_concept, extract_coding, extract_parameter_array, find_str_param,
+    parse_query_string, query_params_to_fhir_params,
 };
+
+/// Resolve a `(system, code)` pair from the Coding/CodeableConcept spellings of a
+/// `$translate` input parameter.
+///
+/// The spec defines the source concept three ways — `code` + `system`, `coding`, or
+/// `codeableConcept` (R5: `sourceCoding` / `sourceCodeableConcept`, and the `target*`
+/// forms for reverse translation) — but this handler only ever read the scalar pair, so
+/// a spec-legal `coding` request was rejected as "Missing required parameter". See #287.
+///
+/// A CodeableConcept may carry several codings; the first is used, matching how
+/// `$validate-code` treats the same input.
+fn coding_pair(params: &[Value], coding_name: &str, cc_name: &str) -> Option<(String, String)> {
+    if let Some((system, code, _display)) = extract_coding(params, coding_name) {
+        return Some((system, code));
+    }
+    extract_codeable_concept(params, cc_name)?
+        .into_iter()
+        .next()
+}
 
 /// Core translation logic shared by the POST and GET handlers.
 ///
-/// Extracts `code` (required) and optional `system`, `url` (ConceptMap URL),
-/// `source`, `target`, `targetSystem`, `reverse`, and `date` from `params`,
-/// delegates to [`ConceptMapOperations::translate`], and assembles the FHIR
-/// `Parameters` response.
+/// Extracts the source concept (required — see [`coding_pair`] for the accepted
+/// spellings) and optional `url` (ConceptMap URL), `source`, `target`,
+/// `targetSystem`, `reverse`, and `date` from `params`, delegates to
+/// [`ConceptMapOperations::translate`], and assembles the FHIR `Parameters`
+/// response.
 ///
 /// `reverse` is parsed from `"true"` / `"false"` strings so it works for both
 /// GET (query-string) and POST (JSON boolean) inputs.
@@ -47,19 +70,38 @@ use super::params::{
 ///
 /// ## Errors
 ///
-/// Returns [`HtsError::InvalidRequest`] when `code` is absent.
+/// Returns [`HtsError::InvalidRequest`] when no source concept is supplied in any
+/// of the accepted spellings.
 pub(crate) async fn process_translate<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Value, HtsError> {
     // R4 names: `code`, `system`. R5 names: `sourceCode`, `sourceSystem`,
     // `targetCode`, `targetSystem`. Accept either form.
-    let source_code =
+    let mut source_code =
         find_str_param(&params, "sourceCode").or_else(|| find_str_param(&params, "code"));
-    let target_code = find_str_param(&params, "targetCode");
-    let source_system =
+    let mut target_code = find_str_param(&params, "targetCode");
+    let mut source_system =
         find_str_param(&params, "sourceSystem").or_else(|| find_str_param(&params, "system"));
-    let target_system = find_str_param(&params, "targetSystem");
+    let mut target_system = find_str_param(&params, "targetSystem");
+
+    // The scalar pair wins when present; Coding/CodeableConcept only fill the gaps, so a
+    // request mixing the spellings keeps the explicit `code`/`system` the caller named.
+    if source_code.is_none() {
+        if let Some((system, code)) = coding_pair(&params, "coding", "codeableConcept")
+            .or_else(|| coding_pair(&params, "sourceCoding", "sourceCodeableConcept"))
+        {
+            source_code = Some(code);
+            source_system = source_system.or(Some(system).filter(|s| !s.is_empty()));
+        }
+    }
+    if target_code.is_none() {
+        if let Some((system, code)) = coding_pair(&params, "targetCoding", "targetCodeableConcept")
+        {
+            target_code = Some(code);
+            target_system = target_system.or(Some(system).filter(|s| !s.is_empty()));
+        }
+    }
 
     // Need at least one of source code (forward) or target code (reverse).
     if source_code.is_none() && target_code.is_none() {
@@ -487,6 +529,165 @@ mod tests {
         let source = parts.iter().find(|p| p["name"] == "source").unwrap();
         assert_eq!(source["valueCoding"]["code"], "A");
         assert_eq!(source["valueCoding"]["system"], "http://example.org/src");
+    }
+
+    // ── Coding / CodeableConcept source spellings (#287) ───────────────────────
+
+    /// The spec allows the source concept as a `coding`, but the handler only read the
+    /// scalar `code` + `system` pair, so this shape 400'd as "Missing required
+    /// parameter". Regression test for #287.
+    #[tokio::test]
+    async fn translate_accepts_coding_param() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "coding", "valueCoding": {
+                    "system": "http://example.org/src",
+                    "code": "A"
+                }},
+                {"name": "targetSystem", "valueUri": "http://example.org/tgt"}
+            ]
+        });
+
+        let resp = post_json(app, "/ConceptMap/$translate", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], true);
+
+        let m = params.iter().find(|p| p["name"] == "match").unwrap();
+        let concept = m["part"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "concept")
+            .unwrap();
+        assert_eq!(concept["valueCoding"]["code"], "X");
+    }
+
+    /// R5 spelling of the same input.
+    #[tokio::test]
+    async fn translate_accepts_source_coding_param() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "sourceCoding", "valueCoding": {
+                    "system": "http://example.org/src",
+                    "code": "A"
+                }},
+                {"name": "targetSystem", "valueUri": "http://example.org/tgt"}
+            ]
+        });
+
+        let resp = post_json(app, "/ConceptMap/$translate", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let result = json["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "result")
+            .unwrap();
+        assert_eq!(result["valueBoolean"], true);
+    }
+
+    /// A `codeableConcept` translates on its first coding.
+    #[tokio::test]
+    async fn translate_accepts_codeable_concept_param() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "codeableConcept", "valueCodeableConcept": {
+                    "coding": [{"system": "http://example.org/src", "code": "A"}]
+                }},
+                {"name": "targetSystem", "valueUri": "http://example.org/tgt"}
+            ]
+        });
+
+        let resp = post_json(app, "/ConceptMap/$translate", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let result = json["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "result")
+            .unwrap();
+        assert_eq!(result["valueBoolean"], true);
+    }
+
+    /// `targetCoding` drives reverse mode the same way a bare `targetCode` does.
+    #[tokio::test]
+    async fn translate_accepts_target_coding_param_for_reverse() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "sourceSystem", "valueUri": "http://example.org/src"},
+                {"name": "targetCoding", "valueCoding": {
+                    "system": "http://example.org/tgt",
+                    "code": "X"
+                }}
+            ]
+        });
+
+        let resp = post_json(app, "/ConceptMap/$translate", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], true);
+
+        let m = params.iter().find(|p| p["name"] == "match").unwrap();
+        let source = m["part"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "source")
+            .unwrap();
+        assert_eq!(source["valueCoding"]["code"], "A");
+    }
+
+    /// An explicit `code` outranks a `coding` sent alongside it, so a request mixing the
+    /// spellings translates what the caller named rather than silently preferring one.
+    #[tokio::test]
+    async fn translate_scalar_code_wins_over_coding() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "code",   "valueCode": "A"},
+                {"name": "system", "valueUri": "http://example.org/src"},
+                {"name": "coding", "valueCoding": {
+                    "system": "http://example.org/src",
+                    "code": "no-such-code"
+                }},
+                {"name": "targetSystem", "valueUri": "http://example.org/tgt"}
+            ]
+        });
+
+        let resp = post_json(app, "/ConceptMap/$translate", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let result = params.iter().find(|p| p["name"] == "result").unwrap();
+        assert_eq!(result["valueBoolean"], true);
+
+        let m = params.iter().find(|p| p["name"] == "match").unwrap();
+        let concept = m["part"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "concept")
+            .unwrap();
+        assert_eq!(concept["valueCoding"]["code"], "X");
     }
 
     // ── Error cases ────────────────────────────────────────────────────────────
