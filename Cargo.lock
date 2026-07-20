@@ -3248,6 +3248,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-fhir-validator"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "clap",
+ "flate2",
+ "helios-fhir",
+ "helios-fhirpath",
+ "indexmap 2.14.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "helios-fhirpath"
 version = "0.2.1"
 dependencies = [
@@ -3455,6 +3471,7 @@ dependencies = [
  "helios-audit",
  "helios-auth",
  "helios-fhir",
+ "helios-fhir-validator",
  "helios-observability",
  "helios-persistence",
  "helios-serde",
@@ -3592,13 +3609,16 @@ dependencies = [
  "fluent-templates",
  "helios-auth",
  "helios-fhir",
+ "helios-fhir-validator",
  "helios-observability",
  "helios-persistence",
  "http-body-util",
+ "json-patch",
  "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
+ "similar",
  "tokio",
  "tower",
  "unic-langid",
@@ -7056,6 +7076,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "simple_asn1"
