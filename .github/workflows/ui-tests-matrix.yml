@@ -334,7 +334,8 @@ jobs:
           BASE="http://$RUNNER_IP:$HFS_PORT"
           echo "Driving browser against $BASE"
           docker rm -f "$PW_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$PW_CONTAINER" -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          # 2g shm: Chromium needs more than docker's 64m default.
+          docker run -d --name "$PW_CONTAINER" --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
           docker cp crates/ui/e2e "$PW_CONTAINER":/work/e2e
           docker exec -e CI=1 -e HFS_E2E_BASE_URL="$BASE" -w /work/e2e "$PW_CONTAINER" \
             bash -c "npm ci && npx playwright test"
