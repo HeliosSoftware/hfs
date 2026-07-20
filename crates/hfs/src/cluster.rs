@@ -252,6 +252,10 @@ pub fn resolve_jwks_coordination(
 /// degrading to best-effort in-memory is a known, tolerable, already-shipped
 /// fallback. Only relevant in `Asynchronous`/`Hybrid` mode — `Synchronous`
 /// blocks on the secondary write and is already durable by construction.
+///
+/// Composite storage modes only exist in Elasticsearch-enabled builds, so
+/// the sole non-test caller is gated the same way.
+#[cfg(any(test, feature = "elasticsearch"))]
 pub fn resolve_composite_sync_durability(
     cluster: bool,
     primary_backend: BackendKind,
