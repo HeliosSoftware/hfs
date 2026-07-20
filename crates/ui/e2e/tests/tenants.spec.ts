@@ -6,6 +6,10 @@ import { test, expect } from "../pages/fixtures";
 
 test.describe("tenants", () => {
   test.beforeEach(async ({ tenants }) => {
+    // Creating a tenant seeds its conformance resources (~1.4k inserts) inside
+    // the request: round-trip bound on the remote-backend matrix, fsync bound
+    // on filesystem SQLite (~90s measured on NTFS). Budget accordingly.
+    test.setTimeout(180_000);
     await tenants.goto();
     if (await tenants.unavailableNotice.isVisible().catch(() => false)) {
       test.skip(true, "no tenant store on this backend");
@@ -29,7 +33,10 @@ test.describe("tenants", () => {
     await expect(tenants.row(id)).toBeHidden();
   });
 
-  test("deleting a tenant removes its row", async ({ page, tenants }) => {
+  test("deleting a tenant deregisters it, leaving a data-discovered row", async ({
+    page,
+    tenants,
+  }) => {
     const id = `e2e-del-${Date.now().toString(36)}`;
     await tenants.addTenant(id, "Deletable");
     const row = tenants.row(id);
@@ -37,6 +44,9 @@ test.describe("tenants", () => {
 
     page.once("dialog", (d) => d.accept()); // hx-confirm
     await row.locator("[hx-delete]").click();
-    await expect(row).toBeHidden();
+    // Provisioning seeded the tenant's conformance resources, and the trash
+    // button deliberately never purges data: the deregistered tenant remains
+    // visible as a data-discovered row, flagged unregistered.
+    await expect(row.locator(".tag--muted")).toBeVisible();
   });
 });

@@ -4,6 +4,7 @@
 // webServer waits for the port, then tears this down.
 import { spawn } from "node:child_process";
 import { existsSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -27,7 +28,12 @@ if (!bin) {
   process.exit(1);
 }
 
-const db = join(here, ".hfs-e2e.db");
+// Keep the DB on tmpfs when available: startup and per-tenant conformance
+// seeding write ~1.4k resources one insert (and one fsync) at a time, which
+// on the container's overlayfs turns tenant creation into a minutes-long
+// request. /dev/shm makes those fsyncs free without changing what is tested.
+const dbDir = existsSync("/dev/shm") ? "/dev/shm" : tmpdir();
+const db = join(dbDir, ".hfs-e2e.db");
 for (const suffix of ["", "-wal", "-shm"]) {
   try { rmSync(db + suffix, { force: true }); } catch {}
 }

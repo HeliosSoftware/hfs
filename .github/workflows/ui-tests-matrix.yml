@@ -307,7 +307,10 @@ jobs:
       - name: Wait for HFS to be ready
         run: |
           echo "Waiting for HFS /ui..."
-          for i in {1..30}; do
+          # Startup seeds conformance resources for every provisioned tenant
+          # before the server listens; against the remote-docker backends that
+          # is minutes of per-insert round trips, so wait well past it.
+          for i in {1..120}; do
             if ! kill -0 "$HFS_PID" 2>/dev/null; then
               echo "HFS process ($HFS_PID) exited"
               cat "$HFS_LOG"
@@ -317,7 +320,7 @@ jobs:
               echo "HFS UI is ready"
               exit 0
             fi
-            echo "Attempt $i/30: HFS not ready yet..."
+            echo "Attempt $i/120: HFS not ready yet..."
             sleep 2
           done
 
