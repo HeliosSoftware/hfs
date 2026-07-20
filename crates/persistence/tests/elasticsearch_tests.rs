@@ -576,15 +576,14 @@ mod es_integration {
     use std::sync::Arc;
 
     use helios_fhir::FhirVersion;
-    use parking_lot::RwLock;
     use serde_json::json;
 
     use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
     use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
     use helios_persistence::error::{ResourceError, StorageError};
     use helios_persistence::search::{
-        SearchParameterDefinition, SearchParameterLoader, SearchParameterRegistry,
-        SearchParameterSource, SearchParameterStatus,
+        SearchParameterDefinition, SearchParameterLoader, SearchParameterSource,
+        SearchParameterStatus, TenantSearchRegistries,
     };
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
@@ -636,7 +635,7 @@ mod es_integration {
     }
 
     /// Builds a search parameter registry loaded from the FHIR spec data files.
-    fn build_search_registry() -> Arc<RwLock<SearchParameterRegistry>> {
+    fn build_search_registry() -> Arc<TenantSearchRegistries> {
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -644,7 +643,8 @@ mod es_integration {
             .unwrap_or_else(|| PathBuf::from("data"));
 
         let loader = SearchParameterLoader::new(FhirVersion::default());
-        let mut registry = SearchParameterRegistry::new();
+        let registries = Arc::new(TenantSearchRegistries::base_only());
+        let mut registry = registries.base().write();
 
         // Load embedded (minimal) params first
         if let Ok(params) = loader.load_embedded() {
@@ -683,7 +683,8 @@ mod es_integration {
             xpath: None,
         });
 
-        Arc::new(RwLock::new(registry))
+        drop(registry);
+        registries
     }
 
     /// Creates an ElasticsearchBackend connected to the shared testcontainers ES instance.

@@ -91,6 +91,16 @@
     "start": "2017-01-01",
     "end": "2017-12-31"
   },
+  "topic": [
+    {
+      "coding": [
+        {
+          "system": "http://loinc.org",
+          "code": "57024-2"
+        }
+      ]
+    }
+  ],
   "author": [
     {
       "name": "National Committee for Quality Assurance"

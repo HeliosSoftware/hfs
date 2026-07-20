@@ -1,0 +1,119 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "substance-glycosylation-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem substance-glycosylation-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"substance-glycosylation-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsubstance-glycosylation-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/substance-glycosylation-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehuman\u003ca name\u003d\"substance-glycosylation-type-human\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHuman\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from human cell lines (e.g. HEK293, PER.C6). No non-human glycan epitopes.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emammalian\u003ca name\u003d\"substance-glycosylation-type-mammalian\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMammalian (non-human)\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from non-human mammalian cell lines such as CHO, BHK or NS0. The most common pattern for therapeutic monoclonal antibodies.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eold-world-monkey\u003ca name\u003d\"substance-glycosylation-type-old-world-monkey\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOld World Monkey\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from old world monkey cell lines such as Vero or COS. Often used for vaccine production.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emouse\u003ca name\u003d\"substance-glycosylation-type-mouse\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMurine\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from murine cell lines such as NS0 or SP2/0 hybridoma. Carries the alpha-1,3-galactose epitope which can be immunogenic in humans.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emammalian-afucosylated\u003ca name\u003d\"substance-glycosylation-type-mammalian-afucosylated\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMammalian, afucosylated\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from engineered mammalian cell lines lacking fucosyltransferase (e.g. Potelligent), producing antibodies with enhanced ADCC activity.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eavian\u003ca name\u003d\"substance-glycosylation-type-avian\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAvian\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from egg-derived or avian cell line production. Common for influenza vaccines.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003einsect\u003ca name\u003d\"substance-glycosylation-type-insect\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInsect cell\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from insect cell expression systems such as baculovirus/Sf9. Used for some recombinant proteins and vaccines.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eyeast\u003ca name\u003d\"substance-glycosylation-type-yeast\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eYeast\u003c/td\u003e\u003ctd\u003eNative yeast glycosylation pattern (e.g. Saccharomyces cerevisiae). Examples include insulin and hepatitis B surface antigen.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eyeast-humanised\u003ca name\u003d\"substance-glycosylation-type-yeast-humanised\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eYeast, humanised\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from glyco-engineered yeast (e.g. Pichia pastoris GlycoFi systems) that produces human-like glycan structures.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eplant\u003ca name\u003d\"substance-glycosylation-type-plant\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePlant\u003c/td\u003e\u003ctd\u003eGlycosylation pattern from plant or plant cell culture production (e.g. taliglucerase alfa from carrot cells).\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ebacterial\u003ca name\u003d\"substance-glycosylation-type-bacterial\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBacterial\u003c/td\u003e\u003ctd\u003eBacterial expression (typically E. coli). Generally unglycosylated; included for completeness when the substance has been characterised as such.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/substance-glycosylation-type",
+  "version": "6.0.0-ballot4",
+  "name": "SubstanceGlycosylationTypeExample",
+  "title": "Substance Glycosylation Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-30",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "A categorical pattern of glycosylation for a substance, typically derived from the production cell line or source organism. Applicable to proteins and structurally diverse substances (notably vaccines) per ISO 11238.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/substance-glycosylation-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "human",
+      "display": "Human",
+      "definition": "Glycosylation pattern from human cell lines (e.g. HEK293, PER.C6). No non-human glycan epitopes."
+    },
+    {
+      "code": "mammalian",
+      "display": "Mammalian (non-human)",
+      "definition": "Glycosylation pattern from non-human mammalian cell lines such as CHO, BHK or NS0. The most common pattern for therapeutic monoclonal antibodies."
+    },
+    {
+      "code": "old-world-monkey",
+      "display": "Old World Monkey",
+      "definition": "Glycosylation pattern from old world monkey cell lines such as Vero or COS. Often used for vaccine production."
+    },
+    {
+      "code": "mouse",
+      "display": "Murine",
+      "definition": "Glycosylation pattern from murine cell lines such as NS0 or SP2/0 hybridoma. Carries the alpha-1,3-galactose epitope which can be immunogenic in humans."
+    },
+    {
+      "code": "mammalian-afucosylated",
+      "display": "Mammalian, afucosylated",
+      "definition": "Glycosylation pattern from engineered mammalian cell lines lacking fucosyltransferase (e.g. Potelligent), producing antibodies with enhanced ADCC activity."
+    },
+    {
+      "code": "avian",
+      "display": "Avian",
+      "definition": "Glycosylation pattern from egg-derived or avian cell line production. Common for influenza vaccines."
+    },
+    {
+      "code": "insect",
+      "display": "Insect cell",
+      "definition": "Glycosylation pattern from insect cell expression systems such as baculovirus/Sf9. Used for some recombinant proteins and vaccines."
+    },
+    {
+      "code": "yeast",
+      "display": "Yeast",
+      "definition": "Native yeast glycosylation pattern (e.g. Saccharomyces cerevisiae). Examples include insulin and hepatitis B surface antigen."
+    },
+    {
+      "code": "yeast-humanised",
+      "display": "Yeast, humanised",
+      "definition": "Glycosylation pattern from glyco-engineered yeast (e.g. Pichia pastoris GlycoFi systems) that produces human-like glycan structures."
+    },
+    {
+      "code": "plant",
+      "display": "Plant",
+      "definition": "Glycosylation pattern from plant or plant cell culture production (e.g. taliglucerase alfa from carrot cells)."
+    },
+    {
+      "code": "bacterial",
+      "display": "Bacterial",
+      "definition": "Bacterial expression (typically E. coli). Generally unglycosylated; included for completeness when the substance has been characterised as such."
+    }
+  ]
+}

@@ -55,18 +55,6 @@
       }
     }
   ],
-  "bodySite": [
-    {
-      "coding": [
-        {
-          "system": "http://snomed.info/sct",
-          "code": "36701003",
-          "display": "Both knees (body structure)"
-        }
-      ],
-      "text": "Both knees"
-    }
-  ],
   "meta": {
     "tag": [
       {

@@ -11,8 +11,8 @@ keywords = ["helios-software", "fhir", "ui", "htmx"]
 
 [features]
 # FHIR version features forward to helios-fhir so the viewer read paths
-# (SearchParameter registry snapshot, compartment definitions) cover exactly
-# the versions the server is built with. R4 is the workspace default.
+# (SearchParameter + CompartmentDefinition fetched from the FHIR API) cover
+# exactly the versions the server is built with. R4 is the workspace default.
 default = ["R4"]
 R4 = ["helios-fhir/R4", "helios-fhir-validator/R4"]
 R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B"]
@@ -32,11 +32,21 @@ helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
 # pass, not the async effects pass.
 helios-fhir-validator = { path = "../fhir-validator", version = "0.2.1", default-features = false }
 
-# Parses the vendored CompartmentDefinition spec JSONs (data/compartments/)
-# at first use, and derives the query-string extractors. Both already in the
-# workspace dependency graph via helios-fhir.
+# Deserializes the FHIR resources fetched from the server's own
+# `/SearchParameter` and `/CompartmentDefinition` endpoints, and derives the
+# query-string extractors. Both already in the workspace dependency graph.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The UI reads conformance data (SearchParameter, CompartmentDefinition) from
+# the server's own FHIR API over HTTP — storage is the source of truth. Plain
+# HTTP against a loopback URL, so no TLS backend is needed.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+async-trait = "0.1"
+
+# `OutboundAuthProvider`: the credentials the UI attaches to its server-to-server
+# self-calls (a service token when auth is enabled; a no-op when it is not).
+helios-auth = { path = "../auth", version = "0.2.1" }
 
 # Web framework (matches the version used by helios-hfs / helios-rest)
 axum = "0.8"

@@ -21,7 +21,7 @@
   "title": "event",
   "status": "draft",
   "experimental": false,
-  "date": "2026-06-13T17:13:29+00:00",
+  "date": "2026-07-17T03:44:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -130,7 +130,7 @@
         "path": "Event.identifier",
         "short": "Business identifier for {{title}}",
         "definition": "Business identifiers assigned to this {{title}} by the performer and/or other systems.  These identifiers remain constant as the resource is updated and propagates from server to server.",
-        "comment": "Note: This is a business identifier, not a resource identifier (see [discussion](resource.html#identifiers)).  It is best practice for the identifier to only appear on a single resource instance, however business practices may occasionally dictate that multiple resource instances with the same identifier can exist - possibly even with different resource types.  For example, multiple Patient and a Person resource instance might share the same social insurance number.",
+        "comment": "Note: This is a business identifier, not a resource identifier (see [general discussion](resource.html#identifiers) and [event-specific discussion](event.html#identifier)).  It is best practice for the identifier to only appear on a single resource instance, however business practices may occasionally dictate that multiple resource instances with the same identifier can exist - possibly even with different resource types.  For example, multiple Patient and a Person resource instance might share the same social insurance number.",
         "requirements": "Allows identification of the {{title}} as it is known by various participating systems and in a way that remains consistent across servers.",
         "min": 0,
         "max": "*",
@@ -197,7 +197,6 @@
               "http://hl7.org/fhir/StructureDefinition/CommunicationRequest",
               "http://hl7.org/fhir/StructureDefinition/CoverageEligibilityRequest",
               "http://hl7.org/fhir/StructureDefinition/DeviceRequest",
-              "http://hl7.org/fhir/StructureDefinition/EnrollmentRequest",
               "http://hl7.org/fhir/StructureDefinition/MedicationRequest",
               "http://hl7.org/fhir/StructureDefinition/NutritionOrder",
               "http://hl7.org/fhir/StructureDefinition/RequestOrchestration",
@@ -256,7 +255,6 @@
               "http://hl7.org/fhir/StructureDefinition/Communication",
               "http://hl7.org/fhir/StructureDefinition/Composition",
               "http://hl7.org/fhir/StructureDefinition/Consent",
-              "http://hl7.org/fhir/StructureDefinition/Contract",
               "http://hl7.org/fhir/StructureDefinition/Coverage",
               "http://hl7.org/fhir/StructureDefinition/CoverageEligibilityResponse",
               "http://hl7.org/fhir/StructureDefinition/DetectedIssue",
@@ -264,7 +262,6 @@
               "http://hl7.org/fhir/StructureDefinition/DiagnosticReport",
               "http://hl7.org/fhir/StructureDefinition/DocumentReference",
               "http://hl7.org/fhir/StructureDefinition/Encounter",
-              "http://hl7.org/fhir/StructureDefinition/EnrollmentResponse",
               "http://hl7.org/fhir/StructureDefinition/EpisodeOfCare",
               "http://hl7.org/fhir/StructureDefinition/ExplanationOfBenefit",
               "http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory",
@@ -272,7 +269,6 @@
               "http://hl7.org/fhir/StructureDefinition/ImagingSelection",
               "http://hl7.org/fhir/StructureDefinition/ImagingStudy",
               "http://hl7.org/fhir/StructureDefinition/Immunization",
-              "http://hl7.org/fhir/StructureDefinition/Invoice",
               "http://hl7.org/fhir/StructureDefinition/MedicationAdministration",
               "http://hl7.org/fhir/StructureDefinition/MedicationDispense",
               "http://hl7.org/fhir/StructureDefinition/MedicationStatement",
@@ -954,7 +950,8 @@
               "http://hl7.org/fhir/StructureDefinition/CareTeam",
               "http://hl7.org/fhir/StructureDefinition/Patient",
               "http://hl7.org/fhir/StructureDefinition/Device",
-              "http://hl7.org/fhir/StructureDefinition/RelatedPerson"
+              "http://hl7.org/fhir/StructureDefinition/RelatedPerson",
+              "http://hl7.org/fhir/StructureDefinition/HealthCareService"
             ]
           }
         ],

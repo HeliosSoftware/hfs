@@ -26,12 +26,12 @@
     <display value="Pieter van de Heuvel"/>
   </subject>
   <date value="2018-12-24"/>
-  <!--  The example given is Organization wide  -->
+  <!-- The example given is Organization wide -->
   <controller>
     <reference value="Organization/f201"/>
   </controller>
-  <!--  the text terms of the consent in lawyer speak  -->
-  <!--  likely use url pointer to common text  -->
+  <!-- the text terms of the consent in lawyer speak -->
+  <!-- likely use url pointer to common text -->
   <sourceAttachment>
     <title value="The patient [grantor] declines to agree to the provider's [grantee's] consent directive form, which lists permissible collection, access, use, or disclosure activities, purposes of use, handling caveats, revocation policies, and consequences of not assenting."/>
   </sourceAttachment>
@@ -43,7 +43,7 @@
   </regulatoryBasis>
   <decision value="deny"/>
   <provision>
-    <!--  deny Artis University Medical Center specifically  -->
+    <!-- deny Artis University Medical Center specifically -->
     <actor>
       <role>
         <coding>
@@ -56,7 +56,7 @@
       </reference>
     </actor>
     <provision>
-      <!--  permit Artis University Medical Center for Emergency Treatment  -->
+      <!-- permit Artis University Medical Center for Emergency Treatment -->
       <actor>
         <role>
           <coding>

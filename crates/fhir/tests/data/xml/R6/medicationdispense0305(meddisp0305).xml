@@ -21,7 +21,7 @@
   </contained>
   <status value="entered-in-error"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0311"/>
       <display value="Prednisone"/>

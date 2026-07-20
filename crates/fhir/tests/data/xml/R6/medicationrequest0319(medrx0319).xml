@@ -11,7 +11,7 @@
     <Medication>
       <id value="med0302"/>
       <code>
-        <!--  Zosyn (piperacillin/tazobactam) 4.5gm injection  -->
+        <!-- Zosyn (piperacillin/tazobactam) 4.5gm injection -->
         <coding>
           <system value="http://hl7.org/fhir/sid/ndc"/>
           <code value="0206-8862-02"/>
@@ -35,7 +35,7 @@
     </reference>
   </medication>
   <subject>
-    <!--  Linked to the resource patient who needs the medication  -->
+    <!-- Linked to the resource patient who needs the medication -->
     <reference value="Patient/pat1"/>
     <display value="Donald Duck"/>
   </subject>

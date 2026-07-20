@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><AllergyIntolerance xmlns="http://hl7.org/fhir">
   <id value="example"/>
-  <!--  an identifier used for this allergic propensity (adverse reaction risk)  -->
+  <!-- an identifier used for this allergic propensity (adverse reaction risk) -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -12,7 +12,7 @@
     <system value="http://acme.com/ids/patients/risks"/>
     <value value="49476534"/>
   </identifier>
-  <!--  this individual has had several reactions  -->
+  <!-- this individual has had several reactions -->
   <clinicalStatus>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical"/>
@@ -27,7 +27,7 @@
       <display value="Confirmed"/>
     </coding>
   </verificationStatus>
-  <!--  note: it's often unknown whether an allergy is mediated by an immune response, and not as significant as once thought  -->
+  <!-- note: it's often unknown whether an allergy is mediated by an immune response, and not as significant as once thought -->
   <type>
     <coding>
       <system value="http://hl7.org/fhir/allergy-intolerance-type"/>
@@ -35,10 +35,10 @@
       <display value="Allergy"/>
     </coding>
   </type>
-  <!--  this categorization is implied by "cashew nut" and therefore basically 
+  <!-- this categorization is implied by "cashew nut" and therefore basically 
     redundant, but many systems collect this field anyway, since it's either 
     useful when the substance is not coded, or it's quicker to sort/filter on
-    than using terminology based reasoning  -->
+    than using terminology based reasoning -->
   <category>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/allergy-intolerance-category"/>
@@ -46,11 +46,11 @@
       <display value="Food"/>
     </coding>
   </category>
-  <!--  there is no question that the allergy is real and serious  -->
+  <!-- there is no question that the allergy is real and serious -->
   <criticality value="high"/>
-  <!--  Allergy or intolerance code (substance, product, condition or negated/excluded statement) or text. A few times, 
+  <!-- Allergy or intolerance code (substance, product, condition or negated/excluded statement) or text. A few times, 
     there's a full description of a complex substance/product - in these caes, use the
-    extension [url] to refer to a Substance resource.  -->
+    extension [url] to refer to a Substance resource. -->
   <code>
     <coding>
       <system value="http://snomed.info/sct"/>
@@ -58,37 +58,38 @@
       <display value="Cashew nuts"/>
     </coding>
   </code>
-  <!--  the patient that actually has the risk of adverse reaction  -->
+  <!-- the patient that actually has the risk of adverse reaction -->
   <patient>
     <reference value="Patient/example"/>
   </patient>
-  <!--  when the allergy was first noted (in this case the same as reaction.onset of the first occurrence)  -->
+  <!-- when the allergy was first noted (in this case the same as reaction.onset of the first occurrence) -->
   <onsetDateTime value="2004"/>
-  <!--  the date that this entry was recorded  -->
+  <!-- the date that this entry was recorded -->
   <recordedDate value="2014-10-09T14:58:00+11:00"/>
-  <!--  who made the record / last updated it  -->
+  <!-- who made the record / last updated it -->
   <recorder>
     <reference value="Practitioner/example"/>
   </recorder>
-  <!--  the patient is the reporter in this case  -->
+  <!-- the patient is the reporter in this case -->
   <asserter>
     <reference value="Patient/example"/>
   </asserter>
-  <!--  an additional note about the allergy propensity by the recorder  -->
+  <!-- last happened June 2012. Typically, systems either track lastOccurrence,
+     or a list of events. -->
+  <lastOccurrence value="2012-06"/>
+  <!-- an additional note about the allergy propensity by the recorder -->
   <note>
     <text value="The criticality is high becasue of the observed anaphylactic reaction when challenged with cashew extract."/>
   </note>
-  <!--  past events. There's no claim that this is all the events, and 
-     that should not be assumed  -->
+  <!-- past events. There's no claim that this is all the events, and 
+     that should not be assumed -->
   <reaction>
-    <!--  
-      It's possible to list specific things to which the patient responded,
+    <!-- It's possible to list specific things to which the patient responded,
       e.g. chocolate (that happened to contain cashew nuts). This event has
       such a specific substance. Note that systems should ensure that what
       goes in here does not conflict with the substance above, and systems
       processing the data can be sure that what is here does not contravene
-      the substance above
-     -->
+      the substance above -->
     <substance>
       <coding>
         <system value="http://www.nlm.nih.gov/research/umls/rxnorm"/>
@@ -116,7 +117,7 @@
       </coding>
     </exposureRoute>
   </reaction>
-  <!--  this was the first occurrence  -->
+  <!-- this was the first occurrence -->
   <reaction>
     <manifestation>
       <concept>
@@ -129,7 +130,7 @@
     </manifestation>
     <onset value="2004"/>
     <severity value="moderate"/>
-    <!--  an additional note about the reaction by the recorder  -->
+    <!-- an additional note about the reaction by the recorder -->
     <note>
       <text value="The patient reports that the onset of urticaria was within 15 minutes of eating cashews."/>
     </note>

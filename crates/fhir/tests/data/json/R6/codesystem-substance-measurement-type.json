@@ -1,0 +1,109 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "substance-measurement-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem substance-measurement-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"substance-measurement-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcsubstance-measurement-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/substance-measurement-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eic50\u003ca name\u003d\"substance-measurement-type-ic50\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eIC50\u003c/td\u003e\u003ctd\u003eHalf maximal inhibitory concentration.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eec50\u003ca name\u003d\"substance-measurement-type-ec50\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eEC50\u003c/td\u003e\u003ctd\u003eHalf maximal effective concentration.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ekd\u003ca name\u003d\"substance-measurement-type-kd\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eKd\u003c/td\u003e\u003ctd\u003eEquilibrium dissociation constant.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eki\u003ca name\u003d\"substance-measurement-type-ki\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eKi\u003c/td\u003e\u003ctd\u003eInhibition constant.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ekm\u003ca name\u003d\"substance-measurement-type-km\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eKm\u003c/td\u003e\u003ctd\u003eMichaelis constant.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ekon\u003ca name\u003d\"substance-measurement-type-kon\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eKon\u003c/td\u003e\u003ctd\u003eAssociation rate constant.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ekoff\u003ca name\u003d\"substance-measurement-type-koff\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eKoff\u003c/td\u003e\u003ctd\u003eDissociation rate constant.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emole-ratio\u003ca name\u003d\"substance-measurement-type-mole-ratio\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMole ratio\u003c/td\u003e\u003ctd\u003eRatio expressed in moles.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eweight-ratio\u003ca name\u003d\"substance-measurement-type-weight-ratio\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eWeight ratio\u003c/td\u003e\u003ctd\u003eRatio expressed by weight (mass).\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/substance-measurement-type",
+  "version": "6.0.0-ballot4",
+  "name": "SubstanceMeasurementTypeExample",
+  "title": "Substance Measurement Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-23",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The kind of numeric measurement being recorded for a substance amount or relationship, e.g. IC50, Kd, mole ratio.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/substance-measurement-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "ic50",
+      "display": "IC50",
+      "definition": "Half maximal inhibitory concentration."
+    },
+    {
+      "code": "ec50",
+      "display": "EC50",
+      "definition": "Half maximal effective concentration."
+    },
+    {
+      "code": "kd",
+      "display": "Kd",
+      "definition": "Equilibrium dissociation constant."
+    },
+    {
+      "code": "ki",
+      "display": "Ki",
+      "definition": "Inhibition constant."
+    },
+    {
+      "code": "km",
+      "display": "Km",
+      "definition": "Michaelis constant."
+    },
+    {
+      "code": "kon",
+      "display": "Kon",
+      "definition": "Association rate constant."
+    },
+    {
+      "code": "koff",
+      "display": "Koff",
+      "definition": "Dissociation rate constant."
+    },
+    {
+      "code": "mole-ratio",
+      "display": "Mole ratio",
+      "definition": "Ratio expressed in moles."
+    },
+    {
+      "code": "weight-ratio",
+      "display": "Weight ratio",
+      "definition": "Ratio expressed by weight (mass)."
+    }
+  ]
+}

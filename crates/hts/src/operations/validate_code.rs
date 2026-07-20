@@ -2303,7 +2303,14 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
         let supplements =
             resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let display = find_str_param(&params, "display");
-        let req_version = find_str_param(&params, "version");
+        let req_version = resolve_cs_effective_version(
+            state.backend(),
+            &ctx,
+            &params,
+            &system,
+            find_str_param(&params, "version"),
+        )
+        .await;
         let req = ValidateCodeRequest {
             url: None,
             value_set_version: None,
@@ -2376,7 +2383,14 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
         // report a mismatch.
         let display = coding_display.or_else(|| find_str_param(&params, "display"));
         // Coding.version takes precedence over a top-level `version` param.
-        let req_version = coding_version.or_else(|| find_str_param(&params, "version"));
+        let req_version = resolve_cs_effective_version(
+            state.backend(),
+            &ctx,
+            &params,
+            &system,
+            coding_version.or_else(|| find_str_param(&params, "version")),
+        )
+        .await;
         let supplements =
             resolve_supplements(state.backend(), &ctx, &params, Some(&system)).await?;
         let req = ValidateCodeRequest {
@@ -2451,12 +2465,24 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
         // codings in a CodeableConcept all validate, the response echoes the
         // last one). Iterate in reverse so the earliest "yes" we find is the
         // last entry in the input.
-        let cc_req_version = find_str_param(&params, "version");
+        let cc_explicit_version = find_str_param(&params, "version");
         let cs_lenient = params
             .iter()
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
             .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()));
         for (system, code) in codings.into_iter().rev() {
+            // Resolved per coding: the version pins are keyed by system canonical
+            // (`system-version=<url>|<version>`), and a CodeableConcept may carry
+            // codings from several systems, so the effective version can differ
+            // between iterations.
+            let cc_req_version = resolve_cs_effective_version(
+                state.backend(),
+                &ctx,
+                &params,
+                &system,
+                cc_explicit_version.clone(),
+            )
+            .await;
             let req = ValidateCodeRequest {
                 url: None,
                 value_set_version: None,
@@ -2611,6 +2637,61 @@ fn vs_include_pin_for_system(vs: &Value, system_url: &str) -> Option<Option<Stri
             return Some(ver);
         }
     }
+    None
+}
+
+/// Resolve the effective CodeSystem version for a `CodeSystem/$validate-code`
+/// call, honouring the tx.fhir.org version-pin parameters.
+///
+/// Priority (the ValueSet path's `resolve_version_for_system` minus its
+/// ValueSet-include tier, which has no meaning here):
+///
+/// 1. `force-system-version|<url>` — overrides even an explicitly supplied version.
+/// 2. Explicit: `Coding.version`, then `version`, then `systemVersion`.
+/// 3. `system-version|<url>` / `check-system-version|<url>` — a *default*, applied
+///    only when the caller supplied no explicit version.
+/// 4. `None` — the backend applies its own default resolution.
+///
+/// The official `CodeSystem/$validate-code` OperationDefinition declares only
+/// `version`; `systemVersion` and the `*-system-version` canonical pins are
+/// tx.fhir.org extensions. HTS already honoured them on `$expand` and
+/// `ValueSet/$validate-code` but silently ignored them here, so a client pinning
+/// `systemVersion=1.0.0` got the default row anyway — the second defect reported
+/// in issue #200. Accepting them removes that asymmetry.
+///
+/// Caching is unaffected: `build_validate_code_cache_key` already refuses to
+/// cache any request carrying the canonical pins, and `systemVersion` is part of
+/// the key like any other value parameter.
+async fn resolve_cs_effective_version<B: TerminologyBackend>(
+    backend: &B,
+    ctx: &TenantContext,
+    params: &[Value],
+    system: &str,
+    explicit: Option<String>,
+) -> Option<String> {
+    let force_pins = collect_canonical_params(params, "force-system-version");
+    if let Some(pattern) = find_pin_for_system(&force_pins, system) {
+        return Some(
+            resolve_cs_version_pattern(backend, ctx, system, pattern)
+                .await
+                .unwrap_or_else(|| pattern.to_string()),
+        );
+    }
+
+    if let Some(version) = explicit.or_else(|| find_str_param(params, "systemVersion")) {
+        return Some(version);
+    }
+
+    let mut defaults = collect_canonical_params(params, "system-version");
+    defaults.extend(collect_canonical_params(params, "check-system-version"));
+    if let Some(pattern) = find_pin_for_system(&defaults, system) {
+        return Some(
+            resolve_cs_version_pattern(backend, ctx, system, pattern)
+                .await
+                .unwrap_or_else(|| pattern.to_string()),
+        );
+    }
+
     None
 }
 

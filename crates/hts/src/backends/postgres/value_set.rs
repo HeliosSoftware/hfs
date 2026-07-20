@@ -1026,6 +1026,19 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         })
     }
 
+    async fn value_set_version_for_url(
+        &self,
+        _ctx: &TenantContext,
+        url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+        Ok(lookup_value_set_version(&client, url).await)
+    }
+
     async fn validate_code(
         &self,
         _ctx: &TenantContext,
@@ -1373,14 +1386,15 @@ impl ValueSetOperations for PostgresTerminologyBackend {
             // \`display\` parameter on mismatch responses (the concept itself
             // is still discoverable, only the version is unknown).
             let system_unwrapped = req.system.clone().unwrap();
+            let sql = format!(
+                "SELECT c.display FROM concepts c \
+                 JOIN code_systems s ON s.id = c.system_id \
+                 WHERE s.url = $1 AND c.code = $2 \
+                 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("s")
+            );
             let display = client
-                .query_opt(
-                    "SELECT c.display FROM concepts c
-                     JOIN code_systems s ON s.id = c.system_id
-                     WHERE s.url = $1 AND c.code = $2
-                     ORDER BY COALESCE(s.version, '') DESC LIMIT 1",
-                    &[&system_unwrapped, &req.code],
-                )
+                .query_opt(&sql, &[&system_unwrapped, &req.code])
                 .await
                 .ok()
                 .flatten()
@@ -1818,14 +1832,15 @@ async fn resolve_value_set_versioned(
     version: Option<&str>,
     date: Option<&str>,
 ) -> Result<(String, Option<String>), HtsError> {
+    let sql = format!(
+        "SELECT id, compose_json, version FROM value_sets \
+         WHERE url = $1 \
+           AND ($2::text IS NULL OR (resource_json->>'date') <= $2) \
+         ORDER BY {}",
+        crate::backends::vs_precedence_order_by("value_sets")
+    );
     let rows = client
-        .query(
-            "SELECT id, compose_json, version FROM value_sets
-             WHERE url = $1
-               AND ($2::text IS NULL OR (resource_json->>'date') <= $2)
-             ORDER BY COALESCE(version, '') DESC",
-            &[&url, &date],
-        )
+        .query(&sql, &[&url, &date])
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -3241,13 +3256,16 @@ async fn resolve_compose_system_id(
     url: &str,
     version: Option<&str>,
 ) -> Result<Option<String>, HtsError> {
+    // Candidates come back best-first under the shared precedence rule, so the
+    // unpinned branch below can simply take the head. Previously ordered by
+    // `COALESCE(version,'') DESC` alone, which ignored the content/has-concepts
+    // tiers and the original-vs-copy tier.
+    let sql = format!(
+        "SELECT id, version FROM code_systems WHERE url = $1 ORDER BY {}",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let rows = client
-        .query(
-            "SELECT id, version FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC",
-            &[&url],
-        )
+        .query(&sql, &[&url])
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
@@ -3352,12 +3370,12 @@ async fn build_hierarchical_expansion(
     let system_urls: HashSet<String> = flat.iter().map(|c| c.system.clone()).collect();
     let mut system_id_map: HashMap<String, String> = HashMap::new();
     for sys_url in &system_urls {
+        let sql = format!(
+            "SELECT id FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+            crate::backends::cs_precedence_order_by("code_systems")
+        );
         let rows = client
-            .query(
-                "SELECT id FROM code_systems WHERE url = $1 \
-                 ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                &[sys_url],
-            )
+            .query(&sql, &[sys_url])
             .await
             .map_err(|e| HtsError::StorageError(e.to_string()))?;
         if let Some(row) = rows.into_iter().next() {
@@ -3596,20 +3614,29 @@ fn extract_single_hierarchy_include(compose: &serde_json::Value) -> Option<(Stri
     Some((system.to_owned(), val.to_owned(), exclude_self))
 }
 
-/// Resolve the highest-versioned `code_systems.id` for a given canonical URL.
-/// Multiple rows can share the same URL (stub + real import); we pick the
-/// most recent textual COALESCE-DESC version, matching SQLite's resolver.
+/// Resolve the winning `code_systems.id` for a given canonical URL.
+///
+/// Multiple rows can share a URL (empty stub + real import, or an original and a
+/// re-published copy). Ordering comes from [`crate::backends::cs_precedence_order_by`],
+/// the same text SQLite uses.
+///
+/// This previously ordered by `COALESCE(version,'') DESC` alone while claiming in
+/// its doc comment to match SQLite — it did not. It lacked the content and
+/// has-concepts tiers, so on Postgres an empty `content=not-present` stub whose
+/// version string merely sorted higher (e.g. SNOMED's `"current"` stub, since
+/// `'c' > '2'`) would beat a fully imported edition and `$expand` would return
+/// nothing. That was a Postgres-only defect independent of the copy-vs-original
+/// bug this ordering also fixes.
 async fn resolve_system_id_pg(
     client: &tokio_postgres::Client,
     cs_url: &str,
 ) -> Result<Option<String>, HtsError> {
+    let sql = format!(
+        "SELECT id FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let row = client
-        .query_opt(
-            "SELECT id FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            &[&cs_url],
-        )
+        .query_opt(&sql, &[&cs_url])
         .await
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
     Ok(row.map(|r| r.get::<_, String>(0)))
@@ -3719,13 +3746,12 @@ async fn validate_fhir_vs(
 /// Highest stored ValueSet version for a URL, used to format `url|version`
 /// in IG-spec not-found messages.
 async fn lookup_value_set_version(client: &tokio_postgres::Client, url: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT version FROM value_sets WHERE url = $1 ORDER BY {} LIMIT 1",
+        crate::backends::vs_precedence_order_by("value_sets")
+    );
     client
-        .query_opt(
-            "SELECT version FROM value_sets \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            &[&url],
-        )
+        .query_opt(&sql, &[&url])
         .await
         .ok()
         .flatten()
@@ -3756,11 +3782,13 @@ async fn pg_lookup_cs_display(
             .flatten(),
         None => client
             .query_opt(
-                "SELECT c.display FROM concepts c
-                   JOIN code_systems s ON s.id = c.system_id
-                  WHERE s.url = $1 AND c.code = $2
-                  ORDER BY COALESCE(s.version, '') DESC
-                  LIMIT 1",
+                &format!(
+                    "SELECT c.display FROM concepts c \
+                     JOIN code_systems s ON s.id = c.system_id \
+                     WHERE s.url = $1 AND c.code = $2 \
+                     ORDER BY {} LIMIT 1",
+                    crate::backends::cs_precedence_order_by("s")
+                ),
                 &[&system_url, &code],
             )
             .await
@@ -3774,13 +3802,12 @@ pub(super) async fn cs_version_for_msg(
     client: &tokio_postgres::Client,
     system_url: &str,
 ) -> Option<String> {
+    let sql = format!(
+        "SELECT version FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     client
-        .query_opt(
-            "SELECT version FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            &[&system_url],
-        )
+        .query_opt(&sql, &[&system_url])
         .await
         .ok()
         .flatten()
@@ -3794,13 +3821,12 @@ pub(super) async fn cs_content_for_url(
     client: &tokio_postgres::Client,
     system_url: &str,
 ) -> Option<String> {
+    let sql = format!(
+        "SELECT content FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     client
-        .query_opt(
-            "SELECT content FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            &[&system_url],
-        )
+        .query_opt(&sql, &[&system_url])
         .await
         .ok()
         .flatten()
@@ -3813,16 +3839,12 @@ pub(super) async fn cs_is_case_insensitive(
     client: &tokio_postgres::Client,
     system_url: &str,
 ) -> bool {
-    let row = match client
-        .query_opt(
-            "SELECT (resource_json->>'caseSensitive') \
-             FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            &[&system_url],
-        )
-        .await
-    {
+    let sql = format!(
+        "SELECT (resource_json->>'caseSensitive') FROM code_systems \
+         WHERE url = $1 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
+    let row = match client.query_opt(&sql, &[&system_url]).await {
         Ok(r) => r,
         Err(_) => return false,
     };
@@ -3900,15 +3922,11 @@ pub(super) async fn cs_property_local_codes(
     canonical: &str,
 ) -> Vec<String> {
     let mut codes: Vec<String> = vec![canonical.to_string()];
-    let row = match client
-        .query_opt(
-            "SELECT resource_json FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            &[&system_url],
-        )
-        .await
-    {
+    let sql = format!(
+        "SELECT resource_json FROM code_systems WHERE url = $1 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
+    let row = match client.query_opt(&sql, &[&system_url]).await {
         Ok(Some(r)) => r,
         _ => return codes,
     };
@@ -4199,17 +4217,14 @@ pub(super) async fn detect_cs_version_mismatch(
     Option<String>,
     Option<String>,
 )> {
-    // Build (id, version) candidate list sorted desc so the first entry is the
-    // highest version — used for both resolution and picking the "actual" ver.
-    let rows = client
-        .query(
-            "SELECT id, version FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC",
-            &[&system_url],
-        )
-        .await
-        .ok()?;
+    // Candidate (id, version) list in precedence order, so the first entry is the
+    // row the server would RESOLVE — not merely the highest version string. The
+    // reported version must name the row validation actually ran against.
+    let sql = format!(
+        "SELECT id, version FROM code_systems WHERE url = $1 ORDER BY {}",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
+    let rows = client.query(&sql, &[&system_url]).await.ok()?;
     let candidates: Vec<(String, Option<String>)> = rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
@@ -4477,15 +4492,11 @@ async fn detect_vs_pin_unknown(
         .and_then(|pin| pin)?; // only when the include has an explicit version
 
     // Build candidates for resolution
-    let rows = client
-        .query(
-            "SELECT id, version FROM code_systems \
-             WHERE url = $1 \
-             ORDER BY COALESCE(version, '') DESC",
-            &[&system_url],
-        )
-        .await
-        .ok()?;
+    let sql = format!(
+        "SELECT id, version FROM code_systems WHERE url = $1 ORDER BY {}",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
+    let rows = client.query(&sql, &[&system_url]).await.ok()?;
     let candidates: Vec<(String, Option<String>)> = rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))

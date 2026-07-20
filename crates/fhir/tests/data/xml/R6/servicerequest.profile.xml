@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ServiceRequest"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -356,13 +356,16 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAMQfAGm6/idTd4yTmF+v8Xa37KvW+lyh3KHJ62aq41ee2bXZ98nm/2mt5W2Ck5XN/C1chEZieho8WXXA/2Gn4P39/W+y6V+l3qjP8Njt/lx2izxPYGyv51Oa1EJWZ////////yH5BAEAAB8ALAAAAAAQABAAAAWH4Cd+Xml6Y0pCQts0EKp6GbYshaM/skhjhCChUmFIeL4OsHIxXRAISQTl6SgIG8+FgfBMoh2qtbLZQr0TQJhk3TC4pYPBApiyFVDEwSOf18UFXxMWBoUJBn9sDgmDewcJCRyJJBoEkRyYmAABPZQEAAOhA5seFDMaDw8BAQ9TpiokJyWwtLUhADs=" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Choice of Types" class="hierarchy"/> 
-            <span title="ServiceRequest.orderDetail.parameterFocus[x] : Indicates the context of the order details by reference.">parameterFocus[x]</span>
+            <span title="ServiceRequest.orderDetail.parameterFocus[x] : Indicates the context of the order details by reference or code when the resource instance is not available.">parameterFocus[x]</span>
             <a name="ServiceRequest.orderDetail.parameterFocus_x_"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"></td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The context of the order details by reference
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The device, substance, medication, or other item the order details apply to
+            <br/>Binding: 
+            <a href="valueset-servicerequest-parameter-focus.html">Service Request Parameter Focus Codes</a> (
+            <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
         </tr>
@@ -717,6 +720,7 @@
             <a name="ServiceRequest.focus"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
+            <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="conformance-rules.html#isModifier" title="This element is a modifier element">?!</a>
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..*</td>
@@ -980,7 +984,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Requested location
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-ServiceDeliveryLocationRoleType.html">ServiceDeliveryLocationRoleType</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-v3-ServiceDeliveryLocationRoleType.html">ServiceDeliveryLocationRoleType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -1223,7 +1227,7 @@
   <name value="ServiceRequest"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
@@ -1373,7 +1377,7 @@
       <path value="ServiceRequest.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1552,6 +1556,14 @@
     </element>
     <element id="ServiceRequest.extension">
       <path value="ServiceRequest.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1584,6 +1596,14 @@
     </element>
     <element id="ServiceRequest.modifierExtension">
       <path value="ServiceRequest.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2198,6 +2218,14 @@
     </element>
     <element id="ServiceRequest.orderDetail.extension">
       <path value="ServiceRequest.orderDetail.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2229,6 +2257,14 @@
     </element>
     <element id="ServiceRequest.orderDetail.modifierExtension">
       <path value="ServiceRequest.orderDetail.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2263,8 +2299,9 @@
     </element>
     <element id="ServiceRequest.orderDetail.parameterFocus[x]">
       <path value="ServiceRequest.orderDetail.parameterFocus[x]"/>
-      <short value="The context of the order details by reference"/>
-      <definition value="Indicates the context of the order details by reference."/>
+      <short value="The device, substance, medication, or other item the order details apply to"/>
+      <definition value="Indicates the context of the order details by reference or code when the resource instance is not available."/>
+      <comment value="parameterFocusReference is the most common choice type for identifying a specific item or a related request. parameterFocusCanonical is used when a definitional resource (such as DeviceDefinition or PlanDefinition) identifies the type of item. parameterFocusCodeableConcept may be used when the item is identified by a coded value such as a device type or medication code; its specificity is implementation dependent."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2300,6 +2337,14 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
+      <binding>
+        <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
+          <valueString value="ParameterFocusCode"/>
+        </extension>
+        <strength value="extensible"/>
+        <description value="Coded representation of the item the order detail parameters apply to, such as a device type, medication, or substance."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/servicerequest-parameter-focus"/>
+      </binding>
       <mapping>
         <identity value="workflow"/>
         <map value="Request.product"/>
@@ -2359,6 +2404,14 @@
     </element>
     <element id="ServiceRequest.orderDetail.parameter.extension">
       <path value="ServiceRequest.orderDetail.parameter.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2390,6 +2443,14 @@
     </element>
     <element id="ServiceRequest.orderDetail.parameter.modifierExtension">
       <path value="ServiceRequest.orderDetail.parameter.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2504,7 +2565,7 @@
       <short value="Service amount"/>
       <definition value="An amount of service being requested."/>
       <comment value="The amount of service being requested can be a quantity (e.g., $1,500 for home modification request), a ratio (e.g., 20 for a request of home visits to occur each month), or a range (e.g., 8-10 for physiotherapy sessions)."/>
-      <requirements value="When ordering a service the number of service items may need to be specified separately from the the service item."/>
+      <requirements value="When ordering a service the number of service items may need to be specified separately from the service item."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2612,7 +2673,8 @@
         <source value="http://hl7.org/fhir/StructureDefinition/Element"/>
       </constraint>
       <mustSupport value="false"/>
-      <isModifier value="false"/>
+      <isModifier value="true"/>
+      <isModifierReason value="This element is labeled as a modifier because it changes who is the target of the request. See the use cases in the definition."/>
       <isSummary value="true"/>
       <mapping>
         <identity value="w5"/>
@@ -2945,7 +3007,7 @@
       <path value="ServiceRequest.performer"/>
       <short value="Requested performer"/>
       <definition value="The desired performer for doing the requested service.  For example, the surgeon, dermatopathologist, endoscopist, etc."/>
-      <comment value="If multiple performers are present, it is interpreted as a list of *alternative* performers without any preference regardless of order.  If order of preference is needed use the [http://hl7.org/fhir/StructureDefinition/request-performerOrder](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-request-performerOrder.html).  Use CareTeam to represent a group of performers (for example, Practitioner A *and* Practitioner B). Group is only allowed in the circumstance where the group represents a family or a household, and should not represent groups of Practitioners. In those instances it is preferable to use more specific resources such as Organization, CareTeam, or HealthcareService instead."/>
+      <comment value="If multiple performers are present, it is interpreted as a list of *alternative* performers without any preference regardless of order.  If order of preference is needed use the [Performer order](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-request-performerOrder.html).  Use CareTeam to represent a group of performers (for example, Practitioner A *and* Practitioner B). Group is only allowed in the circumstance where the group represents a family or a household, and should not represent groups of Practitioners. In those instances it is preferable to use more specific resources such as Organization, CareTeam, or HealthcareService instead."/>
       <alias value="request recipient"/>
       <min value="0"/>
       <max value="*"/>
@@ -3329,6 +3391,14 @@
     </element>
     <element id="ServiceRequest.patientInstruction.extension">
       <path value="ServiceRequest.patientInstruction.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3360,6 +3430,14 @@
     </element>
     <element id="ServiceRequest.patientInstruction.modifierExtension">
       <path value="ServiceRequest.patientInstruction.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3926,8 +4004,9 @@
     </element>
     <element id="ServiceRequest.orderDetail.parameterFocus[x]">
       <path value="ServiceRequest.orderDetail.parameterFocus[x]"/>
-      <short value="The context of the order details by reference"/>
-      <definition value="Indicates the context of the order details by reference."/>
+      <short value="The device, substance, medication, or other item the order details apply to"/>
+      <definition value="Indicates the context of the order details by reference or code when the resource instance is not available."/>
+      <comment value="parameterFocusReference is the most common choice type for identifying a specific item or a related request. parameterFocusCanonical is used when a definitional resource (such as DeviceDefinition or PlanDefinition) identifies the type of item. parameterFocusCodeableConcept may be used when the item is identified by a coded value such as a device type or medication code; its specificity is implementation dependent."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -3951,6 +4030,14 @@
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
+      <binding>
+        <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
+          <valueString value="ParameterFocusCode"/>
+        </extension>
+        <strength value="extensible"/>
+        <description value="Coded representation of the item the order detail parameters apply to, such as a device type, medication, or substance."/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/servicerequest-parameter-focus"/>
+      </binding>
       <mapping>
         <identity value="workflow"/>
         <map value="Request.product"/>
@@ -4027,7 +4114,7 @@
       <short value="Service amount"/>
       <definition value="An amount of service being requested."/>
       <comment value="The amount of service being requested can be a quantity (e.g., $1,500 for home modification request), a ratio (e.g., 20 for a request of home visits to occur each month), or a range (e.g., 8-10 for physiotherapy sessions)."/>
-      <requirements value="When ordering a service the number of service items may need to be specified separately from the the service item."/>
+      <requirements value="When ordering a service the number of service items may need to be specified separately from the service item."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -4099,7 +4186,8 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Resource"/>
       </type>
       <mustSupport value="false"/>
-      <isModifier value="false"/>
+      <isModifier value="true"/>
+      <isModifierReason value="This element is labeled as a modifier because it changes who is the target of the request. See the use cases in the definition."/>
       <isSummary value="true"/>
       <mapping>
         <identity value="w5"/>
@@ -4348,7 +4436,7 @@
       <path value="ServiceRequest.performer"/>
       <short value="Requested performer"/>
       <definition value="The desired performer for doing the requested service.  For example, the surgeon, dermatopathologist, endoscopist, etc."/>
-      <comment value="If multiple performers are present, it is interpreted as a list of *alternative* performers without any preference regardless of order.  If order of preference is needed use the [http://hl7.org/fhir/StructureDefinition/request-performerOrder](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-request-performerOrder.html).  Use CareTeam to represent a group of performers (for example, Practitioner A *and* Practitioner B). Group is only allowed in the circumstance where the group represents a family or a household, and should not represent groups of Practitioners. In those instances it is preferable to use more specific resources such as Organization, CareTeam, or HealthcareService instead."/>
+      <comment value="If multiple performers are present, it is interpreted as a list of *alternative* performers without any preference regardless of order.  If order of preference is needed use the [Performer order](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-request-performerOrder.html).  Use CareTeam to represent a group of performers (for example, Practitioner A *and* Practitioner B). Group is only allowed in the circumstance where the group represents a family or a household, and should not represent groups of Practitioners. In those instances it is preferable to use more specific resources such as Organization, CareTeam, or HealthcareService instead."/>
       <alias value="request recipient"/>
       <min value="0"/>
       <max value="*"/>

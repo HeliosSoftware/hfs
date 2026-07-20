@@ -241,6 +241,12 @@ impl SearchParameterDefinition {
 /// unregistering, or re-statusing a *shadowed* parameter therefore never
 /// changes which definition answers a query, and removing the winner
 /// re-points the slot at the next candidate instead of leaving a hole (#239).
+///
+/// `Clone` is cheap: both indexes hold `Arc<SearchParameterDefinition>`, so a
+/// clone copies the HashMap structure and bumps Arc refcounts — the definitions
+/// themselves are shared. The per-tenant registry container relies on this to
+/// materialize a tenant's registry as `base.clone()` plus that tenant's overlay.
+#[derive(Clone)]
 pub struct SearchParameterRegistry {
     /// Parameters indexed by (resource_type, param_code). Each slot holds the
     /// candidates in descending precedence order; the first entry wins.
@@ -494,6 +500,29 @@ impl SearchParameterRegistry {
         }
 
         Ok(())
+    }
+
+    /// Removes every parameter registered from `source`, returning how many
+    /// were removed.
+    ///
+    /// This is the rebuild primitive for a storage-backed refresh: drop all
+    /// `Stored` definitions, then re-register what storage currently holds.
+    /// Slots shared with other sources keep their remaining candidates, so a
+    /// spec parameter shadowed by a since-deleted stored override resumes
+    /// resolving searches.
+    pub fn unregister_source(&mut self, source: SearchParameterSource) -> usize {
+        let urls: Vec<String> = self
+            .params_by_url
+            .iter()
+            .filter(|(_, p)| p.source == source)
+            .map(|(url, _)| url.clone())
+            .collect();
+        for url in &urls {
+            // The URL came straight out of the index; a NotFound here would
+            // mean the two indexes disagree, which unregister() prevents.
+            let _ = self.unregister(url);
+        }
+        urls.len()
     }
 
     /// Returns all resource types that have registered parameters.
@@ -928,6 +957,40 @@ mod tests {
             registry.get_by_url(SPEC_URL).unwrap().status,
             SearchParameterStatus::Retired
         );
+    }
+
+    /// `unregister_source` is the storage-refresh rebuild primitive (#235):
+    /// dropping all `Stored` params must promote any spec param they were
+    /// shadowing, and leave other sources untouched.
+    #[test]
+    fn unregister_source_removes_only_that_source_and_promotes_shadowed() {
+        let mut registry = SearchParameterRegistry::new();
+        registry.register(spec_code_param()).unwrap();
+        let stored_override = SearchParameterDefinition::new(
+            "http://acme.health/fhir/SearchParameter/observation-code-stored",
+            "code",
+            SearchParamType::Token,
+            "Observation.code",
+        )
+        .with_base(vec!["Observation"])
+        .with_source(SearchParameterSource::Stored);
+        registry.register(stored_override.clone()).unwrap();
+        assert_eq!(
+            registry.get_param("Observation", "code").unwrap().url,
+            stored_override.url
+        );
+
+        let removed = registry.unregister_source(SearchParameterSource::Stored);
+
+        assert_eq!(removed, 1);
+        assert_eq!(registry.len(), 1);
+        // The spec param the stored override was shadowing resolves again.
+        assert_eq!(
+            registry.get_param("Observation", "code").unwrap().url,
+            SPEC_URL
+        );
+        // Removing a source with no registrations is a no-op.
+        assert_eq!(registry.unregister_source(SearchParameterSource::Stored), 0);
     }
 
     #[test]

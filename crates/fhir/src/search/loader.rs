@@ -159,6 +159,75 @@ impl SearchParameterLoader {
         Ok(params)
     }
 
+    /// Returns the raw SearchParameter resources from the FHIR spec bundle,
+    /// as stored-shape JSON.
+    ///
+    /// This is the seeding companion to
+    /// [`load_from_spec_file`](Self::load_from_spec_file): the registry wants
+    /// parsed definitions, but seeding storage wants the original resource
+    /// JSON (ids, metadata, and fields the definition model drops). Only
+    /// entries that also parse as definitions are returned, so storage never
+    /// holds a parameter the registry would reject.
+    pub fn load_spec_resources(&self, data_dir: &Path) -> Result<Vec<Value>, LoaderError> {
+        let path = data_dir.join(self.spec_filename());
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| LoaderError::ConfigLoadFailed {
+                path: path.display().to_string(),
+                message: e.to_string(),
+            })?;
+        let json: Value =
+            serde_json::from_str(&content).map_err(|e| LoaderError::ConfigLoadFailed {
+                path: path.display().to_string(),
+                message: format!("Invalid JSON: {}", e),
+            })?;
+
+        let mut resources = Vec::new();
+        if let Some(entries) = json.get("entry").and_then(|e| e.as_array()) {
+            for entry in entries {
+                if let Some(resource) = entry.get("resource")
+                    && resource.get("resourceType").and_then(|t| t.as_str())
+                        == Some("SearchParameter")
+                    && self.parse_resource(resource).is_ok()
+                {
+                    resources.push(resource.clone());
+                }
+            }
+        }
+        Ok(resources)
+    }
+
+    /// Renders a definition as a minimal FHIR SearchParameter resource.
+    ///
+    /// Used to seed storage with the embedded fallback parameters, which are
+    /// constructed programmatically and have no source JSON. The resource id
+    /// is the last segment of the canonical URL (`.../Resource-id` → id
+    /// `Resource-id`), matching the spec bundle's convention.
+    pub fn definition_to_fhir_resource(def: &SearchParameterDefinition) -> Value {
+        let id = def.url.rsplit('/').next().unwrap_or(&def.code);
+        let mut resource = serde_json::json!({
+            "resourceType": "SearchParameter",
+            "id": id,
+            "url": def.url,
+            "name": def.name.clone().unwrap_or_else(|| def.code.clone()),
+            "status": def.status.to_fhir_status(),
+            "code": def.code,
+            "base": def.base,
+            "type": def.param_type.to_string(),
+            "expression": def.expression,
+        });
+        let fields = resource.as_object_mut().expect("literal object");
+        if let Some(description) = &def.description {
+            fields.insert("description".into(), Value::String(description.clone()));
+        }
+        if let Some(target) = &def.target {
+            fields.insert(
+                "target".into(),
+                Value::Array(target.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        resource
+    }
+
     /// Loads custom SearchParameter files from the data directory.
     ///
     /// Scans the data directory for JSON files that are not the standard
@@ -690,6 +759,112 @@ mod tests {
 
         let result = loader.parse_resource(&json);
         assert!(matches!(result, Err(LoaderError::MissingField { field, .. }) if field == "url"));
+    }
+
+    /// The workspace data directory holding `search-parameters-r4.json`.
+    fn workspace_data_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
+    }
+
+    #[test]
+    fn test_load_spec_resources_returns_stored_shape_json() {
+        let loader = SearchParameterLoader::new(FhirVersion::R4);
+        let resources = loader
+            .load_spec_resources(&workspace_data_dir())
+            .expect("load spec resources");
+
+        assert!(
+            resources.len() > 1300,
+            "expected the full R4 spec set, got {}",
+            resources.len()
+        );
+        // Every entry is a SearchParameter carrying its bundle id — that id is
+        // what makes seeding idempotent (a duplicate `create` fails).
+        for resource in &resources {
+            assert_eq!(
+                resource.get("resourceType").and_then(|t| t.as_str()),
+                Some("SearchParameter")
+            );
+            assert!(
+                resource.get("id").and_then(|id| id.as_str()).is_some(),
+                "spec resource is missing an id: {resource}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_spec_resources_missing_dir_errors() {
+        let loader = SearchParameterLoader::new(FhirVersion::R4);
+        let result = loader.load_spec_resources(Path::new("/nonexistent/data/dir"));
+        assert!(matches!(result, Err(LoaderError::ConfigLoadFailed { .. })));
+    }
+
+    #[test]
+    fn test_definition_to_fhir_resource() {
+        // A reference parameter with description and targets exercises both
+        // optional-field branches.
+        let mut def = SearchParameterDefinition::new(
+            "http://example.org/fhir/SearchParameter/Patient-organization",
+            "organization",
+            SearchParamType::Reference,
+            "Patient.managingOrganization",
+        )
+        .with_base(vec!["Patient"])
+        .with_targets(vec!["Organization"]);
+        def.description = Some("The organization managing the patient".to_string());
+
+        let resource = SearchParameterLoader::definition_to_fhir_resource(&def);
+        assert_eq!(
+            resource.get("resourceType").and_then(|t| t.as_str()),
+            Some("SearchParameter")
+        );
+        // Id is the last URL segment, matching the spec bundle convention.
+        assert_eq!(
+            resource.get("id").and_then(|i| i.as_str()),
+            Some("Patient-organization")
+        );
+        assert_eq!(
+            resource.get("code").and_then(|c| c.as_str()),
+            Some("organization")
+        );
+        assert_eq!(
+            resource.get("type").and_then(|t| t.as_str()),
+            Some("reference")
+        );
+        assert_eq!(
+            resource.get("description").and_then(|d| d.as_str()),
+            Some("The organization managing the patient")
+        );
+        assert_eq!(
+            resource.get("target").and_then(|t| t.as_array()),
+            Some(&vec![Value::String("Organization".to_string())])
+        );
+        // The rendered resource round-trips back into a parseable definition.
+        assert!(loader_can_parse(&resource));
+
+        // A parameter with no description/target omits those fields entirely.
+        let minimal = SearchParameterLoader::definition_to_fhir_resource(
+            &SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Resource-id",
+                "_id",
+                SearchParamType::Token,
+                "id",
+            )
+            .with_base(vec!["Resource"]),
+        );
+        assert_eq!(
+            minimal.get("id").and_then(|i| i.as_str()),
+            Some("Resource-id")
+        );
+        assert!(minimal.get("description").is_none());
+        assert!(minimal.get("target").is_none());
+        assert!(loader_can_parse(&minimal));
+    }
+
+    fn loader_can_parse(resource: &Value) -> bool {
+        SearchParameterLoader::new(FhirVersion::R4)
+            .parse_resource(resource)
+            .is_ok()
     }
 
     #[test]

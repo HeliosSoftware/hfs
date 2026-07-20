@@ -17,7 +17,7 @@
     <system value="http://acme.com/containers/id"/>
     <value value="345679"/>
   </identifier>
-  <!--  <displayName value="SST Tube" />  -->
+  <!-- <displayName value="SST Tube" /> -->
   <name>
     <value value="SST Tube"/>
     <type>

@@ -20,7 +20,7 @@
   "name": "Expression",
   "status": "active",
   "experimental": false,
-  "date": "2026-06-13T17:13:29+00:00",
+  "date": "2026-07-17T03:44:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {
@@ -238,6 +238,7 @@
         "path": "Expression.name",
         "short": "Short name assigned to expression for reuse",
         "definition": "A short name assigned to the expression to allow for multiple reuse of the expression in the context where it is defined.",
+        "comment": "This element is defined with a data type of code because of its behavior, not because of any expectation it will be bound to a value set.",
         "min": 0,
         "max": "1",
         "base": {
@@ -435,6 +436,7 @@
         "path": "Expression.name",
         "short": "Short name assigned to expression for reuse",
         "definition": "A short name assigned to the expression to allow for multiple reuse of the expression in the context where it is defined.",
+        "comment": "This element is defined with a data type of code because of its behavior, not because of any expectation it will be bound to a value set.",
         "min": 0,
         "max": "1",
         "type": [

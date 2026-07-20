@@ -28,7 +28,7 @@
   "name": "xhtml",
   "status": "active",
   "experimental": false,
-  "date": "2026-06-13T17:13:29+00:00",
+  "date": "2026-07-17T03:44:13+00:00",
   "publisher": "HL7 FHIR Standard",
   "contact": [
     {
@@ -64,7 +64,7 @@
   "kind": "primitive-type",
   "abstract": false,
   "type": "xhtml",
-  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Element",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/PrimitiveType",
   "derivation": "specialization",
   "snapshot": {
     "element": [
@@ -101,7 +101,7 @@
         "short": "xml:id (or equivalent in JSON)",
         "definition": "unique id for the element within a resource (for internal references)",
         "min": 0,
-        "max": "1",
+        "max": "0",
         "base": {
           "path": "Element.id",
           "min": 0,
@@ -202,6 +202,11 @@
         "definition": "XHTML",
         "min": 0,
         "max": "*"
+      },
+      {
+        "id": "xhtml.id",
+        "path": "xhtml.id",
+        "max": "0"
       },
       {
         "id": "xhtml.extension",

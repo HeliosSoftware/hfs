@@ -17,7 +17,7 @@
           <lastUpdated value="2015-08-16T10:35:23Z"/>
         </meta>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: DiagnosticReport ghp</b></p><a name="ghp"> </a><a name="hcghp"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px">Last updated: 2015-08-16T10:35:23Z</p></div><h2><span title="Codes:{http://acme.com/labs/reports GHP}">General Health Profile</span> </h2><table class="grid"><tr><td>Subject</td><td>Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</td></tr><tr><td>When For</td><td>2015-08-16T06:40:17Z</td></tr><tr><td>Reported</td><td>2015-08-17T06:40:17Z</td></tr><tr><td>Performer</td><td> <a href="organization-example-lab.html">Acme Laboratory, Inc</a></td></tr><tr><td>Identifier</td><td> <code>http://acme.com/lab/reports</code>/ghp-example</td></tr></table><p><b>Report Details</b></p><table class="grid"><tr><td><b>Code</b></td><td><b>Value</b></td></tr><tr><td colspan="2"><i>Observation</i></td></tr><tr><td colspan="2"><i>Observation</i></td></tr><tr><td colspan="2"><i>Observation</i></td></tr></table></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: DiagnosticReport ghp</b></p><a name="ghp"> </a><a name="hcghp"> </a><div style="display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%"><p style="margin-bottom: 0px">Last updated: 2015-08-16T10:35:23Z</p></div><h2><span title="Codes:{http://acme.com/labs/reports GHP}">General Health Profile</span> </h2><table class="grid"><tr><td>Subject</td><td>Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</td></tr><tr><td>Relevant Time</td><td>2015-08-16T06:40:17Z</td></tr><tr><td>Reported</td><td>2015-08-17T06:40:17Z</td></tr><tr><td>Performer</td><td> <a href="organization-example-lab.html">Acme Laboratory, Inc</a></td></tr><tr><td>Identifier</td><td> <code>http://acme.com/lab/reports</code>/ghp-example</td></tr></table><p><b>Report Details</b></p><table class="grid"><tr><td><b>Code</b></td><td><b>Value</b></td></tr><tr><td colspan="2"><i>Observation</i></td></tr><tr><td colspan="2"><i>Observation</i></td></tr><tr><td colspan="2"><i>Observation</i></td></tr></table></div>
         </text>
         <identifier>
           <system value="http://acme.com/lab/reports"/>
@@ -73,7 +73,7 @@
       <Specimen>
         <id value="rtt"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen rtt</b></p><a name="rtt"> </a><a name="hcrtt"> </a><p><b>identifier</b>: Accession ID/20150816-001245</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 119364003}">Serum sample</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p></blockquote></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen rtt</b></p><a name="rtt"> </a><a name="hcrtt"> </a><p><b>identifier</b>: Accession ID/20150816-001245</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 119364003}">Serum sample</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-example-sst-vacutainer.html">Device: identifier = http://acme.com/containers/id#345679</a></td></tr></table></blockquote></div>
         </text>
         <identifier>
           <type>
@@ -102,7 +102,13 @@
           </collector>
           <collectedDateTime value="2015-08-16T06:40:17Z"/>
         </collection>
-        <container/>
+        <container>
+          <device>
+            <reference>
+              <reference value="Device/device-example-specimen-container-example-sst-vacutainer"/>
+            </reference>
+          </device>
+        </container>
       </Specimen>
     </resource>
   </entry>
@@ -112,7 +118,7 @@
       <Specimen>
         <id value="ltt"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen ltt</b></p><a name="ltt"> </a><a name="hcltt"> </a><p><b>identifier</b>: Accession ID/20150816-00124</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 445295009}">Blood specimen with EDTA</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p></blockquote></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen ltt</b></p><a name="ltt"> </a><a name="hcltt"> </a><p><b>identifier</b>: Accession ID/20150816-00124</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 445295009}">Blood specimen with EDTA</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-lavender-vacutainer.html">Device: identifier = http://acme.com/containers/id#345675; biologicalSourceEvent = </a></td></tr></table></blockquote></div>
         </text>
         <identifier>
           <type>
@@ -141,7 +147,13 @@
           </collector>
           <collectedDateTime value="2015-08-16T06:40:17Z"/>
         </collection>
-        <container/>
+        <container>
+          <device>
+            <reference>
+              <reference value="Device/device-example-specimen-container-lavender-vacutainer"/>
+            </reference>
+          </device>
+        </container>
       </Specimen>
     </resource>
   </entry>
@@ -151,7 +163,7 @@
       <Specimen>
         <id value="urine"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen urine</b></p><a name="urine"> </a><a name="hcurine"> </a><p><b>identifier</b>: Accession ID/20150816-00124</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 122575003}">Urine specimen</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p></blockquote></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: Specimen urine</b></p><a name="urine"> </a><a name="hcurine"> </a><p><b>identifier</b>: Accession ID/20150816-00124</p><p><b>type</b>: <span title="Codes:{http://snomed.info/sct 122575003}">Urine specimen</span></p><p><b>subject</b>: <a href="patient-example-b.html">Duck D Donald (official) Other, DoB Unknown ( Medical record number (use: usual, ))</a></p><h3>Collections</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Collector</b></td><td><b>Collected[x]</b></td></tr><tr><td style="display: none">*</td><td><a href="practitioner-example-f202-lm.html">Practitioner Luigi Maas(official)</a></td><td>2015-08-16T06:40:17Z</td></tr></table><blockquote><p><b>container</b></p><h3>Devices</h3><table class="grid"><tr><td style="display: none">-</td><td><b>Reference</b></td></tr><tr><td style="display: none">*</td><td><a href="device-example-specimen-container-polycup.html">Device: identifier = http://acme.com/containers/id#345675</a></td></tr></table></blockquote></div>
         </text>
         <identifier>
           <type>
@@ -180,7 +192,13 @@
           </collector>
           <collectedDateTime value="2015-08-16T06:40:17Z"/>
         </collection>
-        <container/>
+        <container>
+          <device>
+            <reference>
+              <reference value="Device/device-example-specimen-container-polycup"/>
+            </reference>
+          </device>
+        </container>
       </Specimen>
     </resource>
   </entry>

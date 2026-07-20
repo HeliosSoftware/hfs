@@ -46,6 +46,82 @@ pub struct ParsedBundle {
     pub fresh_load: bool,
 }
 
+/// Authority rank for a resource we have POSITIVE evidence is authoritative:
+/// the package that shipped it declares a `canonical` base that covers the
+/// resource's URL, or it came from a native importer loading a publisher's own
+/// distribution (SNOMED RF2, LOINC, RxNorm, …). Lower wins.
+pub const AUTHORITY_OWNER: i32 = 0;
+
+/// Authority rank for a resource whose provenance we cannot vouch for.
+///
+/// This is the DEFAULT, and the distinction from [`AUTHORITY_OWNER`] is the
+/// whole point: we only ever *promote* on positive evidence, never *demote* on
+/// the absence of it. A row is `UNKNOWN` when it arrived outside any package
+/// (REST write, `$import-bundle`, CLI bundle) or when the package that shipped
+/// it does not declare a canonical base covering the URL.
+///
+/// That second case deliberately conflates two situations we cannot tell apart:
+///
+/// * `hl7.fhir.r4.core` re-publishing `http://terminology.hl7.org/...` — a
+///   genuine stale copy, which must lose to THO's original. This is issue #200.
+/// * `us.nlm.vsac` shipping `http://cts.nlm.nih.gov/...` while declaring the
+///   fhir.org *registry* base `http://fhir.org/packages/us.nlm.vsac` — a genuine
+///   ORIGINAL whose manifest simply doesn't describe its content's authority.
+///   14,850 of its ValueSets look identical to a "copy" under this rule.
+///
+/// Conflating them is safe precisely because rank is only ever a TIEBREAK among
+/// rows sharing one canonical URL. Being `UNKNOWN` costs a row nothing unless a
+/// demonstrable owner of the same URL exists — VSAC's rows have no rival, so they
+/// still win their URLs outright. An earlier draft ranked these as a definite
+/// "foreign copy" (2) and treated non-package writes as owners (0); that was
+/// wrong twice over. It asserted a fact about VSAC we had not established, and —
+/// because `vs_precedence_order_by` has no content/has-concepts tier to absorb
+/// the error — it let any REST upload outrank the real VSAC definition outright.
+pub const AUTHORITY_UNKNOWN: i32 = 1;
+
+/// Sentinel meaning "no source has claimed this row yet", used by the import
+/// upsert's `MIN(COALESCE(authority_rank, …), ?)` / `LEAST(...)` so that a row
+/// which predates the column (NULL) is overwritten by the first source to claim
+/// it, rather than reading as an authoritative 0 and pinning a stale copy.
+///
+/// It must stay strictly greater than every real rank. Note the deliberate
+/// asymmetry: on WRITE, NULL is the *weakest* value (this sentinel); on READ it
+/// coalesces to 0, the *strongest*, so that a database which has not yet
+/// re-imported behaves exactly as it did before the column existed.
+pub const AUTHORITY_UNCLAIMED: i32 = 9;
+
+/// Classify a resource against the canonical base declared by the package that
+/// shipped it (`package.json` → `canonical`).
+///
+/// Returns [`AUTHORITY_OWNER`] only on positive evidence — the package declares a
+/// canonical base and the resource's URL sits under it. Everything else, including
+/// a resource that arrived with no package context at all, is [`AUTHORITY_UNKNOWN`].
+///
+/// The asymmetry is deliberate and load-bearing. Defaulting an unattributed write
+/// to OWNER would mean an operator (or, on a server without auth, anyone) replaying
+/// `hl7.fhir.r4.core`'s truncated copy through `$import-bundle` would stamp it rank
+/// 0 — and since the upsert's `MIN` only ever lowers a rank, that copy would
+/// outrank THO's original permanently and reinstate issue #200 with no way back.
+pub fn authority_rank_for(url: &str, package_canonical: Option<&str>) -> i32 {
+    match package_canonical {
+        Some(base) if !base.is_empty() && url_is_under(url, base) => AUTHORITY_OWNER,
+        _ => AUTHORITY_UNKNOWN,
+    }
+}
+
+/// `true` when `url` sits under the canonical `base`, respecting path
+/// boundaries: `http://hl7.org/fhir` owns `http://hl7.org/fhir/CodeSystem/x`
+/// but NOT `http://hl7.org/fhirpath/x`. A bare `starts_with` would claim the
+/// latter and wrongly mark a genuine original as unattributed.
+fn url_is_under(url: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    match url.strip_prefix(base) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
 /// A single FHIR CodeSystem resource extracted from a Bundle entry.
 #[derive(Debug)]
 pub struct ParsedCodeSystem {
@@ -61,6 +137,9 @@ pub struct ParsedCodeSystem {
     pub concepts: Vec<ParsedConcept>,
     /// The full original JSON resource (stored in `resource_json` column).
     pub resource_json: Value,
+    /// Provenance precedence among rows sharing this canonical URL.
+    /// See [`authority_rank_for`].
+    pub authority_rank: i32,
 }
 
 /// One concept row, already flattened from the potentially nested FHIR tree.
@@ -112,6 +191,9 @@ pub struct ParsedValueSet {
     /// lazy expansion.  `None` when the ValueSet has no `compose`.
     pub compose_json: Option<String>,
     pub resource_json: Value,
+    /// Provenance precedence among rows sharing this canonical URL.
+    /// See [`authority_rank_for`].
+    pub authority_rank: i32,
 }
 
 /// A single FHIR ConceptMap resource extracted from a Bundle entry.
@@ -154,6 +236,23 @@ pub struct ParsedMapElement {
 /// Returns [`HtsError::InvalidRequest`] when the bytes are not valid JSON or
 /// the root resource is not a Bundle.
 pub fn parse_bundle(data: &[u8]) -> Result<ParsedBundle, HtsError> {
+    // No package context: REST writes, `$import-bundle`, and CLI bundles are
+    // treated as authoritative for whatever canonical they declare.
+    parse_bundle_from_package(data, None)
+}
+
+/// Parse a Bundle that arrived inside a FHIR NPM package, whose `package.json`
+/// declared `package_canonical` as the canonical base it owns.
+///
+/// Provenance is an explicit parameter, NOT a field on the payload. An earlier
+/// draft smuggled it through a non-FHIR `_htsSourceCanonical` key on the Bundle
+/// wrapper, which meant an untrusted `POST /import` body could set the value
+/// that decides which definition of a canonical URL is authoritative. Trust
+/// input must come from the caller, never from the bytes being parsed.
+pub fn parse_bundle_from_package(
+    data: &[u8],
+    package_canonical: Option<&str>,
+) -> Result<ParsedBundle, HtsError> {
     let root: Value = serde_json::from_slice(data)
         .map_err(|e| HtsError::InvalidRequest(format!("Invalid JSON: {e}")))?;
 
@@ -175,13 +274,19 @@ pub fn parse_bundle(data: &[u8]) -> Result<ParsedBundle, HtsError> {
         let rid = resource["id"].as_str().unwrap_or("<no-id>");
         match resource["resourceType"].as_str() {
             Some("CodeSystem") => match parse_code_system(resource) {
-                Some(cs) => bundle.code_systems.push(cs),
+                Some(mut cs) => {
+                    cs.authority_rank = authority_rank_for(&cs.url, package_canonical);
+                    bundle.code_systems.push(cs);
+                }
                 None => bundle.parse_errors.push(format!(
                     "CodeSystem '{rid}' skipped: missing required field 'url'"
                 )),
             },
             Some("ValueSet") => match parse_value_set(resource) {
-                Some(vs) => bundle.value_sets.push(vs),
+                Some(mut vs) => {
+                    vs.authority_rank = authority_rank_for(&vs.url, package_canonical);
+                    bundle.value_sets.push(vs);
+                }
                 None => bundle.parse_errors.push(format!(
                     "ValueSet '{rid}' skipped: missing required field 'url'"
                 )),
@@ -248,6 +353,7 @@ fn parse_code_system(cs: &Value) -> Option<ParsedCodeSystem> {
         content: cs["content"].as_str().unwrap_or("complete").to_owned(),
         concepts,
         resource_json: cs.clone(),
+        authority_rank: AUTHORITY_UNKNOWN,
     })
 }
 
@@ -402,6 +508,7 @@ fn parse_value_set(vs: &Value) -> Option<ParsedValueSet> {
         status: vs["status"].as_str().unwrap_or("active").to_owned(),
         compose_json,
         resource_json: vs.clone(),
+        authority_rank: AUTHORITY_UNKNOWN,
     })
 }
 

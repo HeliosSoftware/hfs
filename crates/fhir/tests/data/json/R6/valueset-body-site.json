@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "body-site",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -55,7 +55,7 @@
       ]
     }
   ],
-  "description": "This value set includes all codes from [SNOMED CT](http://snomed.info/sct) where concept is-a 442083009 (Anatomical or acquired body site (body structure)).",
+  "description": "This value set includes all codes from [SNOMED CT](http://snomed.info/sct/) where concept is-a 442083009 (Anatomical or acquired body site (body structure)).",
   "jurisdiction": [
     {
       "coding": [

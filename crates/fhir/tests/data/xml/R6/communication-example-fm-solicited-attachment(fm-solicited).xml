@@ -42,7 +42,7 @@
       </subject>
     </CommunicationRequest>
   </contained>
-  <!--  body of the resource  -->
+  <!-- body of the resource -->
   <identifier>
     <system value="http://www.providerco.com/communication"/>
     <value value="12345"/>

@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  id = fiberrestricteddiet  file name = nutritionorder-example-fiberrestricteddiet.xml Name= Low Fat and Fiber Restricted Diet Description = Nutrition Order Fiber Restricted and Low Fat Diet l Example
-edited by Eric Haas Health eData Inc
- -->
-  <!-- EH  Show all the elements in this examples for preference, and intolerance  -->
-  <!--  EH: use oral Diet element  -->
+  <!-- id = fiberrestricteddiet  file name = nutritionorder-example-fiberrestricteddiet.xml Name= Low Fat and Fiber Restricted Diet Description = Nutrition Order Fiber Restricted and Low Fat Diet l Example
+edited by Eric Haas Health eData Inc -->
+  <!-- EH  Show all the elements in this examples for preference, and intolerance -->
+  <!-- EH: use oral Diet element -->
   <id value="fiberrestricteddiet"/>
   <meta>
     <security>
@@ -45,7 +44,7 @@ edited by Eric Haas Health eData Inc
     </coding>
   </excludeFoodModifier>
   <oralDiet>
-    <!--  EH:  list type of diet showing standard code and local codes  -->
+    <!-- EH:  list type of diet showing standard code and local codes -->
     <type>
       <coding>
         <system value="http://snomed.info/sct"/>
@@ -72,7 +71,7 @@ edited by Eric Haas Health eData Inc
       </coding>
       <text value="Low fat diet"/>
     </type>
-    <!--  EH example of three times a day starting on 2/10   -->
+    <!-- EH example of three times a day starting on 2/10 -->
     <schedule>
       <timing>
         <repeat>
@@ -86,7 +85,7 @@ edited by Eric Haas Health eData Inc
       </timing>
     </schedule>
     <nutrient>
-      <!--  list nutrients and amounts here  -->
+      <!-- list nutrients and amounts here -->
       <modifier>
         <coding>
           <system value="http://snomed.info/sct"/>
@@ -102,7 +101,7 @@ edited by Eric Haas Health eData Inc
       </amount>
     </nutrient>
     <nutrient>
-      <!--  list nutrients and amounts here  -->
+      <!-- list nutrients and amounts here -->
       <modifier>
         <coding>
           <system value="http://snomed.info/sct"/>

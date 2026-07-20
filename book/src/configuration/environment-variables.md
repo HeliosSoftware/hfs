@@ -11,6 +11,7 @@ All server behavior is controlled through environment variables. No configuratio
 | `HFS_LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 | `HFS_BASE_URL` | `http://localhost:8080` | Base URL for Location headers and Bundle links |
 | `HFS_DATA_DIR` | `./data` | Path to FHIR data directory (search parameters) |
+| `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage. In a cluster, a SearchParameter POSTed to one node becomes visible to the others within this interval. `0` disables the periodic refresh. |
 
 ## Limits
 

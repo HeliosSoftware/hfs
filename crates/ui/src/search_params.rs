@@ -1,86 +1,92 @@
 //! Read model for the SearchParameter viewer (`/ui/search-parameters`, #238).
 //!
-//! The screen is a read-only view of the registry the server actually
-//! resolves searches against. The snapshot is seeded exactly the way the
-//! storage backends seed their runtime registries: the minimal embedded
-//! fallback first, then the full spec bundle from the data directory
-//! (`search-parameters-<version>.json`), first canonical URL wins — the same
-//! precedence `SearchParameterRegistry::register` applies. Tenant-scoped
-//! (`Stored`) parameters join this view once #235 makes storage the source
-//! of truth; until then the write half of the screen stays off.
+//! The screen is a read-only view of the SearchParameters the server holds.
+//! It reads them from the server's own `GET /SearchParameter` endpoint —
+//! primary storage is the source of truth (#235), seeded from the spec bundle
+//! at startup — fetched over HTTP via a [`crate::conformance::ConformanceSource`]
+//! and parsed with [`SearchParameterLoader::parse_resource`], deduped by
+//! canonical URL. A failed fetch degrades to an empty snapshot with a warning
+//! rather than silently under-reporting.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use helios_fhir::FhirVersion;
 use helios_fhir::search::{
     SearchParameterDefinition, SearchParameterLoader, SearchParameterSource,
 };
+use serde_json::Value;
+
+use crate::conformance::ConformanceSource;
 
 /// Rows per page. The issue calls for pagination rather than a render cap.
 pub(crate) const PAGE_SIZE: usize = 50;
 
-/// Lazily-loaded, process-lifetime snapshot of the search-parameter read
-/// model, one per enabled FHIR version.
+/// Lazily-fetched, process-lifetime snapshot of the search-parameter read
+/// model, one per enabled FHIR version. The data comes from the server's own
+/// `GET /SearchParameter` endpoint (storage is the source of truth), fetched
+/// once per version and cached for the process lifetime.
 pub(crate) struct SpCatalog {
-    data_dir: Option<PathBuf>,
+    source: Arc<dyn ConformanceSource>,
     versions: Mutex<HashMap<FhirVersion, Arc<VersionSnapshot>>>,
 }
 
 pub(crate) struct VersionSnapshot {
-    /// Every registered definition, sorted by (code, url) for stable paging.
+    /// Every parameter, sorted by (code, url) for stable paging.
     pub params: Vec<Arc<SearchParameterDefinition>>,
-    /// False when the spec bundle was not found in the data directory —
-    /// the snapshot is then only the minimal embedded fallback, and the
-    /// page says so instead of silently under-reporting.
+    /// False when the fetch failed — the snapshot is then empty and the page
+    /// says so instead of silently under-reporting.
     pub spec_loaded: bool,
 }
 
 impl SpCatalog {
-    pub fn new(data_dir: Option<PathBuf>) -> Self {
+    pub fn new(source: Arc<dyn ConformanceSource>) -> Self {
         SpCatalog {
-            data_dir,
+            source,
             versions: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Returns the snapshot for a version, loading it on first use.
-    pub fn snapshot(&self, version: FhirVersion) -> Arc<VersionSnapshot> {
-        let mut versions = self.versions.lock().expect("catalog lock");
-        versions
+    /// Returns the snapshot for a version, fetching it on first use.
+    pub async fn snapshot(&self, version: FhirVersion) -> Arc<VersionSnapshot> {
+        if let Some(cached) = self.versions.lock().expect("catalog lock").get(&version) {
+            return cached.clone();
+        }
+        let built = Arc::new(fetch_snapshot(&*self.source, version).await);
+        // Another task may have raced us here; keep whichever landed first.
+        self.versions
+            .lock()
+            .expect("catalog lock")
             .entry(version)
-            .or_insert_with(|| Arc::new(load_snapshot(version, self.data_dir.as_deref())))
+            .or_insert_with(|| built.clone())
             .clone()
     }
 }
 
-fn load_snapshot(version: FhirVersion, data_dir: Option<&Path>) -> VersionSnapshot {
+async fn fetch_snapshot(source: &dyn ConformanceSource, version: FhirVersion) -> VersionSnapshot {
+    match source.fetch("SearchParameter", version).await {
+        Ok(resources) => build_snapshot(version, resources, true),
+        Err(_) => build_snapshot(version, Vec::new(), false),
+    }
+}
+
+/// Parses fetched FHIR SearchParameter resources into the view's definition
+/// model, deduped by canonical URL and sorted by (code, url) for stable paging.
+fn build_snapshot(
+    version: FhirVersion,
+    resources: Vec<Value>,
+    spec_loaded: bool,
+) -> VersionSnapshot {
     let loader = SearchParameterLoader::new(version);
     let mut params: Vec<Arc<SearchParameterDefinition>> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut push = |defs: Vec<SearchParameterDefinition>| {
-        for def in defs {
-            if seen.insert(def.url.clone()) {
-                params.push(Arc::new(def));
-            }
+    for res in &resources {
+        if let Ok(def) = loader.parse_resource(res)
+            && seen.insert(def.url.clone())
+        {
+            params.push(Arc::new(def));
         }
-    };
-
-    if let Ok(embedded) = loader.load_embedded() {
-        push(embedded);
     }
-    let dir = data_dir.unwrap_or_else(|| Path::new("./data"));
-    // A missing or unreadable spec bundle is surfaced in the page itself
-    // (`spec_loaded`), not just swallowed.
-    let spec_loaded = match loader.load_from_spec_file(dir) {
-        Ok(spec) => {
-            push(spec);
-            true
-        }
-        Err(_) => false,
-    };
-
     params.sort_by(|a, b| a.code.cmp(&b.code).then_with(|| a.url.cmp(&b.url)));
     VersionSnapshot {
         params,
@@ -676,9 +682,13 @@ mod tests {
     use super::*;
 
     fn snapshot() -> VersionSnapshot {
-        // Tests run with the crate as CWD; the workspace spec bundles live
-        // two levels up.
-        load_snapshot(FhirVersion::default(), Some(Path::new("../../data")))
+        // Tests run with the crate as CWD; the workspace spec bundles live two
+        // levels up. Build the snapshot from the bundle's raw resources exactly
+        // as an HTTP fetch would deliver them, keeping the test offline.
+        let resources = SearchParameterLoader::new(FhirVersion::default())
+            .load_spec_resources(std::path::Path::new("../../data"))
+            .expect("spec bundle found in ../../data");
+        build_snapshot(FhirVersion::default(), resources, true)
     }
 
     fn def(
@@ -818,9 +828,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_spec_dir_still_serves_the_fallback() {
-        let snapshot = load_snapshot(FhirVersion::default(), Some(Path::new("./does-not-exist")));
+    fn fetch_failure_yields_an_empty_degraded_snapshot() {
+        // A failed fetch surfaces as `spec_loaded == false` with no rows; the
+        // page renders its warning rather than silently under-reporting.
+        let snapshot = build_snapshot(FhirVersion::default(), Vec::new(), false);
         assert!(!snapshot.spec_loaded);
-        assert!(!snapshot.params.is_empty(), "embedded fallback still loads");
+        assert!(snapshot.params.is_empty());
     }
 }

@@ -70,6 +70,8 @@ pub mod loader;
 pub mod range;
 pub mod registry;
 pub mod reindex;
+pub mod seeder;
+pub mod tenant_registries;
 pub mod text_fold;
 pub mod writer;
 
@@ -88,6 +90,13 @@ pub use registry::{
 pub use reindex::{
     ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
     ReindexableStorage, ResourcePage,
+};
+pub use seeder::{
+    SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,
+    seed_tenant_conformance,
+};
+pub use tenant_registries::{
+    StoredParamLoader, TenantSearchRegistries, search_parameter_create_affects_overlay,
 };
 pub use text_fold::fold_text;
 pub use writer::SearchIndexWriter;
