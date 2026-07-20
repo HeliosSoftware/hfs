@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "iso3166-1-2",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -12,14 +12,6 @@
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
       "valueCode": "fhir"
-    },
-    {
-      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
-      "valueCode": "informative"
-    },
-    {
-      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
-      "valueInteger": 1
     }
   ],
   "url": "http://hl7.org/fhir/ValueSet/iso3166-1-2",
@@ -32,7 +24,7 @@
   "version": "6.0.0-ballot4",
   "name": "Iso316612",
   "title": "Iso 3166 Part 1: 2 Letter Codes",
-  "status": "active",
+  "status": "retired",
   "experimental": false,
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
@@ -45,7 +37,7 @@
       ]
     }
   ],
-  "description": "This value set defines the ISO 3166 Part 1 2-letter codes",
+  "description": "NOTE: This value set has been retired in favor of the THO value set: http://terminology.hl7.org/ValueSet/v3-Country2. This value set defines the ISO 3166 Part 1 2-letter codes.",
   "compose": {
     "include": [
       {

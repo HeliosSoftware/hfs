@@ -17,7 +17,10 @@ use helios_fhir::FhirVersion;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageResult};
-use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParameterRegistry};
+use crate::search::{
+    SearchParameterExtractor, SearchParameterLoader, SearchParameterRegistry,
+    TenantSearchRegistries,
+};
 
 /// Authentication configuration for Elasticsearch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,17 +136,16 @@ pub struct ElasticsearchBackend {
     client: Elasticsearch,
     /// Configuration.
     config: ElasticsearchConfig,
-    /// Search parameter registry (shared with primary for consistency).
-    search_registry: Arc<RwLock<SearchParameterRegistry>>,
-    /// Search parameter extractor.
-    search_extractor: Arc<SearchParameterExtractor>,
+    /// Per-tenant search parameter registries (a shared base plus per-tenant
+    /// overlays). Shared with the primary backend for consistency.
+    registries: Arc<TenantSearchRegistries>,
 }
 
 impl Debug for ElasticsearchBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ElasticsearchBackend")
             .field("config", &self.config)
-            .field("search_registry_len", &self.search_registry.read().len())
+            .field("base_registry_len", &self.registries.base().read().len())
             .finish_non_exhaustive()
     }
 }
@@ -153,11 +155,12 @@ impl ElasticsearchBackend {
     pub fn new(config: ElasticsearchConfig) -> StorageResult<Self> {
         let client = Self::build_client(&config)?;
 
-        // Initialize search parameter registry
-        let search_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+        // Standalone ES has no store of its own, so tenants have no overlay:
+        // every tenant sees the shared base (embedded params only).
+        let registries = Arc::new(TenantSearchRegistries::base_only());
         {
             let loader = SearchParameterLoader::new(config.fhir_version);
-            let mut registry = search_registry.write();
+            let mut registry = registries.base().write();
 
             // Load embedded fallback params
             match loader.load_embedded() {
@@ -177,31 +180,29 @@ impl ElasticsearchBackend {
                 registry.resource_types().len()
             );
         }
-        let search_extractor = Arc::new(SearchParameterExtractor::new(search_registry.clone()));
 
         Ok(Self {
             client,
             config,
-            search_registry,
-            search_extractor,
+            registries,
         })
     }
 
-    /// Creates a new backend with a shared search parameter registry.
+    /// Creates a new backend with a shared per-tenant registry container.
     ///
-    /// Use this when the ES backend should share its registry with a primary backend.
+    /// Use this when the ES backend should share its registries with a primary
+    /// backend (composite deployments): the container's loader points at the
+    /// primary's storage, so ES resolves per-tenant overlays without its own DB.
     pub fn with_shared_registry(
         config: ElasticsearchConfig,
-        search_registry: Arc<RwLock<SearchParameterRegistry>>,
+        registries: Arc<TenantSearchRegistries>,
     ) -> StorageResult<Self> {
         let client = Self::build_client(&config)?;
-        let search_extractor = Arc::new(SearchParameterExtractor::new(search_registry.clone()));
 
         Ok(Self {
             client,
             config,
-            search_registry,
-            search_extractor,
+            registries,
         })
     }
 
@@ -260,15 +261,25 @@ impl ElasticsearchBackend {
         &self.config
     }
 
-    /// Returns the search parameter registry.
-    #[allow(dead_code)]
-    pub(crate) fn search_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
-        &self.search_registry
+    /// Returns the per-tenant search parameter registries (shared base + tenant
+    /// overlays).
+    pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
+        &self.registries
     }
 
-    /// Returns the search parameter extractor.
-    pub(crate) fn search_extractor(&self) -> &Arc<SearchParameterExtractor> {
-        &self.search_extractor
+    /// Returns the shared base registry (embedded/spec/custom, tenant-agnostic).
+    #[allow(dead_code)]
+    pub(crate) fn base_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.base()
+    }
+
+    /// Builds an extractor over the given tenant's registry.
+    ///
+    /// Public because the `s3`+Elasticsearch composite has no SQL primary to
+    /// borrow an extractor from: S3 stores resources but maintains no search
+    /// index, so Elasticsearch's extractor is the only one in that deployment.
+    pub fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
+        SearchParameterExtractor::new(self.registries.for_tenant(tenant_id))
     }
 
     /// Returns the index name for a tenant and resource type.
@@ -451,13 +462,13 @@ impl SearchCapabilityProvider for ElasticsearchBackend {
         resource_type: &str,
     ) -> Option<ResourceSearchCapabilities> {
         let params = {
-            let registry = self.search_registry.read();
+            let registry = self.registries.base().read();
             registry.get_active_params(resource_type)
         };
 
         if params.is_empty() {
             let common_params = {
-                let registry = self.search_registry.read();
+                let registry = self.registries.base().read();
                 registry.get_active_params("Resource")
             };
             if common_params.is_empty() {
@@ -479,7 +490,7 @@ impl SearchCapabilityProvider for ElasticsearchBackend {
 
         // Add common Resource-level parameters
         let common_params = {
-            let registry = self.search_registry.read();
+            let registry = self.registries.base().read();
             registry.get_active_params("Resource")
         };
         for param in &common_params {
@@ -640,47 +651,51 @@ mod tests {
     }
 
     #[test]
-    fn test_with_shared_registry_reuses_arc() {
+    fn test_with_shared_registry_reuses_container() {
         let config = ElasticsearchConfig::default();
-        let shared_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+        let shared = Arc::new(TenantSearchRegistries::base_only());
 
-        let backend =
-            ElasticsearchBackend::with_shared_registry(config, shared_registry.clone()).unwrap();
+        let backend = ElasticsearchBackend::with_shared_registry(config, shared.clone()).unwrap();
 
-        assert!(Arc::ptr_eq(backend.search_registry(), &shared_registry));
+        assert!(Arc::ptr_eq(backend.tenant_registries(), &shared));
     }
 
     #[test]
-    fn test_with_shared_registry_reflects_runtime_updates() {
+    fn test_with_shared_registry_reflects_base_updates() {
         let config = ElasticsearchConfig::default();
-        let shared_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
-        let backend =
-            ElasticsearchBackend::with_shared_registry(config, shared_registry.clone()).unwrap();
+        let shared = Arc::new(TenantSearchRegistries::base_only());
+        let backend = ElasticsearchBackend::with_shared_registry(config, shared.clone()).unwrap();
 
         let loader = SearchParameterLoader::new(FhirVersion::default());
         let definition = loader
             .parse_resource(&json!({
                 "resourceType": "SearchParameter",
-                "id": "mongo-shared-param",
-                "url": "http://example.org/fhir/SearchParameter/mongo-shared-param",
-                "name": "MongoSharedParam",
+                "id": "es-shared-param",
+                "url": "http://example.org/fhir/SearchParameter/es-shared-param",
+                "name": "EsSharedParam",
                 "status": "active",
-                "code": "mongo-shared-code",
+                "code": "es-shared-code",
                 "base": ["Patient"],
                 "type": "token",
                 "expression": "Patient.identifier"
             }))
             .expect("parse shared SearchParameter definition");
 
-        shared_registry
+        // A param added to the shared base is visible to the ES backend through
+        // the shared container (the first per-tenant build clones the base).
+        shared
+            .base()
             .write()
             .register(definition)
             .expect("register shared SearchParameter");
 
-        let registry = backend.search_registry().read();
+        let registry = backend.tenant_registries().for_tenant("default");
         assert!(
-            registry.get_param("Patient", "mongo-shared-code").is_some(),
-            "shared registry updates should be visible to Elasticsearch backend"
+            registry
+                .read()
+                .get_param("Patient", "es-shared-code")
+                .is_some(),
+            "shared base updates should be visible to the Elasticsearch backend"
         );
     }
 }

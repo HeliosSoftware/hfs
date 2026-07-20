@@ -26,7 +26,7 @@
   <name value="code"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -150,7 +150,7 @@
           <valueUrl value="code"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/regex">
-          <valueString value="[^\s]+( [^\s]+)*"/>
+          <valueString value="^[^\s]+( [^\s]+)*$"/>
         </extension>
         <code value="http://hl7.org/fhirpath/System.String"/>
       </type>
@@ -179,7 +179,7 @@
           <valueUrl value="code"/>
         </extension>
         <extension url="http://hl7.org/fhir/StructureDefinition/regex">
-          <valueString value="[^\s]+( [^\s]+)*"/>
+          <valueString value="^[^\s]+( [^\s]+)*$"/>
         </extension>
         <code value="http://hl7.org/fhirpath/System.String"/>
       </type>

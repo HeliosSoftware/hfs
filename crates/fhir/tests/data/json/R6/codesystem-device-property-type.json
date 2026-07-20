@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "device-property-type",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -23,7 +23,7 @@
   "name": "DevicePropertyType",
   "title": "Device Property Type (Example only)",
   "status": "active",
-  "experimental": false,
+  "experimental": true,
   "publisher": "HL7 Orders and Observations Workgroup",
   "description": "The fixed characteristics or conditions of the device. These codes are for example purposes only.",
   "jurisdiction": [

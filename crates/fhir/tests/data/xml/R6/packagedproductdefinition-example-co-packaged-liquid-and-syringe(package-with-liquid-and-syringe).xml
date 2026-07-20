@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><PackagedProductDefinition xmlns="http://hl7.org/fhir">
   <id value="package-with-liquid-and-syringe"/>
-  <!--  Schema appears to be broken, deviceName is not present in XSD  -->
+  <!-- Schema appears to be broken, deviceName is not present in XSD -->
   <!-- deviceName>
 				<name value="WonderSyringe"/>
 				<type value="manufacturer-name"/>
@@ -35,19 +35,19 @@
       </manufacturedDoseForm>
     </ManufacturedItemDefinition>
   </contained>
-  <!--  the product for which this is one available package type (possibly one package type of several for this product)  -->
+  <!-- the product for which this is one available package type (possibly one package type of several for this product) -->
   <packageFor>
     <reference value="MedicinalProductDefinition/ProductThatHasThisPackType"/>
   </packageFor>
-  <!--  package contents start here, consists of a liquid and a syringe  -->
+  <!-- package contents start here, consists of a liquid and a syringe -->
   <packaging>
-    <!--  here we can describe the packaging, but in this case we just want to talk about the contents  -->
-    <!--  Note that containedItem here is a completely different meaning to "contained" above
-	         This refers to items physically contained in the package.  -->
+    <!-- here we can describe the packaging, but in this case we just want to talk about the contents -->
+    <!-- Note that containedItem here is a completely different meaning to "contained" above
+	         This refers to items physically contained in the package. -->
     <containedItem>
       <item>
         <reference>
-          <!--  reference an item defined above  -->
+          <!-- reference an item defined above -->
           <reference value="#liquidItem"/>
         </reference>
       </item>
@@ -61,7 +61,7 @@
     <containedItem>
       <item>
         <reference>
-          <!--  reference an item defined above  -->
+          <!-- reference an item defined above -->
           <reference value="#syringeDevice"/>
         </reference>
       </item>

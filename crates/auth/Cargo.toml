@@ -10,7 +10,6 @@ description = "Authentication and authorization for the Helios FHIR Server"
 
 [features]
 default = []
-redis = ["dep:redis"]
 
 [dependencies]
 # JWT validation
@@ -18,12 +17,6 @@ jsonwebtoken = "9"
 
 # HTTP client for JWKS endpoint
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# In-memory caching (JTI + JWKS)
-moka = { version = "0.12", features = ["future"] }
-
-# Redis (optional, for distributed JTI cache and JWKS coordination)
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
 
 # SMART scope permissions
 bitflags = "2"

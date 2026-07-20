@@ -102,7 +102,8 @@ where
         state.base_url().to_string()
     };
 
-    let capability_statement = build_capability_statement(&state, fhir_version, &base_url);
+    let capability_statement =
+        build_capability_statement(&state, tenant.context(), fhir_version, &base_url);
 
     // Negotiate response format
     let negotiated = negotiate_format(&req_headers, None);
@@ -129,6 +130,7 @@ where
 /// Builds a CapabilityStatement describing server capabilities for a specific FHIR version.
 fn build_capability_statement<S>(
     state: &AppState<S>,
+    tenant: &helios_persistence::tenant::TenantContext,
     version: FhirVersion,
     base_url: &str,
 ) -> serde_json::Value
@@ -163,7 +165,8 @@ where
     .map(|t| (t, state.storage().modifiers_for_param_type(t)))
     .collect();
 
-    let registry = state.storage().search_param_registry().read();
+    let registry_arc = state.storage().search_param_registry(tenant);
+    let registry = registry_arc.read();
 
     // Reverse-include index (target type -> "Source:code" tokens) for advertising
     // each resource's real `searchRevInclude` targets.

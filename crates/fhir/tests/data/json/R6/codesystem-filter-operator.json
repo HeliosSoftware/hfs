@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "filter-operator",
   "meta": {
-    "lastUpdated": "2026-06-14T04:13:29.148+11:00"
+    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
   },
   "text": {
     "status": "extensions",
@@ -148,6 +148,11 @@
       "code": "exists",
       "display": "Exists",
       "definition": "The specified property of the code has at least one value (if the specified value is true; if the specified value is false, then matches when the specified property of the code has no values)."
+    },
+    {
+      "code": "property-value-of",
+      "display": "Property Value Of",
+      "definition": "Includes the concepts that are used as property values from the set of concepts in the provided filter.value element value (comma-separated list or value set).  If the provided filter.value element value is a value set, any concepts not in the filter defining code system are ignored."
     }
   ]
 }

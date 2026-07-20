@@ -18,3 +18,7 @@ off
 
 # Test artifacts
 /test-artifacts
+
+# Python bytecode (e.g. audit test helpers under crates/hfs/tests/audit)
+__pycache__/
+*.pyc

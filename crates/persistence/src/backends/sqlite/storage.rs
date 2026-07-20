@@ -20,9 +20,7 @@ use crate::core::{
 use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::search::extractor::ExtractedValue;
-use crate::search::loader::SearchParameterLoader;
-use crate::search::registry::SearchParameterStatus;
-use crate::search::reindex::{ReindexableStorage, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -145,9 +143,14 @@ impl ResourceStorage for SqliteBackend {
         // Index the resource for search
         self.index_resource(&conn, tenant_id, resource_type, &id, &resource)?;
 
-        // Handle SearchParameter resources specially - update registry
-        if resource_type == "SearchParameter" {
-            self.handle_search_parameter_create(&resource)?;
+        // An *active* SearchParameter write changes this tenant's overlay — drop
+        // its cached registry so the next access rebuilds from storage. Draft
+        // copies (e.g. the seeded spec set) never overlay, so skip them and
+        // avoid an O(n²) rebuild storm during bulk seeding.
+        if resource_type == "SearchParameter"
+            && crate::search::search_parameter_create_affects_overlay(&resource)
+        {
+            self.tenant_registries().invalidate(tenant_id);
         }
 
         // Return the stored resource with updated metadata
@@ -365,9 +368,9 @@ impl ResourceStorage for SqliteBackend {
         self.delete_search_index(&conn, tenant_id, resource_type, id)?;
         self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
 
-        // Handle SearchParameter resources specially - update registry
+        // A SearchParameter write invalidates this tenant's cached registry.
         if resource_type == "SearchParameter" {
-            self.handle_search_parameter_update(current.content(), &resource)?;
+            self.tenant_registries().invalidate(tenant_id);
         }
 
         Ok(StoredResource::from_storage(
@@ -445,11 +448,9 @@ impl ResourceStorage for SqliteBackend {
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
         }
 
-        // Handle SearchParameter resources specially - update registry
+        // A SearchParameter delete invalidates this tenant's cached registry.
         if resource_type == "SearchParameter" {
-            if let Ok(resource_json) = serde_json::from_slice::<Value>(&data) {
-                self.handle_search_parameter_delete(&resource_json)?;
-            }
+            self.tenant_registries().invalidate(tenant_id);
         }
 
         Ok(())
@@ -532,6 +533,76 @@ impl ResourceStorage for SqliteBackend {
                 out.push(crate::core::DailyResourceCount {
                     day,
                     count: n.max(0) as u64,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<crate::core::ResourceCountDelta>> {
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Bound the scan by the raw `last_updated` column so the
+        // `(tenant_id, last_updated)` history index prunes the range (wrapping the
+        // column in `strftime(...)` would force a full scan). The bound is floored
+        // to a bucket boundary, and formatted the same RFC3339 way the rows are
+        // written; because it lands exactly on a whole second it carries no
+        // fractional part, and any stored value in that same second sorts after it
+        // (`.` = 0x2E > `+` = 0x2B), so no row in the first bucket is missed.
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds).to_rfc3339();
+
+        // `strftime('%s', ...)` parses the stored RFC3339 UTC string to epoch
+        // seconds; integer-dividing by the bucket width and multiplying back floors
+        // each version to its epoch-aligned bucket start. The delta rule mirrors the
+        // trait doc: creation `+1`, delete `-1`, plain update `0`.
+        let mut stmt = conn
+            .prepare(
+                "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
+                        SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
+                 GROUP BY bucket HAVING delta != 0 ORDER BY bucket",
+            )
+            .map_err(|e| {
+                internal_error(format!("Failed to prepare count_deltas_by_bucket: {}", e))
+            })?;
+
+        let rows = stmt
+            .query_map(
+                params![tenant_id, resource_type, since_bound, bucket_seconds],
+                |row| {
+                    let bucket: i64 = row.get(0)?;
+                    let delta: i64 = row.get(1)?;
+                    Ok((bucket, delta))
+                },
+            )
+            .map_err(|e| {
+                internal_error(format!("Failed to query count_deltas_by_bucket: {}", e))
+            })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (bucket, delta) = row.map_err(|e| {
+                internal_error(format!("Failed to read count_deltas_by_bucket row: {}", e))
+            })?;
+            if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
+                out.push(crate::core::ResourceCountDelta {
+                    bucket_start,
+                    delta,
                 });
             }
         }
@@ -685,6 +756,122 @@ impl ResourceStorage for SqliteBackend {
         }
         Ok(out)
     }
+
+    fn supports_tenant_registry(&self) -> bool {
+        true
+    }
+
+    async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, display_name, created_at FROM tenants \
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| internal_error(format!("prepare list_tenants: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::core::TenantRecord {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })
+            .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| internal_error(format!("list_tenants row: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare("SELECT id, display_name, created_at FROM tenants WHERE id = ?1")
+            .map_err(|e| internal_error(format!("prepare get_tenant: {e}")))?;
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                Ok(crate::core::TenantRecord {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })
+            .map_err(|e| internal_error(format!("query get_tenant: {e}")))?;
+        match rows.next() {
+            Some(row) => {
+                Ok(Some(row.map_err(|e| {
+                    internal_error(format!("get_tenant row: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> StorageResult<crate::core::TenantRecord> {
+        let conn = self.get_connection()?;
+        // Plain INSERT so a duplicate id surfaces as a constraint error; the
+        // admin handler pre-checks existence and returns 409, so reaching here
+        // with a duplicate is a race and a 500 is acceptable.
+        conn.execute(
+            "INSERT INTO tenants (id, display_name, created_at) \
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+            params![id, display_name],
+        )
+        .map_err(|e| internal_error(format!("register_tenant: {e}")))?;
+        let mut stmt = conn
+            .prepare("SELECT id, display_name, created_at FROM tenants WHERE id = ?1")
+            .map_err(|e| internal_error(format!("prepare register read-back: {e}")))?;
+        stmt.query_row(params![id], |row| {
+            Ok(crate::core::TenantRecord {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })
+        .map_err(|e| internal_error(format!("register read-back: {e}")))
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        let conn = self.get_connection()?;
+        let changed = conn
+            .execute("DELETE FROM tenants WHERE id = ?1", params![id])
+            .map_err(|e| internal_error(format!("deregister_tenant: {e}")))?;
+        Ok(changed > 0)
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        let mut conn = self.get_connection()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| internal_error(format!("purge begin: {e}")))?;
+        // Count current-version rows first so we can report what was removed.
+        let removed: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| internal_error(format!("purge count: {e}")))?;
+        // search_index has ON DELETE CASCADE from resources, but delete it
+        // explicitly too in case foreign keys are not enforced on this handle.
+        for sql in [
+            "DELETE FROM search_index WHERE tenant_id = ?1",
+            "DELETE FROM resource_history WHERE tenant_id = ?1",
+            "DELETE FROM resources WHERE tenant_id = ?1",
+        ] {
+            tx.execute(sql, params![id])
+                .map_err(|e| internal_error(format!("purge delete: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        Ok(removed.max(0) as u64)
+    }
 }
 
 // Search Index Helpers
@@ -798,9 +985,9 @@ impl SqliteBackend {
         resource_id: &str,
         resource: &Value,
     ) -> StorageResult<usize> {
-        // Extract values using the registry-driven extractor
+        // Extract values using the tenant's registry-driven extractor
         let values = self
-            .search_extractor()
+            .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
@@ -879,7 +1066,7 @@ impl SqliteBackend {
     ) -> StorageResult<usize> {
         let mut count = 0;
         let container = (container_type, container_id);
-        for contained in self.search_extractor().extract_contained(resource) {
+        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
             for value in &contained.values {
                 self.write_contained_index_entry(
                     conn,
@@ -992,20 +1179,22 @@ impl SqliteBackend {
     }
 
     /// Delete search index entries for a resource.
+    /// Removes a resource's search entries, returning how many `search_index`
+    /// rows were deleted.
     pub(crate) fn delete_search_index(
         &self,
         conn: &rusqlite::Connection,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         // When search is offloaded to a secondary backend, skip local index cleanup
         if self.is_search_offloaded() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Delete from main search index
-        conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
             params![tenant_id, resource_type, resource_id],
         )
@@ -1017,7 +1206,7 @@ impl SqliteBackend {
             params![tenant_id, resource_type, resource_id],
         );
 
-        Ok(())
+        Ok(deleted as u64)
     }
 
     /// Index minimal fallback search parameters.
@@ -1111,111 +1300,6 @@ impl SqliteBackend {
             params![tenant_id, resource_type, resource_id, param_name, normalized],
         )
         .map_err(|e| internal_error(format!("Failed to insert date index: {}", e)))?;
-        Ok(())
-    }
-}
-
-// SearchParameter Resource Handling
-impl SqliteBackend {
-    /// Handle creation of a SearchParameter resource.
-    ///
-    /// If the SearchParameter has status=active, it will be registered in the
-    /// search parameter registry, making it available for searches on new resources.
-    /// Existing resources will NOT be indexed for this parameter until $reindex is run.
-    fn handle_search_parameter_create(&self, resource: &Value) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
-
-        match loader.parse_resource(resource) {
-            Ok(def) => {
-                // Only register if status is active
-                if def.status == SearchParameterStatus::Active {
-                    let mut registry = self.search_registry().write();
-                    // Ignore duplicate URL errors - the param may already be embedded
-                    if let Err(e) = registry.register(def) {
-                        tracing::debug!("SearchParameter registration skipped: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                // Log but don't fail - the resource is still stored
-                tracing::warn!("Failed to parse SearchParameter for registry: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle update of a SearchParameter resource.
-    ///
-    /// Updates the registry based on status changes:
-    /// - active -> retired: Parameter disabled for searches
-    /// - retired -> active: Parameter re-enabled for searches
-    /// - Any other change: Updates the registry entry
-    fn handle_search_parameter_update(
-        &self,
-        old_resource: &Value,
-        new_resource: &Value,
-    ) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
-
-        let old_def = loader.parse_resource(old_resource).ok();
-        let new_def = loader.parse_resource(new_resource).ok();
-
-        match (old_def, new_def) {
-            (Some(old), Some(new)) => {
-                let mut registry = self.search_registry().write();
-
-                // If URL changed, unregister old and register new
-                if old.url != new.url {
-                    let _ = registry.unregister(&old.url);
-                    if new.status == SearchParameterStatus::Active {
-                        let _ = registry.register(new);
-                    }
-                } else if old.status != new.status {
-                    // Status change - update in registry
-                    if let Err(e) = registry.update_status(&new.url, new.status) {
-                        tracing::debug!("SearchParameter status update skipped: {}", e);
-                    }
-                } else {
-                    // Other changes - re-register (unregister then register)
-                    let _ = registry.unregister(&old.url);
-                    if new.status == SearchParameterStatus::Active {
-                        let _ = registry.register(new);
-                    }
-                }
-            }
-            (None, Some(new)) => {
-                // Old wasn't valid, try to register new
-                if new.status == SearchParameterStatus::Active {
-                    let mut registry = self.search_registry().write();
-                    let _ = registry.register(new);
-                }
-            }
-            (Some(old), None) => {
-                // New isn't valid, unregister old
-                let mut registry = self.search_registry().write();
-                let _ = registry.unregister(&old.url);
-            }
-            (None, None) => {
-                // Neither valid - nothing to do
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle deletion of a SearchParameter resource.
-    ///
-    /// Removes the parameter from the registry. Search index entries for this
-    /// parameter are NOT automatically cleaned up (use $reindex for that).
-    fn handle_search_parameter_delete(&self, resource: &Value) -> StorageResult<()> {
-        if let Some(url) = resource.get("url").and_then(|v| v.as_str()) {
-            let mut registry = self.search_registry().write();
-            if let Err(e) = registry.unregister(url) {
-                tracing::debug!("SearchParameter unregistration skipped: {}", e);
-            }
-        }
-
         Ok(())
     }
 }
@@ -2508,7 +2592,7 @@ impl SqliteBackend {
         }
 
         // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(resource_type, &parsed_params)?;
+        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
 
         // Build a SearchQuery
         let query = SearchQuery {
@@ -2531,10 +2615,12 @@ impl SqliteBackend {
     /// for common parameters when not found.
     fn build_search_parameters(
         &self,
+        tenant: &TenantContext,
         resource_type: &str,
         params: &[(String, String)],
     ) -> StorageResult<Vec<SearchParameter>> {
-        let registry = self.search_registry().read();
+        let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
+        let registry = registry_arc.read();
         let mut search_params = Vec::with_capacity(params.len());
 
         for (name, value) in params {
@@ -3175,9 +3261,9 @@ fn resolve_bundle_references(
     }
 }
 
-// ReindexableStorage implementation for SQLite backend.
+// ReindexSource: SQLite is a primary, so it is where resources are read from.
 #[async_trait]
-impl ReindexableStorage for SqliteBackend {
+impl ReindexSource for SqliteBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
@@ -3311,14 +3397,21 @@ impl ReindexableStorage for SqliteBackend {
             next_cursor,
         })
     }
+}
 
+// ReindexTarget: SQLite keeps search entries in its own `search_index`
+// table, so it is also a writer and can reindex itself standalone.
+#[async_trait]
+impl ReindexTarget for SqliteBackend {
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<u64> {
         let conn = self.get_connection()?;
+        // Reuses the delete path the CRUD layer uses, so the FTS table is
+        // cleaned up too and the `is_search_offloaded` guard is honored.
         self.delete_search_index(
             &conn,
             tenant.tenant_id().as_str(),
@@ -3330,16 +3423,17 @@ impl ReindexableStorage for SqliteBackend {
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
+        resource: &StoredResource,
     ) -> StorageResult<usize> {
         let conn = self.get_connection()?;
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
 
-        // Use the dynamic extraction
+        // Use the dynamic extraction over the tenant's registry
         let values = self
-            .search_extractor()
-            .extract(resource, resource_type)
+            .tenant_extractor(tenant.tenant_id().as_str())
+            .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
         let mut count = 0;
@@ -3361,7 +3455,7 @@ impl ReindexableStorage for SqliteBackend {
             tenant.tenant_id().as_str(),
             resource_type,
             resource_id,
-            resource,
+            content,
         )?;
 
         Ok(count)
@@ -3750,6 +3844,66 @@ mod tests {
         assert_eq!(today_row.count, 2);
     }
 
+    /// The delta rule, straight from SQL: a create is `+1`, an update is `0` (it
+    /// must not move the resource into a newer bucket — the whole point of reading
+    /// history rather than `resources.last_updated`), and a delete is `-1`.
+    #[tokio::test]
+    async fn test_count_deltas_by_bucket() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let first = backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        // An update writes a v2 history row, which must contribute nothing.
+        backend
+            .update(&tenant, &first, json!({"active": true}))
+            .await
+            .unwrap();
+
+        // A one-minute bucket, so the writes above all land in the same one.
+        let since = Utc::now() - chrono::Duration::minutes(5);
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|r| r.delta).sum::<i64>(),
+            2,
+            "two creates and one update net to +2"
+        );
+        assert!(
+            rows.iter().all(|r| r.bucket_start.timestamp() % 60 == 0),
+            "buckets are epoch-aligned to their width"
+        );
+
+        // Deleting one nets it back out.
+        backend
+            .delete(&tenant, "Patient", first.id())
+            .await
+            .unwrap();
+        let rows = backend
+            .count_deltas_by_bucket(&tenant, "Patient", since, 60)
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.delta).sum::<i64>(), 1);
+
+        // Buckets narrower than the window still cover it, and a bogus width is
+        // rejected rather than silently dividing by zero.
+        assert!(
+            backend
+                .count_deltas_by_bucket(&tenant, "Patient", since, 0)
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn test_activity_histogram() {
         let backend = create_test_backend();
@@ -3823,6 +3977,69 @@ mod tests {
     fn test_is_cluster_shared() {
         let backend = create_test_backend();
         assert!(!backend.is_cluster_shared());
+    }
+
+    #[tokio::test]
+    async fn test_tenant_registry_crud() {
+        let backend = create_test_backend();
+        assert!(backend.supports_tenant_registry());
+
+        // Empty to start.
+        assert!(backend.list_tenants().await.unwrap().is_empty());
+        assert!(backend.get_tenant("acme").await.unwrap().is_none());
+
+        // Register two tenants, one with a display name.
+        let acme = backend
+            .register_tenant("acme", Some("Acme Health"))
+            .await
+            .unwrap();
+        assert_eq!(acme.id, "acme");
+        assert_eq!(acme.display_name.as_deref(), Some("Acme Health"));
+        assert!(!acme.created_at.is_empty());
+        backend.register_tenant("beta", None).await.unwrap();
+
+        let all = backend.list_tenants().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(backend.get_tenant("acme").await.unwrap(), Some(acme));
+
+        // Duplicate registration is an error (handler pre-checks for 409).
+        assert!(backend.register_tenant("acme", None).await.is_err());
+
+        // Deregister removes the row; second call reports nothing removed.
+        assert!(backend.deregister_tenant("beta").await.unwrap());
+        assert!(!backend.deregister_tenant("beta").await.unwrap());
+        assert_eq!(backend.list_tenants().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_purge_tenant_data() {
+        let backend = create_test_backend();
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let other = TenantContext::new(TenantId::new("other"), TenantPermissions::full_access());
+
+        for _ in 0..3 {
+            backend
+                .create(&acme, "Patient", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        backend
+            .create(&other, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // Purge removes acme's data only, reporting the row count.
+        let removed = backend.purge_tenant_data("acme").await.unwrap();
+        assert_eq!(removed, 3);
+
+        let counts: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(counts.get("acme"), None);
+        assert_eq!(counts.get("other"), Some(&1));
     }
 
     #[tokio::test]

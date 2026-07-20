@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?><OperationOutcome xmlns="http://hl7.org/fhir">
-  <!--  :md: 
+  <!-- :md: 
 This is an example of an operation outcome that would be returned
 as part of a set of search results (e.g. in the bundle with search.mode = outcome)
 to indicate that additional results may be available using the break-the-glass
-protocol. The correct use of this is discussed on the [security labels](security-labels.html#break-the-glass) page
- -->
+protocol. The correct use of this is discussed on the [security labels](security-labels.html#break-the-glass) page -->
   <id value="break-the-glass"/>
   <meta>
     <security>
@@ -22,8 +21,8 @@ protocol. The correct use of this is discussed on the [security labels](security
     <severity value="information"/>
     <code value="suppressed"/>
     <details>
-      <!--  this is not really the right code; it's being used at cross -purposes to its definition.
-        todo: get a more correct concept defined  -->
+      <!-- this is not really the right code; it's being used at cross -purposes to its definition.
+        todo: get a more correct concept defined -->
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
         <code value="BTG"/>

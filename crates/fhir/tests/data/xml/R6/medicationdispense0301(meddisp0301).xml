@@ -11,7 +11,7 @@
     <Medication>
       <id value="med0301"/>
       <code>
-        <!--  Vancomycin Hydrochloride (VANCOMYCIN HYDROCHLORIDE)"  -->
+        <!-- Vancomycin Hydrochloride (VANCOMYCIN HYDROCHLORIDE)" -->
         <coding>
           <system value="http://hl7.org/fhir/sid/ndc"/>
           <code value="0409-6531-02"/>
@@ -23,7 +23,7 @@
   </contained>
   <status value="in-progress"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0301"/>
       <display value="Vancomycin Hydrochloride"/>

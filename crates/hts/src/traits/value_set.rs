@@ -45,6 +45,27 @@ pub trait ValueSetOperations: Send + Sync {
     ///
     /// Triggers expansion if needed, then tests set membership.
     /// Returns `result = true` with display on success.
+    /// Return the `version` of the ValueSet row this backend would resolve for
+    /// `url` when the caller pins no version.
+    ///
+    /// The operations layer must not re-derive this by sorting the JSON returned
+    /// from [`Self::search`]: same-URL precedence depends on `authority_rank`,
+    /// which is a storage column and is deliberately absent from the FHIR
+    /// resource. A Rust-side "highest version string wins" sort silently
+    /// disagrees with the backend whenever a re-published copy carries a higher
+    /// version than the original — exactly the shape of issue #200 — so the
+    /// response would echo one ValueSet while the backend expanded another.
+    ///
+    /// Default returns `None`, meaning "no opinion"; callers then fall back to
+    /// their previous behaviour.
+    async fn value_set_version_for_url(
+        &self,
+        _ctx: &TenantContext,
+        _url: &str,
+    ) -> Result<Option<String>, HtsError> {
+        Ok(None)
+    }
+
     async fn validate_code(
         &self,
         ctx: &TenantContext,

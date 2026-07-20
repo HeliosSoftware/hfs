@@ -328,6 +328,15 @@ fn extract_operation_for_routing(
     extract_operation(path, method)
 }
 
+/// Operation endpoints whose handlers run their own scope check, so the
+/// middleware defers to them instead of classifying them by HTTP method.
+///
+/// Adding an entry here **removes** the middleware's authorization check for
+/// that path. Only add one whose handler enforces a scope itself — see
+/// `check_purge_scope` / `check_reindex_scope` in `handlers::purge` /
+/// `handlers::reindex`.
+const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-status"];
+
 /// Extract the FHIR resource type and operation from a request path and method.
 ///
 /// Returns `None` for system-level operations (batch, history) where
@@ -362,6 +371,29 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
 
     // The first segment is the resource type (or tenant — handled by prefix stripping)
     let resource_type = first.to_string();
+
+    // Type- and instance-scoped `$purge` / `$reindex` carry their own scope
+    // semantics that do not map onto the HTTP method: POST /Patient/$purge is a
+    // destructive delete, not a Create, and gating it as a Create would both
+    // over-restrict a least-privilege token and label the audit trail
+    // "Granted: Create on Patient" for what is really a purge. Their handlers
+    // enforce the `system/purge` / `system/reindex` operation scopes themselves,
+    // so authorization is deferred to them — the same "defer to handler" pattern
+    // batch and $export already use.
+    //
+    // This MUST stay an explicit allowlist. Returning None for *any* $-suffixed
+    // path would silently remove the only authorization check from every
+    // SQL-on-FHIR operation ($viewdefinition-run, $sqlquery-run, and their
+    // -export variants) and the subscription operations — none of which run a
+    // handler-level scope check. That would let any authenticated token execute
+    // arbitrary ViewDefinitions and SQL.
+    if segments
+        .iter()
+        .skip(1)
+        .any(|s| HANDLER_AUTHORIZED_OPS.contains(s))
+    {
+        return None;
+    }
 
     // Detect compartment search: GET /{compartment_type}/{id}/{target_type}
     // The third segment is the actual resource type being accessed, so the
@@ -724,6 +756,49 @@ mod tests {
         // Methods other than GET/HEAD/POST/PUT/PATCH/DELETE fall through to None.
         assert!(extract_operation("/Patient", "OPTIONS").is_none());
         assert!(extract_operation("/Patient/123", "OPTIONS").is_none());
+    }
+
+    #[test]
+    fn test_purge_and_reindex_defer_to_their_handlers() {
+        // These handlers enforce the system/purge and system/reindex operation
+        // scopes themselves. Classifying POST /Patient/$purge as a Create would
+        // demand create scope for a destructive delete and would label the audit
+        // trail "Create on Patient" for what is really a purge.
+        assert!(extract_operation("/Patient/$purge", "POST").is_none());
+        assert!(extract_operation("/Patient/123/$purge", "DELETE").is_none());
+        assert!(extract_operation("/Patient/$reindex", "POST").is_none());
+        assert!(extract_operation("/$reindex-status/job-1", "GET").is_none());
+        assert!(extract_operation_for_routing("/acme/Patient/$purge", "POST", true).is_none());
+    }
+
+    /// Guards a security regression: the SQL-on-FHIR handlers do NOT run their
+    /// own scope check, so the middleware's classification is the *only* thing
+    /// authorizing them. A blanket "any $-suffixed path returns None" rule —
+    /// which is what the first attempt at $purge/$reindex shipped — would let
+    /// any authenticated token execute arbitrary ViewDefinitions and SQL.
+    ///
+    /// If you are here because you added an entry to HANDLER_AUTHORIZED_OPS and
+    /// this failed: that endpoint's handler must enforce a scope itself.
+    #[test]
+    fn test_sof_and_subscription_ops_still_require_scope() {
+        assert_eq!(
+            extract_operation("/ViewDefinition/$viewdefinition-run", "POST"),
+            Some(("ViewDefinition".to_string(), FhirOperation::Create)),
+            "SQL-on-FHIR run must still be scope-checked by the middleware"
+        );
+        assert_eq!(
+            extract_operation("/Library/$sqlquery-run", "POST"),
+            Some(("Library".to_string(), FhirOperation::Create)),
+            "SQL query run must still be scope-checked by the middleware"
+        );
+        assert_eq!(
+            extract_operation("/ViewDefinition/123/$viewdefinition-export", "POST"),
+            Some(("ViewDefinition".to_string(), FhirOperation::Create)),
+        );
+        assert!(
+            extract_operation("/Subscription/123/$status", "GET").is_some(),
+            "subscription operations must still be scope-checked"
+        );
     }
 
     // ── Additional branch coverage for `extract_operation_for_routing` ──

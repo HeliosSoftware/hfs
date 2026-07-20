@@ -30,9 +30,6 @@ mongodb = ["helios-persistence/mongodb"]
 elasticsearch = ["helios-persistence/elasticsearch"]
 s3 = ["helios-persistence/s3", "dep:aws-sdk-s3", "dep:aws-config"]
 
-# Auth feature (pass through to helios-auth)
-redis = ["helios-auth/redis"]
-
 # Subscriptions
 subscriptions = ["dep:helios-subscriptions"]
 

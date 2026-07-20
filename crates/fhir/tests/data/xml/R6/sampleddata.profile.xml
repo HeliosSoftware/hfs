@@ -43,7 +43,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">A series of measurements taken by a device
             <br/>
-            <span style="font-style: italic" title="sdd-1">+ Rule: A SampledData SHALL have either an interval and offsets but not both</span>
+            <span style="font-style: italic" title="sdd-1">+ Rule: A SampledData SHALL have an interval and/or offsets</span>
             <br/>
             <br/>Elements defined in Ancestors: 
             <a href="types.html#Element" title="Unique id for the element within a resource (for internal references). This may be any string value that does not contain spaces.">id</a>, 
@@ -75,7 +75,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <a href="datatypes-definitions.html#SampledData.interval" title="SampledData.interval : Amount of intervalUnits between samples, e.g. milliseconds for time-based sampling.">interval</a>
+            <a href="datatypes-definitions.html#SampledData.interval" title="SampledData.interval : Amount of intervalUnits between samples, e.g. milliseconds for time-based sampling. If offsets does not provide a value for each sample, this value applies to all samples following the last offset.">interval</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -136,7 +136,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <a href="datatypes-definitions.html#SampledData.lowerLimit" title="SampledData.lowerLimit : The lower limit of detection of the measured points. This is needed if any of the data points have the value &quot;L&quot; (lower than detection limit).">lowerLimit</a>
+            <a href="datatypes-definitions.html#SampledData.lowerLimit" title="SampledData.lowerLimit : The lower limit of detection of the measured points. This value, when present, is scaled in the same manner as the data values. I.e. to find the true limit, multiply this value by the factor and add the origin. This is needed if any of the data points have the value &quot;L&quot; (lower than detection limit).">lowerLimit</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -155,7 +155,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <a href="datatypes-definitions.html#SampledData.upperLimit" title="SampledData.upperLimit : The upper limit of detection of the measured points. This is needed if any of the data points have the value &quot;U&quot; (higher than detection limit).">upperLimit</a>
+            <a href="datatypes-definitions.html#SampledData.upperLimit" title="SampledData.upperLimit : The upper limit of detection of the measured points. This value, when present, is scaled in the same manner as the data values. I.e. to find the true limit, multiply this value by the factor and add the origin. This is needed if any of the data points have the value &quot;U&quot; (higher than detection limit).">upperLimit</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
@@ -211,7 +211,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <a href="datatypes-definitions.html#SampledData.offsets" title="SampledData.offsets : A series of increasing decimal values separated by a single space (character u20), which represent the offset from the logical start point. Offset values may be negative. The units in which the offsets are expressed are found in intervalUnit.  The absolute point at which the measurements begin SHALL be conveyed outside the scope of this datatype, e.g. Observation.effectiveDateTime for a timing offset.">offsets</a>
+            <a href="datatypes-definitions.html#SampledData.offsets" title="SampledData.offsets : A series of increasing decimal values separated by a single space (character u20), which represent the offset from the logical start point. Offset values may be negative. The units in which the offsets are expressed are found in intervalUnit. If fewer offsets are provided than data points, interval applies to samples after the final offset. The absolute point at which the measurements begin SHALL be conveyed outside the scope of this datatype, e.g. Observation.effectiveDateTime for a timing offset.">offsets</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
@@ -264,7 +264,7 @@
   <name value="SampledData"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -308,7 +308,7 @@
       <path value="SampledData"/>
       <short value="A series of measurements taken by a device"/>
       <definition value="A series of measurements taken by a device, with upper and lower limits. There may be more than one dimension in the data."/>
-      <comment value="The data is not interpretable without at least origin, period, and dimensions, but these are optional to allow a separation between the template of measurement and the actual measurement, such as between DeviceCapabilities and DeviceLog.  When providing a summary view (for example with Observation.value[x]) SampledData should be represented with a brief display text such as &quot;Sampled Data&quot;."/>
+      <comment value="The data is not interpretable without at least origin, period, and dimensions, but these are optional to allow a separation between the template of measurement and the actual measurement, such as between DeviceCapabilities and DeviceLog. The lowerLimit and upperLimit, when present, are scaled in the same manner as the data values. I.e. to find the true limit, multiply this value by the factor and add the origin. If there is a need to capture dimensions that differ in scale, origin, limits, etc. this is typically done by having multiple SampledData instances - one in each Observation.component where the components represent different dimensional subsets. When providing a summary view (for example with Observation.value[x]) SampledData should be represented with a brief display text such as &quot;Sampled Data&quot;."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -326,8 +326,8 @@
       <constraint>
         <key value="sdd-1"/>
         <severity value="error"/>
-        <human value="A SampledData SHALL have either an interval and offsets but not both"/>
-        <expression value="interval.exists().not() xor offsets.exists().not()"/>
+        <human value="A SampledData SHALL have an interval and/or offsets"/>
+        <expression value="interval.exists() or offsets.exists()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/SampledData"/>
       </constraint>
       <isModifier value="false"/>
@@ -438,7 +438,7 @@
     <element id="SampledData.interval">
       <path value="SampledData.interval"/>
       <short value="Number of intervalUnits between samples"/>
-      <definition value="Amount of intervalUnits between samples, e.g. milliseconds for time-based sampling."/>
+      <definition value="Amount of intervalUnits between samples, e.g. milliseconds for time-based sampling. If offsets does not provide a value for each sample, this value applies to all samples following the last offset."/>
       <comment value="This is usually a whole number."/>
       <min value="0"/>
       <max value="1"/>
@@ -532,7 +532,7 @@
     <element id="SampledData.lowerLimit">
       <path value="SampledData.lowerLimit"/>
       <short value="Lower limit of detection"/>
-      <definition value="The lower limit of detection of the measured points. This is needed if any of the data points have the value &quot;L&quot; (lower than detection limit)."/>
+      <definition value="The lower limit of detection of the measured points. This value, when present, is scaled in the same manner as the data values. I.e. to find the true limit, multiply this value by the factor and add the origin. This is needed if any of the data points have the value &quot;L&quot; (lower than detection limit)."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -560,7 +560,7 @@
     <element id="SampledData.upperLimit">
       <path value="SampledData.upperLimit"/>
       <short value="Upper limit of detection"/>
-      <definition value="The upper limit of detection of the measured points. This is needed if any of the data points have the value &quot;U&quot; (higher than detection limit)."/>
+      <definition value="The upper limit of detection of the measured points. This value, when present, is scaled in the same manner as the data values. I.e. to find the true limit, multiply this value by the factor and add the origin. This is needed if any of the data points have the value &quot;U&quot; (higher than detection limit)."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -647,8 +647,8 @@
     <element id="SampledData.offsets">
       <path value="SampledData.offsets"/>
       <short value="Offsets, typically in time, at which data values were taken"/>
-      <definition value="A series of increasing decimal values separated by a single space (character u20), which represent the offset from the logical start point. Offset values may be negative. The units in which the offsets are expressed are found in intervalUnit.  The absolute point at which the measurements begin SHALL be conveyed outside the scope of this datatype, e.g. Observation.effectiveDateTime for a timing offset."/>
-      <comment value="If offsets is present, the number of data points must be equal to the number of offsets multipled by the dimensions."/>
+      <definition value="A series of increasing decimal values separated by a single space (character u20), which represent the offset from the logical start point. Offset values may be negative. The units in which the offsets are expressed are found in intervalUnit. If fewer offsets are provided than data points, interval applies to samples after the final offset. The absolute point at which the measurements begin SHALL be conveyed outside the scope of this datatype, e.g. Observation.effectiveDateTime for a timing offset."/>
+      <comment value="If offsets is present without interval, the number of data points must be equal to the number of offsets multiplied by the dimensions. If interval is present, additional data points may be present beyond those offsets."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -709,14 +709,14 @@
       <path value="SampledData"/>
       <short value="A series of measurements taken by a device"/>
       <definition value="A series of measurements taken by a device, with upper and lower limits. There may be more than one dimension in the data."/>
-      <comment value="The data is not interpretable without at least origin, period, and dimensions, but these are optional to allow a separation between the template of measurement and the actual measurement, such as between DeviceCapabilities and DeviceLog.  When providing a summary view (for example with Observation.value[x]) SampledData should be represented with a brief display text such as &quot;Sampled Data&quot;."/>
+      <comment value="The data is not interpretable without at least origin, period, and dimensions, but these are optional to allow a separation between the template of measurement and the actual measurement, such as between DeviceCapabilities and DeviceLog. The lowerLimit and upperLimit, when present, are scaled in the same manner as the data values. I.e. to find the true limit, multiply this value by the factor and add the origin. If there is a need to capture dimensions that differ in scale, origin, limits, etc. this is typically done by having multiple SampledData instances - one in each Observation.component where the components represent different dimensional subsets. When providing a summary view (for example with Observation.value[x]) SampledData should be represented with a brief display text such as &quot;Sampled Data&quot;."/>
       <min value="0"/>
       <max value="*"/>
       <constraint>
         <key value="sdd-1"/>
         <severity value="error"/>
-        <human value="A SampledData SHALL have either an interval and offsets but not both"/>
-        <expression value="interval.exists().not() xor offsets.exists().not()"/>
+        <human value="A SampledData SHALL have an interval and/or offsets"/>
+        <expression value="interval.exists() or offsets.exists()"/>
         <source value="http://hl7.org/fhir/StructureDefinition/SampledData"/>
       </constraint>
       <mapping>
@@ -747,7 +747,7 @@
     <element id="SampledData.interval">
       <path value="SampledData.interval"/>
       <short value="Number of intervalUnits between samples"/>
-      <definition value="Amount of intervalUnits between samples, e.g. milliseconds for time-based sampling."/>
+      <definition value="Amount of intervalUnits between samples, e.g. milliseconds for time-based sampling. If offsets does not provide a value for each sample, this value applies to all samples following the last offset."/>
       <comment value="This is usually a whole number."/>
       <min value="0"/>
       <max value="1"/>
@@ -802,7 +802,7 @@
     <element id="SampledData.lowerLimit">
       <path value="SampledData.lowerLimit"/>
       <short value="Lower limit of detection"/>
-      <definition value="The lower limit of detection of the measured points. This is needed if any of the data points have the value &quot;L&quot; (lower than detection limit)."/>
+      <definition value="The lower limit of detection of the measured points. This value, when present, is scaled in the same manner as the data values. I.e. to find the true limit, multiply this value by the factor and add the origin. This is needed if any of the data points have the value &quot;L&quot; (lower than detection limit)."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -817,7 +817,7 @@
     <element id="SampledData.upperLimit">
       <path value="SampledData.upperLimit"/>
       <short value="Upper limit of detection"/>
-      <definition value="The upper limit of detection of the measured points. This is needed if any of the data points have the value &quot;U&quot; (higher than detection limit)."/>
+      <definition value="The upper limit of detection of the measured points. This value, when present, is scaled in the same manner as the data values. I.e. to find the true limit, multiply this value by the factor and add the origin. This is needed if any of the data points have the value &quot;U&quot; (higher than detection limit)."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -864,8 +864,8 @@
     <element id="SampledData.offsets">
       <path value="SampledData.offsets"/>
       <short value="Offsets, typically in time, at which data values were taken"/>
-      <definition value="A series of increasing decimal values separated by a single space (character u20), which represent the offset from the logical start point. Offset values may be negative. The units in which the offsets are expressed are found in intervalUnit.  The absolute point at which the measurements begin SHALL be conveyed outside the scope of this datatype, e.g. Observation.effectiveDateTime for a timing offset."/>
-      <comment value="If offsets is present, the number of data points must be equal to the number of offsets multipled by the dimensions."/>
+      <definition value="A series of increasing decimal values separated by a single space (character u20), which represent the offset from the logical start point. Offset values may be negative. The units in which the offsets are expressed are found in intervalUnit. If fewer offsets are provided than data points, interval applies to samples after the final offset. The absolute point at which the measurements begin SHALL be conveyed outside the scope of this datatype, e.g. Observation.effectiveDateTime for a timing offset."/>
+      <comment value="If offsets is present without interval, the number of data points must be equal to the number of offsets multiplied by the dimensions. If interval is present, additional data points may be present beyond those offsets."/>
       <min value="0"/>
       <max value="1"/>
       <type>

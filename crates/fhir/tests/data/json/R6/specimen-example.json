@@ -60,7 +60,11 @@
   },
   "container": [
     {
-      "deviceCanonical": "http://hl7.org/fhir/Device/device-example-specimen-container-green-gel-vacutainer",
+      "device": {
+        "reference": {
+          "reference": "Device/device-example-specimen-container-green-gel-vacutainer"
+        }
+      },
       "specimenQuantity": {
         "value": 3,
         "unit": "mL"

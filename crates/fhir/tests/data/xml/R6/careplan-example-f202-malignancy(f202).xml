@@ -64,7 +64,7 @@
         <display value="Roel's Chemotherapy"/>
       </reference>
     </performedActivity>
-    <!--  Chemotherapy  -->
+    <!-- Chemotherapy -->
     <plannedActivityReference>
       <reference value="RequestOrchestration/example"/>
     </plannedActivityReference>

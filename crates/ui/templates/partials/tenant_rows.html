@@ -1,0 +1,51 @@
+{% if let Some(msg) = error %}
+<div class="form-error" role="alert">{{ msg }}</div>
+{% endif %}
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th class="col-tenant">{{ i18n.t("tenants-col-tenant") }}</th>
+      <th class="col-num">{{ i18n.t("tenants-col-resources") }}</th>
+      <th class="col-created">{{ i18n.t("tenants-col-created") }}</th>
+      <th class="col-actions">{{ i18n.t("tenants-col-actions") }}</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% if rows.is_empty() %}
+    <tr class="data-table__empty">
+      <td colspan="4">{{ i18n.t("tenants-empty") }}</td>
+    </tr>
+    {% else %}
+    {% for row in rows %}
+    <tr>
+      <td class="col-tenant">
+        <span class="avatar">{{ row.initials() }}</span>
+        <span class="tenant-id">
+          <span class="tenant-id__name">
+            {% match row.display_name %}{% when Some(name) %}{{ name }}{% when None %}{{ row.id }}{% endmatch %}
+            {% if !row.registered %}<span class="tag tag--muted">{{ i18n.t("tenants-unregistered") }}</span>{% endif %}
+          </span>
+          <span class="tenant-id__slug">{{ row.id }}</span>
+        </span>
+      </td>
+      <td class="col-num">{{ row.resources_human() }}</td>
+      <td class="col-created">{{ row.created_date() }}</td>
+      <td class="col-actions">
+        <button
+          type="button"
+          class="icon-button icon-button--danger"
+          aria-label="{{ i18n.t("tenants-delete") }}"
+          hx-delete="/ui/tenants/{{ row.id }}"
+          hx-target="#tenant-rows"
+          hx-swap="innerHTML"
+          hx-confirm="{{ i18n.t_arg("tenants-delete-confirm", "id", row.id.clone()) }}"
+        >
+          {% include "icons/trash.svg" %}
+        </button>
+      </td>
+    </tr>
+    {% endfor %}
+    {% endif %}
+  </tbody>
+</table>

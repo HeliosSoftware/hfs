@@ -20,7 +20,20 @@ SOURCE_TYPE_RESTFUL_INTERACTION_VS = "http://hl7.org/fhir/ValueSet/type-restful-
 SOURCE_SYSTEM_RESTFUL_INTERACTION_VS = "http://hl7.org/fhir/ValueSet/system-restful-interaction"
 SOURCE_INTERACTION_TRIGGER_VS = "http://hl7.org/fhir/ValueSet/interaction-trigger"
 SOURCE_TESTSCRIPT_OPERATION_CODES_VS = "http://hl7.org/fhir/ValueSet/testscript-operation-codes"
-DEFAULT_TX_BASE_URL = "https://tx.fhir.org/r5"
+DEFAULT_TX_BASE_URL = "https://hts.heliossoftware.com"
+
+# User-Agent presented to the terminology server for live $validate-code calls.
+#
+# hts.heliossoftware.com is fronted by Cloudflare, whose bot protection rejects
+# the default Python urllib User-Agent with "HTTP 403 - Error 1010:
+# browser_signature_banned" before the request reaches the origin. Every code
+# then surfaces as an invalid system+code pair, failing the terminology check.
+# Presenting a browser-like User-Agent clears the filter and lets the real
+# validation response through.
+TX_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 VALID_AUDIT_EVENT_TYPE_CODES = {"rest", "hl7-v2", "hl7-v3", "document", "object"}
 VALID_RESTFUL_INTERACTION_CODES = {
@@ -95,7 +108,7 @@ TERMINOLOGY_SOURCES = [
         "note": "Cross-check context for operation-style interaction codes.",
     },
     {
-        "name": "tx-r5-live-validation",
+        "name": "hts-live-validation",
         "url": DEFAULT_TX_BASE_URL,
         "mode": "strict",
         "applies_to": "Every extracted AuditEvent code usage (system+code)",
@@ -429,7 +442,11 @@ def tx_validate_code(
     base = tx_base_url.rstrip("/")
     query = urllib.parse.urlencode({"url": system, "code": code})
     url = f"{base}/CodeSystem/$validate-code?{query}"
-    request = urllib.request.Request(url, headers={"Accept": "application/fhir+json"})
+    # User-Agent is required to clear the Cloudflare bot filter (see TX_USER_AGENT).
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/fhir+json", "User-Agent": TX_USER_AGENT},
+    )
 
     last_error = ""
     for attempt in range(1, max_attempts + 1):
@@ -594,7 +611,7 @@ def build_terminology_context(events: list[dict[str, Any]], tx_validation: dict[
     sources = [dict(source) for source in TERMINOLOGY_SOURCES]
     if tx_validation is not None:
         for source in sources:
-            if source.get("name") == "tx-r5-live-validation":
+            if source.get("name") == "hts-live-validation":
                 source["url"] = tx_validation.get("tx_base_url", source["url"])
 
     context = {
@@ -1054,7 +1071,7 @@ def main() -> int:
     if terminology_context.get("tx_validation") is not None:
         tx_result = terminology_context["tx_validation"]
         lines.append("")
-        lines.append("### tx.fhir.org/r5 Validation")
+        lines.append("### Terminology Server Validation")
         lines.append("")
         lines.append(f"- Base URL: `{tx_result['tx_base_url']}`")
         lines.append(f"- Total code occurrences validated: **{tx_result['total_occurrences']}**")

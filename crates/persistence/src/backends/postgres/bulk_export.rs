@@ -662,7 +662,7 @@ impl ExportWorkerStorage for PostgresBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let rows = client
             .query(
-                "SELECT request_json, level, group_id, transaction_time, fhir_version
+                "SELECT request_json, level, group_id, transaction_time, fhir_version, owner_subject
                  FROM bulk_export_jobs
                  WHERE id = $1 AND tenant_id = $2 AND worker_id = $3 AND fencing_token = $4",
                 &[
@@ -682,6 +682,7 @@ impl ExportWorkerStorage for PostgresBackend {
         let group_id: Option<String> = row.get(2);
         let transaction_time: DateTime<Utc> = row.get(3);
         let fhir_version_str: String = row.get(4);
+        let owner_subject: Option<String> = row.get(5);
 
         let request: ExportRequest = serde_json::from_str(&request_json)
             .map_err(|e| LeaseError::Storage(internal_error(format!("parse request_json: {e}"))))?;
@@ -725,6 +726,7 @@ impl ExportWorkerStorage for PostgresBackend {
             transaction_time,
             fhir_version,
             type_progress,
+            owner_subject,
         })
     }
 

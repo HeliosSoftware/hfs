@@ -38,6 +38,13 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 - Content negotiation (JSON / XML)
 - CORS support
 
+### Documentation
+
+| Document | Description |
+|----------|-------------|
+| [IG Publisher compatibility](docs/ig-publisher-compatibility.md) | `$validate-code` parameter aliases, SNOMED `version=current`, LOINC version labeling — required for HL7 IG Publisher `-tx` validation |
+| [Expand paths architecture](docs/expand-paths-architecture.md) | ValueSet `$expand` code paths |
+
 ### Terminologies
 
 | Terminology | Authority | Import | License / How to obtain |

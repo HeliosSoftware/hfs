@@ -22,7 +22,7 @@
   </contained>
   <status value="on-hold"/>
   <medication>
-    <!--  Linked to a RESOURCE Medication  -->
+    <!-- Linked to a RESOURCE Medication -->
     <reference>
       <reference value="#med0309"/>
       <display value="Tylenol PM Extra Strength, 1 BOTTLE in 1 CARTON (50580-608-02) &gt; 100 TABLET, FILM COATED in 1 BOTTLE (package)"/>
