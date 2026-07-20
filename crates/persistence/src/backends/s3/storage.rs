@@ -857,10 +857,16 @@ impl ResourceStorage for S3Backend {
         if legacy == key {
             return Ok(None);
         }
+        // The legacy key is ambiguous: `sanitize` mapped `a/b` to `a_b`, which is
+        // also the *canonical* key of a tenant literally named `a_b`. So the key
+        // alone cannot establish ownership — the record body decides. Without
+        // this check the fallback would re-open the very cross-tenant read the
+        // escaping change closes.
         Ok(self
             .get_json_object::<crate::core::TenantRecord>(&location.bucket, &legacy)
             .await?
-            .map(|(record, _)| record))
+            .map(|(record, _)| record)
+            .filter(|record| record.id == id))
     }
 
     async fn register_tenant(
@@ -895,6 +901,12 @@ impl ResourceStorage for S3Backend {
         // Delete both key shapes so deregistering a tenant registered before the
         // `sanitize` fix actually removes its record. S3 deletes are silently
         // idempotent, so probe each first to report whether anything was removed.
+        //
+        // The probe is not just a nicety here: the legacy key is ambiguous —
+        // `sanitize` mapped `a/b` to `a_b`, which is also the *canonical* key of
+        // a tenant named `a_b` — so the record body must confirm ownership
+        // before deleting. Skipping that would make deregistering `a/b` silently
+        // destroy `a_b`'s registration.
         let key = location.keyspace.tenant_registry_key(id);
         let legacy = location.keyspace.legacy_tenant_registry_key(id);
         let mut candidates = vec![key.clone()];
@@ -903,11 +915,13 @@ impl ResourceStorage for S3Backend {
         }
         let mut removed = false;
         for candidate in candidates {
-            if self
+            let Some((record, _)) = self
                 .get_json_object::<crate::core::TenantRecord>(&location.bucket, &candidate)
                 .await?
-                .is_none()
-            {
+            else {
+                continue;
+            };
+            if record.id != id {
                 continue;
             }
             self.client

@@ -477,19 +477,33 @@ mod tests {
 
     /// Traversal in a tenant id cannot walk the registry key out of its
     /// namespace.
+    ///
+    /// What makes this safe is that `/` is escaped, so the id can never
+    /// contribute a separator and the key always stays a single leaf under
+    /// `tenants/`. A `..` surviving *within* that leaf is harmless: the leaf
+    /// always has `.json` appended, so no path segment is ever exactly `.` or
+    /// `..`, and S3 keys carry no path semantics anyway. Assert the property
+    /// that actually holds — one leaf, no separator — rather than the absence of
+    /// the characters.
     #[test]
     fn registry_key_cannot_be_escaped_by_traversal() {
         let ks = S3Keyspace::new(None);
-        for id in ["..", "../..", "a/../../b"] {
+        for id in ["..", ".", "../..", "a/../../b", "../../../etc/passwd"] {
             let key = ks.tenant_registry_key(id);
+            let leaf = key
+                .strip_prefix("tenants/")
+                .unwrap_or_else(|| panic!("{id:?} escaped the registry namespace: {key}"));
             assert!(
-                key.starts_with("tenants/"),
-                "{id:?} escaped the registry namespace: {key}"
+                !leaf.contains('/'),
+                "{id:?} injected a separator into the key: {key}"
             );
-            assert!(
-                !key.contains(".."),
-                "{id:?} left a traversal segment in the key: {key}"
-            );
+            // No path segment is ever a bare traversal token.
+            for segment in key.split('/') {
+                assert!(
+                    segment != ".." && segment != ".",
+                    "{id:?} produced a traversal segment: {key}"
+                );
+            }
         }
     }
 
