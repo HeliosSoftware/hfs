@@ -3095,6 +3095,33 @@ mod settings_mongo {
     }
 }
 
+/// `delete_settings` removes the document and reports whether one existed —
+/// the primitive the #270 legacy-key migration uses to move a document rather
+/// than leave a duplicate copy behind.
+#[tokio::test]
+async fn mongodb_integration_settings_delete_is_idempotent() {
+    let Some(backend) = settings_mongo::backend("settings_delete").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_delete_is_idempotent (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("delete");
+
+    // Absent is not an error, and reports "nothing removed".
+    assert!(!backend.delete_settings(&user).await.unwrap());
+
+    backend
+        .put_settings(&user, json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert!(backend.get_settings(&user).await.unwrap().is_some());
+
+    assert!(backend.delete_settings(&user).await.unwrap());
+    assert!(backend.get_settings(&user).await.unwrap().is_none());
+    assert!(!backend.delete_settings(&user).await.unwrap());
+}
+
 #[tokio::test]
 async fn mongodb_integration_settings_get_missing_is_none() {
     let Some(backend) = settings_mongo::backend("settings_missing").await else {

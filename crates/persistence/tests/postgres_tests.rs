@@ -4296,6 +4296,28 @@ mod postgres_integration {
         format!("{}|{}", prefix, uuid::Uuid::new_v4().simple())
     }
 
+    /// `delete_settings` removes the row and reports whether one existed —
+    /// the primitive the #270 legacy-key migration uses to move a document
+    /// rather than leave a duplicate copy behind.
+    #[tokio::test]
+    async fn postgres_integration_settings_delete_is_idempotent() {
+        let backend = create_backend().await;
+        let user = unique_user_key("delete");
+
+        // Absent is not an error, and reports "nothing removed".
+        assert!(!backend.delete_settings(&user).await.unwrap());
+
+        backend
+            .put_settings(&user, json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        assert!(backend.get_settings(&user).await.unwrap().is_some());
+
+        assert!(backend.delete_settings(&user).await.unwrap());
+        assert!(backend.get_settings(&user).await.unwrap().is_none());
+        assert!(!backend.delete_settings(&user).await.unwrap());
+    }
+
     #[tokio::test]
     async fn postgres_integration_settings_get_missing_is_none() {
         let backend = create_backend().await;

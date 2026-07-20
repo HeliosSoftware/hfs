@@ -229,6 +229,17 @@ impl SettingsStore for MongoBackend {
         })
         .await
     }
+
+    async fn delete_settings(&self, user_key: &str) -> StorageResult<bool> {
+        let db = self.get_database().await?;
+        let collection = db.collection::<Document>(USER_SETTINGS_COLLECTION);
+        let result = retry_transient(|| async {
+            collection.delete_one(doc! { "user_key": user_key }).await
+        })
+        .await
+        .map_err(|e| backend_err(format!("delete user_settings: {e}")))?;
+        Ok(result.deleted_count > 0)
+    }
 }
 
 /// Decodes the JSON `data` field of a stored `user_settings` document.

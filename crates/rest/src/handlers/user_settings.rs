@@ -12,9 +12,12 @@
 //! exempt from FHIR scope checks, and invisible to FHIR machinery
 //! (`CapabilityStatement`, search, history, export).
 //!
-//! Each response carries a weak `ETag` (`W/"{version}"`). Clients may send
-//! `If-Match` on `PUT`/`PATCH` for optimistic concurrency, or `If-None-Match`
-//! on `GET` for conditional fetches.
+//! Each response carries a strong `ETag` (`"{version}"`) — strong because
+//! `If-Match` is defined in terms of the strong comparison function, which a
+//! `W/` validator can never satisfy. Clients may send `If-Match` on
+//! `PUT`/`PATCH` for optimistic concurrency, or `If-None-Match` on `GET` for
+//! conditional fetches. The weak form is still *accepted* on `If-Match` for
+//! clients built against earlier releases.
 //!
 //! [RFC 7386]: https://www.rfc-editor.org/rfc/rfc7386
 
@@ -68,22 +71,22 @@ where
     S: ResourceStorage + Send + Sync,
 {
     let store = settings_store(&state)?;
-    let (document, version) = match store.get_settings(user.as_str()).await? {
+    let (document, version) = match load_settings(store, &user).await? {
         Some(stored) => (stored.document, stored.version),
         None => (Value::Object(Default::default()), 0),
     };
-    let etag = weak_etag(version);
+    let current_etag = etag(version);
 
     // Honor If-None-Match only when a document actually exists; an empty default
     // document (version 0) must never be reported as "not modified".
     if version > 0
         && let Some(inm) = conditional.if_none_match()
-        && (inm == etag || inm == "*")
+        && (inm == current_etag || inm == "*")
     {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, current_etag)]).into_response());
     }
 
-    Ok(([(header::ETAG, etag)], Json(document)).into_response())
+    Ok(([(header::ETAG, current_etag)], Json(document)).into_response())
 }
 
 /// Handler for `PUT /_user/settings`.
@@ -103,7 +106,28 @@ where
     let store = settings_store(&state)?;
     let document = parse_object_body(&body)?;
     validate_settings_document(&document)?;
-    let if_match = parse_if_match_version(&conditional);
+    // Parse before touching storage so a malformed precondition fails fast.
+    let precondition = parse_if_match(&conditional)?;
+
+    // Adopt any pre-#270 document first, so a wholesale replace does not leave
+    // the legacy copy stranded and unreachable.
+    let current_version = load_settings(store, &user)
+        .await?
+        .map(|stored| stored.version)
+        .unwrap_or(0);
+
+    let if_match = match precondition {
+        IfMatch::Absent => None,
+        IfMatch::Version(expected) => Some(expected),
+        // `*` asserts the document exists, which the store cannot express as a
+        // version, so resolve it against the current one and pin the write to
+        // that — which also keeps the write conditional.
+        IfMatch::Any => {
+            check_if_match(precondition, current_version)?;
+            Some(current_version)
+        }
+    };
+
     let stored = store
         .put_settings(user.as_str(), document, if_match)
         .await?;
@@ -128,7 +152,7 @@ where
 {
     let store = settings_store(&state)?;
     let merge_patch = parse_object_body(&body)?;
-    let caller_if_match = parse_if_match_version(&conditional);
+    let precondition = parse_if_match(&conditional)?;
 
     // The bounds below apply to the *post-merge* document, which only the
     // backend sees. Compute the merge here against the version we read, pin the
@@ -137,17 +161,11 @@ where
     // concurrent-writer race with a couple of retries.
     let mut attempts = 0;
     loop {
-        let (current, version) = match store.get_settings(user.as_str()).await? {
+        let (current, version) = match load_settings(store, &user).await? {
             Some(stored) => (stored.document, stored.version),
             None => (Value::Object(Default::default()), 0),
         };
-        if let Some(expected) = caller_if_match
-            && expected != version
-        {
-            return Err(RestError::PreconditionFailed {
-                message: format!("Expected settings version {expected}, but found {version}"),
-            });
-        }
+        check_if_match(precondition, version)?;
         let merged = apply_merge_patch(current, &merge_patch);
         validate_settings_document(&merged)?;
 
@@ -156,7 +174,10 @@ where
             .await
         {
             Ok(stored) => return Ok(settings_response(stored)),
-            Err(e) if is_lock_failure(&e) && caller_if_match.is_none() && attempts < 2 => {
+            // Only a caller who sent *no* precondition gets the conflict
+            // absorbed. A caller who sent one — including `*` — asked to be
+            // told about the race, so the failure must surface.
+            Err(e) if is_lock_failure(&e) && precondition == IfMatch::Absent && attempts < 2 => {
                 attempts += 1;
             }
             Err(e) => return Err(e.into()),
@@ -271,29 +292,171 @@ fn parse_object_body(body: &Bytes) -> RestResult<Value> {
     Ok(value)
 }
 
-/// Extracts the version number from an `If-Match` weak ETag (`W/"{n}"`, `"{n}"`,
-/// or bare `{n}`). A wildcard (`*`) or absent/unparseable header yields `None`,
-/// meaning "no version precondition".
-fn parse_if_match_version(conditional: &ConditionalHeaders) -> Option<i64> {
-    let raw = conditional.if_match()?.trim();
+/// A parsed `If-Match` precondition.
+///
+/// The header has four distinct input states and they must not be conflated —
+/// collapsing them onto `Option<i64>` is what let a malformed header silently
+/// become "no precondition", i.e. an unconditional overwrite (issue #270).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IfMatch {
+    /// No `If-Match` header: the write is unconditional.
+    Absent,
+    /// `If-Match: *` — succeed only if a document already exists.
+    Any,
+    /// A specific version must be current.
+    Version(i64),
+}
+
+/// Parses `If-Match` for `/_user/settings`.
+///
+/// Per [RFC 9110 §13.1.1] a precondition that cannot be satisfied means the
+/// method MUST NOT be performed. A syntactically invalid field value can never
+/// satisfy the strong comparison the section requires, so it is a failed
+/// precondition rather than a missing one — `412`, not "carry on". (`400` would
+/// be equally conformant for malformed syntax; `412` is chosen for consistency
+/// with every other precondition path in this crate.)
+///
+/// Both the strong form `"{n}"` and the legacy weak form `W/"{n}"` are accepted.
+/// This endpoint now emits strong ETags (see [`etag`]), but a client deployed
+/// against an earlier build may still echo back a weak one, so rejecting `W/`
+/// outright would break it for no benefit.
+///
+/// [RFC 9110 §13.1.1]: https://www.rfc-editor.org/rfc/rfc9110#section-13.1.1
+fn parse_if_match(conditional: &ConditionalHeaders) -> RestResult<IfMatch> {
+    let Some(raw) = conditional.if_match() else {
+        return Ok(IfMatch::Absent);
+    };
+    let raw = raw.trim();
     if raw == "*" {
-        return None;
+        return Ok(IfMatch::Any);
     }
-    raw.trim_start_matches("W/").trim_matches('"').parse().ok()
+
+    let unquoted = raw
+        .strip_prefix("W/")
+        .unwrap_or(raw)
+        .trim()
+        .trim_matches('"');
+
+    unquoted
+        .parse::<i64>()
+        .map(IfMatch::Version)
+        .map_err(|_| RestError::PreconditionFailed {
+            message: format!(
+                "Malformed If-Match value {raw:?}; expected an entity-tag such as \"3\", or *"
+            ),
+        })
+}
+
+/// Checks a parsed precondition against the currently stored `version`, where
+/// version `0` means "no document exists yet".
+fn check_if_match(precondition: IfMatch, version: i64) -> RestResult<()> {
+    let failed = match precondition {
+        IfMatch::Absent => None,
+        // `*` is *not* "no precondition": it asserts the resource exists.
+        IfMatch::Any if version == 0 => {
+            Some("If-Match: * requires an existing settings document".to_string())
+        }
+        IfMatch::Any => None,
+        IfMatch::Version(expected) if expected != version => Some(format!(
+            "Expected settings version {expected}, but found {version}"
+        )),
+        IfMatch::Version(_) => None,
+    };
+    match failed {
+        Some(message) => Err(RestError::PreconditionFailed { message }),
+        None => Ok(()),
+    }
+}
+
+/// Reads the caller's settings document, adopting a pre-#270 one on a miss.
+///
+/// The hit path is a single read: the legacy key is only consulted when the
+/// current key holds nothing, which after the first access is never again true
+/// for a given user. That matters because this runs on every page load.
+async fn load_settings(
+    store: &Arc<dyn SettingsStore>,
+    user: &UserKey,
+) -> RestResult<Option<StoredUserSettings>> {
+    if let Some(stored) = store.get_settings(user.as_str()).await? {
+        return Ok(Some(stored));
+    }
+    adopt_legacy_document(store, user).await
+}
+
+/// Moves a settings document written under the pre-#270 key encoding to the
+/// current one, once, on first access.
+///
+/// A batch migration is not possible: computing the new key needs the issuer and
+/// subject *separately*, but the legacy key `"{iss}|{sub}"` is exactly the
+/// ambiguous string that cannot be split back apart. At request time we hold the
+/// real `Principal`, so both keys are derivable — which is why this runs lazily
+/// on the request path instead.
+///
+/// Backend-agnostic by construction, so it covers SQLite, PostgreSQL, MongoDB
+/// and S3 identically and needs no schema change on any of them: `user_key` is
+/// an opaque primary key everywhere.
+///
+/// Copy-then-delete, never the reverse: an interruption in between leaves the
+/// legacy document in place and the next request simply retries. The write
+/// asserts the current key is still empty (`Some(0)`), so a concurrent request
+/// that adopted it first is not clobbered.
+async fn adopt_legacy_document(
+    store: &Arc<dyn SettingsStore>,
+    user: &UserKey,
+) -> RestResult<Option<StoredUserSettings>> {
+    let Some(legacy_key) = user.legacy_key() else {
+        return Ok(None);
+    };
+    let Some(legacy) = store.get_settings(legacy_key).await? else {
+        return Ok(None);
+    };
+
+    let adopted = match store
+        .put_settings(user.as_str(), legacy.document, Some(0))
+        .await
+    {
+        Ok(stored) => stored,
+        // Another request adopted it first; its document is equally valid, so
+        // take whatever is now there rather than racing to overwrite it.
+        Err(e) if is_lock_failure(&e) => return Ok(store.get_settings(user.as_str()).await?),
+        Err(e) => return Err(e.into()),
+    };
+
+    store.delete_settings(legacy_key).await?;
+    Ok(Some(adopted))
 }
 
 /// Builds the success response for a write: the stored document plus its ETag.
 fn settings_response(stored: StoredUserSettings) -> Response {
     (
-        [(header::ETAG, weak_etag(stored.version))],
+        [(header::ETAG, etag(stored.version))],
         Json(stored.document),
     )
         .into_response()
 }
 
-/// Formats a version number as a weak ETag.
-fn weak_etag(version: i64) -> String {
-    format!("W/\"{version}\"")
+/// Formats a version number as a *strong* ETag.
+///
+/// `If-Match` requires the strong comparison function ([RFC 9110 §13.1.1],
+/// defined in §8.8.3.2), under which a weak validator can never match. Emitting
+/// `W/"{n}"` here — as this endpoint previously did — meant a conformant client
+/// echoing the server's own ETag back on `If-Match` could never satisfy the
+/// precondition, making the advertised optimistic-concurrency contract
+/// unimplementable.
+///
+/// A strong validator is factually justified: the settings document is a single
+/// JSON blob keyed by a monotonic integer version, so equal versions are
+/// byte-equivalent. The strong form also remains valid for `If-None-Match` on
+/// `GET`, which uses weak comparison and accepts strong tags.
+///
+/// This deliberately differs from the FHIR handlers (`update.rs`, `patch.rs`),
+/// which must keep `W/"{versionId}"`: FHIR mandates weak ETags, a deliberate
+/// deviation from HTTP. `/_user/settings` is not a FHIR route and should not
+/// inherit it.
+///
+/// [RFC 9110 §13.1.1]: https://www.rfc-editor.org/rfc/rfc9110#section-13.1.1
+fn etag(version: i64) -> String {
+    format!("\"{version}\"")
 }
 
 #[cfg(test)]
@@ -350,25 +513,79 @@ mod tests {
         assert!(value.is_object());
     }
 
+    fn with_if_match(raw: &str) -> ConditionalHeaders {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MATCH, raw.parse().unwrap());
+        ConditionalHeaders::from_headers(&headers)
+    }
+
     #[test]
-    fn parse_if_match_version_variants() {
-        let with_if_match = |raw: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::IF_MATCH, raw.parse().unwrap());
-            ConditionalHeaders::from_headers(&headers)
-        };
-        assert_eq!(parse_if_match_version(&with_if_match("W/\"5\"")), Some(5));
-        assert_eq!(parse_if_match_version(&with_if_match("\"7\"")), Some(7));
-        assert_eq!(parse_if_match_version(&with_if_match("9")), Some(9));
-        // A wildcard means "no version precondition".
-        assert_eq!(parse_if_match_version(&with_if_match("*")), None);
-        // An unparseable value is ignored rather than rejected.
-        assert_eq!(parse_if_match_version(&with_if_match("garbage")), None);
-        // An absent header yields no precondition.
+    fn parse_if_match_accepts_strong_weak_and_bare_tags() {
+        // Strong is the form this endpoint now emits.
         assert_eq!(
-            parse_if_match_version(&ConditionalHeaders::from_headers(&HeaderMap::new())),
-            None
+            parse_if_match(&with_if_match("\"7\"")).unwrap(),
+            IfMatch::Version(7)
         );
+        // Weak is still accepted, for clients built against earlier releases.
+        assert_eq!(
+            parse_if_match(&with_if_match("W/\"5\"")).unwrap(),
+            IfMatch::Version(5)
+        );
+        assert_eq!(
+            parse_if_match(&with_if_match("9")).unwrap(),
+            IfMatch::Version(9)
+        );
+        assert_eq!(parse_if_match(&with_if_match("*")).unwrap(), IfMatch::Any);
+        assert_eq!(
+            parse_if_match(&ConditionalHeaders::from_headers(&HeaderMap::new())).unwrap(),
+            IfMatch::Absent
+        );
+    }
+
+    /// A malformed `If-Match` must fail the precondition, not be discarded.
+    ///
+    /// Previously this returned `None` — "no precondition" — silently turning a
+    /// request that asked to be conditional into an unconditional
+    /// last-writer-wins overwrite (issue #270).
+    #[test]
+    fn parse_if_match_rejects_a_malformed_value() {
+        for raw in ["garbage", "\"\"", "W/\"\"", "\"1\", \"2\"", "1.5", "-"] {
+            let err = parse_if_match(&with_if_match(raw)).unwrap_err();
+            assert!(
+                matches!(err, RestError::PreconditionFailed { .. }),
+                "expected a precondition failure for {raw:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// `If-Match: *` means "the document must already exist" (RFC 9110
+    /// §13.1.1), *not* "no precondition" — so it must fail against version 0.
+    #[test]
+    fn wildcard_requires_an_existing_document() {
+        assert!(check_if_match(IfMatch::Any, 0).is_err());
+        assert!(check_if_match(IfMatch::Any, 1).is_ok());
+    }
+
+    #[test]
+    fn version_precondition_matches_exactly() {
+        assert!(check_if_match(IfMatch::Version(3), 3).is_ok());
+        assert!(check_if_match(IfMatch::Version(3), 4).is_err());
+        // Version 0 = no document; a caller asserting v3 must be told.
+        assert!(check_if_match(IfMatch::Version(3), 0).is_err());
+    }
+
+    #[test]
+    fn absent_precondition_never_fails() {
+        assert!(check_if_match(IfMatch::Absent, 0).is_ok());
+        assert!(check_if_match(IfMatch::Absent, 42).is_ok());
+    }
+
+    /// `If-Match` requires strong comparison, so this endpoint emits a strong
+    /// validator (unlike the FHIR routes, where weak is mandated).
+    #[test]
+    fn etag_is_strong() {
+        assert_eq!(etag(5), "\"5\"");
+        assert!(!etag(5).starts_with("W/"));
     }
 
     /// Backends without a settings store surface `501 Not Implemented`.

@@ -1110,3 +1110,32 @@ async fn test_minio_settings_concurrent_patches_never_lose_an_update() {
     }
     assert_eq!(stored.version, writers as i64);
 }
+
+/// `delete_settings` removes the object and reports whether one was there,
+/// which is what makes the #270 legacy-key migration able to move a document
+/// rather than duplicate it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_settings_delete_is_idempotent() {
+    if skip_if_disabled("test_minio_settings_delete_is_idempotent") {
+        return;
+    }
+
+    let harness = make_prefix_backend("settings-delete").await;
+    let user = unique_user_key("delete");
+
+    // Deleting an absent document is not an error, and reports "nothing there".
+    assert!(!harness.backend.delete_settings(&user).await.unwrap());
+
+    harness
+        .backend
+        .put_settings(&user, json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert!(harness.backend.get_settings(&user).await.unwrap().is_some());
+
+    assert!(harness.backend.delete_settings(&user).await.unwrap());
+    assert!(harness.backend.get_settings(&user).await.unwrap().is_none());
+
+    // Idempotent: a second delete succeeds and reports nothing was removed.
+    assert!(!harness.backend.delete_settings(&user).await.unwrap());
+}
