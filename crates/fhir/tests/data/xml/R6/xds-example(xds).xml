@@ -98,8 +98,8 @@
   </entry>
   <entry>
     <fullUrl value="http://localhost:9556/svc/fhir/Patient/a2"/>
-    <!--   if the server can find a matching resource, use that, else create a new 
-      resource with these details   -->
+    <!-- if the server can find a matching resource, use that, else create a new 
+      resource with these details -->
     <resource>
       <Patient>
         <id value="a2"/>
@@ -156,7 +156,7 @@
     <resource>
       <Practitioner>
         <id value="a4"/>
-        <!--   cid:51b578b4-3ccb-4e67-b0dc-ef519d82ef2d@healthintersections.com.au   -->
+        <!-- cid:51b578b4-3ccb-4e67-b0dc-ef519d82ef2d@healthintersections.com.au -->
         <meta>
           <lastUpdated value="2013-07-01T13:11:33Z"/>
         </meta>

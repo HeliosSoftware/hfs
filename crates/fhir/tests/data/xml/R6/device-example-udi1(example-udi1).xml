@@ -45,7 +45,7 @@
       </coding>
     </type>
   </name>
-  <!--  note: optional text value added here for a prettier generated narrative  -->
+  <!-- note: optional text value added here for a prettier generated narrative -->
   <type>
     <coding>
       <system value="http://snomed.info/sct"/>
@@ -54,7 +54,7 @@
     </coding>
     <text value="Coated femoral stem prosthesis, modular"/>
   </type>
-  <!--  <association>
+  <!-- <association>
 	  <status> 
 	     <coding>
 		   <system value="http://terminology.hl7.org/CodeSystem/device-association-status" />
@@ -64,8 +64,8 @@
       <humanSubject>
 		<reference value="Patient/example"/>
 	  </humanSubject>
-	</association>  -->
-  <!--  note: optional text value added here for a prettier generated narrative  -->
+	</association> -->
+  <!-- note: optional text value added here for a prettier generated narrative -->
   <safety>
     <coding>
       <system value="http://ncicb.nci.nih.gov/xml/owl/EVS/Thesaurus.owl"/>

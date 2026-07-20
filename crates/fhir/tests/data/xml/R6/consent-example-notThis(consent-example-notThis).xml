@@ -36,7 +36,7 @@
   <controller>
     <reference value="Organization/f001"/>
   </controller>
-  <!--  likely use url pointer to common text  -->
+  <!-- likely use url pointer to common text -->
   <sourceAttachment>
     <title value="The terms of the consent in lawyer speak."/>
   </sourceAttachment>
@@ -47,7 +47,7 @@
     </coding>
   </regulatoryBasis>
   <decision value="permit"/>
-  <!--  this is opt-in - e.g. everything approved unless otherwise stated  -->
+  <!-- this is opt-in - e.g. everything approved unless otherwise stated -->
   <provision>
     <data>
       <meaning value="related"/>

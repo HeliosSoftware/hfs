@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?><NutritionOrder xmlns="http://hl7.org/fhir">
-  <!--  Using only instruction element in oralDiet and Supplement minimal other elements  id = pureeddiet-simple file name = nutritionorder-example-pureeddiet-simple.xml  Name= Pureed Diet Simple Description = Nutrition Order Pureed Diet with Energy/Protein Supplement Simple Example
-edited by Eric Haas Health eData Inc
- -->
-  <!--  EH: use oral Diet element  -->
+  <!-- Using only instruction element in oralDiet and Supplement minimal other elements  id = pureeddiet-simple file name = nutritionorder-example-pureeddiet-simple.xml  Name= Pureed Diet Simple Description = Nutrition Order Pureed Diet with Energy/Protein Supplement Simple Example
+edited by Eric Haas Health eData Inc -->
+  <!-- EH: use oral Diet element -->
   <id value="pureeddiet-simple"/>
   <meta>
     <security>
@@ -23,7 +22,7 @@ edited by Eric Haas Health eData Inc
   </subject>
   <dateTime value="2014-09-17"/>
   <oralDiet>
-    <!--  EH:  list type of diet showing standard code and local codes  -->
+    <!-- EH:  list type of diet showing standard code and local codes -->
     <type>
       <coding>
         <system value="http://snomed.info/sct"/>
@@ -37,7 +36,7 @@ edited by Eric Haas Health eData Inc
       </coding>
       <text value="Pureed diet"/>
     </type>
-    <!--  EH example of three times a day starting on 2/10  -->
+    <!-- EH example of three times a day starting on 2/10 -->
     <schedule>
       <timing>
         <repeat>
@@ -78,7 +77,7 @@ edited by Eric Haas Health eData Inc
       </concept>
     </type>
     <productName value="Ensure Pudding 4 oz container"/>
-    <!-- EH:  Instructions to supplement too  -->
+    <!-- EH:  Instructions to supplement too -->
     <instruction value="Ensure Pudding at breakfast, lunch, supper"/>
   </supplement>
 </NutritionOrder>

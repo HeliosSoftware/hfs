@@ -236,6 +236,7 @@ AWS_REGION=us-east-1 \
 | `HFS_BASE_URL` | `http://localhost:8080` | Base URL used in `Location` headers and Bundle links |
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
 | `HFS_DATA_DIR` | `./data` | Directory containing FHIR data files (search parameters) |
+| `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
 | `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
 
@@ -499,7 +500,8 @@ Storage backend abstraction supporting multiple database technologies optimized 
 - History and versioning
 - Batch/transaction support
 - Asynchronous [Bulk Data Export](crates/rest/README.md#bulk-data-export) (`$export`) at system, Patient, and Group level
-- Optional BALP-compliant `AuditEvent` logging for REST and auth interactions
+- [Administrative operations](crates/rest/README.md#administrative-operations): `$purge` (permanent, irreversible erasure of a resource and its history) and `$reindex` (rebuild the search index), each gated on its own scope
+- Optional BALP-compliant `AuditEvent` logging for REST and auth interactions, including the `$export`, `$purge`, and `$reindex` operations
 
 # Development
 

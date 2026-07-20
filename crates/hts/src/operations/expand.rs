@@ -1620,7 +1620,18 @@ async fn process_expand_inner<B: TerminologyBackend>(
         // pure-full-system case this applies to URL-resolved ValueSets too
         // (the IG `search/search-filter-yes` fixture is URL-resolved). Inspect
         // the inline compose when present, else fetch the referenced VS.
-        if hierarchical.is_none() {
+        //
+        // Paging suppresses this default. Tree mode returns the whole subtree —
+        // the backends drop `count`/`offset` and report no `offset` — so nesting a
+        // paged request would silently ignore what the caller asked for, and
+        // answering `count=10` over a SNOMED is-a root would first read that
+        // root's ~10^5 descendants. The IG agrees: every fixture pairing a
+        // subsumption filter with count/offset (`simple-cases/simple-expand-isa-
+        // {c2,o2,o2c2}`, `snomed/expand-pc-none`) expects a flat list, and no
+        // fixture expecting nesting pages. A text `filter` does NOT suppress it —
+        // `search/search-filter-yes` filters and still expects a tree. An explicit
+        // `hierarchical=true` / `excludeNested=false` nests regardless.
+        if hierarchical.is_none() && count.is_none() && offset.is_none() {
             let ctx = TenantContext::system();
             let resolved_vs: Option<Value> = if value_set.is_some() {
                 value_set.clone()
@@ -2040,7 +2051,25 @@ async fn process_expand_inner<B: TerminologyBackend>(
             None
         }
     };
-    let (_, source_vs_search) = tokio::join!(flags_fut, source_vs_fut);
+    // Which ValueSet row would the backend itself resolve for this URL? Ask it,
+    // rather than re-deriving the answer by sorting version strings below.
+    // Same-URL precedence depends on `authority_rank`, a storage column that is
+    // deliberately absent from the FHIR resource, so a Rust-side sort cannot see
+    // it and would echo the re-published copy while the backend expanded the
+    // original (issue #200, ValueSet path). Only needed when no version is pinned.
+    let resolved_vs_version_fut = async {
+        match (&url_for_neg_cache, &req_vs_version) {
+            (Some(u), None) => {
+                ValueSetOperations::value_set_version_for_url(state.backend(), &ctx, u)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        }
+    };
+    let (_, source_vs_search, resolved_vs_version) =
+        tokio::join!(flags_fut, source_vs_fut, resolved_vs_version_fut);
     let source_vs: Option<Value> = if url_for_neg_cache.is_some() {
         source_vs_search.and_then(|mut v| {
             // If a specific version was requested, return the row whose
@@ -2060,7 +2089,15 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     .find(|r| r.get("version").and_then(|x| x.as_str()) == Some(want.as_str()))
                     .cloned();
                 exact.or_else(|| v.into_iter().next())
+            } else if let Some(ref resolved) = resolved_vs_version {
+                // Echo the row the backend actually resolved.
+                v.iter()
+                    .find(|r| r.get("version").and_then(|x| x.as_str()) == Some(resolved.as_str()))
+                    .cloned()
+                    .or_else(|| v.into_iter().next())
             } else {
+                // Backend has no opinion (unversioned row, or a backend that does
+                // not implement the accessor): fall back to highest version.
                 v.sort_by(|a, b| {
                     let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
                     let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
@@ -3573,13 +3610,25 @@ async fn process_expand_inner<B: TerminologyBackend>(
                     pinned_version = Some(default_v.clone());
                 }
             }
-            // When no version pin is in effect, fetch up to 20 candidates and
-            // pick the highest version — mirrors `resolve_value_set_versioned`'s
-            // order-by-version-DESC behaviour.  `count: Some(1)` against the
+            // When no version pin is in effect, fetch up to 20 candidates and pick
+            // the one the BACKEND would resolve.  `count: Some(1)` against the
             // search SQL (which orders by created_at) yields the earliest-
             // imported row instead, silently picking vs-version-a1 over -a2
             // for the `default-valueset-version/indirect-expand-zero` fixture.
+            //
+            // The winner is asked of the backend rather than re-derived by sorting
+            // version strings: precedence depends on `authority_rank`, a storage
+            // column absent from the resource JSON, so a Rust-side sort would echo
+            // a re-published copy while the backend expanded the original.
             let count_hint = if pinned_version.is_some() { 1 } else { 20 };
+            let resolved_vs_version: Option<String> = if pinned_version.is_none() {
+                ValueSetOperations::value_set_version_for_url(state.backend(), &ctx, &bare_url)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let referenced_vs: Option<Value> = ValueSetOperations::search(
                 state.backend(),
                 &ctx,
@@ -3595,9 +3644,22 @@ async fn process_expand_inner<B: TerminologyBackend>(
             .and_then(|mut hits| {
                 if pinned_version.is_some() {
                     hits.pop()
+                } else if let Some(ref resolved) = resolved_vs_version {
+                    hits.iter()
+                        .find(|r| {
+                            r.get("version").and_then(|x| x.as_str()) == Some(resolved.as_str())
+                        })
+                        .cloned()
+                        .or_else(|| {
+                            hits.sort_by(|a, b| {
+                                let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                                bv.cmp(av)
+                            });
+                            hits.into_iter().next()
+                        })
                 } else {
-                    // No pin: highest version wins (matches the backend's
-                    // `ORDER BY COALESCE(version,'') DESC` resolution).
+                    // Backend has no opinion: fall back to highest version.
                     hits.sort_by(|a, b| {
                         let av = a.get("version").and_then(|x| x.as_str()).unwrap_or("");
                         let bv = b.get("version").and_then(|x| x.as_str()).unwrap_or("");

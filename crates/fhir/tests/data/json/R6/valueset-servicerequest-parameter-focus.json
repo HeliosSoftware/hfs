@@ -1,0 +1,69 @@
+{
+  "resourceType": "ValueSet",
+  "id": "servicerequest-parameter-focus",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet servicerequest-parameter-focus\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"servicerequest-parameter-focus\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcservicerequest-parameter-focus\"\u003e \u003c/a\u003e\u003cp\u003eThis value set includes codes based on the following rules:\u003c/p\u003e\u003cul\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"valueset-device-type.html\"\u003eDevice Type\u003c/a\u003e\u003c/li\u003e\u003cli\u003eImport all the codes that are contained in \u003ca href\u003d\"valueset-medication-codes.html\"\u003eSNOMED CT Medication Codes\u003c/a\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "normative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 4
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/servicerequest-parameter-focus",
+  "version": "6.0.0-ballot4",
+  "name": "ServiceRequestParameterFocusCodes",
+  "title": "Service Request Parameter Focus Codes",
+  "status": "active",
+  "experimental": false,
+  "publisher": "Orders and Observations Workgroup",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/orders/index.cfm"
+        }
+      ]
+    }
+  ],
+  "description": "An example value set of coded concepts for identifying the type of item that order detail parameters apply to, such as a device type or medication. This is a union of the Device Type and SNOMED CT Medication Codes value sets.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "copyright": "This resource includes content from SNOMED Clinical Terms® (SNOMED CT®) which is copyright of the International Health Terminology Standards Development Organisation (IHTSDO). Implementers of these specifications must have the appropriate SNOMED CT Affiliate license - for more information contact http://www.snomed.org/snomed-ct/get-snomed-ct or info@snomed.org",
+  "compose": {
+    "include": [
+      {
+        "valueSet": [
+          "http://hl7.org/fhir/ValueSet/device-type"
+        ]
+      },
+      {
+        "valueSet": [
+          "http://hl7.org/fhir/ValueSet/medication-codes"
+        ]
+      }
+    ]
+  }
+}

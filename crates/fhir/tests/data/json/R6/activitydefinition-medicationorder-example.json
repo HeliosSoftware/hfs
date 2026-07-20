@@ -261,44 +261,51 @@
   "productReference": {
     "reference": "#citalopramMedication"
   },
-  "dosage": [
-    {
-      "text": "1 tablet oral 1 time daily",
-      "timing": {
-        "repeat": {
-          "frequency": 1,
-          "period": 1,
-          "periodUnit": "d"
-        }
-      },
-      "route": {
-        "coding": [
+  "dosageInstruction": {
+    "renderedInstruction": "1 tablet oral 1 time daily",
+    "step": [
+      {
+        "component": [
           {
-            "code": "26643006",
-            "display": "Oral route (qualifier value)"
-          }
-        ],
-        "text": "Oral route (qualifier value)"
-      },
-      "doseAndRate": [
-        {
-          "type": {
-            "coding": [
+            "text": "1 tablet oral 1 time daily",
+            "timing": {
+              "repeat": {
+                "frequency": 1,
+                "period": 1,
+                "periodUnit": "d"
+              }
+            },
+            "route": {
+              "coding": [
+                {
+                  "code": "26643006",
+                  "display": "Oral route (qualifier value)"
+                }
+              ],
+              "text": "Oral route (qualifier value)"
+            },
+            "doseAndRate": [
               {
-                "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                "code": "ordered",
-                "display": "Ordered"
+                "type": {
+                  "coding": [
+                    {
+                      "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
+                      "code": "ordered",
+                      "display": "Ordered"
+                    }
+                  ]
+                },
+                "doseQuantity": {
+                  "value": 1,
+                  "unit": "{tbl}"
+                }
               }
             ]
-          },
-          "doseQuantity": {
-            "value": 1,
-            "unit": "{tbl}"
           }
-        }
-      ]
-    }
-  ],
+        ]
+      }
+    ]
+  },
   "dynamicValue": [
     {
       "path": "dispenseRequest.numberOfRepeatsAllowed",

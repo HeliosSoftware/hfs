@@ -2065,7 +2065,7 @@ async fn test_search_multiple_parameters() {
 // ============================================================================
 
 use helios_persistence::search::{
-    ReindexOperation, ReindexRequest, ReindexStatus, ReindexableStorage,
+    ReindexOperation, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
 };
 use std::sync::Arc;
 
@@ -2326,11 +2326,15 @@ async fn test_reindex_operation_full() {
     );
 
     // Create reindex operation
-    let reindex = ReindexOperation::new(backend.clone(), backend.search_extractor().clone());
+    let reindex = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
 
     // Start reindex
     let job_id = reindex
-        .start(tenant.clone(), ReindexRequest::for_types(vec!["Patient"]))
+        .start(
+            tenant.clone(),
+            ReindexRequest::for_types(vec!["Patient"]),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2398,11 +2402,11 @@ async fn test_reindex_operation_cancel() {
     backend.clear_search_index(&tenant).await.unwrap();
 
     // Create reindex operation with small batch size to make it slower
-    let reindex = ReindexOperation::new(backend.clone(), backend.search_extractor().clone());
+    let reindex = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
 
     // Start reindex
     let request = ReindexRequest::all().with_batch_size(5);
-    let job_id = reindex.start(tenant.clone(), request).await.unwrap();
+    let job_id = reindex.start(tenant.clone(), request, None).await.unwrap();
 
     // Cancel immediately
     reindex.cancel(&job_id).await.unwrap();
@@ -2415,6 +2419,110 @@ async fn test_reindex_operation_cancel() {
     assert!(
         progress.status == ReindexStatus::Cancelled || progress.status == ReindexStatus::Completed,
         "Job should be cancelled or already completed"
+    );
+}
+
+/// A [`ReindexTarget`] that records what it was asked to index.
+///
+/// Stands in for the Elasticsearch secondary of a composite deployment, so the
+/// fan-out can be asserted without a container.
+#[derive(Default)]
+struct SpyReindexTarget {
+    written: std::sync::Mutex<Vec<String>>,
+    cleared: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ReindexTarget for SpyReindexTarget {
+    async fn delete_search_entries(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _resource_id: &str,
+    ) -> helios_persistence::error::StorageResult<u64> {
+        Ok(0)
+    }
+
+    async fn write_search_entries(
+        &self,
+        _tenant: &TenantContext,
+        resource: &helios_persistence::types::StoredResource,
+    ) -> helios_persistence::error::StorageResult<usize> {
+        self.written.lock().unwrap().push(format!(
+            "{}/{}",
+            resource.resource_type(),
+            resource.id()
+        ));
+        Ok(1)
+    }
+
+    async fn clear_search_index(
+        &self,
+        _tenant: &TenantContext,
+    ) -> helios_persistence::error::StorageResult<u64> {
+        self.cleared
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(0)
+    }
+}
+
+/// On a composite deployment the primary holds the resources but Elasticsearch
+/// serves search, so `$reindex` MUST rewrite the secondary's index too.
+/// Reindexing only the primary — which is what happens when the reindex driver
+/// is handed a single storage handle — rebuilds an index nothing queries and
+/// leaves search stale, silently.
+#[tokio::test]
+async fn test_reindex_fans_out_to_every_target() {
+    let backend = Arc::new(create_backend());
+    let tenant = create_tenant("test-tenant");
+
+    for i in 1..=3 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let secondary = Arc::new(SpyReindexTarget::default());
+    let reindex = ReindexOperation::with_parts(
+        backend.clone(),
+        vec![backend.clone(), secondary.clone()],
+        backend.tenant_registries().clone(),
+    );
+
+    let request = ReindexRequest::for_types(vec!["Patient"]).clear_existing();
+    let job_id = reindex.start(tenant.clone(), request, None).await.unwrap();
+
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let progress = reindex.get_progress(&job_id).await.unwrap();
+        if progress.status == ReindexStatus::Completed {
+            break;
+        }
+        if progress.status == ReindexStatus::Failed {
+            panic!("Reindex failed: {:?}", progress.error_message);
+        }
+        attempts += 1;
+        assert!(attempts <= 100, "Reindex timed out");
+    }
+
+    let mut written = secondary.written.lock().unwrap().clone();
+    written.sort();
+    assert_eq!(
+        written,
+        ["Patient/p1", "Patient/p2", "Patient/p3"],
+        "every resource must be written to the secondary index, not just the primary's"
+    );
+    assert_eq!(
+        secondary.cleared.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "clear_existing must clear the secondary index too"
     );
 }
 
@@ -2789,7 +2897,8 @@ async fn test_search_parameter_create_registers_in_registry() {
         .unwrap();
 
     // Verify the parameter is registered
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     let param = registry.get_param("Patient", "nickname");
     assert!(
         param.is_some(),
@@ -2833,7 +2942,8 @@ async fn test_search_parameter_create_draft_not_registered() {
         .unwrap();
 
     // Verify the parameter is NOT registered (draft status)
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     let param = registry.get_param("Patient", "draft");
     assert!(
         param.is_none(),
@@ -2871,7 +2981,8 @@ async fn test_search_parameter_delete_unregisters() {
 
     // Verify it's registered
     {
-        let registry = backend.search_registry().read();
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
         assert!(registry.get_param("Observation", "todelete").is_some());
     }
 
@@ -2882,7 +2993,8 @@ async fn test_search_parameter_delete_unregisters() {
         .unwrap();
 
     // Verify it's unregistered
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     assert!(
         registry.get_param("Observation", "todelete").is_none(),
         "Deleted SearchParameter should be unregistered"
@@ -2919,7 +3031,8 @@ async fn test_search_parameter_update_status_change() {
 
     // Verify it's registered and active
     {
-        let registry = backend.search_registry().read();
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
         let param = registry.get_param("Condition", "statuschange");
         assert!(param.is_some());
         assert_eq!(
@@ -2946,14 +3059,13 @@ async fn test_search_parameter_update_status_change() {
         .await
         .unwrap();
 
-    // Verify status is updated in registry
-    let registry = backend.search_registry().read();
-    let param = registry.get_param("Condition", "statuschange");
-    assert!(param.is_some(), "Parameter should still exist in registry");
-    assert_eq!(
-        param.unwrap().status,
-        helios_persistence::search::SearchParameterStatus::Retired,
-        "Status should be updated to retired"
+    // A per-tenant registry overlays only a tenant's *active* stored params, so
+    // retiring the parameter removes it from that tenant's search resolution.
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
+    assert!(
+        registry.get_param("Condition", "statuschange").is_none(),
+        "a retired custom parameter should no longer resolve for the tenant"
     );
 }
 

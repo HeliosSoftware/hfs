@@ -46,7 +46,6 @@
             <br/>
             <span style="font-style: italic" title="ele-1">+ Rule: All FHIR elements must have a @value or children or both</span>
             <br/>
-            <br/>Elements defined in Ancestors: 
           </td>
         </tr>
 
@@ -112,7 +111,7 @@
   <name value="Element"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>

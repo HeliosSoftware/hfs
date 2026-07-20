@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn app() -> Router {
-    helios_ui::mount(
+    helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
         None,
@@ -20,6 +20,9 @@ fn app() -> Router {
             configured: true,
             model: "test-model".to_string(),
         },
+        None,
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
     )
 }
 

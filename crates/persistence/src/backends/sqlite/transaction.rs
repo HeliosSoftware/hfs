@@ -551,7 +551,7 @@ impl TransactionProvider for SqliteBackend {
         SqliteTransaction::new(
             conn,
             tenant.clone(),
-            self.search_extractor().clone(),
+            Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
             self.is_search_offloaded(),
         )
     }

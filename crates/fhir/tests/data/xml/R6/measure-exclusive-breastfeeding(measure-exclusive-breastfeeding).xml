@@ -363,6 +363,9 @@
   </contact>
   <description value="Exclusive breastfeeding measure of outcomes for exclusive breastmilk feeding of newborns."/>
   <purpose value="Measure of newborns who were fed breast milk only since birth"/>
+  <topic>
+    <text value="Exclusive Breastfeeding"/>
+  </topic>
   <relatedArtifact>
     <type value="documentation"/>
     <citation value="American Academy of Pediatrics. (2005). Section on Breastfeeding. Policy Statement:Breastfeeding and the Use of Human Milk. Pediatrics.115:496-506."/>

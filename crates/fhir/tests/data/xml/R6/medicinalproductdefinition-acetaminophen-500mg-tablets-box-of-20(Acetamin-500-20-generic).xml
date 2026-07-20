@@ -19,7 +19,7 @@
             <code value="cardboard box"/>
           </coding>
         </type>
-        <!--  the item contained in the pack (note this is a different concept to a "contained" resource, above)  -->
+        <!-- the item contained in the pack (note this is a different concept to a "contained" resource, above) -->
         <containedItem>
           <item>
             <reference>

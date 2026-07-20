@@ -563,7 +563,7 @@ impl TransactionProvider for PostgresBackend {
         PostgresTransaction::new(
             client,
             tenant.clone(),
-            self.search_extractor().clone(),
+            std::sync::Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
             self.is_search_offloaded(),
         )
         .await

@@ -22,7 +22,7 @@
   <status value="in-progress"/>
   <medication>
     <reference>
-      <!--  Linked to a RESOURCE Medication  -->
+      <!-- Linked to a RESOURCE Medication -->
       <reference value="#med0303"/>
       <display value="alemtuzumab 10 MG/ML [Lemtrada]"/>
     </reference>

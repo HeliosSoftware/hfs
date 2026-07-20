@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Encounter"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -188,7 +188,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
-            <a href="datatypes.html#Coding">Coding</a>
+            <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The kind of workflow the status is tracking
             <br/>Binding: 
@@ -234,7 +234,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Classification of patient encounter context - e.g. Inpatient, outpatient
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-encounter-class.html">Encounter class</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-encounter-class.html">Encounter class</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -256,7 +256,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Indicates the urgency of the encounter
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-ActPriority.html">ActPriority</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-v3-ActPriority.html">ActPriority</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -291,7 +291,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: white; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Encounter.serviceType : Broad categorization of the service that is to be provided (e.g. cardiology).">serviceType</span>
+            <span title="Encounter.serviceType : The specific service that is to be performed during this encounter.">serviceType</span>
             <a name="Encounter.serviceType"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -302,7 +302,7 @@
             <a href="references.html#CodeableReference">CodeableReference</a>(
             <a href="healthcareservice.html">HealthcareService</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Specific type of service
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The specific service that is to be performed during this encounter
             <br/>Binding: 
             <a href="valueset-service-type.html">Service Type</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
@@ -506,7 +506,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Role of participant in encounter
             <br/>Binding: 
             <a href="valueset-encounter-participant-type.html">Participant Type</a> (
-            <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
+            <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
           </td>
@@ -678,7 +678,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPQfAOvGUf7ztuvPMf/78/fkl/Pbg+u8Rvjqteu2Pf3zxPz36Pz0z+vTmPzurPvuw/npofbjquvNefHVduuyN+uuMu3Oafbgjfnqvf/3zv/3xevPi+vRjP/20/bmsP///wD/ACH5BAEKAB8ALAAAAAAQABAAAAVl4CeOZGme5qCqqDg8jyVJaz1876DsmAQAgqDgltspMEhMJoMZ4iy6I1AooFCIv+wKybziALVAoAEjYLwDgGIpJhMslgxaLR4/3rMAWoBp32V5exg8Shl1ckRUQVaMVkQ2kCstKCEAOw==" alt="." style="background-color: white; background-color: inherit" title="Element" class="hierarchy"/> 
-            <span title="Encounter.reason : The list of medical reasons that are expected to be addressed during the episode of care.">reason</span>
+            <span title="Encounter.reason : The list of medical reasons that are expected to be addressed during the encounter.">reason</span>
             <a name="Encounter.reason"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -688,7 +688,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="types.html#BackBoneElement">BackboneElement</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The list of medical reasons that are expected to be addressed during the episode of care
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The list of medical reasons that are expected to be addressed during the encounter
             <br/>
             <br/>
           </td>
@@ -1000,7 +1000,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Indicates that the patient is being re-admitted
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v2-0092.html">hl7VS-re-admissionIndicator</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-v2-0092.html">hl7VS-re-admissionIndicator</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -1124,7 +1124,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#CodeableConcept">CodeableConcept</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The physical type of the location (usually the level in the location hierarchy - bed, room, ward, virtual etc.)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The form of the location (usually the level in the location hierarchy - bed, room, ward, virtual etc.)
             <br/>Binding: 
             <a href="valueset-location-form.html">Location Form</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
@@ -1179,7 +1179,7 @@
   <name value="Encounter"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Patient Administration"/>
   <contact>
     <telecom>
@@ -1301,7 +1301,7 @@
       <path value="Encounter.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1480,6 +1480,14 @@
     </element>
     <element id="Encounter.extension">
       <path value="Encounter.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1512,6 +1520,14 @@
     </element>
     <element id="Encounter.modifierExtension">
       <path value="Encounter.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1691,6 +1707,14 @@
     </element>
     <element id="Encounter.businessStatus.extension">
       <path value="Encounter.businessStatus.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1722,6 +1746,14 @@
     </element>
     <element id="Encounter.businessStatus.modifierExtension">
       <path value="Encounter.businessStatus.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1814,7 +1846,7 @@
         <max value="1"/>
       </base>
       <type>
-        <code value="Coding"/>
+        <code value="CodeableConcept"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -2005,8 +2037,8 @@
     </element>
     <element id="Encounter.serviceType">
       <path value="Encounter.serviceType"/>
-      <short value="Specific type of service"/>
-      <definition value="Broad categorization of the service that is to be provided (e.g. cardiology)."/>
+      <short value="The specific service that is to be performed during this encounter"/>
+      <definition value="The specific service that is to be performed during this encounter."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2394,6 +2426,14 @@
     </element>
     <element id="Encounter.participant.extension">
       <path value="Encounter.participant.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2425,6 +2465,14 @@
     </element>
     <element id="Encounter.participant.modifierExtension">
       <path value="Encounter.participant.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2461,7 +2509,7 @@
       <path value="Encounter.participant.type"/>
       <short value="Role of participant in encounter"/>
       <definition value="Role of participant in encounter."/>
-      <comment value="The participant type indicates how an individual actor participates in an encounter. It includes non-practitioner participants, and for practitioners this is to describe the action type in the context of this encounter (e.g. Admitting Dr, Attending Dr, Translator, Consulting Dr). This is different to the practitioner roles which are functional roles, derived from terms of employment, education, licensing, etc."/>
+      <comment value="The participant type indicates how an individual actor participates in an encounter. It includes non-practitioner participants, and for practitioners this is to describe the action type in the context of this encounter (e.g. Admitting Dr, Attending Dr, Translator, Consulting Dr). This is different to the practitioner roles which are functional roles, derived from terms of employment, education, licensing, etc. Patient and Groups are not permitted to have types as they are the subject of the encounter (invariant enc-2 enforces this)."/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2488,7 +2536,7 @@
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
           <valueString value="ParticipantType"/>
         </extension>
-        <strength value="extensible"/>
+        <strength value="preferred"/>
         <description value="Role of participant in encounter."/>
         <valueSet value="http://hl7.org/fhir/ValueSet/encounter-participant-type"/>
       </binding>
@@ -2509,6 +2557,7 @@
       <path value="Encounter.participant.period"/>
       <short value="Period of time during the encounter that the participant participated"/>
       <definition value="The period of time that the specified participant participated in the encounter. These can overlap or be sub-sets of the overall encounter's period."/>
+      <comment value="This can overlap or be sub-sets of the overall encounter's period as noted in Encounter.actualPeriod."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2661,7 +2710,7 @@
       <path value="Encounter.actualPeriod"/>
       <short value="The actual start and end time of the encounter"/>
       <definition value="The actual start and end time of the encounter."/>
-      <comment value="If not (yet) known, the end of the Period may be omitted."/>
+      <comment value="If not (yet) known, the end of the Period may be omitted. Not all participants/locations in the encounter need to occur within the period defined in actualPeriod. For example, a common use case is actors associated with preparations/cleanup for the encounter."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2800,9 +2849,9 @@
         <valueString value="Reason"/>
       </extension>
       <path value="Encounter.reason"/>
-      <short value="The list of medical reasons that are expected to be addressed during the episode of care"/>
-      <definition value="The list of medical reasons that are expected to be addressed during the episode of care."/>
-      <comment value="The reason communicates what medical problem the patient has that should be addressed during the episode of care.  This reason could be patient reported complaint, a clinical indication that was determined in a previous encounter or episode of care, or some planned care such as an immunization recommendation.  In the case where you have a primary reason, but are expecting to also address other problems, you can list the primary reason with a use code of 'Chief Complaint', while the other problems being addressed would have a use code of 'Reason for Visit'.&#xD;&#xD;Examples:&#xD; * pregnancy would use HealthcareService or a coding as the reason&#xD; * patient home monitoring could use Condition as the reason"/>
+      <short value="The list of medical reasons that are expected to be addressed during the encounter"/>
+      <definition value="The list of medical reasons that are expected to be addressed during the encounter."/>
+      <comment value="The reason communicates what medical problem the patient has that should be addressed during the encounter.  This reason could be patient reported complaint, a clinical indication that was determined in a previous encounter or episode of care, or some planned care such as an immunization recommendation.  In the case where you have a primary reason, but are expecting to also address other problems, you can list the primary reason with a use code of 'Chief Complaint', while the other problems being addressed would have a use code of 'Reason for Visit'.&#xD;&#xD;Examples:&#xD; * pregnancy would use HealthcareService or a coding as the reason&#xD; * patient home monitoring could use Condition as the reason"/>
       <min value="0"/>
       <max value="*"/>
       <base>
@@ -2853,6 +2902,14 @@
     </element>
     <element id="Encounter.reason.extension">
       <path value="Encounter.reason.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2884,6 +2941,14 @@
     </element>
     <element id="Encounter.reason.modifierExtension">
       <path value="Encounter.reason.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3065,6 +3130,14 @@
     </element>
     <element id="Encounter.diagnosis.extension">
       <path value="Encounter.diagnosis.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3096,6 +3169,14 @@
     </element>
     <element id="Encounter.diagnosis.modifierExtension">
       <path value="Encounter.diagnosis.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3440,6 +3521,14 @@
     </element>
     <element id="Encounter.admission.extension">
       <path value="Encounter.admission.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3471,6 +3560,14 @@
     </element>
     <element id="Encounter.admission.modifierExtension">
       <path value="Encounter.admission.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3784,6 +3881,14 @@
     </element>
     <element id="Encounter.location.extension">
       <path value="Encounter.location.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3815,6 +3920,14 @@
     </element>
     <element id="Encounter.location.modifierExtension">
       <path value="Encounter.location.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3929,7 +4042,7 @@
     </element>
     <element id="Encounter.location.form">
       <path value="Encounter.location.form"/>
-      <short value="The physical type of the location (usually the level in the location hierarchy - bed, room, ward, virtual etc.)"/>
+      <short value="The form of the location (usually the level in the location hierarchy - bed, room, ward, virtual etc.)"/>
       <definition value="This will be used to specify the required levels (bed/ward/room/etc.) desired to be recorded to simplify either messaging or query."/>
       <comment value="This information is de-normalized from the Location resource to support the easier understanding of the encounter resource and processing in messaging or query.&#xA;&#xA;There may be many levels in the hierachy, and this may only pic specific levels that are required for a specific usage scenario."/>
       <min value="0"/>
@@ -3957,7 +4070,7 @@
           <valueString value="LocationForm"/>
         </extension>
         <strength value="example"/>
-        <description value="Physical form of the location."/>
+        <description value="Form of the location."/>
         <valueSet value="http://hl7.org/fhir/ValueSet/location-form"/>
       </binding>
     </element>
@@ -3965,6 +4078,7 @@
       <path value="Encounter.location.period"/>
       <short value="Time period during which the patient was present at the location"/>
       <definition value="Time period during which the patient was present at the location."/>
+      <comment value="This can overlap or be sub-sets of the overall encounter's period as noted in Encounter.actualPeriod."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -4139,7 +4253,7 @@
       <min value="0"/>
       <max value="1"/>
       <type>
-        <code value="Coding"/>
+        <code value="CodeableConcept"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
@@ -4275,8 +4389,8 @@
     </element>
     <element id="Encounter.serviceType">
       <path value="Encounter.serviceType"/>
-      <short value="Specific type of service"/>
-      <definition value="Broad categorization of the service that is to be provided (e.g. cardiology)."/>
+      <short value="The specific service that is to be performed during this encounter"/>
+      <definition value="The specific service that is to be performed during this encounter."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -4531,7 +4645,7 @@
       <path value="Encounter.participant.type"/>
       <short value="Role of participant in encounter"/>
       <definition value="Role of participant in encounter."/>
-      <comment value="The participant type indicates how an individual actor participates in an encounter. It includes non-practitioner participants, and for practitioners this is to describe the action type in the context of this encounter (e.g. Admitting Dr, Attending Dr, Translator, Consulting Dr). This is different to the practitioner roles which are functional roles, derived from terms of employment, education, licensing, etc."/>
+      <comment value="The participant type indicates how an individual actor participates in an encounter. It includes non-practitioner participants, and for practitioners this is to describe the action type in the context of this encounter (e.g. Admitting Dr, Attending Dr, Translator, Consulting Dr). This is different to the practitioner roles which are functional roles, derived from terms of employment, education, licensing, etc. Patient and Groups are not permitted to have types as they are the subject of the encounter (invariant enc-2 enforces this)."/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -4546,7 +4660,7 @@
         <extension url="http://hl7.org/fhir/StructureDefinition/elementdefinition-bindingName">
           <valueString value="ParticipantType"/>
         </extension>
-        <strength value="extensible"/>
+        <strength value="preferred"/>
         <description value="Role of participant in encounter."/>
         <valueSet value="http://hl7.org/fhir/ValueSet/encounter-participant-type"/>
       </binding>
@@ -4567,6 +4681,7 @@
       <path value="Encounter.participant.period"/>
       <short value="Period of time during the encounter that the participant participated"/>
       <definition value="The period of time that the specified participant participated in the encounter. These can overlap or be sub-sets of the overall encounter's period."/>
+      <comment value="This can overlap or be sub-sets of the overall encounter's period as noted in Encounter.actualPeriod."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -4671,7 +4786,7 @@
       <path value="Encounter.actualPeriod"/>
       <short value="The actual start and end time of the encounter"/>
       <definition value="The actual start and end time of the encounter."/>
-      <comment value="If not (yet) known, the end of the Period may be omitted."/>
+      <comment value="If not (yet) known, the end of the Period may be omitted. Not all participants/locations in the encounter need to occur within the period defined in actualPeriod. For example, a common use case is actors associated with preparations/cleanup for the encounter."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -4762,9 +4877,9 @@
         <valueString value="Reason"/>
       </extension>
       <path value="Encounter.reason"/>
-      <short value="The list of medical reasons that are expected to be addressed during the episode of care"/>
-      <definition value="The list of medical reasons that are expected to be addressed during the episode of care."/>
-      <comment value="The reason communicates what medical problem the patient has that should be addressed during the episode of care.  This reason could be patient reported complaint, a clinical indication that was determined in a previous encounter or episode of care, or some planned care such as an immunization recommendation.  In the case where you have a primary reason, but are expecting to also address other problems, you can list the primary reason with a use code of 'Chief Complaint', while the other problems being addressed would have a use code of 'Reason for Visit'.&#xD;&#xD;Examples:&#xD; * pregnancy would use HealthcareService or a coding as the reason&#xD; * patient home monitoring could use Condition as the reason"/>
+      <short value="The list of medical reasons that are expected to be addressed during the encounter"/>
+      <definition value="The list of medical reasons that are expected to be addressed during the encounter."/>
+      <comment value="The reason communicates what medical problem the patient has that should be addressed during the encounter.  This reason could be patient reported complaint, a clinical indication that was determined in a previous encounter or episode of care, or some planned care such as an immunization recommendation.  In the case where you have a primary reason, but are expecting to also address other problems, you can list the primary reason with a use code of 'Chief Complaint', while the other problems being addressed would have a use code of 'Reason for Visit'.&#xD;&#xD;Examples:&#xD; * pregnancy would use HealthcareService or a coding as the reason&#xD; * patient home monitoring could use Condition as the reason"/>
       <min value="0"/>
       <max value="*"/>
       <type>
@@ -5283,7 +5398,7 @@
     </element>
     <element id="Encounter.location.form">
       <path value="Encounter.location.form"/>
-      <short value="The physical type of the location (usually the level in the location hierarchy - bed, room, ward, virtual etc.)"/>
+      <short value="The form of the location (usually the level in the location hierarchy - bed, room, ward, virtual etc.)"/>
       <definition value="This will be used to specify the required levels (bed/ward/room/etc.) desired to be recorded to simplify either messaging or query."/>
       <comment value="This information is de-normalized from the Location resource to support the easier understanding of the encounter resource and processing in messaging or query.&#xA;&#xA;There may be many levels in the hierachy, and this may only pic specific levels that are required for a specific usage scenario."/>
       <min value="0"/>
@@ -5299,7 +5414,7 @@
           <valueString value="LocationForm"/>
         </extension>
         <strength value="example"/>
-        <description value="Physical form of the location."/>
+        <description value="Form of the location."/>
         <valueSet value="http://hl7.org/fhir/ValueSet/location-form"/>
       </binding>
     </element>
@@ -5307,6 +5422,7 @@
       <path value="Encounter.location.period"/>
       <short value="Time period during which the patient was present at the location"/>
       <definition value="Time period during which the patient was present at the location."/>
+      <comment value="This can overlap or be sub-sets of the overall encounter's period as noted in Encounter.actualPeriod."/>
       <min value="0"/>
       <max value="1"/>
       <type>

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?><Task xmlns="http://hl7.org/fhir">
-  <!--    This is an example to demonstrate using task for actioning a reprocessing of several lines on a preauthorization -->
+  <!-- This is an example to demonstrate using task for actioning a reprocessing of several lines on a preauthorization -->
   <id value="fm-example4"/>
   <meta>
     <security>
@@ -23,8 +23,8 @@
   <status value="requested"/>
   <intent value="order"/>
   <priority value="stat"/>
-  <!--  real time request and response required  -->
-  <!--    fictive code and description elements populated for this example     -->
+  <!-- real time request and response required -->
+  <!-- fictive code and description elements populated for this example -->
   <code>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/financialtaskcode"/>
@@ -46,7 +46,7 @@
   </owner>
   <input>
     <type>
-      <!--  identifier of the insurer's response to the preauthorization  -->
+      <!-- identifier of the insurer's response to the preauthorization -->
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/financialtaskinputtype"/>
         <code value="origresponse"/>
@@ -61,7 +61,7 @@
   </input>
   <input>
     <type>
-      <!--  authorization reference  -->
+      <!-- authorization reference -->
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/financialtaskinputtype"/>
         <code value="reference"/>
@@ -71,7 +71,7 @@
   </input>
   <input>
     <type>
-      <!--  line item sequence number to reprocess  -->
+      <!-- line item sequence number to reprocess -->
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/financialtaskinputtype"/>
         <code value="item"/>
@@ -81,7 +81,7 @@
   </input>
   <input>
     <type>
-      <!--  line item sequence number to reprocess  -->
+      <!-- line item sequence number to reprocess -->
       <coding>
         <system value="http://terminology.hl7.org/CodeSystem/financialtaskinputtype"/>
         <code value="item"/>

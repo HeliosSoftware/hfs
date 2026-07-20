@@ -576,15 +576,14 @@ mod es_integration {
     use std::sync::Arc;
 
     use helios_fhir::FhirVersion;
-    use parking_lot::RwLock;
     use serde_json::json;
 
     use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
     use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
     use helios_persistence::error::{ResourceError, StorageError};
     use helios_persistence::search::{
-        SearchParameterDefinition, SearchParameterLoader, SearchParameterRegistry,
-        SearchParameterSource, SearchParameterStatus,
+        SearchParameterDefinition, SearchParameterLoader, SearchParameterSource,
+        SearchParameterStatus, TenantSearchRegistries,
     };
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
@@ -636,7 +635,7 @@ mod es_integration {
     }
 
     /// Builds a search parameter registry loaded from the FHIR spec data files.
-    fn build_search_registry() -> Arc<RwLock<SearchParameterRegistry>> {
+    fn build_search_registry() -> Arc<TenantSearchRegistries> {
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -644,7 +643,8 @@ mod es_integration {
             .unwrap_or_else(|| PathBuf::from("data"));
 
         let loader = SearchParameterLoader::new(FhirVersion::default());
-        let mut registry = SearchParameterRegistry::new();
+        let registries = Arc::new(TenantSearchRegistries::base_only());
+        let mut registry = registries.base().write();
 
         // Load embedded (minimal) params first
         if let Ok(params) = loader.load_embedded() {
@@ -683,7 +683,8 @@ mod es_integration {
             xpath: None,
         });
 
-        Arc::new(RwLock::new(registry))
+        drop(registry);
+        registries
     }
 
     /// Creates an ElasticsearchBackend connected to the shared testcontainers ES instance.
@@ -1354,6 +1355,109 @@ mod es_integration {
 
         assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 3);
         assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 2);
+    }
+
+    // ========================================================================
+    // Tenant Purge Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn es_integration_purge_tenant_data() {
+        let backend = create_backend().await;
+
+        // ES is a search secondary, never the tenant registry of record.
+        assert!(!backend.supports_tenant_registry());
+
+        // Unique tenant ids; the suffixed tenant's id starts with tenant A's id
+        // plus `_x`, so its index names (e.g. `{prefix}_{tenant_a}_x_patient`)
+        // match the purge's `{prefix}_{tenant_a}_*` wildcard. Only the exact
+        // `term` filter on tenant_id keeps its data alive.
+        let tenant_a_id = format!("acme-{}", uuid::Uuid::new_v4().simple());
+        let tenant_suffixed_id = format!("{}_x", tenant_a_id);
+        let tenant_b_id = format!("beta-{}", uuid::Uuid::new_v4().simple());
+
+        let tenant_a = create_tenant(&tenant_a_id);
+        let tenant_b = create_tenant(&tenant_b_id);
+        let tenant_suffixed = create_tenant(&tenant_suffixed_id);
+
+        let mut tenant_a_ids = Vec::new();
+        for _ in 0..2 {
+            let patient = json!({"resourceType": "Patient"});
+            let created = backend
+                .create(&tenant_a, "Patient", patient, FhirVersion::default())
+                .await
+                .unwrap();
+            tenant_a_ids.push(created.id().to_string());
+        }
+
+        let patient_b = backend
+            .create(
+                &tenant_b,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let patient_suffixed = backend
+            .create(
+                &tenant_suffixed,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 2);
+
+        // Contained/auxiliary docs may add to the deleted count, so >= 2.
+        let purged = backend.purge_tenant_data(&tenant_a_id).await.unwrap();
+        assert!(purged >= 2, "expected at least 2 purged docs, got {purged}");
+
+        // Tenant A is empty: counts are zero and reads come back None.
+        assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 0);
+        assert_eq!(backend.count(&tenant_a, None).await.unwrap(), 0);
+        for id in &tenant_a_ids {
+            assert!(
+                backend
+                    .read(&tenant_a, "Patient", id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // Tenant B is untouched.
+        assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 1);
+        assert!(
+            backend
+                .read(&tenant_b, "Patient", patient_b.id())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The suffixed tenant survives even though its index names match the
+        // purge's index wildcard — the exact term filter decides membership.
+        assert_eq!(
+            backend
+                .count(&tenant_suffixed, Some("Patient"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            backend
+                .read(&tenant_suffixed, "Patient", patient_suffixed.id())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     // ========================================================================

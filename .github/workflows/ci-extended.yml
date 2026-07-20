@@ -45,7 +45,27 @@ jobs:
     runs-on: [self-hosted, Linux]
     needs: [test-rust]
     if: always()
+    env:
+      MAX_CONTAINER_AGE_MIN: 90
     steps:
       - name: Remove testcontainers from this run
         run: |
           docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -f || true
+
+      - name: Sweep orphaned testcontainers from dead runs
+        run: |
+          # See ci.yml for the full rationale: containers live in `static
+          # OnceCell`s and are never dropped, so anything a dead run left behind
+          # can only be reaped by label + age.
+          now=$(date +%s)
+          reaped=0
+          for id in $(docker ps -q --filter "label=org.testcontainers.managed-by=testcontainers"); do
+            started=$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null) || continue
+            age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
+            if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
+              echo "Reaping orphan $id (age ${age_min}m)"
+              docker rm -f "$id" || true
+              reaped=$((reaped + 1))
+            fi
+          done
+          echo "Swept ${reaped} orphaned testcontainer(s)."
