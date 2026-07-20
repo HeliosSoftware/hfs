@@ -12,11 +12,36 @@ use std::time::Duration;
 use crate::error::{FhirPathError, FhirPathResult};
 use helios_fhir::FhirVersion;
 
-/// Request timeout for terminology server calls.
+/// Default request timeout for terminology server calls.
 ///
-/// Without this, an unresponsive server hangs the evaluating thread indefinitely
+/// Without a timeout, an unresponsive server hangs the evaluating thread indefinitely
 /// (`Client::new()` applies no timeout).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment variable overriding [`DEFAULT_REQUEST_TIMEOUT`], in whole seconds.
+const REQUEST_TIMEOUT_ENV: &str = "FHIRPATH_TERMINOLOGY_TIMEOUT";
+
+/// Resolves the request timeout from [`REQUEST_TIMEOUT_ENV`].
+///
+/// Falls back to [`DEFAULT_REQUEST_TIMEOUT`] when unset or unparseable. `0` is accepted
+/// and means "no timeout" — matching reqwest's own semantics for an absent timeout, for
+/// callers who deliberately want to wait on a slow expansion indefinitely.
+fn request_timeout() -> Option<Duration> {
+    parse_request_timeout(std::env::var(REQUEST_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Pure half of [`request_timeout`], so the parsing rules can be tested without
+/// mutating process-global environment state from a threaded test runner.
+fn parse_request_timeout(raw: Option<&str>) -> Option<Duration> {
+    match raw {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => Some(DEFAULT_REQUEST_TIMEOUT),
+        },
+        None => Some(DEFAULT_REQUEST_TIMEOUT),
+    }
+}
 
 /// Terminology client for making requests to a FHIR terminology server
 #[derive(Clone)]
@@ -34,9 +59,15 @@ impl TerminologyClient {
     ///
     /// * `base_url` - The base URL of the terminology server
     /// * `fhir_version` - The FHIR version to use for requests
+    ///
+    /// The request timeout defaults to 30s and can be overridden with
+    /// `FHIRPATH_TERMINOLOGY_TIMEOUT` (whole seconds; `0` disables it).
     pub fn new(base_url: String, fhir_version: FhirVersion) -> Self {
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+        let mut builder = Client::builder();
+        if let Some(timeout) = request_timeout() {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder
             .build()
             .expect("failed to build terminology HTTP client");
 
@@ -641,6 +672,38 @@ mod tests {
             "http://example.org/target"
         );
         assert_eq!(param(&body, "reverse").unwrap()["valueString"], "true");
+    }
+
+    #[test]
+    fn timeout_defaults_to_30s_when_unset_or_unparseable() {
+        assert_eq!(parse_request_timeout(None), Some(DEFAULT_REQUEST_TIMEOUT));
+        // A typo must not silently remove the timeout that #262 added.
+        assert_eq!(
+            parse_request_timeout(Some("thirty")),
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        );
+        assert_eq!(
+            parse_request_timeout(Some("-5")),
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn timeout_honours_an_explicit_override() {
+        assert_eq!(
+            parse_request_timeout(Some("120")),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_request_timeout(Some(" 5 ")),
+            Some(Duration::from_secs(5)),
+            "surrounding whitespace is common in .env files"
+        );
+    }
+
+    #[test]
+    fn timeout_of_zero_disables_it() {
+        assert_eq!(parse_request_timeout(Some("0")), None);
     }
 
     #[test]

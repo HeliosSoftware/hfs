@@ -1679,6 +1679,13 @@ jobs:
           DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || matrix.server == 'hts' && secrets.HTS_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
           SERVER_NAME: ${{ matrix.server }}
           HFS_PUBLIC_URL: ${{ secrets.HFS_PUBLIC_URL }}
+          # Terminology backend for the three FHIR services. Each binary reads its own
+          # variable name (FHIRPATH_/SOF_/HFS_TERMINOLOGY_SERVER); sof and hfs propagate
+          # theirs into the embedded FHIRPath engine. Since #217 there is no built-in
+          # default, so an unset value is not a fallback -- %terminologies, memberOf,
+          # subsumes and the :in/:not-in search modifiers all fail outright.
+          # HTS serves operations at the root of its base URL: no /r4 or /r5 segment.
+          TERMINOLOGY_SERVER_URL: https://hts.heliossoftware.com
         run: |
           # Define SSH command with proper options (runner's own key is trusted by targets)
           SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
@@ -1744,15 +1751,15 @@ jobs:
           if [ "$SERVER_NAME" = "fhirpath-server" ]; then
             SERVICE_DESCRIPTION="FHIRPath Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"FHIRPATH_SERVER_HOST=0.0.0.0\""
+            SERVICE_ENV="Environment=\"FHIRPATH_SERVER_HOST=0.0.0.0\"\nEnvironment=\"FHIRPATH_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
           elif [ "$SERVER_NAME" = "sof-server" ]; then
             SERVICE_DESCRIPTION="SQL-on-FHIR Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"SOF_SERVER_HOST=0.0.0.0\""
+            SERVICE_ENV="Environment=\"SOF_SERVER_HOST=0.0.0.0\"\nEnvironment=\"SOF_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
           elif [ "$SERVER_NAME" = "hfs" ]; then
             SERVICE_DESCRIPTION="Helios FHIR Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\""
+            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\"\nEnvironment=\"HFS_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
           elif [ "$SERVER_NAME" = "hts" ]; then
             SERVICE_DESCRIPTION="Helios Terminology Server"
             # hts uses a subcommand CLI: host/port/db flags live under `run`

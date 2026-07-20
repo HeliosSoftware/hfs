@@ -156,6 +156,20 @@ fhirpath-cli --terminology-server https://your-terminology-server.com/fhir ...
 fhirpath-server --terminology-server https://your-terminology-server.com/fhir
 ```
 
+Terminology requests time out after **30 seconds** by default, so an unresponsive
+server cannot hang evaluation indefinitely. Override it with
+`FHIRPATH_TERMINOLOGY_TIMEOUT`, in whole seconds:
+
+```bash
+# Allow slow ValueSet expansions up to two minutes
+export FHIRPATH_TERMINOLOGY_TIMEOUT=120
+
+# 0 disables the timeout entirely (waits forever — use with care)
+export FHIRPATH_TERMINOLOGY_TIMEOUT=0
+```
+
+Values that cannot be parsed as a non-negative integer fall back to the 30s default.
+
 **Supported %terminologies Functions:**
 ```fhirpath
 # Expand a ValueSet
@@ -767,6 +781,8 @@ The server can be configured via command-line arguments or environment variables
 | `FHIRPATH_CORS_HEADERS` | `--cors-headers` | Allowed headers | Common headers |
 | `FHIRPATH_MAX_BODY_SIZE` | `--max-body-size` | Max request body size in bytes, measured after decompression | `10485760` |
 | `FHIRPATH_DEBUG_TRACE` | — | Enable step-by-step debug trace output | `false` |
+| `FHIRPATH_TERMINOLOGY_SERVER` | `--terminology-server` | Terminology server base URL (required for `%terminologies` and `memberOf`) | none |
+| `FHIRPATH_TERMINOLOGY_TIMEOUT` | — | Terminology request timeout in seconds (`0` disables) | `30` |
 
 #### HTTP Compression
 
