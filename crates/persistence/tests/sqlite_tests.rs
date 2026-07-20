@@ -2326,7 +2326,7 @@ async fn test_reindex_operation_full() {
     );
 
     // Create reindex operation
-    let reindex = ReindexOperation::new(backend.clone(), backend.search_extractor().clone());
+    let reindex = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
 
     // Start reindex
     let job_id = reindex
@@ -2402,7 +2402,7 @@ async fn test_reindex_operation_cancel() {
     backend.clear_search_index(&tenant).await.unwrap();
 
     // Create reindex operation with small batch size to make it slower
-    let reindex = ReindexOperation::new(backend.clone(), backend.search_extractor().clone());
+    let reindex = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
 
     // Start reindex
     let request = ReindexRequest::all().with_batch_size(5);
@@ -2492,7 +2492,7 @@ async fn test_reindex_fans_out_to_every_target() {
     let reindex = ReindexOperation::with_parts(
         backend.clone(),
         vec![backend.clone(), secondary.clone()],
-        backend.search_extractor().clone(),
+        backend.tenant_registries().clone(),
     );
 
     let request = ReindexRequest::for_types(vec!["Patient"]).clear_existing();
@@ -2897,7 +2897,8 @@ async fn test_search_parameter_create_registers_in_registry() {
         .unwrap();
 
     // Verify the parameter is registered
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     let param = registry.get_param("Patient", "nickname");
     assert!(
         param.is_some(),
@@ -2941,7 +2942,8 @@ async fn test_search_parameter_create_draft_not_registered() {
         .unwrap();
 
     // Verify the parameter is NOT registered (draft status)
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     let param = registry.get_param("Patient", "draft");
     assert!(
         param.is_none(),
@@ -2979,7 +2981,8 @@ async fn test_search_parameter_delete_unregisters() {
 
     // Verify it's registered
     {
-        let registry = backend.search_registry().read();
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
         assert!(registry.get_param("Observation", "todelete").is_some());
     }
 
@@ -2990,7 +2993,8 @@ async fn test_search_parameter_delete_unregisters() {
         .unwrap();
 
     // Verify it's unregistered
-    let registry = backend.search_registry().read();
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
     assert!(
         registry.get_param("Observation", "todelete").is_none(),
         "Deleted SearchParameter should be unregistered"
@@ -3027,7 +3031,8 @@ async fn test_search_parameter_update_status_change() {
 
     // Verify it's registered and active
     {
-        let registry = backend.search_registry().read();
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
         let param = registry.get_param("Condition", "statuschange");
         assert!(param.is_some());
         assert_eq!(
@@ -3054,14 +3059,13 @@ async fn test_search_parameter_update_status_change() {
         .await
         .unwrap();
 
-    // Verify status is updated in registry
-    let registry = backend.search_registry().read();
-    let param = registry.get_param("Condition", "statuschange");
-    assert!(param.is_some(), "Parameter should still exist in registry");
-    assert_eq!(
-        param.unwrap().status,
-        helios_persistence::search::SearchParameterStatus::Retired,
-        "Status should be updated to retired"
+    // A per-tenant registry overlays only a tenant's *active* stored params, so
+    // retiring the parameter removes it from that tenant's search resolution.
+    let reg = backend.search_param_registry(&tenant);
+    let registry = reg.read();
+    assert!(
+        registry.get_param("Condition", "statuschange").is_none(),
+        "a retired custom parameter should no longer resolve for the tenant"
     );
 }
 

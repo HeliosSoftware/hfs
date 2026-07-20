@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?><Consent xmlns="http://hl7.org/fhir">
+  <id value="consent-example-notLabs"/>
+  <meta>
+    <security>
+      <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
+      <code value="HTEST"/>
+      <display value="test health data"/>
+    </security>
+  </meta>
+  <text>
+    <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml">
+      <p>The default policy is one of implied consent for the provision of care, so these scenarios all deal with withdrawal or withholding consent for that purpose.</p>
+      <p>Withhold or withdraw consent for disclosure of records related to specific domain (e.g. DI, LAB, etc.)</p>
+      <p>Patient "Donald D DUCK" wishes to withhold disclosure of all of her lab results to any provider.</p>
+    </div>
+  </text>
+  <status value="active"/>
+  <category>
+    <coding>
+      <system value="http://loinc.org"/>
+      <code value="59284-0"/>
+    </coding>
+  </category>
+  <subject>
+    <reference value="Patient/f002"/>
+    <display value="P. van de Heuvel"/>
+  </subject>
+  <date value="2015-11-18"/>
+  <manager>
+    <reference value="Practitioner/f007"/>
+  </manager>
+  <controller>
+    <reference value="Organization/f001"/>
+  </controller>
+  <!-- the text terms of the consent in lawyer speak -->
+  <!-- likely use url pointer to common text -->
+  <sourceAttachment>
+    <title value="The terms of the consent in lawyer speak."/>
+  </sourceAttachment>
+  <!-- this is opt-in - e.g. everything approved unless otherwise stated -->
+  <regulatoryBasis>
+    <coding>
+      <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
+      <code value="INFA"/>
+    </coding>
+  </regulatoryBasis>
+  <decision value="permit"/>
+  <provision>
+    <action>
+      <coding>
+        <system value="http://terminology.hl7.org/CodeSystem/consentaction"/>
+        <code value="access"/>
+      </coding>
+    </action>
+    <action>
+      <coding>
+        <system value="http://terminology.hl7.org/CodeSystem/consentaction"/>
+        <code value="correct"/>
+      </coding>
+    </action>
+  </provision>
+</Consent>

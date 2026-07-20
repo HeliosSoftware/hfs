@@ -53,19 +53,26 @@
       <DeviceAssociation>
         <id value="example-device-patient-association"/>
         <text>
-          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: DeviceAssociation example-device-patient-association</b></p><a name="example-device-patient-association"> </a><a name="hcexample-device-patient-association"> </a><p><b>device</b>: <a href="broken-link.html">Device/example-IV-pump</a></p><p><b>status</b>: Active</p><p><b>associationStatus</b>: <span title="Codes:{http://hl7.org/fhir/CodeSystem/deviceassociation-association-status attached}">Attached</span></p><p><b>subject</b>: <a href="patient-example-a.html">Donald Duck</a></p></div>
+          <status value="generated"/><div xmlns="http://www.w3.org/1999/xhtml"><p class="res-header-id"><b>Generated Narrative: DeviceAssociation example-device-patient-association</b></p><a name="example-device-patient-association"> </a><a name="hcexample-device-patient-association"> </a><p><b>device</b>: <a href="broken-link.html">Device/example-IV-pump</a></p><p><b>relationship</b>: <span title="Codes:{http://hl7.org/fhir/deviceassociation-relationship attached-to}">Attached To</span></p><p><b>status</b>: Active</p><p><b>relationshipStatus</b>: <span title="Codes:{http://hl7.org/fhir/deviceassociation-relationship-status active}">Active</span></p><p><b>subject</b>: <a href="patient-example-a.html">Donald Duck</a></p></div>
         </text>
         <device>
           <reference value="Device/example-IV-pump"/>
         </device>
-        <status value="active"/>
-        <associationStatus>
+        <relationship>
           <coding>
-            <system value="http://hl7.org/fhir/CodeSystem/deviceassociation-association-status"/>
-            <code value="attached"/>
-            <display value="Attached"/>
+            <system value="http://hl7.org/fhir/deviceassociation-relationship"/>
+            <code value="attached-to"/>
+            <display value="Attached To"/>
           </coding>
-        </associationStatus>
+        </relationship>
+        <status value="active"/>
+        <relationshipStatus>
+          <coding>
+            <system value="http://hl7.org/fhir/deviceassociation-relationship-status"/>
+            <code value="active"/>
+            <display value="Active"/>
+          </coding>
+        </relationshipStatus>
         <subject>
           <reference value="Patient/pat1"/>
           <display value="Donald Duck"/>

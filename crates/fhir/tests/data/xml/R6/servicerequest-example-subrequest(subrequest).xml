@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?><ServiceRequest xmlns="http://hl7.org/fhir">
   <id value="subrequest"/>
-  <!-- 	<extension url="http://hl7.org/fhir/StructureDefinition/bodysitecode">
+  <!-- <extension url="http://hl7.org/fhir/StructureDefinition/bodysitecode">
 		<valueCodeableConcept>
 			<coding>
 				<system value="http://snomed.info/sct"/>
@@ -8,8 +8,7 @@
 				<display value="Thoracic structure"/>
 			</coding>
 		</valueCodeableConcept>
-</extension>
-	 -->
+</extension> -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>
@@ -23,9 +22,9 @@
   <replaces>
     <display value="Previous allergy test"/>
   </replaces>
-  <!--  0..1 The value that is unique  -->
+  <!-- 0..1 The value that is unique -->
   <requisition>
-    <!--  from Element: extension  -->
+    <!-- from Element: extension -->
     <value value="A13848392"/>
   </requisition>
   <status value="active"/>

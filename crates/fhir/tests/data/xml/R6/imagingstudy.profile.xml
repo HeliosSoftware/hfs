@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="ImagingStudy"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -887,7 +887,7 @@
   <name value="ImagingStudy"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Imaging Integration"/>
   <contact>
     <telecom>
@@ -1073,7 +1073,7 @@
       <path value="ImagingStudy.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1252,6 +1252,14 @@
     </element>
     <element id="ImagingStudy.extension">
       <path value="ImagingStudy.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1284,6 +1292,14 @@
     </element>
     <element id="ImagingStudy.modifierExtension">
       <path value="ImagingStudy.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1321,7 +1337,7 @@
       <short value="Business identifier for imaging study"/>
       <definition value="Business identifiers assigned to this imaging study by the performer and/or other systems.  These identifiers remain constant as the resource is updated and propagates from server to server. Typically this will include the DICOM Study Instance UID."/>
       <comment value="Note: This is a business identifier, not a resource identifier (see [discussion](resource.html#identifiers)).  It is best practice for the identifier to only appear on a single resource instance, however business practices MAY occasionally dictate that multiple resource instances with the same identifier can exist - possibly even with different resource types.  See discussion under [Imaging Study Implementation Notes](imagingstudy.html#dicom-uids) for encoding of DICOM Study Instance UID."/>
-      <requirements value="Allows identification of the imaging study as it is known by various participating systems and in a way that remains consistent across servers. ImagingStudy.identifier SHALL include exactly one Study Instance UID value if one or more series element values are present (see [DICOM PS 3.3 C.7.2](http://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.7.2.html).)"/>
+      <requirements value="Allows identification of the imaging study as it is known by various participating systems and in a way that remains consistent across servers. ImagingStudy.identifier SHALL include exactly one Study Instance UID value if one or more series element values are present (see [DICOM PS3.3 C.7.2](http://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.7.2.html).)"/>
       <alias value="StudyInstanceUID"/>
       <min value="0"/>
       <max value="*"/>
@@ -1952,7 +1968,7 @@
       </mapping>
       <mapping>
         <identity value="dicom"/>
-        <map value="Number of Study Related Series (0020,1206). See DICOM PS 3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
+        <map value="Number of Study Related Series (0020,1206). See DICOM PS3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
       </mapping>
     </element>
     <element id="ImagingStudy.numberOfInstances">
@@ -1988,7 +2004,7 @@
       </mapping>
       <mapping>
         <identity value="dicom"/>
-        <map value="Number of Study Related Instances (0020,1208). See DICOM PS 3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
+        <map value="Number of Study Related Instances (0020,1208). See DICOM PS3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
       </mapping>
     </element>
     <element id="ImagingStudy.series">
@@ -2055,6 +2071,14 @@
     </element>
     <element id="ImagingStudy.series.extension">
       <path value="ImagingStudy.series.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2086,6 +2110,14 @@
     </element>
     <element id="ImagingStudy.series.modifierExtension">
       <path value="ImagingStudy.series.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2310,7 +2342,7 @@
       </mapping>
       <mapping>
         <identity value="dicom"/>
-        <map value="Number of Series Related Instances (0020,1209). See DICOM PS 3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
+        <map value="Number of Series Related Instances (0020,1209). See DICOM PS3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
       </mapping>
     </element>
     <element id="ImagingStudy.series.endpoint">
@@ -2529,6 +2561,14 @@
     </element>
     <element id="ImagingStudy.series.performer.extension">
       <path value="ImagingStudy.series.performer.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2560,6 +2600,14 @@
     </element>
     <element id="ImagingStudy.series.performer.modifierExtension">
       <path value="ImagingStudy.series.performer.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2751,6 +2799,14 @@
     </element>
     <element id="ImagingStudy.series.instance.extension">
       <path value="ImagingStudy.series.instance.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2782,6 +2838,14 @@
     </element>
     <element id="ImagingStudy.series.instance.modifierExtension">
       <path value="ImagingStudy.series.instance.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3083,7 +3147,7 @@
       <short value="Business identifier for imaging study"/>
       <definition value="Business identifiers assigned to this imaging study by the performer and/or other systems.  These identifiers remain constant as the resource is updated and propagates from server to server. Typically this will include the DICOM Study Instance UID."/>
       <comment value="Note: This is a business identifier, not a resource identifier (see [discussion](resource.html#identifiers)).  It is best practice for the identifier to only appear on a single resource instance, however business practices MAY occasionally dictate that multiple resource instances with the same identifier can exist - possibly even with different resource types.  See discussion under [Imaging Study Implementation Notes](imagingstudy.html#dicom-uids) for encoding of DICOM Study Instance UID."/>
-      <requirements value="Allows identification of the imaging study as it is known by various participating systems and in a way that remains consistent across servers. ImagingStudy.identifier SHALL include exactly one Study Instance UID value if one or more series element values are present (see [DICOM PS 3.3 C.7.2](http://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.7.2.html).)"/>
+      <requirements value="Allows identification of the imaging study as it is known by various participating systems and in a way that remains consistent across servers. ImagingStudy.identifier SHALL include exactly one Study Instance UID value if one or more series element values are present (see [DICOM PS3.3 C.7.2](http://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.7.2.html).)"/>
       <alias value="StudyInstanceUID"/>
       <min value="0"/>
       <max value="*"/>
@@ -3534,7 +3598,7 @@
       </mapping>
       <mapping>
         <identity value="dicom"/>
-        <map value="Number of Study Related Series (0020,1206). See DICOM PS 3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
+        <map value="Number of Study Related Series (0020,1206). See DICOM PS3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
       </mapping>
     </element>
     <element id="ImagingStudy.numberOfInstances">
@@ -3558,7 +3622,7 @@
       </mapping>
       <mapping>
         <identity value="dicom"/>
-        <map value="Number of Study Related Instances (0020,1208). See DICOM PS 3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
+        <map value="Number of Study Related Instances (0020,1208). See DICOM PS3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
       </mapping>
     </element>
     <element id="ImagingStudy.series">
@@ -3716,7 +3780,7 @@
       </mapping>
       <mapping>
         <identity value="dicom"/>
-        <map value="Number of Series Related Instances (0020,1209). See DICOM PS 3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
+        <map value="Number of Series Related Instances (0020,1209). See DICOM PS3.4 Table C.3-1. Additional Query/Retrieve Attributes."/>
       </mapping>
     </element>
     <element id="ImagingStudy.series.endpoint">

@@ -1,0 +1,84 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "degree-of-polymerisation-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem degree-of-polymerisation-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"degree-of-polymerisation-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdegree-of-polymerisation-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/degree-of-polymerisation-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003enumber-average\u003ca name\u003d\"degree-of-polymerisation-type-number-average\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNumber average\u003c/td\u003e\u003ctd\u003eNumber-average degree of polymerisation (Mn).\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eweight-average\u003ca name\u003d\"degree-of-polymerisation-type-weight-average\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eWeight average\u003c/td\u003e\u003ctd\u003eWeight-average degree of polymerisation (Mw).\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eviscosity-average\u003ca name\u003d\"degree-of-polymerisation-type-viscosity-average\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eViscosity average\u003c/td\u003e\u003ctd\u003eViscosity-average degree of polymerisation (Mv).\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ez-average\u003ca name\u003d\"degree-of-polymerisation-type-z-average\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eZ-average\u003c/td\u003e\u003ctd\u003eZ-average degree of polymerisation (Mz).\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/degree-of-polymerisation-type",
+  "version": "6.0.0-ballot4",
+  "name": "DegreeOfPolymerisationTypeExample",
+  "title": "Degree of Polymerisation Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-19",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The type of degree of polymerisation, e.g. number-average, weight-average.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/degree-of-polymerisation-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "number-average",
+      "display": "Number average",
+      "definition": "Number-average degree of polymerisation (Mn)."
+    },
+    {
+      "code": "weight-average",
+      "display": "Weight average",
+      "definition": "Weight-average degree of polymerisation (Mw)."
+    },
+    {
+      "code": "viscosity-average",
+      "display": "Viscosity average",
+      "definition": "Viscosity-average degree of polymerisation (Mv)."
+    },
+    {
+      "code": "z-average",
+      "display": "Z-average",
+      "definition": "Z-average degree of polymerisation (Mz)."
+    }
+  ]
+}

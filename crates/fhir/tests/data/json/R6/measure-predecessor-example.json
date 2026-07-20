@@ -35,6 +35,11 @@
   ],
   "description": "Exclusive breastfeeding measure of outcomes for exclusive breastmilk feeding of newborns.",
   "purpose": "Measure of newborns who were fed breast milk only since birth",
+  "topic": [
+    {
+      "text": "Exclusive Breastfeeding"
+    }
+  ],
   "relatedArtifact": [
     {
       "type": "documentation",

@@ -65,30 +65,12 @@
       },
       "preference": "preferred",
       "container": {
-        "material": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "61088005",
-              "display": "plastic"
-            }
-          ]
-        },
-        "type": {
+        "deviceCodeableConcept": {
           "coding": [
             {
               "system": "http://snomed.info/sct",
               "code": "702281005",
               "display": "Evacuated blood collection tube, thrombin/clot activator/gel separator"
-            }
-          ]
-        },
-        "cap": {
-          "coding": [
-            {
-              "system": "urn:iso:std:iso:6710:2017",
-              "code": "yellow",
-              "display": "yellow cap"
             }
           ]
         },
@@ -164,30 +146,12 @@
       },
       "preference": "alternate",
       "container": {
-        "material": {
-          "coding": [
-            {
-              "system": "http://snomed.info/sct",
-              "code": "32039001",
-              "display": "glass"
-            }
-          ]
-        },
-        "type": {
+        "deviceCodeableConcept": {
           "coding": [
             {
               "system": "http://snomed.info/sct",
               "code": "702281005",
               "display": "Evacuated blood collection tube, thrombin/clot activator/gel separator"
-            }
-          ]
-        },
-        "cap": {
-          "coding": [
-            {
-              "system": "urn:iso:std:iso:6710:2017",
-              "code": "green",
-              "display": "green cap"
             }
           ]
         },

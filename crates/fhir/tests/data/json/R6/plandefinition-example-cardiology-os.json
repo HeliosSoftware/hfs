@@ -52,44 +52,6 @@
       "productReference": {
         "reference": "#metoprololTartrate25Medication"
       },
-      "dosage": [
-        {
-          "text": "1 tablet oral 2 time daily",
-          "timing": {
-            "repeat": {
-              "frequency": 2,
-              "period": 1,
-              "periodUnit": "d"
-            }
-          },
-          "route": {
-            "coding": [
-              {
-                "code": "26643006",
-                "display": "Oral route (qualifier value)"
-              }
-            ],
-            "text": "Oral route (qualifier value)"
-          },
-          "doseAndRate": [
-            {
-              "type": {
-                "coding": [
-                  {
-                    "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                    "code": "ordered",
-                    "display": "Ordered"
-                  }
-                ]
-              },
-              "doseQuantity": {
-                "value": 1,
-                "unit": "{tbl}"
-              }
-            }
-          ]
-        }
-      ],
       "dynamicValue": [
         {
           "path": "medicationRequest.priority",
@@ -165,44 +127,6 @@
       "productReference": {
         "reference": "#metoprololTartrate50Medication"
       },
-      "dosage": [
-        {
-          "text": "1 tablet oral 2 time daily",
-          "timing": {
-            "repeat": {
-              "frequency": 2,
-              "period": 1,
-              "periodUnit": "d"
-            }
-          },
-          "route": {
-            "coding": [
-              {
-                "code": "26643006",
-                "display": "Oral route (qualifier value)"
-              }
-            ],
-            "text": "Oral route (qualifier value)"
-          },
-          "doseAndRate": [
-            {
-              "type": {
-                "coding": [
-                  {
-                    "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                    "code": "ordered",
-                    "display": "Ordered"
-                  }
-                ]
-              },
-              "doseQuantity": {
-                "value": 1,
-                "unit": "{tbl}"
-              }
-            }
-          ]
-        }
-      ],
       "dynamicValue": [
         {
           "path": "medicationRequest.priority",
@@ -278,44 +202,6 @@
       "productReference": {
         "reference": "#amlodipineMedication"
       },
-      "dosage": [
-        {
-          "text": "1 tablet oral 1 time daily",
-          "timing": {
-            "repeat": {
-              "frequency": 1,
-              "period": 1,
-              "periodUnit": "d"
-            }
-          },
-          "route": {
-            "coding": [
-              {
-                "code": "26643006",
-                "display": "Oral route (qualifier value)"
-              }
-            ],
-            "text": "Oral route (qualifier value)"
-          },
-          "doseAndRate": [
-            {
-              "type": {
-                "coding": [
-                  {
-                    "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                    "code": "ordered",
-                    "display": "Ordered"
-                  }
-                ]
-              },
-              "doseQuantity": {
-                "value": 1,
-                "unit": "{tbl}"
-              }
-            }
-          ]
-        }
-      ],
       "dynamicValue": [
         {
           "path": "medicationRequest.priority",
@@ -371,46 +257,6 @@
       "productReference": {
         "reference": "#nitroglycerinMedication"
       },
-      "dosage": [
-        {
-          "text": "nitroglycerin 0.4 mg tablet sub-lingual every 5 minutes as needed for chest pain; maximum 3 tablets",
-          "timing": {
-            "repeat": {
-              "frequency": 1,
-              "period": 5,
-              "periodUnit": "min"
-            }
-          },
-          "doseAndRate": [
-            {
-              "type": {
-                "coding": [
-                  {
-                    "system": "http://terminology.hl7.org/CodeSystem/dose-rate-type",
-                    "code": "ordered",
-                    "display": "Ordered"
-                  }
-                ]
-              },
-              "doseQuantity": {
-                "value": 1,
-                "unit": "{tbl}"
-              }
-            }
-          ],
-          "safety": {
-            "doseLimit": [
-              {
-                "valueQuantity": {
-                  "value": 3,
-                  "unit": "{tbl}"
-                },
-                "scope": "administration"
-              }
-            ]
-          }
-        }
-      ],
       "dynamicValue": [
         {
           "path": "medicationRequest.priority",

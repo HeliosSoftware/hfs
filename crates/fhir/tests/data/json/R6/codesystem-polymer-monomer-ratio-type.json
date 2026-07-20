@@ -1,0 +1,74 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "polymer-monomer-ratio-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem polymer-monomer-ratio-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"polymer-monomer-ratio-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcpolymer-monomer-ratio-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/polymer-monomer-ratio-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emonomer-polymer-ratio\u003ca name\u003d\"polymer-monomer-ratio-type-monomer-polymer-ratio\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMonomer/Polymer ratio\u003c/td\u003e\u003ctd\u003eRatio of monomer units to polymer.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esru-polymer-ratio\u003ca name\u003d\"polymer-monomer-ratio-type-sru-polymer-ratio\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSRU/Polymer ratio\u003c/td\u003e\u003ctd\u003eRatio of structural repeat units to polymer.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/polymer-monomer-ratio-type",
+  "version": "6.0.0-ballot4",
+  "name": "PolymerMonomerRatioTypeExample",
+  "title": "Polymer Monomer Ratio Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-19",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Captures the type of ratio of monomer/repeat units to the entire polymer.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/polymer-monomer-ratio-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "monomer-polymer-ratio",
+      "display": "Monomer/Polymer ratio",
+      "definition": "Ratio of monomer units to polymer."
+    },
+    {
+      "code": "sru-polymer-ratio",
+      "display": "SRU/Polymer ratio",
+      "definition": "Ratio of structural repeat units to polymer."
+    }
+  ]
+}

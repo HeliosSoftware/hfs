@@ -37,12 +37,16 @@
 //! without JavaScript.
 
 mod compartments;
+mod conformance;
 mod editor;
 mod history;
 mod i18n;
 mod json_view;
 mod search_params;
 mod tenants;
+
+#[doc(hidden)]
+pub use conformance::{ConformanceSource, StaticConformanceSource};
 
 use askama::Template;
 use axum::{
@@ -96,14 +100,23 @@ pub struct NlSearch {
 #[derive(Clone)]
 struct WebState {
     version: &'static str,
-    /// Lazily-loaded SearchParameter snapshot per FHIR version (#238).
+    /// Lazily-fetched SearchParameter snapshot per FHIR version (#238), read
+    /// from the server's own `/SearchParameter` endpoint.
     sp_catalog: Arc<search_params::SpCatalog>,
+    /// Lazily-fetched CompartmentDefinitions per FHIR version (#237), read from
+    /// the server's own `/CompartmentDefinition` endpoint.
+    compartments: Arc<compartments::CompartmentCatalog>,
     /// Natural-language search feature state (#255).
     nl: Arc<NlSearch>,
     /// Read/write path for the tenant-maintenance page. `None` when the host did
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
+    /// tenant's conformance resources from the tenant-maintenance page.
+    data_dir: Option<PathBuf>,
+    /// The server's default FHIR version, used when seeding a new tenant.
+    fhir_version: helios_fhir::FhirVersion,
 }
 
 /// A small, self-contained system-status snapshot — the "real read path" the
@@ -323,23 +336,58 @@ struct HistoryDiffFragment {
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
 /// other path. The UI depends on the rest of the server, never the reverse.
 ///
-/// `data_dir` is the server's data directory (`HFS_DATA_DIR`), where the
-/// SearchParameter spec bundles live; `None` falls back to `./data`, matching
-/// the storage backends.
+/// The SearchParameter and CompartmentDefinition viewers read the server's own
+/// FHIR API over HTTP (storage is the source of truth): `self_base_url` is the
+/// loopback base URL the UI calls itself at, and `outbound_auth` supplies the
+/// credentials for that self-call (a service token when auth is enabled, a
+/// no-op otherwise). `data_dir` (`HFS_DATA_DIR`) and `fhir_version` are used to
+/// seed a newly-provisioned tenant from the tenant-maintenance page. `tenants`
+/// is the storage handle that page reads and writes; pass `None` to render the
+/// UI without a live registry (the page then reports it as unavailable).
 ///
 /// `nl` mirrors the server's natural-language search configuration. With
 /// `enabled: false` the `/ui/search` route is never registered, so the page
 /// 404s through to the FHIR app exactly as it did before the feature existed.
-///
-/// `tenants` is the storage handle the tenant-maintenance page reads and writes
-/// (the same backend the FHIR API uses); pass `None` to render the UI without a
-/// live registry (the page then reports it as unavailable).
+#[allow(clippy::too_many_arguments)]
 pub fn mount(
     fhir_app: Router,
     hfs_version: &'static str,
     data_dir: Option<PathBuf>,
     nl: NlSearch,
     tenants: Option<Arc<dyn ResourceStorage>>,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    fhir_version: helios_fhir::FhirVersion,
+) -> Router {
+    let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
+        self_base_url,
+        outbound_auth,
+    ));
+    mount_with_conformance_source(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        source,
+        fhir_version,
+    )
+}
+
+/// Mounts the UI with an injected [`ConformanceSource`], so tests can serve the
+/// SearchParameter/CompartmentDefinition data offline instead of standing up a
+/// real HTTP server. Production callers use [`mount`], which wires an HTTP
+/// source pointed at the server's own loopback address.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
 ) -> Router {
     let nl_enabled = nl.enabled;
 
@@ -390,9 +438,12 @@ pub fn mount(
         .layer(middleware::from_fn(i18n::negotiate_locale))
         .with_state(WebState {
             version: hfs_version,
-            sp_catalog: Arc::new(search_params::SpCatalog::new(data_dir)),
+            sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
+            compartments: Arc::new(compartments::CompartmentCatalog::new(source)),
             nl: Arc::new(nl),
             tenants,
+            data_dir,
+            fhir_version,
         })
         .fallback_service(fhir_app)
 }
@@ -432,24 +483,32 @@ async fn index(
 
 /// Search page: natural language and the visual builder over one editable query.
 async fn search(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    let resource_types = state
+        .compartments
+        .resource_type_names(helios_fhir::FhirVersion::default())
+        .await;
     render(SearchPage {
         status: current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "search",
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
-        resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
+        resource_types,
         show_save: false,
     })
 }
 
 /// Saved FHIR queries page.
 async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    let resource_types = state
+        .compartments
+        .resource_type_names(helios_fhir::FhirVersion::default())
+        .await;
     render(QueriesPage {
         status: current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "queries",
-        resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
+        resource_types,
         show_save: true,
     })
 }
@@ -464,13 +523,17 @@ async fn resources(
     locale: RequestLocale,
     Query(query): Query<ResourcesQuery>,
 ) -> Response {
+    let resource_types = state
+        .compartments
+        .resource_type_names(helios_fhir::FhirVersion::default())
+        .await;
     render(ResourcesPage {
         status: current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "resources",
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
-        resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
+        resource_types,
         // The type the rail opens focused on (from the nav submenu deep link).
         selected_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
         show_save: false,
@@ -500,7 +563,8 @@ async fn query_params_catalog(
 ) -> Response {
     let snapshot = state
         .sp_catalog
-        .snapshot(helios_fhir::FhirVersion::default());
+        .snapshot(helios_fhir::FhirVersion::default())
+        .await;
     let resource_type = raw.resource_type.unwrap_or_default();
     let mut params: Vec<ParamOption> = snapshot
         .params
@@ -546,7 +610,7 @@ async fn search_parameters(
         page: raw.page.unwrap_or(1),
         sel: raw.sel.filter(|s| !s.is_empty()),
     };
-    let snapshot = state.sp_catalog.snapshot(query.fhir_version());
+    let snapshot = state.sp_catalog.snapshot(query.fhir_version()).await;
     render(SearchParametersPage {
         status: current_status(state.version),
         i18n: I18n::new(locale),
@@ -582,7 +646,8 @@ async fn compartments_page(
         id: raw.id,
         target: raw.target,
     };
-    match compartments::build_view(&query) {
+    let defs = state.compartments.definitions(query.fhir_version()).await;
+    match compartments::build_view(&query, &defs) {
         Some(view) => render(CompartmentsPage {
             status: current_status(state.version),
             i18n: I18n::new(locale),
@@ -1162,7 +1227,7 @@ mod tests {
             i18n: i18n("en"),
             active_page: "queries",
             show_save: true,
-            resource_types: compartments::resource_type_names(helios_fhir::FhirVersion::default()),
+            resource_types: vec!["Patient".to_string(), "Observation".to_string()],
         }
         .render()
         .expect("queries page renders");

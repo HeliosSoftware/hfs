@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?><AuditEvent xmlns="http://hl7.org/fhir">
   <id value="example-advanced-create"/>
-  <!--  to include elements not typically populated, but for which there are query parameters  -->
-  <!--  derived off of example in IHE.BALP IG  -->
+  <!-- to include elements not typically populated, but for which there are query parameters -->
+  <!-- derived off of example in IHE.BALP IG -->
   <meta>
     <security>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActReason"/>

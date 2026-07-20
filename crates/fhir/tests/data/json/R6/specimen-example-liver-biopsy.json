@@ -66,14 +66,16 @@
       "description": "Fixed in 10% neutral buffered formalin",
       "additive": [
         {
-          "concept": {
-            "coding": [
-              {
-                "system": "http://terminology.hl7.org/CodeSystem/v2-0371",
-                "code": "F10",
-                "display": "10% Formalin"
-              }
-            ]
+          "type": {
+            "concept": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v2-0371",
+                  "code": "F10",
+                  "display": "10% Formalin"
+                }
+              ]
+            }
           }
         }
       ],
@@ -82,7 +84,11 @@
   ],
   "container": [
     {
-      "deviceCanonical": "http://hl7.org/fhir/Device/specimen-container-formalin",
+      "device": {
+        "concept": {
+          "text": "Formalin specimen container"
+        }
+      },
       "specimenQuantity": {
         "value": 1,
         "unit": "specimen"

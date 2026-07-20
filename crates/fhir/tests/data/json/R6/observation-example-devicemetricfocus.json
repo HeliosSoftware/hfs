@@ -55,18 +55,27 @@
         "id": "example-device-patient-association",
         "text": {
           "status": "generated",
-          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: DeviceAssociation example-device-patient-association\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"example-device-patient-association\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcexample-device-patient-association\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003edevice\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003eDevice/example-IV-pump\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Active\u003c/p\u003e\u003cp\u003e\u003cb\u003eassociationStatus\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://hl7.org/fhir/CodeSystem/deviceassociation-association-status attached}\"\u003eAttached\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example-a.html\"\u003eDonald Duck\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e"
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: DeviceAssociation example-device-patient-association\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"example-device-patient-association\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcexample-device-patient-association\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003edevice\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003eDevice/example-IV-pump\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003erelationship\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://hl7.org/fhir/deviceassociation-relationship attached-to}\"\u003eAttached To\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Active\u003c/p\u003e\u003cp\u003e\u003cb\u003erelationshipStatus\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://hl7.org/fhir/deviceassociation-relationship-status active}\"\u003eActive\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example-a.html\"\u003eDonald Duck\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e"
         },
         "device": {
           "reference": "Device/example-IV-pump"
         },
-        "status": "active",
-        "associationStatus": {
+        "relationship": {
           "coding": [
             {
-              "system": "http://hl7.org/fhir/CodeSystem/deviceassociation-association-status",
-              "code": "attached",
-              "display": "Attached"
+              "system": "http://hl7.org/fhir/deviceassociation-relationship",
+              "code": "attached-to",
+              "display": "Attached To"
+            }
+          ]
+        },
+        "status": "active",
+        "relationshipStatus": {
+          "coding": [
+            {
+              "system": "http://hl7.org/fhir/deviceassociation-relationship-status",
+              "code": "active",
+              "display": "Active"
             }
           ]
         },

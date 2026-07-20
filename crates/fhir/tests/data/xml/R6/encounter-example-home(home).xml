@@ -21,8 +21,8 @@
   <class>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
-      <!--  Note that this value implies that the practitioner was at the patients home, 
-			if it was a tele-service, then the virtual code should be used.  -->
+      <!-- Note that this value implies that the practitioner was at the patients home, 
+			if it was a tele-service, then the virtual code should be used. -->
       <code value="HH"/>
       <display value="home health"/>
     </coding>

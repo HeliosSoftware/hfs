@@ -32,12 +32,12 @@
   <controller>
     <reference value="Organization/f001"/>
   </controller>
-  <!--  the terms of the consent as signed by the patient in ink  -->
-  <!--  likely use url pointer to common text  -->
+  <!-- the terms of the consent as signed by the patient in ink -->
+  <!-- likely use url pointer to common text -->
   <sourceAttachment>
     <title value="The terms of the consent in lawyer speak."/>
   </sourceAttachment>
-  <!--  this is plain out opt-in with no exceptions  -->
+  <!-- this is plain out opt-in with no exceptions -->
   <regulatoryBasis>
     <coding>
       <system value="http://terminology.hl7.org/CodeSystem/v3-ActCode"/>
@@ -46,7 +46,7 @@
   </regulatoryBasis>
   <decision value="deny"/>
   <provision>
-    <!--  bound by a time frame between 1964 and 2019 - consent.applies  -->
+    <!-- bound by a time frame between 1964 and 2019 - consent.applies -->
     <period>
       <start value="1964-01-01"/>
       <end value="2019-01-01"/>

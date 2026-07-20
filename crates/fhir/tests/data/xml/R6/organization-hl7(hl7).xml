@@ -26,7 +26,7 @@
     
     </div>
   </text>
-  <!--   HL7 itself   -->
+  <!-- HL7 itself -->
   <name value="Health Level Seven International"/>
   <alias value="HL7 International"/>
   <contact>
@@ -75,7 +75,7 @@
     </address>
   </contact>
   <endpoint>
-    <!--  Endpoint that handles the v2 messaging for the external organization  -->
+    <!-- Endpoint that handles the v2 messaging for the external organization -->
     <reference value="Endpoint/example"/>
   </endpoint>
 </Organization>

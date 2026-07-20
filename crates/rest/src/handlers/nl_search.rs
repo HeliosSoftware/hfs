@@ -157,7 +157,8 @@ where
     // Ground the prompt in the registry's actual vocabulary.
     let fhir_version = config.default_fhir_version;
     let system = {
-        let registry = state.storage().search_param_registry().read();
+        let registry = state.storage().search_param_registry(tenant.context());
+        let registry = registry.read();
         build_system_prompt(fhir_version, &registry)
     };
 
@@ -180,7 +181,8 @@ where
         .await?;
 
         let verdict = {
-            let registry = state.storage().search_param_registry().read();
+            let registry = state.storage().search_param_registry(tenant.context());
+            let registry = registry.read();
             validate_output(raw, fhir_version, &registry)
         };
 

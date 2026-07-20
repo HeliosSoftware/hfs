@@ -301,7 +301,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The kind of dose or rate specified
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-dose-rate-type.html" title="The kind of dose or rate specified.">DoseAndRateType</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-dose-rate-type.html" title="The kind of dose or rate specified.">DoseAndRateType</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
           </td>
@@ -501,7 +501,7 @@
   <name value="Dosage"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -639,6 +639,14 @@
     </element>
     <element id="Dosage.modifierExtension">
       <path value="Dosage.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -918,7 +926,7 @@
       <path value="Dosage.site"/>
       <short value="Body site to administer to"/>
       <definition value="Body site to administer to."/>
-      <comment value="If the use case requires attributes from the BodySite resource (e.g. to identify and track separately) then use the standard extension [http://hl7.org/fhir/StructureDefinition/bodySite](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-bodySite.html).  May be a summary code, or a reference to a very precise definition of the location, or both."/>
+      <comment value="If the use case requires attributes from the BodySite resource (e.g. to identify and track separately) then use the standard extension [BodyStructure Reference](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-bodySite.html).  May be a summary code, or a reference to a very precise definition of the location, or both."/>
       <requirements value="A coded specification of the anatomic site where the medication first enters the body."/>
       <min value="0"/>
       <max value="1"/>
@@ -1472,7 +1480,7 @@
       <path value="Dosage.site"/>
       <short value="Body site to administer to"/>
       <definition value="Body site to administer to."/>
-      <comment value="If the use case requires attributes from the BodySite resource (e.g. to identify and track separately) then use the standard extension [http://hl7.org/fhir/StructureDefinition/bodySite](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-bodySite.html).  May be a summary code, or a reference to a very precise definition of the location, or both."/>
+      <comment value="If the use case requires attributes from the BodySite resource (e.g. to identify and track separately) then use the standard extension [BodyStructure Reference](https://build.fhir.org/ig/HL7/fhir-extensions/StructureDefinition-bodySite.html).  May be a summary code, or a reference to a very precise definition of the location, or both."/>
       <requirements value="A coded specification of the anatomic site where the medication first enters the body."/>
       <min value="0"/>
       <max value="1"/>

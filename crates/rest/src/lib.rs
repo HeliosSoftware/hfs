@@ -452,7 +452,7 @@ where
 /// Like [`create_app_with_auth_and_bulk`], but also wires the per-user settings
 /// store (used by the `/_user/settings` endpoints). `bulk_export` and
 /// `bulk_submit` are each optional, so this single entry point covers every
-/// combination for a settings-capable backend (SQLite, PostgreSQL).
+/// combination for a settings-capable backend (SQLite, PostgreSQL, MongoDB, S3).
 #[allow(clippy::too_many_arguments)]
 pub fn create_app_with_auth_bulk_and_settings<S>(
     storage: Arc<S>,
