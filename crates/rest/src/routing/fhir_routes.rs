@@ -287,6 +287,14 @@ where
             "/bulk-submit-file/{poll_token}/{part}",
             get(handlers::bulk_submit_file_handler::<S>),
         )
+        // $reindex — system level. Registered before the type-level routes so
+        // `/$reindex` is not swallowed by `/{resource_type}`.
+        .route("/$reindex", post(handlers::reindex_system_handler::<S>))
+        .route(
+            "/$reindex-status/{job_id}",
+            get(handlers::reindex_status_handler::<S>)
+                .delete(handlers::reindex_cancel_handler::<S>),
+        )
         // Resource validation ($validate) — operation routes precede the
         // catch-all (matchit gives static segments priority over {id}).
         .route(
@@ -297,14 +305,6 @@ where
             "/{resource_type}/{id}/$validate",
             get(handlers::validate_instance_get_handler::<S>)
                 .post(handlers::validate_instance_post_handler::<S>),
-        )
-        // $reindex — system level. Registered before the type-level routes so
-        // `/$reindex` is not swallowed by `/{resource_type}`.
-        .route("/$reindex", post(handlers::reindex_system_handler::<S>))
-        .route(
-            "/$reindex-status/{job_id}",
-            get(handlers::reindex_status_handler::<S>)
-                .delete(handlers::reindex_cancel_handler::<S>),
         )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
