@@ -46,15 +46,38 @@ pub struct TerminologyFunctions {
     client: Arc<TerminologyClient>,
 }
 
+/// Error returned when a terminology operation is attempted with no server configured.
+///
+/// Terminology operations transmit codes taken from the resource under evaluation,
+/// so there is no default server to fall back on — the caller must name one.
+fn no_terminology_server() -> EvaluationError {
+    EvaluationError::InvalidOperation(
+        "No terminology server is configured. Terminology operations (%terminologies.* \
+         and memberOf()) send codes from the evaluated resource to a terminology server, \
+         so no default server is used. Set the FHIRPATH_TERMINOLOGY_SERVER environment \
+         variable, or pass --terminology-server (fhirpath-cli/fhirpath-server). The HFS \
+         server and SQL-on-FHIR tools propagate HFS_TERMINOLOGY_SERVER and \
+         SOF_TERMINOLOGY_SERVER respectively."
+            .to_string(),
+    )
+}
+
 impl TerminologyFunctions {
     /// Creates a new terminology functions instance
-    pub fn new(context: &EvaluationContext) -> Self {
-        let server_url = context.get_terminology_server_url();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationError::InvalidOperation`] if no terminology server is
+    /// configured on the context or via `FHIRPATH_TERMINOLOGY_SERVER`.
+    pub fn new(context: &EvaluationContext) -> Result<Self, EvaluationError> {
+        let server_url = context
+            .get_terminology_server_url()
+            .ok_or_else(no_terminology_server)?;
         let client = TerminologyClient::new(server_url, context.fhir_version);
 
-        Self {
+        Ok(Self {
             client: Arc::new(client),
-        }
+        })
     }
 
     /// Expands a ValueSet
@@ -505,7 +528,7 @@ pub fn member_of(
     value_set_url: &str,
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
-    let terminology = TerminologyFunctions::new(context);
+    let terminology = TerminologyFunctions::new(context)?;
 
     // Call validateVS and extract the result
     let validation_result = terminology.validate_vs(

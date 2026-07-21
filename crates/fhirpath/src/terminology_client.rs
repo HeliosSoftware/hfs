@@ -7,9 +7,41 @@
 use reqwest::Client;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::error::{FhirPathError, FhirPathResult};
 use helios_fhir::FhirVersion;
+
+/// Default request timeout for terminology server calls.
+///
+/// Without a timeout, an unresponsive server hangs the evaluating thread indefinitely
+/// (`Client::new()` applies no timeout).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment variable overriding [`DEFAULT_REQUEST_TIMEOUT`], in whole seconds.
+const REQUEST_TIMEOUT_ENV: &str = "FHIRPATH_TERMINOLOGY_TIMEOUT";
+
+/// Resolves the request timeout from [`REQUEST_TIMEOUT_ENV`].
+///
+/// Falls back to [`DEFAULT_REQUEST_TIMEOUT`] when unset or unparseable. `0` is accepted
+/// and means "no timeout" — matching reqwest's own semantics for an absent timeout, for
+/// callers who deliberately want to wait on a slow expansion indefinitely.
+fn request_timeout() -> Option<Duration> {
+    parse_request_timeout(std::env::var(REQUEST_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Pure half of [`request_timeout`], so the parsing rules can be tested without
+/// mutating process-global environment state from a threaded test runner.
+fn parse_request_timeout(raw: Option<&str>) -> Option<Duration> {
+    match raw {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => Some(DEFAULT_REQUEST_TIMEOUT),
+        },
+        None => Some(DEFAULT_REQUEST_TIMEOUT),
+    }
+}
 
 /// Terminology client for making requests to a FHIR terminology server
 #[derive(Clone)]
@@ -27,9 +59,20 @@ impl TerminologyClient {
     ///
     /// * `base_url` - The base URL of the terminology server
     /// * `fhir_version` - The FHIR version to use for requests
+    ///
+    /// The request timeout defaults to 30s and can be overridden with
+    /// `FHIRPATH_TERMINOLOGY_TIMEOUT` (whole seconds; `0` disables it).
     pub fn new(base_url: String, fhir_version: FhirVersion) -> Self {
+        let mut builder = Client::builder();
+        if let Some(timeout) = request_timeout() {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder
+            .build()
+            .expect("failed to build terminology HTTP client");
+
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
             fhir_version,
         }
@@ -632,6 +675,38 @@ mod tests {
     }
 
     #[test]
+    fn timeout_defaults_to_30s_when_unset_or_unparseable() {
+        assert_eq!(parse_request_timeout(None), Some(DEFAULT_REQUEST_TIMEOUT));
+        // A typo must not silently remove the timeout that #262 added.
+        assert_eq!(
+            parse_request_timeout(Some("thirty")),
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        );
+        assert_eq!(
+            parse_request_timeout(Some("-5")),
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn timeout_honours_an_explicit_override() {
+        assert_eq!(
+            parse_request_timeout(Some("120")),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_request_timeout(Some(" 5 ")),
+            Some(Duration::from_secs(5)),
+            "surrounding whitespace is common in .env files"
+        );
+    }
+
+    #[test]
+    fn timeout_of_zero_disables_it() {
+        assert_eq!(parse_request_timeout(Some("0")), None);
+    }
+
+    #[test]
     fn test_terminology_client_creation() {
         let client = TerminologyClient::new("https://tx.fhir.org/r4/".to_string(), FhirVersion::R4);
         assert_eq!(client.base_url, "https://tx.fhir.org/r4");
@@ -644,5 +719,93 @@ mod tests {
 
         let client2 = TerminologyClient::new("https://tx.fhir.org/r4".to_string(), FhirVersion::R4);
         assert_eq!(client2.base_url, "https://tx.fhir.org/r4");
+    }
+
+    /// Captures the `$translate` request body and returns the parameter names it carries.
+    ///
+    /// The R5 conformance suite covers this path end-to-end, but it is gated behind
+    /// `feature = "R5"` and the coverage job builds without it -- so these tests are
+    /// what hold the wire format under default features.
+    async fn translate_param_names(system: &str, code: &str) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let captured = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/ConceptMap/$translate"))
+            .and(move |req: &Request| {
+                if let Ok(body) = serde_json::from_slice::<Value>(&req.body)
+                    && let Some(params) = body.get("parameter").and_then(|p| p.as_array())
+                {
+                    *captured.lock().unwrap() = params
+                        .iter()
+                        .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+                        .map(str::to_string)
+                        .collect();
+                }
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resourceType": "Parameters",
+                "parameter": [{ "name": "result", "valueBoolean": true }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        client
+            .translate(
+                "http://hl7.org/fhir/ConceptMap/cm-address-use-v2",
+                system,
+                code,
+                None,
+                None,
+            )
+            .await
+            .expect("stub answers 200");
+
+        // Cloned out of the guard so the lock is released with the temporary.
+        seen.lock().unwrap().clone()
+    }
+
+    /// HTS rejects a lone `coding` with `400 Missing required parameter: code or
+    /// sourceCode`, and rejects the R5 `sourceCoding` too (#288). `code` + `system`
+    /// is the only form it accepts, so sending `coding` is a regression (#287).
+    #[tokio::test]
+    async fn translate_sends_code_and_system_not_coding() {
+        let names = translate_param_names("http://hl7.org/fhir/address-use", "home").await;
+
+        assert!(names.contains(&"code".to_string()), "got {names:?}");
+        assert!(names.contains(&"system".to_string()), "got {names:?}");
+        assert!(!names.contains(&"coding".to_string()), "got {names:?}");
+        assert!(
+            !names.contains(&"sourceCoding".to_string()),
+            "got {names:?}"
+        );
+    }
+
+    /// A bare code carries no system (`Patient.address.use` is the conformance case),
+    /// so the client infers one for the FHIR-defined value sets.
+    #[tokio::test]
+    async fn translate_infers_the_system_for_a_bare_code() {
+        let names = translate_param_names("", "home").await;
+
+        assert!(names.contains(&"system".to_string()), "got {names:?}");
+        assert!(!names.contains(&"coding".to_string()), "got {names:?}");
+    }
+
+    /// An unrecognised bare code has no system to infer; the client omits the
+    /// parameter and lets the server resolve it from the ConceptMap's source scope
+    /// rather than guessing a wrong one.
+    #[tokio::test]
+    async fn translate_omits_the_system_when_it_cannot_be_inferred() {
+        let names = translate_param_names("", "not-a-known-code").await;
+
+        assert!(names.contains(&"code".to_string()), "got {names:?}");
+        assert!(!names.contains(&"system".to_string()), "got {names:?}");
     }
 }
