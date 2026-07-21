@@ -58,6 +58,7 @@ tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 futures = "0.3"
 flate2 = "1" # gzip/deflate test payloads for HTTP compression tests
+wiremock = "0.6" # in-process terminology server stub (tests must not hit the network)
 
 [[bin]]
 name = "fhirpath-cli"

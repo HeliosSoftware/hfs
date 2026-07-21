@@ -159,8 +159,10 @@ pub struct EvaluationContext {
     /// When looking up variables, if not found in current context, search parent chain
     pub parent_context: Option<Box<EvaluationContext>>,
 
-    /// Terminology server URL for terminology operations
-    /// If not set, uses default servers based on FHIR version
+    /// Terminology server base URL for terminology operations.
+    ///
+    /// If unset, `FHIRPATH_TERMINOLOGY_SERVER` is consulted; there is no default
+    /// server. See [`get_terminology_server_url`](Self::get_terminology_server_url).
     pub terminology_server_url: Option<String>,
 
     /// Debug tracer for step-by-step evaluation tracing.
@@ -624,40 +626,31 @@ impl EvaluationContext {
         self.terminology_server_url = Some(url);
     }
 
-    /// Gets the terminology server URL with defaults
+    /// Gets the configured terminology server URL, if any
     ///
-    /// Returns the configured terminology server URL, or the default server
-    /// based on FHIR version if none is configured. Logs a warning when
-    /// using default servers.
+    /// Resolution order is the explicitly configured URL (via
+    /// [`set_terminology_server`](Self::set_terminology_server)), then the
+    /// `FHIRPATH_TERMINOLOGY_SERVER` environment variable.
+    ///
+    /// There is deliberately **no default server**. Terminology operations send
+    /// codes drawn from the resource under evaluation — potentially patient
+    /// data — to the terminology server, so the engine never contacts a host the
+    /// caller did not name. When this returns `None`, `%terminologies` functions
+    /// and `memberOf()` fail with an actionable error rather than silently
+    /// calling a public server.
+    ///
+    /// The URL is used verbatim as a base: no FHIR-version path segment is
+    /// appended, because a terminology server's base URL is opaque (HTS, for
+    /// example, serves operations at the root).
     ///
     /// # Returns
     ///
-    /// The terminology server URL to use
-    pub fn get_terminology_server_url(&self) -> String {
-        if let Some(url) = &self.terminology_server_url {
-            url.clone()
-        } else if let Ok(url) = std::env::var("FHIRPATH_TERMINOLOGY_SERVER") {
-            // Check environment variable
-            url
-        } else {
-            // Use default servers based on FHIR version
-            let default_url = match self.fhir_version.as_str() {
-                "R4" | "R4B" => "https://tx.fhir.org/r4/",
-                "R5" | "R6" => "https://tx.fhir.org/r5/", // R6 may use R5 server for now
-                _ => "https://tx.fhir.org/r4/",           // Fallback
-            };
-
-            // TODO: Add proper logging when tracing is integrated
-            eprintln!(
-                "WARNING: Using default terminology server '{}' - DO NOT use in production!",
-                default_url
-            );
-            eprintln!(
-                "         Set FHIRPATH_TERMINOLOGY_SERVER environment variable or use --terminology-server option"
-            );
-
-            default_url.to_string()
-        }
+    /// The terminology server URL to use, or `None` if none is configured
+    pub fn get_terminology_server_url(&self) -> Option<String> {
+        self.terminology_server_url
+            .clone()
+            .or_else(|| std::env::var("FHIRPATH_TERMINOLOGY_SERVER").ok())
+            .filter(|url| !url.trim().is_empty())
     }
 }
 
@@ -1736,11 +1729,9 @@ fn evaluate_term(
                     "http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string(),
                 ))
             } else if name == "terminologies" {
-                // Return %terminologies object for terminology operations
-                use crate::terminology_functions::TerminologyFunctions;
-                let _terminology = TerminologyFunctions::new(context);
-
-                // Create a special object that represents the terminology functions
+                // Return %terminologies object for terminology operations.
+                // Resolving the server is deferred to the actual function call so
+                // that merely naming %terminologies never requires configuration.
                 let mut map = HashMap::new();
                 map.insert(
                     "_terminology_functions".to_string(),
@@ -2667,7 +2658,7 @@ fn evaluate_invocation(
                         {
                             // This is a method call on %terminologies
                             use crate::terminology_functions::TerminologyFunctions;
-                            let terminology = TerminologyFunctions::new(context);
+                            let terminology = TerminologyFunctions::new(context)?;
 
                             // Evaluate arguments
                             let mut evaluated_args = Vec::with_capacity(args_exprs.len());
