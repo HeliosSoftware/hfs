@@ -109,6 +109,14 @@ jobs:
       # so point Windows at Git Bash explicitly and keep plain `shell: bash` for
       # the Unix agents. The two steps run the identical script; exactly one fires
       # per run via the `runner.os` guard.
+      #
+      # The Windows path MUST use the 8.3 short name `C:\Progra~1` rather than
+      # `C:\Program Files`. The runner parses a custom `shell:` string by
+      # splitting on the FIRST space into (executable, args). A space inside the
+      # executable path splits it as ("C:\Program", "Files\...bash.exe ..."), and
+      # resolving that broken "C:\Program" fragment throws "Second path fragment
+      # must not be a drive or UNC name" before the script ever runs. The
+      # space-free short path avoids the mis-split entirely.
       - name: Verify S3 conditional writes against MinIO (per-user settings)
         if: runner.os != 'Windows'
         shell: bash
@@ -128,7 +136,7 @@ jobs:
           fi
       - name: Verify S3 conditional writes against MinIO (per-user settings) (Windows)
         if: runner.os == 'Windows'
-        shell: 'C:\Program Files\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
         env:
           RUN_MINIO_S3_TESTS: "1"
           EXPECTED_MINIO_SETTINGS_TESTS: "4"
