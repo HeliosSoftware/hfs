@@ -33,14 +33,21 @@
   var MAX_RETRIES = 2;
   var MAX_RECENT = 10;
 
+  /* The builder, the results table and the recent list are shared with the
+   * Search page (#255), which renders the same partials; the saved-query list
+   * is this page's alone. So the script keys off the form, and treats the list
+   * host as optional. Prose comes from the shared message carrier either page
+   * renders. */
   var root = document.getElementById("saved-queries");
+  var messageHost = document.getElementById("search-messages");
+  var errorHost = document.getElementById("search-error");
   var form = document.getElementById("saved-query-form");
   var recentHost = document.getElementById("recent-searches");
   var sections = document.getElementById("builder-sections");
   var urlInput = form && form.elements.url;
-  if (!root || !window.fetch) return;
+  if (!form || !messageHost || !window.fetch) return;
 
-  var messages = root.dataset;
+  var messages = messageHost.dataset;
   var etag = null;
   var lang = document.documentElement.lang || undefined;
 
@@ -724,9 +731,14 @@
   }
 
   function render(doc) {
+    clearError();
+    renderRecent(doc);
+    /* The Search page renders the builder and the recent list but no saved
+     * list; there is nothing further to draw there. */
+    if (!root) return;
+
     var byType = savedQueries(doc);
     root.textContent = "";
-    renderRecent(doc);
 
     var types = Object.keys(byType).sort();
     var total = 0;
@@ -800,34 +812,43 @@
     }
   }
 
+  /* Errors surface next to the query strip — the control they are almost
+   * always about — on both pages that render the builder. */
   function showError(outcome, fallback) {
-    var text =
+    if (!errorHost) return;
+    errorHost.textContent =
       (outcome &&
         outcome.issue &&
         outcome.issue[0] &&
         outcome.issue[0].diagnostics) ||
       fallback ||
       messages.msgError;
-    var note = document.createElement("p");
-    note.className = "query-error";
-    note.setAttribute("role", "alert");
-    note.textContent = text;
-    root.insertBefore(note, root.firstChild);
+    errorHost.hidden = false;
+  }
+
+  function clearError() {
+    if (!errorHost) return;
+    errorHost.textContent = "";
+    errorHost.hidden = true;
   }
 
   function reload() {
     return fetchDocument()
       .then(render)
       .catch(function (failure) {
+        var unavailable = failure && failure.unavailable;
+        /* Saved queries need the per-user settings document; search does not.
+         * Without the list, the page is the Search page — leave its form
+         * alone and say nothing. */
+        if (!root) return;
         root.textContent = "";
         var note = document.createElement("p");
         note.className = "query-empty";
-        note.textContent =
-          failure && failure.unavailable
-            ? messages.msgUnavailable
-            : messages.msgError;
+        note.textContent = unavailable
+          ? messages.msgUnavailable
+          : messages.msgError;
         root.appendChild(note);
-        if (failure && failure.unavailable && form) form.hidden = true;
+        if (unavailable && form) form.hidden = true;
       });
   }
 
@@ -857,41 +878,56 @@
     renderBuilder();
   }
 
-  root.addEventListener("click", function (event) {
-    var target = event.target.closest("button[data-action]");
-    if (!target) return;
-    var resourceType = target.dataset.type;
-    var id = target.dataset.id;
-
-    fetchDocument().then(function (doc) {
-      var entry = entryFor(doc, resourceType, id);
-      if (!entry) {
-        render(doc);
-        return;
-      }
-
-      if (target.dataset.action === "run") {
-        var path = searchPath(resourceType, entry.query || "");
-        loadIntoBuilder(path);
-        runSearch(path, true);
-        mutate(resourceType, id, {
-          lastAccessedAt: new Date().toISOString(),
-          accessCount: (Number(entry.accessCount) || 0) + 1,
-        });
-      } else if (target.dataset.action === "rename") {
-        var name = window.prompt(messages.msgRenamePrompt, entry.name || "");
-        if (name === null) return;
-        name = name.trim();
-        if (!name || name === entry.name) return;
-        mutate(resourceType, id, { name: name });
-      } else if (target.dataset.action === "delete") {
-        var label = (entry.name || id).toString();
-        if (!window.confirm(messages.msgConfirmDelete.replace("{name}", label)))
-          return;
-        mutate(resourceType, id, null);
-      }
+  /* Copy the query exactly as shown: what gets copied is what would run. */
+  var copyButton = document.getElementById("query-copy");
+  if (copyButton && navigator.clipboard) {
+    copyButton.addEventListener("click", function () {
+      navigator.clipboard.writeText(urlInput.value || "");
     });
-  });
+  } else if (copyButton) {
+    copyButton.hidden = true;
+  }
+
+  /* Saved-list actions — only the Saved Queries page renders the list. */
+  if (root) {
+    root.addEventListener("click", function (event) {
+      var target = event.target.closest("button[data-action]");
+      if (!target) return;
+      var resourceType = target.dataset.type;
+      var id = target.dataset.id;
+
+      fetchDocument().then(function (doc) {
+        var entry = entryFor(doc, resourceType, id);
+        if (!entry) {
+          render(doc);
+          return;
+        }
+
+        if (target.dataset.action === "run") {
+          var path = searchPath(resourceType, entry.query || "");
+          loadIntoBuilder(path);
+          runSearch(path, true);
+          mutate(resourceType, id, {
+            lastAccessedAt: new Date().toISOString(),
+            accessCount: (Number(entry.accessCount) || 0) + 1,
+          });
+        } else if (target.dataset.action === "rename") {
+          var name = window.prompt(messages.msgRenamePrompt, entry.name || "");
+          if (name === null) return;
+          name = name.trim();
+          if (!name || name === entry.name) return;
+          mutate(resourceType, id, { name: name });
+        } else if (target.dataset.action === "delete") {
+          var label = (entry.name || id).toString();
+          if (
+            !window.confirm(messages.msgConfirmDelete.replace("{name}", label))
+          )
+            return;
+          mutate(resourceType, id, null);
+        }
+      });
+    });
+  }
 
   if (recentHost) {
     recentHost.addEventListener("click", function (event) {

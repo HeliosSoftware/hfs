@@ -1,0 +1,29 @@
+<!--
+  Results render in-page from the FHIR search response itself (the existing
+  REST API; no UI-facing endpoint) — Bundle.total, columns honoring
+  _elements, and paging over Bundle.link. Hidden until the first run.
+-->
+<section class="card query-results" id="query-results" hidden
+         data-msg-total="{{ i18n.t_arg("queries-results-total", "count", "{count}".to_string()) }}"
+         data-msg-included="{{ i18n.t_arg("queries-results-included", "count", "{count}".to_string()) }}"
+         data-msg-empty="{{ i18n.t("queries-results-empty") }}"
+         data-msg-updated="{{ i18n.t("queries-col-updated") }}">
+  <div class="query-results__head">
+    <h2 class="query-group__type">{{ i18n.t("queries-results") }}</h2>
+    <span class="query-results__meta" id="query-results-meta"></span>
+    <a class="btn query-results__open" id="query-results-open" target="_blank" rel="noopener">{{ i18n.t("queries-open-tab") }}</a>
+  </div>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead id="query-results-head"></thead>
+      <tbody id="query-results-body"></tbody>
+    </table>
+  </div>
+  <div class="table-foot">
+    <span id="query-results-note"></span>
+    <nav class="pagination">
+      <button class="btn" type="button" id="query-results-prev" hidden>{{ i18n.t("queries-prev") }}</button>
+      <button class="btn" type="button" id="query-results-next" hidden>{{ i18n.t("queries-next") }}</button>
+    </nav>
+  </div>
+</section>
