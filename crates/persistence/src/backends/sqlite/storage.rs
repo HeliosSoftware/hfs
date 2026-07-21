@@ -63,6 +63,10 @@ impl ResourceStorage for SqliteBackend {
         "sqlite"
     }
 
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
     fn is_cluster_shared(&self) -> bool {
         false
     }

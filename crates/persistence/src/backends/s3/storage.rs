@@ -467,6 +467,10 @@ impl ResourceStorage for S3Backend {
         "s3"
     }
 
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
     fn is_cluster_shared(&self) -> bool {
         // S3 is a networked object store shared by every instance; `count` (and
         // thus the console `count_by_types` totals) reads the shared bucket, so

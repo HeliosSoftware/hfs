@@ -523,6 +523,10 @@ impl ResourceStorage for MongoBackend {
         "mongodb"
     }
 
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
     fn is_cluster_shared(&self) -> bool {
         true
     }

@@ -459,6 +459,10 @@ impl ResourceStorage for ElasticsearchBackend {
         "elasticsearch"
     }
 
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,

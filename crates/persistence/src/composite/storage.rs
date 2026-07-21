@@ -747,6 +747,15 @@ impl ResourceStorage for CompositeStorage {
         "composite"
     }
 
+    /// Readiness gates on the primary (CRUD) backend only. A secondary/search
+    /// backend being down is a partial degradation — core CRUD still works, so
+    /// the instance should stay in rotation rather than be pulled out entirely
+    /// (which would take down the traffic it can still serve). If the primary
+    /// system-of-record is unreachable, the instance is not ready.
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        self.primary().readiness_check().await
+    }
+
     fn is_cluster_shared(&self) -> bool {
         self.primary.is_cluster_shared()
     }
