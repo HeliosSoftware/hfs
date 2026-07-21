@@ -328,6 +328,24 @@ jobs:
           tail -50 "$HFS_LOG"
           exit 1
 
+      - name: Probe the conformance read path
+        run: |
+          # Ground truth for the UI's self-fetch: what the FHIR API returns for
+          # the conformance types, and (on ES backends) what the index holds.
+          # Diagnostic only — never fails the job.
+          sleep 15
+          echo "--- GET /CompartmentDefinition?_count=10000"
+          curl -s "http://localhost:$HFS_PORT/CompartmentDefinition?_count=10000" | head -c 1500; echo
+          echo "--- GET /SearchParameter?_count=2"
+          curl -s "http://localhost:$HFS_PORT/SearchParameter?_count=2" | head -c 1500; echo
+          if [ -n "${ES_PORT:-}" ]; then
+            echo "--- ES indices"
+            curl -s "http://$DOCKER_HOST_IP:$ES_PORT/_cat/indices?v" | head -20
+            echo "--- ES compartmentdefinition count"
+            curl -s "http://$DOCKER_HOST_IP:$ES_PORT/hfs_default_compartmentdefinition/_count" | head -c 300; echo
+          fi
+        continue-on-error: true
+
       - name: Run browser suite (Playwright)
         run: |
           set -euo pipefail
