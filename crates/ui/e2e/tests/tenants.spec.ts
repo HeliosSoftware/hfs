@@ -33,10 +33,7 @@ test.describe("tenants", () => {
     await expect(tenants.row(id)).toBeHidden();
   });
 
-  test("deleting a tenant deregisters it, leaving a data-discovered row", async ({
-    page,
-    tenants,
-  }) => {
+  test("deleting a tenant deregisters it", async ({ page, tenants }) => {
     const id = `e2e-del-${Date.now().toString(36)}`;
     await tenants.addTenant(id, "Deletable");
     const row = tenants.row(id);
@@ -44,9 +41,22 @@ test.describe("tenants", () => {
 
     page.once("dialog", (d) => d.accept()); // hx-confirm
     await row.locator("[hx-delete]").click();
-    // Provisioning seeded the tenant's conformance resources, and the trash
-    // button deliberately never purges data: the deregistered tenant remains
-    // visible as a data-discovered row, flagged unregistered.
-    await expect(row.locator(".tag--muted")).toBeVisible();
+    // The trash button deregisters without purging. The invariant is "no
+    // longer registered" — how that renders depends on the backend: stores
+    // that discover tenants from their data (count_by_tenant) keep the row,
+    // flagged unregistered; stores that cannot (S3) drop it from the list.
+    await expect
+      .poll(
+        async () => {
+          if ((await row.count()) === 0) return "gone";
+          const flagged = await row
+            .locator(".tag--muted")
+            .isVisible()
+            .catch(() => false);
+          return flagged ? "unregistered" : "pending";
+        },
+        { timeout: 15_000 },
+      )
+      .not.toBe("pending");
   });
 });
