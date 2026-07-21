@@ -101,6 +101,7 @@ helios-observability = { path = "../observability", version = "0.2.1" }
 # depends on the rest of the server, never the reverse.
 helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
 
+
 [dev-dependencies]
 # Parses the .ftl sources so tests can enforce key-set parity across locales.
 fluent-syntax = "0.11"
