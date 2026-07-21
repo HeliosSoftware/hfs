@@ -1270,6 +1270,13 @@ button.pill {
 .history__select select {
   height: 30px;
   font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+}
+
 /* ---- Saved queries (#234) ---------------------------------------------- */
 
 .page-head {
@@ -1624,6 +1631,14 @@ button.pill {
 }
 
 .diff__head h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-strong);
+}
+
 .query-builder__save {
   display: flex;
   gap: 12px;
