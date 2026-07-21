@@ -19,6 +19,7 @@
 //! registration path — the stored-parameter refresh skips them (draft, and
 //! their canonical URLs are already registered).
 
+use std::future::Future;
 use std::path::Path;
 
 use helios_fhir::FhirVersion;
@@ -59,6 +60,33 @@ async fn create_all<S>(
 where
     S: ResourceStorage + ?Sized,
 {
+    let concurrency = storage.bulk_write_concurrency().clamp(1, 32);
+    write_all(
+        concurrency,
+        resource_type,
+        resources,
+        |resource| async move {
+            storage
+                .create(tenant, resource_type, resource, fhir_version)
+                .await
+                .map(|_| ())
+        },
+    )
+    .await
+}
+
+/// The fanout/retry core of [`create_all`], parameterized over the write so it
+/// can be exercised without a storage backend.
+async fn write_all<F, Fut>(
+    concurrency: usize,
+    resource_type: &'static str,
+    resources: Vec<Value>,
+    create: F,
+) -> SeedOutcome
+where
+    F: Fn(Value) -> Fut,
+    Fut: Future<Output = StorageResult<()>>,
+{
     use futures::stream::{self, StreamExt};
 
     enum Wrote {
@@ -67,16 +95,13 @@ where
         Failed,
     }
 
-    let concurrency = storage.bulk_write_concurrency().clamp(1, 32);
+    let create = &create;
     stream::iter(resources)
         .map(|resource| async move {
             let mut attempt: u32 = 0;
             loop {
-                match storage
-                    .create(tenant, resource_type, resource.clone(), fhir_version)
-                    .await
-                {
-                    Ok(_) => return Wrote::Created,
+                match create(resource.clone()).await {
+                    Ok(()) => return Wrote::Created,
                     Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {
                         return Wrote::Existing;
                     }
@@ -92,7 +117,7 @@ where
                 }
             }
         })
-        .buffer_unordered(concurrency)
+        .buffer_unordered(concurrency.max(1))
         .fold(
             SeedOutcome {
                 created: 0,
@@ -301,4 +326,97 @@ where
         "Seeded spec CompartmentDefinitions into storage"
     );
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::error::BackendError;
+
+    fn resources(n: usize) -> Vec<Value> {
+        (0..n).map(|i| json!({ "id": format!("r{i}") })).collect()
+    }
+
+    fn transient() -> StorageError {
+        StorageError::Backend(BackendError::Internal {
+            backend_name: "test".to_string(),
+            message: "table is locked".to_string(),
+            source: None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn counts_created_and_existing() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(4, "SearchParameter", resources(5), |resource| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let dup = resource["id"] == json!("r0");
+            async move {
+                let _ = n;
+                if dup {
+                    Err(StorageError::Resource(ResourceError::AlreadyExists {
+                        resource_type: "SearchParameter".to_string(),
+                        id: "r0".to_string(),
+                    }))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(outcome.created, 4);
+        assert_eq!(outcome.existing, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "AlreadyExists is not retried"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_failures_are_retried_then_succeed() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(1, "SearchParameter", resources(1), |_| {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(transient())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(outcome.created, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_failures_count_after_three_attempts() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(2, "CompartmentDefinition", resources(2), |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err(transient()) }
+        })
+        .await;
+        assert_eq!(outcome.created, 0);
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "initial try + two retries each"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_concurrency_is_clamped_not_deadlocked() {
+        let outcome = write_all(0, "SearchParameter", resources(3), |_| async { Ok(()) }).await;
+        assert_eq!(outcome.created, 3);
+    }
 }
