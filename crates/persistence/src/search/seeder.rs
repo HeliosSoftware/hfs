@@ -40,6 +40,77 @@ pub struct SeedOutcome {
     pub failed: usize,
 }
 
+/// Writes every resource of `resource_type` for `tenant`, fanning creates out
+/// at the backend's [`bulk_write_concurrency`] so latency-bound backends (one
+/// PUT per resource on S3, one round trip per row on networked databases) pay
+/// round-trips-divided-by-fanout rather than their sum. `AlreadyExists` counts
+/// as already-seeded. Any other error is retried twice with a short backoff —
+/// shared-cache SQLite surfaces reader/writer overlap as an immediate `table
+/// is locked` error rather than waiting — before counting as failed.
+///
+/// [`bulk_write_concurrency`]: ResourceStorage::bulk_write_concurrency
+async fn create_all<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    resource_type: &'static str,
+    resources: Vec<Value>,
+    fhir_version: FhirVersion,
+) -> SeedOutcome
+where
+    S: ResourceStorage + ?Sized,
+{
+    use futures::stream::{self, StreamExt};
+
+    enum Wrote {
+        Created,
+        Existing,
+        Failed,
+    }
+
+    let concurrency = storage.bulk_write_concurrency().clamp(1, 32);
+    stream::iter(resources)
+        .map(|resource| async move {
+            let mut attempt: u32 = 0;
+            loop {
+                match storage
+                    .create(tenant, resource_type, resource.clone(), fhir_version)
+                    .await
+                {
+                    Ok(_) => return Wrote::Created,
+                    Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {
+                        return Wrote::Existing;
+                    }
+                    Err(_) if attempt < 2 => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(25 * attempt as u64))
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("{resource_type} seeding: create failed: {e}");
+                        return Wrote::Failed;
+                    }
+                }
+            }
+        })
+        .buffer_unordered(concurrency)
+        .fold(
+            SeedOutcome {
+                created: 0,
+                existing: 0,
+                failed: 0,
+            },
+            |mut outcome, wrote| async move {
+                match wrote {
+                    Wrote::Created => outcome.created += 1,
+                    Wrote::Existing => outcome.existing += 1,
+                    Wrote::Failed => outcome.failed += 1,
+                }
+                outcome
+            },
+        )
+        .await
+}
+
 /// Seeds `storage` with the spec SearchParameter bundle for `fhir_version`,
 /// plus the embedded fallback parameters, under `tenant_id`.
 ///
@@ -112,26 +183,7 @@ where
         });
     }
 
-    let mut outcome = SeedOutcome {
-        created: 0,
-        existing: 0,
-        failed: 0,
-    };
-    for resource in resources {
-        match storage
-            .create(&tenant, "SearchParameter", resource, fhir_version)
-            .await
-        {
-            Ok(_) => outcome.created += 1,
-            Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {
-                outcome.existing += 1;
-            }
-            Err(e) => {
-                outcome.failed += 1;
-                tracing::warn!("SearchParameter seeding: create failed: {e}");
-            }
-        }
-    }
+    let outcome = create_all(storage, &tenant, "SearchParameter", resources, fhir_version).await;
     tracing::info!(
         created = outcome.created,
         existing = outcome.existing,
@@ -233,26 +285,14 @@ where
         });
     }
 
-    let mut outcome = SeedOutcome {
-        created: 0,
-        existing: 0,
-        failed: 0,
-    };
-    for resource in resources {
-        match storage
-            .create(&tenant, "CompartmentDefinition", resource, fhir_version)
-            .await
-        {
-            Ok(_) => outcome.created += 1,
-            Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {
-                outcome.existing += 1;
-            }
-            Err(e) => {
-                outcome.failed += 1;
-                tracing::warn!("CompartmentDefinition seeding: create failed: {e}");
-            }
-        }
-    }
+    let outcome = create_all(
+        storage,
+        &tenant,
+        "CompartmentDefinition",
+        resources,
+        fhir_version,
+    )
+    .await;
     tracing::info!(
         created = outcome.created,
         existing = outcome.existing,

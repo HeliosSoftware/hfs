@@ -62,6 +62,11 @@ impl ResourceStorage for PostgresBackend {
         "postgres"
     }
 
+    fn bulk_write_concurrency(&self) -> usize {
+        // Bulk seeding is round-trip bound; the pool absorbs parallel writers.
+        8
+    }
+
     fn is_cluster_shared(&self) -> bool {
         true
     }

@@ -751,6 +751,11 @@ impl ResourceStorage for CompositeStorage {
         self.primary.is_cluster_shared()
     }
 
+    fn bulk_write_concurrency(&self) -> usize {
+        // Writes route to the primary, so its tolerance is the bound.
+        self.primary.bulk_write_concurrency()
+    }
+
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
         // SQL-on-FHIR runs as in-DB SQL against the primary store (where all
         // writes land), so delegate to the primary backend. Composites whose

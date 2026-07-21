@@ -44,6 +44,10 @@ chrono.workspace = true
 # (`dashboard::DashboardProvider`), registered by the server at startup.
 async-trait = "0.1"
 
+# The dashboard snapshot cache refreshes in a background task ("rt") and paces
+# its cold-start wait ("time"); see `dashboard::snapshot`.
+tokio = { version = "1", features = ["rt", "time"] }
+
 # OpenTelemetry (feature-gated). Versions pinned to a mutually compatible set:
 # core 0.32 / tracing-opentelemetry 0.33 (runs one minor ahead of core).
 opentelemetry = { version = "0.32", optional = true }
@@ -53,4 +57,4 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 
 [dev-dependencies]
 # Drives the async `dashboard::snapshot` path in unit tests.
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }

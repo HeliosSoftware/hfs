@@ -704,6 +704,15 @@ pub trait ResourceStorage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// How many concurrent `create` calls this backend absorbs well during bulk
+    /// writes (e.g. conformance seeding). Latency-bound backends — object
+    /// stores, networked databases — override this so a ~1.4k-resource seed is
+    /// bounded by round trips divided by this factor rather than their sum. The
+    /// default of 1 keeps single-writer backends (SQLite) strictly sequential.
+    fn bulk_write_concurrency(&self) -> usize {
+        1
+    }
+
     // ---- Tenant registry (first-class tenant maintenance) ------------------
     //
     // These make tenants explicit, backing the admin `/admin/tenants` API
