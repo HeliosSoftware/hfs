@@ -100,10 +100,6 @@ pub struct PostgresConfig {
     /// When true, search indexing is offloaded to a secondary backend.
     #[serde(default)]
     pub search_offloaded: bool,
-
-    /// Optional schema name for schema-per-tenant isolation.
-    #[serde(default)]
-    pub schema_name: Option<String>,
 }
 
 /// SSL mode for PostgreSQL connections.
@@ -186,7 +182,6 @@ impl Default for PostgresConfig {
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
-            schema_name: None,
         }
     }
 }
@@ -556,7 +551,7 @@ impl PostgresBackend {
     }
 
     /// Get a client from the pool.
-    pub(crate) async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
+    pub async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
         use deadpool_postgres::{PoolError, TimeoutType};
 
         self.pool.get().await.map_err(|e| match e {

@@ -34,7 +34,6 @@ fn test_postgres_config_defaults() {
     assert_eq!(config.connect_timeout_secs, 5);
     assert_eq!(config.statement_timeout_ms, 30000);
     assert!(!config.search_offloaded);
-    assert!(config.schema_name.is_none());
 }
 
 #[test]
@@ -831,6 +830,64 @@ mod postgres_integration {
     fn create_tenant(id: &str) -> TenantContext {
         let unique_id = format!("{}_{}", id, uuid::Uuid::new_v4().simple());
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
+    }
+
+    // ========================================================================
+    // Pool timeout regression (#285)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn statement_timeout_applies_to_every_pooled_connection() {
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+
+        const POOL_SIZE: usize = 10;
+        const TIMEOUT_MS: u64 = 250;
+
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: POOL_SIZE,
+            statement_timeout_ms: TIMEOUT_MS,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        let backend =
+            std::sync::Arc::new(PostgresBackend::new(config).await.expect("create backend"));
+
+        // Hold POOL_SIZE clients across a barrier so the pool is forced to
+        // create every connection before any is released. Under the pre-fix
+        // code only the connection used inside `PostgresBackend::new` to
+        // verify connectivity carried the GUC; every connection created
+        // lazily after that inherited the server default (usually 0).
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(POOL_SIZE));
+        let mut handles = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
+            let backend = backend.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let client = backend.get_client().await.expect("get_client");
+                barrier.wait().await;
+                let row = client
+                    .query_one("SELECT current_setting('statement_timeout')", &[])
+                    .await
+                    .expect("current_setting");
+                let value: String = row.get(0);
+                value
+            }));
+        }
+
+        for h in handles {
+            let value = h.await.expect("task panicked");
+            assert_eq!(value, format!("{TIMEOUT_MS}ms"));
+        }
     }
 
     // ========================================================================
