@@ -3523,6 +3523,15 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_bulk_write_concurrency_delegates_to_primary() {
+        let composite = make_composite_no_secondary();
+        assert_eq!(
+            composite.bulk_write_concurrency(),
+            composite.primary().bulk_write_concurrency()
+        );
+    }
+
     // ── routing_error_to_storage_error ────────────────────────────
 
     #[test]
