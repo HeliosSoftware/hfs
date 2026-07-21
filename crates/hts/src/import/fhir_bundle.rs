@@ -245,8 +245,9 @@ fn write_code_system(
     // guarantees each (url, version) maps to at most one storage row.
     conn.execute(
         "INSERT OR IGNORE INTO code_systems
-         (id, url, version, name, title, status, content, resource_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+         (id, url, version, name, title, status, content, resource_json, created_at, updated_at,
+          authority_rank)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
         rusqlite::params![
             storage_id,
             cs.url,
@@ -256,7 +257,8 @@ fn write_code_system(
             cs.status,
             cs.content,
             resource_json,
-            now
+            now,
+            cs.authority_rank,
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -264,15 +266,36 @@ fn write_code_system(
     // INSERT OR IGNORE skips the update path on conflict; force-update the
     // metadata for this (url, version) row so re-imports refresh title/status
     // /resource_json without disturbing sibling versions.
-    conn.execute(
+    //
+    // `authority_rank` keeps the strongest claim ever asserted for this row: if a
+    // source that owns this canonical URL supplies it, the row stays authoritative
+    // even when a package that merely re-publishes it is imported afterwards. That
+    // makes the RANK independent of import order — which matters, because bootstrap
+    // walks the directory alphabetically and `hl7.fhir.r4.core-*.tgz` happens to
+    // sort before `hl7.terminology-*.tgz`. (Only the rank: the other columns are
+    // overwritten unconditionally, so whichever source writes a given (url,
+    // version) row last supplies its content. No two vendored packages ship the
+    // same (url, version) — verified across all 8 — so that is moot today.)
+    //
+    // The COALESCE sentinel (9 — above any real rank) is what makes an existing
+    // database converge: a row that predates the column is NULL, meaning "never
+    // claimed", so the first source to claim it wins outright. A plain
+    // MIN(authority_rank, ?) would instead read the legacy row as rank 0 and pin
+    // the stale copy at authoritative forever, silently defeating the migration.
+    let cs_update = format!(
         "UPDATE code_systems SET
-           name          = ?1,
-           title         = ?2,
-           status        = ?3,
-           content       = ?4,
-           resource_json = ?5,
-           updated_at    = ?6
+           name           = ?1,
+           title          = ?2,
+           status         = ?3,
+           content        = ?4,
+           resource_json  = ?5,
+           updated_at     = ?6,
+           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9)
          WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
+        unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
+    );
+    conn.execute(
+        &cs_update,
         rusqlite::params![
             cs.name,
             cs.title,
@@ -282,6 +305,7 @@ fn write_code_system(
             now,
             cs.url,
             cs.version,
+            cs.authority_rank,
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -516,8 +540,9 @@ fn write_value_set(
     // per (url, version).
     conn.execute(
         "INSERT OR IGNORE INTO value_sets
-         (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+         (id, url, version, name, title, status, compose_json, resource_json, created_at, updated_at,
+          authority_rank)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
         rusqlite::params![
             storage_id,
             vs.url,
@@ -527,7 +552,8 @@ fn write_value_set(
             vs.status,
             vs.compose_json,
             resource_json,
-            now
+            now,
+            vs.authority_rank,
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -535,15 +561,22 @@ fn write_value_set(
     // INSERT OR IGNORE skipped the metadata refresh on conflict — apply it
     // explicitly so re-imports of the same (url, version) get the latest
     // name/title/status/compose without disturbing siblings.
-    conn.execute(
+    // See `write_code_system` for why authority_rank uses MIN over a COALESCE
+    // sentinel rather than a plain assignment or a bare MIN.
+    let vs_update = format!(
         "UPDATE value_sets SET
-           name          = ?1,
-           title         = ?2,
-           status        = ?3,
-           compose_json  = ?4,
-           resource_json = ?5,
-           updated_at    = ?6
+           name           = ?1,
+           title          = ?2,
+           status         = ?3,
+           compose_json   = ?4,
+           resource_json  = ?5,
+           updated_at     = ?6,
+           authority_rank = MIN(COALESCE(authority_rank, {unclaimed}), ?9)
          WHERE url = ?7 AND COALESCE(version, '') = COALESCE(?8, '')",
+        unclaimed = bundle_parser::AUTHORITY_UNCLAIMED
+    );
+    conn.execute(
+        &vs_update,
         rusqlite::params![
             vs.name,
             vs.title,
@@ -553,6 +586,7 @@ fn write_value_set(
             now,
             vs.url,
             vs.version,
+            vs.authority_rank,
         ],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -655,16 +689,15 @@ pub(crate) fn get_code_system_url(conn: &Connection, id: &str) -> Result<Option<
     {
         return Ok(Some(url));
     }
-    conn.query_row(
+    let sql = format!(
         "SELECT url FROM code_systems \
          WHERE json_extract(resource_json, '$.id') = ?1 \
-         ORDER BY COALESCE(version, '') DESC \
-         LIMIT 1",
-        rusqlite::params![id],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .map_err(|e| HtsError::StorageError(e.to_string()))
+         ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
+    conn.query_row(&sql, rusqlite::params![id], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
 /// Delete all cached value set expansion rows that were derived from the given

@@ -1,0 +1,133 @@
+{
+  "resourceType": "SubstanceDefinition",
+  "id": "her2",
+  "identifier": [
+    {
+      "system": "https://www.uniprot.org",
+      "value": "P04626"
+    }
+  ],
+  "status": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/publication-status",
+        "code": "active",
+        "display": "Active"
+      }
+    ]
+  },
+  "classification": [
+    {
+      "coding": [
+        {
+          "system": "http://example.europa.eu/fhir/SubstanceType",
+          "code": "protein",
+          "display": "Protein"
+        }
+      ]
+    }
+  ],
+  "domain": {
+    "coding": [
+      {
+        "system": "http://example.europa.eu/fhir/Domain",
+        "code": "human",
+        "display": "Human use"
+      }
+    ]
+  },
+  "description": "Human HER2 (ErbB2, receptor tyrosine-protein kinase erbB-2). A transmembrane receptor of the EGFR family, frequently overexpressed in breast and gastric cancers. The molecular target of trastuzumab and other HER2-directed therapies.",
+  "code": [
+    {
+      "code": {
+        "coding": [
+          {
+            "system": "https://www.uniprot.org",
+            "code": "P04626",
+            "display": "ERBB2_HUMAN"
+          }
+        ]
+      }
+    }
+  ],
+  "name": [
+    {
+      "name": "Receptor tyrosine-protein kinase erbB-2",
+      "preferred": true,
+      "language": [
+        {
+          "coding": [
+            {
+              "system": "urn:ietf:bcp:47",
+              "code": "en",
+              "display": "English"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "HER2",
+      "preferred": false
+    },
+    {
+      "name": "ErbB-2",
+      "preferred": false
+    },
+    {
+      "name": "CD340",
+      "preferred": false
+    }
+  ],
+  "protein": {
+    "sequenceType": {
+      "coding": [
+        {
+          "system": "http://hl7.org/fhir/substance-sequence-type",
+          "code": "complete",
+          "display": "Complete"
+        }
+      ]
+    },
+    "numberOfSubunits": 1,
+    "subunit": [
+      {
+        "subunit": 1,
+        "length": 1255
+      }
+    ],
+    "gene": [
+      {
+        "sequenceOrigin": {
+          "coding": [
+            {
+              "system": "http://hl7.org/fhir/gene-sequence-origin",
+              "code": "human",
+              "display": "Human"
+            }
+          ]
+        },
+        "gene": {
+          "concept": {
+            "coding": [
+              {
+                "system": "http://www.genenames.org",
+                "code": "ERBB2",
+                "display": "Erb-B2 receptor tyrosine kinase 2"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

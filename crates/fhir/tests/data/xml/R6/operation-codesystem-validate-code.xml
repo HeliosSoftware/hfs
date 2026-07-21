@@ -346,7 +346,7 @@
   <status value="active"/>
   <kind value="operation"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Terminology Infrastructure"/>
   <contact>
     <telecom>
@@ -364,7 +364,7 @@
       <value value="http://www.hl7.org/Special/committees/Vocab"/>
     </telecom>
   </contact>
-  <description value="Validate that a coded value is in the code system. If the operation is not called at the instance level, one of the parameters &quot;url&quot; or &quot;codeSystem&quot; must be provided. The operation returns a result (true / false), an error message, and the recommended display for the code.&#xA;&#xA;When invoking this operation, a client **SHALL** provide one (and only one) of the parameters (code+system, coding, or codeableConcept). Other parameters (including version and display) are optional. When validating a code or a coding, then the code, system and version output parameters **SHOULD** be populated when possible. When a validating a CodeableConcept, then the codeableConcept output parameter **SHOULD** be populated when possible."/>
+  <description value="Validate that a coded value is in the code system. If the operation is not called at the instance level, one of the parameters &quot;url&quot; or &quot;codeSystem&quot; must be provided. The operation returns a result (true / false), an error message, and the recommended display for the code.&#xA;&#xA;When invoking this operation, a client **SHALL** provide one (and only one) of the parameters (code+system, coding, or codeableConcept). Other parameters (including version and display) are optional. When validating a code or a coding, then the code, system and version output parameters **SHOULD** be populated when possible. When a validating a CodeableConcept, then the codeableConcept output parameter **SHOULD** be populated when possible.&#xA;&#xA;Implementers should note that additional requirements are made on terminology servers that wish to be part of the public HL7 terminology ecosystem in the [FHIR Terminology Ecosystem IG](https://hl7.org/fhir/uv/tx-ecosystem/)."/>
   <jurisdiction>
     <coding>
       <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>

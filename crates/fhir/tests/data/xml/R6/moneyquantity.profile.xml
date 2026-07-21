@@ -41,7 +41,7 @@
   <name value="MoneyQuantity"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -239,8 +239,8 @@
     </element>
     <element id="Quantity.comparator">
       <path value="Quantity.comparator"/>
-      <short value="&lt; | &lt;= | &gt;= | &gt; | ad - how to understand the value"/>
-      <definition value="How the value should be understood and represented - whether the actual value is greater or less than the stated value due to measurement issues; e.g. if the comparator is &quot;&lt;&quot; , then the real value is &lt; stated value."/>
+      <short value="&lt; | &lt;= | &gt;= | &gt; | ~ | ad - how to understand the value"/>
+      <definition value="How the value should be understood and represented - whether the actual value is greater than, less than, or approximately equal to the stated value due to measurement issues; e.g. if the comparator is &quot;&lt;&quot; , then the real value is &lt; stated value."/>
       <requirements value="Need a framework for handling measures where the value is &lt;5ug/L or &gt;400mg/L due to the limitations of measuring methodology."/>
       <min value="0"/>
       <max value="1"/>

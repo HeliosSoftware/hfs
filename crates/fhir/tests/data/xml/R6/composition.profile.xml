@@ -3,7 +3,7 @@
 <StructureDefinition xmlns="http://hl7.org/fhir">
   <id value="Composition"/>
   <meta>
-    <lastUpdated value="2026-06-13T17:13:29.148+00:00"/>
+    <lastUpdated value="2026-07-17T03:44:13.245+00:00"/>
   </meta>
   <text>
     <status value="generated"/>
@@ -35,7 +35,7 @@
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px; white-space: nowrap; background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAyAAAAACCAYAAACg/LjIAAAAJUlEQVR4Xu3IIQEAAAgDsHd9/w4EQIOamFnaBgAA4MMKAACAKwNp30CqZFfFmwAAAABJRU5ErkJggg==)" class="hierarchy">
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAACCElEQVQ4y4XTv2sUQRTA8e9Mzt3kjoOLSXFgZ6GJQlALCysLC89OsLTXv0VFxE4stRAEQUghSWEXuM4qMZpATsUD70dyMdnduZ15z2IvMV5IfDDNm5nPm59GVTkpms1mTVXvhxDuichlEZn03m+KyJL3/mWj0fiKqp7YVlZWXrfbbR2PTqeji4uLn1WVEqdECKFRr9eP5WdnZ/HeXwROB0TEA3S7XarVKiLC1tYW8/PzeO/5LxBCUABrLXEc02q1KJfLB30F0P144dPU9LVL1kwcrU06WP0ewhML4JwDYDgcHo7I87wAjNq5ypU3Z8arT8F5u/xejw52zmGM+Rcg1wyIcc/BTYCdBlODyh3ElA1AHMekaUoURURRBECWZSNgaGzBxxAU9jfQ9jrJr2dcbbXobRYHlQAzo9X1gDR9+KUArE6CwLefZD9WCW6P0uRZKreXqADkHXZ3dshzjwRholJH397AOXcTwHTfzQ1n7q6NnYEAy+DWQVNwKWQJ6vcx557Se7HAzIN1M9rCwVteA/rAYDRRICQgSZEr7WLYO3bzJVJGQBu0D74PkoHkoBnIHvjfkO9AGABmDHCjFWgH8i7kPQh9yEeYH4DfLhBJgA2A7BBQJ9uwXWY3rhJqFo1AaiB1CBngwKZQcqAeSFSduL9Akj7qPF64jnALS5VTPwdgPwwJ+uog9Qcx4kRZiPKqxgAAAABJRU5ErkJggg==" alt="." style="background-color: white; background-color: inherit" title="Resource" class="hierarchy"/> 
-            <span title="Composition : A set of healthcare-related information that is assembled together into a single logical package that provides a single coherent statement of meaning, establishes its own context and has traceability to the author who is making the statement. A Composition defines the structure and narrative content necessary for a document. However, a Composition alone does not constitute a document. Rather, the Composition must be the first entry in a Bundle where Bundle.type=document, and any other resources referenced from Composition must be included as subsequent entries in the Bundle (for example Patient, Practitioner, Encounter, etc.).">Composition</span>
+            <span title="Composition : Composition provides the structural backbone for assembling a set of healthcare-related information into a single logical package that provides a single coherent statement of meaning, establishes its own context and has traceability to the author who is making the statement.">Composition</span>
             <a name="Composition"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -159,7 +159,6 @@
             <a href="communicationrequest.html">CommunicationRequest</a> | 
             <a href="coverageeligibilityrequest.html">CoverageEligibilityRequest</a> | 
             <a href="devicerequest.html">DeviceRequest</a> | 
-            <a href="enrollmentrequest.html">EnrollmentRequest</a> | 
             <a href="medicationrequest.html">MedicationRequest</a> | 
             <a href="nutritionorder.html">NutritionOrder</a> | 
             <a href="requestorchestration.html">RequestOrchestration</a> | 
@@ -225,7 +224,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,R0lGODlhEAAQAPZ/APrkusOiYvvfqbiXWaV2G+jGhdq1b8GgYf3v1frw3vTUlsWkZNewbcSjY/DQkad4Hb6dXv3u0f3v1ObEgfPTlerJiP3w1v79+e7OkPrfrfnjuNOtZPrpydaxa+/YrvvdpP779ZxvFPvnwKKBQaFyF/369M2vdaqHRPz58/HNh/vowufFhfroxO3OkPrluv779tK0e6JzGProwvrow9m4eOnIifPTlPDPkP78+Naxaf3v0/zowfXRi+bFhLWUVv379/rnwPvszv3rye3LiPvnv+3MjPDasKiIS/789/3x2f747eXDg+7Mifvu0tu7f+/QkfDTnPXWmPrjsvrjtPbPgrqZW+/QlPz48K2EMv36866OUPvowat8Ivvgq/Pbrvzgq/PguvrgrqN0Gda2evfYm9+7d/rpw9q6e/LSku/Rl/XVl/LSlfrkt+zVqe7Wqv3x1/bNffbOf59wFdS6if3u0vrqyP3owPvepfXQivDQkO/PkKh9K7STVf779P///wD/ACH5BAEKAH8ALAAAAAAQABAAAAemgH+CgxeFF4OIhBdKGwFChYl/hYwbdkoBPnaQkosbG3d3VEpSUlonUoY1Gzo6QkI8SrGxWBOFG4uySgY5ZWR3PFy2hnaWZXC/PHcPwkpJk1ShoHcxhQEXSUmtFy6+0iSFVResrjoTPDzdcoU+F65CduVU6KAhhQa3F8Tx8nchBoYuqoTLZoAKFRIhqGwqJAULFx0GYpBQeChRIR4TJm6KJMhQRUSBAAA7" alt="." style="background-color: white; background-color: inherit" title="Data Type" class="hierarchy"/> 
-            <span title="Composition.category : A categorization for the type of the composition - helps for indexing and searching. This may be implied by or derived from the code specified in the Composition Type.">category</span>
+            <span title="Composition.category : A categorization for the type of the composition - helps with indexing and searching. This may be implied by or derived from the code specified in the Composition Type.">category</span>
             <a name="Composition.category"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -391,7 +390,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Meaning and purpose of participation, in creation of the clinical document
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-fhir-clinical-doc-participant.html">FHIR Clinical Document Participant Types Value set</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-fhir-clinical-doc-participant.html">FHIR Clinical Document Participant Types Value set</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -414,7 +413,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-ParticipationFunction.html">ParticipationFunction</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-v3-ParticipationFunction.html">ParticipationFunction</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
             <br/>
@@ -458,7 +457,9 @@
             <a href="patient.html">Patient</a> | 
             <a href="relatedperson.html">RelatedPerson</a> | 
             <a href="device.html">Device</a> | 
-            <a href="organization.html">Organization</a>)
+            <a href="organization.html">Organization</a> | 
+            <a href="careteam.html">CareTeam</a> | 
+            <a href="group.html">Group</a>)
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Who the participant is
             <br/>
@@ -470,17 +471,20 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAWCAYAAAABxvaqAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIs1vtcMQAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAE0lEQVQI12P4//8/AxMDAwNdCABMPwMo2ctnoQAAAABJRU5ErkJggg==" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARklEQVQ4y2P8//8/AyWAhYFCMAgMuHjx4n+KXaCv+I0szW8WpCG8kFO1lGFKW/SIjAUYgxz/MzAwMDC+nqhDUTQyjuYFBgCNmhP4OvTRgwAAAABJRU5ErkJggg==" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Primitive Data Type" class="hierarchy"/> 
-            <span title="Composition.name : A natural language name identifying the {{title}}. This name should be usable as an identifier for the module by machine processing applications such as code generation.">name</span>
+            <span title="Composition.name : A machine-friendly identifier suitable for code generation. For example, 'ClinicalDocument' or 'Composition_v2'. See the Constraint description.">name</span>
             <a name="Composition.name"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a style="padding-left: 3px; padding-right: 3px; color: black; null; padding-left: 3px; padding-right: 3px; color: black; null" href="elementdefinition-definitions.html#ElementDefinition.isSummary" title="This element is included in summaries">Σ</a>
+            <a style="padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;; padding-left: 3px; padding-right: 3px; border: 1px maroon solid; font-weight: bold; color: #301212; background-color: #fdf4f4;" href="conformance-rules.html#constraints" title="This element has or is affected by some invariants">C</a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">0..1</td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
             <a href="datatypes.html#string">string</a>
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Name for this Composition (computer friendly)
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Computer friendly name
+            <br/>
+            <span style="font-style: italic" title="cmp-4">+ Warning: Name should start with an uppercase letter (A–Z), be 2 to 255 characters long, and contain only letters, digits, and underscores. Whitespace, hyphens, and other punctuation are not permitted</span>
             <br/>
           </td>
         </tr>
@@ -628,7 +632,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">personal | professional | legal | official
             <br/>Binding: 
-            <a href="valueset-composition-attestation-mode.html">Composition Attestation Mode</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-composition-attestation-mode.html">Composition Attestation Mode</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -736,7 +740,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">documentation | justification | citation | predecessor | successor | derived-from | depends-on | composed-of | part-of | amends | amended-with | appends | appended-with | cites | cited-by | comments-on | comment-in | contains | contained-in | corrects | correction-in | replaces | replaced-with | retracts | retracted-by | signs | similar-to | supports | supported-with | transforms | transformed-into | transformed-with | documents | specification-of | created-with | cite-as | reprint | reprint-of | summarizes
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-artifact-relationship-type.html">Artifact Relationship Type</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-artifact-relationship-type.html">Artifact Relationship Type</a> (
             <a href="terminologies.html#extensible" title="To be conformant, the concept in this element SHALL be from the specified value set if any of the codes within the value set can apply to the concept being communicated.  If the value set does not cover the concept (based on human review), alternate codings (or, data type allowing, text) may be included instead.">Extensible</a>)
             <br/>
           </td>
@@ -892,7 +896,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzMPbYccAgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAMElEQVQ4y+3OQREAIBDDwAv+PQcFFN5MIyCzqHMKUGVCpMFLK97heq+gggoq+EiwAVjvMhFGmlEUAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzME+lXFigAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+3OsRUAIAjEUOL+O8cJABttJM11/x1qZAGqRBEVcNIqdWj1efDqQbb3HwwwwEfABmQUHSPM9dtDAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: white; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Composition.event.detail : Represents the main clinical acts, such as a colonoscopy or an appendectomy, being documented. In some cases, the event is inherent in the typeCode, such as a &quot;History and Physical Report&quot; in which case the procedure being documented is necessarily a &quot;History and Physical&quot; act. The events may be included as a code or as a reference to an other resource.">detail</span>
+            <span title="Composition.event.detail : Represents the main clinical acts, such as a colonoscopy or an appendectomy, being documented. In some cases, the event is inherent in the typeCode, such as a &quot;History and Physical Report&quot; in which case the procedure being documented is necessarily a &quot;History and Physical&quot; act. The events may be included as a code or as a reference to another resource.">detail</span>
             <a name="Composition.event.detail"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">
@@ -905,7 +909,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">The event(s) being documented, as code(s), reference(s), or both
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-v3-ActCode.html">v3 Code System ActCode</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-v3-ActCode.html">v3 Code System ActCode</a> (
             <a href="terminologies.html#example" title="Instances are not expected or even encouraged to draw from the specified value set.  The value set merely provides examples of the types of concepts intended to be included.">Example</a>)
             <br/>
             <br/>
@@ -1013,7 +1017,7 @@
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzIZgEiYEgAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAAIElEQVQ4y2P8//8/AyWAiYFCMGrAqAGjBowaMGoAAgAALL0DKYQ0DPIAAAAASUVORK5CYII=" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAWCAYAAADJqhx8AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAB3RJTUUH3wYeFzI3XJ6V3QAAAB1pVFh0Q29tbWVudAAAAAAAQ3JlYXRlZCB3aXRoIEdJTVBkLmUHAAAANklEQVQ4y+2RsQ0AIAzDav7/2VzQwoCY4iWbZSmo1QGoUgNMghvWaIejPQW/CrrNCylIwcOCDYfLNRcNer4SAAAAAElFTkSuQmCC" alt="." style="background-color: inherit" class="hierarchy"/>
             <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAadEVYdFNvZnR3YXJlAFBhaW50Lk5FVCB2My41LjEwMPRyoQAAAFxJREFUOE/NjEEOACEIA/0o/38GGw+agoXYeNnDJDCUDnd/gkoFKhWozJiZI3gLwY6rAgxhsPKTPUzycTl8lAryMyMsVQG6TFi6cHULyz8KOjC7OIQKlQpU3uPjAwhX2CCcGsgOAAAAAElFTkSuQmCC" alt="." style="background-color: #F7F7F7; background-color: inherit" title="Reference to another Resource" class="hierarchy"/> 
-            <span title="Composition.section.focus : The actual focus of the section when it is not the subject of the composition, but instead represents something or someone associated with the subject such as (for a patient subject) a spouse, parent, fetus, or donor. If not focus is specified, the focus is assumed to be focus of the parent section, or, for a section in the Composition itself, the subject of the composition. Sections with a focus SHALL only include resources where the logical subject (patient, subject, focus, etc.) matches the section focus, or the resources have no logical subject (few resources).">focus</span>
+            <span title="Composition.section.focus : The actual focus of the section when it is not the subject of the composition, but instead represents something or someone associated with the subject such as (for a patient subject) a spouse, parent, fetus, or donor. If no focus is specified, the focus is assumed to be focus of the parent section, or, for a section in the Composition itself, the subject of the composition. Sections with a focus SHALL only include resources where the logical subject (patient, subject, focus, etc.) matches the section focus, or the resources have no logical subject (few resources).">focus</span>
             <a name="Composition.section.focus"> </a>
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy"/>
@@ -1022,7 +1026,7 @@
             <a href="references.html#Reference">Reference</a>(
             <a href="resourcelist.html">Any</a>)
           </td>
-          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Who/what the section is about, when it is not about the subject of composition
+          <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: #F7F7F7; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Who/what the section is about, when it is not about the subject of the composition
             <br/>
           </td>
         </tr>
@@ -1084,7 +1088,7 @@
           </td>
           <td style="vertical-align: top; text-align : var(--ig-left,left); background-color: white; border: 0px #F0F0F0 solid; padding:0px 4px 0px 4px" class="hierarchy">Order of section entries
             <br/>Binding: 
-            <a href="http://terminology.hl7.org/7.1.0/ValueSet-list-order.html">List Order Codes</a> (
+            <a href="http://terminology.hl7.org/7.2.0/ValueSet-list-order.html">List Order Codes</a> (
             <a href="terminologies.html#preferred" title="Instances are encouraged to draw from the specified codes for interoperability purposes but are not required to do so to be considered conformant.">Preferred</a>)
             <br/>
           </td>
@@ -1185,7 +1189,7 @@
   <name value="Composition"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 International / Structured Documents"/>
   <contact>
     <telecom>
@@ -1199,7 +1203,7 @@
       <value value="http://www.hl7.org/Special/committees/structure"/>
     </telecom>
   </contact>
-  <description value="A set of healthcare-related information that is assembled together into a single logical package that provides a single coherent statement of meaning, establishes its own context and has traceability to the author who is making the statement. A Composition defines the structure and narrative content necessary for a document. However, a Composition alone does not constitute a document. Rather, the Composition must be the first entry in a Bundle where Bundle.type=document, and any other resources referenced from Composition must be included as subsequent entries in the Bundle (for example Patient, Practitioner, Encounter, etc.)."/>
+  <description value="Composition provides the structural backbone for assembling a set of healthcare-related information into a single logical package that provides a single coherent statement of meaning, establishes its own context and has traceability to the author who is making the statement."/>
   <jurisdiction>
     <coding>
       <system value="http://unstats.un.org/unsd/methods/m49/m49.htm"/>
@@ -1243,7 +1247,7 @@
     <element id="Composition">
       <path value="Composition"/>
       <short value="A set of resources composed into a single coherent clinical statement with clinical attestation"/>
-      <definition value="A set of healthcare-related information that is assembled together into a single logical package that provides a single coherent statement of meaning, establishes its own context and has traceability to the author who is making the statement. A Composition defines the structure and narrative content necessary for a document. However, a Composition alone does not constitute a document. Rather, the Composition must be the first entry in a Bundle where Bundle.type=document, and any other resources referenced from Composition must be included as subsequent entries in the Bundle (for example Patient, Practitioner, Encounter, etc.)."/>
+      <definition value="Composition provides the structural backbone for assembling a set of healthcare-related information into a single logical package that provides a single coherent statement of meaning, establishes its own context and has traceability to the author who is making the statement."/>
       <comment value="While the focus of this specification is on patient-specific clinical statements, this resource can also apply to other healthcare-related statements such as study protocol designs, healthcare invoices and other activities that are not necessarily patient-specific or clinical."/>
       <min value="0"/>
       <max value="*"/>
@@ -1321,7 +1325,7 @@
       <path value="Composition.id"/>
       <short value="Logical id of this artifact"/>
       <definition value="The logical id of the resource, as used in the URL for the resource. Once assigned, this value never changes."/>
-      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resouce id depends on the given use case."/>
+      <comment value="Within the context of the FHIR RESTful interactions, the resource has an id except for cases like the create and conditional update. Otherwise, the use of the resource id depends on the given use case."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1500,6 +1504,14 @@
     </element>
     <element id="Composition.extension">
       <path value="Composition.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1532,6 +1544,14 @@
     </element>
     <element id="Composition.modifierExtension">
       <path value="Composition.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the resource and that modifies the understanding of the element that contains it and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer is allowed to define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -1645,7 +1665,7 @@
       <path value="Composition.version"/>
       <short value="An explicitly assigned identifier of a variation of the content in the Composition"/>
       <definition value="An explicitly assigned identifier of a variation of the content in the Composition."/>
-      <comment value="While each resource, including the composition itself, has its own version identifier, this is a formal identifier for the logical version of the Composition as a whole. It would remain constant if the resources were moved to a new server, and all got new individual resource versions, for example."/>
+      <comment value="This element is the author-assigned business version of the Composition (analogous to CDA ClinicalDocument.versionNumber). It is distinct from Resource.meta.versionId, which is a server-assigned technical version that every resource carries and that may change whenever the resource is updated on a server. Composition.version reflects the version of a logical document's content and remains constant even if the Composition or its referenced resources are moved between servers and receive new meta.versionId values."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -1731,7 +1751,6 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/CommunicationRequest"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/CoverageEligibilityRequest"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/DeviceRequest"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/EnrollmentRequest"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/MedicationRequest"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/NutritionOrder"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RequestOrchestration"/>
@@ -1766,7 +1785,7 @@
       <path value="Composition.status"/>
       <short value="registered | partial | preliminary | final | amended | corrected | appended | cancelled | entered-in-error | deprecated | unknown"/>
       <definition value="The workflow/clinical status of this composition. The status is a marker for the clinical standing of the document."/>
-      <comment value="If a composition is marked as withdrawn, the compositions/documents in the series, or data from the composition or document series, should never be displayed to a user without being clearly marked as untrustworthy. The flag &quot;entered-in-error&quot; is why this element is labeled as a modifier of other elements.   &#xA;&#xA;Some reporting work flows require that the original narrative of a final document never be altered; instead, only new narrative can be added. The composition resource has no explicit status for explicitly noting whether this business rule is in effect. This would be handled by an extension if required."/>
+      <comment value="See section 2.8.3.2, The workflow/clinical status of the composition, for guidance.  Because the entered-in-error flag changes how this resource and its related elements must be interpreted, status is labeled as a modifier element. Some reporting workflows require that the original narrative of a final document never be altered; instead, only new narrative can be added. The Composition resource has no explicit status for noting whether this business rule is in effect; this would be handled by an extension if required."/>
       <requirements value="Need to be able to mark interim, amended, or withdrawn compositions or documents."/>
       <min value="1"/>
       <max value="1"/>
@@ -1876,7 +1895,7 @@
     <element id="Composition.category">
       <path value="Composition.category"/>
       <short value="Categorization of Composition"/>
-      <definition value="A categorization for the type of the composition - helps for indexing and searching. This may be implied by or derived from the code specified in the Composition Type."/>
+      <definition value="A categorization for the type of the composition - helps with indexing and searching. This may be implied by or derived from the code specified in the Composition Type."/>
       <requirements value="Helps humans to assess whether the composition is of interest when viewing an index of compositions or documents."/>
       <min value="0"/>
       <max value="*"/>
@@ -2022,7 +2041,7 @@
       <path value="Composition.date"/>
       <short value="Composition editing time"/>
       <definition value="The composition editing time, when the composition was last logically changed by the author."/>
-      <comment value="The Last Modified Date on the composition may be after the date of the document was attested without being changed. This means that the date on an amended document is the date of the amendment, not the date of original authorship."/>
+      <comment value="The Last Modified Date on the composition may be after the date the document was attested without being changed. This means that the date on an amended document is the date of the amendment, not the date of original authorship."/>
       <requirements value="dateTime is used for tracking, organizing versions and searching. Note that this is the time of authoring this version of the Composition. When packaged in a document, [Bundle.timestamp](bundle-definitions.html#Bundle.timestamp) is the date of packaging."/>
       <min value="1"/>
       <max value="1"/>
@@ -2200,6 +2219,14 @@
     </element>
     <element id="Composition.participant.extension">
       <path value="Composition.participant.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2231,6 +2258,14 @@
     </element>
     <element id="Composition.participant.modifierExtension">
       <path value="Composition.participant.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2372,6 +2407,8 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Organization"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/CareTeam"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
       </type>
       <constraint>
         <key value="ele-1"/>
@@ -2386,9 +2423,9 @@
     </element>
     <element id="Composition.name">
       <path value="Composition.name"/>
-      <short value="Name for this Composition (computer friendly)"/>
-      <definition value="A natural language name identifying the {{title}}. This name should be usable as an identifier for the module by machine processing applications such as code generation."/>
-      <comment value="The name is not expected to be globally unique. The name should be a simple alphanumeric type name to ensure that it is machine-processing friendly."/>
+      <short value="Computer friendly name"/>
+      <definition value="A machine-friendly identifier suitable for code generation. For example, 'ClinicalDocument' or 'Composition_v2'. See the Constraint description."/>
+      <comment value="The name is not expected to be globally unique. This field is used primarily by computers while the title field includes information for human-display. Composition.type is used to provide a CodeableConcept for the document type when available while Composition.name is an uncoded string. Composition.identifier is used to identify the specific instance of a document."/>
       <requirements value="Support human navigation and code generation."/>
       <min value="0"/>
       <max value="1"/>
@@ -2400,6 +2437,14 @@
       <type>
         <code value="string"/>
       </type>
+      <condition value="cmp-4"/>
+      <constraint>
+        <key value="cmp-4"/>
+        <severity value="warning"/>
+        <human value="Name should start with an uppercase letter (A–Z), be 2 to 255 characters long, and contain only letters, digits, and underscores. Whitespace, hyphens, and other punctuation are not permitted"/>
+        <expression value="%resource.name.exists() implies %resource.name.matches('^[A-Z]([A-Za-z0-9_]){1,254}$')"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/Composition"/>
+      </constraint>
       <constraint>
         <key value="ele-1"/>
         <severity value="error"/>
@@ -2415,7 +2460,7 @@
       <path value="Composition.title"/>
       <short value="Human Readable name/title"/>
       <definition value="Official human-readable label for the composition."/>
-      <comment value="For many compositions, the title is the same as the text or a display name of Composition.type (e.g. a &quot;consultation&quot; or &quot;progress note&quot;). Note that CDA does not make title mandatory, but there are no known cases where it is useful for title to be omitted, so it is mandatory here. Feedback on this requirement is welcome during the trial use period."/>
+      <comment value="For many compositions, the title is the same as the text or a display name of Composition.type (e.g. a &quot;consultation&quot; or &quot;progress note&quot;)."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -2529,6 +2574,14 @@
     </element>
     <element id="Composition.classification.extension">
       <path value="Composition.classification.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2560,6 +2613,14 @@
     </element>
     <element id="Composition.classification.modifierExtension">
       <path value="Composition.classification.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2726,6 +2787,14 @@
     </element>
     <element id="Composition.attester.extension">
       <path value="Composition.attester.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2757,6 +2826,14 @@
     </element>
     <element id="Composition.attester.modifierExtension">
       <path value="Composition.attester.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -2820,7 +2897,7 @@
         </extension>
         <strength value="preferred"/>
         <description value="The way in which a person authenticated a composition."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/composition-attestation-mode"/>
+        <valueSet value="http://terminology.hl7.org/ValueSet/composition-attestation-mode"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -2839,7 +2916,7 @@
       <path value="Composition.attester.time"/>
       <short value="When the composition was attested"/>
       <definition value="When the composition was attested by the party."/>
-      <requirements value="Identifies when the information in the composition was deemed accurate.  (Things may have changed since then.)."/>
+      <requirements value="Identifies when the information in the composition was deemed accurate. (Things may have changed since then.)"/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -3030,6 +3107,14 @@
     </element>
     <element id="Composition.relatesTo.extension">
       <path value="Composition.relatesTo.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3061,6 +3146,14 @@
     </element>
     <element id="Composition.relatesTo.modifierExtension">
       <path value="Composition.relatesTo.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3169,7 +3262,7 @@
       <path value="Composition.event"/>
       <short value="The clinical service(s) being documented"/>
       <definition value="The clinical service, such as a colonoscopy or an appendectomy, being documented."/>
-      <comment value="The event needs to be consistent with the type element, though can provide further information if desired."/>
+      <comment value="The event needs to be consistent with the type element, though it can provide further information if desired."/>
       <requirements value="Provides context for the composition and creates a linkage between a resource describing an event and the composition created describing the event."/>
       <min value="0"/>
       <max value="*"/>
@@ -3229,6 +3322,14 @@
     </element>
     <element id="Composition.event.extension">
       <path value="Composition.event.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3260,6 +3361,14 @@
     </element>
     <element id="Composition.event.modifierExtension">
       <path value="Composition.event.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3332,7 +3441,7 @@
     <element id="Composition.event.detail">
       <path value="Composition.event.detail"/>
       <short value="The event(s) being documented, as code(s), reference(s), or both"/>
-      <definition value="Represents the main clinical acts, such as a colonoscopy or an appendectomy, being documented. In some cases, the event is inherent in the typeCode, such as a &quot;History and Physical Report&quot; in which case the procedure being documented is necessarily a &quot;History and Physical&quot; act. The events may be included as a code or as a reference to an other resource."/>
+      <definition value="Represents the main clinical acts, such as a colonoscopy or an appendectomy, being documented. In some cases, the event is inherent in the typeCode, such as a &quot;History and Physical Report&quot; in which case the procedure being documented is necessarily a &quot;History and Physical&quot; act. The events may be included as a code or as a reference to another resource."/>
       <comment value="An event can further specialize the act inherent in Composition.type, such as where it is simply &quot;Procedure Report&quot; and the procedure was a &quot;colonoscopy&quot;. If one or more events are included, they SHALL NOT conflict with the values inherent in Composition.type as such a conflict would create an ambiguous situation. This short list of codes is provided to be used as key words for certain types of queries."/>
       <min value="0"/>
       <max value="*"/>
@@ -3463,6 +3572,14 @@
     </element>
     <element id="Composition.section.extension">
       <path value="Composition.section.extension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Additional content defined by implementations"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3494,6 +3611,14 @@
     </element>
     <element id="Composition.section.modifierExtension">
       <path value="Composition.section.modifierExtension"/>
+      <slicing>
+        <discriminator>
+          <type value="value"/>
+          <path value="url"/>
+        </discriminator>
+        <description value="Extensions are always sliced by (at least) url"/>
+        <rules value="open"/>
+      </slicing>
       <short value="Extensions that cannot be ignored even if unrecognized"/>
       <definition value="May be used to represent additional information that is not part of the basic definition of the element and that modifies the understanding of the element in which it is contained and/or the understanding of the containing element's descendants. Usually modifier elements provide negation or qualification. To make the use of extensions safe and managable, there is a strict set of governance applied to the definition and use of extensions. Though any implementer can define an extension, there is a set of requirements that SHALL be met as part of the definition of the extension. Applications processing a resource are required to check for modifier extensions.&#xA;&#xA;Modifier extensions SHALL NOT change the meaning of any elements on Resource or DomainResource (including cannot change the meaning of modifierExtension itself)."/>
       <comment value="There can be no stigma associated with the use of extensions by any application, project, or standard - regardless of the institution or jurisdiction that uses or defines the extensions.  The use of extensions is what allows the FHIR specification to retain a core level of simplicity for everyone."/>
@@ -3530,7 +3655,7 @@
       <path value="Composition.section.title"/>
       <short value="Label for section (e.g. for ToC)"/>
       <definition value="The label for this particular section.  This will be part of the rendered content for the document, and is often used to build a table of contents."/>
-      <comment value="The title identifies the section for a human reader. The title must be consistent with the narrative of the resource that is the target of the section.content reference. Generally, sections SHOULD have titles, but in some documents, it is unnecessary or inappropriate. Typically, this is where a section has subsections that have their own adequately distinguishing title,  or documents that only have a single section. Most Implementation Guides will make section title to be a required element."/>
+      <comment value="The title identifies the section for a human reader. The title must be consistent with the narrative of the resource that is the target of the section.content reference. Generally, sections SHOULD have titles, but in some documents, it is unnecessary or inappropriate. Typically, this is where a section has subsections that have their own adequately distinguishing title,  or documents that only have a single section. Most Implementation Guides will make section title a required element."/>
       <requirements value="Section headings are often standardized for different types of documents.  They give guidance to humans on how the document is organized."/>
       <alias value="header"/>
       <alias value="label"/>
@@ -3568,7 +3693,7 @@
       <path value="Composition.section.code"/>
       <short value="Classification of section (recommended)"/>
       <definition value="A code identifying the kind of content contained within the section. This must be consistent with the section title."/>
-      <comment value="The code identifies the section for an automated processor of the document. This is particularly relevant when using profiles to control the structure of the document.   &#xA;&#xA;If the section has content (instead of sub-sections), the section.code does not change the meaning or interpretation of the resource that is the content of the section in the comments for the section.code."/>
+      <comment value="The code identifies the section for an automated processor of the document. This is particularly relevant when using profiles to control the structure of the document.   &#xA;&#xA;If the section has content (instead of sub-sections), the section.code does not change the meaning or interpretation of the resource that is the content of the section."/>
       <requirements value="Provides computable standardized labels to topics within the document."/>
       <min value="0"/>
       <max value="1"/>
@@ -3654,9 +3779,9 @@
     </element>
     <element id="Composition.section.focus">
       <path value="Composition.section.focus"/>
-      <short value="Who/what the section is about, when it is not about the subject of composition"/>
-      <definition value="The actual focus of the section when it is not the subject of the composition, but instead represents something or someone associated with the subject such as (for a patient subject) a spouse, parent, fetus, or donor. If not focus is specified, the focus is assumed to be focus of the parent section, or, for a section in the Composition itself, the subject of the composition. Sections with a focus SHALL only include resources where the logical subject (patient, subject, focus, etc.) matches the section focus, or the resources have no logical subject (few resources)."/>
-      <comment value="Typically, sections in a doument are about the subject of the document, whether that is a  patient, or group of patients, location, or device, or whatever. For some kind of documents, some sections actually contain data about related entities. Typical examples are  a section in a newborn discharge summary concerning the mother, or family history documents, with a section about each family member, though there are many other examples."/>
+      <short value="Who/what the section is about, when it is not about the subject of the composition"/>
+      <definition value="The actual focus of the section when it is not the subject of the composition, but instead represents something or someone associated with the subject such as (for a patient subject) a spouse, parent, fetus, or donor. If no focus is specified, the focus is assumed to be focus of the parent section, or, for a section in the Composition itself, the subject of the composition. Sections with a focus SHALL only include resources where the logical subject (patient, subject, focus, etc.) matches the section focus, or the resources have no logical subject (few resources)."/>
+      <comment value="Typically, sections in a document are about the subject of the document, whether that is a  patient, or group of patients, location, or device, or whatever. For some kinds of documents, some sections actually contain data about related entities. Typical examples are  a section in a newborn discharge summary concerning the mother, or family history documents, with a section about each family member, though there are many other examples."/>
       <min value="0"/>
       <max value="1"/>
       <base>
@@ -3699,6 +3824,7 @@
         <code value="Narrative"/>
       </type>
       <condition value="cmp-1"/>
+      <condition value="cmp-3"/>
       <constraint>
         <key value="ele-1"/>
         <severity value="error"/>
@@ -3828,7 +3954,7 @@
       <path value="Composition.section.emptyReason"/>
       <short value="Why the section is empty"/>
       <definition value="If the section is empty, why the list is empty. An empty section typically has some text explaining the empty reason."/>
-      <comment value="The various reasons for an empty section make a significant interpretation to its interpretation. Note that this code is for use when the entire section content has been suppressed, and not for when individual items are omitted - implementers may consider using a text note or a flag on an entry in these cases."/>
+      <comment value="The various reasons for an empty section make a significant difference to its interpretation. Note that this code is for use when the entire section content has been suppressed, and not for when individual items are omitted - implementers may consider using a text note or a flag on an entry in these cases."/>
       <requirements value="Allows capturing things like &quot;none exist&quot; or &quot;not asked&quot; which can be important for most lists."/>
       <min value="0"/>
       <max value="1"/>
@@ -3905,7 +4031,7 @@
     <element id="Composition">
       <path value="Composition"/>
       <short value="A set of resources composed into a single coherent clinical statement with clinical attestation"/>
-      <definition value="A set of healthcare-related information that is assembled together into a single logical package that provides a single coherent statement of meaning, establishes its own context and has traceability to the author who is making the statement. A Composition defines the structure and narrative content necessary for a document. However, a Composition alone does not constitute a document. Rather, the Composition must be the first entry in a Bundle where Bundle.type=document, and any other resources referenced from Composition must be included as subsequent entries in the Bundle (for example Patient, Practitioner, Encounter, etc.)."/>
+      <definition value="Composition provides the structural backbone for assembling a set of healthcare-related information into a single logical package that provides a single coherent statement of meaning, establishes its own context and has traceability to the author who is making the statement."/>
       <comment value="While the focus of this specification is on patient-specific clinical statements, this resource can also apply to other healthcare-related statements such as study protocol designs, healthcare invoices and other activities that are not necessarily patient-specific or clinical."/>
       <min value="0"/>
       <max value="*"/>
@@ -3989,7 +4115,7 @@
       <path value="Composition.version"/>
       <short value="An explicitly assigned identifier of a variation of the content in the Composition"/>
       <definition value="An explicitly assigned identifier of a variation of the content in the Composition."/>
-      <comment value="While each resource, including the composition itself, has its own version identifier, this is a formal identifier for the logical version of the Composition as a whole. It would remain constant if the resources were moved to a new server, and all got new individual resource versions, for example."/>
+      <comment value="This element is the author-assigned business version of the Composition (analogous to CDA ClinicalDocument.versionNumber). It is distinct from Resource.meta.versionId, which is a server-assigned technical version that every resource carries and that may change whenever the resource is updated on a server. Composition.version reflects the version of a logical document's content and remains constant even if the Composition or its referenced resources are moved between servers and receive new meta.versionId values."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -4046,7 +4172,6 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/CommunicationRequest"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/CoverageEligibilityRequest"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/DeviceRequest"/>
-        <targetProfile value="http://hl7.org/fhir/StructureDefinition/EnrollmentRequest"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/MedicationRequest"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/NutritionOrder"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RequestOrchestration"/>
@@ -4074,7 +4199,7 @@
       <path value="Composition.status"/>
       <short value="registered | partial | preliminary | final | amended | corrected | appended | cancelled | entered-in-error | deprecated | unknown"/>
       <definition value="The workflow/clinical status of this composition. The status is a marker for the clinical standing of the document."/>
-      <comment value="If a composition is marked as withdrawn, the compositions/documents in the series, or data from the composition or document series, should never be displayed to a user without being clearly marked as untrustworthy. The flag &quot;entered-in-error&quot; is why this element is labeled as a modifier of other elements.   &#xA;&#xA;Some reporting work flows require that the original narrative of a final document never be altered; instead, only new narrative can be added. The composition resource has no explicit status for explicitly noting whether this business rule is in effect. This would be handled by an extension if required."/>
+      <comment value="See section 2.8.3.2, The workflow/clinical status of the composition, for guidance.  Because the entered-in-error flag changes how this resource and its related elements must be interpreted, status is labeled as a modifier element. Some reporting workflows require that the original narrative of a final document never be altered; instead, only new narrative can be added. The Composition resource has no explicit status for noting whether this business rule is in effect; this would be handled by an extension if required."/>
       <requirements value="Need to be able to mark interim, amended, or withdrawn compositions or documents."/>
       <min value="1"/>
       <max value="1"/>
@@ -4160,7 +4285,7 @@
     <element id="Composition.category">
       <path value="Composition.category"/>
       <short value="Categorization of Composition"/>
-      <definition value="A categorization for the type of the composition - helps for indexing and searching. This may be implied by or derived from the code specified in the Composition Type."/>
+      <definition value="A categorization for the type of the composition - helps with indexing and searching. This may be implied by or derived from the code specified in the Composition Type."/>
       <requirements value="Helps humans to assess whether the composition is of interest when viewing an index of compositions or documents."/>
       <min value="0"/>
       <max value="*"/>
@@ -4270,7 +4395,7 @@
       <path value="Composition.date"/>
       <short value="Composition editing time"/>
       <definition value="The composition editing time, when the composition was last logically changed by the author."/>
-      <comment value="The Last Modified Date on the composition may be after the date of the document was attested without being changed. This means that the date on an amended document is the date of the amendment, not the date of original authorship."/>
+      <comment value="The Last Modified Date on the composition may be after the date the document was attested without being changed. This means that the date on an amended document is the date of the amendment, not the date of original authorship."/>
       <requirements value="dateTime is used for tracking, organizing versions and searching. Note that this is the time of authoring this version of the Composition. When packaged in a document, [Bundle.timestamp](bundle-definitions.html#Bundle.timestamp) is the date of packaging."/>
       <min value="1"/>
       <max value="1"/>
@@ -4439,6 +4564,8 @@
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/RelatedPerson"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Device"/>
         <targetProfile value="http://hl7.org/fhir/StructureDefinition/Organization"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/CareTeam"/>
+        <targetProfile value="http://hl7.org/fhir/StructureDefinition/Group"/>
       </type>
       <mustSupport value="false"/>
       <isModifier value="false"/>
@@ -4446,15 +4573,23 @@
     </element>
     <element id="Composition.name">
       <path value="Composition.name"/>
-      <short value="Name for this Composition (computer friendly)"/>
-      <definition value="A natural language name identifying the {{title}}. This name should be usable as an identifier for the module by machine processing applications such as code generation."/>
-      <comment value="The name is not expected to be globally unique. The name should be a simple alphanumeric type name to ensure that it is machine-processing friendly."/>
+      <short value="Computer friendly name"/>
+      <definition value="A machine-friendly identifier suitable for code generation. For example, 'ClinicalDocument' or 'Composition_v2'. See the Constraint description."/>
+      <comment value="The name is not expected to be globally unique. This field is used primarily by computers while the title field includes information for human-display. Composition.type is used to provide a CodeableConcept for the document type when available while Composition.name is an uncoded string. Composition.identifier is used to identify the specific instance of a document."/>
       <requirements value="Support human navigation and code generation."/>
       <min value="0"/>
       <max value="1"/>
       <type>
         <code value="string"/>
       </type>
+      <condition value="cmp-4"/>
+      <constraint>
+        <key value="cmp-4"/>
+        <severity value="warning"/>
+        <human value="Name should start with an uppercase letter (A–Z), be 2 to 255 characters long, and contain only letters, digits, and underscores. Whitespace, hyphens, and other punctuation are not permitted"/>
+        <expression value="%resource.name.exists() implies %resource.name.matches('^[A-Z]([A-Za-z0-9_]){1,254}$')"/>
+        <source value="http://hl7.org/fhir/StructureDefinition/Composition"/>
+      </constraint>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="true"/>
@@ -4463,7 +4598,7 @@
       <path value="Composition.title"/>
       <short value="Human Readable name/title"/>
       <definition value="Official human-readable label for the composition."/>
-      <comment value="For many compositions, the title is the same as the text or a display name of Composition.type (e.g. a &quot;consultation&quot; or &quot;progress note&quot;). Note that CDA does not make title mandatory, but there are no known cases where it is useful for title to be omitted, so it is mandatory here. Feedback on this requirement is welcome during the trial use period."/>
+      <comment value="For many compositions, the title is the same as the text or a display name of Composition.type (e.g. a &quot;consultation&quot; or &quot;progress note&quot;)."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -4600,7 +4735,7 @@
         </extension>
         <strength value="preferred"/>
         <description value="The way in which a person authenticated a composition."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/composition-attestation-mode"/>
+        <valueSet value="http://terminology.hl7.org/ValueSet/composition-attestation-mode"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -4619,7 +4754,7 @@
       <path value="Composition.attester.time"/>
       <short value="When the composition was attested"/>
       <definition value="When the composition was attested by the party."/>
-      <requirements value="Identifies when the information in the composition was deemed accurate.  (Things may have changed since then.)."/>
+      <requirements value="Identifies when the information in the composition was deemed accurate. (Things may have changed since then.)"/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -4785,7 +4920,7 @@
       <path value="Composition.event"/>
       <short value="The clinical service(s) being documented"/>
       <definition value="The clinical service, such as a colonoscopy or an appendectomy, being documented."/>
-      <comment value="The event needs to be consistent with the type element, though can provide further information if desired."/>
+      <comment value="The event needs to be consistent with the type element, though it can provide further information if desired."/>
       <requirements value="Provides context for the composition and creates a linkage between a resource describing an event and the composition created describing the event."/>
       <min value="0"/>
       <max value="*"/>
@@ -4832,7 +4967,7 @@
     <element id="Composition.event.detail">
       <path value="Composition.event.detail"/>
       <short value="The event(s) being documented, as code(s), reference(s), or both"/>
-      <definition value="Represents the main clinical acts, such as a colonoscopy or an appendectomy, being documented. In some cases, the event is inherent in the typeCode, such as a &quot;History and Physical Report&quot; in which case the procedure being documented is necessarily a &quot;History and Physical&quot; act. The events may be included as a code or as a reference to an other resource."/>
+      <definition value="Represents the main clinical acts, such as a colonoscopy or an appendectomy, being documented. In some cases, the event is inherent in the typeCode, such as a &quot;History and Physical Report&quot; in which case the procedure being documented is necessarily a &quot;History and Physical&quot; act. The events may be included as a code or as a reference to another resource."/>
       <comment value="An event can further specialize the act inherent in Composition.type, such as where it is simply &quot;Procedure Report&quot; and the procedure was a &quot;colonoscopy&quot;. If one or more events are included, they SHALL NOT conflict with the values inherent in Composition.type as such a conflict would create an ambiguous situation. This short list of codes is provided to be used as key words for certain types of queries."/>
       <min value="0"/>
       <max value="*"/>
@@ -4914,7 +5049,7 @@
       <path value="Composition.section.title"/>
       <short value="Label for section (e.g. for ToC)"/>
       <definition value="The label for this particular section.  This will be part of the rendered content for the document, and is often used to build a table of contents."/>
-      <comment value="The title identifies the section for a human reader. The title must be consistent with the narrative of the resource that is the target of the section.content reference. Generally, sections SHOULD have titles, but in some documents, it is unnecessary or inappropriate. Typically, this is where a section has subsections that have their own adequately distinguishing title,  or documents that only have a single section. Most Implementation Guides will make section title to be a required element."/>
+      <comment value="The title identifies the section for a human reader. The title must be consistent with the narrative of the resource that is the target of the section.content reference. Generally, sections SHOULD have titles, but in some documents, it is unnecessary or inappropriate. Typically, this is where a section has subsections that have their own adequately distinguishing title,  or documents that only have a single section. Most Implementation Guides will make section title a required element."/>
       <requirements value="Section headings are often standardized for different types of documents.  They give guidance to humans on how the document is organized."/>
       <alias value="header"/>
       <alias value="label"/>
@@ -4940,7 +5075,7 @@
       <path value="Composition.section.code"/>
       <short value="Classification of section (recommended)"/>
       <definition value="A code identifying the kind of content contained within the section. This must be consistent with the section title."/>
-      <comment value="The code identifies the section for an automated processor of the document. This is particularly relevant when using profiles to control the structure of the document.   &#xA;&#xA;If the section has content (instead of sub-sections), the section.code does not change the meaning or interpretation of the resource that is the content of the section in the comments for the section.code."/>
+      <comment value="The code identifies the section for an automated processor of the document. This is particularly relevant when using profiles to control the structure of the document.   &#xA;&#xA;If the section has content (instead of sub-sections), the section.code does not change the meaning or interpretation of the resource that is the content of the section."/>
       <requirements value="Provides computable standardized labels to topics within the document."/>
       <min value="0"/>
       <max value="1"/>
@@ -5002,9 +5137,9 @@
     </element>
     <element id="Composition.section.focus">
       <path value="Composition.section.focus"/>
-      <short value="Who/what the section is about, when it is not about the subject of composition"/>
-      <definition value="The actual focus of the section when it is not the subject of the composition, but instead represents something or someone associated with the subject such as (for a patient subject) a spouse, parent, fetus, or donor. If not focus is specified, the focus is assumed to be focus of the parent section, or, for a section in the Composition itself, the subject of the composition. Sections with a focus SHALL only include resources where the logical subject (patient, subject, focus, etc.) matches the section focus, or the resources have no logical subject (few resources)."/>
-      <comment value="Typically, sections in a doument are about the subject of the document, whether that is a  patient, or group of patients, location, or device, or whatever. For some kind of documents, some sections actually contain data about related entities. Typical examples are  a section in a newborn discharge summary concerning the mother, or family history documents, with a section about each family member, though there are many other examples."/>
+      <short value="Who/what the section is about, when it is not about the subject of the composition"/>
+      <definition value="The actual focus of the section when it is not the subject of the composition, but instead represents something or someone associated with the subject such as (for a patient subject) a spouse, parent, fetus, or donor. If no focus is specified, the focus is assumed to be focus of the parent section, or, for a section in the Composition itself, the subject of the composition. Sections with a focus SHALL only include resources where the logical subject (patient, subject, focus, etc.) matches the section focus, or the resources have no logical subject (few resources)."/>
+      <comment value="Typically, sections in a document are about the subject of the document, whether that is a  patient, or group of patients, location, or device, or whatever. For some kinds of documents, some sections actually contain data about related entities. Typical examples are  a section in a newborn discharge summary concerning the mother, or family history documents, with a section about each family member, though there are many other examples."/>
       <min value="0"/>
       <max value="1"/>
       <type>
@@ -5030,6 +5165,7 @@
         <code value="Narrative"/>
       </type>
       <condition value="cmp-1"/>
+      <condition value="cmp-3"/>
       <mustSupport value="false"/>
       <isModifier value="false"/>
       <isSummary value="false"/>
@@ -5116,7 +5252,7 @@
       <path value="Composition.section.emptyReason"/>
       <short value="Why the section is empty"/>
       <definition value="If the section is empty, why the list is empty. An empty section typically has some text explaining the empty reason."/>
-      <comment value="The various reasons for an empty section make a significant interpretation to its interpretation. Note that this code is for use when the entire section content has been suppressed, and not for when individual items are omitted - implementers may consider using a text note or a flag on an entry in these cases."/>
+      <comment value="The various reasons for an empty section make a significant difference to its interpretation. Note that this code is for use when the entire section content has been suppressed, and not for when individual items are omitted - implementers may consider using a text note or a flag on an entry in these cases."/>
       <requirements value="Allows capturing things like &quot;none exist&quot; or &quot;not asked&quot; which can be important for most lists."/>
       <min value="0"/>
       <max value="1"/>

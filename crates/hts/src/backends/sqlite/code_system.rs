@@ -461,22 +461,24 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                     // Match the IG `validation/cs-code-bad-code` text format
                     // exactly: "Unknown code 'X' in the CodeSystem 'url'
                     // version 'Y'" (with version when known).
-                    let row: Option<(Option<String>, Option<String>)> = conn
+                    //
+                    // Report the row we ACTUALLY validated against. This used to
+                    // re-query by URL with its own `ORDER BY version DESC`, which
+                    // could name a different row than the one `resolve_code_system`
+                    // chose a few lines above — so a miss could cite a version the
+                    // code was never checked in (and, once provenance ranking is in
+                    // play, routinely would). Both facts are already in hand:
+                    // `resolved_cs_version` from the resolver, and `content` keyed
+                    // on the resolved `system_id` rather than the URL.
+                    let cs_version_str = resolved_cs_version.clone();
+                    let cs_content: Option<String> = conn
                         .query_row(
-                            "SELECT version, content FROM code_systems \
-                             WHERE url = ?1 \
-                             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                            rusqlite::params![system],
-                            |row| {
-                                Ok((
-                                    row.get::<_, Option<String>>(0)?,
-                                    row.get::<_, Option<String>>(1)?,
-                                ))
-                            },
+                            "SELECT content FROM code_systems WHERE id = ?1",
+                            rusqlite::params![&system_id],
+                            |row| row.get::<_, Option<String>>(0),
                         )
-                        .ok();
-                    let cs_version_str = row.as_ref().and_then(|(v, _)| v.clone());
-                    let cs_content = row.as_ref().and_then(|(_, c)| c.clone());
+                        .ok()
+                        .flatten();
                     // Fragment CodeSystems carry only a subset of the real
                     // corpus, so an unknown code is not necessarily invalid —
                     // it may live in a different fragment of the same system.
@@ -695,14 +697,12 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             let conn = pool
                 .get()
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
+            let sql = format!(
+                "SELECT version FROM code_systems WHERE url = ?1 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
             let version: Option<String> = conn
-                .query_row(
-                    "SELECT version FROM code_systems \
-                         WHERE url = ?1 \
-                         ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                    rusqlite::params![url_owned],
-                    |row| row.get(0),
-                )
+                .query_row(&sql, rusqlite::params![url_owned], |row| row.get(0))
                 .optional()
                 .map_err(|e| HtsError::StorageError(e.to_string()))?
                 .flatten();
@@ -781,19 +781,17 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
             // by terminology packages), then highest version, then lowest id.
             // `json_extract` returns NULL when the column or path is absent,
             // which becomes Option::None in Rust.
+            let sql = format!(
+                "SELECT json_extract(resource_json, '$.language') \
+                 FROM code_systems \
+                 WHERE url = ?1 \
+                 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
             let lang: Option<String> = conn
-                .query_row(
-                    "SELECT json_extract(resource_json, '$.language') \
-                     FROM code_systems \
-                     WHERE url = ?1 \
-                     ORDER BY (CASE WHEN EXISTS \
-                         (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
-                         THEN 0 ELSE 1 END), \
-                         COALESCE(version, '') DESC, id \
-                     LIMIT 1",
-                    rusqlite::params![url_owned],
-                    |row| row.get::<_, Option<String>>(0),
-                )
+                .query_row(&sql, rusqlite::params![url_owned], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
                 .optional()
                 .map_err(|e| HtsError::StorageError(e.to_string()))?
                 .flatten();
@@ -1301,21 +1299,21 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
             // Read content + resource_json + version in one query so we can
             // confirm the row really is a supplement before returning.
+            let sql = format!(
+                "SELECT content, version, json_extract(resource_json, '$.supplements') \
+                 FROM code_systems \
+                 WHERE url = ?1 \
+                 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
             let row: Option<(String, Option<String>, Option<String>)> = conn
-                .query_row(
-                    "SELECT content, version, json_extract(resource_json, '$.supplements')
-                     FROM code_systems
-                     WHERE url = ?1
-                     LIMIT 1",
-                    rusqlite::params![supplement_url],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
+                .query_row(&sql, rusqlite::params![supplement_url], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
                 .optional()
                 .map_err(|e| HtsError::StorageError(e.to_string()))?;
             let Some((content, version, target)) = row else {
@@ -1534,14 +1532,16 @@ impl CodeSystemOperations for SqliteTerminologyBackend {
                 .map_err(|e| HtsError::StorageError(format!("Pool error: {e}")))?;
             // Read the base CodeSystem's resource_json (highest version), then
             // walk concept[] picking entries whose code is in the requested set.
+            let sql = format!(
+                "SELECT resource_json FROM code_systems \
+                 WHERE url = ?1 AND content != 'supplement' \
+                 ORDER BY {} LIMIT 1",
+                crate::backends::cs_precedence_order_by("code_systems")
+            );
             let resource_json: Option<String> = conn
-                .query_row(
-                    "SELECT resource_json FROM code_systems
-                     WHERE url = ?1 AND content != 'supplement'
-                     ORDER BY COALESCE(version, '') DESC LIMIT 1",
-                    rusqlite::params![system_url],
-                    |row| row.get::<_, Option<String>>(0),
-                )
+                .query_row(&sql, rusqlite::params![system_url], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
                 .ok()
                 .flatten();
             let mut out: std::collections::HashMap<String, serde_json::Value> =
@@ -1685,14 +1685,14 @@ fn cs_property_local_codes(
     canonical: &str,
 ) -> Vec<String> {
     let mut codes: Vec<String> = vec![canonical.to_string()];
+    let sql = format!(
+        "SELECT resource_json FROM code_systems WHERE url = ?1 ORDER BY {} LIMIT 1",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let resource_json: Option<String> = conn
-        .query_row(
-            "SELECT resource_json FROM code_systems \
-             WHERE url = ?1 \
-             ORDER BY COALESCE(version, '') DESC LIMIT 1",
-            rusqlite::params![system_url],
-            |row| row.get::<_, Option<String>>(0),
-        )
+        .query_row(&sql, rusqlite::params![system_url], |row| {
+            row.get::<_, Option<String>>(0)
+        })
         .ok()
         .flatten();
     let suffix = format!("#{canonical}");
@@ -1825,35 +1825,26 @@ fn resolve_code_system_uncached(
     Ok(chosen)
 }
 
-/// Fetch every (id, name, version) row for `url`.
+/// Fetch every (id, name, version) row for `url`, best candidate first.
 ///
-/// Sort order (see `docs/ig-publisher-compatibility.md`):
-/// complete/supplement → rows with concepts → highest version → id.
-/// Ensures full LOINC/SNOMED imports beat empty stubs when IG Publisher validates
-/// with unpinned or `version=current` requests.
+/// Ordering comes from [`crate::backends::cs_precedence_order_by`] — the single shared
+/// definition of same-URL precedence, embedded verbatim so this cannot drift
+/// from the Postgres resolver. See `docs/ig-publisher-compatibility.md`.
 fn fetch_versions(
     conn: &rusqlite::Connection,
     url: &str,
     date: Option<&str>,
 ) -> Result<Vec<(String, String, Option<String>)>, HtsError> {
+    let sql = format!(
+        "SELECT id, COALESCE(name, url), version \
+         FROM code_systems \
+         WHERE url = ?1 \
+           AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2) \
+         ORDER BY {}",
+        crate::backends::cs_precedence_order_by("code_systems")
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id, COALESCE(name, url), version \
-             FROM code_systems \
-             WHERE url = ?1 \
-               AND (?2 IS NULL OR json_extract(resource_json, '$.date') <= ?2) \
-             ORDER BY (CASE COALESCE(content, 'complete') \
-                            WHEN 'complete'   THEN 0 \
-                            WHEN 'supplement' THEN 0 \
-                            WHEN 'fragment'   THEN 1 \
-                            WHEN 'example'    THEN 1 \
-                            WHEN 'not-present' THEN 2 \
-                            ELSE 1 END), \
-                      (CASE WHEN EXISTS \
-                          (SELECT 1 FROM concepts c WHERE c.system_id = code_systems.id) \
-                          THEN 0 ELSE 1 END), \
-                      COALESCE(version, '') DESC, id",
-        )
+        .prepare(&sql)
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     let rows = stmt
@@ -2094,15 +2085,20 @@ fn fetch_designations_cross_version(
     exclude_system_id: &str,
     lang: &str,
 ) -> Result<Vec<DesignationValue>, HtsError> {
+    // Ranked by the same precedence as the primary resolver, so the "next best
+    // other row" we fall back to is the one the server would have picked had the
+    // resolved row not existed — not merely the highest version string.
+    let sql = format!(
+        "SELECT cd.language, cd.use_system, cd.use_code, cd.value, COALESCE(s.version, '') \
+         FROM concept_designations cd \
+         JOIN concepts c ON c.id = cd.concept_id \
+         JOIN code_systems s ON s.id = c.system_id \
+         WHERE s.url = ?1 AND c.code = ?2 AND s.id <> ?3 \
+         ORDER BY {}, cd.id",
+        crate::backends::cs_precedence_order_by("s")
+    );
     let mut stmt = conn
-        .prepare_cached(
-            "SELECT cd.language, cd.use_system, cd.use_code, cd.value, COALESCE(s.version, '') \
-             FROM concept_designations cd \
-             JOIN concepts c ON c.id = cd.concept_id \
-             JOIN code_systems s ON s.id = c.system_id \
-             WHERE s.url = ?1 AND c.code = ?2 AND s.id <> ?3 \
-             ORDER BY COALESCE(s.version, '') DESC, cd.id",
-        )
+        .prepare_cached(&sql)
         .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     let rows: Vec<(DesignationValue, String)> = stmt

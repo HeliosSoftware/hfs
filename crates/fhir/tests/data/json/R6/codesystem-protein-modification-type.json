@@ -1,0 +1,119 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "protein-modification-type",
+  "meta": {
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem protein-modification-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"protein-modification-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcprotein-modification-type\"\u003e \u003c/a\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/protein-modification-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ePEGylated\u003ca name\u003d\"protein-modification-type-PEGylated\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePEGylated\u003c/td\u003e\u003ctd\u003eConjugated to one or more polyethylene glycol (PEG) chains for half-life extension. Examples: pegfilgrastim, peginterferon, certolizumab pegol.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003elipidated\u003ca name\u003d\"protein-modification-type-lipidated\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLipidated\u003c/td\u003e\u003ctd\u003eConjugated to a fatty acid chain (acylation) for half-life extension via albumin binding. Examples: semaglutide, liraglutide, insulin detemir, insulin degludec.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eFc-fused\u003ca name\u003d\"protein-modification-type-Fc-fused\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFc fusion\u003c/td\u003e\u003ctd\u003eFused to an immunoglobulin Fc region for half-life extension and effector function. Examples: etanercept, abatacept, aflibercept, dulaglutide.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ealbumin-fused\u003ca name\u003d\"protein-modification-type-albumin-fused\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAlbumin fusion\u003c/td\u003e\u003ctd\u003eFused to human serum albumin for half-life extension. Example: albiglutide.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003edrug-conjugated\u003ca name\u003d\"protein-modification-type-drug-conjugated\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDrug-conjugated (ADC)\u003c/td\u003e\u003ctd\u003eConjugated to a small-molecule drug payload via a linker (antibody-drug conjugate). Examples: trastuzumab emtansine, brentuximab vedotin, gemtuzumab ozogamicin.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epolysaccharide-conjugated\u003ca name\u003d\"protein-modification-type-polysaccharide-conjugated\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePolysaccharide-conjugated\u003c/td\u003e\u003ctd\u003eConjugated to a polysaccharide antigen for vaccine immunogenicity. Examples: Hib, pneumococcal and meningococcal conjugate vaccines.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eglycoengineered\u003ca name\u003d\"protein-modification-type-glycoengineered\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGlycoengineered\u003c/td\u003e\u003ctd\u003eGlycan structure engineered (e.g. afucosylated) to alter biological activity. Examples: obinutuzumab, mogamulizumab (enhanced ADCC).\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eamino-acid-substituted\u003ca name\u003d\"protein-modification-type-amino-acid-substituted\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAmino acid substituted\u003c/td\u003e\u003ctd\u003eSequence carries one or more amino acid substitutions relative to a natural or parent protein. Examples: insulin analogs lispro, aspart, glargine.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003etruncated\u003ca name\u003d\"protein-modification-type-truncated\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eTruncated\u003c/td\u003e\u003ctd\u003eSequence is shortened relative to the parent protein.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ebiotinylated\u003ca name\u003d\"protein-modification-type-biotinylated\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBiotinylated\u003c/td\u003e\u003ctd\u003eCovalently labelled with biotin. Typical for research or diagnostic reagents.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efluorescent-labeled\u003ca name\u003d\"protein-modification-type-fluorescent-labeled\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFluorescent labelled\u003c/td\u003e\u003ctd\u003eCovalently labelled with a fluorescent dye. Typical for imaging or flow-cytometry reagents.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/protein-modification-type",
+  "version": "6.0.0-ballot4",
+  "name": "ProteinModificationTypeExample",
+  "title": "Protein Modification Type",
+  "status": "active",
+  "experimental": true,
+  "date": "2026-06-30",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "A high-level summary of how a protein has been modified, e.g. PEGylation, lipidation, Fc fusion. Useful for categorising modified biologics without enumerating the detailed chemistry.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/protein-modification-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "PEGylated",
+      "display": "PEGylated",
+      "definition": "Conjugated to one or more polyethylene glycol (PEG) chains for half-life extension. Examples: pegfilgrastim, peginterferon, certolizumab pegol."
+    },
+    {
+      "code": "lipidated",
+      "display": "Lipidated",
+      "definition": "Conjugated to a fatty acid chain (acylation) for half-life extension via albumin binding. Examples: semaglutide, liraglutide, insulin detemir, insulin degludec."
+    },
+    {
+      "code": "Fc-fused",
+      "display": "Fc fusion",
+      "definition": "Fused to an immunoglobulin Fc region for half-life extension and effector function. Examples: etanercept, abatacept, aflibercept, dulaglutide."
+    },
+    {
+      "code": "albumin-fused",
+      "display": "Albumin fusion",
+      "definition": "Fused to human serum albumin for half-life extension. Example: albiglutide."
+    },
+    {
+      "code": "drug-conjugated",
+      "display": "Drug-conjugated (ADC)",
+      "definition": "Conjugated to a small-molecule drug payload via a linker (antibody-drug conjugate). Examples: trastuzumab emtansine, brentuximab vedotin, gemtuzumab ozogamicin."
+    },
+    {
+      "code": "polysaccharide-conjugated",
+      "display": "Polysaccharide-conjugated",
+      "definition": "Conjugated to a polysaccharide antigen for vaccine immunogenicity. Examples: Hib, pneumococcal and meningococcal conjugate vaccines."
+    },
+    {
+      "code": "glycoengineered",
+      "display": "Glycoengineered",
+      "definition": "Glycan structure engineered (e.g. afucosylated) to alter biological activity. Examples: obinutuzumab, mogamulizumab (enhanced ADCC)."
+    },
+    {
+      "code": "amino-acid-substituted",
+      "display": "Amino acid substituted",
+      "definition": "Sequence carries one or more amino acid substitutions relative to a natural or parent protein. Examples: insulin analogs lispro, aspart, glargine."
+    },
+    {
+      "code": "truncated",
+      "display": "Truncated",
+      "definition": "Sequence is shortened relative to the parent protein."
+    },
+    {
+      "code": "biotinylated",
+      "display": "Biotinylated",
+      "definition": "Covalently labelled with biotin. Typical for research or diagnostic reagents."
+    },
+    {
+      "code": "fluorescent-labeled",
+      "display": "Fluorescent labelled",
+      "definition": "Covalently labelled with a fluorescent dye. Typical for imaging or flow-cytometry reagents."
+    }
+  ]
+}

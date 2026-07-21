@@ -2,11 +2,11 @@
   "resourceType": "ValueSet",
   "id": "specimen-container-type",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
-    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet specimen-container-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"specimen-container-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcspecimen-container-type\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://www.snomed.org/\"\u003e\u003ccode\u003ehttp://snomed.info/sct\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e where concept  is-a 434711009 (Specimen container (physical object))\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet specimen-container-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"specimen-container-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcspecimen-container-type\"\u003e \u003c/a\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://www.snomed.org/\"\u003e\u003ccode\u003ehttp://snomed.info/sct\u003c/code\u003e\u003c/a\u003e\u003cspan title\u003d\"Version is not explicitly stated. No matching Code System found\"\u003e version Not Stated (use latest from terminology server)\u003c/span\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/434711009\"\u003e434711009\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSpecimen container (physical object)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/434746001\"\u003e434746001\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSpecimen vial (physical object)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/434822004\"\u003e434822004\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSpecimen well (physical object)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/713791004\"\u003e713791004\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBreath specimen container (physical object)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/1331905008\"\u003e1331905008\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCytology specimen vial containing preservative fluid (physical object)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/702281005\"\u003e702281005\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eEvacuated blood collection tube, thrombin/clot activator/gel separator\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/702232008\"\u003e702232008\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSweat specimen container IVD\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/702244006\"\u003e702244006\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSterile urine specimen container\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
   },
   "extension": [
     {
@@ -55,7 +55,7 @@
       ]
     }
   ],
-  "description": "Containers which may hold specimens or specimen containers. Include codes  SNOMED CT(http://snomed.info/sct) where concept is-a 434711009 (Specimen container (physical object))",
+  "description": "Containers which may hold specimens or specimen containers.",
   "jurisdiction": [
     {
       "coding": [
@@ -72,11 +72,38 @@
     "include": [
       {
         "system": "http://snomed.info/sct",
-        "filter": [
+        "concept": [
           {
-            "property": "concept",
-            "op": "is-a",
-            "value": "434711009"
+            "code": "434711009",
+            "display": "Specimen container (physical object)"
+          },
+          {
+            "code": "434746001",
+            "display": "Specimen vial (physical object)"
+          },
+          {
+            "code": "434822004",
+            "display": "Specimen well (physical object)"
+          },
+          {
+            "code": "713791004",
+            "display": "Breath specimen container (physical object)"
+          },
+          {
+            "code": "1331905008",
+            "display": "Cytology specimen vial containing preservative fluid (physical object)"
+          },
+          {
+            "code": "702281005",
+            "display": "Evacuated blood collection tube, thrombin/clot activator/gel separator"
+          },
+          {
+            "code": "702232008",
+            "display": "Sweat specimen container IVD"
+          },
+          {
+            "code": "702244006",
+            "display": "Sterile urine specimen container"
           }
         ]
       }

@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "nutrition-product-category",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -41,7 +41,7 @@
       ]
     }
   ],
-  "description": "This value set represents codes for categories of nutrition products.  It includes all of the codes from the Food Type Modifiers valueset.  It include codes from [SNOMED CT](http://snomed.info/sct) where concept is Breast Milk (226789007) and its sub-concepts, Infant Formula (412413001) and its sub-concepts, Enteral and Supplement Feeds (346415002) and its sub-concepts, Drinks (226465004) and its sub-concepts, Water (11713004), Potable Water (890302005) and its sub-concepts, and 444923006 (Tap Water).",
+  "description": "This value set represents codes for categories of nutrition products.  It includes all of the codes from the Food Type Modifiers valueset.  It include codes from [SNOMED CT](http://snomed.info/sct/) where concept is Breast Milk (226789007) and its sub-concepts, Infant Formula (412413001) and its sub-concepts, Enteral and Supplement Feeds (346415002) and its sub-concepts, Drinks (226465004) and its sub-concepts, Water (11713004), Potable Water (890302005) and its sub-concepts, and 444923006 (Tap Water).",
   "jurisdiction": [
     {
       "coding": [

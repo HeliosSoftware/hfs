@@ -16,6 +16,12 @@
 //! assertion in the SMART Backend Services style) is planned and is the
 //! reason the trait carries an `audience` argument — that lets the future
 //! signer scope tokens per receiver. The current impls ignore it.
+//!
+//! Consumers that need this today: the web UI's server-side self-call
+//! (`crates/hfs/src/main.rs`, mounting `helios_ui`) currently uses the static
+//! bearer, so an auth-enabled deployment must provision `HFS_OUTBOUND_BEARER_TOKEN`
+//! with a valid token or the UI's conformance pages degrade. See the
+//! `TODO(service-token)` there.
 
 use std::sync::Arc;
 

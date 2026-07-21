@@ -23,7 +23,7 @@
   <name value="xhtml"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-06-13T17:13:29+00:00"/>
+  <date value="2026-07-17T03:44:13+00:00"/>
   <publisher value="HL7 FHIR Standard"/>
   <contact>
     <telecom>
@@ -49,7 +49,7 @@
   <kind value="primitive-type"/>
   <abstract value="false"/>
   <type value="xhtml"/>
-  <baseDefinition value="http://hl7.org/fhir/StructureDefinition/Element"/>
+  <baseDefinition value="http://hl7.org/fhir/StructureDefinition/PrimitiveType"/>
   <derivation value="specialization"/>
   <snapshot>
     <element id="xhtml">
@@ -79,7 +79,7 @@
       <short value="xml:id (or equivalent in JSON)"/>
       <definition value="unique id for the element within a resource (for internal references)"/>
       <min value="0"/>
-      <max value="1"/>
+      <max value="0"/>
       <base>
         <path value="Element.id"/>
         <min value="0"/>
@@ -158,6 +158,10 @@
       <definition value="XHTML"/>
       <min value="0"/>
       <max value="*"/>
+    </element>
+    <element id="xhtml.id">
+      <path value="xhtml.id"/>
+      <max value="0"/>
     </element>
     <element id="xhtml.extension">
       <path value="xhtml.extension"/>

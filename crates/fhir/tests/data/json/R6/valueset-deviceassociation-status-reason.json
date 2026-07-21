@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "deviceassociation-status-reason",
   "meta": {
-    "lastUpdated": "2026-06-13T17:13:29.148+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -16,29 +16,15 @@
     {
       "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
       "valueCode": "normative"
-    },
-    {
-      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
-      "valueInteger": 0
     }
   ],
   "url": "http://hl7.org/fhir/ValueSet/deviceassociation-status-reason",
   "version": "6.0.0-ballot4",
-  "name": "DeviceAssociationCodes",
+  "name": "DeviceAssociationStatusReasonCodes",
   "title": "DeviceAssociation Status Reason Codes",
   "status": "active",
   "experimental": false,
-  "publisher": "FHIR Project team",
-  "contact": [
-    {
-      "telecom": [
-        {
-          "system": "url",
-          "value": "http://hl7.org/fhir"
-        }
-      ]
-    }
-  ],
+  "publisher": "HL7 International",
   "description": "DeviceAssociation Status Reason Codes",
   "jurisdiction": [
     {
