@@ -770,6 +770,12 @@ impl ResourceStorage for S3Backend {
     // bucket-per-tenant mode without a default system bucket there is nowhere
     // cross-tenant to keep the records, so the registry is unsupported there.
 
+    fn bulk_write_concurrency(&self) -> usize {
+        // One PUT per resource; S3 absorbs parallel writers trivially, and this
+        // turns a ~1.4k-object conformance seed from minutes into seconds.
+        32
+    }
+
     fn supports_tenant_registry(&self) -> bool {
         self.registry_location().is_some()
     }

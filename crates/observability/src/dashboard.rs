@@ -45,7 +45,7 @@ use chrono::{DateTime, Utc};
 /// (`count_deltas_by_bucket`), not from the current rows' `last_updated`, so
 /// buckets do not shift when a resource is edited. That is what makes the
 /// sub-day windows meaningful rather than merely finer-grained.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DashboardWindow {
     /// Last hour, in one-minute buckets (60 points).
     LastHour,
@@ -172,12 +172,100 @@ fn provider() -> Option<Arc<dyn DashboardProvider>> {
     PROVIDER.read().ok().and_then(|guard| guard.clone())
 }
 
-/// Fetch a fresh dashboard snapshot over `window`, or `None` when no provider is
+/// One cached window: the last computed snapshot (if any) and whether a
+/// compute task is currently in flight for it.
+struct CacheEntry {
+    value: Option<(std::time::Instant, DashboardSnapshot)>,
+    computing: bool,
+}
+
+static CACHE: RwLock<Option<std::collections::HashMap<DashboardWindow, CacheEntry>>> =
+    RwLock::new(None);
+
+/// How long a computed snapshot is served without recomputing.
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a cold request waits for the first compute before falling back to
+/// placeholder figures. Long enough for row-store backends (milliseconds);
+/// deliberately far below what an object-store scan can take.
+const COLD_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Fetch a dashboard snapshot over `window`, or `None` when no provider is
 /// registered (e.g. a server build without persistence, or the standalone UI
-/// example). The UI falls back to placeholder figures in that case.
+/// example) or the first compute is still in flight. The UI falls back to
+/// placeholder figures in that case.
+///
+/// Snapshots are cached per window and recomputed in the background: a request
+/// inside [`CACHE_TTL`] returns the cached value, a stale request returns the
+/// stale value immediately while one refresh task recomputes, and a cold
+/// request waits up to [`COLD_WAIT`] before degrading to `None`. This keeps
+/// page loads O(1) even on backends where computing the snapshot walks storage
+/// (the S3 primary reads one object per resource — minutes once conformance
+/// seeding has populated the store, #326).
 pub async fn snapshot(window: DashboardWindow) -> Option<DashboardSnapshot> {
     let provider = provider()?;
-    Some(provider.snapshot(window).await)
+
+    // One pass under the lock: serve fresh hits, note staleness, and claim the
+    // compute slot if nobody holds it.
+    let (cached, spawn_compute) = {
+        let mut guard = CACHE.write().ok()?;
+        let cache = guard.get_or_insert_with(std::collections::HashMap::new);
+        let entry = cache.entry(window).or_insert(CacheEntry {
+            value: None,
+            computing: false,
+        });
+        if let Some((at, value)) = &entry.value
+            && at.elapsed() < CACHE_TTL
+        {
+            return Some(value.clone());
+        }
+        let spawn_compute = !entry.computing;
+        if spawn_compute {
+            entry.computing = true;
+        }
+        (entry.value.clone(), spawn_compute)
+    };
+
+    if spawn_compute {
+        tokio::spawn(async move {
+            let value = provider.snapshot(window).await;
+            if let Ok(mut guard) = CACHE.write()
+                && let Some(cache) = guard.as_mut()
+                && let Some(entry) = cache.get_mut(&window)
+            {
+                entry.value = Some((std::time::Instant::now(), value));
+                entry.computing = false;
+            }
+        });
+    }
+
+    // Stale beats absent: serve it now, the refresh lands for the next load.
+    if let Some((_, value)) = cached {
+        return Some(value);
+    }
+
+    // Cold: give a fast backend a beat to fill the cache before degrading.
+    let deadline = std::time::Instant::now() + COLD_WAIT;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(guard) = CACHE.read()
+            && let Some(value) = guard
+                .as_ref()
+                .and_then(|c| c.get(&window))
+                .and_then(|e| e.value.as_ref())
+        {
+            return Some(value.1.clone());
+        }
+    }
+    None
+}
+
+/// Drops every cached snapshot so the next request recomputes. Test-only: the
+/// cache is process-global, and tests re-register providers.
+#[doc(hidden)]
+pub fn reset_snapshot_cache() {
+    if let Ok(mut guard) = CACHE.write() {
+        *guard = None;
+    }
 }
 
 #[cfg(test)]
