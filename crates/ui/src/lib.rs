@@ -39,6 +39,7 @@
 mod compartments;
 mod conformance;
 mod editor;
+mod history;
 mod i18n;
 mod json_view;
 mod search_params;
@@ -276,6 +277,38 @@ struct StatusPartial {
     i18n: I18n,
 }
 
+/// History & Versions screen (#236, Figma "History & Versions"): the version
+/// rail and the two-layer diff. The shell is server-rendered; the version list
+/// and the two compared versions are fetched by the browser from the ordinary
+/// `_history` / `vread` FHIR API, then posted to [`history_diff`] to render.
+#[derive(Template)]
+#[template(path = "pages/history.html")]
+struct HistoryPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    /// Whether the sidebar links to the natural-language search page (#255).
+    nl_enabled: bool,
+}
+
+/// The rendered diff fragment, swapped in when the version selection changes.
+#[derive(Template)]
+#[template(path = "partials/history-diff.html")]
+struct HistoryDiffFragment {
+    i18n: I18n,
+    diff: history::Diff,
+    /// The versions being compared, for the heading (`v3 → v4`).
+    from_label: String,
+    to_label: String,
+    show_metadata: bool,
+    /// A version was deleted (an R6 destructive op): render a state banner
+    /// rather than a diff against a tombstone.
+    deleted: bool,
+    /// The two documents could not be parsed — the fragment says so instead of
+    /// rendering an empty diff.
+    parse_error: bool,
+}
+
 /// One `<option>` in the search-builder's parameter datalist.
 struct ParamOption {
     code: String,
@@ -373,6 +406,11 @@ pub fn mount_with_conformance_source(
             axum::routing::post(editor::render_body),
         )
         .route("/ui/status", get(status))
+        .route("/ui/history", get(history_page))
+        // The diff is computed server-side (the decision in
+        // docs/history-diff-rendering.md); the browser posts the two versions
+        // it fetched from `_history`.
+        .route("/ui/history/diff", axum::routing::post(history_diff))
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete));
@@ -603,6 +641,71 @@ async fn status(
             .await,
         )
     }
+}
+
+/// History & Versions page shell.
+async fn history_page(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    render(HistoryPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "history",
+        nl_enabled: state.nl.enabled,
+    })
+}
+
+/// A diff request: the two versions to compare, and the metadata toggle.
+#[derive(serde::Deserialize)]
+struct DiffForm {
+    /// The older version's JSON.
+    from: String,
+    /// The newer version's JSON.
+    to: String,
+    #[serde(default)]
+    from_label: String,
+    #[serde(default)]
+    to_label: String,
+    #[serde(default)]
+    show_metadata: String,
+    /// Set when the newer side is a deleted (tombstone) version.
+    #[serde(default)]
+    deleted: String,
+}
+
+/// Renders the diff between two posted versions. The versions themselves are
+/// fetched by the browser from the FHIR `_history` API; computing the diff here
+/// keeps it off the client (no diff library shipped) and on the one code path
+/// the decision doc settled on.
+async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffForm>) -> Response {
+    let i18n = I18n::new(locale);
+    let show_metadata = form.show_metadata == "true";
+    let deleted = form.deleted == "true";
+
+    let (from, to) = (
+        serde_json::from_str::<serde_json::Value>(&form.from),
+        serde_json::from_str::<serde_json::Value>(&form.to),
+    );
+
+    let (Ok(from), Ok(to)) = (from, to) else {
+        return render(HistoryDiffFragment {
+            i18n,
+            diff: history::diff(&serde_json::Value::Null, &serde_json::Value::Null, true),
+            from_label: form.from_label,
+            to_label: form.to_label,
+            show_metadata,
+            deleted,
+            parse_error: true,
+        });
+    };
+
+    render(HistoryDiffFragment {
+        i18n,
+        diff: history::diff(&from, &to, show_metadata),
+        from_label: form.from_label,
+        to_label: form.to_label,
+        show_metadata,
+        deleted,
+        parse_error: false,
+    })
 }
 
 /// Assembles the landing page from the live dashboard snapshot, or from
