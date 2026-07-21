@@ -17,8 +17,7 @@ use helios_fhir::FhirVersion;
 use helios_fhir_validator::converter::convert;
 use helios_fhir_validator::packs::core_registry;
 use helios_fhir_validator::{
-    CompositeResolver, SchemaRegistry, Severity, UnknownProfilePolicy, ValidationOptions,
-    Validator,
+    CompositeResolver, SchemaRegistry, Severity, UnknownProfilePolicy, ValidationOptions, Validator,
 };
 use std::fs;
 use std::io::Read;
@@ -138,8 +137,11 @@ fn main() -> ExitCode {
     };
     let outcome = validator.validate_sync(&resource, &opts);
 
-    let error_count =
-        outcome.errors.iter().filter(|e| e.severity == Severity::Error).count();
+    let error_count = outcome
+        .errors
+        .iter()
+        .filter(|e| e.severity == Severity::Error)
+        .count();
 
     match args.output {
         Output::Json => {
@@ -157,7 +159,11 @@ fn main() -> ExitCode {
                 println!("valid: no issues");
             } else {
                 for e in &outcome.errors {
-                    let sev = if e.severity == Severity::Error { "error" } else { "warning" };
+                    let sev = if e.severity == Severity::Error {
+                        "error"
+                    } else {
+                        "warning"
+                    };
                     let kind = serde_json::to_value(e.kind)
                         .ok()
                         .and_then(|v| v.as_str().map(str::to_string))
@@ -173,5 +179,9 @@ fn main() -> ExitCode {
         }
     }
 
-    if error_count > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
+    if error_count > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }

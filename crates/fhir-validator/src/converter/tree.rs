@@ -34,10 +34,16 @@ pub(super) fn parse_segments(id: &str) -> Result<Vec<Segment>, String> {
         }
         match part.split_once(':') {
             Some((name, slice)) if !name.is_empty() && !slice.is_empty() => {
-                segments.push(Segment { name: name.to_string(), slice: Some(slice.to_string()) });
+                segments.push(Segment {
+                    name: name.to_string(),
+                    slice: Some(slice.to_string()),
+                });
             }
             Some(_) => return Err(format!("malformed slice segment '{part}'")),
-            None => segments.push(Segment { name: part.to_string(), slice: None }),
+            None => segments.push(Segment {
+                name: part.to_string(),
+                slice: None,
+            }),
         }
     }
     Ok(segments)
@@ -64,7 +70,10 @@ pub(super) struct Node {
 
 impl Node {
     pub(super) fn new(element_name: String) -> Self {
-        Self { element_name, ..Default::default() }
+        Self {
+            element_name,
+            ..Default::default()
+        }
     }
 }
 
@@ -112,8 +121,10 @@ pub(super) fn apply(root: &mut Node, segments: &[Segment], ed: &Ed, warnings: &m
         let slice = element.slices.entry(slice_name.clone()).or_default();
         slice.min = ed.min;
         slice.max = parse_numeric_max(ed.max.as_deref());
-        if matches!(element.element_name.as_str(), "extension" | "modifierExtension")
-            && let Some(first) = ed.types.first()
+        if matches!(
+            element.element_name.as_str(),
+            "extension" | "modifierExtension"
+        ) && let Some(first) = ed.types.first()
             && first.code == "Extension"
             && let Some(profile) = first.profile.first()
         {
@@ -135,15 +146,20 @@ pub(super) fn apply(root: &mut Node, segments: &[Segment], ed: &Ed, warnings: &m
     let name = last.name.clone();
     if ed.max.as_deref() == Some("0") {
         push_unique(&mut node.schema.excluded, &name);
-        let element =
-            node.children.entry(name.clone()).or_insert_with(|| Node::new(name.clone()));
+        let element = node
+            .children
+            .entry(name.clone())
+            .or_insert_with(|| Node::new(name.clone()));
         element.dead = true;
         return;
     }
     if ed.min.unwrap_or(0) >= 1 {
         push_unique(&mut node.schema.required, &name);
     }
-    let element = node.children.entry(name.clone()).or_insert_with(|| Node::new(name));
+    let element = node
+        .children
+        .entry(name.clone())
+        .or_insert_with(|| Node::new(name));
     if let Some(slicing) = &ed.slicing {
         element.discriminators = slicing.discriminator.clone();
         element.slicing_rules = slicing.rules.clone();
@@ -167,7 +183,11 @@ fn descend<'a>(node: &'a mut Node, seg: &Segment) -> &'a mut Node {
 /// Array-ness comes from `base.max` when present (profiles constrain the
 /// count, not the shape), else the ED's own `max`/`min`.
 fn apply_shape(element: &mut Node, ed: &Ed) {
-    let shape_max = ed.base.as_ref().and_then(|b| b.max.as_deref()).or(ed.max.as_deref());
+    let shape_max = ed
+        .base
+        .as_ref()
+        .and_then(|b| b.max.as_deref())
+        .or(ed.max.as_deref());
     let is_array = match shape_max {
         Some("*") => true,
         Some(n) => n.parse::<u64>().map(|n| n > 1).unwrap_or(false),
@@ -193,8 +213,10 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
             if let Some(reference) = &ed.content_reference {
                 match parse_content_reference(reference) {
                     Some(segments) => element.schema.element_reference = Some(segments),
-                    None => warnings
-                        .push(format!("{}: unparseable contentReference '{reference}'", ed.path)),
+                    None => warnings.push(format!(
+                        "{}: unparseable contentReference '{reference}'",
+                        ed.path
+                    )),
                 }
             }
         }
@@ -207,7 +229,10 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
         }
         _ => {
             // Multiple types without `[x]` should not occur; take the first.
-            warnings.push(format!("{}: multiple types without [x]; using the first", ed.path));
+            warnings.push(format!(
+                "{}: multiple types without [x]; using the first",
+                ed.path
+            ));
             element.schema.type_ = Some(ed.types[0].effective_code());
         }
     }
@@ -330,11 +355,22 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
 
     // Slices on this node (non-sugar) become a slicing definition.
     if !slices.is_empty() {
-        let sugar: Vec<&String> =
-            slices.iter().filter(|(_, s)| s.extension_profile.is_some()).map(|(n, _)| n).collect();
-        debug_assert!(sugar.is_empty(), "extension-sugar slices are lifted by the parent");
-        let slicing =
-            super::slicing::build_slicing(slices, &discriminators, slicing_rules, slicing_ordered, warnings);
+        let sugar: Vec<&String> = slices
+            .iter()
+            .filter(|(_, s)| s.extension_profile.is_some())
+            .map(|(n, _)| n)
+            .collect();
+        debug_assert!(
+            sugar.is_empty(),
+            "extension-sugar slices are lifted by the parent"
+        );
+        let slicing = super::slicing::build_slicing(
+            slices,
+            &discriminators,
+            slicing_rules,
+            slicing_ordered,
+            warnings,
+        );
         if let Some(slicing) = slicing {
             schema.slicing = Some(slicing);
         }
@@ -346,7 +382,10 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
     for (name, mut child) in children {
         // Extension sugar: slices on an extension child with a type profile
         // become entries in *this* schema's `extensions` map.
-        if matches!(child.element_name.as_str(), "extension" | "modifierExtension") {
+        if matches!(
+            child.element_name.as_str(),
+            "extension" | "modifierExtension"
+        ) {
             let mut remaining: IndexMap<String, SliceNode> = IndexMap::new();
             for (slice_name, slice) in std::mem::take(&mut child.slices) {
                 match &slice.extension_profile {

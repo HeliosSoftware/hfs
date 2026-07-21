@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, DeferredConstraint, EffectHandlers,
-    FhirSchema, SchemaRegistry, Severity, TerminologyError, TerminologyProvider,
-    ValidationOptions, Validator,
+    FhirSchema, SchemaRegistry, Severity, TerminologyError, TerminologyProvider, ValidationOptions,
+    Validator,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
 fn registry() -> SchemaRegistry {
@@ -112,9 +112,10 @@ impl TerminologyProvider for AllowList {
         let code = match coded {
             CodedValue::Code(c) => c.clone(),
             CodedValue::Coding(v) => v["code"].as_str().unwrap_or_default().to_string(),
-            CodedValue::CodeableConcept(v) => {
-                v["coding"][0]["code"].as_str().unwrap_or_default().to_string()
-            }
+            CodedValue::CodeableConcept(v) => v["coding"][0]["code"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         };
         Ok(self.0.contains(&code.as_str()))
     }
@@ -144,15 +145,25 @@ async fn constraint_failure_shapes_and_severities() {
         outcome: |_| ConstraintOutcome::Failed,
         seen: Mutex::new(Vec::new()),
     };
-    let handlers =
-        EffectHandlers { constraints: Some(&evaluator), ..Default::default() };
+    let handlers = EffectHandlers {
+        constraints: Some(&evaluator),
+        ..Default::default()
+    };
     let resource = json!({ "resourceType": "Patient" });
     let errors = validator()
-        .validate(&resource, FhirVersion::R4, &ValidationOptions::default(), &handlers)
+        .validate(
+            &resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &handlers,
+        )
         .await;
 
     // guideline (pat-g) is never evaluated.
-    assert_eq!(evaluator.seen.lock().unwrap().as_slice(), &["pat-x", "pat-w"]);
+    assert_eq!(
+        evaluator.seen.lock().unwrap().as_slice(),
+        &["pat-x", "pat-w"]
+    );
 
     let as_json = serde_json::to_value(&errors).unwrap();
     assert_eq!(
@@ -190,12 +201,21 @@ async fn constraints_suppressed_and_not_evaluable() {
     };
     let resource = json!({ "resourceType": "Patient" });
     let errors = validator()
-        .validate(&resource, FhirVersion::R4, &ValidationOptions::default(), &handlers)
+        .validate(
+            &resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &handlers,
+        )
         .await;
 
     assert_eq!(evaluator.seen.lock().unwrap().as_slice(), &["pat-x"]);
     assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].severity, Severity::Warning, "not-evaluable is a warning");
+    assert_eq!(
+        errors[0].severity,
+        Severity::Warning,
+        "not-evaluable is a warning"
+    );
     assert_eq!(
         errors[0].message,
         "FHIRPath constraint pat-x could not be evaluated: parse error: boom"
@@ -205,17 +225,30 @@ async fn constraints_suppressed_and_not_evaluable() {
 #[tokio::test]
 async fn required_binding_pass_and_fail() {
     let allow = AllowList(&["male", "female"]);
-    let handlers = EffectHandlers { terminology: Some(&allow), ..Default::default() };
+    let handlers = EffectHandlers {
+        terminology: Some(&allow),
+        ..Default::default()
+    };
 
     let ok = json!({ "resourceType": "Patient", "gender": "male" });
     let errors = validator()
-        .validate(&ok, FhirVersion::R4, &ValidationOptions::default(), &handlers)
+        .validate(
+            &ok,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &handlers,
+        )
         .await;
     assert_eq!(errors, vec![]);
 
     let bad = json!({ "resourceType": "Patient", "gender": "zzz" });
     let errors = validator()
-        .validate(&bad, FhirVersion::R4, &ValidationOptions::default(), &handlers)
+        .validate(
+            &bad,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &handlers,
+        )
         .await;
     let as_json = serde_json::to_value(&errors).unwrap();
     assert_eq!(
@@ -235,13 +268,21 @@ async fn required_binding_pass_and_fail() {
 #[tokio::test]
 async fn non_required_bindings_are_not_checked() {
     let allow = AllowList(&[]); // everything would fail if checked
-    let handlers = EffectHandlers { terminology: Some(&allow), ..Default::default() };
+    let handlers = EffectHandlers {
+        terminology: Some(&allow),
+        ..Default::default()
+    };
     let resource = json!({
         "resourceType": "Patient",
         "maritalStatus": { "text": "married" }
     });
     let errors = validator()
-        .validate(&resource, FhirVersion::R4, &ValidationOptions::default(), &handlers)
+        .validate(
+            &resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &handlers,
+        )
         .await;
     assert_eq!(errors, vec![], "extensible bindings must not be enforced");
 }
@@ -251,12 +292,24 @@ async fn terminology_outage_fail_open_and_closed() {
     let down = Down;
     let resource = json!({ "resourceType": "Patient", "gender": "male" });
 
-    let open = EffectHandlers { terminology: Some(&down), ..Default::default() };
+    let open = EffectHandlers {
+        terminology: Some(&down),
+        ..Default::default()
+    };
     let errors = validator()
-        .validate(&resource, FhirVersion::R4, &ValidationOptions::default(), &open)
+        .validate(
+            &resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &open,
+        )
         .await;
     assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].severity, Severity::Warning, "fail-open surfaces a warning");
+    assert_eq!(
+        errors[0].severity,
+        Severity::Warning,
+        "fail-open surfaces a warning"
+    );
     assert!(errors[0].message.contains("could not be performed"));
 
     let closed = EffectHandlers {
@@ -265,10 +318,19 @@ async fn terminology_outage_fail_open_and_closed() {
         ..Default::default()
     };
     let errors = validator()
-        .validate(&resource, FhirVersion::R4, &ValidationOptions::default(), &closed)
+        .validate(
+            &resource,
+            FhirVersion::R4,
+            &ValidationOptions::default(),
+            &closed,
+        )
         .await;
     assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].severity, Severity::Error, "fail-closed escalates to an error");
+    assert_eq!(
+        errors[0].severity,
+        Severity::Error,
+        "fail-closed escalates to an error"
+    );
 }
 
 #[tokio::test]

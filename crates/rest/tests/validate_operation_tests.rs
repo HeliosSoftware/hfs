@@ -13,7 +13,7 @@ use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_rest::{MultitenancyConfig, ServerConfig, TenantRoutingMode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,7 +22,10 @@ async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
         .map(|p| p.join("data"))
         .unwrap_or_else(|| PathBuf::from("data"));
 
-    let backend_config = SqliteBackendConfig { data_dir: Some(data_dir), ..Default::default() };
+    let backend_config = SqliteBackendConfig {
+        data_dir: Some(data_dir),
+        ..Default::default()
+    };
     let backend = SqliteBackend::with_config(":memory:", backend_config)
         .expect("Failed to create SQLite backend");
     backend.init_schema().expect("Failed to init schema");
@@ -45,7 +48,10 @@ async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
 }
 
 fn test_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 fn issue_codes(outcome: &Value) -> Vec<(String, String)> {
@@ -106,12 +112,15 @@ async fn validate_reports_structural_issues_with_expressions() {
     let outcome: Value = response.json();
     let issues = outcome["issue"].as_array().expect("issues");
     assert!(
-        issues.iter().any(|i| i["code"] == "structure"
-            && i["expression"][0] == "Patient.bogusElement"),
+        issues
+            .iter()
+            .any(|i| i["code"] == "structure" && i["expression"][0] == "Patient.bogusElement"),
         "unknown element issue with FHIRPath expression expected: {outcome:#}"
     );
     assert!(
-        issues.iter().any(|i| i["expression"][0] == "Patient.gender"),
+        issues
+            .iter()
+            .any(|i| i["expression"][0] == "Patient.gender"),
         "not-singular issue on gender expected: {outcome:#}"
     );
     assert!(
@@ -156,7 +165,10 @@ async fn validate_mode_delete_skips_content_validation() {
         .await;
     response.assert_status_ok();
     let outcome: Value = response.json();
-    assert_eq!(outcome["issue"][0]["severity"], "information", "{outcome:#}");
+    assert_eq!(
+        outcome["issue"][0]["severity"], "information",
+        "{outcome:#}"
+    );
 }
 
 #[tokio::test]
@@ -258,7 +270,10 @@ async fn validate_evaluates_real_fhirpath_invariants() {
         issues.iter().any(|i| i["code"] == "invariant"
             && i["severity"] == "error"
             && i["expression"][0] == "Patient.contact[0]"
-            && i["details"]["text"].as_str().unwrap_or_default().contains("pat-1")),
+            && i["details"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pat-1")),
         "pat-1 invariant issue expected: {outcome:#}"
     );
 

@@ -76,8 +76,8 @@ pub use effects::{
     EffectHandlers, TerminologyError, TerminologyProvider,
 };
 pub use engine::{
-    dotted_to_fhirpath, ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError,
-    ValidationOptions, Validator,
+    ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
+    Validator, dotted_to_fhirpath,
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};

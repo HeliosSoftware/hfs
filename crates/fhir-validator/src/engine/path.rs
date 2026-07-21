@@ -21,7 +21,9 @@ impl PathTracker {
     /// Root the path at the resource type (empty string when the data has no
     /// `resourceType`, mirroring the reference validator).
     pub(crate) fn new(root: impl Into<String>) -> Self {
-        Self { segs: vec![PathSeg::Key(root.into())] }
+        Self {
+            segs: vec![PathSeg::Key(root.into())],
+        }
     }
 
     pub(crate) fn push_key(&mut self, key: &str) {

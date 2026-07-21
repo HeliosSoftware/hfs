@@ -236,8 +236,10 @@ where
         let Some(resource) = &entry.resource else {
             continue;
         };
-        let (resource_type, _) = parse_request_url(&entry.url)
-            .map_err(|e| RestError::BadRequest { message: format!("Entry {}: {}", index, e) })?;
+        let (resource_type, _) =
+            parse_request_url(&entry.url).map_err(|e| RestError::BadRequest {
+                message: format!("Entry {}: {}", index, e),
+            })?;
         state
             .validation()
             .check_write(
