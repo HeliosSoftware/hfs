@@ -7,9 +7,9 @@ import { test, expect } from "../pages/fixtures";
 test.describe("tenants", () => {
   test.beforeEach(async ({ tenants }) => {
     // Creating a tenant seeds its conformance resources (~1.4k inserts) inside
-    // the request: round-trip bound on the remote-backend matrix, fsync bound
-    // on filesystem SQLite (~90s measured on NTFS). Budget accordingly.
-    test.setTimeout(180_000);
+    // the request: round-trip bound on the remote-backend matrix (minutes on
+    // real S3), fsync bound on filesystem SQLite (~90s measured on NTFS).
+    test.setTimeout(300_000);
     await tenants.goto();
     if (await tenants.unavailableNotice.isVisible().catch(() => false)) {
       test.skip(true, "no tenant store on this backend");
