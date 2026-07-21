@@ -94,13 +94,13 @@
         <span class="icon">{% include "icons/pencil.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-resource-editor") }}</span>
       </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-history-versions") }}">
+      <a class="nav-item" href="/ui/history" title="{{ i18n.t("nav-history-versions") }}">
         <span class="icon">{% include "icons/history.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-history-versions") }}</span>
-      </span>
-      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %}>
+      </a>
+      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
         <span class="icon">{% include "icons/compartments.svg" %}</span>
-        {{ i18n.t("nav-compartments") }}
+        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
       </a>
 
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>

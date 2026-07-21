@@ -259,3 +259,87 @@ async fn queries_param_catalog_is_a_registry_fed_fragment() {
     assert!(!html.contains(r#"value="clinical-status""#));
     assert!(!html.contains("<html"), "fragment, not a page");
 }
+
+/* History & Versions (#236). The diff is computed server-side; these post two
+ * versions the way the browser does after fetching them from _history. */
+
+#[tokio::test]
+async fn history_page_renders_the_shell() {
+    let response = app()
+        .oneshot(Request::get("/ui/history").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    // Brett's tabs and the version rail.
+    assert!(html.contains(r#"data-tab="instance""#));
+    assert!(html.contains(r#"id="history-versions""#));
+    assert!(html.contains("history.js"));
+}
+
+async fn diff(form: &str) -> String {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/history/diff")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_text(response).await
+}
+
+#[tokio::test]
+async fn diff_shows_a_rename_in_both_layers_and_hides_metadata() {
+    // v3 -> v4: family Smith -> Smythe, and the meta churn that should be hidden.
+    let from = "%7B%22name%22%3A%5B%7B%22family%22%3A%22Smith%22%7D%5D%2C%22meta%22%3A%7B%22versionId%22%3A%223%22%7D%7D";
+    let to = "%7B%22name%22%3A%5B%7B%22family%22%3A%22Smythe%22%7D%5D%2C%22meta%22%3A%7B%22versionId%22%3A%224%22%7D%7D";
+    let html = diff(&format!(
+        "from={from}&to={to}&from_label=v3&to_label=v4&show_metadata=false"
+    ))
+    .await;
+
+    // Semantic layer: a field-level replace on family, with the old value.
+    assert!(html.contains("/name/0/family"));
+    assert!(html.contains("Smith"));
+    assert!(html.contains("Smythe"));
+    // Metadata is filtered, and the toggle says how much.
+    assert!(!html.contains("/meta/versionId"));
+    assert!(html.contains("metadata"));
+    // Textual layer: word-level highlight of the changed run.
+    assert!(html.contains("<mark>"));
+}
+
+#[tokio::test]
+async fn diff_shows_metadata_when_asked() {
+    let from = "%7B%22meta%22%3A%7B%22versionId%22%3A%223%22%7D%7D";
+    let to = "%7B%22meta%22%3A%7B%22versionId%22%3A%224%22%7D%7D";
+    let html = diff(&format!("from={from}&to={to}&show_metadata=true")).await;
+    assert!(html.contains("/meta/versionId"));
+}
+
+#[tokio::test]
+async fn a_deleted_version_is_a_banner_not_a_diff() {
+    let html = diff("from=%7B%7D&to=%7B%7D&to_label=v5&deleted=true").await;
+    assert!(html.contains("history__banner--deleted"));
+    assert!(html.contains("v5"));
+    // No diff table for a tombstone.
+    assert!(!html.contains("diff-table"));
+}
+
+#[tokio::test]
+async fn identical_versions_say_so() {
+    let doc = "%7B%22name%22%3A%5B%7B%22family%22%3A%22Smith%22%7D%5D%7D";
+    let html = diff(&format!("from={doc}&to={doc}&show_metadata=true")).await;
+    assert!(html.contains("history__banner--same"));
+}
+
+#[tokio::test]
+async fn unparseable_versions_report_an_error_not_an_empty_diff() {
+    let html = diff("from=%7Bnope&to=%7B%7D").await;
+    assert!(html.contains("history__banner--error"));
+}
