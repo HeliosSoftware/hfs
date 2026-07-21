@@ -145,6 +145,37 @@ chart-window = Zeitfenster des Diagramms
 
 footer-copyright = © { $year } { -org-name }
 
+## Verlauf & Versionen (#236)
+
+history-heading = Verlauf & Versionen
+history-lede = Zwei Versionen einer Ressource vergleichen. Der Speicher ist vollständig versioniert; dies liest ihn über die übliche _history- und vread-API.
+history-type-label = Ressourcentyp
+history-id-label = Ressourcen-ID
+history-id-placeholder = Ressourcen-ID
+history-load = Laden
+history-tabs-label = Verlaufsbereich
+history-tab-instance = Instanz
+history-tab-type = Typ-Feed
+history-tab-system = System-Feed
+history-versions-label = Versionen
+history-pick-instance = Instanz wählen
+history-current = aktuell
+history-from = Von
+history-to = Bis
+history-show-metadata = Metadatenänderungen anzeigen
+history-empty = Laden Sie eine Ressource und wählen Sie zwei Versionen zum Vergleich.
+history-load-error = Der Verlauf dieser Ressource konnte nicht geladen werden.
+history-not-found = Kein Verlauf für diese Ressource — Typ und ID prüfen.
+history-diff-heading = { $from }
+history-metadata-hidden = { $count ->
+    [one] { $count } Metadatenänderung ausgeblendet
+   *[other] { $count } Metadatenänderungen ausgeblendet
+}
+history-textual = Vollständigen Text-Diff anzeigen
+history-only-metadata = Zwischen diesen Versionen änderten sich nur die Metadaten.
+history-identical = Diese beiden Versionen sind identisch.
+history-deleted = { $version } ist eine Löschung — es gibt nichts zu vergleichen.
+history-parse-error = Diese Versionen konnten nicht als JSON gelesen werden.
 ## Saved queries (#234)
 
 nav-saved-queries = Gespeicherte Abfragen
@@ -360,36 +391,6 @@ editor-edit-raw = Rohtext bearbeiten
 editor-versions = Versionen
 editor-versions-none = Keine früheren Versionen.
 ## Verlauf & Versionen (#236)
-
-history-heading = Verlauf & Versionen
-history-lede = Zwei Versionen einer Ressource vergleichen. Der Speicher ist vollständig versioniert; dies liest ihn über die übliche _history- und vread-API.
-history-type-label = Ressourcentyp
-history-id-label = Ressourcen-ID
-history-id-placeholder = Ressourcen-ID
-history-load = Laden
-history-tabs-label = Verlaufsbereich
-history-tab-instance = Instanz
-history-tab-type = Typ-Feed
-history-tab-system = System-Feed
-history-versions-label = Versionen
-history-pick-instance = Instanz wählen
-history-current = aktuell
-history-from = Von
-history-to = Bis
-history-show-metadata = Metadatenänderungen anzeigen
-history-empty = Laden Sie eine Ressource und wählen Sie zwei Versionen zum Vergleich.
-history-load-error = Der Verlauf dieser Ressource konnte nicht geladen werden.
-history-not-found = Kein Verlauf für diese Ressource — Typ und ID prüfen.
-history-diff-heading = { $from }
-history-metadata-hidden = { $count ->
-    [one] { $count } Metadatenänderung ausgeblendet
-   *[other] { $count } Metadatenänderungen ausgeblendet
-}
-history-textual = Vollständigen Text-Diff anzeigen
-history-only-metadata = Zwischen diesen Versionen änderten sich nur die Metadaten.
-history-identical = Diese beiden Versionen sind identisch.
-history-deleted = { $version } ist eine Löschung — es gibt nichts zu vergleichen.
-history-parse-error = Diese Versionen konnten nicht als JSON gelesen werden.
 
 ## Ressourcen-Arbeitsbereich (#282)
 

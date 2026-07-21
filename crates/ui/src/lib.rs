@@ -103,11 +103,11 @@ struct WebState {
     /// Lazily-fetched SearchParameter snapshot per FHIR version (#238), read
     /// from the server's own `/SearchParameter` endpoint.
     sp_catalog: Arc<search_params::SpCatalog>,
+    /// Natural-language search feature state (#255).
+    nl: Arc<NlSearch>,
     /// Lazily-fetched CompartmentDefinitions per FHIR version (#237), read from
     /// the server's own `/CompartmentDefinition` endpoint.
     compartments: Arc<compartments::CompartmentCatalog>,
-    /// Natural-language search feature state (#255).
-    nl: Arc<NlSearch>,
     /// Read/write path for the tenant-maintenance page. `None` when the host did
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
@@ -415,11 +415,12 @@ pub fn mount_with_conformance_source(
             "/ui/editor/render",
             axum::routing::post(editor::render_body),
         )
-        // History & Versions diff (#236). The diff is computed server-side; the
-        // browser posts the two versions it fetched from `_history`.
-        .route("/ui/history", get(history_page))
-        .route("/ui/history/diff", axum::routing::post(history_diff))
         .route("/ui/status", get(status))
+        .route("/ui/history", get(history_page))
+        // The diff is computed server-side (the decision in
+        // docs/history-diff-rendering.md); the browser posts the two versions
+        // it fetched from `_history`.
+        .route("/ui/history/diff", axum::routing::post(history_diff))
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete));
