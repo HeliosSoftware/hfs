@@ -28,12 +28,19 @@ for (const theme of THEMES) {
 
       const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
 
-      // Name the offenders in the failure message so a red run is actionable.
+      // Name the offenders — with axe's per-node check message (it carries the
+      // measured geometry for e.g. target-size) so a red run is actionable.
       const summary = violations
         .map(
           (v) =>
             `${v.impact ?? "?"}  ${v.id}: ${v.help}\n    ${v.nodes
-              .map((n) => n.target.join(" "))
+              .map((n) => {
+                const why = [...n.any, ...n.all]
+                  .map((c) => c.message)
+                  .filter(Boolean)
+                  .join("; ");
+                return `${n.target.join(" ")}${why ? ` — ${why}` : ""}`;
+              })
               .join("\n    ")}`,
         )
         .join("\n");
