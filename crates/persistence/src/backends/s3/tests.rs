@@ -185,6 +185,21 @@ impl MockS3Client {
 
 #[async_trait]
 impl S3Api for MockS3Client {
+    // NOTE: the two HEAD operations below deliberately do NOT report
+    // `BucketNotFound`, even though a missing bucket is exactly what they are up
+    // against. A HEAD response has no body, so real S3 cannot return
+    // `<Code>NoSuchBucket</Code>` on these paths — the SDK sees a bare 404 and
+    // synthesizes `NotFound`, which `map_sdk_error` maps to
+    // `S3ClientError::NotFound`. Making the mock answer `BucketNotFound` here
+    // would let it claim a distinction the real client cannot make, and these
+    // tests would then vouch for behaviour that does not exist in production.
+    //
+    // That gap is real and tracked in #284: `head_object` in `S3Client` swallows
+    // `NotFound` into `Ok(None)`, so a missing bucket still reads as a missing
+    // object on the `create` existence check and on the bulk-submit state read,
+    // and `validate_buckets` reports a missing bucket as "resource not found in
+    // S3". Until that is fixed, the mock stays honest about it rather than
+    // papering over it.
     async fn head_bucket(&self, bucket: &str) -> Result<(), S3ClientError> {
         let state = self.state.lock().unwrap();
         if state.buckets.contains(bucket) {
@@ -200,6 +215,10 @@ impl S3Api for MockS3Client {
         key: &str,
     ) -> Result<Option<ObjectMetadata>, S3ClientError> {
         let state = self.state.lock().unwrap();
+        // No bucket check: a missing bucket has no objects, so the lookup below
+        // already yields `Ok(None)` — which is exactly what `S3Client::head_object`
+        // produces against real S3, since it swallows the bodyless 404's
+        // `NotFound` into `Ok(None)`.
         Ok(state
             .objects
             .get(&(bucket.to_string(), key.to_string()))
@@ -216,6 +235,9 @@ impl S3Api for MockS3Client {
         key: &str,
     ) -> Result<Option<ObjectData>, S3ClientError> {
         let state = self.state.lock().unwrap();
+        if !state.buckets.contains(bucket) {
+            return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
         Ok(state
             .objects
             .get(&(bucket.to_string(), key.to_string()))
@@ -240,7 +262,7 @@ impl S3Api for MockS3Client {
     ) -> Result<ObjectMetadata, S3ClientError> {
         let mut state = self.state.lock().unwrap();
         if !state.buckets.contains(bucket) {
-            return Err(S3ClientError::NotFound);
+            return Err(S3ClientError::BucketNotFound(bucket.to_string()));
         }
         state.put_count += 1;
         state.recorded_puts.push(RecordedPut {
@@ -316,6 +338,12 @@ impl S3Api for MockS3Client {
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError> {
         let state = self.state.lock().unwrap();
+        // Faithful to S3: listing a bucket that does not exist is `NoSuchBucket`,
+        // not an empty listing. Otherwise a misconfigured bucket would report zero
+        // objects, and `count` would confidently answer "no resources".
+        if !state.buckets.contains(bucket) {
+            return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
         let mut keys = state
             .objects
             .iter()
@@ -1325,6 +1353,85 @@ async fn purge_tenant_data_sweeps_resources_and_history() {
 
     assert!(backend.read(&tb, "Patient", "p2").await.unwrap().is_some());
     assert_eq!(backend.count(&tb, None).await.unwrap(), 1);
+}
+
+// ============================================================================
+// Backend error handling — a misconfigured bucket is not an empty store
+// ============================================================================
+//
+// Companion to `tests/backend_error_handling.rs`, which covers the *unreachable
+// endpoint* case for every backend. This covers the case that needs a
+// responsive-but-misconfigured S3, which only the mock client can express: the
+// endpoint answers, but the configured bucket does not exist (a typo, a deleted
+// bucket, or credentials that cannot see it).
+//
+// The danger is specific to S3. `read` legitimately returns `Ok(None)` when an
+// object is absent, and S3 reports a missing bucket on the very same code path.
+// If the two are conflated, every read against a misconfigured bucket answers
+// "this resource does not exist" — a store that is merely pointed at the wrong
+// place would look exactly like a store that is empty.
+//
+// Scope, so these tests are not read as more than they are: they cover the
+// operations that reach S3 via GET / PUT / LIST, whose error responses carry a
+// body and can therefore say `NoSuchBucket`. The HEAD paths cannot (#284) — see
+// the note on `MockS3Client::head_bucket` — so `create` below is covered only
+// because its `PutObject` fails, not because its `head_object` existence check
+// notices the missing bucket. It does not.
+
+/// A `read` against a bucket that does not exist must error, not report the
+/// resource as absent.
+#[tokio::test]
+async fn s3_missing_bucket_read_is_an_error_not_an_empty_store() {
+    // The backend is configured for "test-bucket"; the mock has no buckets at all.
+    let mock = Arc::new(MockS3Client::default());
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let result = backend.read(&tenant, "Patient", "some-id").await;
+
+    assert!(
+        !matches!(result, Ok(None)),
+        "read against a nonexistent bucket returned Ok(None) — a store pointed at \
+         the wrong bucket must not be indistinguishable from an empty one"
+    );
+    assert!(
+        matches!(result, Err(StorageError::Backend(_))),
+        "expected a backend error from a nonexistent bucket, got {result:?}"
+    );
+}
+
+/// The same applies to writes and counts: they must not silently succeed or
+/// report zero against a bucket that isn't there.
+///
+/// `create` fails at its `PutObject`, not at its `head_object` existence check —
+/// the check reports `Ok(None)` ("no such object, go ahead and create") because a
+/// bodyless HEAD 404 cannot say `NoSuchBucket`. The contract holds here, but by
+/// way of the write that follows rather than by the check noticing anything.
+#[tokio::test]
+async fn s3_missing_bucket_create_and_count_are_errors() {
+    let mock = Arc::new(MockS3Client::default());
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType":"Patient"}),
+            FhirVersion::default(),
+        )
+        .await;
+    assert!(
+        matches!(created, Err(StorageError::Backend(_))),
+        "expected a backend error creating into a nonexistent bucket, got {created:?}"
+    );
+
+    let counted = backend.count(&tenant, Some("Patient")).await;
+    assert!(
+        !matches!(counted, Ok(0)),
+        "count against a nonexistent bucket returned Ok(0) — 'zero resources' is a \
+         claim about data we never reached"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

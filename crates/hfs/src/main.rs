@@ -160,12 +160,19 @@ where
     let connect_timeout_ms = env("HFS_MONGODB_CONNECT_TIMEOUT_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(5000);
+    // Bounds how long an operation waits for a usable server. `connect_timeout_ms`
+    // only bounds a TCP handshake, so this is what actually decides how quickly an
+    // unreachable MongoDB surfaces an error.
+    let server_selection_timeout_ms = env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15_000);
 
     MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
         connect_timeout_ms,
+        server_selection_timeout_ms,
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
         search_offloaded,
@@ -377,12 +384,17 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5000);
+        let server_selection_timeout_ms = std::env::var("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15_000);
 
         let config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
             connect_timeout_ms,
+            server_selection_timeout_ms,
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
@@ -2650,6 +2662,7 @@ mod tests {
             "HFS_MONGODB_DATABASE" => Some("inferno_suite".to_string()),
             "HFS_MONGODB_MAX_CONNECTIONS" => Some("24".to_string()),
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
+            "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
         });
 
@@ -2660,6 +2673,7 @@ mod tests {
         assert_eq!(mongo_config.database_name, "inferno_suite");
         assert_eq!(mongo_config.max_connections, 24);
         assert_eq!(mongo_config.connect_timeout_ms, 7500);
+        assert_eq!(mongo_config.server_selection_timeout_ms, 2500);
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);
