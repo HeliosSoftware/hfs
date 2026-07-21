@@ -832,10 +832,6 @@ mod postgres_integration {
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
     }
 
-    // ========================================================================
-    // Pool timeout regression (#285)
-    // ========================================================================
-
     #[tokio::test]
     async fn statement_timeout_applies_to_every_pooled_connection() {
         let pg = shared_pg().await;
@@ -862,11 +858,6 @@ mod postgres_integration {
         let backend =
             std::sync::Arc::new(PostgresBackend::new(config).await.expect("create backend"));
 
-        // Hold POOL_SIZE clients across a barrier so the pool is forced to
-        // create every connection before any is released. Under the pre-fix
-        // code only the connection used inside `PostgresBackend::new` to
-        // verify connectivity carried the GUC; every connection created
-        // lazily after that inherited the server default (usually 0).
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(POOL_SIZE));
         let mut handles = Vec::with_capacity(POOL_SIZE);
         for _ in 0..POOL_SIZE {
