@@ -434,3 +434,19 @@ async fn unparseable_versions_report_an_error_not_an_empty_diff() {
     let html = diff("from=%7Bnope&to=%7B%7D").await;
     assert!(html.contains("history__banner--error"));
 }
+
+#[tokio::test]
+async fn version_selector_lists_the_enabled_versions() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    // A real disclosure, not the old static chip: the compiled-in versions as
+    // plain links carrying `?version=`, with the server default marked current.
+    assert!(html.contains(r#"href="?version=R4""#));
+    assert!(html.contains(r#"aria-current="true""#));
+    // The default label is server-derived, not hardcoded markup.
+    assert!(html.contains("FHIR R4"));
+}

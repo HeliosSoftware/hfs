@@ -320,6 +320,13 @@ html[data-nav="collapsed"] .brand__version {
   display: none;
 }
 
+/* Footer variant: the version selector opens upward, clear of the viewport
+   bottom edge. */
+.menu--up .menu__panel {
+  top: auto;
+  bottom: calc(100% + 8px);
+}
+
 .menu__panel {
   position: absolute;
   z-index: 10;

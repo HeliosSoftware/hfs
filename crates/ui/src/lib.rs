@@ -123,6 +123,25 @@ struct WebState {
 pub(crate) struct Status {
     pub(crate) version: &'static str,
     checked_at: u64,
+    /// The server's default FHIR version — the sidebar selector's label.
+    fhir_version: helios_fhir::FhirVersion,
+}
+
+impl Status {
+    /// The default FHIR version's display label (`"R4"`, `"R5"`, …).
+    pub(crate) fn fhir_version_label(&self) -> &'static str {
+        self.fhir_version.as_str()
+    }
+
+    /// Labels of every FHIR version compiled into this build, in spec order —
+    /// the sidebar selector's options. Each links the current page with
+    /// `?version=`; pages without a version dimension ignore it.
+    pub(crate) fn enabled_version_labels(&self) -> Vec<&'static str> {
+        search_params::enabled_versions()
+            .into_iter()
+            .map(|v| v.as_str())
+            .collect()
+    }
 }
 
 /// Dashboard headline metrics rendered by `pages/index.html` (design: Figma
@@ -459,7 +478,17 @@ async fn index(
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
         .unwrap_or_default();
-    render(build_index_page(state.version, locale, selected, window, state.nl.enabled).await)
+    render(
+        build_index_page(
+            state.version,
+            locale,
+            selected,
+            window,
+            state.nl.enabled,
+            state.fhir_version,
+        )
+        .await,
+    )
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -469,7 +498,7 @@ async fn search(State(state): State<WebState>, locale: RequestLocale) -> Respons
         .resource_type_names(helios_fhir::FhirVersion::default())
         .await;
     render(SearchPage {
-        status: current_status(state.version),
+        status: current_status(state.version, state.fhir_version),
         i18n: I18n::new(locale),
         active_page: "search",
         nl_enabled: state.nl.enabled,
@@ -487,7 +516,7 @@ async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Respon
         .resource_type_names(helios_fhir::FhirVersion::default())
         .await;
     render(QueriesPage {
-        status: current_status(state.version),
+        status: current_status(state.version, state.fhir_version),
         i18n: I18n::new(locale),
         active_page: "queries",
         nl_enabled: state.nl.enabled,
@@ -560,7 +589,7 @@ async fn search_parameters(
     };
     let snapshot = state.sp_catalog.snapshot(query.fhir_version()).await;
     render(SearchParametersPage {
-        status: current_status(state.version),
+        status: current_status(state.version, state.fhir_version),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
         nl_enabled: state.nl.enabled,
@@ -598,7 +627,7 @@ async fn compartments_page(
     let defs = state.compartments.definitions(query.fhir_version()).await;
     match compartments::build_view(&query, &defs) {
         Some(view) => render(CompartmentsPage {
-            status: current_status(state.version),
+            status: current_status(state.version, state.fhir_version),
             i18n: I18n::new(locale),
             active_page: "compartments",
             nl_enabled: state.nl.enabled,
@@ -615,7 +644,7 @@ async fn status(
     locale: RequestLocale,
     HxRequest(is_htmx): HxRequest,
 ) -> Response {
-    let status = current_status(state.version);
+    let status = current_status(state.version, state.fhir_version);
     let i18n = I18n::new(locale);
     if is_htmx {
         render(StatusPartial { status, i18n })
@@ -627,6 +656,7 @@ async fn status(
                 None,
                 DashboardWindow::default(),
                 state.nl.enabled,
+                state.fhir_version,
             )
             .await,
         )
@@ -636,7 +666,7 @@ async fn status(
 /// History & Versions page shell.
 async fn history_page(State(state): State<WebState>, locale: RequestLocale) -> Response {
     render(HistoryPage {
-        status: current_status(state.version),
+        status: current_status(state.version, state.fhir_version),
         i18n: I18n::new(locale),
         active_page: "history",
         nl_enabled: state.nl.enabled,
@@ -706,8 +736,9 @@ async fn build_index_page(
     selected: Option<String>,
     window: DashboardWindow,
     nl_enabled: bool,
+    fhir_version: helios_fhir::FhirVersion,
 ) -> IndexPage {
-    let status = current_status(version);
+    let status = current_status(version, fhir_version);
     let i18n = I18n::new(locale);
     let snapshot = helios_observability::dashboard::snapshot(window)
         .await
@@ -1028,10 +1059,14 @@ fn bucket_floor_utc(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(floored, 0).unwrap_or(ts)
 }
 
-pub(crate) fn current_status(version: &'static str) -> Status {
+pub(crate) fn current_status(
+    version: &'static str,
+    fhir_version: helios_fhir::FhirVersion,
+) -> Status {
     Status {
         version,
         checked_at: unix_timestamp_seconds(),
+        fhir_version,
     }
 }
 
@@ -1069,6 +1104,7 @@ mod tests {
             status: Status {
                 version,
                 checked_at,
+                fhir_version: helios_fhir::FhirVersion::R4,
             },
             metrics,
             chart,
@@ -1120,6 +1156,7 @@ mod tests {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
+                fhir_version: helios_fhir::FhirVersion::R4,
             },
             i18n: i18n("en"),
         }
@@ -1186,6 +1223,7 @@ mod tests {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
+                fhir_version: helios_fhir::FhirVersion::R4,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -1223,6 +1261,7 @@ mod tests {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
+                fhir_version: helios_fhir::FhirVersion::R4,
             },
             i18n: i18n("es"),
             active_page: "queries",
