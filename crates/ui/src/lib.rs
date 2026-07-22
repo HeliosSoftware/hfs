@@ -61,7 +61,7 @@ use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow,
 };
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{ResourceStorage, SettingsStore};
 use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -115,6 +115,75 @@ struct WebState {
     data_dir: Option<PathBuf>,
     /// The server's default FHIR version, used when seeding a new tenant.
     fhir_version: helios_fhir::FhirVersion,
+    /// Per-user settings, for the persisted FHIR-version choice (#343). `None`
+    /// when the backend has no settings store; the selector then applies
+    /// per-page only.
+    settings: Option<Arc<dyn SettingsStore>>,
+}
+
+/// The settings key holding the user's FHIR-version choice, and the user key
+/// the settings resolve under. The key mirrors `helios-rest`'s `UserKey`
+/// derivation: `"{issuer}|{subject}"` from an authenticated principal, or this
+/// local fallback when auth is disabled (`/ui` also sits outside the auth
+/// layer today — #320 tracks the authenticated modes).
+const SETTINGS_VERSION_KEY: &str = "fhirVersion";
+const LOCAL_USER_KEY: &str = "local|default";
+
+fn settings_user_key(extensions: &axum::http::Extensions) -> String {
+    match extensions.get::<helios_auth::Principal>() {
+        Some(principal) => format!("{}|{}", principal.issuer(), principal.subject()),
+        None => LOCAL_USER_KEY.to_string(),
+    }
+}
+
+/// The FHIR version this request renders under: the user's stored choice when
+/// one exists and is compiled in, the server default otherwise. Resolved once
+/// per request by [`resolve_version`]; explicit `?version=` query parameters
+/// still override it per page.
+#[derive(Clone, Copy)]
+pub(crate) struct RequestVersion(pub(crate) helios_fhir::FhirVersion);
+
+impl<S> axum::extract::FromRequestParts<S> for RequestVersion
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<RequestVersion>()
+            .copied()
+            .unwrap_or(RequestVersion(helios_fhir::FhirVersion::default_enabled())))
+    }
+}
+
+/// Middleware: stamps [`RequestVersion`] from the user's stored settings (one
+/// settings read per page load, the documented cost model of that store),
+/// falling back to the server default.
+async fn resolve_version(
+    State(state): State<WebState>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let mut effective = state.fhir_version;
+    if let Some(store) = &state.settings {
+        let user = settings_user_key(request.extensions());
+        if let Ok(Some(stored)) = store.get_settings(&user).await
+            && let Some(choice) = stored
+                .document
+                .get(SETTINGS_VERSION_KEY)
+                .and_then(|v| v.as_str())
+                .and_then(search_params::version_from_str)
+        {
+            effective = choice;
+        }
+    }
+    request.extensions_mut().insert(RequestVersion(effective));
+    next.run(request).await
 }
 
 /// A small, self-contained system-status snapshot — the "real read path" the
@@ -363,6 +432,7 @@ pub fn mount(
     data_dir: Option<PathBuf>,
     nl: NlSearch,
     tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
     self_base_url: String,
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
@@ -377,6 +447,7 @@ pub fn mount(
         data_dir,
         nl,
         tenants,
+        settings,
         source,
         fhir_version,
     )
@@ -394,6 +465,7 @@ pub fn mount_with_conformance_source(
     data_dir: Option<PathBuf>,
     nl: NlSearch,
     tenants: Option<Arc<dyn ResourceStorage>>,
+    settings: Option<Arc<dyn SettingsStore>>,
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
 ) -> Router {
@@ -422,11 +494,24 @@ pub fn mount_with_conformance_source(
         .route("/ui/history/diff", axum::routing::post(history_diff))
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
-        .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete));
+        .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
+        // Persists the sidebar's FHIR-version choice (#343) and redirects back.
+        .route("/ui/version", axum::routing::post(set_version));
 
     if nl_enabled {
         router = router.route("/ui/search", get(search));
     }
+
+    let state = WebState {
+        version: hfs_version,
+        sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
+        compartments: Arc::new(compartments::CompartmentCatalog::new(source)),
+        nl: Arc::new(nl),
+        tenants,
+        settings,
+        data_dir,
+        fhir_version,
+    };
 
     router
         .merge(assets)
@@ -436,16 +521,71 @@ pub fn mount_with_conformance_source(
         // One negotiated locale per request, in request extensions; every
         // handler and template reads this same value.
         .layer(middleware::from_fn(i18n::negotiate_locale))
-        .with_state(WebState {
-            version: hfs_version,
-            sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
-            compartments: Arc::new(compartments::CompartmentCatalog::new(source)),
-            nl: Arc::new(nl),
-            tenants,
-            data_dir,
-            fhir_version,
-        })
+        // One effective FHIR version per request (stored choice or default),
+        // in request extensions next to the locale.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            resolve_version,
+        ))
+        .with_state(state)
         .fallback_service(fhir_app)
+}
+
+/// Form body for `POST /ui/version` — the sidebar selector's submit.
+#[derive(Deserialize)]
+struct VersionForm {
+    version: String,
+}
+
+/// Persists the FHIR-version choice to the user's settings document (the same
+/// `/_user/settings` document the theme roams in) and bounces back to the page
+/// the form was submitted from. Best-effort: with no settings store the choice
+/// still applies to the redirect target via `?version=`.
+async fn set_version(
+    State(state): State<WebState>,
+    headers: axum::http::HeaderMap,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::Form(form): axum::Form<VersionForm>,
+) -> Response {
+    let Some(version) = search_params::version_from_str(&form.version) else {
+        return (StatusCode::BAD_REQUEST, "unknown FHIR version").into_response();
+    };
+
+    let mut persisted = false;
+    if let Some(store) = &state.settings {
+        let user = match &principal {
+            Some(axum::Extension(p)) => format!("{}|{}", p.issuer(), p.subject()),
+            None => LOCAL_USER_KEY.to_string(),
+        };
+        match store
+            .patch_settings(
+                &user,
+                serde_json::json!({ SETTINGS_VERSION_KEY: version.as_str() }),
+                None,
+            )
+            .await
+        {
+            Ok(_) => persisted = true,
+            Err(e) => tracing::warn!("persisting FHIR-version choice failed: {e}"),
+        }
+    }
+
+    // Bounce back to the submitting page — same-origin `/ui` paths only.
+    let back = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| r.parse::<axum::http::Uri>().ok())
+        .map(|u| u.path().to_string())
+        .filter(|p| p.starts_with("/ui"))
+        .unwrap_or_else(|| "/ui".to_string());
+    // Without a store the choice cannot outlive this navigation; carry it on
+    // the redirect so the target page still honors it once.
+    let target = if persisted {
+        back
+    } else {
+        format!("{back}?version={}", version.as_str())
+    };
+    axum::response::Redirect::to(&target).into_response()
 }
 
 /// The how-to page for natural-language search, linked from the setup state.
@@ -472,6 +612,7 @@ async fn revalidate_assets(request: axum::extract::Request, next: middleware::Ne
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
+    rv: RequestVersion,
     RawQuery(query): RawQuery,
 ) -> Response {
     let selected = query_value(query.as_deref(), "type");
@@ -485,20 +626,24 @@ async fn index(
             selected,
             window,
             state.nl.enabled,
-            state.fhir_version,
+            rv.0,
         )
         .await,
     )
 }
 
 /// Search page: natural language and the visual builder over one editable query.
-async fn search(State(state): State<WebState>, locale: RequestLocale) -> Response {
+async fn search(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+) -> Response {
     let resource_types = state
         .compartments
         .resource_type_names(helios_fhir::FhirVersion::default())
         .await;
     render(SearchPage {
-        status: current_status(state.version, state.fhir_version),
+        status: current_status(state.version, rv.0),
         i18n: I18n::new(locale),
         active_page: "search",
         nl_enabled: state.nl.enabled,
@@ -510,13 +655,17 @@ async fn search(State(state): State<WebState>, locale: RequestLocale) -> Respons
 }
 
 /// Saved FHIR queries page.
-async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Response {
+async fn queries(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+) -> Response {
     let resource_types = state
         .compartments
         .resource_type_names(helios_fhir::FhirVersion::default())
         .await;
     render(QueriesPage {
-        status: current_status(state.version, state.fhir_version),
+        status: current_status(state.version, rv.0),
         i18n: I18n::new(locale),
         active_page: "queries",
         nl_enabled: state.nl.enabled,
@@ -576,10 +725,12 @@ struct SearchParametersQuery {
 async fn search_parameters(
     State(state): State<WebState>,
     locale: RequestLocale,
+    rv: RequestVersion,
     Query(raw): Query<SearchParametersQuery>,
 ) -> Response {
     let query = search_params::SpQuery {
-        version: raw.version,
+        // Explicit ?version= wins; otherwise the user's stored choice (#343).
+        version: raw.version.or_else(|| Some(rv.0.as_str().to_string())),
         base: raw.base.filter(|b| !b.is_empty()),
         ptype: raw.ptype.filter(|t| !t.is_empty()),
         source: raw.source.filter(|s| !s.is_empty()),
@@ -589,7 +740,7 @@ async fn search_parameters(
     };
     let snapshot = state.sp_catalog.snapshot(query.fhir_version()).await;
     render(SearchParametersPage {
-        status: current_status(state.version, state.fhir_version),
+        status: current_status(state.version, rv.0),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
         nl_enabled: state.nl.enabled,
@@ -614,10 +765,12 @@ struct CompartmentsQuery {
 async fn compartments_page(
     State(state): State<WebState>,
     locale: RequestLocale,
+    rv: RequestVersion,
     Query(raw): Query<CompartmentsQuery>,
 ) -> Response {
     let query = compartments::CmpQuery {
-        version: raw.version,
+        // Explicit ?version= wins; otherwise the user's stored choice (#343).
+        version: raw.version.or_else(|| Some(rv.0.as_str().to_string())),
         def: raw.def,
         tab: raw.tab,
         filter: raw.filter,
@@ -627,7 +780,7 @@ async fn compartments_page(
     let defs = state.compartments.definitions(query.fhir_version()).await;
     match compartments::build_view(&query, &defs) {
         Some(view) => render(CompartmentsPage {
-            status: current_status(state.version, state.fhir_version),
+            status: current_status(state.version, rv.0),
             i18n: I18n::new(locale),
             active_page: "compartments",
             nl_enabled: state.nl.enabled,
@@ -642,9 +795,10 @@ async fn compartments_page(
 async fn status(
     State(state): State<WebState>,
     locale: RequestLocale,
+    rv: RequestVersion,
     HxRequest(is_htmx): HxRequest,
 ) -> Response {
-    let status = current_status(state.version, state.fhir_version);
+    let status = current_status(state.version, rv.0);
     let i18n = I18n::new(locale);
     if is_htmx {
         render(StatusPartial { status, i18n })
@@ -656,7 +810,7 @@ async fn status(
                 None,
                 DashboardWindow::default(),
                 state.nl.enabled,
-                state.fhir_version,
+                rv.0,
             )
             .await,
         )
@@ -664,9 +818,13 @@ async fn status(
 }
 
 /// History & Versions page shell.
-async fn history_page(State(state): State<WebState>, locale: RequestLocale) -> Response {
+async fn history_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+) -> Response {
     render(HistoryPage {
-        status: current_status(state.version, state.fhir_version),
+        status: current_status(state.version, rv.0),
         i18n: I18n::new(locale),
         active_page: "history",
         nl_enabled: state.nl.enabled,

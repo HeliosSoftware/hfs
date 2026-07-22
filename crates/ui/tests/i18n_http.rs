@@ -21,6 +21,7 @@ fn app() -> Router {
             model: "test-model".to_string(),
         },
         None,
+        None,
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
     )

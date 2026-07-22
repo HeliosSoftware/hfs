@@ -179,11 +179,14 @@
         <div class="menu__panel">
           <div class="menu__heading">{{ i18n.t("fhir-version-heading") }}</div>
           {% for v in status.enabled_version_labels() %}
-          <a class="menu__option" href="?version={{ v }}"{% if v == status.fhir_version_label() %} aria-current="true"{% endif %}>
-            <span class="avatar">{% include "icons/hierarchy.svg" %}</span>
-            {{ v }}
-            {% if v == status.fhir_version_label() %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
-          </a>
+          <form method="post" action="/ui/version">
+            <input type="hidden" name="version" value="{{ v }}">
+            <button type="submit" class="menu__option"{% if v == status.fhir_version_label() %} aria-current="true"{% endif %}>
+              <span class="avatar">{% include "icons/hierarchy.svg" %}</span>
+              {{ v }}
+              {% if v == status.fhir_version_label() %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
+            </button>
+          </form>
           {% endfor %}
         </div>
       </details>
