@@ -2423,6 +2423,15 @@ mod postgres_integration {
 
         let result = backend.health_check().await;
         assert!(result.is_ok(), "Health check failed: {:?}", result.err());
+
+        // The `/_readiness` probe delegates to `Backend::health_check` via the
+        // `ResourceStorage::readiness_check` override; a live pg must report ready.
+        let readiness = ResourceStorage::readiness_check(&backend).await;
+        assert!(
+            readiness.is_ok(),
+            "readiness_check failed on a live postgres: {:?}",
+            readiness.err()
+        );
     }
 
     #[tokio::test]

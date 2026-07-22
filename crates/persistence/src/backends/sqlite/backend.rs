@@ -583,11 +583,14 @@ impl Backend for SqliteBackend {
                 backend_name: "sqlite".to_string(),
                 message: "Failed to get connection".to_string(),
             })?;
+        // A failing constant `SELECT 1` means the backend is unreachable/broken,
+        // not a bad query — surface it as a retryable `Unavailable` (503) rather
+        // than an `Internal` (500) so a down backend reads as "try again", and
+        // so the readiness probe classifies it correctly.
         conn.query_row("SELECT 1", [], |_| Ok(()))
-            .map_err(|e| BackendError::Internal {
+            .map_err(|e| BackendError::Unavailable {
                 backend_name: "sqlite".to_string(),
                 message: format!("Health check failed: {}", e),
-                source: None,
             })?;
         Ok(())
     }

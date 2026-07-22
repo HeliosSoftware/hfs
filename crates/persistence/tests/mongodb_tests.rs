@@ -455,6 +455,25 @@ async fn mongodb_total_created_connections(connection_string: &str) -> Option<i6
 }
 
 #[tokio::test]
+async fn mongodb_integration_readiness_check() {
+    let Some(backend) = create_backend("readiness_check").await else {
+        eprintln!(
+            "Skipping mongodb_integration_readiness_check (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    // The `/_readiness` probe delegates to `Backend::health_check` via the
+    // `ResourceStorage::readiness_check` override; a live mongo must report ready.
+    let readiness = ResourceStorage::readiness_check(&backend).await;
+    assert!(
+        readiness.is_ok(),
+        "readiness_check failed on a live mongodb: {:?}",
+        readiness.err()
+    );
+}
+
+#[tokio::test]
 async fn mongodb_integration_create_read_update_delete() {
     let Some(backend) = create_backend("crud").await else {
         eprintln!(
