@@ -6,6 +6,7 @@
 //! exports spans over OTLP via `tracing-opentelemetry`. Call [`shutdown`] during
 //! graceful shutdown to flush buffered spans.
 
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -58,6 +59,10 @@ fn env_filter_from(rust_log: Option<&str>, log_level: &str) -> EnvFilter {
 /// once per process.
 pub fn init(service_name: &str, log_level: &str) {
     let filter = env_filter_from(std::env::var("RUST_LOG").ok().as_deref(), log_level);
+    // Only colorize when stdout is a real terminal. Emitting ANSI escapes into a
+    // redirected file / journald / CloudWatch corrupts the text — and it made the
+    // obs-A/B harness unable to grep the `obs_mode=` stamp out of the arm logs.
+    let use_ansi = std::io::stdout().is_terminal();
 
     #[cfg(feature = "otel")]
     {
@@ -66,7 +71,7 @@ pub fn init(service_name: &str, log_level: &str) {
             let tracer = provider.tracer("helios");
             tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt::layer())
+                .with(fmt::layer().with_ansi(use_ansi))
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
             let _ = PROVIDER.set(provider);
@@ -80,7 +85,7 @@ pub fn init(service_name: &str, log_level: &str) {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer())
+        .with(fmt::layer().with_ansi(use_ansi))
         .init();
     let _ = service_name;
 }
