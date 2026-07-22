@@ -145,6 +145,37 @@ chart-window = Intervalo de tiempo del gráfico
 
 footer-copyright = © { $year } { -org-name }
 
+## Historial y versiones (#236)
+
+history-heading = Historial y versiones
+history-lede = Compara dos versiones de un recurso. El almacenamiento está totalmente versionado; esto lo lee con la API estándar _history y vread.
+history-type-label = Tipo de recurso
+history-id-label = Id del recurso
+history-id-placeholder = id del recurso
+history-load = Cargar
+history-tabs-label = Alcance del historial
+history-tab-instance = Instancia
+history-tab-type = Feed por tipo
+history-tab-system = Feed del sistema
+history-versions-label = Versiones
+history-pick-instance = Elige una instancia
+history-current = actual
+history-from = Desde
+history-to = Hasta
+history-show-metadata = Mostrar cambios de metadatos
+history-empty = Carga un recurso y elige dos versiones para comparar.
+history-load-error = No se pudo cargar el historial de ese recurso.
+history-not-found = No hay historial para ese recurso — revisa el tipo y el id.
+history-diff-heading = { $from }
+history-metadata-hidden = { $count ->
+    [one] { $count } cambio de metadatos oculto
+   *[other] { $count } cambios de metadatos ocultos
+}
+history-textual = Ver diff de texto completo
+history-only-metadata = Entre estas versiones solo cambiaron los metadatos.
+history-identical = Estas dos versiones son idénticas.
+history-deleted = { $version } es una eliminación — no hay contra qué comparar.
+history-parse-error = No se pudieron leer esas versiones como JSON.
 ## Saved queries (#234)
 
 nav-saved-queries = Consultas guardadas
@@ -287,3 +318,31 @@ queries-next = Siguiente
 
 queries-rail-heading = Tipos de recurso
 queries-rail-filter = Filtrar tipos
+
+## Búsqueda — lenguaje natural y constructor visual (#255)
+
+search-heading = Buscar
+search-lede = Describe lo que buscas, o arma la consulta a mano. En ambos casos obtienes una búsqueda FHIR que puedes leer, corregir y ejecutar.
+search-query-tag = CONSULTA
+search-copy = Copiar la consulta
+
+search-mode-label = Cómo escribir la consulta
+search-mode-nl = Lenguaje natural
+search-mode-builder = Constructor visual
+
+search-nl-label = Describe la búsqueda
+search-nl-placeholder = Describe lo que buscas — p. ej. pacientes de apellido Smith nacidos después de 1980
+search-nl-hint = Tu texto y los parámetros de búsqueda de este servidor van al modelo de lenguaje. Los datos de pacientes nunca. La consulta que escribe se muestra abajo para que la revises y la ejecutes.
+search-nl-working = Traduciendo…
+search-nl-caveats = Ten en cuenta:
+search-nl-unsupported = Eso no es una búsqueda que este servidor pueda ejecutar. Prueba describiendo los registros que quieres encontrar.
+
+search-nl-example-1 = Pacientes mujeres mayores de 65 con diagnóstico de diabetes
+search-nl-example-2 = Observaciones de los últimos 30 días, las más recientes primero
+search-nl-example-3 = Encuentros en Boston General todavía en curso
+
+search-setup-heading = La búsqueda en lenguaje natural está disponible
+search-setup-body = Convierte descripciones en lenguaje llano en consultas de búsqueda FHIR. Necesita una clave de API de un modelo de lenguaje — el servidor la lee del entorno y nunca llega a esta página. Mientras no haya una, usa el constructor visual de abajo.
+search-setup-key-placeholder = tu clave de API
+search-setup-disable = Para eliminar la función por completo — endpoint, página y este aviso — define HFS_NL_SEARCH_ENABLED=false.
+search-setup-docs = Leer el instructivo

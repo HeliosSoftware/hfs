@@ -29,6 +29,17 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+/// The cluster could not be reached (connection refused, DNS, TLS, timeout).
+///
+/// Distinct from [`internal_error`] because the caller must never confuse it
+/// with "the resource is not there": we never got an answer at all.
+fn unavailable_error(message: String) -> StorageError {
+    StorageError::Backend(BackendError::Unavailable {
+        backend_name: "elasticsearch".to_string(),
+        message,
+    })
+}
+
 /// Content extracted from a resource for full-text search.
 struct SearchableContent {
     narrative: String,
@@ -459,6 +470,11 @@ impl ResourceStorage for ElasticsearchBackend {
         "elasticsearch"
     }
 
+    fn bulk_write_concurrency(&self) -> usize {
+        // One index request per resource; ES absorbs parallel writers.
+        8
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,
@@ -580,6 +596,11 @@ impl ResourceStorage for ElasticsearchBackend {
             .send()
             .await;
 
+        // Deciding "this resource is new, start at version 1" requires knowing that
+        // it does not already exist. Only a 404 establishes that. If the existence
+        // check failed at the transport layer we must not guess "new" — doing so
+        // would reset the version of a resource that does exist, silently clobbering
+        // its history.
         let (version_id, is_new) = match existing {
             Ok(resp) if resp.status_code().is_success() => {
                 let body = resp.json::<Value>().await.unwrap_or_default();
@@ -591,7 +612,19 @@ impl ResourceStorage for ElasticsearchBackend {
                     .unwrap_or(0);
                 ((current_version + 1).to_string(), false)
             }
-            _ => ("1".to_string(), true),
+            Ok(resp) if resp.status_code().as_u16() == 404 => ("1".to_string(), true),
+            Ok(resp) => {
+                let status = resp.status_code().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(internal_error(format!(
+                    "Failed to check existence of {resource_type}/{id} (status {status}): {body}"
+                )));
+            }
+            Err(e) => {
+                return Err(unavailable_error(format!(
+                    "Elasticsearch unreachable while checking existence of {resource_type}/{id}: {e}"
+                )));
+            }
         };
 
         // Ensure resource has correct type and id
@@ -686,13 +719,31 @@ impl ResourceStorage for ElasticsearchBackend {
             .send()
             .await;
 
+        // `Ok(None)` means "this resource does not exist" — a factual claim about
+        // the data. Only ES itself can license that claim, by answering 404. A
+        // transport failure (cluster down, DNS, TLS, timeout) or a 5xx/401/403
+        // means we never learned anything, and must surface as an error. Reporting
+        // it as "not found" would make a down cluster indistinguishable from an
+        // empty one, which is exactly the misleading result this contract forbids.
         let response = match response {
             Ok(r) => r,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                return Err(unavailable_error(format!(
+                    "Elasticsearch unreachable while reading {resource_type}/{id}: {e}"
+                )));
+            }
         };
 
-        if !response.status_code().is_success() {
+        let status = response.status_code();
+        if status.as_u16() == 404 {
             return Ok(None);
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(internal_error(format!(
+                "Failed to read {resource_type}/{id} (status {}): {body}",
+                status.as_u16()
+            )));
         }
 
         let body: Value = response
@@ -872,13 +923,26 @@ impl ResourceStorage for ElasticsearchBackend {
             .send()
             .await;
 
+        // As in `read`: a count of 0 is a claim about the data. Make it only when
+        // the cluster says so, or when the index genuinely does not exist (404).
+        // An unreachable cluster must error, not silently report "zero resources".
         match response {
             Ok(resp) if resp.status_code().is_success() => {
                 let body: Value = resp.json().await.unwrap_or_default();
                 Ok(body.get("count").and_then(|c| c.as_u64()).unwrap_or(0))
             }
-            // If index doesn't exist, count is 0
-            _ => Ok(0),
+            // Index doesn't exist yet — legitimately zero.
+            Ok(resp) if resp.status_code().as_u16() == 404 => Ok(0),
+            Ok(resp) => {
+                let status = resp.status_code().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                Err(internal_error(format!(
+                    "Count failed (status {status}): {body}"
+                )))
+            }
+            Err(e) => Err(unavailable_error(format!(
+                "Elasticsearch unreachable during count: {e}"
+            ))),
         }
     }
 

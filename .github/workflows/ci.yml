@@ -16,8 +16,12 @@ env:
 
 jobs:
   test-rust:
-    name: Test Rust
-    runs-on: [self-hosted]
+    name: Test Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [Linux, Windows]
+    runs-on: [self-hosted, "${{ matrix.os }}"]
     # Bound the whole job so a genuine hang fails fast instead of parking a
     # runner for hours. The Windows leg is the constraint: there is a single
     # self-hosted Windows runner, so a stuck job there blocks every other PR's
@@ -164,6 +168,11 @@ jobs:
           # env vars, so setting them here is sufficient.
           AWS_REQUEST_CHECKSUM_CALCULATION: "WHEN_REQUIRED"
           AWS_RESPONSE_CHECKSUM_VALIDATION: "WHEN_REQUIRED"
+        # The matrix runs this job on a Windows runner (as well as Linux),
+        # where `run:` defaults to PowerShell and cannot parse this bash
+        # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
+        # Pin Git Bash explicitly via its 8.3 short path (see line 139) — the
+        # plain `shell: bash` alias is unreliable on this self-hosted runner.
         run: |
           set -o pipefail
           cargo test -p helios-persistence --all-features \
