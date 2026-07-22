@@ -160,12 +160,19 @@ where
     let connect_timeout_ms = env("HFS_MONGODB_CONNECT_TIMEOUT_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(5000);
+    // Bounds how long an operation waits for a usable server. `connect_timeout_ms`
+    // only bounds a TCP handshake, so this is what actually decides how quickly an
+    // unreachable MongoDB surfaces an error.
+    let server_selection_timeout_ms = env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15_000);
 
     MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
         connect_timeout_ms,
+        server_selection_timeout_ms,
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
         search_offloaded,
@@ -377,12 +384,17 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5000);
+        let server_selection_timeout_ms = std::env::var("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15_000);
 
         let config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
             connect_timeout_ms,
+            server_selection_timeout_ms,
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
@@ -608,6 +620,11 @@ async fn serve(
             app,
             env!("CARGO_PKG_VERSION"),
             config.data_dir.clone(),
+            helios_ui::NlSearch {
+                enabled: config.nl_search_enabled,
+                configured: config.nl_search_api_key.is_some(),
+                model: config.nl_search_model.clone(),
+            },
             ui_tenants.clone(),
             self_base_url,
             outbound_auth,
@@ -630,18 +647,24 @@ async fn serve(
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Shutdown signal received, draining connections");
-            if let Some(state) = audit_state {
-                lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
-                state.sink.flush().await;
-            }
-            // Flush any buffered OTLP spans (no-op without the `otel` feature).
-            helios_observability::telemetry::shutdown();
-        })
-        .await?;
+    // Peer address in request extensions: the natural-language search rate
+    // limiter falls back to it when auth is disabled and there is no principal
+    // to bill a request to.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Shutdown signal received, draining connections");
+        if let Some(state) = audit_state {
+            lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
+            state.sink.flush().await;
+        }
+        // Flush any buffered OTLP spans (no-op without the `otel` feature).
+        helios_observability::telemetry::shutdown();
+    })
+    .await?;
     Ok(())
 }
 
@@ -797,6 +820,10 @@ async fn main() -> anyhow::Result<()> {
     helios_observability::uptime::init();
     helios_observability::telemetry::init("hfs", &config.log_level);
     helios_observability::metrics::init("hfs");
+    // hfs is the one server that mounts the console traffic/tenants endpoints
+    // backed by the reqlog ring buffer, so it opts into recording. Servers that
+    // don't (hts, sof-server, fhirpath-server) leave it off and skip the cost.
+    helios_observability::reqlog::enable();
 
     if let Err(errors) = config.validate() {
         for error in &errors {
@@ -2639,6 +2666,7 @@ mod tests {
             "HFS_MONGODB_DATABASE" => Some("inferno_suite".to_string()),
             "HFS_MONGODB_MAX_CONNECTIONS" => Some("24".to_string()),
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
+            "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
         });
 
@@ -2649,6 +2677,7 @@ mod tests {
         assert_eq!(mongo_config.database_name, "inferno_suite");
         assert_eq!(mongo_config.max_connections, 24);
         assert_eq!(mongo_config.connect_timeout_ms, 7500);
+        assert_eq!(mongo_config.server_selection_timeout_ms, 2500);
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);

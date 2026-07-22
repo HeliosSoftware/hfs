@@ -3,8 +3,9 @@ name: HTS Terminology Benchmark
 # ──────────────────────────────────────────────────────────────────────────────
 # Manual trigger only — benchmarks are expensive and require licensed data.
 #
-# Runs the k6 preflight + benchmark scenarios (HealthSamurai/tx-benchmark)
-# against HTS. The `backend` input selects which storage backend(s) to
+# Runs the k6 preflight + benchmark scenarios (our fork,
+# HeliosSoftware/tx-benchmark — the fork's latest default branch) against
+# HTS. The `backend` input selects which storage backend(s) to
 # exercise:
 #   • sqlite   — default-feature build, file-backed DB.
 #   • postgres — `--features postgres,R4` build, ephemeral postgres:16 container.
@@ -52,6 +53,40 @@ on:
         description: "Tests to run: 'all' | 'preflight-only' | comma-separated IDs (e.g. LK01,SS01)"
         required: false
         default: "all"
+      # ── Perf-attribution arms (issue #227) ────────────────────────────────
+      # Observability instrumentation is a per-request cost on a server that
+      # serves tens of thousands of req/s. These arms exist to *attribute* that
+      # cost to a component instead of guessing at it: run the same commit on
+      # the same runner with only this input varying, and the delta between
+      # arms is that component's price.
+      #
+      # `obs_mode` maps to HELIOS_OBS_MODE (see crates/observability/src/mode.rs):
+      #   default  — what production ships: metrics only, span iff OTLP is live.
+      #   full     — additionally forces the request span + reqlog ring buffer,
+      #              reproducing the pre-fix cost profile for A/B attribution.
+      #   no-span  — metrics + reqlog, no span.
+      #   off      — middleware present but does no work; the floor.
+      obs_mode:
+        description: "Observability arm: default | full | no-span | off"
+        type: choice
+        required: false
+        default: "default"
+        options:
+          - default
+          - full
+          - no-span
+          - off
+      # Overrides RUST_LOG for the server process. The `hts::probe` developer
+      # probes log at DEBUG; `info,hts::probe=debug` re-enables them to price
+      # the stdout-logging arm without touching code.
+      log_directives:
+        description: "RUST_LOG for the server (blank = HTS_LOG_LEVEL only)"
+        required: false
+        default: ""
+      tx_benchmark_ref:
+        description: "tx-benchmark git ref (blank = our fork's default branch; set to pin a specific baseline)"
+        required: false
+        default: ""
 
 # Self-hosted runner has finite Docker port and disk capacity; superseded
 # runs on the same branch yield to fresh ones.
@@ -163,10 +198,19 @@ jobs:
         with:
           clean: false
 
+      # Track our fork's default branch (HeliosSoftware/tx-benchmark) rather
+      # than pinning a SHA. The benchmark test definitions are an *input* to
+      # every perf comparison here, so drift must be controlled — but because
+      # we own the fork, upstream HealthSamurai changes only reach CI once we
+      # deliberately merge them into the fork. That gives us a single, auditable
+      # place to gate drift without stale SHA pins scattered across workflows.
+      # Set the `tx_benchmark_ref` input to pin a specific ref for a one-off
+      # re-baseline run.
       - name: Checkout tx-benchmark
         uses: actions/checkout@v5
         with:
-          repository: HealthSamurai/tx-benchmark
+          repository: HeliosSoftware/tx-benchmark
+          ref: ${{ inputs.tx_benchmark_ref || '' }}
           path: tx-benchmark
 
       - name: Download HTS binary
@@ -368,20 +412,32 @@ jobs:
       - name: Start HTS server
         run: |
           # HTS_DATABASE_URL + HTS_STORAGE_BACKEND already exported.
+          #
+          # RUST_LOG, when supplied, takes precedence over HTS_LOG_LEVEL (the
+          # server's EnvFilter reads the environment first). Left blank in the
+          # default arm so the benchmark measures the shipped configuration.
+          echo "obs arm: HELIOS_OBS_MODE=${{ inputs.obs_mode || 'default' }} RUST_LOG='${{ inputs.log_directives }}'"
           HTS_SERVER_PORT="${{ matrix.port }}" \
           HTS_LOG_LEVEL="info" \
+          HELIOS_OBS_MODE="${{ inputs.obs_mode || 'default' }}" \
+          ${{ inputs.log_directives && format('RUST_LOG="{0}"', inputs.log_directives) || '' }} \
             ./hts > "/tmp/hts-bench-${{ matrix.backend }}.log" 2>&1 &
 
           echo "HTS_PID=$!" >> "$GITHUB_ENV"
 
+          # The sqlite backend warms its in-process hierarchy/closure caches
+          # over the full terminology corpus before it serves, which in a debug
+          # build on a loaded self-hosted runner can take a few minutes — well
+          # past a 60s window. Wait up to 300s so a healthy-but-slow cold start
+          # is not mistaken for a failure; a genuine hang still trips the bound.
           echo "Waiting for HTS to become ready..."
-          for i in $(seq 1 30); do
+          for i in $(seq 1 150); do
             if curl -sf "http://localhost:${{ matrix.port }}/health" > /dev/null 2>&1; then
               echo "HTS ready after $((i * 2))s"
               break
             fi
-            if [ "$i" -eq 30 ]; then
-              echo "ERROR: HTS did not start within 60s"
+            if [ "$i" -eq 150 ]; then
+              echo "ERROR: HTS did not start within 300s"
               cat "/tmp/hts-bench-${{ matrix.backend }}.log"
               exit 1
             fi
