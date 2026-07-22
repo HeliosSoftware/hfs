@@ -1978,3 +1978,291 @@ async fn settings_key_respects_the_configured_global_prefix() {
     let stored = backend.get_settings("u1").await.unwrap().unwrap();
     assert_eq!(stored.document, json!({"theme": "dark"}));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #271 — a tenant whose id names the registry namespace
+// ---------------------------------------------------------------------------
+
+/// A tenant named `tenants` writes under `tenants/resources/…`, which shares the
+/// registry's list prefix. Its resources must not be read back as registry
+/// records.
+#[tokio::test]
+async fn list_tenants_ignores_data_written_by_a_tenant_named_tenants() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    let acme = backend.register_tenant("acme", None).await.unwrap();
+
+    let hostile = tenant("tenants");
+    backend
+        .create(
+            &hostile,
+            "Patient",
+            json!({"resourceType":"Patient","id":"p1","active":true}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(
+        listed,
+        vec![acme],
+        "a resource under `tenants/` must not surface as a registry record"
+    );
+}
+
+/// The permanent-failure half of #271: a history index event has no
+/// `created_at`, so deserializing it as a `TenantRecord` fails. That must skip
+/// the object, not abort the listing — otherwise the admin tenant list and the
+/// UI tenants page return 500 forever with no operator recovery path.
+#[tokio::test]
+async fn list_tenants_survives_history_events_under_the_registry_prefix() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    let acme = backend.register_tenant("acme", None).await.unwrap();
+
+    // Create, update, and delete so both type- and system-level history index
+    // events exist under `tenants/history/…`.
+    let hostile = tenant("tenants");
+    let created = backend
+        .create(
+            &hostile,
+            "Patient",
+            json!({"resourceType":"Patient","id":"p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .update(
+            &hostile,
+            &created,
+            json!({"resourceType":"Patient","id":"p1","active":true}),
+        )
+        .await
+        .unwrap();
+    backend.delete(&hostile, "Patient", "p1").await.unwrap();
+
+    let listed = backend
+        .list_tenants()
+        .await
+        .expect("history events under the registry prefix must not fail the listing");
+    assert_eq!(listed, vec![acme]);
+}
+
+/// A bucket already poisoned before the upgrade must recover on read alone.
+///
+/// The hostile objects are written *raw* through the mock client rather than via
+/// the backend API, so this keeps testing the real corrupted-bucket shape even if
+/// the registry is later relocated.
+#[tokio::test]
+async fn list_tenants_recovers_from_an_already_poisoned_bucket() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+
+    // A resource object: deserializes cleanly into a TenantRecord (both `id` and
+    // `created_at` are present), so pre-fix it injected a phantom tenant row.
+    mock.put_object(
+        "test-bucket",
+        "tenants/resources/Patient/p1/current.json",
+        serde_json::to_vec(&json!({
+            "id": "p1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "resource": {"resourceType": "Patient", "id": "p1"}
+        }))
+        .unwrap(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // A history index event: no `created_at`, so pre-fix it hard-failed the call.
+    mock.put_object(
+        "test-bucket",
+        "tenants/history/system/1700000000000_Patient_p1_1_abc.json",
+        serde_json::to_vec(&json!({
+            "id": "p1",
+            "resource_type": "Patient",
+            "version_id": "1"
+        }))
+        .unwrap(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let backend = make_prefix_backend(mock);
+    let acme = backend.register_tenant("acme", None).await.unwrap();
+
+    let listed = backend
+        .list_tenants()
+        .await
+        .expect("a poisoned bucket must recover on upgrade, without bucket surgery");
+    assert_eq!(listed, vec![acme]);
+}
+
+/// `sanitize()` mapped `/` to `_`, so `a/b` and `a_b` shared one registry
+/// object. That is a cross-tenant read and delete, not a cosmetic listing bug,
+/// so `get_tenant` and `deregister_tenant` are asserted too.
+#[tokio::test]
+async fn registry_distinguishes_ids_a_sanitiser_would_collide() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    let slashed = backend
+        .register_tenant("a/b", Some("Slashed"))
+        .await
+        .unwrap();
+    let underscored = backend
+        .register_tenant("a_b", Some("Underscored"))
+        .await
+        .unwrap();
+
+    assert_eq!(backend.list_tenants().await.unwrap().len(), 2);
+
+    let got_slashed = backend.get_tenant("a/b").await.unwrap().unwrap();
+    let got_underscored = backend.get_tenant("a_b").await.unwrap().unwrap();
+    assert_eq!(got_slashed, slashed);
+    assert_eq!(got_underscored, underscored);
+    assert_eq!(got_slashed.display_name.as_deref(), Some("Slashed"));
+
+    // Deregistering one must leave the other intact.
+    assert!(backend.deregister_tenant("a/b").await.unwrap());
+    assert!(backend.get_tenant("a/b").await.unwrap().is_none());
+    assert_eq!(
+        backend.get_tenant("a_b").await.unwrap(),
+        Some(underscored),
+        "deregistering `a/b` must not remove `a_b`"
+    );
+}
+
+/// A record written under the pre-fix key shape stays readable after upgrade, so
+/// the escaping change does not orphan existing registrations.
+#[tokio::test]
+async fn registry_reads_records_written_under_the_legacy_key() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+
+    // `a/b` as the old code would have written it: sanitized to `a_b.json`.
+    mock.put_object(
+        "test-bucket",
+        "tenants/a_b.json",
+        serde_json::to_vec(&json!({
+            "id": "a/b",
+            "display_name": "Legacy",
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let backend = make_prefix_backend(mock);
+
+    let found = backend
+        .get_tenant("a/b")
+        .await
+        .unwrap()
+        .expect("a pre-fix record must remain readable after upgrade");
+    assert_eq!(found.display_name.as_deref(), Some("Legacy"));
+
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "a/b");
+
+    assert!(
+        backend.deregister_tenant("a/b").await.unwrap(),
+        "deregister must remove a record stored under the legacy key"
+    );
+    assert!(backend.get_tenant("a/b").await.unwrap().is_none());
+}
+
+/// Every sibling namespace of the registry, exercised end to end: writing data
+/// as a tenant with that name must never corrupt or fail the registry listing.
+#[tokio::test]
+async fn list_tenants_survives_tenants_named_after_control_plane_namespaces() {
+    for hostile_id in [
+        "tenants",
+        "resources",
+        "history",
+        "bulk",
+        "_system.user-settings",
+    ] {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        let backend = make_prefix_backend(mock);
+
+        let acme = backend.register_tenant("acme", None).await.unwrap();
+
+        let hostile = tenant(hostile_id);
+        backend
+            .create(
+                &hostile,
+                "Patient",
+                json!({"resourceType":"Patient","id":"p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&hostile, "Patient", "p1").await.unwrap();
+
+        let listed = backend
+            .list_tenants()
+            .await
+            .unwrap_or_else(|e| panic!("tenant named {hostile_id:?} broke list_tenants: {e}"));
+        assert_eq!(
+            listed,
+            vec![acme.clone()],
+            "tenant named {hostile_id:?} corrupted the registry listing"
+        );
+    }
+}
+
+/// A malformed object sitting *directly* under the registry prefix — a foreign
+/// object, a truncated write, or a future schema change — must be skipped, not
+/// abort the listing. The direct-child filter cannot catch this one, so it is
+/// what keeps a single bad object from making the admin tenant list permanently
+/// unavailable.
+#[tokio::test]
+async fn list_tenants_skips_an_unreadable_record_instead_of_failing() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+
+    // Well-formed JSON, but not a TenantRecord (no `created_at`).
+    mock.put_object(
+        "test-bucket",
+        "tenants/not-a-record.json",
+        serde_json::to_vec(&json!({"something": "else"})).unwrap(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Not JSON at all.
+    mock.put_object(
+        "test-bucket",
+        "tenants/truncated.json",
+        b"{\"id\": \"half-writ".to_vec(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let backend = make_prefix_backend(mock);
+    let acme = backend.register_tenant("acme", None).await.unwrap();
+
+    let listed = backend
+        .list_tenants()
+        .await
+        .expect("one unreadable record must not fail the whole listing");
+    assert_eq!(listed, vec![acme]);
+}
