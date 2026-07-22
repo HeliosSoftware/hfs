@@ -686,14 +686,19 @@ async fn init_auth_with_audit(
         return Ok((auth_config, None));
     }
 
-    let jwks_url = auth_config.jwks_url.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("HFS_AUTH_JWKS_URL is required when HFS_AUTH_ENABLED=true")
-    })?;
-
-    // Require issuer validation to prevent cross-service token reuse
-    if auth_config.expected_issuer.is_none() {
-        anyhow::bail!("HFS_AUTH_ISSUER is required when HFS_AUTH_ENABLED=true");
+    // Every invariant of an enabled auth config now lives on the type, so an
+    // embedder that builds one directly gets the same guarantees this binary
+    // does. Issuer validation in particular is required, both to prevent
+    // cross-service token reuse and because `iss` qualifies every per-user
+    // identity (see `helios_rest::extractors::UserKey`).
+    if let Err(errors) = auth_config.validate() {
+        anyhow::bail!("Invalid auth configuration:\n  - {}", errors.join("\n  - "));
     }
+
+    let jwks_url = auth_config
+        .jwks_url
+        .as_ref()
+        .expect("validate() guarantees a JWKS URL when auth is enabled");
 
     // Audience stays optional so an open demo deployment can accept any token
     // from its issuer, but that also means a token minted for a *different*

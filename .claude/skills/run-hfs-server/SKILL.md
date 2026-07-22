@@ -151,7 +151,10 @@ reports the same `501`) in bucket-per-tenant mode with no default system bucket,
 since there is nowhere tenant-independent to keep a user-global document.
 
 When authentication is disabled, every caller resolves to the same fallback user
-key (`local|default`) and therefore **shares one settings document**.
+key (`l2:`) and therefore **shares one settings document**. When auth is enabled,
+each caller's key is derived injectively from the token's `iss` and `sub`
+(`u2:{iss_len}:{iss}:{sub}`); a document written under the pre-#270 `iss|sub`
+encoding is migrated to the new key on first access.
 
 ## Multi-tenancy
 

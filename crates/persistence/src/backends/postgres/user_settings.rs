@@ -134,6 +134,18 @@ impl SettingsStore for PostgresBackend {
         })
         .await
     }
+
+    async fn delete_settings(&self, user_key: &str) -> StorageResult<bool> {
+        let client = self.get_client().await?;
+        let removed = client
+            .execute(
+                "DELETE FROM user_settings WHERE user_key = $1",
+                &[&user_key],
+            )
+            .await
+            .map_err(|e| backend_err(format!("delete user_settings: {e}")))?;
+        Ok(removed > 0)
+    }
 }
 
 /// Builds an `OptimisticLockFailure` for a `user_settings` write whose

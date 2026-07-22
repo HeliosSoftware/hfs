@@ -284,7 +284,7 @@ impl S3Keyspace {
     ///
     /// `object_id` **must** be an opaque, injective digest of the user key (see
     /// `settings_object_id` in the `user_settings` module), never the raw key.
-    /// The raw key is `"{issuer}|{subject}"` built from unvalidated JWT claims: it
+    /// The raw key is derived from JWT claims the server does not constrain: it
     /// can contain `/`, `..`, or be empty, and `sanitize` below is *lossy*, so
     /// embedding it here would let two distinct users collide on one object — a
     /// cross-user settings leak.

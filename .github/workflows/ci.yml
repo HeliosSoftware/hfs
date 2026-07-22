@@ -127,7 +127,7 @@ jobs:
         timeout-minutes: 15
         env:
           RUN_MINIO_S3_TESTS: "1"
-          EXPECTED_MINIO_SETTINGS_TESTS: "4"
+          EXPECTED_MINIO_SETTINGS_TESTS: "5"
         run: |
           set -o pipefail
           cargo test -p helios-persistence --all-features \
