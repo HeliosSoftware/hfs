@@ -551,6 +551,13 @@ impl PostgresBackend {
     }
 
     /// Get a client from the pool.
+    ///
+    /// `#[doc(hidden)] pub` rather than `pub(crate)` only so the out-of-crate
+    /// pool-timeout regression test (`tests/postgres_tests.rs`) can hold several
+    /// pooled connections at once. It hands out a raw connection that bypasses
+    /// tenant scoping, so it is not stable API — workspace callers should use the
+    /// `ResourceStorage`/`SearchProvider` methods instead.
+    #[doc(hidden)]
     pub async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
         use deadpool_postgres::{PoolError, TimeoutType};
 

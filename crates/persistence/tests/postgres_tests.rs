@@ -858,6 +858,15 @@ mod postgres_integration {
         let backend =
             std::sync::Arc::new(PostgresBackend::new(config).await.expect("create backend"));
 
+        // Hold POOL_SIZE clients across a barrier so the pool is forced to open
+        // every physical connection before any is released. deadpool creates
+        // connections lazily, so a serial check could pass while exercising only
+        // one connection. The regression this guards (#285): the pre-fix code ran
+        // `SET statement_timeout` on the single connection borrowed inside
+        // `PostgresBackend::new`, so every connection created lazily afterwards
+        // inherited the server default (usually 0 = uncapped). Shipping the GUC
+        // in the connection startup packet makes every connection carry it, which
+        // is what each task asserts below.
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(POOL_SIZE));
         let mut handles = Vec::with_capacity(POOL_SIZE);
         for _ in 0..POOL_SIZE {
@@ -875,9 +884,14 @@ mod postgres_integration {
             }));
         }
 
-        for h in handles {
+        for (i, h) in handles.into_iter().enumerate() {
             let value = h.await.expect("task panicked");
-            assert_eq!(value, format!("{TIMEOUT_MS}ms"));
+            assert_eq!(
+                value,
+                format!("{TIMEOUT_MS}ms"),
+                "pooled connection #{i} reported statement_timeout={value:?}, \
+                 expected {TIMEOUT_MS}ms — the GUC did not reach every connection"
+            );
         }
     }
 
