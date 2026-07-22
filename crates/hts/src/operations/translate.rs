@@ -104,9 +104,16 @@ pub(crate) async fn process_translate<B: TerminologyBackend>(
     }
 
     // Need at least one of source code (forward) or target code (reverse).
+    // Name every accepted spelling so a client that sent a valid-but-unread
+    // shape (e.g. the R5 `sourceCoding`) can self-correct — the old message
+    // listed only the scalar forms and gave no hint the Coding/CodeableConcept
+    // spellings this handler accepts even exist. See #288.
     if source_code.is_none() && target_code.is_none() {
         return Err(HtsError::InvalidRequest(
-            "Missing required parameter: code or sourceCode (or targetCode for reverse)".into(),
+            "Missing source concept: provide code (with system), coding, or codeableConcept \
+             (R5 aliases sourceCode/sourceSystem, sourceCoding, sourceCodeableConcept accepted); \
+             for a reverse translation supply targetCode, targetCoding, or targetCodeableConcept"
+                .into(),
         ));
     }
 
@@ -704,6 +711,48 @@ mod tests {
 
         let resp = post_json(app, "/ConceptMap/$translate", body).await;
         assert_eq!(resp.status(), 400);
+    }
+
+    /// When no source concept is supplied, the 400 OperationOutcome must name
+    /// every accepted spelling — including the Coding/CodeableConcept ones — so a
+    /// client that sent a spec-legal-but-unread shape (e.g. R5 `sourceCoding`) has
+    /// a hint about what HTS accepts. Regression test for #288: the old message
+    /// listed only `code`/`sourceCode`/`targetCode`. Assert substring-contains per
+    /// spelling (not exact-equality) so rewording the prose doesn't spuriously
+    /// break CI while still guaranteeing each alias stays discoverable.
+    #[tokio::test]
+    async fn translate_missing_code_diagnostics_names_accepted_spellings() {
+        let app = make_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "system", "valueUri": "http://example.org/src"}
+            ]
+        });
+
+        let resp = post_json(app, "/ConceptMap/$translate", body).await;
+        assert_eq!(resp.status(), 400);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["resourceType"], "OperationOutcome");
+        assert_eq!(json["issue"][0]["code"], "invalid");
+        let diag = json["issue"][0]["diagnostics"]
+            .as_str()
+            .expect("diagnostics string");
+        for spelling in [
+            "sourceCoding",
+            "coding",
+            "sourceCodeableConcept",
+            "codeableConcept",
+            "sourceCode",
+            "targetCoding",
+            "targetCode",
+        ] {
+            assert!(
+                diag.contains(spelling),
+                "diagnostics must name the accepted `{spelling}` spelling, got: {diag}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -124,18 +124,19 @@ struct WebState {
     settings: Option<Arc<dyn SettingsStore>>,
 }
 
-/// The settings key holding the user's FHIR-version choice, and the user key
-/// the settings resolve under. The key mirrors `helios-rest`'s `UserKey`
-/// derivation: `"{issuer}|{subject}"` from an authenticated principal, or this
-/// local fallback when auth is disabled (`/ui` also sits outside the auth
-/// layer today — #320 tracks the authenticated modes).
+/// The settings keys holding the user's FHIR-version and tenant choices, and
+/// the user key the settings resolve under. The key mirrors `helios-rest`'s
+/// `UserKey` post-#270 encoding — `u2:{issuer_len}:{issuer}:{subject}` from an
+/// authenticated principal, `l2:` when auth is disabled (`/ui` also sits
+/// outside the auth layer today; #320 tracks the authenticated modes). Keep in
+/// step with `crates/rest/src/extractors/user.rs`.
 const SETTINGS_VERSION_KEY: &str = "fhirVersion";
 const SETTINGS_TENANT_KEY: &str = "tenantId";
-const LOCAL_USER_KEY: &str = "local|default";
+const LOCAL_USER_KEY: &str = "l2:";
 
-fn settings_user_key(extensions: &axum::http::Extensions) -> String {
-    match extensions.get::<helios_auth::Principal>() {
-        Some(principal) => format!("{}|{}", principal.issuer(), principal.subject()),
+fn settings_user_key(principal: Option<&helios_auth::Principal>) -> String {
+    match principal {
+        Some(p) => format!("u2:{}:{}:{}", p.issuer().len(), p.issuer(), p.subject()),
         None => LOCAL_USER_KEY.to_string(),
     }
 }
@@ -211,7 +212,7 @@ async fn resolve_prefs(
     };
     let document = match &state.settings {
         Some(store) => {
-            let user = settings_user_key(request.extensions());
+            let user = settings_user_key(request.extensions().get::<helios_auth::Principal>());
             match store.get_settings(&user).await {
                 Ok(stored) => stored.map(|s| s.document),
                 Err(_) => None,
@@ -648,10 +649,7 @@ async fn set_version(
 
     let mut persisted = false;
     if let Some(store) = &state.settings {
-        let user = match &principal {
-            Some(axum::Extension(p)) => format!("{}|{}", p.issuer(), p.subject()),
-            None => LOCAL_USER_KEY.to_string(),
-        };
+        let user = settings_user_key(principal.as_ref().map(|e| &e.0));
         match store
             .patch_settings(
                 &user,
@@ -774,10 +772,7 @@ async fn set_tenant(
     }
 
     if let Some(store) = &state.settings {
-        let user = match &principal {
-            Some(axum::Extension(p)) => format!("{}|{}", p.issuer(), p.subject()),
-            None => LOCAL_USER_KEY.to_string(),
-        };
+        let user = settings_user_key(principal.as_ref().map(|e| &e.0));
         if let Err(e) = store
             .patch_settings(
                 &user,

@@ -455,6 +455,25 @@ async fn mongodb_total_created_connections(connection_string: &str) -> Option<i6
 }
 
 #[tokio::test]
+async fn mongodb_integration_readiness_check() {
+    let Some(backend) = create_backend("readiness_check").await else {
+        eprintln!(
+            "Skipping mongodb_integration_readiness_check (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    // The `/_readiness` probe delegates to `Backend::health_check` via the
+    // `ResourceStorage::readiness_check` override; a live mongo must report ready.
+    let readiness = ResourceStorage::readiness_check(&backend).await;
+    assert!(
+        readiness.is_ok(),
+        "readiness_check failed on a live mongodb: {:?}",
+        readiness.err()
+    );
+}
+
+#[tokio::test]
 async fn mongodb_integration_create_read_update_delete() {
     let Some(backend) = create_backend("crud").await else {
         eprintln!(
@@ -3036,6 +3055,33 @@ mod settings_mongo {
     pub(super) async fn backend(test_name: &str) -> Option<MongoBackend> {
         super::create_backend(test_name).await
     }
+}
+
+/// `delete_settings` removes the document and reports whether one existed —
+/// the primitive the #270 legacy-key migration uses to move a document rather
+/// than leave a duplicate copy behind.
+#[tokio::test]
+async fn mongodb_integration_settings_delete_is_idempotent() {
+    let Some(backend) = settings_mongo::backend("settings_delete").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_delete_is_idempotent (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("delete");
+
+    // Absent is not an error, and reports "nothing removed".
+    assert!(!backend.delete_settings(&user).await.unwrap());
+
+    backend
+        .put_settings(&user, json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert!(backend.get_settings(&user).await.unwrap().is_some());
+
+    assert!(backend.delete_settings(&user).await.unwrap());
+    assert!(backend.get_settings(&user).await.unwrap().is_none());
+    assert!(!backend.delete_settings(&user).await.unwrap());
 }
 
 #[tokio::test]

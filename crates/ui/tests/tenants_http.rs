@@ -244,7 +244,7 @@ async fn version_choice_persists_to_user_settings_and_redirects_back() {
         "/ui/search-parameters"
     );
     let stored = backend
-        .get_settings("local|default")
+        .get_settings("l2:")
         .await
         .expect("settings read")
         .expect("document stored");
@@ -321,7 +321,7 @@ async fn tenant_choice_persists_and_the_selector_follows_it() {
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     assert_eq!(res.headers().get(header::LOCATION).unwrap(), "/ui/queries");
     let stored = backend
-        .get_settings("local|default")
+        .get_settings("l2:")
         .await
         .expect("settings read")
         .expect("document stored");

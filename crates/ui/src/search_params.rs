@@ -54,6 +54,12 @@ impl SpCatalog {
             return cached.clone();
         }
         let built = Arc::new(fetch_snapshot(&*self.source, version, tenant).await);
+        // A failed fetch (`spec_loaded == false`) is served degraded for this
+        // request only — caching it would pin the page to the failure until
+        // restart.
+        if !built.spec_loaded {
+            return built;
+        }
         // Another task may have raced us here; keep whichever landed first.
         self.versions
             .lock()

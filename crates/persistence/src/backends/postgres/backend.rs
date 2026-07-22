@@ -773,13 +773,16 @@ impl Backend for PostgresBackend {
                 backend_name: "postgres".to_string(),
                 message: "Failed to get connection".to_string(),
             })?;
+        // A failing constant `SELECT 1` means the backend is unreachable/broken,
+        // not a bad query — surface it as a retryable `Unavailable` (503) rather
+        // than an `Internal` (500) so a down backend reads as "try again", and
+        // so the readiness probe classifies it correctly.
         client
             .query_one("SELECT 1", &[])
             .await
-            .map_err(|e| BackendError::Internal {
+            .map_err(|e| BackendError::Unavailable {
                 backend_name: "postgres".to_string(),
                 message: format!("Health check failed: {}", e),
-                source: None,
             })?;
         Ok(())
     }

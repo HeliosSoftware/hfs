@@ -180,6 +180,22 @@ mod contract {
 mod sqlite_backend {
     use super::contract::*;
     use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+    use helios_persistence::core::{Backend, ResourceStorage};
+
+    /// Positive control for the readiness fix (issue #286): a reachable backend's
+    /// `readiness_check` — and the `Backend::health_check` it delegates to — must
+    /// succeed. This is the counterpart to the unreachable-store failures above,
+    /// and it is what covers the `readiness_check` override in `sqlite/storage.rs`.
+    #[tokio::test]
+    async fn live_sqlite_readiness_and_health_check_ok() {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        Backend::health_check(&backend)
+            .await
+            .expect("health_check ok on a live db");
+        ResourceStorage::readiness_check(&backend)
+            .await
+            .expect("readiness_check ok on a live db");
+    }
 
     /// Operation-time: a store that opened fine but was never migrated.
     ///
