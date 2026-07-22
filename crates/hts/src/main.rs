@@ -30,6 +30,13 @@ async fn main() -> anyhow::Result<()> {
                 host = %config.host,
                 storage_backend = %config.storage_backend,
                 database_url = %config.database_url,
+                // Eagerly resolve the HELIOS_OBS_MODE OnceLock at boot and stamp
+                // it into the startup line. The same-session A/B benchmark (#297)
+                // greps this to assert each arm's server actually resolved to the
+                // arm it set — a server that silently ignored the env var (e.g.
+                // built without the observability arm switch) is caught here
+                // rather than producing a clean-looking table of ~zero deltas.
+                obs_mode = ?helios_observability::mode::mode(),
                 "Starting Helios Terminology Server"
             );
             run_server(config).await
