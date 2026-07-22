@@ -470,6 +470,11 @@ impl ResourceStorage for ElasticsearchBackend {
         "elasticsearch"
     }
 
+    fn bulk_write_concurrency(&self) -> usize {
+        // One index request per resource; ES absorbs parallel writers.
+        8
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,
