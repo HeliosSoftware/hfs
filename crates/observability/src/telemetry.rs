@@ -6,11 +6,26 @@
 //! exports spans over OTLP via `tracing-opentelemetry`. Call [`shutdown`] during
 //! graceful shutdown to flush buffered spans.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[cfg(feature = "otel")]
 static PROVIDER: std::sync::OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> =
     std::sync::OnceLock::new();
+
+/// Set once, at [`init`], to whether a tracing layer is actually exporting the
+/// per-request span. Without an exporter the span is created, entered on every
+/// poll, and dropped with nobody reading it — pure overhead. The request
+/// middleware consults [`traces_live`] to skip it in that case.
+static TRACES_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether a layer that consumes the per-request span is installed. `false`
+/// until [`init`] decides otherwise, so the middleware defaults to the cheap
+/// path. See [`crate::mode::ObsMode::span_enabled`].
+pub fn traces_live() -> bool {
+    TRACES_LIVE.load(Ordering::Relaxed)
+}
 
 /// Global default log directives when neither `RUST_LOG` nor the cli/env filter
 /// is set. Applies `level` globally; deps remain overridable via `RUST_LOG`.
@@ -36,6 +51,9 @@ pub fn init(service_name: &str, log_level: &str) {
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
             let _ = PROVIDER.set(provider);
+            // A layer now consumes the per-request span, so producing it earns
+            // its keep. Everywhere else the middleware skips it.
+            TRACES_LIVE.store(true, Ordering::Relaxed);
             tracing::info!(service = service_name, "OTLP trace export enabled");
             return;
         }
