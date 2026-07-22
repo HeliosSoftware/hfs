@@ -4522,4 +4522,104 @@ mod postgres_integration {
         let backend = create_backend().await;
         assert!(backend.supports_contained_search());
     }
+
+    // ========================================================================
+    // Backend error handling — a reachable but misconfigured store
+    // ========================================================================
+    //
+    // `tests/backend_error_handling.rs` covers every backend's *unreachable*
+    // case with no server at all. PostgreSQL has a gap that cannot be closed
+    // there: `PostgresBackend::new` eagerly verifies connectivity, so an
+    // unreachable server fails at construction and the caller never obtains a
+    // backend to drive. That leaves every per-operation error arm in
+    // `postgres/storage.rs` — the `internal_error(..)` mapping behind `read`,
+    // `count`, `create` and friends — completely unexercised, which is exactly
+    // the class of uncovered code that motivated this work.
+    //
+    // Reaching those arms needs a server that answers but cannot serve the
+    // query, so this test lives here, with the shared container. It mirrors the
+    // SQLite `unmigrated_store_surfaces_backend_error` test: connect to a
+    // database whose schema was never created (`new()` runs no DDL —
+    // `init_schema()` is a separate, opt-in call) and drive the core operations.
+    // Every one of them hits `relation "resources" does not exist`.
+
+    /// Operations against a reachable database with no schema must surface a
+    /// backend error — never a misleading success.
+    #[tokio::test]
+    async fn postgres_integration_unmigrated_store_surfaces_backend_error() {
+        let pg = shared_pg().await;
+
+        // A database of our own, so we can leave it unmigrated without disturbing
+        // the schema the rest of this suite shares.
+        let dbname = format!("unmigrated_{}", uuid::Uuid::new_v4().simple());
+        let admin_conn = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (admin, connection) = tokio_postgres::connect(&admin_conn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        // `batch_execute` uses the simple query protocol. `execute` would use the
+        // extended one, which wraps the statement in an implicit transaction —
+        // and CREATE DATABASE cannot run inside a transaction block.
+        admin
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .expect("create an empty database");
+
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname,
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 2,
+            ..Default::default()
+        })
+        .await
+        .expect("the server is reachable, so construction must succeed");
+
+        // init_schema() is deliberately NOT called.
+
+        let tenant = create_tenant("unmigrated");
+
+        let read = backend.read(&tenant, "Patient", "does-not-exist").await;
+        assert!(
+            !matches!(read, Ok(None)),
+            "read against an unmigrated database returned Ok(None) — a store we \
+             could not query must not be indistinguishable from one where the \
+             resource is genuinely absent"
+        );
+        assert!(
+            matches!(read, Err(StorageError::Backend(_))),
+            "expected a backend error from an unmigrated database, got {read:?}"
+        );
+
+        let count = backend.count(&tenant, Some("Patient")).await;
+        assert!(
+            !matches!(count, Ok(0)),
+            "count against an unmigrated database returned Ok(0) — 'zero resources' \
+             is a claim about data we never successfully queried"
+        );
+        assert!(
+            matches!(count, Err(StorageError::Backend(_))),
+            "expected a backend error from an unmigrated database, got {count:?}"
+        );
+
+        let create = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient" }),
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(
+            matches!(create, Err(StorageError::Backend(_))),
+            "expected a backend error from an unmigrated database, got {create:?}"
+        );
+    }
 }

@@ -58,3 +58,6 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 [dev-dependencies]
 # Drives the async `dashboard::snapshot` path in unit tests.
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+# Drives the `middleware::track` layer end-to-end via `ServiceExt::oneshot`
+# against a real axum router (tests/middleware.rs).
+tower = { version = "0.5", features = ["util"] }

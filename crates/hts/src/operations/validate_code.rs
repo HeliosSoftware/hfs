@@ -2209,28 +2209,25 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.cs_validate_code_handler_cache, key) {
-            let key_short: String = key.chars().take(100).collect();
-            tracing::info!(
+            // Field exprs are evaluated only when the probe target is enabled,
+            // so the truncating alloc costs nothing at the default level.
+            tracing::debug!(
                 target: "hts::probe",
                 "VC_CACHE: path=cs hit=true cache_key={}",
-                key_short,
+                key.chars().take(100).collect::<String>(),
             );
             return Ok((*cached).clone());
         }
     }
-    {
-        let (skip, key_short, key_len) = match cache_key.as_ref() {
-            Some(k) => (false, k.chars().take(100).collect::<String>(), k.len()),
-            None => (true, String::new(), 0usize),
-        };
-        tracing::info!(
-            target: "hts::probe",
-            "VC_CACHE: path=cs hit=false skip={} key_len={} cache_key={}",
-            skip,
-            key_len,
-            key_short,
-        );
-    }
+    tracing::debug!(
+        target: "hts::probe",
+        "VC_CACHE: path=cs hit=false skip={} key_len={} cache_key={}",
+        cache_key.is_none(),
+        cache_key.as_ref().map_or(0, |k| k.len()),
+        cache_key
+            .as_ref()
+            .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
+    );
     let result = process_validate_code_inner(state, params).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
@@ -4108,30 +4105,25 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.vs_validate_code_handler_cache, key) {
-            // Probe: cache hit on VS path.
-            let key_short: String = key.chars().take(100).collect();
-            tracing::info!(
+            // Field exprs evaluated only when the probe target is enabled.
+            tracing::debug!(
                 target: "hts::probe",
                 "VC_CACHE: path=vs hit=true cache_key={}",
-                key_short,
+                key.chars().take(100).collect::<String>(),
             );
             return Ok((*cached).clone());
         }
     }
     // Probe: cache miss (or skipped) on VS path. Capture key length / shape.
-    {
-        let (skip, key_short, key_len) = match cache_key.as_ref() {
-            Some(k) => (false, k.chars().take(100).collect::<String>(), k.len()),
-            None => (true, String::new(), 0usize),
-        };
-        tracing::info!(
-            target: "hts::probe",
-            "VC_CACHE: path=vs hit=false skip={} key_len={} cache_key={}",
-            skip,
-            key_len,
-            key_short,
-        );
-    }
+    tracing::debug!(
+        target: "hts::probe",
+        "VC_CACHE: path=vs hit=false skip={} key_len={} cache_key={}",
+        cache_key.is_none(),
+        cache_key.as_ref().map_or(0, |k| k.len()),
+        cache_key
+            .as_ref()
+            .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
+    );
     let result = process_vs_validate_code_inner(state, params).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(

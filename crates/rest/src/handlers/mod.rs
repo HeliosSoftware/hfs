@@ -27,6 +27,7 @@ pub mod create;
 pub mod delete;
 pub mod health;
 pub mod history;
+pub mod nl_search;
 pub mod patch;
 pub mod purge;
 pub mod read;
@@ -78,6 +79,7 @@ pub use history::{
     delete_instance_history_handler, delete_version_handler, history_instance_handler,
     history_system_handler, history_type_handler,
 };
+pub use nl_search::nl_search_handler;
 pub use patch::patch_handler;
 pub use purge::{purge_instance_handler, purge_type_handler};
 pub use read::{head_read_handler, read_handler};
