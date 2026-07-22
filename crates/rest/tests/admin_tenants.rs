@@ -138,6 +138,36 @@ async fn invalid_ids_are_rejected() {
     }
 }
 
+/// Ids naming a control-plane namespace are refused at creation (issue #271).
+///
+/// This is a guardrail, not the fix: the backend is safe structurally, because
+/// this check only covers the admin API and the JWT tenant extractor validates
+/// nothing.
+#[tokio::test]
+async fn control_plane_namespace_ids_are_reserved() {
+    let server = create_test_server().await;
+    for reserved in ["tenants", "resources", "history", "bulk"] {
+        let res = server
+            .post("/admin/tenants")
+            .json(&json!({ "id": reserved }))
+            .await;
+        res.assert_status(StatusCode::BAD_REQUEST);
+    }
+}
+
+/// Hierarchical ids stay valid — `TenantId` treats `/` as the hierarchy
+/// separator and `SharedSchemaStrategy` accepts `acme/research`. Tightening the
+/// charset here would contradict a shipped feature.
+#[tokio::test]
+async fn hierarchical_ids_are_still_accepted() {
+    let server = create_test_server().await;
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme/research" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+}
+
 #[tokio::test]
 async fn list_includes_data_only_tenants_with_counts() {
     let server = create_test_server().await;
