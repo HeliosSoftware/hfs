@@ -16,12 +16,12 @@ env:
 
 jobs:
   test-rust:
-    name: Test Rust (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [Linux, Windows]
-    runs-on: [self-hosted, "${{ matrix.os }}"]
+    name: Test Rust
+    runs-on: [self-hosted]
+    # Bound the whole job so a genuine hang fails fast instead of parking a
+    # runner for hours. A healthy run (full all-features build + tests) fits
+    # comfortably under this.
+    timeout-minutes: 120
     steps:
       - name: Verify DOCKER_HOST is set
         if: env.DOCKER_HOST == ''
@@ -124,6 +124,7 @@ jobs:
       - name: Verify S3 conditional writes against MinIO (per-user settings)
         if: runner.os != 'Windows'
         shell: bash
+        timeout-minutes: 15
         env:
           RUN_MINIO_S3_TESTS: "1"
           EXPECTED_MINIO_SETTINGS_TESTS: "4"
@@ -141,11 +142,28 @@ jobs:
       - name: Verify S3 conditional writes against MinIO (per-user settings) (Windows)
         if: runner.os == 'Windows'
         shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        timeout-minutes: 15
         env:
           RUN_MINIO_S3_TESTS: "1"
           EXPECTED_MINIO_SETTINGS_TESTS: "4"
-        # The matrix runs this job on a Windows runner (as well as Linux),
-        # where `run:` defaults to PowerShell and cannot parse this bash
+          # The single self-hosted Windows runner is a virtualized guest whose
+          # CPU does not advertise SSE4.1 + PCLMULQDQ. The AWS S3 SDK's default
+          # integrity protection computes a CRC32 on every upload via the
+          # `crc-fast` crate (aws-sdk-s3 -> aws-smithy-checksums -> crc-fast),
+          # and crc-fast 1.6.0 has no software fallback on x86_64 — it panics
+          # ("x86 features missing (SSE4.1 && PCLMULQDQ)"), failing all four
+          # tests before they can verify anything. Opt out of the default
+          # checksum calc/validation so the SDK never enters that code path.
+          # This step verifies the If-Match / If-None-Match precondition
+          # contract, not checksums, so no coverage is lost; the Linux leg above
+          # still exercises the default checksum path. Both the test's SDK
+          # client and the S3 backend build config via
+          # `aws_config::defaults(BehaviorVersion::latest())`, which reads these
+          # env vars, so setting them here is sufficient.
+          AWS_REQUEST_CHECKSUM_CALCULATION: "WHEN_REQUIRED"
+          AWS_RESPONSE_CHECKSUM_VALIDATION: "WHEN_REQUIRED"
+        # `runs-on: [self-hosted]` is unpinned, so this job can land on a Windows
+        # runner, where `run:` defaults to PowerShell and cannot parse this bash
         # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
         # Pin Git Bash explicitly via its 8.3 short path (see line 139) — the
         # plain `shell: bash` alias is unreliable on this self-hosted runner.
