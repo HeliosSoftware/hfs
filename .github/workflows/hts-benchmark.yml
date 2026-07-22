@@ -3,8 +3,9 @@ name: HTS Terminology Benchmark
 # ──────────────────────────────────────────────────────────────────────────────
 # Manual trigger only — benchmarks are expensive and require licensed data.
 #
-# Runs the k6 preflight + benchmark scenarios (HealthSamurai/tx-benchmark)
-# against HTS. The `backend` input selects which storage backend(s) to
+# Runs the k6 preflight + benchmark scenarios (our fork,
+# HeliosSoftware/tx-benchmark — the fork's latest default branch) against
+# HTS. The `backend` input selects which storage backend(s) to
 # exercise:
 #   • sqlite   — default-feature build, file-backed DB.
 #   • postgres — `--features postgres,R4` build, ephemeral postgres:16 container.
@@ -83,7 +84,7 @@ on:
         required: false
         default: ""
       tx_benchmark_ref:
-        description: "tx-benchmark git ref (blank = pinned SHA; changing it re-baselines)"
+        description: "tx-benchmark git ref (blank = our fork's default branch; set to pin a specific baseline)"
         required: false
         default: ""
 
@@ -197,17 +198,19 @@ jobs:
         with:
           clean: false
 
-      # Pinned to a SHA, not a moving branch. The benchmark test definitions
-      # are an *input* to every perf comparison in this repo: an unpinned
-      # checkout means a baseline recorded weeks ago and a run recorded today
-      # may not have measured the same thing, and no regression claim made
-      # against that baseline is falsifiable. Bump this deliberately, and
-      # re-baseline when you do.
+      # Track our fork's default branch (HeliosSoftware/tx-benchmark) rather
+      # than pinning a SHA. The benchmark test definitions are an *input* to
+      # every perf comparison here, so drift must be controlled — but because
+      # we own the fork, upstream HealthSamurai changes only reach CI once we
+      # deliberately merge them into the fork. That gives us a single, auditable
+      # place to gate drift without stale SHA pins scattered across workflows.
+      # Set the `tx_benchmark_ref` input to pin a specific ref for a one-off
+      # re-baseline run.
       - name: Checkout tx-benchmark
         uses: actions/checkout@v5
         with:
-          repository: HealthSamurai/tx-benchmark
-          ref: ${{ inputs.tx_benchmark_ref || '78bdffa769e21ac5d654f5dad412d1becf9d7e57' }}
+          repository: HeliosSoftware/tx-benchmark
+          ref: ${{ inputs.tx_benchmark_ref || '' }}
           path: tx-benchmark
 
       - name: Download HTS binary
