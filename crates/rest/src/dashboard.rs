@@ -174,10 +174,11 @@ where
     Ok(series)
 }
 
-/// [`DashboardProvider`] backed by a live storage backend, scoped to the
-/// server's default tenant. Registered once in [`crate::build_app`].
+/// [`DashboardProvider`] backed by a live storage backend. Registered once in
+/// [`crate::build_app`]; the tenant to chart arrives per call (#344), with the
+/// server default as the fallback for an empty id.
 pub(crate) struct StorageDashboardProvider<S> {
-    tenant: TenantContext,
+    default_tenant: String,
     fhir_version: String,
     types: Vec<String>,
     storage: Arc<S>,
@@ -188,12 +189,8 @@ impl<S> StorageDashboardProvider<S> {
     /// version, charting [`DEFAULT_DASHBOARD_TYPES`]. The window is chosen per
     /// request by the UI, so it is not fixed here.
     pub(crate) fn new(storage: Arc<S>, config: &ServerConfig) -> Self {
-        let tenant = TenantContext::new(
-            TenantId::new(config.default_tenant.clone()),
-            TenantPermissions::full_access(),
-        );
         Self {
-            tenant,
+            default_tenant: config.default_tenant.clone(),
             fhir_version: config.default_fhir_version.to_string(),
             types: DEFAULT_DASHBOARD_TYPES
                 .iter()
@@ -209,7 +206,16 @@ impl<S> DashboardProvider for StorageDashboardProvider<S>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
-    async fn snapshot(&self, window: DashboardWindow) -> DashboardSnapshot {
+    async fn snapshot(&self, window: DashboardWindow, tenant: &str) -> DashboardSnapshot {
+        let tenant_id = if tenant.is_empty() {
+            self.default_tenant.as_str()
+        } else {
+            tenant
+        };
+        let tenant = TenantContext::new(
+            TenantId::new(tenant_id.to_string()),
+            TenantPermissions::full_access(),
+        );
         let now = Utc::now();
         let type_refs: Vec<&str> = self.types.iter().map(|t| t.as_str()).collect();
 
@@ -217,7 +223,7 @@ where
         // the operator dashboard should render even if a count query hiccups.
         let series = match resource_count_series(
             self.storage.as_ref(),
-            &self.tenant,
+            &tenant,
             &type_refs,
             SeriesWindow::from_dashboard_window(window),
             now,
@@ -231,18 +237,18 @@ where
             }
         };
 
-        let total_resources =
-            self.storage
-                .count(&self.tenant, None)
-                .await
-                .unwrap_or_else(|error| {
-                    warn!(%error, "dashboard snapshot: total count query failed");
-                    0
-                });
+        let total_resources = self
+            .storage
+            .count(&tenant, None)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(%error, "dashboard snapshot: total count query failed");
+                0
+            });
 
         let distinct_types = self
             .storage
-            .count_all_types(&self.tenant)
+            .count_all_types(&tenant)
             .await
             .map(|types| types.len())
             .unwrap_or_else(|error| {
@@ -280,7 +286,7 @@ mod tests {
         };
 
         let provider = StorageDashboardProvider::new(Arc::new(backend), &config);
-        let snapshot = provider.snapshot(DashboardWindow::default()).await;
+        let snapshot = provider.snapshot(DashboardWindow::default(), "").await;
 
         // One series per charted type, each a dense 30-day window of zeros.
         assert_eq!(snapshot.series.len(), DEFAULT_DASHBOARD_TYPES.len());

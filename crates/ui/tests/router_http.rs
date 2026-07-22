@@ -35,6 +35,7 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
         nl,
         None,
         None,
+        "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
             std::path::Path::new("../../data"),
         )),
@@ -148,6 +149,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         nl(true, true),
         None,
         None,
+        "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
     )

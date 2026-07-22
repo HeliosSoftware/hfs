@@ -55,7 +55,7 @@ pub(crate) struct CompartmentResource {
 /// cached; sorted by compartment code.
 pub(crate) struct CompartmentCatalog {
     source: Arc<dyn ConformanceSource>,
-    cache: Mutex<HashMap<FhirVersion, Arc<Vec<CompartmentDef>>>>,
+    cache: Mutex<HashMap<(String, FhirVersion), Arc<Vec<CompartmentDef>>>>,
 }
 
 impl CompartmentCatalog {
@@ -68,24 +68,32 @@ impl CompartmentCatalog {
 
     /// The definitions for a version, fetching on first use. A failed fetch
     /// yields an empty set (the page degrades to a warning).
-    pub async fn definitions(&self, version: FhirVersion) -> Arc<Vec<CompartmentDef>> {
-        if let Some(cached) = self.cache.lock().expect("compartment lock").get(&version) {
+    pub async fn definitions(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+    ) -> Arc<Vec<CompartmentDef>> {
+        let key = (tenant.to_string(), version);
+        if let Some(cached) = self.cache.lock().expect("compartment lock").get(&key) {
             return cached.clone();
         }
-        let mut defs: Vec<CompartmentDef> =
-            match self.source.fetch("CompartmentDefinition", version).await {
-                Ok(resources) => resources
-                    .into_iter()
-                    .filter_map(|r| serde_json::from_value(r).ok())
-                    .collect(),
-                Err(_) => Vec::new(),
-            };
+        let mut defs: Vec<CompartmentDef> = match self
+            .source
+            .fetch("CompartmentDefinition", version, tenant)
+            .await
+        {
+            Ok(resources) => resources
+                .into_iter()
+                .filter_map(|r| serde_json::from_value(r).ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
         defs.sort_by(|a, b| a.code.cmp(&b.code));
         let built = Arc::new(defs);
         self.cache
             .lock()
             .expect("compartment lock")
-            .entry(version)
+            .entry(key)
             .or_insert_with(|| built.clone())
             .clone()
     }
@@ -93,8 +101,8 @@ impl CompartmentCatalog {
     /// Every resource type of the version, from the first CompartmentDefinition
     /// (each enumerates the full set — 145 in R4). Used by the queries page's
     /// resource picker rail.
-    pub async fn resource_type_names(&self, version: FhirVersion) -> Vec<String> {
-        self.definitions(version)
+    pub async fn resource_type_names(&self, tenant: &str, version: FhirVersion) -> Vec<String> {
+        self.definitions(tenant, version)
             .await
             .first()
             .map(|def| def.resource.iter().map(|r| r.code.clone()).collect())

@@ -23,7 +23,12 @@ use serde_json::Value;
 pub trait ConformanceSource: Send + Sync {
     /// Returns every resource of `resource_type` the server holds for `version`,
     /// or an `Err` message when the fetch fails (the caller degrades the page).
-    async fn fetch(&self, resource_type: &str, version: FhirVersion) -> Result<Vec<Value>, String>;
+    async fn fetch(
+        &self,
+        resource_type: &str,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<Vec<Value>, String>;
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -56,14 +61,20 @@ impl ConformanceSource for HttpConformanceSource {
         &self,
         resource_type: &str,
         _version: FhirVersion,
+        tenant: &str,
     ) -> Result<Vec<Value>, String> {
         // A single page large enough to hold the whole conformance set: the UI
         // needs the full list for its facets and rail, and paginates in-memory.
         let url = format!("{}/{}?_count=100000", self.base_url, resource_type);
-        let request = self
+        let mut request = self
             .client
             .get(&url)
             .header("Accept", "application/fhir+json");
+        // Scope the self-call to the effective tenant (#344); an empty id means
+        // the server default and needs no header.
+        if !tenant.is_empty() {
+            request = request.header("X-Tenant-ID", tenant);
+        }
         let request = self
             .outbound_auth
             .authorize(request, &self.base_url)
@@ -149,7 +160,12 @@ impl StaticConformanceSource {
 
 #[async_trait]
 impl ConformanceSource for StaticConformanceSource {
-    async fn fetch(&self, resource_type: &str, version: FhirVersion) -> Result<Vec<Value>, String> {
+    async fn fetch(
+        &self,
+        resource_type: &str,
+        version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<Vec<Value>, String> {
         Ok(self
             .map
             .get(&(resource_type.to_string(), version))
