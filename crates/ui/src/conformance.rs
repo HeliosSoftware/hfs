@@ -57,9 +57,12 @@ impl ConformanceSource for HttpConformanceSource {
         resource_type: &str,
         _version: FhirVersion,
     ) -> Result<Vec<Value>, String> {
-        // A single page large enough to hold the whole conformance set: the UI
-        // needs the full list for its facets and rail, and paginates in-memory.
-        let url = format!("{}/{}?_count=100000", self.base_url, resource_type);
+        // A single page large enough to hold the whole conformance set (~1.4k
+        // SearchParameters per version): the UI needs the full list for its
+        // facets and rail, and paginates in-memory. Capped at 10000 — the
+        // Elasticsearch max_result_window — so the search also succeeds on
+        // backends that delegate search to ES.
+        let url = format!("{}/{}?_count=10000", self.base_url, resource_type);
         let request = self
             .client
             .get(&url)
