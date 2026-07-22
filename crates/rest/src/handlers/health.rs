@@ -78,11 +78,16 @@ mod tests {
 
     use crate::config::ServerConfig;
 
-    /// Minimal `ResourceStorage` whose `readiness_check` result is configurable.
-    /// Every other method is unused by the health handlers. Mirrors the required
-    /// (non-defaulted) trait surface only.
+    /// Minimal `ResourceStorage` whose `readiness_check` behaviour is
+    /// configurable. Every other method is unused by the health handlers.
+    /// Mirrors the required (non-defaulted) trait surface only.
     struct ProbeStorage {
         ready: bool,
+        /// When set, `readiness_check` sleeps this long before returning, so a
+        /// test can drive the probe past [`READINESS_PROBE_TIMEOUT`] and
+        /// exercise the timeout arm. With a paused clock the sleep resolves
+        /// instantly against the timeout's earlier deadline.
+        delay: Option<Duration>,
     }
 
     #[async_trait]
@@ -92,6 +97,9 @@ mod tests {
         }
 
         async fn readiness_check(&self) -> Result<(), BackendError> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.ready {
                 Ok(())
             } else {
@@ -160,7 +168,21 @@ mod tests {
     }
 
     fn state_with(ready: bool) -> AppState<ProbeStorage> {
-        AppState::new(Arc::new(ProbeStorage { ready }), ServerConfig::default())
+        AppState::new(
+            Arc::new(ProbeStorage { ready, delay: None }),
+            ServerConfig::default(),
+        )
+    }
+
+    /// State whose storage probe never answers within [`READINESS_PROBE_TIMEOUT`].
+    fn state_that_hangs() -> AppState<ProbeStorage> {
+        AppState::new(
+            Arc::new(ProbeStorage {
+                ready: true,
+                delay: Some(READINESS_PROBE_TIMEOUT * 4),
+            }),
+            ServerConfig::default(),
+        )
     }
 
     async fn body_json(response: Response) -> Value {
@@ -207,6 +229,33 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["status"], "not_ready");
         assert_eq!(json["checks"]["storage"], "unavailable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_returns_503_and_retry_after_when_storage_times_out() {
+        // A backend that never answers must be treated exactly like an
+        // unreachable one — a hung probe cannot be allowed to keep the pod in
+        // rotation. `start_paused` auto-advances the clock to the timeout's
+        // deadline, so this asserts the timeout arm without waiting in real time.
+        let response = readiness_handler(State(state_that_hangs())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_some(),
+            "a timed-out readiness probe must still carry Retry-After"
+        );
+        let json = body_json(response).await;
+        assert_eq!(json["status"], "not_ready");
+        assert_eq!(json["checks"]["storage"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn probe_storage_reports_its_backend_name() {
+        // Guards the trait's `backend_name` accessor on the probe double so the
+        // handler's `state.storage()` surface stays exercised.
+        assert_eq!(state_with(true).storage().backend_name(), "probe-mock");
     }
 
     #[tokio::test]

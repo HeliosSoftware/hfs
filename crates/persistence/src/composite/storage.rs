@@ -3002,6 +3002,19 @@ mod tests {
     /// leaves the resource in the Elasticsearch index, where it stays
     /// searchable and keeps holding the resource's full content.
     #[tokio::test]
+    async fn readiness_check_delegates_to_primary() {
+        // Composite readiness gates on the primary system-of-record only. The
+        // primary mock leaves the trait's default `readiness_check` (Ok) in
+        // place, so a healthy primary makes the composite ready — this exercises
+        // both the composite delegation and the default trait impl.
+        let composite = make_composite_no_secondary();
+        composite
+            .readiness_check()
+            .await
+            .expect("a composite over a healthy primary must be ready");
+    }
+
+    #[tokio::test]
     async fn test_purge_reaches_every_backend() {
         let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let composite = composite_with_purge(
