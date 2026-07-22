@@ -185,27 +185,20 @@ impl MockS3Client {
 
 #[async_trait]
 impl S3Api for MockS3Client {
-    // NOTE: the two HEAD operations below deliberately do NOT report
-    // `BucketNotFound`, even though a missing bucket is exactly what they are up
-    // against. A HEAD response has no body, so real S3 cannot return
-    // `<Code>NoSuchBucket</Code>` on these paths — the SDK sees a bare 404 and
-    // synthesizes `NotFound`, which `map_sdk_error` maps to
-    // `S3ClientError::NotFound`. Making the mock answer `BucketNotFound` here
-    // would let it claim a distinction the real client cannot make, and these
-    // tests would then vouch for behaviour that does not exist in production.
-    //
-    // That gap is real and tracked in #284: `head_object` in `S3Client` swallows
-    // `NotFound` into `Ok(None)`, so a missing bucket still reads as a missing
-    // object on the `create` existence check and on the bulk-submit state read,
-    // and `validate_buckets` reports a missing bucket as "resource not found in
-    // S3". Until that is fixed, the mock stays honest about it rather than
-    // papering over it.
+    // The two HEAD operations below report `BucketNotFound` for a missing
+    // bucket, mirroring the real client after #284. A HEAD response is bodyless,
+    // so real S3 cannot tag it `<Code>NoSuchBucket</Code>` directly — but the
+    // real `AwsS3Client` now disambiguates anyway: `head_bucket` treats its own
+    // (unambiguous) 404 as `BucketNotFound`, and `head_object`, on a bodyless
+    // 404, issues a follow-up `HeadBucket` to tell a missing object apart from a
+    // missing bucket. So the mock is not inventing a distinction the real client
+    // lacks — it is modelling the outcome the real client now produces.
     async fn head_bucket(&self, bucket: &str) -> Result<(), S3ClientError> {
         let state = self.state.lock().unwrap();
         if state.buckets.contains(bucket) {
             Ok(())
         } else {
-            Err(S3ClientError::NotFound)
+            Err(S3ClientError::BucketNotFound(bucket.to_string()))
         }
     }
 
@@ -215,10 +208,13 @@ impl S3Api for MockS3Client {
         key: &str,
     ) -> Result<Option<ObjectMetadata>, S3ClientError> {
         let state = self.state.lock().unwrap();
-        // No bucket check: a missing bucket has no objects, so the lookup below
-        // already yields `Ok(None)` — which is exactly what `S3Client::head_object`
-        // produces against real S3, since it swallows the bodyless 404's
-        // `NotFound` into `Ok(None)`.
+        // A missing bucket is an error, never `Ok(None)`: the real client reaches
+        // this verdict via a follow-up `HeadBucket` on a bodyless 404; the mock
+        // reaches it directly from its in-memory bucket set. Either way, a
+        // misconfigured store must not read as an absent object.
+        if !state.buckets.contains(bucket) {
+            return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
         Ok(state
             .objects
             .get(&(bucket.to_string(), key.to_string()))
@@ -1371,12 +1367,13 @@ async fn purge_tenant_data_sweeps_resources_and_history() {
 // "this resource does not exist" — a store that is merely pointed at the wrong
 // place would look exactly like a store that is empty.
 //
-// Scope, so these tests are not read as more than they are: they cover the
-// operations that reach S3 via GET / PUT / LIST, whose error responses carry a
-// body and can therefore say `NoSuchBucket`. The HEAD paths cannot (#284) — see
-// the note on `MockS3Client::head_bucket` — so `create` below is covered only
-// because its `PutObject` fails, not because its `head_object` existence check
-// notices the missing bucket. It does not.
+// The GET / PUT / LIST paths tell the two apart from the error body's
+// `NoSuchBucket` code. The HEAD paths cannot — a HEAD response is bodyless — so
+// #284's fix has the real client disambiguate for itself: `head_bucket` treats
+// its own 404 as `BucketNotFound`, and `head_object` issues a follow-up
+// `HeadBucket` on a 404. The tests below therefore assert the existence checks
+// fail at the *check* (no write attempted), not merely because a later write
+// happens to fail.
 
 /// A `read` against a bucket that does not exist must error, not report the
 /// resource as absent.
@@ -1403,14 +1400,15 @@ async fn s3_missing_bucket_read_is_an_error_not_an_empty_store() {
 /// The same applies to writes and counts: they must not silently succeed or
 /// report zero against a bucket that isn't there.
 ///
-/// `create` fails at its `PutObject`, not at its `head_object` existence check —
-/// the check reports `Ok(None)` ("no such object, go ahead and create") because a
-/// bodyless HEAD 404 cannot say `NoSuchBucket`. The contract holds here, but by
-/// way of the write that follows rather than by the check noticing anything.
+/// `create` now fails at its `head_object` existence check, before any write:
+/// the check confirms the bucket and gets `BucketNotFound`, so no `PutObject` is
+/// ever attempted. The `put_count == 0` assertion is what distinguishes this
+/// from the old behaviour, where the check reported `Ok(None)` and the error
+/// only surfaced because the following write failed.
 #[tokio::test]
 async fn s3_missing_bucket_create_and_count_are_errors() {
     let mock = Arc::new(MockS3Client::default());
-    let backend = make_prefix_backend(mock);
+    let backend = make_prefix_backend(mock.clone());
     let tenant = tenant("tenant-a");
 
     let created = backend
@@ -1425,12 +1423,129 @@ async fn s3_missing_bucket_create_and_count_are_errors() {
         matches!(created, Err(StorageError::Backend(_))),
         "expected a backend error creating into a nonexistent bucket, got {created:?}"
     );
+    assert_eq!(
+        mock.put_count(),
+        0,
+        "create into a nonexistent bucket must fail at the existence check, not \
+         at a subsequent write — no PutObject should have been attempted"
+    );
 
     let counted = backend.count(&tenant, Some("Patient")).await;
     assert!(
         !matches!(counted, Ok(0)),
         "count against a nonexistent bucket returned Ok(0) — 'zero resources' is a \
          claim about data we never reached"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #284: a missing bucket must never masquerade as a missing object on the HEAD
+// paths. These pin the client seam (so the mock stays in step with the real
+// `AwsS3Client`) and both `head_object` existence-check callers. The real
+// client is exercised end-to-end against a live server in `minio_s3_tests.rs`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `head_object` against a bucket that does not exist is a bucket-level error,
+/// not `Ok(None)`. (Acceptance criterion 1.)
+#[tokio::test]
+async fn head_object_missing_bucket_is_bucket_not_found() {
+    let mock = MockS3Client::default();
+    let result = mock.head_object("test-bucket", "some-key").await;
+    assert!(
+        matches!(&result, Err(S3ClientError::BucketNotFound(b)) if b == "test-bucket"),
+        "head_object against a nonexistent bucket must surface BucketNotFound, got {result:?}"
+    );
+}
+
+/// A genuinely absent object in an existing bucket is still `Ok(None)` — the
+/// #284 fix must not turn an ordinary miss into an error.
+#[tokio::test]
+async fn head_object_absent_object_in_existing_bucket_is_ok_none() {
+    let mock = MockS3Client::with_buckets(&["test-bucket"]);
+    let result = mock.head_object("test-bucket", "absent-key").await;
+    assert!(
+        matches!(result, Ok(None)),
+        "an absent object in an existing bucket must remain Ok(None), got {result:?}"
+    );
+}
+
+/// A present object still reports its metadata — guards against the new bucket
+/// check short-circuiting a real hit.
+#[tokio::test]
+async fn head_object_present_object_is_ok_some() {
+    let mock = MockS3Client::with_buckets(&["test-bucket"]);
+    mock.put_object("test-bucket", "k", b"body".to_vec(), None, None, None)
+        .await
+        .expect("seed object");
+    let result = mock.head_object("test-bucket", "k").await;
+    assert!(
+        matches!(result, Ok(Some(_))),
+        "a present object must report Ok(Some(_)), got {result:?}"
+    );
+}
+
+/// `head_bucket` against a nonexistent bucket is `BucketNotFound`, so
+/// `validate_buckets` can name the bucket. (Underpins acceptance criterion 2.)
+#[tokio::test]
+async fn head_bucket_missing_is_bucket_not_found() {
+    let mock = MockS3Client::default();
+    let result = mock.head_bucket("test-bucket").await;
+    assert!(
+        matches!(&result, Err(S3ClientError::BucketNotFound(b)) if b == "test-bucket"),
+        "head_bucket against a nonexistent bucket must be BucketNotFound, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn head_bucket_existing_is_ok() {
+    let mock = MockS3Client::with_buckets(&["test-bucket"]);
+    assert!(mock.head_bucket("test-bucket").await.is_ok());
+}
+
+/// `validate_buckets` against a nonexistent bucket reports the bucket as
+/// missing, not "resource not found in S3". (Acceptance criterion 2.)
+#[tokio::test]
+async fn s3_validate_buckets_missing_bucket_is_bucket_flavored_error() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::default()));
+    let err = backend
+        .validate_buckets()
+        .await
+        .expect_err("validate_buckets must fail against a nonexistent bucket");
+    match &err {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            assert!(
+                message.contains("bucket"),
+                "expected a bucket-flavored message, got {message:?}"
+            );
+            assert!(
+                !message.contains("resource not found in S3"),
+                "validate_buckets must not report a missing bucket as a missing resource, \
+                 got {message:?}"
+            );
+        }
+        other => panic!("expected Backend(Unavailable), got {other:?}"),
+    }
+}
+
+/// The bulk-submit duplicate check (the second `head_object` existence-check
+/// caller) also errors at the *check* against a missing bucket, before writing
+/// any state. (Acceptance criterion 4, for `create_submission`.)
+#[tokio::test]
+async fn s3_bulk_submit_missing_bucket_errors_at_the_check() {
+    let mock = Arc::new(MockS3Client::default());
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let id = SubmissionId::new("client-a", "sub-1");
+
+    let result = backend.create_submission(&tenant, &id, None).await;
+    assert!(
+        matches!(result, Err(StorageError::Backend(_))),
+        "create_submission into a nonexistent bucket must be a backend error, got {result:?}"
+    );
+    assert_eq!(
+        mock.put_count(),
+        0,
+        "the duplicate check must fail before any submission state is written"
     );
 }
 
