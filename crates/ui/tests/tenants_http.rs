@@ -241,7 +241,7 @@ async fn version_choice_persists_to_user_settings_and_redirects_back() {
         "/ui/search-parameters"
     );
     let stored = backend
-        .get_settings("local|default")
+        .get_settings("l2:")
         .await
         .expect("settings read")
         .expect("document stored");
