@@ -133,7 +133,7 @@ pub struct Args {
     #[arg(long)]
     pub validate: bool,
 
-    /// Terminology server URL (for terminology operations)
+    /// Terminology server base URL, required for %terminologies and memberOf (no default)
     #[arg(long)]
     pub terminology_server: Option<String>,
 }

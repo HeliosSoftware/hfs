@@ -86,21 +86,34 @@
         <span class="icon">{% include "icons/bookmark.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-saved-queries") }}</span>
       </a>
+      <!--
+        Search is a real page only when natural-language search is enabled
+        (#255). With HFS_NL_SEARCH_ENABLED=false the route is not mounted and
+        the entry stays as it was: a coming-soon placeholder that says nothing
+        about the feature.
+      -->
+      {% if nl_enabled %}
+      <a class="nav-item" href="/ui/search"{% if active_page == "search" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-search") }}">
+        <span class="icon">{% include "icons/search.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-search") }}</span>
+      </a>
+      {% else %}
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-search") }}">
         <span class="icon">{% include "icons/search.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-search") }}</span>
       </span>
+      {% endif %}
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-resource-editor") }}">
         <span class="icon">{% include "icons/pencil.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-resource-editor") }}</span>
       </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-history-versions") }}">
+      <a class="nav-item" href="/ui/history" title="{{ i18n.t("nav-history-versions") }}">
         <span class="icon">{% include "icons/history.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-history-versions") }}</span>
-      </span>
-      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %}>
+      </a>
+      <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
         <span class="icon">{% include "icons/compartments.svg" %}</span>
-        {{ i18n.t("nav-compartments") }}
+        <span class="nav-item__label">{{ i18n.t("nav-compartments") }}</span>
       </a>
 
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>

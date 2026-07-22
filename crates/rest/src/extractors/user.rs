@@ -97,6 +97,14 @@ impl UserKey {
     pub fn legacy_key(&self) -> Option<&str> {
         self.legacy.as_deref()
     }
+
+    /// Whether this is the auth-disabled fallback rather than a real
+    /// authenticated identity. Callers that need to attribute a request to
+    /// *someone* — rate limiting, for instance — use this to fall back to a
+    /// different discriminator (the peer address).
+    pub fn is_local(&self) -> bool {
+        self.key == LOCAL_KEY
+    }
 }
 
 /// Encodes `(issuer, subject)` injectively.

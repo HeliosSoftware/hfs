@@ -60,8 +60,21 @@ pub struct ListObjectsResult {
 /// depend on the AWS SDK error types directly.
 #[derive(Debug, Clone)]
 pub enum S3ClientError {
-    /// The requested bucket or object does not exist.
+    /// The requested object does not exist.
+    ///
+    /// This is the one "absence" the object callers may legitimately turn into
+    /// `Ok(None)` — S3 told us the key is not there. See [`Self::BucketNotFound`]
+    /// for the case that must NOT be treated this way.
     NotFound,
+    /// The *bucket* does not exist, or is not visible to these credentials.
+    ///
+    /// Deliberately distinct from [`Self::NotFound`]. A missing object means "this
+    /// resource is not stored"; a missing bucket means the store is misconfigured
+    /// and we learned nothing at all about the object. Collapsing the two would let
+    /// a typo'd or deleted bucket read as an *empty store* — every `read` returning
+    /// "resource not found" — which is the same misleading-success failure the
+    /// backend error contract forbids.
+    BucketNotFound(String),
     /// A conditional write failed because the ETag or existence precondition
     /// was not satisfied (`If-Match` or `If-None-Match: *`).
     PreconditionFailed,
@@ -413,7 +426,16 @@ where
                 .map(str::to_string)
                 .unwrap_or_default();
             match code {
-                "NoSuchKey" | "NotFound" | "NoSuchBucket" => S3ClientError::NotFound,
+                // A missing bucket is a misconfiguration, not an absent object —
+                // keep it distinct so the object callers cannot swallow it into
+                // `Ok(None)`.
+                "NoSuchBucket" => S3ClientError::BucketNotFound(if message.is_empty() {
+                    "bucket does not exist".to_string()
+                } else {
+                    message
+                }),
+                // `NotFound` is what HeadObject returns for a missing key.
+                "NoSuchKey" | "NotFound" => S3ClientError::NotFound,
                 // Deliberately narrow: only a 412 is a failed precondition.
                 //
                 // S3's `ConditionalRequestConflict` (HTTP 409) looks tempting to
