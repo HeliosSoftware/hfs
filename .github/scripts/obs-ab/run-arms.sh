@@ -127,13 +127,24 @@ start_server() {
   started_epoch=$(date +%s)
 
   echo "  starting server: HELIOS_OBS_MODE=${obs} RUST_LOG='${rustlog}'  -> ${logfile}"
-  # RUST_LOG (when set) overrides HTS_LOG_LEVEL in the server's EnvFilter; unset
-  # for every non-probe arm so only the probe arm changes the log configuration.
-  HTS_SERVER_PORT="$PORT" \
-  HTS_LOG_LEVEL="info" \
-  HELIOS_OBS_MODE="$obs" \
-  RUST_LOG="$rustlog" \
-    "$HTS_BIN" >"$logfile" 2>&1 &
+  # RUST_LOG (when set) overrides HTS_LOG_LEVEL in the server's EnvFilter. It
+  # must be genuinely UNSET for the non-probe arms, not set to "" — a set-but-
+  # empty RUST_LOG makes the tracing EnvFilter enable nothing, which suppresses
+  # the startup `obs_mode=` line this script greps to confirm the active arm.
+  # `env -u RUST_LOG` guarantees it is absent (even if inherited); the probe arm
+  # sets it explicitly.
+  if [ -n "$rustlog" ]; then
+    HTS_SERVER_PORT="$PORT" \
+    HTS_LOG_LEVEL="info" \
+    HELIOS_OBS_MODE="$obs" \
+    RUST_LOG="$rustlog" \
+      "$HTS_BIN" >"$logfile" 2>&1 &
+  else
+    HTS_SERVER_PORT="$PORT" \
+    HTS_LOG_LEVEL="info" \
+    HELIOS_OBS_MODE="$obs" \
+      env -u RUST_LOG "$HTS_BIN" >"$logfile" 2>&1 &
+  fi
   SERVER_PID=$!
 
   # Readiness — generous bound: inside the arm loop a cold start (and, on
