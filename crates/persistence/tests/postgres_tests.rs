@@ -2423,6 +2423,15 @@ mod postgres_integration {
 
         let result = backend.health_check().await;
         assert!(result.is_ok(), "Health check failed: {:?}", result.err());
+
+        // The `/_readiness` probe delegates to `Backend::health_check` via the
+        // `ResourceStorage::readiness_check` override; a live pg must report ready.
+        let readiness = ResourceStorage::readiness_check(&backend).await;
+        assert!(
+            readiness.is_ok(),
+            "readiness_check failed on a live postgres: {:?}",
+            readiness.err()
+        );
     }
 
     #[tokio::test]
@@ -4294,6 +4303,28 @@ mod postgres_integration {
     /// collide on the single-row-per-user `user_settings` table.
     fn unique_user_key(prefix: &str) -> String {
         format!("{}|{}", prefix, uuid::Uuid::new_v4().simple())
+    }
+
+    /// `delete_settings` removes the row and reports whether one existed —
+    /// the primitive the #270 legacy-key migration uses to move a document
+    /// rather than leave a duplicate copy behind.
+    #[tokio::test]
+    async fn postgres_integration_settings_delete_is_idempotent() {
+        let backend = create_backend().await;
+        let user = unique_user_key("delete");
+
+        // Absent is not an error, and reports "nothing removed".
+        assert!(!backend.delete_settings(&user).await.unwrap());
+
+        backend
+            .put_settings(&user, json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        assert!(backend.get_settings(&user).await.unwrap().is_some());
+
+        assert!(backend.delete_settings(&user).await.unwrap());
+        assert!(backend.get_settings(&user).await.unwrap().is_none());
+        assert!(!backend.delete_settings(&user).await.unwrap());
     }
 
     #[tokio::test]

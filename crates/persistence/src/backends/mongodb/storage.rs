@@ -523,6 +523,16 @@ impl ResourceStorage for MongoBackend {
         "mongodb"
     }
 
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
+    fn bulk_write_concurrency(&self) -> usize {
+        // Bulk seeding is round-trip bound; the driver pool absorbs parallel
+        // writers.
+        8
+    }
+
     fn is_cluster_shared(&self) -> bool {
         true
     }

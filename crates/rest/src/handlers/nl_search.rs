@@ -725,13 +725,25 @@ mod tests {
 
     #[test]
     fn rate_limit_key_prefers_the_authenticated_principal_then_the_peer_ip() {
+        use chrono::Utc;
+        use helios_auth::Principal;
+        use helios_auth::scope::ScopeSet;
+
         let addr: IpAddr = "203.0.113.7".parse().unwrap();
-        let authenticated = UserKey("https://idp.example.com|user-123".to_string());
-        let anonymous = UserKey("local|default".to_string());
+        let authenticated = UserKey::from_principal(&Principal {
+            subject: "user-123".to_string(),
+            issuer: "https://idp.example.com".to_string(),
+            tenant_id: None,
+            scopes: ScopeSet::default(),
+            jti: None,
+            expires_at: Utc::now(),
+            custom_claims: serde_json::Map::new(),
+        });
+        let anonymous = UserKey::local();
 
         assert_eq!(
             rate_limit_key("acme", &authenticated, Some(addr)),
-            "acme|https://idp.example.com|user-123",
+            "acme|u2:23:https://idp.example.com:user-123",
             "an authenticated principal outranks the peer address"
         );
         assert_eq!(

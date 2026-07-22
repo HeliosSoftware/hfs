@@ -10,8 +10,10 @@
 //! # Design
 //!
 //! - **One document per user.** Each user owns a single JSON *object* keyed by a
-//!   caller-supplied `user_key` (e.g. `"{issuer}|{subject}"` from an
-//!   authenticated principal, or a fixed local key when auth is disabled).
+//!   caller-supplied `user_key` (e.g. `"u2:{issuer_len}:{issuer}:{subject}"`
+//!   from an authenticated principal, or a fixed local key when auth is
+//!   disabled). The key is opaque to this layer; deriving it injectively is the
+//!   caller's job — see `helios_rest::extractors::UserKey`.
 //! - **Opaque and extensible.** The document is stored as an arbitrary
 //!   [`serde_json::Value`] object, so new settings keys require no schema or
 //!   code changes — the frontend owns the document shape.
@@ -134,6 +136,18 @@ pub trait SettingsStore: Send + Sync {
         merge_patch: Value,
         if_match_version: Option<i64>,
     ) -> StorageResult<StoredUserSettings>;
+
+    /// Deletes the user's settings document, returning whether one existed.
+    ///
+    /// Deleting an absent document is not an error — the method is idempotent,
+    /// so a caller that races another deleter still sees success.
+    ///
+    /// This exists to complete the lifecycle the other three methods imply: a
+    /// document that can be created must be removable, both to migrate a
+    /// document written under a superseded key encoding (see issue #270) and so
+    /// that a user's stored preferences — which may include recent FHIR search
+    /// strings — are erasable at all.
+    async fn delete_settings(&self, user_key: &str) -> StorageResult<bool>;
 }
 
 /// Applies an [RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) JSON Merge

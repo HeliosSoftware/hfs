@@ -72,16 +72,22 @@ impl CompartmentCatalog {
         if let Some(cached) = self.cache.lock().expect("compartment lock").get(&version) {
             return cached.clone();
         }
-        let mut defs: Vec<CompartmentDef> =
-            match self.source.fetch("CompartmentDefinition", version).await {
-                Ok(resources) => resources
-                    .into_iter()
-                    .filter_map(|r| serde_json::from_value(r).ok())
-                    .collect(),
-                Err(_) => Vec::new(),
-            };
+        let fetched = self.source.fetch("CompartmentDefinition", version).await;
+        let fetch_ok = fetched.is_ok();
+        let mut defs: Vec<CompartmentDef> = match fetched {
+            Ok(resources) => resources
+                .into_iter()
+                .filter_map(|r| serde_json::from_value(r).ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
         defs.sort_by(|a, b| a.code.cmp(&b.code));
         let built = Arc::new(defs);
+        // A failed fetch is served empty for this request only — caching it
+        // would pin the page to the failure until restart.
+        if !fetch_ok {
+            return built;
+        }
         self.cache
             .lock()
             .expect("compartment lock")
