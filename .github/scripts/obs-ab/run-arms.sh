@@ -181,9 +181,15 @@ start_server() {
   # startup line (main.rs). If it does not match, the arm is inert (e.g. a
   # server built without the arm switch) and its numbers are meaningless.
   if [ -n "$expected" ]; then
-    if ! grep -Eq "obs_mode=${expected}\b" "$logfile"; then
+    # Strip ANSI colour escapes before matching: a server writing to this file
+    # may still colourize (older builds, or a forced-colour env), which would
+    # otherwise split `obs_mode=Off` with escape sequences and fail the match.
+    local plainlog
+    plainlog="$(sed -E 's/\x1b\[[0-9;]*m//g' "$logfile")"
+    if ! printf '%s' "$plainlog" | grep -Eq "obs_mode=${expected}\b"; then
       echo "  ERROR: server did not report obs_mode=${expected}; arm '${arm}' is not active."
-      grep -i 'obs_mode' "$logfile" | head -3 || echo "    (no obs_mode line found in startup log)"
+      printf '%s' "$plainlog" | grep -i 'obs_mode' | head -3 \
+        || echo "    (no obs_mode line found in startup log)"
       return 1
     fi
     echo "  active arm confirmed: obs_mode=${expected}"
