@@ -2881,13 +2881,14 @@ impl BundleProvider for SqliteBackend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
 
         // Start a transaction
         let mut tx = self
-            .begin_transaction(tenant, TransactionOptions::new())
+            .begin_transaction(tenant, TransactionOptions::new().fhir_version(fhir_version))
             .await
             .map_err(|e| TransactionError::RolledBack {
                 reason: format!("Failed to begin transaction: {}", e),
@@ -2972,12 +2973,13 @@ impl BundleProvider for SqliteBackend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleResult> {
         let mut results = Vec::with_capacity(entries.len());
 
         // Process each entry independently
         for entry in &entries {
-            let result = self.process_batch_entry(tenant, entry).await;
+            let result = self.process_batch_entry(tenant, entry, fhir_version).await;
             results.push(result);
         }
 
@@ -3096,8 +3098,12 @@ impl SqliteBackend {
         &self,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> BundleEntryResult {
-        match self.process_batch_entry_inner(tenant, entry).await {
+        match self
+            .process_batch_entry_inner(tenant, entry, fhir_version)
+            .await
+        {
             Ok(result) => result,
             Err(e) => BundleEntryResult::error(
                 500,
@@ -3113,6 +3119,7 @@ impl SqliteBackend {
         &self,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleEntryResult> {
         match entry.method {
             BundleMethod::Get => {
@@ -3147,14 +3154,8 @@ impl SqliteBackend {
                         )
                     })?;
 
-                // Use default FHIR version for bundle operations
                 let created = self
-                    .create(
-                        tenant,
-                        &resource_type,
-                        resource,
-                        FhirVersion::default_enabled(),
-                    )
+                    .create(tenant, &resource_type, resource, fhir_version)
                     .await?;
                 Ok(BundleEntryResult::created(created))
             }
@@ -3166,15 +3167,8 @@ impl SqliteBackend {
                 })?;
 
                 let (resource_type, id) = self.parse_url(&entry.url)?;
-                // Use default FHIR version for bundle operations
                 let (stored, _created) = self
-                    .create_or_update(
-                        tenant,
-                        &resource_type,
-                        &id,
-                        resource,
-                        FhirVersion::default_enabled(),
-                    )
+                    .create_or_update(tenant, &resource_type, &id, resource, fhir_version)
                     .await?;
                 Ok(BundleEntryResult::ok(stored))
             }
@@ -5971,11 +5965,60 @@ mod tests {
             },
         ];
 
-        let result = backend.process_batch(&tenant, entries).await.unwrap();
+        let result = backend
+            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
+            .await
+            .unwrap();
 
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.entries[0].status, 201);
         assert_eq!(result.entries[1].status, 201);
+    }
+
+    /// #350: bundle-created resources must be stamped with the bundle's
+    /// negotiated version, not the compile-time default.
+    #[cfg(feature = "R5")]
+    #[tokio::test]
+    async fn test_bundle_writes_stamp_the_negotiated_version() {
+        use crate::core::transaction::BundleProvider;
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let entry = |id: &str| BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "id": id})),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+        };
+
+        let tx_result = backend
+            .process_transaction(&tenant, vec![entry("tx-r5")], helios_fhir::FhirVersion::R5)
+            .await
+            .unwrap();
+        assert_eq!(tx_result.entries[0].status, 201);
+
+        let batch_result = backend
+            .process_batch(
+                &tenant,
+                vec![entry("batch-r5")],
+                helios_fhir::FhirVersion::R5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch_result.entries[0].status, 201);
+
+        for id in ["tx-r5", "batch-r5"] {
+            let stored = backend.read(&tenant, "Patient", id).await.unwrap().unwrap();
+            assert_eq!(
+                stored.fhir_version(),
+                helios_fhir::FhirVersion::R5,
+                "{id} should be stamped R5"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6029,7 +6072,10 @@ mod tests {
             },
         ];
 
-        let result = backend.process_batch(&tenant, entries).await.unwrap();
+        let result = backend
+            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
+            .await
+            .unwrap();
 
         assert_eq!(result.entries.len(), 3);
         assert_eq!(result.entries[0].status, 200); // Read existing
@@ -6065,7 +6111,10 @@ mod tests {
             full_url: None,
         }];
 
-        let result = backend.process_batch(&tenant, entries).await.unwrap();
+        let result = backend
+            .process_batch(&tenant, entries, helios_fhir::FhirVersion::default())
+            .await
+            .unwrap();
 
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].status, 204);
@@ -6120,7 +6169,9 @@ mod tests {
             },
         ];
 
-        let result = backend.process_transaction(&tenant, entries).await;
+        let result = backend
+            .process_transaction(&tenant, entries, helios_fhir::FhirVersion::default())
+            .await;
 
         // Should fail
         assert!(result.is_err());
@@ -6158,7 +6209,10 @@ mod tests {
             },
         ];
 
-        let result = backend.process_transaction(&tenant, entries).await.unwrap();
+        let result = backend
+            .process_transaction(&tenant, entries, helios_fhir::FhirVersion::default())
+            .await
+            .unwrap();
 
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.entries[0].status, 201);

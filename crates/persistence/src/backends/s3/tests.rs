@@ -744,7 +744,10 @@ async fn bundle_batch_mixed_results() {
         },
     ];
 
-    let result = backend.process_batch(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_batch(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(result.entries.len(), 2);
     assert_eq!(result.entries[0].status, 201);
     assert_eq!(result.entries[1].status, 404);
@@ -776,7 +779,10 @@ async fn bundle_transaction_success_and_reference_resolution() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(result.entries.len(), 2);
 
     let obs = backend
@@ -814,7 +820,9 @@ async fn bundle_transaction_failure_rolls_back() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await;
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
     assert!(matches!(result, Err(TransactionError::BundleError { .. })));
 
     let read = backend.read(&tenant, "Patient", "rollback-me").await;
@@ -848,7 +856,9 @@ async fn bundle_transaction_reports_rollback_failure() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await;
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
     match result {
         Err(TransactionError::BundleError { message, .. }) => {
             assert!(message.contains("rollback failed"));

@@ -61,6 +61,11 @@ pub struct TransactionOptions {
     pub timeout_ms: u64,
     /// Whether this is a read-only transaction.
     pub read_only: bool,
+    /// The FHIR version resources written in this transaction are stamped
+    /// with. A transaction serves one request, and a request negotiates one
+    /// version, so it rides on the transaction rather than on every write.
+    /// `None` falls back to the backend's configured version.
+    pub fhir_version: Option<helios_fhir::FhirVersion>,
 }
 
 impl TransactionOptions {
@@ -91,6 +96,12 @@ impl TransactionOptions {
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self.locking_strategy = LockingStrategy::None;
+        self
+    }
+
+    /// Sets the FHIR version writes in this transaction are stamped with.
+    pub fn fhir_version(mut self, version: helios_fhir::FhirVersion) -> Self {
+        self.fhir_version = Some(version);
         self
     }
 }
@@ -390,6 +401,8 @@ pub trait BundleProvider: ResourceStorage {
     ///
     /// * `tenant` - The tenant context
     /// * `entries` - The bundle entries to process
+    /// * `fhir_version` - The version created/updated resources are stamped
+    ///   with — the request's negotiated version (one bundle, one version)
     ///
     /// # Returns
     ///
@@ -398,6 +411,7 @@ pub trait BundleProvider: ResourceStorage {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError>;
 
     /// Processes a batch bundle (independent operations).
@@ -409,6 +423,8 @@ pub trait BundleProvider: ResourceStorage {
     ///
     /// * `tenant` - The tenant context
     /// * `entries` - The bundle entries to process
+    /// * `fhir_version` - The version created/updated resources are stamped
+    ///   with — the request's negotiated version (one bundle, one version)
     ///
     /// # Returns
     ///
@@ -417,6 +433,7 @@ pub trait BundleProvider: ResourceStorage {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleResult>;
 }
 

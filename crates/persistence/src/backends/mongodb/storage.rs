@@ -2307,6 +2307,7 @@ impl BundleProvider for MongoBackend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError> {
         let db = self
             .get_database()
@@ -2334,6 +2335,7 @@ impl BundleProvider for MongoBackend {
                     &mut session,
                     tenant,
                     entry,
+                    fhir_version,
                     &mut pending_search_parameter_changes,
                 )
                 .await;
@@ -2401,6 +2403,7 @@ impl BundleProvider for MongoBackend {
         &self,
         _tenant: &TenantContext,
         _entries: Vec<BundleEntry>,
+        _fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleResult> {
         Err(StorageError::Backend(BackendError::UnsupportedCapability {
             backend_name: "mongodb".to_string(),
@@ -2416,6 +2419,7 @@ impl MongoBackend {
         session: &mut ClientSession,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
     ) -> StorageResult<BundleEntryResult> {
         match entry.method {
@@ -2498,6 +2502,7 @@ impl MongoBackend {
                         tenant,
                         &resource_type,
                         resource,
+                        fhir_version,
                         pending_search_parameter_changes,
                     )
                     .await?;
@@ -2554,6 +2559,7 @@ impl MongoBackend {
                                 tenant,
                                 &resource_type,
                                 resource_with_id,
+                                fhir_version,
                                 pending_search_parameter_changes,
                             )
                             .await?;
@@ -2626,6 +2632,7 @@ impl MongoBackend {
         tenant: &TenantContext,
         resource_type: &str,
         resource: Value,
+        fhir_version: helios_fhir::FhirVersion,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
     ) -> StorageResult<StoredResource> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
@@ -2667,7 +2674,6 @@ impl MongoBackend {
         let now = Utc::now();
         let now_bson = chrono_to_bson(now);
         let version_id = "1".to_string();
-        let fhir_version = FhirVersion::default_enabled();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
         resources

@@ -22,7 +22,7 @@ use serde_json::Value;
 use tracing::{debug, error, warn};
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::TenantExtractor;
+use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::prefer::PreferHeader;
 use crate::state::AppState;
@@ -52,6 +52,7 @@ use crate::state::AppState;
 pub async fn batch_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
+    version: FhirVersionExtractor,
     prefer: PreferHeader,
     request: Request,
 ) -> RestResult<Response>
@@ -61,6 +62,11 @@ where
     // Extract the Principal from request extensions (set by auth middleware).
     // If present, per-entry scope checks will be enforced.
     let principal = request.extensions().get::<Principal>().cloned();
+
+    // One bundle, one version: every entry the bundle creates or updates is
+    // stamped with the request's negotiated version, exactly as a
+    // single-resource endpoint would stamp it (#350).
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Parse the body as JSON
     let bundle: Value = serde_json::from_slice(
@@ -94,9 +100,27 @@ where
             })?;
 
     match bundle_type {
-        "batch" => process_batch(&state, tenant, &prefer, &bundle, principal.as_ref()).await,
+        "batch" => {
+            process_batch(
+                &state,
+                tenant,
+                fhir_version,
+                &prefer,
+                &bundle,
+                principal.as_ref(),
+            )
+            .await
+        }
         "transaction" => {
-            process_transaction(&state, tenant, &prefer, &bundle, principal.as_ref()).await
+            process_transaction(
+                &state,
+                tenant,
+                fhir_version,
+                &prefer,
+                &bundle,
+                principal.as_ref(),
+            )
+            .await
         }
         _ => Err(RestError::BadRequest {
             message: format!(
@@ -111,6 +135,7 @@ where
 async fn process_batch<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
+    fhir_version: FhirVersion,
     prefer: &PreferHeader,
     bundle: &Value,
     principal: Option<&Principal>,
@@ -134,7 +159,8 @@ where
     let mut response_entries = Vec::with_capacity(entries.len());
 
     for (index, entry) in entries.iter().enumerate() {
-        let result = process_batch_entry(state, &tenant, entry, index, principal).await;
+        let result =
+            process_batch_entry(state, &tenant, fhir_version, entry, index, principal).await;
         let correlation_details = EntryAuditCorrelation::from_bundle(&correlation, index);
         emit_batch_entry_audit(
             state,
@@ -172,6 +198,7 @@ where
 async fn process_transaction<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
+    fhir_version: FhirVersion,
     prefer: &PreferHeader,
     bundle: &Value,
     principal: Option<&Principal>,
@@ -243,7 +270,7 @@ where
     // Call the persistence layer
     let result = state
         .storage()
-        .process_transaction(tenant.context(), entries_for_processing)
+        .process_transaction(tenant.context(), entries_for_processing, fhir_version)
         .await;
 
     match result {
@@ -319,6 +346,7 @@ where
 async fn process_batch_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
     entry: &Value,
     index: usize,
     principal: Option<&Principal>,
@@ -389,15 +417,9 @@ where
                 }
             };
 
-            // Use default FHIR version for batch operations
             match state
                 .storage()
-                .create(
-                    tenant.context(),
-                    &resource_type,
-                    resource,
-                    FhirVersion::default_enabled(),
-                )
+                .create(tenant.context(), &resource_type, resource, fhir_version)
                 .await
             {
                 Ok(stored) => BundleEntryResult::created(stored),
@@ -416,7 +438,6 @@ where
                 }
             };
 
-            // Use default FHIR version for batch operations
             match state
                 .storage()
                 .create_or_update(
@@ -424,7 +445,7 @@ where
                     &resource_type,
                     &id,
                     resource,
-                    FhirVersion::default_enabled(),
+                    fhir_version,
                 )
                 .await
             {
