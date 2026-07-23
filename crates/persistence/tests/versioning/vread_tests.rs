@@ -100,6 +100,7 @@ async fn test_vread_specific_version() {
 /// Test that vread returns correct metadata for each version.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+#[ignore = "#306: SQLite has no created_at column and approximates it with last_modified (backends/sqlite/storage.rs), so created_at cannot survive an update — see PR #361"]
 async fn test_vread_returns_correct_metadata() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();

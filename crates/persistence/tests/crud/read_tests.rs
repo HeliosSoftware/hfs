@@ -7,6 +7,7 @@ use serde_json::json;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::core::ResourceStorage;
+use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 #[cfg(feature = "sqlite")]
@@ -554,13 +555,16 @@ async fn test_read_after_delete() {
         .await
         .unwrap();
 
-    // Read it
-    let read = backend
-        .read(&tenant, "Patient", created.id())
-        .await
-        .unwrap();
-
-    assert!(read.is_none(), "Read after delete should return None");
+    // Soft delete: `read` surfaces a deleted resource as `Gone` (SQLite/PG/S3)
+    // or as `None`; either satisfies "not readable". Mirrors sqlite_tests.rs.
+    match backend.read(&tenant, "Patient", created.id()).await {
+        Ok(None) => {}
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+        other => panic!(
+            "Read after delete should not return a resource, got: {:?}",
+            other
+        ),
+    }
 }
 
 /// Test that exists returns false after delete.
