@@ -29,7 +29,7 @@ mod inner {
 
     use crate::error::HtsError;
     use crate::state::AppState;
-    use crate::traits::{TerminologyBackend, TerminologyCaches};
+    use crate::traits::TerminologyBackend;
 
     #[cfg(feature = "sqlite")]
     use crate::import::ImportStats;
@@ -82,7 +82,7 @@ mod inner {
     ///   404'd stays absent until something clears it, so without this a
     ///   `POST /ValueSet` creating that exact URL is followed by a 404 for a
     ///   resource that demonstrably exists.
-    /// - [`TerminologyCaches::invalidate_caches`] — the backend's own per-instance
+    /// - [`crate::traits::TerminologyCaches::invalidate_caches`] — the backend's own per-instance
     ///   memos. Clearing only the handler tier is not enough: a `PUT` that changes
     ///   a display forces the handler to recompute, and the recomputation is then
     ///   served from the backend's stale `lookup_response_cache`.
