@@ -5,6 +5,7 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::{BackendCapability, ResourceStorage};
 use helios_persistence::error::StorageError;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -24,7 +25,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 fn create_patient_json(id: Option<&str>) -> serde_json::Value {
@@ -51,7 +55,9 @@ async fn test_create_resource_success() {
     let tenant = create_tenant();
     let patient = create_patient_json(None);
 
-    let result = backend.create(&tenant, "Patient", patient).await;
+    let result = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await;
 
     assert!(result.is_ok(), "Create should succeed");
     let stored = result.unwrap();
@@ -70,7 +76,7 @@ async fn test_create_resource_has_metadata() {
     let patient = create_patient_json(None);
 
     let stored = backend
-        .create(&tenant, "Patient", patient)
+        .create(&tenant, "Patient", patient, FhirVersion::default())
         .await
         .expect("Create should succeed");
 
@@ -106,15 +112,11 @@ async fn test_create_resource_tenant_association() {
     let patient = create_patient_json(None);
 
     let stored = backend
-        .create(&tenant, "Patient", patient)
+        .create(&tenant, "Patient", patient, FhirVersion::default())
         .await
         .expect("Create should succeed");
 
-    assert_eq!(
-        stored.tenant_id(),
-        &tenant_id,
-        "Tenant ID should match"
-    );
+    assert_eq!(stored.tenant_id(), &tenant_id, "Tenant ID should match");
 }
 
 /// Test creating resources of different types.
@@ -126,7 +128,10 @@ async fn test_create_different_resource_types() {
 
     // Create a Patient
     let patient = create_patient_json(None);
-    let patient_stored = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let patient_stored = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(patient_stored.resource_type(), "Patient");
 
     // Create an Observation
@@ -138,7 +143,7 @@ async fn test_create_different_resource_types() {
         }
     });
     let obs_stored = backend
-        .create(&tenant, "Observation", observation)
+        .create(&tenant, "Observation", observation, FhirVersion::default())
         .await
         .unwrap();
     assert_eq!(obs_stored.resource_type(), "Observation");
@@ -149,7 +154,12 @@ async fn test_create_different_resource_types() {
         "name": "Test Hospital"
     });
     let org_stored = backend
-        .create(&tenant, "Organization", organization)
+        .create(
+            &tenant,
+            "Organization",
+            organization,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
     assert_eq!(org_stored.resource_type(), "Organization");
@@ -167,7 +177,9 @@ async fn test_create_without_permission_fails() {
     let tenant = TenantContext::new(TenantId::new("test"), TenantPermissions::read_only());
     let patient = create_patient_json(None);
 
-    let result = backend.create(&tenant, "Patient", patient).await;
+    let result = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await;
 
     assert!(result.is_err(), "Create without permission should fail");
     match result {
@@ -190,7 +202,13 @@ async fn test_create_or_update_creates_new() {
     let patient = create_patient_json(Some("new-patient-123"));
 
     let (stored, created) = backend
-        .create_or_update(&tenant, "Patient", "new-patient-123", patient)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "new-patient-123",
+            patient,
+            FhirVersion::default(),
+        )
         .await
         .expect("create_or_update should succeed");
 
@@ -209,7 +227,13 @@ async fn test_create_or_update_updates_existing() {
     // First create a resource
     let patient1 = create_patient_json(Some("patient-456"));
     let (stored1, created1) = backend
-        .create_or_update(&tenant, "Patient", "patient-456", patient1)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-456",
+            patient1,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
     assert!(created1);
@@ -220,11 +244,20 @@ async fn test_create_or_update_updates_existing() {
     patient2["active"] = json!(false);
 
     let (stored2, created2) = backend
-        .create_or_update(&tenant, "Patient", "patient-456", patient2)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-456",
+            patient2,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
-    assert!(!created2, "Should indicate resource was updated, not created");
+    assert!(
+        !created2,
+        "Should indicate resource was updated, not created"
+    );
     assert_eq!(stored2.id(), "patient-456");
     assert_eq!(stored2.version_id(), "2", "Version should be incremented");
     assert_eq!(stored2.content()["active"], false);
@@ -240,7 +273,13 @@ async fn test_create_or_update_preserves_created_timestamp() {
     // Create initial resource
     let patient1 = create_patient_json(Some("patient-789"));
     let (stored1, _) = backend
-        .create_or_update(&tenant, "Patient", "patient-789", patient1)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-789",
+            patient1,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
     let created_at = stored1.created_at();
@@ -251,7 +290,13 @@ async fn test_create_or_update_preserves_created_timestamp() {
     // Update it
     let patient2 = create_patient_json(Some("patient-789"));
     let (stored2, _) = backend
-        .create_or_update(&tenant, "Patient", "patient-789", patient2)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-789",
+            patient2,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -283,7 +328,10 @@ async fn test_create_multiple_resources() {
             "resourceType": "Patient",
             "name": [{"family": format!("Patient{}", i)}]
         });
-        let stored = backend.create(&tenant, "Patient", patient).await.unwrap();
+        let stored = backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
         ids.push(stored.id().to_string());
     }
 
@@ -305,10 +353,13 @@ async fn test_create_tenant_isolation() {
     let patient = create_patient_json(None);
 
     let stored1 = backend
-        .create(&tenant1, "Patient", patient.clone())
+        .create(&tenant1, "Patient", patient.clone(), FhirVersion::default())
         .await
         .unwrap();
-    let stored2 = backend.create(&tenant2, "Patient", patient).await.unwrap();
+    let stored2 = backend
+        .create(&tenant2, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Verify different tenant IDs
     assert_eq!(stored1.tenant_id().as_str(), "tenant-1");
@@ -354,7 +405,10 @@ async fn test_create_preserves_content() {
         }]
     });
 
-    let stored = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let stored = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let content = stored.content();
 
     assert_eq!(content["name"][0]["family"], "Smith");
@@ -407,7 +461,7 @@ async fn test_create_preserves_nested_objects() {
     });
 
     let stored = backend
-        .create(&tenant, "Observation", observation)
+        .create(&tenant, "Observation", observation, FhirVersion::default())
         .await
         .unwrap();
     let content = stored.content();
@@ -434,7 +488,10 @@ async fn test_create_with_empty_arrays() {
         "identifier": []
     });
 
-    let stored = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let stored = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let content = stored.content();
 
     assert!(content["name"].as_array().unwrap().is_empty());
@@ -454,7 +511,10 @@ async fn test_create_with_null_fields() {
         "birthDate": null
     });
 
-    let stored = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let stored = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let content = stored.content();
 
     // Null fields may or may not be preserved depending on implementation
@@ -479,7 +539,10 @@ async fn test_create_with_unicode() {
         }]
     });
 
-    let stored = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let stored = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let content = stored.content();
 
     assert_eq!(content["name"][0]["family"], "日本語");
@@ -508,7 +571,10 @@ async fn test_create_with_large_content() {
         "name": names
     });
 
-    let stored = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let stored = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let content = stored.content();
 
     assert_eq!(content["name"].as_array().unwrap().len(), 100);

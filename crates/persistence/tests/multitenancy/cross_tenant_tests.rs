@@ -5,6 +5,7 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::error::{StorageError, TenantError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -34,10 +35,7 @@ async fn test_validate_reference_same_tenant() {
     let tenant = create_tenant("tenant-1");
 
     // Reference to same tenant should be allowed
-    let result = tenant.validate_reference(
-        "Patient/123",
-        &TenantId::new("tenant-1"),
-    );
+    let result = tenant.validate_reference("Patient/123", &TenantId::new("tenant-1"));
     assert!(result.is_ok());
 }
 
@@ -48,10 +46,7 @@ async fn test_validate_reference_different_tenant() {
     let tenant = create_tenant("tenant-1");
 
     // Reference to different tenant should be rejected
-    let result = tenant.validate_reference(
-        "Patient/123",
-        &TenantId::new("tenant-2"),
-    );
+    let result = tenant.validate_reference("Patient/123", &TenantId::new("tenant-2"));
     assert!(result.is_err());
 
     match result {
@@ -68,10 +63,7 @@ async fn test_validate_reference_to_system() {
     let tenant = create_tenant("tenant-1");
 
     // Reference to system tenant should be allowed
-    let result = tenant.validate_reference(
-        "ValueSet/shared-valueset",
-        &TenantId::system(),
-    );
+    let result = tenant.validate_reference("ValueSet/shared-valueset", &TenantId::system());
     assert!(result.is_ok());
 }
 
@@ -126,21 +118,16 @@ async fn test_permission_boundaries() {
     let backend = create_sqlite_backend();
 
     // Tenant with full access
-    let full_access = TenantContext::new(
-        TenantId::new("tenant-1"),
-        TenantPermissions::full_access(),
-    );
+    let full_access =
+        TenantContext::new(TenantId::new("tenant-1"), TenantPermissions::full_access());
 
     // Same tenant with read-only access
-    let read_only = TenantContext::new(
-        TenantId::new("tenant-1"),
-        TenantPermissions::read_only(),
-    );
+    let read_only = TenantContext::new(TenantId::new("tenant-1"), TenantPermissions::read_only());
 
     // Create with full access
     let patient = json!({"resourceType": "Patient", "name": [{"family": "Test"}]});
     let created = backend
-        .create(&full_access, "Patient", patient)
+        .create(&full_access, "Patient", patient, FhirVersion::default())
         .await
         .unwrap();
 
@@ -157,6 +144,7 @@ async fn test_permission_boundaries() {
             &read_only,
             "Patient",
             json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
         )
         .await;
     assert!(result.is_err());
@@ -197,12 +185,13 @@ async fn test_resource_type_restrictions() {
 
     // Create Patient (should work with either)
     let patient = json!({"resourceType": "Patient"});
-    let created = backend.create(&full, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&full, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // restricted tenant can read Patient
-    let read = backend
-        .read(&patient_only, "Patient", created.id())
-        .await;
+    let read = backend.read(&patient_only, "Patient", created.id()).await;
     // Result depends on whether restriction is enforced at read level
 
     // Create Observation
@@ -211,7 +200,10 @@ async fn test_resource_type_restrictions() {
         "status": "final",
         "code": {"coding": [{"code": "test"}]}
     });
-    let obs_created = backend.create(&full, "Observation", obs).await.unwrap();
+    let obs_created = backend
+        .create(&full, "Observation", obs, FhirVersion::default())
+        .await
+        .unwrap();
 
     // restricted tenant might not be able to access Observation
     // (depends on implementation)
@@ -247,7 +239,7 @@ async fn test_concurrent_tenant_access() {
                 "name": [{"family": format!("{}_{}", name, i)}]
             });
             backend
-                .create(&tenant_ref, "Patient", patient)
+                .create(&tenant_ref, "Patient", patient, FhirVersion::default())
                 .await
                 .unwrap();
         }

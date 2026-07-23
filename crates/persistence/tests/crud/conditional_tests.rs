@@ -5,6 +5,7 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::{ConditionalStorage, ResourceStorage};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
@@ -23,7 +24,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 fn create_patient_json(family: &str, identifier: Option<(&str, &str)>) -> serde_json::Value {
@@ -69,7 +73,10 @@ async fn test_conditional_create_no_match_creates() {
 
     // For now, we test basic create since conditional_create needs SearchProvider
     let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN001")));
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     assert_eq!(created.content()["identifier"][0]["value"], "MRN001");
 }
@@ -86,7 +93,10 @@ async fn test_conditional_create_single_match_returns_existing() {
 
     // Create initial resource
     let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN002")));
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Verify it exists
     let count = backend.count(&tenant, Some("Patient")).await.unwrap();
@@ -116,8 +126,14 @@ async fn test_conditional_create_multiple_matches_fails() {
     let patient1 = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN003")));
     let patient2 = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN004")));
 
-    backend.create(&tenant, "Patient", patient1).await.unwrap();
-    backend.create(&tenant, "Patient", patient2).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient1, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", patient2, FhirVersion::default())
+        .await
+        .unwrap();
 
     // If we tried conditional_create with name=Smith, it should fail
     // because there are two matches
@@ -144,7 +160,10 @@ async fn test_conditional_update_single_match_updates() {
 
     // Create a resource
     let patient = create_patient_json("Smith", Some(("http://example.org/mrn", "MRN005")));
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Update using regular update (conditional update would use search params)
     let mut updated_content = created.content().clone();
@@ -175,7 +194,13 @@ async fn test_conditional_update_upsert_creates() {
     // This is equivalent to upsert behavior
     let patient = create_patient_json("NewPatient", Some(("http://example.org/mrn", "MRN006")));
     let (created, is_created) = backend
-        .create_or_update(&tenant, "Patient", "new-patient-id", patient)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "new-patient-id",
+            patient,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -201,7 +226,10 @@ async fn test_conditional_delete_single_match_deletes() {
 
     // Create a resource
     let patient = create_patient_json("ToDelete", Some(("http://example.org/mrn", "MRN007")));
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     // Delete it (regular delete; conditional would use search params)
@@ -245,12 +273,28 @@ async fn test_conditional_delete_multiple_matches_fails() {
     let patient1 = create_patient_json("DeleteTest", Some(("http://example.org/mrn", "MRN008")));
     let patient2 = create_patient_json("DeleteTest", Some(("http://example.org/mrn", "MRN009")));
 
-    let created1 = backend.create(&tenant, "Patient", patient1).await.unwrap();
-    let created2 = backend.create(&tenant, "Patient", patient2).await.unwrap();
+    let created1 = backend
+        .create(&tenant, "Patient", patient1, FhirVersion::default())
+        .await
+        .unwrap();
+    let created2 = backend
+        .create(&tenant, "Patient", patient2, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Both should exist
-    assert!(backend.exists(&tenant, "Patient", created1.id()).await.unwrap());
-    assert!(backend.exists(&tenant, "Patient", created2.id()).await.unwrap());
+    assert!(
+        backend
+            .exists(&tenant, "Patient", created1.id())
+            .await
+            .unwrap()
+    );
+    assert!(
+        backend
+            .exists(&tenant, "Patient", created2.id())
+            .await
+            .unwrap()
+    );
 
     // If conditional_delete were called with name=DeleteTest,
     // it should fail with MultipleMatches
@@ -268,7 +312,10 @@ async fn test_if_match_success() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith", None);
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Update with correct ETag (version matches)
     let mut content = created.content().clone();
@@ -288,7 +335,10 @@ async fn test_if_match_failure() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith", None);
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Do an update to create v2
     let v2 = backend
@@ -321,7 +371,13 @@ async fn test_if_none_match_success() {
     // This is essentially what create_or_update does when creating new
     let patient = create_patient_json("NewPatient", None);
     let (created, is_new) = backend
-        .create_or_update(&tenant, "Patient", "unique-id-123", patient)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "unique-id-123",
+            patient,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -339,7 +395,13 @@ async fn test_if_none_match_failure() {
     // Create a resource with specific ID
     let patient1 = create_patient_json("First", None);
     let (_, is_new1) = backend
-        .create_or_update(&tenant, "Patient", "existing-id", patient1)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "existing-id",
+            patient1,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
     assert!(is_new1);
@@ -348,7 +410,13 @@ async fn test_if_none_match_failure() {
     // create_or_update will update instead of failing
     let patient2 = create_patient_json("Second", None);
     let (updated, is_new2) = backend
-        .create_or_update(&tenant, "Patient", "existing-id", patient2)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "existing-id",
+            patient2,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -379,7 +447,10 @@ async fn test_conditional_patch_single_match() {
 
     // Create a resource with unique identifier
     let patient = create_patient_json("PatchTest", Some(("http://example.org/mrn", "PATCH-001")));
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Verify the resource exists
     let read = backend
@@ -398,7 +469,10 @@ async fn test_conditional_patch_single_match() {
 
     let mut patched_content = read.content().clone();
     patched_content["name"][0]["family"] = json!("Patched");
-    let updated = backend.update(&tenant, &read, patched_content).await.unwrap();
+    let updated = backend
+        .update(&tenant, &read, patched_content)
+        .await
+        .unwrap();
 
     assert_eq!(updated.content()["name"][0]["family"], "Patched");
     assert_eq!(updated.version_id(), "2");
@@ -435,11 +509,19 @@ async fn test_conditional_patch_multiple_matches() {
     let tenant = create_tenant();
 
     // Create multiple resources with the same family name
-    let patient1 = create_patient_json("DuplicateName", Some(("http://example.org/mrn", "DUP-001")));
-    let patient2 = create_patient_json("DuplicateName", Some(("http://example.org/mrn", "DUP-002")));
+    let patient1 =
+        create_patient_json("DuplicateName", Some(("http://example.org/mrn", "DUP-001")));
+    let patient2 =
+        create_patient_json("DuplicateName", Some(("http://example.org/mrn", "DUP-002")));
 
-    backend.create(&tenant, "Patient", patient1).await.unwrap();
-    backend.create(&tenant, "Patient", patient2).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient1, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", patient2, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Conditional patch with multiple matches should fail
     // PATCH /Patient?family=DuplicateName
@@ -467,7 +549,10 @@ async fn test_conditional_patch_json_patch_format() {
         "name": [{"family": "Original", "given": ["First"]}],
         "active": true
     });
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // JSON Patch operations (RFC 6902):
     // [
@@ -513,7 +598,10 @@ async fn test_conditional_patch_fhirpath_format() {
         "name": [{"family": "Original"}],
         "birthDate": "1990-01-15"
     });
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // FHIRPath Patch uses a Parameters resource with operations:
     // {
@@ -557,12 +645,18 @@ async fn test_conditional_patch_tenant_isolation() {
 
     // Create resource in tenant1
     let patient = create_patient_json("TenantPatch", Some(("http://example.org/mrn", "T1-001")));
-    let created = backend.create(&tenant1, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant1, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     // Verify tenant2 cannot read it
     let read_t2 = backend.read(&tenant2, "Patient", &id).await.unwrap();
-    assert!(read_t2.is_none(), "Tenant2 should not see tenant1's resource");
+    assert!(
+        read_t2.is_none(),
+        "Tenant2 should not see tenant1's resource"
+    );
 
     // Conditional patch from tenant2 should not find the resource
     // PATCH /Patient?identifier=http://example.org/mrn|T1-001

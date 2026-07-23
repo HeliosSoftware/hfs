@@ -5,6 +5,7 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, VersionedStorage};
 use helios_persistence::error::{ConcurrencyError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -24,7 +25,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 fn create_patient_json(name: &str) -> serde_json::Value {
@@ -47,7 +51,10 @@ async fn test_update_with_match_success() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let etag = created.etag().to_string();
 
     // Update with matching ETag
@@ -72,7 +79,10 @@ async fn test_update_with_match_etag_mismatch() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Update to create v2
     let v2 = backend
@@ -104,13 +114,16 @@ async fn test_update_with_match_etag_formats() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Test different ETag formats that should all be equivalent
     let etag_formats = vec![
-        r#"W/"1""#.to_string(),  // Weak ETag with quotes
-        r#""1""#.to_string(),    // Strong ETag with quotes
-        "1".to_string(),         // Just the version
+        r#"W/"1""#.to_string(), // Weak ETag with quotes
+        r#""1""#.to_string(),   // Strong ETag with quotes
+        "1".to_string(),        // Just the version
     ];
 
     for etag in etag_formats {
@@ -121,7 +134,13 @@ async fn test_update_with_match_etag_formats() {
             .unwrap();
 
         let result = backend
-            .update_with_match(&tenant, "Patient", created.id(), &etag, read.content().clone())
+            .update_with_match(
+                &tenant,
+                "Patient",
+                created.id(),
+                &etag,
+                read.content().clone(),
+            )
             .await;
 
         // Should succeed with any valid format
@@ -144,7 +163,10 @@ async fn test_concurrent_update_serialization() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Original");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     // Simulate two users reading at the same time
@@ -199,7 +221,10 @@ async fn test_concurrent_update_retry() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Original");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
 
     // User 1 reads
@@ -228,7 +253,13 @@ async fn test_concurrent_update_retry() {
     let mut user2_content = user2_read.content().clone();
     user2_content["name"][0]["family"] = json!("User2Edit");
     let first_attempt = backend
-        .update_with_match(&tenant, "Patient", &id, user2_read.etag(), user2_content.clone())
+        .update_with_match(
+            &tenant,
+            "Patient",
+            &id,
+            user2_read.etag(),
+            user2_content.clone(),
+        )
         .await;
     assert!(first_attempt.is_err());
 
@@ -287,7 +318,10 @@ async fn test_update_with_match_deleted() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = created.id().to_string();
     let etag = created.etag().to_string();
 
@@ -314,7 +348,10 @@ async fn test_etag_generation() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let v2 = backend
         .update(&tenant, &v1, v1.content().clone())
         .await
@@ -341,7 +378,10 @@ async fn test_stored_resource_matches_etag() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Should match various formats
     assert!(created.matches_etag("W/\"1\""));
@@ -366,20 +406,17 @@ async fn test_sequential_updates_with_etag() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Version0");
-    let mut current = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let mut current = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     for i in 1..=10 {
         let mut content = current.content().clone();
         content["name"][0]["family"] = json!(format!("Version{}", i));
 
         current = backend
-            .update_with_match(
-                &tenant,
-                "Patient",
-                current.id(),
-                current.etag(),
-                content,
-            )
+            .update_with_match(&tenant, "Patient", current.id(), current.etag(), content)
             .await
             .expect(&format!("Update {} should succeed", i));
 
@@ -401,7 +438,13 @@ async fn test_if_none_match_create_only() {
     // First create succeeds (resource doesn't exist)
     let patient1 = create_patient_json("First");
     let (created, is_new) = backend
-        .create_or_update(&tenant, "Patient", "test-id", patient1)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "test-id",
+            patient1,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -411,7 +454,13 @@ async fn test_if_none_match_create_only() {
     // Second create with same ID updates instead
     let patient2 = create_patient_json("Second");
     let (updated, is_new2) = backend
-        .create_or_update(&tenant, "Patient", "test-id", patient2)
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "test-id",
+            patient2,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -431,7 +480,10 @@ async fn test_rapid_sequential_updates() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Initial");
-    let mut current = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let mut current = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let id = current.id().to_string();
 
     // Do 100 rapid updates

@@ -5,6 +5,7 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
@@ -23,7 +24,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 fn create_patient_json(name: &str) -> serde_json::Value {
@@ -47,7 +51,10 @@ async fn test_read_existing_resource() {
 
     // Create a resource first
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Read it back
     let result = backend
@@ -74,7 +81,10 @@ async fn test_read_returns_correct_content() {
         "name": [{"family": "Smith", "given": ["John"]}],
         "birthDate": "1980-01-15"
     });
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let read = backend
         .read(&tenant, "Patient", created.id())
@@ -99,7 +109,10 @@ async fn test_read_nonexistent_resource() {
         .await
         .unwrap();
 
-    assert!(result.is_none(), "Reading nonexistent resource should return None");
+    assert!(
+        result.is_none(),
+        "Reading nonexistent resource should return None"
+    );
 }
 
 /// Test reading returns correct metadata.
@@ -110,7 +123,10 @@ async fn test_read_returns_metadata() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let read = backend
         .read(&tenant, "Patient", created.id())
@@ -139,7 +155,10 @@ async fn test_read_tenant_isolation() {
 
     // Create resource in tenant1
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant1, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant1, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Try to read from tenant2 - should not find it
     let result = backend
@@ -166,7 +185,7 @@ async fn test_read_system_tenant() {
         "name": "TestValueSet"
     });
     let created = backend
-        .create(&system, "ValueSet", value_set)
+        .create(&system, "ValueSet", value_set, FhirVersion::default())
         .await
         .unwrap();
 
@@ -192,7 +211,10 @@ async fn test_exists_returns_true() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let exists = backend
         .exists(&tenant, "Patient", created.id())
@@ -230,7 +252,10 @@ async fn test_exists_tenant_isolation() {
     let tenant2 = TenantContext::new(TenantId::new("tenant-2"), TenantPermissions::full_access());
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant1, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant1, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Check from different tenant
     let exists = backend
@@ -238,7 +263,10 @@ async fn test_exists_tenant_isolation() {
         .await
         .unwrap();
 
-    assert!(!exists, "exists should return false for other tenant's resource");
+    assert!(
+        !exists,
+        "exists should return false for other tenant's resource"
+    );
 }
 
 // ============================================================================
@@ -256,7 +284,10 @@ async fn test_read_batch_success() {
     let mut ids = Vec::new();
     for i in 0..5 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+        let created = backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
         ids.push(created.id().to_string());
     }
 
@@ -279,9 +310,15 @@ async fn test_read_batch_partial() {
 
     // Create 2 resources
     let patient1 = create_patient_json("Smith");
-    let created1 = backend.create(&tenant, "Patient", patient1).await.unwrap();
+    let created1 = backend
+        .create(&tenant, "Patient", patient1, FhirVersion::default())
+        .await
+        .unwrap();
     let patient2 = create_patient_json("Jones");
-    let created2 = backend.create(&tenant, "Patient", patient2).await.unwrap();
+    let created2 = backend
+        .create(&tenant, "Patient", patient2, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Read with some nonexistent IDs
     let ids = vec![
@@ -292,11 +329,7 @@ async fn test_read_batch_partial() {
     ];
     let results = backend.read_batch(&tenant, "Patient", &ids).await.unwrap();
 
-    assert_eq!(
-        results.len(),
-        2,
-        "Should return only existing resources"
-    );
+    assert_eq!(results.len(), 2, "Should return only existing resources");
 }
 
 /// Test read_batch with empty list.
@@ -306,12 +339,13 @@ async fn test_read_batch_empty() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let results: Vec<helios_persistence::types::StoredResource> = backend
-        .read_batch(&tenant, "Patient", &[])
-        .await
-        .unwrap();
+    let results: Vec<helios_persistence::types::StoredResource> =
+        backend.read_batch(&tenant, "Patient", &[]).await.unwrap();
 
-    assert!(results.is_empty(), "Empty input should return empty results");
+    assert!(
+        results.is_empty(),
+        "Empty input should return empty results"
+    );
 }
 
 /// Test read_batch respects tenant isolation.
@@ -325,7 +359,10 @@ async fn test_read_batch_tenant_isolation() {
 
     // Create resources in tenant1
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant1, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant1, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Try to read from tenant2
     let results = backend
@@ -333,7 +370,10 @@ async fn test_read_batch_tenant_isolation() {
         .await
         .unwrap();
 
-    assert!(results.is_empty(), "Should not find other tenant's resources");
+    assert!(
+        results.is_empty(),
+        "Should not find other tenant's resources"
+    );
 }
 
 // ============================================================================
@@ -350,7 +390,10 @@ async fn test_count_by_type() {
     // Create some patients
     for i in 0..3 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        backend.create(&tenant, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     // Create some observations
@@ -361,7 +404,7 @@ async fn test_count_by_type() {
             "code": {"coding": [{"code": format!("code-{}", i)}]}
         });
         backend
-            .create(&tenant, "Observation", obs)
+            .create(&tenant, "Observation", obs, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -383,7 +426,10 @@ async fn test_count_all() {
     // Create mixed resources
     for i in 0..3 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        backend.create(&tenant, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
     for i in 0..2 {
         let obs = json!({
@@ -392,7 +438,7 @@ async fn test_count_all() {
             "code": {"coding": [{"code": format!("code-{}", i)}]}
         });
         backend
-            .create(&tenant, "Observation", obs)
+            .create(&tenant, "Observation", obs, FhirVersion::default())
             .await
             .unwrap();
     }
@@ -424,13 +470,19 @@ async fn test_count_tenant_isolation() {
     // Create resources in tenant1
     for i in 0..5 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        backend.create(&tenant1, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant1, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     // Create resources in tenant2
     for i in 0..3 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        backend.create(&tenant2, "Patient", patient).await.unwrap();
+        backend
+            .create(&tenant2, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 
     let count1 = backend.count(&tenant1, Some("Patient")).await.unwrap();
@@ -453,7 +505,10 @@ async fn test_read_after_update() {
 
     // Create resource
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Update it
     let mut updated_content = created.content().clone();
@@ -488,7 +543,10 @@ async fn test_read_after_delete() {
 
     // Create resource
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Delete it
     backend
@@ -514,7 +572,10 @@ async fn test_exists_after_delete() {
 
     // Create resource
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Delete it
     backend
@@ -542,7 +603,10 @@ async fn test_count_excludes_deleted() {
     let mut ids = Vec::new();
     for i in 0..3 {
         let patient = create_patient_json(&format!("Patient{}", i));
-        let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+        let created = backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
         ids.push(created.id().to_string());
     }
 
@@ -551,10 +615,7 @@ async fn test_count_excludes_deleted() {
     assert_eq!(initial_count, 3);
 
     // Delete one
-    backend
-        .delete(&tenant, "Patient", &ids[0])
-        .await
-        .unwrap();
+    backend.delete(&tenant, "Patient", &ids[0]).await.unwrap();
 
     // Count should decrease
     let final_count = backend.count(&tenant, Some("Patient")).await.unwrap();
@@ -574,14 +635,15 @@ async fn test_read_with_read_only_permissions() {
         TenantId::new("test-tenant"),
         TenantPermissions::full_access(),
     );
-    let read_only = TenantContext::new(
-        TenantId::new("test-tenant"),
-        TenantPermissions::read_only(),
-    );
+    let read_only =
+        TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::read_only());
 
     // Create resource with full access
     let patient = create_patient_json("Smith");
-    let created = backend.create(&full_access, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&full_access, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Read with read-only permissions
     let read = backend
@@ -589,5 +651,8 @@ async fn test_read_with_read_only_permissions() {
         .await
         .unwrap();
 
-    assert!(read.is_some(), "Should be able to read with read-only permissions");
+    assert!(
+        read.is_some(),
+        "Should be able to read with read-only permissions"
+    );
 }

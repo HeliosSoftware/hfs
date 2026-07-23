@@ -5,6 +5,7 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::ResourceStorage;
 use helios_persistence::error::{ConcurrencyError, ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -24,7 +25,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 fn create_patient_json(name: &str) -> serde_json::Value {
@@ -48,7 +52,10 @@ async fn test_update_resource_success() {
 
     // Create a resource
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Update it
     let mut updated_content = created.content().clone();
@@ -72,7 +79,10 @@ async fn test_update_increments_version() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(v1.version_id(), "1");
 
     let v2 = backend
@@ -102,7 +112,10 @@ async fn test_update_updates_timestamp() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     let created_time = created.last_modified();
 
     // Small delay to ensure timestamp difference
@@ -132,7 +145,10 @@ async fn test_update_generates_new_etag() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let updated = backend
         .update(&tenant, &created, created.content().clone())
@@ -144,7 +160,10 @@ async fn test_update_generates_new_etag() {
         created.etag(),
         "ETag should change after update"
     );
-    assert!(updated.etag().contains("2"), "ETag should contain version 2");
+    assert!(
+        updated.etag().contains("2"),
+        "ETag should contain version 2"
+    );
 }
 
 // ============================================================================
@@ -164,7 +183,10 @@ async fn test_update_multiple_fields() {
         "active": true,
         "gender": "male"
     });
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let mut updated_content = created.content().clone();
     updated_content["name"][0]["family"] = json!("Jones");
@@ -192,7 +214,10 @@ async fn test_update_add_new_fields() {
         "resourceType": "Patient",
         "name": [{"family": "Smith"}]
     });
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let mut updated_content = created.content().clone();
     updated_content["birthDate"] = json!("1980-01-15");
@@ -222,7 +247,10 @@ async fn test_update_remove_fields() {
         "birthDate": "1980-01-15",
         "gender": "male"
     });
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Create content without birthDate and gender
     let updated_content = json!({
@@ -236,8 +264,7 @@ async fn test_update_remove_fields() {
         .unwrap();
 
     assert!(
-        updated.content().get("birthDate").is_none()
-            || updated.content()["birthDate"].is_null(),
+        updated.content().get("birthDate").is_none() || updated.content()["birthDate"].is_null(),
         "birthDate should be removed or null"
     );
 }
@@ -265,7 +292,7 @@ async fn test_update_nested_objects() {
         }
     });
     let created = backend
-        .create(&tenant, "Observation", observation)
+        .create(&tenant, "Observation", observation, FhirVersion::default())
         .await
         .unwrap();
 
@@ -322,14 +349,15 @@ async fn test_update_without_permission_fails() {
         TenantId::new("test-tenant"),
         TenantPermissions::full_access(),
     );
-    let read_only = TenantContext::new(
-        TenantId::new("test-tenant"),
-        TenantPermissions::read_only(),
-    );
+    let read_only =
+        TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::read_only());
 
     // Create with full access
     let patient = create_patient_json("Smith");
-    let created = backend.create(&full_access, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&full_access, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Try to update with read-only
     let result = backend
@@ -353,7 +381,10 @@ async fn test_update_deleted_fails() {
 
     // Create and delete a resource
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
     backend
         .delete(&tenant, "Patient", created.id())
         .await
@@ -385,7 +416,10 @@ async fn test_update_wrong_tenant_fails() {
 
     // Create in tenant1
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant1, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant1, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Try to update from tenant2
     let result = backend
@@ -408,7 +442,10 @@ async fn test_update_version_conflict() {
 
     // Create a resource
     let patient = create_patient_json("Smith");
-    let v1 = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let v1 = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Do a legitimate update
     let mut content2 = v1.content().clone();
@@ -444,7 +481,10 @@ async fn test_sequential_updates() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Name0");
-    let mut current = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let mut current = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     for i in 1..=10 {
         let mut content = current.content().clone();
@@ -475,7 +515,10 @@ async fn test_update_same_content_increments_version() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Update with identical content
     let updated = backend
@@ -499,7 +542,10 @@ async fn test_update_with_unicode() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let mut updated_content = created.content().clone();
     updated_content["name"][0]["family"] = json!("日本語");
@@ -522,7 +568,10 @@ async fn test_update_with_large_content() {
     let tenant = create_tenant();
 
     let patient = create_patient_json("Smith");
-    let created = backend.create(&tenant, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Create large update with many names
     let mut names = Vec::new();
