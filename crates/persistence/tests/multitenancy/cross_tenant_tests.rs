@@ -173,7 +173,7 @@ async fn test_resource_type_restrictions() {
     let patient_only = TenantContext::new(
         TenantId::new("restricted"),
         TenantPermissions::builder()
-            .allow_resource_type("Patient")
+            .allow_resource_types(vec!["Patient"])
             .build(),
     );
 
@@ -224,7 +224,6 @@ async fn test_concurrent_tenant_access() {
     let tenant_c = create_tenant("tenant-c");
 
     // Create resources in multiple tenants concurrently
-    let mut handles = vec![];
 
     for (tenant, name) in [
         (tenant_a.clone(), "A"),

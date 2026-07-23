@@ -406,7 +406,7 @@ async fn test_system_tenant_access() {
     let backend = create_sqlite_backend();
 
     let system = TenantContext::system();
-    let tenant_a = create_tenant("tenant-a");
+    let _tenant_a = create_tenant("tenant-a");
 
     // Create shared resource in system tenant
     let value_set = json!({
