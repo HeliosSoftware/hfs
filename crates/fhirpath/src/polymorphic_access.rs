@@ -215,10 +215,22 @@ fn get_polymorphic_fields(
         }
     }
 
-    // Fallback for nested objects (no `resourceType`) and for the
-    // version-feature-disabled case — preserves prior behavior so callers
-    // working below the resource root still resolve typed variants.
-    if !consulted_field_types {
+    // Fallback for nested objects (no `resourceType`), for the
+    // version-feature-disabled case, and — crucially — whenever the table was
+    // consulted but matched nothing.
+    //
+    // That last condition is a defence-in-depth measure for #309. Suppressing
+    // the scan on a *miss* is what turned "consulted the wrong version's
+    // table" into "the element vanishes": the table lookup is an optimisation
+    // over this scan, so a miss should degrade to the scan rather than to an
+    // empty result. It keeps callers that still cannot supply an accurate
+    // version — notably the search-index extractor in `helios-persistence`,
+    // which hardcodes the default version and is fixed separately — resolving
+    // choice elements correctly.
+    //
+    // When the table matched, `matches` is non-empty and behaviour is
+    // unchanged, so this cannot loosen the well-formed, correct-version case.
+    if !consulted_field_types || matches.is_empty() {
         for (field_name, value) in obj {
             if matches.iter().any(|(name, _)| name == field_name) {
                 continue;
@@ -1069,17 +1081,27 @@ mod tests {
     // default.
     // ------------------------------------------------------------------
 
-    /// An R5-only choice variant must be found when asking for R5, and must not
-    /// be invented when asking for R4.
+    /// The table consulted must be the one for the requested version.
     ///
-    /// `Observation.valueAttachment` is declared in R5/R6 but not R4.
+    /// The fixture carries **two** typed variants: `valueQuantity` (declared in
+    /// every version) and `valueAttachment` (R5/R6 only). That combination is
+    /// what makes the assertion discriminating even with the `matches.is_empty()`
+    /// fallback in place — under R4 the table still matches `valueQuantity`, so
+    /// `matches` is non-empty, the prefix-scan fallback never runs, and
+    /// `valueAttachment` is correctly absent. A single-variant fixture would be
+    /// rescued by the fallback under both versions and would prove nothing.
     #[cfg(all(feature = "R4", feature = "R5"))]
     #[test]
-    fn get_polymorphic_fields_honours_the_requested_version() {
+    fn get_polymorphic_fields_consults_the_requested_versions_table() {
         let mut attachment = HashMap::new();
         attachment.insert(
             "title".to_string(),
             EvaluationResult::string("scan.pdf".to_string()),
+        );
+        let mut quantity = HashMap::new();
+        quantity.insert(
+            "unit".to_string(),
+            EvaluationResult::string("kg".to_string()),
         );
 
         let mut obs = HashMap::new();
@@ -1094,62 +1116,50 @@ mod tests {
                 type_info: None,
             },
         );
-
-        let r5 = get_polymorphic_fields(&obs, "value", FhirVersion::R5);
-        assert_eq!(
-            r5.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-            vec!["valueAttachment"],
-            "R5 declares Observation.valueAttachment, so it must resolve"
-        );
-
-        let r4 = get_polymorphic_fields(&obs, "value", FhirVersion::R4);
-        assert!(
-            r4.is_empty(),
-            "R4 does not declare Observation.valueAttachment; the R4 table must \
-             not report it. Getting a hit here would mean the version argument \
-             is ignored."
-        );
-    }
-
-    /// The same, through the entry point the evaluator actually calls.
-    #[cfg(all(feature = "R4", feature = "R5"))]
-    #[test]
-    fn access_polymorphic_element_honours_the_requested_version() {
-        let mut attachment = HashMap::new();
-        attachment.insert(
-            "title".to_string(),
-            EvaluationResult::string("scan.pdf".to_string()),
-        );
-
-        let mut obs = HashMap::new();
         obs.insert(
-            "resourceType".to_string(),
-            EvaluationResult::string("Observation".to_string()),
-        );
-        obs.insert(
-            "valueAttachment".to_string(),
+            "valueQuantity".to_string(),
             EvaluationResult::Object {
-                map: attachment,
+                map: quantity,
                 type_info: None,
             },
         );
 
+        let names = |v: FhirVersion| -> Vec<String> {
+            get_polymorphic_fields(&obs, "value", v)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+
+        let r5 = names(FhirVersion::R5);
         assert!(
-            access_polymorphic_element(&obs, "value", FhirVersion::R5).is_some(),
-            "R5 Observation.value must resolve to the Attachment (issue #309)"
+            r5.iter().any(|n| n == "valueAttachment"),
+            "R5 declares Observation.valueAttachment, so it must be resolved; got {r5:?}"
+        );
+
+        let r4 = names(FhirVersion::R4);
+        assert!(
+            !r4.iter().any(|n| n == "valueAttachment"),
+            "R4 does not declare Observation.valueAttachment, so the R4 table must \
+             not report it; got {r4:?}. A hit here means the version argument was \
+             ignored (issue #309)."
         );
         assert!(
-            access_polymorphic_element(&obs, "value", FhirVersion::R4).is_none(),
-            "R4 has no Observation.valueAttachment to resolve to"
+            r4.iter().any(|n| n == "valueQuantity"),
+            "valueQuantity is declared in R4 and must still resolve; got {r4:?}"
         );
     }
 
-    /// Isolates "this choice base is new in R5" from "this parent type is new
-    /// in R5": `Person` is declared in both tables (18 field rows in R4), but
-    /// only R5 gives it `deceased[x]`.
+    /// A table *miss* must degrade to the prefix scan, not to an empty result.
+    ///
+    /// This is the defence-in-depth half of the #309 fix, and the reason
+    /// callers that cannot yet supply an accurate version (the persistence
+    /// search-index extractor) still resolve choice elements. `Person` is
+    /// declared in both tables but gained `deceased[x]` only in R5, so the R4
+    /// lookup finds the parent, matches nothing, and must fall through.
     #[cfg(all(feature = "R4", feature = "R5"))]
     #[test]
-    fn choice_base_added_in_a_later_version_on_a_shared_parent() {
+    fn table_miss_falls_back_to_the_prefix_scan() {
         let mut person = HashMap::new();
         person.insert(
             "resourceType".to_string(),
@@ -1160,15 +1170,14 @@ mod tests {
             EvaluationResult::boolean(true),
         );
 
-        assert_eq!(
-            access_polymorphic_element(&person, "deceased", FhirVersion::R5),
-            Some(EvaluationResult::boolean(true)),
-            "Person.deceased[x] is R5+; it must resolve under R5 (issue #309)"
-        );
-        assert!(
-            access_polymorphic_element(&person, "deceased", FhirVersion::R4).is_none(),
-            "R4 Person has no deceased[x]"
-        );
+        for version in [FhirVersion::R5, FhirVersion::R4] {
+            assert_eq!(
+                access_polymorphic_element(&person, "deceased", version),
+                Some(EvaluationResult::boolean(true)),
+                "Person.deceased must resolve under {version:?} — via the R5 table \
+                 directly, and via the fallback scan when the R4 table misses"
+            );
+        }
     }
 
     /// The choice-base *classification* is version-specific too. Verified

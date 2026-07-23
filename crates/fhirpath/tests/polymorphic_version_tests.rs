@@ -135,6 +135,13 @@ fn r4_choice_variant_still_resolves() {
 /// `Person` is present in the R4 table (18 field rows) but gained
 /// `deceased[x]` only in R5, so an R4 lookup finds the parent, finds no
 /// `deceased*` match, and — before the fix — suppressed the fallback as well.
+///
+/// Note on attribution: once the table-miss fallback is restored (the
+/// defence-in-depth half of the fix), this case is resolved by *either* half
+/// independently. The test that uniquely pins the version-threading half is
+/// `get_polymorphic_fields_consults_the_requested_versions_table` in
+/// `polymorphic_access.rs`, which uses a two-variant fixture the fallback
+/// cannot rescue.
 #[test]
 fn r5_only_choice_base_on_a_parent_present_in_both_versions() {
     assert_not_vacuous();
