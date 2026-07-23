@@ -253,7 +253,7 @@ async fn test_vread_after_delete() {
         .create(&tenant, "Patient", patient, FhirVersion::default())
         .await
         .unwrap();
-    let v2 = backend
+    let _v2 = backend
         .update(&tenant, &v1, v1.content().clone())
         .await
         .unwrap();
@@ -275,11 +275,11 @@ async fn test_vread_after_delete() {
     // Note: Behavior may vary by implementation
     // Some backends preserve history, others don't
     // This test documents expected FHIR behavior
-    if read_v1.is_some() {
-        assert_eq!(read_v1.unwrap().version_id(), "1");
+    if let Some(v1_read) = read_v1 {
+        assert_eq!(v1_read.version_id(), "1");
     }
-    if read_v2.is_some() {
-        assert_eq!(read_v2.unwrap().version_id(), "2");
+    if let Some(v2_read) = read_v2 {
+        assert_eq!(v2_read.version_id(), "2");
     }
 }
 

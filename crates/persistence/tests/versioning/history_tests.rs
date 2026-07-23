@@ -444,7 +444,7 @@ async fn test_system_history_order() {
 
     // Create resources with small delays to ensure ordering
     let patient = create_patient_json("First");
-    let first = backend
+    let _first = backend
         .create(&tenant, "Patient", patient, FhirVersion::default())
         .await
         .unwrap();
@@ -456,7 +456,7 @@ async fn test_system_history_order() {
         "status": "final",
         "code": {"coding": [{"code": "second"}]}
     });
-    let second = backend
+    let _second = backend
         .create(&tenant, "Observation", observation, FhirVersion::default())
         .await
         .unwrap();

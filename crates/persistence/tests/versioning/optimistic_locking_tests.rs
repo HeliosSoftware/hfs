@@ -418,7 +418,7 @@ async fn test_sequential_updates_with_etag() {
         current = backend
             .update_with_match(&tenant, "Patient", current.id(), current.etag(), content)
             .await
-            .expect(&format!("Update {} should succeed", i));
+            .unwrap_or_else(|e| panic!("Update {i} should succeed: {e:?}"));
 
         assert_eq!(current.version_id(), (i + 1).to_string());
     }
@@ -494,7 +494,7 @@ async fn test_rapid_sequential_updates() {
         current = backend
             .update_with_match(&tenant, "Patient", &id, current.etag(), content)
             .await
-            .expect(&format!("Update {} should succeed", i));
+            .unwrap_or_else(|e| panic!("Update {i} should succeed: {e:?}"));
     }
 
     // Final version should be 101
