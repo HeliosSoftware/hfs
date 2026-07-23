@@ -164,6 +164,21 @@ Comparators supported: `eq` (default), `in`. Native `filterBy.comparator` values
 | `HFS_SUBSCRIPTION_OFF_THRESHOLD` | `10` | Consecutive failures before `off` status |
 | `ws_token_lifetime_secs` *(config field)* | `30` | Binding token expiry in seconds (WebSocket only) |
 
+### Startup rehydration
+
+The engine's registries are in-memory, so without rehydration a restart would leave every previously-stored subscription inert — the resources still read back over the REST API, but nothing matches or delivers. At startup HFS pages stored `SubscriptionTopic`, R4-backport `Basic`, and `Subscription` resources back into the engine, for every provisioned tenant.
+
+This runs in the background: the server begins accepting requests immediately, and subscriptions come back online shortly after. A summary line (`Subscription engine rehydrated`) reports what was restored.
+
+Subscription **status transitions are held in memory only** — a successful handshake is not written back to the stored resource. A subscription created as `requested` therefore still reads `"requested"` from the database after it went active, so rehydration re-runs the activation handshake for `requested` subscriptions by default. Set `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE=false` to restore them with no outbound traffic, accepting that they stay inert until re-written. Subscriptions stored as `off` are skipped (the status is terminal); `error` ones are registered but dormant.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SUBSCRIPTION_REHYDRATE` | `true` | Reload stored subscriptions and topics at startup |
+| `HFS_SUBSCRIPTION_REHYDRATE_BATCH_SIZE` | `500` | Resources fetched per storage round-trip |
+| `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | `true` | Re-run the activation handshake for stored `requested` subscriptions |
+| `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE_CONCURRENCY` | `8` | Max handshakes in flight at once, across all tenants |
+
 ### Email channel (SMTP)
 
 The email channel is enabled only when `HFS_SUBSCRIPTION_SMTP_HOST` and `HFS_SUBSCRIPTION_SMTP_FROM` are both set. With either missing, `email` is omitted from the server's supported channel list and any email `Subscription` is rejected with an `unsupported channel type` OperationOutcome.

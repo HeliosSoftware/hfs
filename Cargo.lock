@@ -3582,6 +3582,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "futures",
  "helios-auth",
  "helios-fhir",
  "helios-persistence",

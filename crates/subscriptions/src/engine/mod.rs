@@ -523,7 +523,11 @@ impl SubscriptionEngine {
     }
 
     /// Activate a subscription by performing the handshake.
-    async fn activate_subscription(&self, subscription: &ActiveSubscription) {
+    ///
+    /// `pub(crate)` so startup rehydration ([`crate::rehydrate`]) drives the
+    /// *same* activation path as the write handler rather than reimplementing
+    /// the handshake, retry, and status-transition logic.
+    pub(crate) async fn activate_subscription(&self, subscription: &ActiveSubscription) {
         let tenant_id = &subscription.tenant_id;
         let sub_id = &subscription.id;
         let handshake_max_attempts = self.config.handshake_max_attempts.max(1);
