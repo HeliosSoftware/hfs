@@ -297,9 +297,17 @@ impl PostgresBackend {
     /// a URL-configured deployment can tune connection establishment exactly as an
     /// `HFS_PG_*`-configured one can.
     pub async fn from_connection_string(url: &str) -> StorageResult<Self> {
+        Self::new(Self::config_from_connection_string(url)?).await
+    }
+
+    /// Builds the configuration `from_connection_string` would connect with,
+    /// without connecting. Callers that need to override config fields the URL
+    /// cannot express (e.g. the server's default FHIR version) adjust the
+    /// returned config and pass it to [`PostgresBackend::new`].
+    pub fn config_from_connection_string(url: &str) -> StorageResult<PostgresConfig> {
         let mut config = Self::parse_connection_string(url)?;
         config.connect_timeout_secs = connect_timeout_secs_from_env();
-        Self::new(config).await
+        Ok(config)
     }
 
     /// Creates a backend from environment variables.
@@ -315,6 +323,13 @@ impl PostgresBackend {
     /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
     pub async fn from_env() -> StorageResult<Self> {
+        Self::new(Self::config_from_env()).await
+    }
+
+    /// Builds the configuration `from_env` would connect with, without
+    /// connecting. Same override contract as
+    /// [`PostgresBackend::config_from_connection_string`].
+    pub fn config_from_env() -> PostgresConfig {
         let mut config = PostgresConfig {
             host: std::env::var("HFS_PG_HOST").unwrap_or_else(|_| default_host()),
             port: std::env::var("HFS_PG_PORT")
@@ -333,7 +348,7 @@ impl PostgresBackend {
         // Pool/timeout knobs are applied through the shared helper so this path and
         // the connection-URL path cannot drift apart again.
         config.apply_env_overrides();
-        Self::new(config).await
+        config
     }
 
     fn create_pool(config: &PostgresConfig) -> StorageResult<Pool> {

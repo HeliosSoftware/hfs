@@ -308,15 +308,12 @@ async fn create_audit_postgres_storage(
                 "HFS_AUDIT_DATABASE_URL must be a PostgreSQL connection string when primary backend is postgres"
             );
         }
-        PostgresBackend::from_connection_string(url).await?
-    } else if let Some(ref url) = server_config.database_url {
-        if is_postgres_url(url) {
-            PostgresBackend::from_connection_string(url).await?
-        } else {
-            PostgresBackend::from_env().await?
-        }
+        let mut backend_config = PostgresBackend::config_from_connection_string(url)?;
+        backend_config.fhir_version = server_config.default_fhir_version;
+        backend_config.data_dir = server_config.data_dir.clone();
+        PostgresBackend::new(backend_config).await?
     } else {
-        PostgresBackend::from_env().await?
+        create_postgres_backend(server_config).await?
     };
 
     backend.init_schema().await?;
@@ -493,6 +490,35 @@ async fn create_audit_s3_storage(
         "Database audit backend with s3 storage requires the 's3' feature. \
          Build with: cargo build -p helios-hfs --features s3"
     )
+}
+
+/// Creates a PostgreSQL backend from the server configuration.
+///
+/// Like the SQLite and MongoDB paths, the server's configured default FHIR
+/// version and data directory are applied on top of the URL/env-derived
+/// connection config, so `HFS_DEFAULT_FHIR_VERSION` reaches the backend.
+#[cfg(feature = "postgres")]
+async fn create_postgres_backend(
+    config: &ServerConfig,
+) -> anyhow::Result<helios_persistence::backends::postgres::PostgresBackend> {
+    use helios_persistence::backends::postgres::PostgresBackend;
+
+    let mut backend_config = if let Some(ref url) = config.database_url {
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            info!(url = %url, "Initializing PostgreSQL backend from connection string");
+            PostgresBackend::config_from_connection_string(url)?
+        } else {
+            info!("Initializing PostgreSQL backend from environment variables");
+            PostgresBackend::config_from_env()
+        }
+    } else {
+        info!("Initializing PostgreSQL backend from environment variables");
+        PostgresBackend::config_from_env()
+    };
+    backend_config.fhir_version = config.default_fhir_version;
+    backend_config.data_dir = config.data_dir.clone();
+
+    Ok(PostgresBackend::new(backend_config).await?)
 }
 
 /// Creates and initializes a SQLite backend from the server configuration.
@@ -1802,20 +1828,7 @@ async fn start_postgres(
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    use helios_persistence::backends::postgres::PostgresBackend;
-
-    let backend = if let Some(ref url) = config.database_url {
-        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            info!(url = %url, "Initializing PostgreSQL backend from connection string");
-            PostgresBackend::from_connection_string(url).await?
-        } else {
-            info!("Initializing PostgreSQL backend from environment variables");
-            PostgresBackend::from_env().await?
-        }
-    } else {
-        info!("Initializing PostgreSQL backend from environment variables");
-        PostgresBackend::from_env().await?
-    };
+    let backend = create_postgres_backend(&config).await?;
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
@@ -1877,23 +1890,11 @@ async fn start_postgres_elasticsearch(
     use helios_persistence::backends::elasticsearch::{
         ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
     };
-    use helios_persistence::backends::postgres::PostgresBackend;
     use helios_persistence::composite::{CompositeConfig, CompositeStorage};
     use helios_persistence::core::BackendKind;
 
     // Create PostgreSQL backend
-    let backend = if let Some(ref url) = config.database_url {
-        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            info!(url = %url, "Initializing PostgreSQL backend from connection string");
-            PostgresBackend::from_connection_string(url).await?
-        } else {
-            info!("Initializing PostgreSQL backend from environment variables");
-            PostgresBackend::from_env().await?
-        }
-    } else {
-        info!("Initializing PostgreSQL backend from environment variables");
-        PostgresBackend::from_env().await?
-    };
+    let backend = create_postgres_backend(&config).await?;
 
     backend.init_schema().await?;
 

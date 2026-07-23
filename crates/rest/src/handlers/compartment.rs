@@ -72,7 +72,7 @@ where
     }
 
     // Get the reference parameters for this compartment/target combination
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let ref_params =
         helios_fhir::get_compartment_params(fhir_version, &compartment_type, &target_type);
 
@@ -180,7 +180,7 @@ async fn compartment_search_all<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
     let search_params = SearchParams::from_pairs(pairs.clone());
 
