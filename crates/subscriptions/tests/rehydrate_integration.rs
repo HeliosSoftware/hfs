@@ -23,6 +23,8 @@ use helios_subscriptions::{
 };
 use serde_json::{Value, json};
 use std::time::Duration;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TENANT_ID: &str = "tenant-a";
 const OTHER_TENANT_ID: &str = "tenant-b";
@@ -564,4 +566,110 @@ async fn rehydration_is_idempotent() {
         .get_subscription(TENANT_ID, "sub-1")
         .expect("still registered");
     assert_eq!(sub.status, SubscriptionStatusCode::Active);
+}
+
+/// The core reason rehydration re-handshakes: status transitions are not
+/// persisted, so a subscription the server activated in a previous lifetime
+/// still reads `requested` from storage. Rehydration must drive it back through
+/// the handshake and leave it `active` — otherwise the fix restores nothing for
+/// exactly the subscriptions that were working before the restart.
+#[tokio::test]
+async fn requested_subscriptions_are_handshaked_and_activated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let backend = storage();
+    seed(&backend, TENANT_ID, topic_resource_type(), topic_resource()).await;
+    let endpoint = format!("{}/hook", server.uri());
+    seed(
+        &backend,
+        TENANT_ID,
+        "Subscription",
+        subscription_resource("sub-req", "requested", &endpoint),
+    )
+    .await;
+
+    let engine = fresh_engine();
+    // Default config handshakes `requested` subscriptions — the behaviour under
+    // test, and the opposite of `no_handshake_config`.
+    let report = engine
+        .rehydrate(
+            &backend,
+            TENANT_ID,
+            current_fhir_version(),
+            &RehydrationConfig::default(),
+        )
+        .await;
+
+    assert_eq!(report.subscriptions_registered, 1, "report: {report:?}");
+    assert_eq!(
+        report.handshakes_started, 1,
+        "a stored `requested` subscription must be scheduled for handshake: {report:?}"
+    );
+
+    // `rehydrate` awaits `activate_pending`, so the handshake has completed by
+    // the time it returns.
+    let sub = engine
+        .manager()
+        .get_subscription(TENANT_ID, "sub-req")
+        .expect("subscription registered");
+    assert_eq!(
+        sub.status,
+        SubscriptionStatusCode::Active,
+        "a successful handshake must transition the subscription to active"
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server request log");
+    assert_eq!(
+        requests.len(),
+        1,
+        "rehydration must send exactly one handshake to the endpoint"
+    );
+}
+
+/// Rehydration must page through storage without dropping or duplicating
+/// resources. Forcing a batch size below the resource count exercises the
+/// cursor-advance loop that a single-page fixture never reaches.
+#[tokio::test]
+async fn rehydration_pages_across_multiple_batches() {
+    let backend = storage();
+    seed(&backend, TENANT_ID, topic_resource_type(), topic_resource()).await;
+    for id in ["sub-1", "sub-2", "sub-3"] {
+        seed(
+            &backend,
+            TENANT_ID,
+            "Subscription",
+            subscription_resource(id, "active", "http://127.0.0.1:1/hook"),
+        )
+        .await;
+    }
+
+    let engine = fresh_engine();
+    let paged_config = RehydrationConfig {
+        batch_size: 1,
+        handshake_requested: false,
+        ..RehydrationConfig::default()
+    };
+    let report = engine
+        .rehydrate(&backend, TENANT_ID, current_fhir_version(), &paged_config)
+        .await;
+
+    assert!(report.is_complete(), "report: {report:?}");
+    assert_eq!(
+        report.subscriptions_registered, 3,
+        "every subscription across pages must be registered exactly once: {report:?}"
+    );
+    for id in ["sub-1", "sub-2", "sub-3"] {
+        assert!(
+            engine.manager().get_subscription(TENANT_ID, id).is_some(),
+            "{id} must survive paged rehydration"
+        );
+    }
 }
