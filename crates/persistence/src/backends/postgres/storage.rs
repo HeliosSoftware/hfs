@@ -18,8 +18,6 @@ use crate::core::{
 };
 use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
-use crate::search::loader::SearchParameterLoader;
-use crate::search::registry::SearchParameterStatus;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
@@ -62,6 +60,15 @@ fn extract_part_value(part: &Value) -> Option<Value> {
 impl ResourceStorage for PostgresBackend {
     fn backend_name(&self) -> &'static str {
         "postgres"
+    }
+
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
+    fn bulk_write_concurrency(&self) -> usize {
+        // Bulk seeding is round-trip bound; the pool absorbs parallel writers.
+        8
     }
 
     fn is_cluster_shared(&self) -> bool {
@@ -145,9 +152,16 @@ impl ResourceStorage for PostgresBackend {
         self.index_resource(&client, tenant_id, resource_type, &id, &resource)
             .await?;
 
-        // Handle SearchParameter resources specially - update registry
-        if resource_type == "SearchParameter" {
-            self.handle_search_parameter_create(&resource)?;
+        // An *active* SearchParameter write changes a tenant's overlay: reload
+        // the stored cache and drop the per-tenant registries so they rebuild.
+        // Draft copies (the seeded spec set) never overlay, so skip them and
+        // avoid an O(n²) reload storm during bulk seeding.
+        if resource_type == "SearchParameter"
+            && crate::search::search_parameter_create_affects_overlay(&resource)
+        {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
         }
 
         // Return the stored resource with updated metadata
@@ -342,9 +356,11 @@ impl ResourceStorage for PostgresBackend {
         self.index_resource(&client, tenant_id, resource_type, id, &resource)
             .await?;
 
-        // Handle SearchParameter resources specially - update registry
+        // A SearchParameter write invalidates the tenant overlays.
         if resource_type == "SearchParameter" {
-            self.handle_search_parameter_update(current.content(), &resource)?;
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
         }
 
         Ok(StoredResource::from_storage(
@@ -432,9 +448,11 @@ impl ResourceStorage for PostgresBackend {
                 .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
         }
 
-        // Handle SearchParameter resources specially - update registry
+        // A SearchParameter delete invalidates the tenant overlays.
         if resource_type == "SearchParameter" {
-            self.handle_search_parameter_delete(&data)?;
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
         }
 
         Ok(())
@@ -836,7 +854,10 @@ impl PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
 
         // Extract values using the registry-driven extractor
-        match self.search_extractor().extract(resource, resource_type) {
+        match self
+            .tenant_extractor(tenant_id)
+            .extract(resource, resource_type)
+        {
             Ok(values) => {
                 let mut count = 0;
                 for value in values {
@@ -901,7 +922,7 @@ impl PostgresBackend {
     ) -> StorageResult<usize> {
         let mut count = 0;
         let container = (container_type, container_id);
-        for contained in self.search_extractor().extract_contained(resource) {
+        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
             for value in &contained.values {
                 PostgresSearchIndexWriter::write_contained_entry(
                     client,
@@ -1053,114 +1074,6 @@ impl PostgresBackend {
             .await;
 
         Ok(deleted)
-    }
-}
-
-// ============================================================================
-// SearchParameter Resource Handling
-// ============================================================================
-
-impl PostgresBackend {
-    /// Handle creation of a SearchParameter resource.
-    ///
-    /// If the SearchParameter has status=active, it will be registered in the
-    /// search parameter registry, making it available for searches on new resources.
-    /// Existing resources will NOT be indexed for this parameter until $reindex is run.
-    fn handle_search_parameter_create(&self, resource: &Value) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(self.config().fhir_version);
-
-        match loader.parse_resource(resource) {
-            Ok(def) => {
-                // Only register if status is active
-                if def.status == SearchParameterStatus::Active {
-                    let mut registry = self.search_registry().write();
-                    // Ignore duplicate URL errors - the param may already be embedded
-                    if let Err(e) = registry.register(def) {
-                        tracing::debug!("SearchParameter registration skipped: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                // Log but don't fail - the resource is still stored
-                tracing::warn!("Failed to parse SearchParameter for registry: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle update of a SearchParameter resource.
-    ///
-    /// Updates the registry based on status changes:
-    /// - active -> retired: Parameter disabled for searches
-    /// - retired -> active: Parameter re-enabled for searches
-    /// - Any other change: Updates the registry entry
-    fn handle_search_parameter_update(
-        &self,
-        old_resource: &Value,
-        new_resource: &Value,
-    ) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(self.config().fhir_version);
-
-        let old_def = loader.parse_resource(old_resource).ok();
-        let new_def = loader.parse_resource(new_resource).ok();
-
-        match (old_def, new_def) {
-            (Some(old), Some(new)) => {
-                let mut registry = self.search_registry().write();
-
-                // If URL changed, unregister old and register new
-                if old.url != new.url {
-                    let _ = registry.unregister(&old.url);
-                    if new.status == SearchParameterStatus::Active {
-                        let _ = registry.register(new);
-                    }
-                } else if old.status != new.status {
-                    // Status change - update in registry
-                    if let Err(e) = registry.update_status(&new.url, new.status) {
-                        tracing::debug!("SearchParameter status update skipped: {}", e);
-                    }
-                } else {
-                    // Other changes - re-register (unregister then register)
-                    let _ = registry.unregister(&old.url);
-                    if new.status == SearchParameterStatus::Active {
-                        let _ = registry.register(new);
-                    }
-                }
-            }
-            (None, Some(new)) => {
-                // Old wasn't valid, try to register new
-                if new.status == SearchParameterStatus::Active {
-                    let mut registry = self.search_registry().write();
-                    let _ = registry.register(new);
-                }
-            }
-            (Some(old), None) => {
-                // New isn't valid, unregister old
-                let mut registry = self.search_registry().write();
-                let _ = registry.unregister(&old.url);
-            }
-            (None, None) => {
-                // Neither valid - nothing to do
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle deletion of a SearchParameter resource.
-    ///
-    /// Removes the parameter from the registry. Search index entries for this
-    /// parameter are NOT automatically cleaned up (use $reindex for that).
-    fn handle_search_parameter_delete(&self, resource: &Value) -> StorageResult<()> {
-        if let Some(url) = resource.get("url").and_then(|v| v.as_str()) {
-            let mut registry = self.search_registry().write();
-            if let Err(e) = registry.unregister(url) {
-                tracing::debug!("SearchParameter unregistration skipped: {}", e);
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -2393,7 +2306,7 @@ impl PostgresBackend {
         }
 
         // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(resource_type, &parsed_params)?;
+        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
 
         // Build a SearchQuery
         let query = SearchQuery {
@@ -2412,10 +2325,12 @@ impl PostgresBackend {
     /// Builds SearchParameter objects from parsed (name, value) pairs.
     fn build_search_parameters(
         &self,
+        tenant: &TenantContext,
         resource_type: &str,
         params: &[(String, String)],
     ) -> StorageResult<Vec<SearchParameter>> {
-        let registry = self.search_registry().read();
+        let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
+        let registry = registry_arc.read();
         let mut search_params = Vec::with_capacity(params.len());
 
         for (name, value) in params {
@@ -3154,9 +3069,9 @@ impl ReindexTarget for PostgresBackend {
         let resource_id = resource.id();
         let content = resource.content();
 
-        // Use the dynamic extraction
+        // Use the dynamic extraction over the tenant's registry
         let values = self
-            .search_extractor()
+            .tenant_extractor(tenant_id)
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 

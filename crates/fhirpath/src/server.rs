@@ -55,6 +55,8 @@
 //! - `FHIRPATH_CORS_ORIGINS` / `--cors-origins`: Allowed origins (default: *)
 //! - `FHIRPATH_MAX_BODY_SIZE` / `--max-body-size`: Max request body size in
 //!   bytes, measured after decompression (default: 10485760)
+//! - `FHIRPATH_TERMINOLOGY_TIMEOUT`: Terminology request timeout in seconds,
+//!   `0` to disable (default: 30)
 //!
 //! ## HTTP Compression
 //!
@@ -149,7 +151,7 @@ impl Default for ServerConfig {
     author,
     version,
     about = "FHIRPath HTTP server",
-    long_about = "HTTP server providing FHIRPath expression evaluation for fhirpath-lab integration\n\nEnvironment variables:\n  FHIRPATH_SERVER_PORT - Server port (default: 3000)\n  FHIRPATH_SERVER_HOST - Server host (default: 127.0.0.1)\n  FHIRPATH_LOG_LEVEL - Log level: error, warn, info, debug, trace (default: info)\n  FHIRPATH_ENABLE_CORS - Enable CORS: true/false (default: true)\n  FHIRPATH_CORS_ORIGINS - Allowed origins (comma-separated, * for any) (default: *)\n  FHIRPATH_CORS_METHODS - Allowed methods (comma-separated, * for any) (default: GET,POST,OPTIONS)\n  FHIRPATH_CORS_HEADERS - Allowed headers (comma-separated, * for any) (default: common headers)\n  FHIRPATH_MAX_BODY_SIZE - Max request body size in bytes, measured after decompression (default: 10485760)\n  FHIRPATH_TERMINOLOGY_SERVER - Terminology server URL (default: version-specific test servers)"
+    long_about = "HTTP server providing FHIRPath expression evaluation for fhirpath-lab integration\n\nEnvironment variables:\n  FHIRPATH_SERVER_PORT - Server port (default: 3000)\n  FHIRPATH_SERVER_HOST - Server host (default: 127.0.0.1)\n  FHIRPATH_LOG_LEVEL - Log level: error, warn, info, debug, trace (default: info)\n  FHIRPATH_ENABLE_CORS - Enable CORS: true/false (default: true)\n  FHIRPATH_CORS_ORIGINS - Allowed origins (comma-separated, * for any) (default: *)\n  FHIRPATH_CORS_METHODS - Allowed methods (comma-separated, * for any) (default: GET,POST,OPTIONS)\n  FHIRPATH_CORS_HEADERS - Allowed headers (comma-separated, * for any) (default: common headers)\n  FHIRPATH_MAX_BODY_SIZE - Max request body size in bytes, measured after decompression (default: 10485760)\n  FHIRPATH_TERMINOLOGY_SERVER - Terminology server base URL (no default; required for %terminologies and memberOf)\n  FHIRPATH_TERMINOLOGY_TIMEOUT - Terminology request timeout in seconds, 0 to disable (default: 30)"
 )]
 pub struct ServerArgs {
     /// Port to bind the server to

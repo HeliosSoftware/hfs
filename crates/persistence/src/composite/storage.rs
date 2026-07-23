@@ -747,8 +747,22 @@ impl ResourceStorage for CompositeStorage {
         "composite"
     }
 
+    /// Readiness gates on the primary (CRUD) backend only. A secondary/search
+    /// backend being down is a partial degradation — core CRUD still works, so
+    /// the instance should stay in rotation rather than be pulled out entirely
+    /// (which would take down the traffic it can still serve). If the primary
+    /// system-of-record is unreachable, the instance is not ready.
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        self.primary().readiness_check().await
+    }
+
     fn is_cluster_shared(&self) -> bool {
         self.primary.is_cluster_shared()
+    }
+
+    fn bulk_write_concurrency(&self) -> usize {
+        // Writes route to the primary, so its tolerance is the bound.
+        self.primary.bulk_write_concurrency()
     }
 
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
@@ -1090,18 +1104,17 @@ impl SearchProvider for CompositeStorage {
 
     fn search_param_registry(
         &self,
-    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
         // Same routing as `search`: prefer the dedicated Search backend's
-        // registry, fall back to primary, otherwise an empty registry. The
-        // returned reference outlives `&self` because both providers are
-        // owned by `self.search_providers` for the lifetime of the composite.
+        // registry, fall back to primary, otherwise an empty registry.
         if let Some(search_backend) = self
             .config
             .backends_with_role(super::config::BackendRole::Search)
             .next()
         {
             if let Some(provider) = self.search_providers.get(&search_backend.id) {
-                return provider.search_param_registry();
+                return provider.search_param_registry(tenant);
             }
         }
 
@@ -1109,18 +1122,12 @@ impl SearchProvider for CompositeStorage {
             .search_providers
             .get(self.config.primary_id().unwrap_or("primary"))
         {
-            return provider.search_param_registry();
+            return provider.search_param_registry(tenant);
         }
 
-        use std::sync::OnceLock;
-        static EMPTY: OnceLock<
-            std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
-        > = OnceLock::new();
-        EMPTY.get_or_init(|| {
-            std::sync::Arc::new(parking_lot::RwLock::new(
-                crate::search::SearchParameterRegistry::new(),
-            ))
-        })
+        std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::search::SearchParameterRegistry::new(),
+        ))
     }
 
     fn supports_contained_search(&self) -> bool {
@@ -1744,7 +1751,7 @@ impl CompositeStorage {
         for resource in resources {
             for include in includes {
                 // Extract references from resource based on search param
-                let refs = self.extract_references(resource, &include.search_param);
+                let refs = self.extract_references(tenant, resource, &include.search_param);
 
                 for reference in refs {
                     // Parse reference: "ResourceType/id"
@@ -1784,21 +1791,25 @@ impl CompositeStorage {
     ///    only when the registry doesn't know about the parameter at all.
     ///    That keeps unregistered custom parameters working as they did
     ///    before this change.
-    fn extract_references(&self, resource: &StoredResource, search_param: &str) -> Vec<String> {
+    fn extract_references(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+        search_param: &str,
+    ) -> Vec<String> {
         let content = resource.content();
         let resource_type = resource.resource_type();
 
+        let registry_arc = self.search_param_registry(tenant);
         let registered = {
-            let registry = self.search_param_registry().read();
+            let registry = registry_arc.read();
             registry
                 .get_param(resource_type, search_param)
                 .or_else(|| registry.get_param("Resource", search_param))
         };
 
         if let Some(param_def) = registered {
-            let extractor = crate::search::SearchParameterExtractor::new(Arc::clone(
-                self.search_param_registry(),
-            ));
+            let extractor = crate::search::SearchParameterExtractor::new(Arc::clone(&registry_arc));
             if let Ok(values) = extractor.extract_for_param(content, &param_def) {
                 // Trust the registry: if the param is registered, return what
                 // the FHIRPath expression yields (even if empty) rather than
@@ -1938,7 +1949,7 @@ impl ChainedSearchProvider for CompositeStorage {
         // Extract references to base_type
         let mut ids = Vec::new();
         for resource in result.resources.items {
-            let refs = self.extract_references(&resource, &reverse_chain.reference_param);
+            let refs = self.extract_references(tenant, &resource, &reverse_chain.reference_param);
             for reference in refs {
                 if let Some((ref_type, ref_id)) = reference.split_once('/') {
                     if ref_type == base_type {
@@ -1984,7 +1995,8 @@ impl CompositeStorage {
         // chain_builder::resolve_target_type so composite agrees with SQLite
         // and Postgres on ambiguous reference disambiguation.
         let target_types: Vec<String> = {
-            let registry = self.search_param_registry().read();
+            let reg = self.search_param_registry(tenant);
+            let registry = reg.read();
             let mut types = Vec::with_capacity(parts.len() - 1);
             let mut current = base_type.to_string();
             for ref_param in parts.iter().take(parts.len() - 1) {
@@ -2013,7 +2025,8 @@ impl CompositeStorage {
         let terminal_query = SearchQuery::new(deepest_type).with_parameter(SearchParameter {
             name: terminal_param.to_string(),
             param_type: {
-                let registry = self.search_param_registry().read();
+                let reg = self.search_param_registry(tenant);
+                let registry = reg.read();
                 crate::search::resolve_param_type(
                     &registry,
                     deepest_type,
@@ -2574,16 +2587,11 @@ mod tests {
 
         fn search_param_registry(
             &self,
-        ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-            use std::sync::OnceLock;
-            static EMPTY: OnceLock<
-                std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
-            > = OnceLock::new();
-            EMPTY.get_or_init(|| {
-                std::sync::Arc::new(parking_lot::RwLock::new(
-                    crate::search::SearchParameterRegistry::new(),
-                ))
-            })
+            _tenant: &crate::tenant::TenantContext,
+        ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::search::SearchParameterRegistry::new(),
+            ))
         }
     }
 
@@ -2998,6 +3006,19 @@ mod tests {
     /// The bug this whole fan-out exists to prevent: purging only the primary
     /// leaves the resource in the Elasticsearch index, where it stays
     /// searchable and keeps holding the resource's full content.
+    #[tokio::test]
+    async fn readiness_check_delegates_to_primary() {
+        // Composite readiness gates on the primary system-of-record only. The
+        // primary mock leaves the trait's default `readiness_check` (Ok) in
+        // place, so a healthy primary makes the composite ready — this exercises
+        // both the composite delegation and the default trait impl.
+        let composite = make_composite_no_secondary();
+        composite
+            .readiness_check()
+            .await
+            .expect("a composite over a healthy primary must be ready");
+    }
+
     #[tokio::test]
     async fn test_purge_reaches_every_backend() {
         let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -3524,6 +3545,15 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_bulk_write_concurrency_delegates_to_primary() {
+        let composite = make_composite_no_secondary();
+        assert_eq!(
+            composite.bulk_write_concurrency(),
+            composite.primary().bulk_write_concurrency()
+        );
+    }
+
     // ── routing_error_to_storage_error ────────────────────────────
 
     #[test]
@@ -3844,8 +3874,11 @@ mod tests {
             ) -> StorageResult<u64> {
                 Ok(0)
             }
-            fn search_param_registry(&self) -> &Arc<parking_lot::RwLock<SearchParameterRegistry>> {
-                &self.registry
+            fn search_param_registry(
+                &self,
+                _tenant: &TenantContext,
+            ) -> Arc<parking_lot::RwLock<SearchParameterRegistry>> {
+                Arc::clone(&self.registry)
             }
         }
 
@@ -3878,7 +3911,8 @@ mod tests {
             FhirVersion::default(),
         );
 
-        let refs = composite.extract_references(&resource, "subject");
+        let tenant = TenantContext::new(TenantId::new("test"), TenantPermissions::full_access());
+        let refs = composite.extract_references(&tenant, &resource, "subject");
         assert_eq!(refs, vec!["Patient/p1".to_string()]);
     }
 
@@ -4099,16 +4133,11 @@ mod tests {
 
         fn search_param_registry(
             &self,
-        ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-            use std::sync::OnceLock;
-            static EMPTY: OnceLock<
-                std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
-            > = OnceLock::new();
-            EMPTY.get_or_init(|| {
-                std::sync::Arc::new(parking_lot::RwLock::new(
-                    crate::search::SearchParameterRegistry::new(),
-                ))
-            })
+            _tenant: &crate::tenant::TenantContext,
+        ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::search::SearchParameterRegistry::new(),
+            ))
         }
     }
 }

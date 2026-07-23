@@ -980,3 +980,86 @@ async fn translate_r6_arm_returns_snomed_code() {
         .unwrap_or(false);
     assert!(result, "R6 arm should translate to SNOMED code");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Re-import refreshes filtered $expand — PostgreSQL parity for issue #295
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// #295 parity: the fix that makes SQLite rebuild its concept FTS on re-import
+/// is a no-op for PostgreSQL, which searches a live `pg_trgm` GIN index on
+/// `concepts.display` that the engine maintains transactionally on every write.
+/// This test pins that invariant — a re-imported display is reflected by a
+/// filtered `$expand` with no application-side index maintenance and no restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn reimport_changed_display_refreshes_filtered_expand_pg() {
+    let app = TestAppPg::new().await;
+
+    let bundle = |display: &str| {
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{"resource": {
+                "resourceType": "CodeSystem",
+                "url": "http://pg-295.example/cs/reindex",
+                "version": "1.0.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [{"code": "x", "display": display}]
+            }}]
+        })
+        .to_string()
+    };
+
+    let expand = |filter: &str| {
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "filter", "valueString": filter},
+                {"name": "valueSet", "resource": {
+                    "resourceType": "ValueSet",
+                    "url": "http://pg-295.example/vs/reindex",
+                    "status": "active",
+                    "compose": {"include": [{"system": "http://pg-295.example/cs/reindex"}]}
+                }}
+            ]
+        })
+        .to_string()
+    };
+
+    let contains_x = |body: &serde_json::Value| -> bool {
+        body["expansion"]["contains"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|c| c["code"].as_str() == Some("x")))
+    };
+
+    app.import_bundle_ok(&bundle("originalword marker")).await;
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("originalword"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "initial expand failed: {body}");
+    assert!(contains_x(&body), "original display should match: {body}");
+
+    app.import_bundle_ok(&bundle("changedword marker")).await;
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("changedword"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "post-reimport expand failed: {body}"
+    );
+    assert!(
+        contains_x(&body),
+        "changed display should match after re-import: {body}"
+    );
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("originalword"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "stale-filter expand failed: {body}");
+    assert!(
+        !contains_x(&body),
+        "stale display must not match after re-import: {body}"
+    );
+}

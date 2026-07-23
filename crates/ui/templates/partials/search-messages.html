@@ -1,0 +1,16 @@
+<!--
+  Negotiated-locale strings for the search scripts. The scripts never embed
+  prose of their own; they read it from here, so every page that loads them
+  (Saved Queries, Search) speaks the request's language.
+-->
+<div id="search-messages" hidden
+     data-msg-empty="{{ i18n.t("queries-empty") }}"
+     data-msg-never-run="{{ i18n.t("queries-never-run") }}"
+     data-msg-run="{{ i18n.t("queries-run") }}"
+     data-msg-rename="{{ i18n.t("queries-rename") }}"
+     data-msg-delete="{{ i18n.t("queries-delete") }}"
+     data-msg-rename-prompt="{{ i18n.t("queries-rename-prompt") }}"
+     data-msg-confirm-delete="{{ i18n.t_arg("queries-confirm-delete", "name", "{name}".to_string()) }}"
+     data-msg-invalid-url="{{ i18n.t("queries-invalid-url") }}"
+     data-msg-unavailable="{{ i18n.t("queries-unavailable") }}"
+     data-msg-error="{{ i18n.t("error-generic") }}"></div>

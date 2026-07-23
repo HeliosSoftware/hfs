@@ -45,7 +45,7 @@ use chrono::{DateTime, Utc};
 /// (`count_deltas_by_bucket`), not from the current rows' `last_updated`, so
 /// buckets do not shift when a resource is edited. That is what makes the
 /// sub-day windows meaningful rather than merely finer-grained.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DashboardWindow {
     /// Last hour, in one-minute buckets (60 points).
     LastHour,
@@ -172,17 +172,257 @@ fn provider() -> Option<Arc<dyn DashboardProvider>> {
     PROVIDER.read().ok().and_then(|guard| guard.clone())
 }
 
-/// Fetch a fresh dashboard snapshot over `window`, or `None` when no provider is
+/// One cached window: the last computed snapshot (if any) and whether a
+/// compute task is currently in flight for it.
+struct CacheEntry {
+    value: Option<(std::time::Instant, DashboardSnapshot)>,
+    computing: bool,
+}
+
+type SnapCache = Arc<RwLock<std::collections::HashMap<DashboardWindow, CacheEntry>>>;
+
+static CACHE: std::sync::LazyLock<SnapCache> = std::sync::LazyLock::new(SnapCache::default);
+
+/// How long a computed snapshot is served without recomputing.
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a cold request waits for the first compute before falling back to
+/// placeholder figures. Long enough for row-store backends (milliseconds);
+/// deliberately far below what an object-store scan can take.
+const COLD_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Fetch a dashboard snapshot over `window`, or `None` when no provider is
 /// registered (e.g. a server build without persistence, or the standalone UI
-/// example). The UI falls back to placeholder figures in that case.
+/// example) or the first compute is still in flight. The UI falls back to
+/// placeholder figures in that case.
+///
+/// Snapshots are cached per window and recomputed in the background: a request
+/// inside [`CACHE_TTL`] returns the cached value, a stale request returns the
+/// stale value immediately while one refresh task recomputes, and a cold
+/// request waits up to [`COLD_WAIT`] before degrading to `None`. This keeps
+/// page loads O(1) even on backends where computing the snapshot walks storage
+/// (the S3 primary reads one object per resource — minutes once conformance
+/// seeding has populated the store, #326).
 pub async fn snapshot(window: DashboardWindow) -> Option<DashboardSnapshot> {
     let provider = provider()?;
-    Some(provider.snapshot(window).await)
+    snapshot_via(CACHE.clone(), provider, window, CACHE_TTL, COLD_WAIT).await
+}
+
+/// [`snapshot`] with the cache, provider, and timings injected, so the serve
+/// paths are testable against private caches and fast clocks.
+async fn snapshot_via(
+    cache: SnapCache,
+    provider: Arc<dyn DashboardProvider>,
+    window: DashboardWindow,
+    ttl: std::time::Duration,
+    cold_wait: std::time::Duration,
+) -> Option<DashboardSnapshot> {
+    // One pass under the lock: serve fresh hits, note staleness, and claim the
+    // compute slot if nobody holds it.
+    let (cached, spawn_compute) = {
+        let mut guard = cache.write().ok()?;
+        let entry = guard.entry(window).or_insert(CacheEntry {
+            value: None,
+            computing: false,
+        });
+        if let Some((at, value)) = &entry.value
+            && at.elapsed() < ttl
+        {
+            return Some(value.clone());
+        }
+        let spawn_compute = !entry.computing;
+        if spawn_compute {
+            entry.computing = true;
+        }
+        (entry.value.clone(), spawn_compute)
+    };
+
+    if spawn_compute {
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            let value = provider.snapshot(window).await;
+            if let Ok(mut guard) = cache.write()
+                && let Some(entry) = guard.get_mut(&window)
+            {
+                entry.value = Some((std::time::Instant::now(), value));
+                entry.computing = false;
+            }
+        });
+    }
+
+    // Stale beats absent: serve it now, the refresh lands for the next load.
+    if let Some((_, value)) = cached {
+        return Some(value);
+    }
+
+    // Cold: give a fast backend a beat to fill the cache before degrading.
+    let deadline = std::time::Instant::now() + cold_wait;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(guard) = cache.read()
+            && let Some(value) = guard.get(&window).and_then(|e| e.value.as_ref())
+        {
+            return Some(value.1.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
     use super::*;
+
+    /// Counts computes and answers with that count as `total_resources`, after
+    /// an optional delay — enough to tell cached from recomputed values apart.
+    struct Counting {
+        hits: AtomicUsize,
+        delay: Duration,
+    }
+
+    impl Counting {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Counting {
+                hits: AtomicUsize::new(0),
+                delay,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DashboardProvider for Counting {
+        async fn snapshot(&self, window: DashboardWindow) -> DashboardSnapshot {
+            let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            DashboardSnapshot {
+                total_resources: hit as u64,
+                window,
+                ..DashboardSnapshot::default()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_load_fills_the_cache_and_fresh_hits_reuse_it() {
+        let cache = SnapCache::default();
+        let provider = Counting::new(Duration::ZERO);
+        let ttl = Duration::from_secs(60);
+        let cold = Duration::from_millis(800);
+
+        let first = snapshot_via(
+            cache.clone(),
+            provider.clone(),
+            DashboardWindow::LastHour,
+            ttl,
+            cold,
+        )
+        .await
+        .expect("cold load fills within the wait");
+        assert_eq!(first.total_resources, 1);
+
+        let second = snapshot_via(
+            cache,
+            provider.clone(),
+            DashboardWindow::LastHour,
+            ttl,
+            cold,
+        )
+        .await
+        .expect("fresh hit");
+        assert_eq!(second.total_resources, 1, "served from cache");
+        assert_eq!(
+            provider.hits.load(Ordering::SeqCst),
+            1,
+            "no recompute inside the TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_hits_serve_immediately_and_refresh_in_the_background() {
+        let cache = SnapCache::default();
+        let provider = Counting::new(Duration::ZERO);
+        let ttl = Duration::ZERO; // everything is instantly stale
+        let cold = Duration::from_millis(800);
+
+        let first = snapshot_via(
+            cache.clone(),
+            provider.clone(),
+            DashboardWindow::LastDay,
+            ttl,
+            cold,
+        )
+        .await
+        .expect("cold load");
+        assert_eq!(first.total_resources, 1);
+
+        let stale = snapshot_via(
+            cache.clone(),
+            provider.clone(),
+            DashboardWindow::LastDay,
+            ttl,
+            cold,
+        )
+        .await
+        .expect("stale value served without waiting");
+        assert_eq!(stale.total_resources, 1, "the old value, not the refresh");
+
+        // The background refresh lands; a later hit sees the new compute.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if provider.hits.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+        }
+        let refreshed = snapshot_via(cache, provider.clone(), DashboardWindow::LastDay, ttl, cold)
+            .await
+            .expect("refreshed value");
+        assert!(
+            refreshed.total_resources >= 2,
+            "got {}",
+            refreshed.total_resources
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_cold_compute_degrades_to_none_then_lands() {
+        let cache = SnapCache::default();
+        let provider = Counting::new(Duration::from_millis(400));
+        let ttl = Duration::from_secs(60);
+        let cold = Duration::from_millis(120);
+
+        let first = snapshot_via(
+            cache.clone(),
+            provider.clone(),
+            DashboardWindow::LastMonth,
+            ttl,
+            cold,
+        )
+        .await;
+        assert!(
+            first.is_none(),
+            "cold load past the wait degrades to placeholder"
+        );
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let second = snapshot_via(
+            cache,
+            provider.clone(),
+            DashboardWindow::LastMonth,
+            ttl,
+            cold,
+        )
+        .await
+        .expect("the detached compute landed");
+        assert_eq!(second.total_resources, 1);
+        assert_eq!(
+            provider.hits.load(Ordering::SeqCst),
+            1,
+            "single-flight: no compute stampede"
+        );
+    }
 
     /// Echoes back the window it was asked for, so the test can assert the
     /// requested window reaches the provider.

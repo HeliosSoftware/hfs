@@ -36,13 +36,20 @@
 //! selector. Both selectors are plain links, so the dashboard stays navigable
 //! without JavaScript.
 
+mod compartments;
+mod conformance;
+mod history;
 mod i18n;
+mod search_params;
 mod tenants;
+
+#[doc(hidden)]
+pub use conformance::{ConformanceSource, StaticConformanceSource};
 
 use askama::Template;
 use axum::{
     Router,
-    extract::{RawQuery, State},
+    extract::{Query, RawQuery, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
@@ -57,6 +64,8 @@ use helios_observability::dashboard::{
 use helios_persistence::core::ResourceStorage;
 use i18n::{I18n, RequestLocale};
 use rust_embed::RustEmbed;
+use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -67,14 +76,45 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[folder = "assets/"]
 struct Assets;
 
+/// How natural-language search (#255) presents itself in the UI, mirroring the
+/// server's `HFS_NL_SEARCH_*` configuration.
+///
+/// The three states are deliberate: `enabled: false` makes the feature vanish
+/// (no page, no nav entry, no mention); enabled but unconfigured advertises
+/// what it does and how to switch it on; enabled and configured is the working
+/// feature. The UI never sees the API key itself — only whether one is set.
+#[derive(Clone, Debug, Default)]
+pub struct NlSearch {
+    /// `HFS_NL_SEARCH_ENABLED` — the operator's kill switch.
+    pub enabled: bool,
+    /// Whether `HFS_NL_SEARCH_API_KEY` is set.
+    pub configured: bool,
+    /// `HFS_NL_SEARCH_MODEL` — shown in the setup state so an operator can see
+    /// what they would be billed for.
+    pub model: String,
+}
+
 /// Shared router state: values that are constant for the process lifetime.
 #[derive(Clone)]
 struct WebState {
     version: &'static str,
+    /// Lazily-fetched SearchParameter snapshot per FHIR version (#238), read
+    /// from the server's own `/SearchParameter` endpoint.
+    sp_catalog: Arc<search_params::SpCatalog>,
+    /// Natural-language search feature state (#255).
+    nl: Arc<NlSearch>,
+    /// Lazily-fetched CompartmentDefinitions per FHIR version (#237), read from
+    /// the server's own `/CompartmentDefinition` endpoint.
+    compartments: Arc<compartments::CompartmentCatalog>,
     /// Read/write path for the tenant-maintenance page. `None` when the host did
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
+    /// tenant's conformance resources from the tenant-maintenance page.
+    data_dir: Option<PathBuf>,
+    /// The server's default FHIR version, used when seeding a new tenant.
+    fhir_version: helios_fhir::FhirVersion,
 }
 
 /// A small, self-contained system-status snapshot — the "real read path" the
@@ -158,6 +198,31 @@ struct IndexPage {
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
+    /// Whether the sidebar links to the natural-language search page (#255).
+    nl_enabled: bool,
+}
+
+/// Search page (#255, Figma "Search V1.0"): natural language and the visual
+/// builder as two modes over one editable FHIR query.
+///
+/// Rendered only when the feature is enabled. When it is enabled but no API
+/// key is configured, the natural-language pane renders its setup state
+/// instead of an input — the page still works, in visual-builder mode.
+#[derive(Template)]
+#[template(path = "pages/search.html")]
+struct SearchPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    nl_enabled: bool,
+    /// Feature state; `configured` picks between the working pane and setup.
+    nl: NlSearch,
+    /// How-to page for the unconfigured state (docs live in the book).
+    docs_url: &'static str,
+    resource_types: Vec<String>,
+    /// The saved-query controls are the Saved Queries page's job, not this
+    /// page's (see `partials/search-builder.html`).
+    show_save: bool,
 }
 
 /// Saved FHIR queries page (#234). The shell is server-rendered; the list is
@@ -169,6 +234,38 @@ struct QueriesPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    nl_enabled: bool,
+    /// The version's resource types for the picker rail, from the spec
+    /// CompartmentDefinitions already vendored for the compartment viewer.
+    /// Counts hydrate client-side via `_summary=count`.
+    resource_types: Vec<String>,
+    show_save: bool,
+}
+
+/// SearchParameter viewer (#238). Read-only against the same snapshot the
+/// storage backends seed their registries from; the write half lands
+/// behind #235.
+#[derive(Template)]
+#[template(path = "pages/search-parameters.html")]
+struct SearchParametersPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    nl_enabled: bool,
+    view: search_params::SpView,
+}
+
+/// Compartment viewer & route tester (#237). Read-only: the base definitions
+/// are codegen'd into the binary; a tenant-scoped override layer is open
+/// question 1 on the issue.
+#[derive(Template)]
+#[template(path = "pages/compartments.html")]
+struct CompartmentsPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    nl_enabled: bool,
+    view: compartments::CmpView,
 }
 
 #[derive(Template)]
@@ -178,17 +275,111 @@ struct StatusPartial {
     i18n: I18n,
 }
 
+/// History & Versions screen (#236, Figma "History & Versions"): the version
+/// rail and the two-layer diff. The shell is server-rendered; the version list
+/// and the two compared versions are fetched by the browser from the ordinary
+/// `_history` / `vread` FHIR API, then posted to [`history_diff`] to render.
+#[derive(Template)]
+#[template(path = "pages/history.html")]
+struct HistoryPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    nl_enabled: bool,
+}
+
+/// The rendered diff fragment, swapped in when the version selection changes.
+#[derive(Template)]
+#[template(path = "partials/history-diff.html")]
+struct HistoryDiffFragment {
+    i18n: I18n,
+    diff: history::Diff,
+    /// The versions being compared, for the heading (`v3 → v4`).
+    from_label: String,
+    to_label: String,
+    show_metadata: bool,
+    /// A version was deleted (an R6 destructive op): render a state banner
+    /// rather than a diff against a tombstone.
+    deleted: bool,
+    /// The two documents could not be parsed — the fragment says so instead of
+    /// rendering an empty diff.
+    parse_error: bool,
+}
+
+/// One `<option>` in the search-builder's parameter datalist.
+struct ParamOption {
+    code: String,
+    type_label: String,
+}
+
+/// Parameter suggestions for the search builder (`/ui/queries/params`),
+/// rendered from the same registry snapshot the SearchParameter viewer
+/// reads. An HTML fragment the page swaps per resource type — hypermedia,
+/// not a UI-facing JSON API.
+#[derive(Template)]
+#[template(path = "partials/param-options.html")]
+struct ParamOptionsPartial {
+    params: Vec<ParamOption>,
+}
+
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
 /// other path. The UI depends on the rest of the server, never the reverse.
 ///
-/// `tenants` is the storage handle the tenant-maintenance page reads and writes
-/// (the same backend the FHIR API uses); pass `None` to render the UI without a
-/// live registry (the page then reports it as unavailable).
+/// The SearchParameter and CompartmentDefinition viewers read the server's own
+/// FHIR API over HTTP (storage is the source of truth): `self_base_url` is the
+/// loopback base URL the UI calls itself at, and `outbound_auth` supplies the
+/// credentials for that self-call (a service token when auth is enabled, a
+/// no-op otherwise). `data_dir` (`HFS_DATA_DIR`) and `fhir_version` are used to
+/// seed a newly-provisioned tenant from the tenant-maintenance page. `tenants`
+/// is the storage handle that page reads and writes; pass `None` to render the
+/// UI without a live registry (the page then reports it as unavailable).
+///
+/// `nl` mirrors the server's natural-language search configuration. With
+/// `enabled: false` the `/ui/search` route is never registered, so the page
+/// 404s through to the FHIR app exactly as it did before the feature existed.
+#[allow(clippy::too_many_arguments)]
 pub fn mount(
     fhir_app: Router,
     hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
     tenants: Option<Arc<dyn ResourceStorage>>,
+    self_base_url: String,
+    outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
+    fhir_version: helios_fhir::FhirVersion,
 ) -> Router {
+    let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
+        self_base_url,
+        outbound_auth,
+    ));
+    mount_with_conformance_source(
+        fhir_app,
+        hfs_version,
+        data_dir,
+        nl,
+        tenants,
+        source,
+        fhir_version,
+    )
+}
+
+/// Mounts the UI with an injected [`ConformanceSource`], so tests can serve the
+/// SearchParameter/CompartmentDefinition data offline instead of standing up a
+/// real HTTP server. Production callers use [`mount`], which wires an HTTP
+/// source pointed at the server's own loopback address.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mount_with_conformance_source(
+    fhir_app: Router,
+    hfs_version: &'static str,
+    data_dir: Option<PathBuf>,
+    nl: NlSearch,
+    tenants: Option<Arc<dyn ResourceStorage>>,
+    source: Arc<dyn ConformanceSource>,
+    fhir_version: helios_fhir::FhirVersion,
+) -> Router {
+    let nl_enabled = nl.enabled;
+
     // Embedded, pinned htmx + CSS/JS + fonts, served with br/gzip/deflate
     // negotiation. `Cache-Control: no-cache` forces the browser to revalidate
     // against the (content-based) ETag on every load: unchanged assets come
@@ -198,13 +389,27 @@ pub fn mount(
         .nest_service("/ui/assets", ServeEmbed::<Assets>::new())
         .layer(middleware::from_fn(revalidate_assets));
 
-    Router::new()
+    let mut router = Router::new()
         .route("/ui", get(index))
         .route("/ui/queries", get(queries))
+        .route("/ui/queries/params", get(query_params_catalog))
+        .route("/ui/search-parameters", get(search_parameters))
+        .route("/ui/compartments", get(compartments_page))
         .route("/ui/status", get(status))
+        .route("/ui/history", get(history_page))
+        // The diff is computed server-side (the decision in
+        // docs/history-diff-rendering.md); the browser posts the two versions
+        // it fetched from `_history`.
+        .route("/ui/history/diff", axum::routing::post(history_diff))
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
-        .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
+        .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete));
+
+    if nl_enabled {
+        router = router.route("/ui/search", get(search));
+    }
+
+    router
         .merge(assets)
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
@@ -214,10 +419,19 @@ pub fn mount(
         .layer(middleware::from_fn(i18n::negotiate_locale))
         .with_state(WebState {
             version: hfs_version,
+            sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
+            compartments: Arc::new(compartments::CompartmentCatalog::new(source)),
+            nl: Arc::new(nl),
             tenants,
+            data_dir,
+            fhir_version,
         })
         .fallback_service(fhir_app)
 }
+
+/// The how-to page for natural-language search, linked from the setup state.
+const NL_SEARCH_DOCS: &str =
+    "https://heliossoftware.github.io/hfs/components/natural-language-search.html";
 
 /// Adds `Cache-Control: no-cache` to embedded-asset responses so a rebuilt
 /// asset is never served stale from the browser cache (revalidation is cheap:
@@ -245,16 +459,153 @@ async fn index(
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
         .unwrap_or_default();
-    render(build_index_page(state.version, locale, selected, window).await)
+    render(build_index_page(state.version, locale, selected, window, state.nl.enabled).await)
+}
+
+/// Search page: natural language and the visual builder over one editable query.
+async fn search(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    let resource_types = state
+        .compartments
+        .resource_type_names(helios_fhir::FhirVersion::default())
+        .await;
+    render(SearchPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "search",
+        nl_enabled: state.nl.enabled,
+        nl: (*state.nl).clone(),
+        docs_url: NL_SEARCH_DOCS,
+        resource_types,
+        show_save: false,
+    })
 }
 
 /// Saved FHIR queries page.
 async fn queries(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    let resource_types = state
+        .compartments
+        .resource_type_names(helios_fhir::FhirVersion::default())
+        .await;
     render(QueriesPage {
         status: current_status(state.version),
         i18n: I18n::new(locale),
         active_page: "queries",
+        nl_enabled: state.nl.enabled,
+        resource_types,
+        show_save: true,
     })
+}
+
+#[derive(Deserialize, Default)]
+struct ParamsCatalogQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
+}
+
+/// Parameter datalist for the search builder: the active parameters that
+/// apply to the given resource type (including `Resource` /
+/// `DomainResource`-level ones), from the default-version snapshot.
+async fn query_params_catalog(
+    State(state): State<WebState>,
+    Query(raw): Query<ParamsCatalogQuery>,
+) -> Response {
+    let snapshot = state
+        .sp_catalog
+        .snapshot(helios_fhir::FhirVersion::default())
+        .await;
+    let resource_type = raw.resource_type.unwrap_or_default();
+    let mut params: Vec<ParamOption> = snapshot
+        .params
+        .iter()
+        .filter(|p| p.applies_to(&resource_type))
+        .map(|p| ParamOption {
+            code: p.code.clone(),
+            type_label: p.param_type.to_string(),
+        })
+        .collect();
+    params.sort_by(|a, b| a.code.cmp(&b.code));
+    params.dedup_by(|a, b| a.code == b.code);
+    render(ParamOptionsPartial { params })
+}
+
+/// Query string for the SearchParameter viewer. Every filter is a link and
+/// the search box is a GET form, so the page works without JavaScript.
+#[derive(Deserialize, Default)]
+struct SearchParametersQuery {
+    version: Option<String>,
+    base: Option<String>,
+    #[serde(rename = "type")]
+    ptype: Option<String>,
+    source: Option<String>,
+    #[serde(default)]
+    q: String,
+    page: Option<usize>,
+    sel: Option<String>,
+}
+
+/// SearchParameter viewer page.
+async fn search_parameters(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    Query(raw): Query<SearchParametersQuery>,
+) -> Response {
+    let query = search_params::SpQuery {
+        version: raw.version,
+        base: raw.base.filter(|b| !b.is_empty()),
+        ptype: raw.ptype.filter(|t| !t.is_empty()),
+        source: raw.source.filter(|s| !s.is_empty()),
+        q: raw.q,
+        page: raw.page.unwrap_or(1),
+        sel: raw.sel.filter(|s| !s.is_empty()),
+    };
+    let snapshot = state.sp_catalog.snapshot(query.fhir_version()).await;
+    render(SearchParametersPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "search-parameters",
+        nl_enabled: state.nl.enabled,
+        view: search_params::build_view(&snapshot, &query),
+    })
+}
+
+/// Query string for the compartment viewer & tester.
+#[derive(Deserialize, Default)]
+struct CompartmentsQuery {
+    version: Option<String>,
+    def: Option<String>,
+    tab: Option<String>,
+    filter: Option<String>,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    target: String,
+}
+
+/// Compartment viewer & tester page.
+async fn compartments_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    Query(raw): Query<CompartmentsQuery>,
+) -> Response {
+    let query = compartments::CmpQuery {
+        version: raw.version,
+        def: raw.def,
+        tab: raw.tab,
+        filter: raw.filter,
+        id: raw.id,
+        target: raw.target,
+    };
+    let defs = state.compartments.definitions(query.fhir_version()).await;
+    match compartments::build_view(&query, &defs) {
+        Some(view) => render(CompartmentsPage {
+            status: current_status(state.version),
+            i18n: I18n::new(locale),
+            active_page: "compartments",
+            nl_enabled: state.nl.enabled,
+            view,
+        }),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Status read path. Returns a fragment to htmx (`HX-Request`) and a full page
@@ -269,8 +620,82 @@ async fn status(
     if is_htmx {
         render(StatusPartial { status, i18n })
     } else {
-        render(build_index_page(state.version, locale, None, DashboardWindow::default()).await)
+        render(
+            build_index_page(
+                state.version,
+                locale,
+                None,
+                DashboardWindow::default(),
+                state.nl.enabled,
+            )
+            .await,
+        )
     }
+}
+
+/// History & Versions page shell.
+async fn history_page(State(state): State<WebState>, locale: RequestLocale) -> Response {
+    render(HistoryPage {
+        status: current_status(state.version),
+        i18n: I18n::new(locale),
+        active_page: "history",
+        nl_enabled: state.nl.enabled,
+    })
+}
+
+/// A diff request: the two versions to compare, and the metadata toggle.
+#[derive(serde::Deserialize)]
+struct DiffForm {
+    /// The older version's JSON.
+    from: String,
+    /// The newer version's JSON.
+    to: String,
+    #[serde(default)]
+    from_label: String,
+    #[serde(default)]
+    to_label: String,
+    #[serde(default)]
+    show_metadata: String,
+    /// Set when the newer side is a deleted (tombstone) version.
+    #[serde(default)]
+    deleted: String,
+}
+
+/// Renders the diff between two posted versions. The versions themselves are
+/// fetched by the browser from the FHIR `_history` API; computing the diff here
+/// keeps it off the client (no diff library shipped) and on the one code path
+/// the decision doc settled on.
+async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffForm>) -> Response {
+    let i18n = I18n::new(locale);
+    let show_metadata = form.show_metadata == "true";
+    let deleted = form.deleted == "true";
+
+    let (from, to) = (
+        serde_json::from_str::<serde_json::Value>(&form.from),
+        serde_json::from_str::<serde_json::Value>(&form.to),
+    );
+
+    let (Ok(from), Ok(to)) = (from, to) else {
+        return render(HistoryDiffFragment {
+            i18n,
+            diff: history::diff(&serde_json::Value::Null, &serde_json::Value::Null, true),
+            from_label: form.from_label,
+            to_label: form.to_label,
+            show_metadata,
+            deleted,
+            parse_error: true,
+        });
+    };
+
+    render(HistoryDiffFragment {
+        i18n,
+        diff: history::diff(&from, &to, show_metadata),
+        from_label: form.from_label,
+        to_label: form.to_label,
+        show_metadata,
+        deleted,
+        parse_error: false,
+    })
 }
 
 /// Assembles the landing page from the live dashboard snapshot, or from
@@ -280,6 +705,7 @@ async fn build_index_page(
     locale: RequestLocale,
     selected: Option<String>,
     window: DashboardWindow,
+    nl_enabled: bool,
 ) -> IndexPage {
     let status = current_status(version);
     let i18n = I18n::new(locale);
@@ -295,6 +721,7 @@ async fn build_index_page(
         windows,
         i18n,
         active_page: "home",
+        nl_enabled,
     }
 }
 
@@ -649,6 +1076,7 @@ mod tests {
             windows,
             i18n,
             active_page: "home",
+            nl_enabled: true,
         }
     }
 
@@ -761,6 +1189,9 @@ mod tests {
             },
             i18n: i18n("en"),
             active_page: "queries",
+            nl_enabled: true,
+            show_save: true,
+            resource_types: vec!["Patient".to_string(), "Observation".to_string()],
         }
         .render()
         .expect("queries page renders");
@@ -774,6 +1205,11 @@ mod tests {
         assert!(html.contains(r#"data-intent="run""#));
         assert!(html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
+        // Resource picker rail: the version's full type list, with count
+        // slots the script hydrates via _summary=count.
+        assert!(html.contains(r#"data-rail-type="Patient""#));
+        assert!(html.contains(r#"data-rail-type="Observation""#));
+        assert!(html.contains(r#"data-count-for="Patient""#));
         // This page, not Home, carries aria-current in the sidebar.
         assert!(html.contains(r#"href="/ui/queries" aria-current="page""#));
         assert!(!html.contains(r#"href="/ui" aria-current="page""#));
@@ -790,6 +1226,9 @@ mod tests {
             },
             i18n: i18n("es"),
             active_page: "queries",
+            nl_enabled: true,
+            show_save: true,
+            resource_types: vec!["Patient".to_string()],
         }
         .render()
         .expect("queries page renders");
@@ -816,6 +1255,34 @@ mod tests {
         assert!(source.contains("lastAccessedAt"));
         // Every run is recorded to the roaming recent-searches list.
         assert!(source.contains("recentSearches"));
+        // Results render in-page from the FHIR API itself, and the builder's
+        // parameter suggestions come from the server-rendered datalist.
+        assert!(source.contains("application/fhir+json"));
+        assert!(source.contains("/ui/queries/params"));
+    }
+
+    /// The builder's datalist fragment is fed by the SearchParameter
+    /// registry and scoped to the requested resource type.
+    #[test]
+    fn param_options_partial_renders_datalist() {
+        let html = ParamOptionsPartial {
+            params: vec![
+                ParamOption {
+                    code: "birthdate".into(),
+                    type_label: "date".into(),
+                },
+                ParamOption {
+                    code: "name".into(),
+                    type_label: "string".into(),
+                },
+            ],
+        }
+        .render()
+        .expect("partial renders");
+
+        assert!(html.contains(r#"<datalist id="param-options">"#));
+        assert!(html.contains(r#"<option value="birthdate" label="date">"#));
+        assert!(!html.contains("<html"), "fragment, not a page");
     }
 
     /// Both theme buttons render, and icons are inlined (so `currentColor`

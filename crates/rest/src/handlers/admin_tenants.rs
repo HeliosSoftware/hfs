@@ -40,6 +40,12 @@ use crate::state::AppState;
 /// into schema names / storage keys.
 const MAX_TENANT_ID_LEN: usize = 128;
 
+/// Tenant ids that name a control-plane namespace in a storage backend's
+/// keyspace. Currently the S3 sibling prefixes of `tenants/` (see
+/// `S3Keyspace`); `__system__` is checked separately as the shared-tenant
+/// sentinel.
+const RESERVED_TENANT_IDS: &[&str] = &["tenants", "resources", "history", "bulk"];
+
 /// Request body for `POST /admin/tenants`.
 #[derive(Debug, Deserialize)]
 pub struct CreateTenantBody {
@@ -65,6 +71,28 @@ fn require_registry<S: ResourceStorage>(storage: &S) -> RestResult<()> {
     }
 }
 
+/// Seeds a newly-provisioned tenant with the spec conformance resources
+/// (SearchParameters and CompartmentDefinitions), mirroring the per-tenant
+/// startup seed. Best-effort: failures are logged, never surfaced to the caller
+/// (the tenant is registered regardless; the next startup seed completes it).
+async fn seed_new_tenant<S: ResourceStorage>(
+    storage: &S,
+    config: &crate::config::ServerConfig,
+    tenant_id: &str,
+) {
+    let data_dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    helios_persistence::search::seed_tenant_conformance(
+        storage,
+        config.default_fhir_version,
+        &data_dir,
+        tenant_id,
+    )
+    .await;
+}
+
 /// Validates a tenant id: non-empty, within length, no whitespace, a
 /// conservative identifier charset, and never the internal system sentinel.
 fn validate_tenant_id(id: &str) -> RestResult<()> {
@@ -81,6 +109,20 @@ fn validate_tenant_id(id: &str) -> RestResult<()> {
     if id == SYSTEM_TENANT {
         return Err(RestError::BadRequest {
             message: "'__system__' is reserved for internal shared resources".to_string(),
+        });
+    }
+    // Names that collide with a control-plane namespace in the S3 keyspace.
+    //
+    // Defense in depth and a UX guardrail only — it is *not* what makes the
+    // keyspace safe. The S3 backend is safe structurally (registry records are
+    // direct `{id}.json` children of `tenants/`, tenant data is always nested
+    // deeper), because this check is reachable from the admin API alone: the JWT
+    // tenant extractor validates nothing. See `S3Keyspace::tenant_registry_prefix`
+    // and issue #271 — do not conclude from this list that the reader-side filter
+    // is redundant.
+    if RESERVED_TENANT_IDS.contains(&id) {
+        return Err(RestError::BadRequest {
+            message: format!("'{id}' is reserved for internal use"),
         });
     }
     // Allow the characters that are safe across routing (header / URL prefix /
@@ -187,6 +229,16 @@ where
 
     let record = state.storage().register_tenant(&id, display_name).await?;
     debug!(tenant = %id, "Registered tenant");
+
+    // Seed the new tenant with the conformance resources (spec SearchParameters
+    // and CompartmentDefinitions) so `GET /SearchParameter` and
+    // `GET /CompartmentDefinition` are populated for it, matching what the
+    // server seeds every provisioned tenant with at startup. Best-effort: a
+    // failed seed logs and still returns the created tenant.
+    if state.config().seed_conformance {
+        seed_new_tenant(state.storage(), state.config(), &id).await;
+    }
+
     audit(
         &state,
         AuditAction::Create,

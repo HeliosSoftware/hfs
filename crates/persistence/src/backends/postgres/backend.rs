@@ -1,8 +1,10 @@
 //! PostgreSQL backend implementation.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config, Pool, Runtime, SslMode};
@@ -14,23 +16,32 @@ use helios_fhir::FhirVersion;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageResult};
-use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParameterRegistry};
+use crate::search::{
+    SearchParameterDefinition, SearchParameterExtractor, SearchParameterLoader,
+    SearchParameterRegistry, TenantSearchRegistries,
+};
+
+/// Sync in-memory cache of each tenant's stored (POSTed) active SearchParameter
+/// definitions, keyed by tenant id. Postgres queries are async but the per-tenant
+/// registry loader must be sync, so async paths (startup, TTL refresh, and
+/// SearchParameter writes) populate this map and the loader reads it.
+type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
 
 /// PostgreSQL backend for FHIR resource storage.
 pub struct PostgresBackend {
     pool: Pool,
     config: PostgresConfig,
-    /// Search parameter registry (in-memory cache of active parameters).
-    search_registry: Arc<RwLock<SearchParameterRegistry>>,
-    /// Extractor for deriving searchable values from resources.
-    search_extractor: Arc<SearchParameterExtractor>,
+    /// Per-tenant search parameter registries (shared base + per-tenant overlay).
+    registries: Arc<TenantSearchRegistries>,
+    /// Sync cache of each tenant's stored params, read by the registry loader.
+    stored_by_tenant: StoredByTenant,
 }
 
 impl Debug for PostgresBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresBackend")
             .field("config", &self.config)
-            .field("search_registry_len", &self.search_registry.read().len())
+            .field("base_registry_len", &self.registries.base().read().len())
             .finish_non_exhaustive()
     }
 }
@@ -66,7 +77,15 @@ pub struct PostgresConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
-    /// Connection timeout in seconds.
+    /// Upper bound, in seconds, for establishing a connection to the server.
+    ///
+    /// Bounds the whole of connection establishment — DNS, TCP, TLS and the
+    /// Postgres startup/auth exchange — via deadpool's `create_timeout`, not just
+    /// the TCP handshake that tokio-postgres' own `connect_timeout` covers.
+    ///
+    /// Raise it for servers that are slow to answer a fresh connection: a cold or
+    /// loaded cluster, a cross-region failover, or a TLS handshake against a
+    /// distant proxy. Settable as `HFS_PG_CONNECT_TIMEOUT_SECS`.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
 
@@ -146,6 +165,20 @@ fn default_max_connections() -> usize {
 
 fn default_connect_timeout_secs() -> u64 {
     5
+}
+
+/// Reads `HFS_PG_CONNECT_TIMEOUT_SECS`, falling back to the default.
+///
+/// This value bounds deadpool's `create_timeout` and is therefore a hard ceiling
+/// on connection establishment. It must be reachable from every construction path
+/// — an operator whose server needs longer than the default has no other way to
+/// say so, and before this was wired up the field was dead config, so no
+/// deployment has ever had to think about it.
+fn connect_timeout_secs_from_env() -> u64 {
+    std::env::var("HFS_PG_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(default_connect_timeout_secs)
 }
 
 fn default_statement_timeout_ms() -> u64 {
@@ -232,22 +265,40 @@ impl PostgresBackend {
         })?;
         drop(client);
 
-        // Initialize the search parameter registry
-        let search_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
-        Self::initialize_search_registry(&search_registry, &config);
-        let search_extractor = Arc::new(SearchParameterExtractor::new(search_registry.clone()));
+        // Initialize the per-tenant search parameter registries. Base params
+        // (embedded + spec + custom) go into the shared base; each tenant's
+        // stored overlay is read from `stored_by_tenant`, populated by
+        // `reload_stored_cache` at startup / refresh / SearchParameter writes.
+        let stored_by_tenant: StoredByTenant = Arc::new(RwLock::new(HashMap::new()));
+        let loader_cache = stored_by_tenant.clone();
+        let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
+            move |tenant_id: &str| {
+                loader_cache
+                    .read()
+                    .get(tenant_id)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+        )));
+        Self::initialize_search_registry(registries.base(), &config);
 
         Ok(Self {
             pool,
             config,
-            search_registry,
-            search_extractor,
+            registries,
+            stored_by_tenant,
         })
     }
 
     /// Creates a backend from a connection string.
+    ///
+    /// The URL carries the connection's identity (host, port, database,
+    /// credentials); `HFS_PG_CONNECT_TIMEOUT_SECS` still applies on top of it, so
+    /// a URL-configured deployment can tune connection establishment exactly as an
+    /// `HFS_PG_*`-configured one can.
     pub async fn from_connection_string(url: &str) -> StorageResult<Self> {
-        let config = Self::parse_connection_string(url)?;
+        let mut config = Self::parse_connection_string(url)?;
+        config.connect_timeout_secs = connect_timeout_secs_from_env();
         Self::new(config).await
     }
 
@@ -260,6 +311,7 @@ impl PostgresBackend {
     /// - `HFS_PG_USER` (default: "helios")
     /// - `HFS_PG_PASSWORD`
     /// - `HFS_PG_MAX_CONNECTIONS` (default: `cores * 4`, clamped to 16..=64)
+    /// - `HFS_PG_CONNECT_TIMEOUT_SECS` (default: 5)
     /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
     pub async fn from_env() -> StorageResult<Self> {
@@ -272,6 +324,10 @@ impl PostgresBackend {
             dbname: std::env::var("HFS_PG_DBNAME").unwrap_or_else(|_| default_dbname()),
             user: std::env::var("HFS_PG_USER").unwrap_or_else(|_| default_user()),
             password: std::env::var("HFS_PG_PASSWORD").ok(),
+            // The other tuning knobs are applied by `apply_env_overrides` below;
+            // `connect_timeout_secs` reads its env var through a dedicated helper so
+            // the connection-URL path can pick it up the same way.
+            connect_timeout_secs: connect_timeout_secs_from_env(),
             ..Default::default()
         };
         // Pool/timeout knobs are applied through the shared helper so this path and
@@ -292,6 +348,15 @@ impl PostgresBackend {
             PostgresSslMode::Prefer => SslMode::Prefer,
             PostgresSslMode::Require => SslMode::Require,
         });
+
+        let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+
+        // Bound the TCP handshake. NOTE: tokio-postgres applies `connect_timeout`
+        // to `TcpStream::connect` and nothing else — DNS resolution, the TLS
+        // handshake and the Postgres startup/auth exchange are all awaited
+        // unbounded. So this alone does NOT bound connection establishment; the
+        // deadpool `create` timeout below covers the rest.
+        cfg.connect_timeout = Some(connect_timeout);
 
         // Ship `statement_timeout` in the startup packet so it applies to every
         // connection the pool ever creates — including ones added as the pool grows
@@ -319,12 +384,18 @@ impl PostgresBackend {
             // that accepts TCP but stalls the startup handshake — becomes an
             // unbounded latency tail. Bound the wait and surface exhaustion as a
             // fast `Unavailable` (503) instead of a request that hangs for a minute.
+            //
+            // `create` also bounds the whole of `Manager::create` (DNS + TCP + TLS +
+            // auth). Without it, a peer that completes the TCP handshake and then
+            // never answers — a hung server, or a load balancer accepting into a
+            // blackhole — hangs the caller forever, since the kernel's SYN-retry only
+            // covers failures that never complete the handshake.
             .timeouts(deadpool_postgres::Timeouts {
                 wait: Some(std::time::Duration::from_secs(
                     config.pool_wait_timeout_secs,
                 )),
-                create: Some(std::time::Duration::from_secs(config.connect_timeout_secs)),
-                recycle: Some(std::time::Duration::from_secs(config.connect_timeout_secs)),
+                create: Some(connect_timeout),
+                recycle: Some(connect_timeout),
             })
             .runtime(Runtime::Tokio1)
             .build()
@@ -480,39 +551,23 @@ impl PostgresBackend {
     pub async fn init_schema(&self) -> StorageResult<()> {
         let client = self.get_client().await?;
         super::schema::initialize_schema(&client).await?;
-
-        // Load stored SearchParameters from database
-        let stored_count = self.load_stored_search_parameters().await?;
-        if stored_count > 0 {
-            let registry = self.search_registry.read();
-            tracing::info!(
-                "Loaded {} stored SearchParameters from database (total now: {})",
-                stored_count,
-                registry.len()
-            );
-        }
-
+        // Populate the per-tenant stored-param cache so the registries can build
+        // each tenant's overlay lazily.
+        self.reload_stored_cache().await?;
         Ok(())
     }
 
-    /// Loads SearchParameter resources stored in the database into the registry.
-    async fn load_stored_search_parameters(&self) -> StorageResult<usize> {
-        self.refresh_stored_search_parameters().await
-    }
-
-    /// Rebuilds the registry's `Stored` parameters from what the database
-    /// currently holds, returning how many are registered afterwards.
-    ///
-    /// TTL-cache refresh (#235): rows are fetched and parsed before the
-    /// (sync) write lock is taken, and on any read error the registry is left
-    /// untouched — stale-serve rather than losing search resolution.
-    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+    /// Reloads every tenant's stored active SearchParameters into the sync
+    /// `stored_by_tenant` cache (grouped by tenant), then drops the cached
+    /// per-tenant registries so they rebuild against the fresh overlay.
+    pub(crate) async fn reload_stored_cache(&self) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
         let client = self.get_client().await?;
         let rows = client
             .query(
-                "SELECT data FROM resources WHERE resource_type = 'SearchParameter' AND is_deleted = FALSE",
+                "SELECT tenant_id, data FROM resources \
+                 WHERE resource_type = 'SearchParameter' AND is_deleted = FALSE",
                 &[],
             )
             .await
@@ -525,32 +580,28 @@ impl PostgresBackend {
             })?;
 
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut definitions = Vec::new();
-        for row in rows {
-            let data: serde_json::Value = row.get(0);
-            match loader.parse_resource(&data) {
-                Ok(mut def) => {
-                    if def.status == SearchParameterStatus::Active {
-                        def.source = SearchParameterSource::Stored;
-                        definitions.push(def);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse stored SearchParameter: {}", e);
-                }
-            }
-        }
-
-        let mut registry = self.search_registry.write();
-        registry.unregister_source(SearchParameterSource::Stored);
+        let mut by_tenant: HashMap<String, Vec<SearchParameterDefinition>> = HashMap::new();
         let mut count = 0;
-        for def in definitions {
-            match registry.register(def) {
-                Ok(()) => count += 1,
-                Err(e) => tracing::warn!("Stored SearchParameter not registered: {}", e),
+        for row in rows {
+            let tenant_id: String = row.get(0);
+            let data: serde_json::Value = row.get(1);
+            if let Ok(mut def) = loader.parse_resource(&data) {
+                if def.status == SearchParameterStatus::Active {
+                    def.source = SearchParameterSource::Stored;
+                    by_tenant.entry(tenant_id).or_default().push(def);
+                    count += 1;
+                }
             }
         }
+        *self.stored_by_tenant.write() = by_tenant;
+        self.registries.invalidate_all();
         Ok(count)
+    }
+
+    /// TTL-cache refresh (#235): reload the stored-param cache from storage and
+    /// drop the cached per-tenant registries. Returns the stored-param count.
+    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+        self.reload_stored_cache().await
     }
 
     /// Get a client from the pool.
@@ -575,10 +626,24 @@ impl PostgresBackend {
         })
     }
 
-    /// Get the search parameter registry.
-    #[allow(dead_code)]
-    pub(crate) fn get_search_registry(&self) -> Arc<RwLock<SearchParameterRegistry>> {
-        Arc::clone(&self.search_registry)
+    /// The per-tenant registry container (shared with a co-located ES backend).
+    pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
+        &self.registries
+    }
+
+    /// The shared base registry (embedded + spec + custom), tenant-independent.
+    pub(crate) fn base_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.base()
+    }
+
+    /// The registry for a tenant (base + that tenant's stored overlay).
+    pub(crate) fn tenant_registry(&self, tenant_id: &str) -> Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.for_tenant(tenant_id)
+    }
+
+    /// A value extractor over a tenant's registry.
+    pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
+        SearchParameterExtractor::new(self.tenant_registry(tenant_id))
     }
 
     /// Returns the backend configuration.
@@ -591,16 +656,6 @@ impl PostgresBackend {
     /// `deadpool_postgres::Pool` is `Clone` (Arc-backed), so this is cheap.
     pub(crate) fn pool(&self) -> Pool {
         self.pool.clone()
-    }
-
-    /// Returns a reference to the search parameter registry.
-    pub fn search_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
-        &self.search_registry
-    }
-
-    /// Returns a reference to the search parameter extractor.
-    pub fn search_extractor(&self) -> &Arc<SearchParameterExtractor> {
-        &self.search_extractor
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.
@@ -718,13 +773,16 @@ impl Backend for PostgresBackend {
                 backend_name: "postgres".to_string(),
                 message: "Failed to get connection".to_string(),
             })?;
+        // A failing constant `SELECT 1` means the backend is unreachable/broken,
+        // not a bad query — surface it as a retryable `Unavailable` (503) rather
+        // than an `Internal` (500) so a down backend reads as "try again", and
+        // so the readiness probe classifies it correctly.
         client
             .query_one("SELECT 1", &[])
             .await
-            .map_err(|e| BackendError::Internal {
+            .map_err(|e| BackendError::Unavailable {
                 backend_name: "postgres".to_string(),
                 message: format!("Health check failed: {}", e),
-                source: None,
             })?;
         Ok(())
     }
@@ -768,13 +826,13 @@ impl SearchCapabilityProvider for PostgresBackend {
         resource_type: &str,
     ) -> Option<ResourceSearchCapabilities> {
         let params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params(resource_type)
         };
 
         if params.is_empty() {
             let common_params = {
-                let registry = self.search_registry.read();
+                let registry = self.base_registry().read();
                 registry.get_active_params("Resource")
             };
             if common_params.is_empty() {
@@ -795,7 +853,7 @@ impl SearchCapabilityProvider for PostgresBackend {
         }
 
         let common_params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params("Resource")
         };
         for param in &common_params {

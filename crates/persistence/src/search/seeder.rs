@@ -19,6 +19,7 @@
 //! registration path — the stored-parameter refresh skips them (draft, and
 //! their canonical URLs are already registered).
 
+use std::future::Future;
 use std::path::Path;
 
 use helios_fhir::FhirVersion;
@@ -38,6 +39,101 @@ pub struct SeedOutcome {
     pub existing: usize,
     /// Resources that failed to write and were skipped (logged).
     pub failed: usize,
+}
+
+/// Writes every resource of `resource_type` for `tenant`, fanning creates out
+/// at the backend's [`bulk_write_concurrency`] so latency-bound backends (one
+/// PUT per resource on S3, one round trip per row on networked databases) pay
+/// round-trips-divided-by-fanout rather than their sum. `AlreadyExists` counts
+/// as already-seeded. Any other error is retried twice with a short backoff —
+/// shared-cache SQLite surfaces reader/writer overlap as an immediate `table
+/// is locked` error rather than waiting — before counting as failed.
+///
+/// [`bulk_write_concurrency`]: ResourceStorage::bulk_write_concurrency
+async fn create_all<S>(
+    storage: &S,
+    tenant: &TenantContext,
+    resource_type: &'static str,
+    resources: Vec<Value>,
+    fhir_version: FhirVersion,
+) -> SeedOutcome
+where
+    S: ResourceStorage + ?Sized,
+{
+    let concurrency = storage.bulk_write_concurrency().clamp(1, 32);
+    write_all(
+        concurrency,
+        resource_type,
+        resources,
+        |resource| async move {
+            storage
+                .create(tenant, resource_type, resource, fhir_version)
+                .await
+                .map(|_| ())
+        },
+    )
+    .await
+}
+
+/// The fanout/retry core of [`create_all`], parameterized over the write so it
+/// can be exercised without a storage backend.
+async fn write_all<F, Fut>(
+    concurrency: usize,
+    resource_type: &'static str,
+    resources: Vec<Value>,
+    create: F,
+) -> SeedOutcome
+where
+    F: Fn(Value) -> Fut,
+    Fut: Future<Output = StorageResult<()>>,
+{
+    use futures::stream::{self, StreamExt};
+
+    enum Wrote {
+        Created,
+        Existing,
+        Failed,
+    }
+
+    let create = &create;
+    stream::iter(resources)
+        .map(|resource| async move {
+            let mut attempt: u32 = 0;
+            loop {
+                match create(resource.clone()).await {
+                    Ok(()) => return Wrote::Created,
+                    Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {
+                        return Wrote::Existing;
+                    }
+                    Err(_) if attempt < 2 => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(25 * attempt as u64))
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("{resource_type} seeding: create failed: {e}");
+                        return Wrote::Failed;
+                    }
+                }
+            }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .fold(
+            SeedOutcome {
+                created: 0,
+                existing: 0,
+                failed: 0,
+            },
+            |mut outcome, wrote| async move {
+                match wrote {
+                    Wrote::Created => outcome.created += 1,
+                    Wrote::Existing => outcome.existing += 1,
+                    Wrote::Failed => outcome.failed += 1,
+                }
+                outcome
+            },
+        )
+        .await
 }
 
 /// Seeds `storage` with the spec SearchParameter bundle for `fhir_version`,
@@ -112,26 +208,7 @@ where
         });
     }
 
-    let mut outcome = SeedOutcome {
-        created: 0,
-        existing: 0,
-        failed: 0,
-    };
-    for resource in resources {
-        match storage
-            .create(&tenant, "SearchParameter", resource, fhir_version)
-            .await
-        {
-            Ok(_) => outcome.created += 1,
-            Err(StorageError::Resource(ResourceError::AlreadyExists { .. })) => {
-                outcome.existing += 1;
-            }
-            Err(e) => {
-                outcome.failed += 1;
-                tracing::warn!("SearchParameter seeding: create failed: {e}");
-            }
-        }
-    }
+    let outcome = create_all(storage, &tenant, "SearchParameter", resources, fhir_version).await;
     tracing::info!(
         created = outcome.created,
         existing = outcome.existing,
@@ -140,4 +217,206 @@ where
         "Seeded spec SearchParameters into storage"
     );
     Ok(outcome)
+}
+
+/// Seeds one tenant with both spec conformance resource sets — SearchParameters
+/// (#235) and CompartmentDefinitions (#237/#238) — from `data_dir`. Best-effort
+/// per set: an error in one is logged and does not block the other. Returns the
+/// combined outcome. Idempotent; safe to call at startup and on tenant
+/// provisioning.
+pub async fn seed_tenant_conformance<S>(
+    storage: &S,
+    fhir_version: FhirVersion,
+    data_dir: &Path,
+    tenant_id: &str,
+) -> SeedOutcome
+where
+    S: ResourceStorage + ?Sized,
+{
+    let mut total = SeedOutcome {
+        created: 0,
+        existing: 0,
+        failed: 0,
+    };
+    let mut add = |r: StorageResult<SeedOutcome>, kind: &str| match r {
+        Ok(o) => {
+            total.created += o.created;
+            total.existing += o.existing;
+            total.failed += o.failed;
+        }
+        Err(e) => tracing::warn!(tenant = %tenant_id, "{kind} seeding failed: {e}"),
+    };
+    add(
+        seed_spec_search_parameters(storage, fhir_version, data_dir, tenant_id).await,
+        "SearchParameter",
+    );
+    add(
+        seed_spec_compartment_definitions(storage, fhir_version, data_dir, tenant_id).await,
+        "CompartmentDefinition",
+    );
+    total
+}
+
+/// Seeds `storage` with the spec CompartmentDefinition bundle for
+/// `fhir_version`, under `tenant_id`.
+///
+/// The compartment analogue of [`seed_spec_search_parameters`]: storage — not
+/// the codegen'd membership table — is what `GET /CompartmentDefinition` and
+/// the web UI read. Compartment *search* membership is unaffected (it still
+/// resolves through `helios_fhir::get_compartment_params`); these stored copies
+/// exist only for API discovery.
+///
+/// Same idempotency contract: every definition carries its bundle id
+/// (`patient`, `encounter`, …), so a concurrent second writer's `create` fails
+/// `AlreadyExists` and is treated as already-seeded; existing resources are
+/// never clobbered. When the tenant already holds at least the bundle's count,
+/// the pass short-circuits to a single `count`.
+pub async fn seed_spec_compartment_definitions<S>(
+    storage: &S,
+    fhir_version: FhirVersion,
+    data_dir: &Path,
+    tenant_id: &str,
+) -> StorageResult<SeedOutcome>
+where
+    S: ResourceStorage + ?Sized,
+{
+    let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
+    let loader = helios_fhir::compartment::CompartmentDefinitionLoader::new(fhir_version);
+
+    let resources: Vec<Value> = match loader.load_spec_resources(data_dir) {
+        Ok(resources) => resources,
+        Err(e) => {
+            // No bundle is a supported minimal deployment; nothing to seed.
+            tracing::warn!("CompartmentDefinition seeding: no spec bundle loaded: {e}");
+            Vec::new()
+        }
+    };
+    if resources.is_empty() {
+        return Ok(SeedOutcome {
+            created: 0,
+            existing: 0,
+            failed: 0,
+        });
+    }
+
+    let present = storage
+        .count(&tenant, Some("CompartmentDefinition"))
+        .await?;
+    if present as usize >= resources.len() {
+        return Ok(SeedOutcome {
+            created: 0,
+            existing: resources.len(),
+            failed: 0,
+        });
+    }
+
+    let outcome = create_all(
+        storage,
+        &tenant,
+        "CompartmentDefinition",
+        resources,
+        fhir_version,
+    )
+    .await;
+    tracing::info!(
+        created = outcome.created,
+        existing = outcome.existing,
+        failed = outcome.failed,
+        tenant = %tenant_id,
+        "Seeded spec CompartmentDefinitions into storage"
+    );
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::error::BackendError;
+
+    fn resources(n: usize) -> Vec<Value> {
+        (0..n).map(|i| json!({ "id": format!("r{i}") })).collect()
+    }
+
+    fn transient() -> StorageError {
+        StorageError::Backend(BackendError::Internal {
+            backend_name: "test".to_string(),
+            message: "table is locked".to_string(),
+            source: None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn counts_created_and_existing() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(4, "SearchParameter", resources(5), |resource| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let dup = resource["id"] == json!("r0");
+            async move {
+                let _ = n;
+                if dup {
+                    Err(StorageError::Resource(ResourceError::AlreadyExists {
+                        resource_type: "SearchParameter".to_string(),
+                        id: "r0".to_string(),
+                    }))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(outcome.created, 4);
+        assert_eq!(outcome.existing, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "AlreadyExists is not retried"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_failures_are_retried_then_succeed() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(1, "SearchParameter", resources(1), |_| {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(transient())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(outcome.created, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_failures_count_after_three_attempts() {
+        let calls = AtomicUsize::new(0);
+        let outcome = write_all(2, "CompartmentDefinition", resources(2), |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err(transient()) }
+        })
+        .await;
+        assert_eq!(outcome.created, 0);
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "initial try + two retries each"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_concurrency_is_clamped_not_deadlocked() {
+        let outcome = write_all(0, "SearchParameter", resources(3), |_| async { Ok(()) }).await;
+        assert_eq!(outcome.created, 3);
+    }
 }

@@ -25,7 +25,6 @@ use crate::error::{
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::search::{SearchParameterLoader, SearchParameterStatus};
 use crate::tenant::TenantContext;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
@@ -39,11 +38,15 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+/// A SearchParameter mutation staged during a bundle transaction. The variant
+/// records *that* a change occurred; the post-commit step only needs to know a
+/// tenant's SearchParameter overlay changed (to invalidate its cached registry),
+/// so no payload is carried.
 #[derive(Debug, Clone)]
 enum PendingSearchParameterChange {
-    Create(Value),
-    Update { old: Value, new: Value },
-    Delete(Value),
+    Create,
+    Update,
+    Delete,
 }
 
 fn serialization_error(message: String) -> StorageError {
@@ -520,6 +523,16 @@ impl ResourceStorage for MongoBackend {
         "mongodb"
     }
 
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
+    fn bulk_write_concurrency(&self) -> usize {
+        // Bulk seeding is round-trip bound; the driver pool absorbs parallel
+        // writers.
+        8
+    }
+
     fn is_cluster_shared(&self) -> bool {
         true
     }
@@ -668,8 +681,16 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
             .await?;
 
-        if resource_type == "SearchParameter" {
-            self.handle_search_parameter_create(&resource)?;
+        // An active SearchParameter write changes a tenant's overlay: refresh
+        // the stored-param cache (which the per-tenant loader reads) and drop
+        // the cached registries. Draft copies (the seeded spec set) never
+        // overlay, so skip them — avoids an O(n²) reload storm during seeding.
+        if resource_type == "SearchParameter"
+            && crate::search::search_parameter_create_affects_overlay(&resource)
+        {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
         }
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
@@ -938,8 +959,12 @@ impl ResourceStorage for MongoBackend {
         self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
             .await?;
 
+        // A SearchParameter update may change a tenant's overlay (status flips,
+        // expression edits): refresh the stored-param cache and drop registries.
         if resource_type == "SearchParameter" {
-            self.handle_search_parameter_update(current.content(), &resource)?;
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
         }
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "update").await?;
@@ -1013,7 +1038,6 @@ impl ResourceStorage for MongoBackend {
             .get_document("data")
             .map_err(|e| internal_error(format!("Missing resource payload: {}", e)))?
             .clone();
-        let resource_value = document_to_value(&payload)?;
         let fhir_version = existing_doc
             .get_str("fhir_version")
             .unwrap_or("4.0")
@@ -1094,8 +1118,12 @@ impl ResourceStorage for MongoBackend {
         self.delete_search_index(&db, tenant_id, resource_type, id, &mut session)
             .await?;
 
+        // A SearchParameter delete may remove a tenant's overlay entry: refresh
+        // the stored-param cache and drop registries.
         if resource_type == "SearchParameter" {
-            self.handle_search_parameter_delete(&resource_value)?;
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
         }
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "delete").await?;
@@ -1583,7 +1611,10 @@ impl MongoBackend {
         self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
             .await?;
 
-        let mut index_docs = match self.search_extractor().extract(resource, resource_type) {
+        let mut index_docs = match self
+            .tenant_extractor(tenant_id)
+            .extract(resource, resource_type)
+        {
             Ok(values) => values
                 .iter()
                 .filter_map(|value| {
@@ -1610,7 +1641,7 @@ impl MongoBackend {
         // share the container's (resource_type, resource_id) — so the earlier
         // delete-by-(type,id) cleans them too — but are flagged `is_contained`
         // and carry the contained resource's type and local id.
-        for contained in self.search_extractor().extract_contained(resource) {
+        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
             for value in &contained.values {
                 if let Some(d) = self.build_contained_index_document(
                     tenant_id,
@@ -1840,83 +1871,6 @@ impl MongoBackend {
         }
 
         docs
-    }
-
-    fn handle_search_parameter_create(&self, resource: &Value) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(self.config().fhir_version);
-
-        match loader.parse_resource(resource) {
-            Ok(def) => {
-                if def.status == SearchParameterStatus::Active {
-                    let mut registry = self.search_registry().write();
-                    if let Err(e) = registry.register(def) {
-                        tracing::debug!("SearchParameter registration skipped: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse SearchParameter for registry update: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_search_parameter_update(
-        &self,
-        old_resource: &Value,
-        new_resource: &Value,
-    ) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(self.config().fhir_version);
-
-        let old_def = loader.parse_resource(old_resource).ok();
-        let new_def = loader.parse_resource(new_resource).ok();
-
-        match (old_def, new_def) {
-            (Some(old), Some(new)) => {
-                let mut registry = self.search_registry().write();
-
-                if old.url != new.url {
-                    let _ = registry.unregister(&old.url);
-                    if new.status == SearchParameterStatus::Active {
-                        let _ = registry.register(new);
-                    }
-                } else if old.status != new.status {
-                    if let Err(e) = registry.update_status(&new.url, new.status) {
-                        tracing::debug!("SearchParameter status update skipped: {}", e);
-                    }
-                } else {
-                    let _ = registry.unregister(&old.url);
-                    if new.status == SearchParameterStatus::Active {
-                        let _ = registry.register(new);
-                    }
-                }
-            }
-            (None, Some(new)) => {
-                if new.status == SearchParameterStatus::Active {
-                    let mut registry = self.search_registry().write();
-                    let _ = registry.register(new);
-                }
-            }
-            (Some(old), None) => {
-                let mut registry = self.search_registry().write();
-                let _ = registry.unregister(&old.url);
-            }
-            (None, None) => {}
-        }
-
-        Ok(())
-    }
-
-    fn handle_search_parameter_delete(&self, resource: &Value) -> StorageResult<()> {
-        if let Some(url) = resource.get("url").and_then(|v| v.as_str()) {
-            let mut registry = self.search_registry().write();
-            if let Err(e) = registry.unregister(url) {
-                tracing::debug!("SearchParameter unregistration skipped: {}", e);
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -2428,24 +2382,12 @@ impl BundleProvider for MongoBackend {
                 reason: format!("Commit failed: {}", e),
             })?;
 
-        for change in pending_search_parameter_changes {
-            let result = match change {
-                PendingSearchParameterChange::Create(resource) => {
-                    self.handle_search_parameter_create(&resource)
-                }
-                PendingSearchParameterChange::Update { old, new } => {
-                    self.handle_search_parameter_update(&old, &new)
-                }
-                PendingSearchParameterChange::Delete(resource) => {
-                    self.handle_search_parameter_delete(&resource)
-                }
-            };
-
-            if let Err(e) = result {
-                tracing::warn!(
-                    "Transaction committed but failed to apply SearchParameter registry update: {}",
-                    e
-                );
+        // Any SearchParameter change in this transaction alters a tenant's
+        // overlay — refresh the stored-param cache and drop the cached
+        // registries so the next access reflects the committed writes.
+        if !pending_search_parameter_changes.is_empty() {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
 
@@ -2784,8 +2726,7 @@ impl MongoBackend {
         .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes
-                .push(PendingSearchParameterChange::Create(resource.clone()));
+            pending_search_parameter_changes.push(PendingSearchParameterChange::Create);
         }
 
         Ok(StoredResource::from_storage(
@@ -2933,10 +2874,7 @@ impl MongoBackend {
         .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes.push(PendingSearchParameterChange::Update {
-                old: current.content().clone(),
-                new: resource.clone(),
-            });
+            pending_search_parameter_changes.push(PendingSearchParameterChange::Update);
         }
 
         Ok(StoredResource::from_storage(
@@ -3007,7 +2945,6 @@ impl MongoBackend {
                 ))
             })?
             .clone();
-        let resource_value = document_to_value(&payload)?;
         let fhir_version = existing_doc
             .get_str("fhir_version")
             .unwrap_or("4.0")
@@ -3077,8 +3014,7 @@ impl MongoBackend {
             .await?;
 
         if resource_type == "SearchParameter" {
-            pending_search_parameter_changes
-                .push(PendingSearchParameterChange::Delete(resource_value));
+            pending_search_parameter_changes.push(PendingSearchParameterChange::Delete);
         }
 
         Ok(())
@@ -3237,7 +3173,10 @@ impl MongoBackend {
         )
         .await?;
 
-        let index_docs = match self.search_extractor().extract(resource, resource_type) {
+        let index_docs = match self
+            .tenant_extractor(tenant_id)
+            .extract(resource, resource_type)
+        {
             Ok(values) => values
                 .iter()
                 .filter_map(|value| {
@@ -3697,7 +3636,7 @@ impl ReindexTarget for MongoBackend {
         .await?;
 
         let values = self
-            .search_extractor()
+            .tenant_extractor(tenant.tenant_id().as_str())
             .extract(resource.content(), resource.resource_type())
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
 

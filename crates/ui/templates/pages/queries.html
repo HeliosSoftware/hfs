@@ -2,70 +2,63 @@
 
 {% block title %}{{ i18n.t("queries-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
 
+{% block content_class %} content--wide{% endblock %}
+
 {% block content %}
 <section class="page-head">
   <h1 class="page-head__title">{{ i18n.t("queries-heading") }}</h1>
   <p class="page-head__lede">{{ i18n.t("queries-lede") }}</p>
 </section>
 
-<!--
-  Search Builder (hi-fi console design): a featured, editable GET URL is the
-  primary control — Run opens the search and records it under Recent; naming
-  it saves it to the per-user document. The Recent dropdown is a <details>
-  disclosure (same primitive as the tenant selector) so it opens without
-  JavaScript; its list, like everything else on the page, hydrates from
-  /_user/settings.
--->
-<section class="card query-form-card">
-  <h2 class="query-group__type">{{ i18n.t("queries-builder-heading") }}</h2>
-  <form id="saved-query-form" class="query-builder" autocomplete="off">
-    <div class="query-builder__row">
-      <input class="query-builder__url" name="url" required spellcheck="false"
-             placeholder="{{ i18n.t("queries-url-placeholder") }}"
-             aria-label="{{ i18n.t("queries-url-label") }}">
-      <details class="menu query-recent">
-        <summary class="btn query-recent__toggle">
-          <span class="icon">{% include "icons/history.svg" %}</span>
-          {{ i18n.t("queries-recent") }}
-        </summary>
-        <div class="menu__panel menu__panel--right">
-          <div class="menu__heading">{{ i18n.t("queries-recent-heading") }}</div>
-          <div id="recent-searches"
-               data-msg-empty="{{ i18n.t("queries-recent-empty") }}"
-               data-msg-delete="{{ i18n.t("queries-delete") }}"></div>
-        </div>
-      </details>
-      <button class="btn btn--primary" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
+<div class="queries-layout">
+  <!--
+    Resource picker rail (hi-fi Search screen): the version's resource types
+    from the spec, with live counts hydrated client-side via the standard
+    _summary=count search. Picking a type re-keys the builder.
+  -->
+  <aside class="card filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}">
+    <div class="filter-rail__search">
+      <span class="icon">{% include "icons/search.svg" %}</span>
+      <input type="search" id="type-rail-filter"
+             placeholder="{{ i18n.t("queries-rail-filter") }}"
+             aria-label="{{ i18n.t("queries-rail-filter") }}">
     </div>
-    <div class="query-builder__save">
-      <label class="query-form__field query-builder__name">
-        <span>{{ i18n.t("queries-name-label") }}</span>
-        <input name="name" placeholder="{{ i18n.t("queries-name-placeholder") }}">
-      </label>
-      <button class="btn" type="submit" data-intent="save">{{ i18n.t("action-save") }}</button>
-      <p class="query-builder__hint">{{ i18n.t("queries-builder-hint") }}</p>
+    <div class="filter-rail__heading">{{ i18n.t("queries-rail-heading") }}</div>
+    <div class="filter-rail__list" id="type-rail-list">
+      {% for t in resource_types %}
+      <button type="button" class="filter-rail__item" data-rail-type="{{ t }}">
+        <span>{{ t }}</span>
+        <span class="count" data-count-for="{{ t }}"></span>
+      </button>
+      {% endfor %}
     </div>
-  </form>
-</section>
+  </aside>
 
-<!--
-  The saved-query list is rendered client-side from /_user/settings — the
-  document is per-user state the browser already has credentials for, exactly
-  like the theme (see saved-queries.js for the ETag/If-Match cycle). The
-  data-msg-* attributes carry the negotiated-locale strings into the script,
-  which never embeds prose of its own.
--->
-<div id="saved-queries"
-     data-msg-empty="{{ i18n.t("queries-empty") }}"
-     data-msg-never-run="{{ i18n.t("queries-never-run") }}"
-     data-msg-run="{{ i18n.t("queries-run") }}"
-     data-msg-rename="{{ i18n.t("queries-rename") }}"
-     data-msg-delete="{{ i18n.t("queries-delete") }}"
-     data-msg-rename-prompt="{{ i18n.t("queries-rename-prompt") }}"
-     data-msg-confirm-delete="{{ i18n.t_arg("queries-confirm-delete", "name", "{name}".to_string()) }}"
-     data-msg-invalid-url="{{ i18n.t("queries-invalid-url") }}"
-     data-msg-unavailable="{{ i18n.t("queries-unavailable") }}"
-     data-msg-error="{{ i18n.t("error-generic") }}">
+  <div class="queries-main">
+    <!--
+      Search Builder (hi-fi console design): a featured, editable GET URL is
+      the primary control — Run opens the search and records it under Recent;
+      naming it saves it to the per-user document. The Recent dropdown is a
+      <details> disclosure (same primitive as the tenant selector) so it opens
+      without JavaScript; its list, like everything else on the page, hydrates
+      from /_user/settings.
+    -->
+    <section class="card query-form-card">
+      <h2 class="query-group__type">{{ i18n.t("queries-builder-heading") }}</h2>
+      {% include "partials/search-builder.html" %}
+    </section>
+
+    {% include "partials/search-results.html" %}
+
+    <!--
+      The saved-query list is rendered client-side from /_user/settings — the
+      document is per-user state the browser already has credentials for,
+      exactly like the theme (see saved-queries.js for the ETag/If-Match
+      cycle).
+    -->
+    <div id="saved-queries"></div>
+    {% include "partials/search-messages.html" %}
+  </div>
 </div>
 
 <script src="/ui/assets/saved-queries.js" defer></script>

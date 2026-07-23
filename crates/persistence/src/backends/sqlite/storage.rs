@@ -20,8 +20,6 @@ use crate::core::{
 use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::search::extractor::ExtractedValue;
-use crate::search::loader::SearchParameterLoader;
-use crate::search::registry::SearchParameterStatus;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::TenantContext;
 use crate::types::Pagination;
@@ -63,6 +61,10 @@ fn extract_part_value(part: &Value) -> Option<Value> {
 impl ResourceStorage for SqliteBackend {
     fn backend_name(&self) -> &'static str {
         "sqlite"
+    }
+
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
     }
 
     fn is_cluster_shared(&self) -> bool {
@@ -145,9 +147,14 @@ impl ResourceStorage for SqliteBackend {
         // Index the resource for search
         self.index_resource(&conn, tenant_id, resource_type, &id, &resource)?;
 
-        // Handle SearchParameter resources specially - update registry
-        if resource_type == "SearchParameter" {
-            self.handle_search_parameter_create(&resource)?;
+        // An *active* SearchParameter write changes this tenant's overlay — drop
+        // its cached registry so the next access rebuilds from storage. Draft
+        // copies (e.g. the seeded spec set) never overlay, so skip them and
+        // avoid an O(n²) rebuild storm during bulk seeding.
+        if resource_type == "SearchParameter"
+            && crate::search::search_parameter_create_affects_overlay(&resource)
+        {
+            self.tenant_registries().invalidate(tenant_id);
         }
 
         // Return the stored resource with updated metadata
@@ -365,9 +372,9 @@ impl ResourceStorage for SqliteBackend {
         self.delete_search_index(&conn, tenant_id, resource_type, id)?;
         self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
 
-        // Handle SearchParameter resources specially - update registry
+        // A SearchParameter write invalidates this tenant's cached registry.
         if resource_type == "SearchParameter" {
-            self.handle_search_parameter_update(current.content(), &resource)?;
+            self.tenant_registries().invalidate(tenant_id);
         }
 
         Ok(StoredResource::from_storage(
@@ -445,11 +452,9 @@ impl ResourceStorage for SqliteBackend {
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
         }
 
-        // Handle SearchParameter resources specially - update registry
+        // A SearchParameter delete invalidates this tenant's cached registry.
         if resource_type == "SearchParameter" {
-            if let Ok(resource_json) = serde_json::from_slice::<Value>(&data) {
-                self.handle_search_parameter_delete(&resource_json)?;
-            }
+            self.tenant_registries().invalidate(tenant_id);
         }
 
         Ok(())
@@ -984,9 +989,9 @@ impl SqliteBackend {
         resource_id: &str,
         resource: &Value,
     ) -> StorageResult<usize> {
-        // Extract values using the registry-driven extractor
+        // Extract values using the tenant's registry-driven extractor
         let values = self
-            .search_extractor()
+            .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 
@@ -1065,7 +1070,7 @@ impl SqliteBackend {
     ) -> StorageResult<usize> {
         let mut count = 0;
         let container = (container_type, container_id);
-        for contained in self.search_extractor().extract_contained(resource) {
+        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
             for value in &contained.values {
                 self.write_contained_index_entry(
                     conn,
@@ -1299,111 +1304,6 @@ impl SqliteBackend {
             params![tenant_id, resource_type, resource_id, param_name, normalized],
         )
         .map_err(|e| internal_error(format!("Failed to insert date index: {}", e)))?;
-        Ok(())
-    }
-}
-
-// SearchParameter Resource Handling
-impl SqliteBackend {
-    /// Handle creation of a SearchParameter resource.
-    ///
-    /// If the SearchParameter has status=active, it will be registered in the
-    /// search parameter registry, making it available for searches on new resources.
-    /// Existing resources will NOT be indexed for this parameter until $reindex is run.
-    fn handle_search_parameter_create(&self, resource: &Value) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
-
-        match loader.parse_resource(resource) {
-            Ok(def) => {
-                // Only register if status is active
-                if def.status == SearchParameterStatus::Active {
-                    let mut registry = self.search_registry().write();
-                    // Ignore duplicate URL errors - the param may already be embedded
-                    if let Err(e) = registry.register(def) {
-                        tracing::debug!("SearchParameter registration skipped: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                // Log but don't fail - the resource is still stored
-                tracing::warn!("Failed to parse SearchParameter for registry: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle update of a SearchParameter resource.
-    ///
-    /// Updates the registry based on status changes:
-    /// - active -> retired: Parameter disabled for searches
-    /// - retired -> active: Parameter re-enabled for searches
-    /// - Any other change: Updates the registry entry
-    fn handle_search_parameter_update(
-        &self,
-        old_resource: &Value,
-        new_resource: &Value,
-    ) -> StorageResult<()> {
-        let loader = SearchParameterLoader::new(FhirVersion::default_enabled());
-
-        let old_def = loader.parse_resource(old_resource).ok();
-        let new_def = loader.parse_resource(new_resource).ok();
-
-        match (old_def, new_def) {
-            (Some(old), Some(new)) => {
-                let mut registry = self.search_registry().write();
-
-                // If URL changed, unregister old and register new
-                if old.url != new.url {
-                    let _ = registry.unregister(&old.url);
-                    if new.status == SearchParameterStatus::Active {
-                        let _ = registry.register(new);
-                    }
-                } else if old.status != new.status {
-                    // Status change - update in registry
-                    if let Err(e) = registry.update_status(&new.url, new.status) {
-                        tracing::debug!("SearchParameter status update skipped: {}", e);
-                    }
-                } else {
-                    // Other changes - re-register (unregister then register)
-                    let _ = registry.unregister(&old.url);
-                    if new.status == SearchParameterStatus::Active {
-                        let _ = registry.register(new);
-                    }
-                }
-            }
-            (None, Some(new)) => {
-                // Old wasn't valid, try to register new
-                if new.status == SearchParameterStatus::Active {
-                    let mut registry = self.search_registry().write();
-                    let _ = registry.register(new);
-                }
-            }
-            (Some(old), None) => {
-                // New isn't valid, unregister old
-                let mut registry = self.search_registry().write();
-                let _ = registry.unregister(&old.url);
-            }
-            (None, None) => {
-                // Neither valid - nothing to do
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle deletion of a SearchParameter resource.
-    ///
-    /// Removes the parameter from the registry. Search index entries for this
-    /// parameter are NOT automatically cleaned up (use $reindex for that).
-    fn handle_search_parameter_delete(&self, resource: &Value) -> StorageResult<()> {
-        if let Some(url) = resource.get("url").and_then(|v| v.as_str()) {
-            let mut registry = self.search_registry().write();
-            if let Err(e) = registry.unregister(url) {
-                tracing::debug!("SearchParameter unregistration skipped: {}", e);
-            }
-        }
-
         Ok(())
     }
 }
@@ -2696,7 +2596,7 @@ impl SqliteBackend {
         }
 
         // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(resource_type, &parsed_params)?;
+        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
 
         // Build a SearchQuery
         let query = SearchQuery {
@@ -2719,10 +2619,12 @@ impl SqliteBackend {
     /// for common parameters when not found.
     fn build_search_parameters(
         &self,
+        tenant: &TenantContext,
         resource_type: &str,
         params: &[(String, String)],
     ) -> StorageResult<Vec<SearchParameter>> {
-        let registry = self.search_registry().read();
+        let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
+        let registry = registry_arc.read();
         let mut search_params = Vec::with_capacity(params.len());
 
         for (name, value) in params {
@@ -3532,9 +3434,9 @@ impl ReindexTarget for SqliteBackend {
         let resource_id = resource.id();
         let content = resource.content();
 
-        // Use the dynamic extraction
+        // Use the dynamic extraction over the tenant's registry
         let values = self
-            .search_extractor()
+            .tenant_extractor(tenant.tenant_id().as_str())
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
 

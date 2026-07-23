@@ -137,6 +137,14 @@ impl SettingsStore for SqliteBackend {
             )
         })
     }
+
+    async fn delete_settings(&self, user_key: &str) -> StorageResult<bool> {
+        let conn = self.get_connection()?;
+        let removed = conn
+            .execute("DELETE FROM user_settings WHERE user_key = ?1", [user_key])
+            .map_err(|e| backend_err(format!("delete user_settings: {e}")))?;
+        Ok(removed > 0)
+    }
 }
 
 /// Builds an `OptimisticLockFailure` for a `user_settings` write whose
@@ -261,6 +269,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.version, 2);
+    }
+
+    /// `delete_settings` removes the row and reports whether one existed — the
+    /// primitive the #270 legacy-key migration uses to move a document rather
+    /// than leave a duplicate copy behind.
+    #[tokio::test]
+    async fn delete_settings_is_idempotent() {
+        let backend = backend();
+
+        // Absent is not an error, and reports "nothing removed".
+        assert!(!backend.delete_settings("u1").await.unwrap());
+
+        backend
+            .put_settings("u1", json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        assert!(backend.get_settings("u1").await.unwrap().is_some());
+
+        assert!(backend.delete_settings("u1").await.unwrap());
+        assert!(backend.get_settings("u1").await.unwrap().is_none());
+        assert!(!backend.delete_settings("u1").await.unwrap());
+    }
+
+    /// Deleting one user's document must not touch another's.
+    #[tokio::test]
+    async fn delete_settings_is_scoped_to_one_user() {
+        let backend = backend();
+        backend
+            .put_settings("u1", json!({"a": 1}), None)
+            .await
+            .unwrap();
+        backend
+            .put_settings("u2", json!({"b": 2}), None)
+            .await
+            .unwrap();
+
+        assert!(backend.delete_settings("u1").await.unwrap());
+        assert!(backend.get_settings("u1").await.unwrap().is_none());
+        assert_eq!(
+            backend.get_settings("u2").await.unwrap().unwrap().document,
+            json!({"b": 2})
+        );
     }
 
     #[tokio::test]

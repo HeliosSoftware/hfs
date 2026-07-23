@@ -15,9 +15,58 @@ use helios_fhir::FhirVersion;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageResult};
-use crate::search::{SearchParameterExtractor, SearchParameterLoader, SearchParameterRegistry};
+use crate::search::{
+    SearchParameterDefinition, SearchParameterExtractor, SearchParameterLoader,
+    SearchParameterRegistry, TenantSearchRegistries,
+};
 
 use super::schema;
+
+/// Reads a tenant's stored (POSTed) active SearchParameter definitions from the
+/// database. Used as the [`TenantSearchRegistries`] loader closure — it captures
+/// only the pool + FHIR version, never the backend, so an Elasticsearch backend
+/// sharing the container resolves per-tenant params through this same query.
+fn load_tenant_stored_params(
+    pool: &Pool<SqliteConnectionManager>,
+    fhir_version: FhirVersion,
+    tenant_id: &str,
+) -> Vec<SearchParameterDefinition> {
+    use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
+
+    let Ok(conn) = pool.get() else {
+        tracing::warn!("SearchParameter loader: could not get connection");
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT data FROM resources WHERE resource_type = 'SearchParameter' \
+         AND tenant_id = ?1 AND is_deleted = 0",
+    ) else {
+        tracing::warn!("SearchParameter loader: prepare failed");
+        return Vec::new();
+    };
+    let rows = match stmt.query_map([tenant_id], |row| row.get::<_, Vec<u8>>(0)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("SearchParameter loader: query failed: {e}");
+            return Vec::new();
+        }
+    };
+    let loader = SearchParameterLoader::new(fhir_version);
+    let mut defs = Vec::new();
+    for row in rows {
+        let Ok(data) = row else { continue };
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if let Ok(mut def) = loader.parse_resource(&json) {
+            if def.status == SearchParameterStatus::Active {
+                def.source = SearchParameterSource::Stored;
+                defs.push(def);
+            }
+        }
+    }
+    defs
+}
 
 /// Counter for generating unique in-memory database names.
 static MEMORY_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -27,10 +76,9 @@ pub struct SqliteBackend {
     pool: Pool<SqliteConnectionManager>,
     config: SqliteBackendConfig,
     is_memory: bool,
-    /// Search parameter registry (in-memory cache of active parameters).
-    search_registry: Arc<RwLock<SearchParameterRegistry>>,
-    /// Extractor for deriving searchable values from resources.
-    search_extractor: Arc<SearchParameterExtractor>,
+    /// Per-tenant search parameter registries: a shared base (embedded + spec +
+    /// custom) plus each tenant's stored (POSTed) overlay, built lazily.
+    registries: Arc<TenantSearchRegistries>,
 }
 
 impl Debug for SqliteBackend {
@@ -38,7 +86,7 @@ impl Debug for SqliteBackend {
         f.debug_struct("SqliteBackend")
             .field("config", &self.config)
             .field("is_memory", &self.is_memory)
-            .field("search_registry_len", &self.search_registry.read().len())
+            .field("base_registry_len", &self.registries.base().read().len())
             .finish_non_exhaustive()
     }
 }
@@ -201,11 +249,19 @@ impl SqliteBackend {
                 })
             })?;
 
-        // Initialize the search parameter registry
-        let search_registry = Arc::new(RwLock::new(SearchParameterRegistry::new()));
+        // Initialize the per-tenant search parameter registries. The loader
+        // reads a tenant's stored params from this pool; base params (embedded +
+        // spec + custom) are registered into the shared base below.
+        let loader_pool = pool.clone();
+        let loader_version = config.fhir_version;
+        let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
+            move |tenant_id: &str| {
+                load_tenant_stored_params(&loader_pool, loader_version, tenant_id)
+            },
+        )));
         {
             let loader = SearchParameterLoader::new(config.fhir_version);
-            let mut registry = search_registry.write();
+            let mut registry = registries.base().write();
 
             // Track counts and sources for summary
             let mut fallback_count = 0;
@@ -295,14 +351,12 @@ impl SqliteBackend {
                 resource_type_count
             );
         }
-        let search_extractor = Arc::new(SearchParameterExtractor::new(search_registry.clone()));
 
         let backend = Self {
             pool,
             config,
             is_memory,
-            search_registry,
-            search_extractor,
+            registries,
         };
 
         // Configure the connection
@@ -318,107 +372,21 @@ impl SqliteBackend {
     pub fn init_schema(&self) -> StorageResult<()> {
         let conn = self.get_connection()?;
         schema::initialize_schema(&conn)?;
-
-        // Load stored (POSTed) SearchParameters from database
-        let stored_count = self.load_stored_search_parameters()?;
-        if stored_count > 0 {
-            let registry = self.search_registry.read();
-            tracing::info!(
-                "Loaded {} stored SearchParameters from database (total now: {})",
-                stored_count,
-                registry.len()
-            );
-        }
-
+        // Per-tenant registries build lazily on first access (each tenant's
+        // stored params are read from storage then), so nothing to eagerly load.
         Ok(())
     }
 
-    /// Loads SearchParameter resources stored in the database into the registry.
+    /// Drops every cached per-tenant registry so each tenant's stored-param
+    /// overlay is re-read from storage on next access.
     ///
-    /// This is called during schema initialization to restore any custom
-    /// SearchParameters that were POSTed to the server.
-    fn load_stored_search_parameters(&self) -> StorageResult<usize> {
-        self.refresh_stored_search_parameters()
-    }
-
-    /// Rebuilds the registry's `Stored` parameters from what the database
-    /// currently holds, returning how many are registered afterwards.
-    ///
-    /// This is the TTL-cache refresh (#235): storage is the source of truth,
-    /// so a SearchParameter POSTed to a cluster-mate appears here on the next
-    /// pass. All rows are read and parsed **before** the write lock is taken
-    /// (the lock is sync and shared with request paths), and on any read
-    /// error the registry is left untouched — a node serves its stale cache
-    /// rather than losing search resolution.
+    /// This is the TTL-cache refresh (#235): storage is the source of truth, so
+    /// a SearchParameter POSTed to a cluster-mate becomes visible on the next
+    /// pass. Returns the number of cached tenant registries that were dropped.
     pub fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
-        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
-
-        let conn = self.get_connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT data FROM resources WHERE resource_type = 'SearchParameter' AND is_deleted = 0",
-            )
-            .map_err(|e| {
-                crate::error::StorageError::Backend(BackendError::Internal {
-                    backend_name: "sqlite".to_string(),
-                    message: format!("Failed to prepare SearchParameter query: {}", e),
-                    source: None,
-                })
-            })?;
-
-        let rows = stmt
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(|e| {
-                crate::error::StorageError::Backend(BackendError::Internal {
-                    backend_name: "sqlite".to_string(),
-                    message: format!("Failed to query SearchParameters: {}", e),
-                    source: None,
-                })
-            })?;
-
-        let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut definitions = Vec::new();
-        for row in rows {
-            let data = match row {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!("Failed to read SearchParameter row: {}", e);
-                    continue;
-                }
-            };
-            let json: serde_json::Value = match serde_json::from_slice(&data) {
-                Ok(json) => json,
-                Err(e) => {
-                    tracing::warn!("Failed to parse SearchParameter JSON: {}", e);
-                    continue;
-                }
-            };
-            match loader.parse_resource(&json) {
-                Ok(mut def) => {
-                    // Only register active parameters
-                    if def.status == SearchParameterStatus::Active {
-                        def.source = SearchParameterSource::Stored;
-                        definitions.push(def);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse stored SearchParameter: {}", e);
-                }
-            }
-        }
-
-        // Synchronous rebuild under the existing lock; the Arc identity must
-        // be preserved (extractor/ES/chain builders hold clones).
-        let mut registry = self.search_registry.write();
-        registry.unregister_source(SearchParameterSource::Stored);
-        let mut count = 0;
-        for def in definitions {
-            match registry.register(def) {
-                Ok(()) => count += 1,
-                Err(e) => tracing::warn!("Stored SearchParameter not registered: {}", e),
-            }
-        }
-        Ok(count)
+        let n = self.registries.cached_tenant_count();
+        self.registries.invalidate_all();
+        Ok(n)
     }
 
     /// Returns a clone of the connection pool (cheap — pool is `Arc`-backed internally).
@@ -438,9 +406,25 @@ impl SqliteBackend {
         })
     }
 
-    /// Get the search parameter registry.
-    pub(crate) fn get_search_registry(&self) -> Arc<RwLock<SearchParameterRegistry>> {
-        Arc::clone(&self.search_registry)
+    /// The per-tenant registry container (shared with a co-located ES backend).
+    pub fn tenant_registries(&self) -> &Arc<TenantSearchRegistries> {
+        &self.registries
+    }
+
+    /// The shared base registry (embedded + spec + custom), tenant-independent.
+    pub(crate) fn base_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.base()
+    }
+
+    /// The registry for a tenant (base + that tenant's stored overlay).
+    pub(crate) fn tenant_registry(&self, tenant_id: &str) -> Arc<RwLock<SearchParameterRegistry>> {
+        self.registries.for_tenant(tenant_id)
+    }
+
+    /// A value extractor over a tenant's registry, for indexing that tenant's
+    /// resources.
+    pub(crate) fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
+        SearchParameterExtractor::new(self.tenant_registry(tenant_id))
     }
 
     /// Configure connection settings.
@@ -491,16 +475,6 @@ impl SqliteBackend {
     /// Returns the backend configuration.
     pub fn config(&self) -> &SqliteBackendConfig {
         &self.config
-    }
-
-    /// Returns a reference to the search parameter registry.
-    pub fn search_registry(&self) -> &Arc<RwLock<SearchParameterRegistry>> {
-        &self.search_registry
-    }
-
-    /// Returns a reference to the search parameter extractor.
-    pub fn search_extractor(&self) -> &Arc<SearchParameterExtractor> {
-        &self.search_extractor
     }
 
     /// Returns whether search indexing is offloaded to a secondary backend.
@@ -609,11 +583,14 @@ impl Backend for SqliteBackend {
                 backend_name: "sqlite".to_string(),
                 message: "Failed to get connection".to_string(),
             })?;
+        // A failing constant `SELECT 1` means the backend is unreachable/broken,
+        // not a bad query — surface it as a retryable `Unavailable` (503) rather
+        // than an `Internal` (500) so a down backend reads as "try again", and
+        // so the readiness probe classifies it correctly.
         conn.query_row("SELECT 1", [], |_| Ok(()))
-            .map_err(|e| BackendError::Internal {
+            .map_err(|e| BackendError::Unavailable {
                 backend_name: "sqlite".to_string(),
                 message: format!("Health check failed: {}", e),
-                source: None,
             })?;
         Ok(())
     }
@@ -655,14 +632,14 @@ impl SearchCapabilityProvider for SqliteBackend {
     ) -> Option<ResourceSearchCapabilities> {
         // Get active parameters for this resource type from the registry
         let params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params(resource_type)
         };
 
         if params.is_empty() {
             // Also check if there are Resource-level params
             let common_params = {
-                let registry = self.search_registry.read();
+                let registry = self.base_registry().read();
                 registry.get_active_params("Resource")
             };
             if common_params.is_empty() {
@@ -690,7 +667,7 @@ impl SearchCapabilityProvider for SqliteBackend {
 
         // Add common Resource-level parameters
         let common_params = {
-            let registry = self.search_registry.read();
+            let registry = self.base_registry().read();
             registry.get_active_params("Resource")
         };
         for param in &common_params {

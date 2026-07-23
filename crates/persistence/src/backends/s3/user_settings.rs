@@ -115,10 +115,10 @@ struct SettingsObject {
 /// Derives the S3 object name for a user key: the lowercase hex SHA-256 of the
 /// key's UTF-8 bytes.
 ///
-/// The user key is `"{issuer}|{subject}"`, built from JWT claims that the server
-/// does not constrain: it may contain `/`, `\`, `..`, or be empty, and it is
-/// unbounded in length. Hashing — rather than escaping or sanitising — is what
-/// makes the mapping safe:
+/// The user key is built from JWT claims that the server does not constrain: it
+/// may contain `/`, `\`, `..`, or be empty, and it is unbounded in length.
+/// Hashing — rather than escaping or sanitising — is what makes the mapping
+/// safe:
 ///
 /// - **Injective in practice.** A lossy transform (such as the keyspace's
 ///   `sanitize`, which maps both `/` and space to `_`) would let two distinct
@@ -380,6 +380,27 @@ impl SettingsStore for S3Backend {
             )
         })
         .await
+    }
+
+    async fn delete_settings(&self, user_key: &str) -> StorageResult<bool> {
+        let (location, key) = self.settings_key(user_key)?;
+
+        // Probe first so the return value distinguishes "removed one" from
+        // "there was nothing there" — `DeleteObject` is idempotent and reports
+        // success either way. The probe also runs the owner tripwire in
+        // `load_settings`, so a body whose `user_key` disagrees with the object
+        // name surfaces as an error rather than being silently deleted.
+        let existed = self
+            .load_settings(&location.bucket, &key, user_key)
+            .await?
+            .is_some();
+
+        self.client
+            .delete_object(&location.bucket, &key)
+            .await
+            .map_err(|e| context("delete user_settings", self.map_client_error(e)))?;
+
+        Ok(existed)
     }
 }
 

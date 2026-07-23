@@ -33,6 +33,18 @@ fn internal_error(message: String) -> crate::error::StorageError {
     })
 }
 
+/// The cluster could not be reached (connection refused, DNS, TLS, timeout).
+///
+/// This is deliberately distinct from [`internal_error`]: "I could not ask" is
+/// not "the answer is no". Callers must never turn this into an empty result —
+/// see the `SearchAttempt::Unreachable` docs.
+fn unavailable_error(message: String) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(BackendError::Unavailable {
+        backend_name: "elasticsearch".to_string(),
+        message,
+    })
+}
+
 /// Maximum retry attempts for transient ES search failures (in addition to the
 /// initial attempt). Transient failures observed in CI: shard allocation
 /// flapping during recovery/relocation, brief master-node hiccups.
@@ -58,7 +70,21 @@ fn is_transient_es_error(status: u16, body: &str) -> bool {
 enum SearchAttempt {
     Body(Value),
     EmptyIndex,
-    Transient { status: u16, body: String },
+    /// The cluster was unreachable at the transport layer (connection refused,
+    /// DNS failure, TLS failure, timeout) — we never got an answer at all.
+    ///
+    /// This is retried like a transient error (a rolling restart or a
+    /// not-yet-ready cluster is a real, recoverable condition), but once the
+    /// retries are exhausted it MUST surface as an error. It must never
+    /// degrade into an empty result set: a search that reports "no matches"
+    /// when it never reached the cluster is indistinguishable from a search
+    /// that genuinely found nothing, and for a FHIR query ("does this patient
+    /// have any allergies?") those two answers are not interchangeable.
+    Unreachable(String),
+    Transient {
+        status: u16,
+        body: String,
+    },
     Permanent(crate::error::StorageError),
 }
 
@@ -78,10 +104,13 @@ async fn send_search_once(
     let response = match response {
         Ok(r) => r,
         Err(e) => {
-            // Connection-level failure — treat the same as missing index so
-            // searches don't 500 against a backend that isn't ready yet.
-            tracing::debug!("ES search request failed (index may not exist): {}", e);
-            return SearchAttempt::EmptyIndex;
+            // Transport-level failure: we never reached the cluster, so we do
+            // not know whether the index exists or what it contains. Retry it
+            // (see `SearchAttempt::Unreachable`), but never report it as an
+            // empty index — that would silently turn "Elasticsearch is down"
+            // into "this patient has no matching records".
+            tracing::warn!("ES search request failed at the transport layer: {}", e);
+            return SearchAttempt::Unreachable(e.to_string());
         }
     };
 
@@ -112,49 +141,69 @@ async fn send_search_once(
     }
 }
 
+/// A retryable failure carried across attempts so the last one can be reported.
+enum RetryableFailure {
+    /// Cluster never answered (transport failure).
+    Unreachable(String),
+    /// Cluster answered with a retryable status/body.
+    Transient { status: u16, body: String },
+}
+
 /// Sends an ES search and retries on transient errors with exponential backoff.
 ///
 /// Returns:
 /// - `Ok(Some(value))` — successful response, parsed JSON body
 /// - `Ok(None)` — index does not exist (caller returns empty results)
-/// - `Err(...)` — non-transient failure, or transient retries exhausted
+/// - `Err(...)` — non-transient failure, or retries exhausted
+///
+/// `Ok(None)` is returned ONLY for a genuine `index_not_found_exception`. An
+/// unreachable cluster always yields `Err`, never `Ok(None)` — the caller turns
+/// `Ok(None)` into an empty result set, and an empty result set is a factual
+/// claim about the data that we are in no position to make when we never
+/// reached the cluster.
 async fn send_search_with_retry(
     backend: &ElasticsearchBackend,
     index: &str,
     body: Value,
 ) -> StorageResult<Option<Value>> {
-    let mut last_transient: Option<(u16, String)> = None;
+    let mut last_failure: Option<RetryableFailure> = None;
 
     for attempt in 0..=MAX_SEARCH_RETRIES {
-        match send_search_once(backend, index, body.clone()).await {
+        let failure = match send_search_once(backend, index, body.clone()).await {
             SearchAttempt::Body(v) => return Ok(Some(v)),
             SearchAttempt::EmptyIndex => return Ok(None),
             SearchAttempt::Permanent(e) => return Err(e),
+            SearchAttempt::Unreachable(message) => RetryableFailure::Unreachable(message),
             SearchAttempt::Transient { status, body } => {
-                if attempt < MAX_SEARCH_RETRIES {
-                    let delay_ms = RETRY_BASE_DELAY_MS << attempt;
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max = MAX_SEARCH_RETRIES + 1,
-                        delay_ms,
-                        status,
-                        index,
-                        "Transient ES search failure, retrying"
-                    );
-                    sleep(Duration::from_millis(delay_ms)).await;
-                }
-                last_transient = Some((status, body));
+                RetryableFailure::Transient { status, body }
             }
+        };
+
+        if attempt < MAX_SEARCH_RETRIES {
+            let delay_ms = RETRY_BASE_DELAY_MS << attempt;
+            tracing::warn!(
+                attempt = attempt + 1,
+                max = MAX_SEARCH_RETRIES + 1,
+                delay_ms,
+                index,
+                "Retryable ES search failure, retrying"
+            );
+            sleep(Duration::from_millis(delay_ms)).await;
         }
+        last_failure = Some(failure);
     }
 
-    let (status, body) = last_transient.expect("transient branch always sets last_transient");
-    Err(internal_error(format!(
-        "Search failed after {} attempts (status {}): {}",
-        MAX_SEARCH_RETRIES + 1,
-        status,
-        body
-    )))
+    let attempts = MAX_SEARCH_RETRIES + 1;
+    Err(
+        match last_failure.expect("a retryable branch always sets last_failure") {
+            RetryableFailure::Unreachable(message) => unavailable_error(format!(
+                "Elasticsearch unreachable after {attempts} attempts: {message}"
+            )),
+            RetryableFailure::Transient { status, body } => internal_error(format!(
+                "Search failed after {attempts} attempts (status {status}): {body}"
+            )),
+        },
+    )
 }
 
 #[async_trait]
@@ -322,19 +371,35 @@ impl SearchProvider for ElasticsearchBackend {
             .send()
             .await;
 
+        // A count of 0 is a factual claim about the data. Only make it when the
+        // cluster actually told us so (success), or when the index genuinely
+        // does not exist yet (404). A transport failure or a 5xx means we never
+        // got an answer, and must surface as an error rather than as "zero".
         match response {
             Ok(resp) if resp.status_code().is_success() => {
                 let body: Value = resp.json().await.unwrap_or_default();
                 Ok(body.get("count").and_then(|c| c.as_u64()).unwrap_or(0))
             }
-            _ => Ok(0),
+            Ok(resp) if resp.status_code().as_u16() == 404 => Ok(0),
+            Ok(resp) => {
+                let status = resp.status_code().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                Err(internal_error(format!(
+                    "Count failed (status {status}): {body}"
+                )))
+            }
+            Err(e) => Err(unavailable_error(format!(
+                "Elasticsearch unreachable during count: {e}"
+            ))),
         }
     }
 
     fn search_param_registry(
         &self,
-    ) -> &std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        self.search_registry()
+        tenant: &crate::tenant::TenantContext,
+    ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+        self.tenant_registries()
+            .for_tenant(tenant.tenant_id().as_str())
     }
 
     fn supports_contained_search(&self) -> bool {

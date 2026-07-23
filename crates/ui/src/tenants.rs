@@ -92,6 +92,8 @@ struct TenantsPage {
     error: Option<String>,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
+    /// Whether the sidebar links to the natural-language search page (#255).
+    nl_enabled: bool,
 }
 
 #[derive(Template)]
@@ -226,6 +228,7 @@ pub async fn page(
             available: false,
             error: None,
             active_page: "tenants",
+            nl_enabled: state.nl.enabled,
         });
     };
 
@@ -246,6 +249,7 @@ pub async fn page(
         available: true,
         error,
         active_page: "tenants",
+        nl_enabled: state.nl.enabled,
     })
 }
 
@@ -315,6 +319,21 @@ pub async fn create(
     if let Err(e) = storage.register_tenant(&id, display_name).await {
         return load(Some(e.to_string())).await;
     }
+    // Seed the new tenant with the conformance resources (SearchParameters and
+    // CompartmentDefinitions), matching the per-tenant startup seed. Best-effort:
+    // a failed seed still returns the refreshed rows; the next startup completes
+    // it.
+    let data_dir = state
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    helios_persistence::search::seed_tenant_conformance(
+        storage.as_ref(),
+        state.fhir_version,
+        &data_dir,
+        &id,
+    )
+    .await;
     load(None).await
 }
 
