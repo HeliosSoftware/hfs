@@ -583,10 +583,11 @@ fn test_r4_test_suite() {
             }
 
             // The `quantity_tests_to_ignore` array that used to sit here — ten UCUM
-            // and calendar-duration cases, declared nowhere — is now in
-            // data/r4/rust-known-failures.json (issue #307). The tests run and are
-            // scored KnownFail, so the exclusion is visible and countable, and the
-            // build fails if any of them starts passing.
+            // and calendar-duration cases, declared nowhere — is gone. Moving it into
+            // data/r4/rust-known-failures.json (issue #307) put it under enforcement,
+            // which immediately proved every entry obsolete: UCUM conversion and
+            // calendar-duration comparison are implemented, and all eleven
+            // testQuantity tests pass. They are now scored like any other test.
 
             // Run the test
             let is_predicate_test = test.predicate == "true";

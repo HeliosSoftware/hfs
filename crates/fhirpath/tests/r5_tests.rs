@@ -588,11 +588,14 @@ fn r5_suite_must_not_be_a_noop() {
         println!("HFS_REQUIRE_R5 not set; not asserting that the R5 suite is live.");
         return;
     }
-    assert!(
-        cfg!(feature = "R5"),
+    // `#[cfg]` rather than `assert!(cfg!(..))`: the condition is a compile-time
+    // constant, which clippy rejects under `-D warnings` (assertions_on_constants).
+    #[cfg(not(feature = "R5"))]
+    panic!(
         "HFS_REQUIRE_R5 is set, but this binary was built without --features R5, so the R5 \
          conformance suite compiled to a no-op and verified nothing. Either pass the feature \
          or unset HFS_REQUIRE_R5."
     );
+    #[cfg(feature = "R5")]
     println!("R5 feature is enabled; the conformance suite is live.");
 }
