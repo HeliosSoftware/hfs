@@ -521,7 +521,10 @@ fn test_r4_test_suite() {
                                 tally.record(Outcome::KnownFail);
                             }
                             None => {
-                                println!("  FAIL: {} - '{}' - {}", test.name, test.expression, detail);
+                                println!(
+                                    "  FAIL: {} - '{}' - {}",
+                                    test.name, test.expression, detail
+                                );
                                 tally
                                     .failures
                                     .push(format!("{}::{} — {}", group_name, test.name, detail));

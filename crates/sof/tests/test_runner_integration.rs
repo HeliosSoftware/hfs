@@ -405,8 +405,12 @@ fn run_comprehensive_test_suite() {
     let report_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_report.json");
     let report_json =
         serde_json::to_string_pretty(&all_reports).expect("Failed to serialize test report");
-    fs::write(&report_path, report_json)
-        .unwrap_or_else(|e| panic!("Failed to write test report to {}: {e}", report_path.display()));
+    fs::write(&report_path, report_json).unwrap_or_else(|e| {
+        panic!(
+            "Failed to write test report to {}: {e}",
+            report_path.display()
+        )
+    });
     println!("\nTest report saved to {}", report_path.display());
 
     // Fail the test if any individual tests failed
