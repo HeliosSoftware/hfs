@@ -26,9 +26,12 @@ pub(crate) const PAGE_SIZE: usize = 50;
 /// model, one per enabled FHIR version. The data comes from the server's own
 /// `GET /SearchParameter` endpoint (storage is the source of truth), fetched
 /// once per version and cached for the process lifetime.
+/// Cache key: the tenant the snapshot was fetched for, and the version.
+type TenantVersion = (String, FhirVersion);
+
 pub(crate) struct SpCatalog {
     source: Arc<dyn ConformanceSource>,
-    versions: Mutex<HashMap<(String, FhirVersion), Arc<VersionSnapshot>>>,
+    versions: Mutex<HashMap<TenantVersion, Arc<VersionSnapshot>>>,
 }
 
 pub(crate) struct VersionSnapshot {

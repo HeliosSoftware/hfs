@@ -53,9 +53,12 @@ pub(crate) struct CompartmentResource {
 /// Lazily-fetched, process-lifetime CompartmentDefinitions, one set per enabled
 /// FHIR version. Fetched from the server's own endpoint once per version and
 /// cached; sorted by compartment code.
+/// Cache key: the tenant the definitions were fetched for, and the version.
+type TenantVersion = (String, FhirVersion);
+
 pub(crate) struct CompartmentCatalog {
     source: Arc<dyn ConformanceSource>,
-    cache: Mutex<HashMap<(String, FhirVersion), Arc<Vec<CompartmentDef>>>>,
+    cache: Mutex<HashMap<TenantVersion, Arc<Vec<CompartmentDef>>>>,
 }
 
 impl CompartmentCatalog {
