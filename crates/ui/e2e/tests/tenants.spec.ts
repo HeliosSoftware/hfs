@@ -41,22 +41,10 @@ test.describe("tenants", () => {
 
     page.once("dialog", (d) => d.accept()); // hx-confirm
     await row.locator("[hx-delete]").click();
-    // The trash button deregisters without purging. The invariant is "no
-    // longer registered" — how that renders depends on the backend: stores
-    // that discover tenants from their data (count_by_tenant) keep the row,
-    // flagged unregistered; stores that cannot (S3) drop it from the list.
-    await expect
-      .poll(
-        async () => {
-          if ((await row.count()) === 0) return "gone";
-          const flagged = await row
-            .locator(".tag--muted")
-            .isVisible()
-            .catch(() => false);
-          return flagged ? "unregistered" : "pending";
-        },
-        { timeout: 15_000 },
-      )
-      .not.toBe("pending");
+    // The trash button deregisters without purging, so the tenant's data
+    // still exists and every backend must keep the row visible, flagged
+    // unregistered, with its purge affordance intact (#252; S3 gained
+    // count_by_tenant in #330 — data-discovery is universal now).
+    await expect(row.locator(".tag--muted")).toBeVisible({ timeout: 15_000 });
   });
 });
