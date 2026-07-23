@@ -76,6 +76,20 @@ fn cs_id_cache() -> &'static RwLock<SystemIdCacheMap> {
     SYSTEM_ID_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Truncate a URL to at most 80 characters for `hts::probe` log labels,
+/// appending an ellipsis when it was shortened. Operates on `char` boundaries,
+/// so a URL with a multibyte character straddling byte 80 is truncated safely
+/// rather than panicking as a raw `&u[..80]` byte slice would.
+fn truncate_url_for_probe(u: &str) -> String {
+    let mut chars = u.chars();
+    let head: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// Clear the process-wide URL→system_id cache. Called by code paths that
 /// write to the `code_systems` table (CRUD + bulk import).
 pub(crate) fn invalidate_cs_id_cache() {
@@ -199,19 +213,22 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             ));
         }
         // EX_PROBE: per-call timing to identify which path served the request.
-        // (Stripped after iter11 diagnosis.)
+        // These probes log at the `hts::probe` DEBUG target; when it is not
+        // enabled (the default, and the benchmark) the truncated-URL string is
+        // never built, so the hot expand path pays only this one bool check.
+        // The value is reused across the probe sites below — including the ones
+        // inside `spawn_blocking`, which need an owned copy — so it is bound
+        // once here rather than recomputed per site.
         let _probe_t0 = std::time::Instant::now();
-        let probe_url_short: String = req
-            .url
-            .as_deref()
-            .map(|u| {
-                if u.len() > 80 {
-                    format!("{}…", &u[..80])
-                } else {
-                    u.to_string()
-                }
-            })
-            .unwrap_or_else(|| "<inline>".to_string());
+        let probe_on = tracing::enabled!(target: "hts::probe", tracing::Level::DEBUG);
+        let probe_url_short: String = if probe_on {
+            req.url
+                .as_deref()
+                .map(truncate_url_for_probe)
+                .unwrap_or_else(|| "<inline>".to_string())
+        } else {
+            String::new()
+        };
 
         // ── Async hot path: in-memory index already warm ──────────────────────
         // For URL-based implicit ValueSet requests (no inline ValueSet body),
@@ -261,7 +278,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             sql_offset,
                             sql_limit,
                         );
-                        tracing::info!(
+                        tracing::debug!(
                             target: "hts::probe",
                             "EX_PROBE_BACKEND: hit=implicit_index url={} took={:.3}ms n={}",
                             probe_url_short,
@@ -315,7 +332,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             }
                         }
                         let page = page_in_memory(&concept_idx, None, sql_offset, sql_limit);
-                        tracing::info!(
+                        tracing::debug!(
                             target: "hts::probe",
                             "EX_PROBE_BACKEND: hit=inline_compose_index url={} took={:.3}ms n={}",
                             probe_url_short,
@@ -358,7 +375,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                             sql_offset,
                             sql_limit,
                         );
-                        tracing::info!(
+                        tracing::debug!(
                             target: "hts::probe",
                             "EX_PROBE_BACKEND: hit=property_result_cache url={} took={:.3}ms n={}",
                             probe_url_short,
@@ -417,7 +434,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                             sql_offset,
                                             sql_limit,
                                         );
-                                        tracing::info!(
+                                        tracing::debug!(
                                             target: "hts::probe",
                                             "EX_PROBE_BACKEND: hit=plain_fts_cache url={} took={:.3}ms n={}",
                                             probe_url_short,
@@ -445,7 +462,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
         // slow path. This is the hot suspicion for the EX04-after-EX01 stall.
         let probe_url_short_owned = probe_url_short.clone();
         let probe_t_pre_spawn = std::time::Instant::now();
-        tracing::info!(
+        tracing::debug!(
             target: "hts::probe",
             "EX_PROBE_BACKEND: miss_all_caches url={} entering spawn_blocking",
             probe_url_short_owned,
@@ -465,7 +482,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             let probe_pre_spawn_ms =
                 probe_t_pre_spawn.elapsed().as_micros() as f64 / 1000.0;
             let conn = pool.get().map_err(|e| {
-                tracing::info!(
+                tracing::debug!(
                     target: "hts::probe",
                     "EX_PROBE_BACKEND: pool_get_FAILED url={} pre_spawn={:.3}ms",
                     probe_url_inner,
@@ -475,7 +492,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             })?;
             let probe_pool_get_ms =
                 probe_t_in_blocking.elapsed().as_micros() as f64 / 1000.0;
-            tracing::info!(
+            tracing::debug!(
                 target: "hts::probe",
                 "EX_PROBE_BACKEND: pool_get url={} pre_spawn={:.3}ms pool_get={:.3}ms",
                 probe_url_inner,
@@ -704,7 +721,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                         )?;
                         let probe_compute_ms =
                             probe_t_compute.elapsed().as_micros() as f64 / 1000.0;
-                        tracing::info!(
+                        tracing::debug!(
                             target: "hts::probe",
                             "EX04_PROBE: compute_expansion_with_ctx took={:.3}ms cache_key={} n={} warnings={}",
                             probe_compute_ms,
@@ -732,14 +749,14 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                 &cache_key,
                                 &inline_compose_index,
                             );
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "hts::probe",
                                 "EX04_PROBE: populate_caches took={:.3}ms cache_key={}",
                                 probe_t_pop.elapsed().as_micros() as f64 / 1000.0,
                                 cache_key,
                             );
                         } else {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "hts::probe",
                                 "EX04_PROBE: skip_cache cache_key={} warnings={} contained={} tx_resources={}",
                                 cache_key,
@@ -1011,7 +1028,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
                                         )?;
                                         let probe_bfs_ms =
                                             probe_t_bfs.elapsed().as_micros() as f64 / 1000.0;
-                                        tracing::info!(
+                                        tracing::debug!(
                                             target: "hts::probe",
                                             "EX01_PROBE: bfs_expand_page took={:.3}ms cs_url={} pattern={:?} n={}",
                                             probe_bfs_ms,
@@ -1232,7 +1249,7 @@ impl ValueSetOperations for SqliteTerminologyBackend {
             // i.e. the actual SQLite work (compose evaluation + filtering).
             let probe_compute_ms =
                 probe_t_after_conn.elapsed().as_micros() as f64 / 1000.0;
-            tracing::info!(
+            tracing::debug!(
                 target: "hts::probe",
                 "EX_PROBE_BACKEND: blocking_done url={} pool_get={:.3}ms compute={:.3}ms n={}",
                 probe_url_inner,
@@ -8569,23 +8586,65 @@ fn populate_implicit_cache(
         .map_err(|e| HtsError::StorageError(e.to_string()))
 }
 
-/// Pre-populate `concepts_fts` for every code system currently in the DB.
+/// Incrementally populate the concept FTS indexes for every code system that is
+/// not yet recorded in `concepts_fts_built`. Systems already tracked are skipped
+/// entirely, so a warm restart — or a server start after `hts import` /
+/// `HTS_BOOTSTRAP_DIR` already built the index — does zero rebuild work instead
+/// of re-tokenising the whole corpus on every boot (issue #295). Returns the
+/// number of concept rows newly indexed (`0` = nothing needed building).
 ///
-/// Called once at server startup (after clearing `concepts_fts`) so that
-/// filtered `$expand` requests always use the fast FTS path rather than
-/// triggering a blocking per-system build on the first filtered request.
-/// Uses a single bulk INSERT inside one transaction — much faster than
-/// building per-system (1 transaction per system × 1217 systems would take
-/// several minutes; the bulk approach finishes in under 30 s).
-pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
+/// # Invariant
+///
+/// `concepts_fts_built` contains a system's row **iff** that system's rows in
+/// all three FTS tables (`concepts_fts`, `concepts_word_fts`,
+/// `concepts_search_fts`) are current for its concepts and designations. This
+/// function only ever *adds* untracked systems; the other half of the invariant
+/// — clearing a system's FTS rows *and* its tracker row together when its
+/// concepts change — is upheld by `import::fhir_bundle::write_code_system`,
+/// which deletes both in the same transaction as the concept upserts. Removing
+/// either the per-import invalidation or the `NOT IN (…concepts_fts_built)`
+/// guard below breaks correctness: the former serves stale FTS after a
+/// re-import, the latter double-inserts rows (FTS5 has no row uniqueness),
+/// worst on the churning `-cd.id` designation rows.
+///
+/// Runs the build in a single `BEGIN IMMEDIATE` transaction (bulk INSERTs are
+/// far faster than the per-system path — 1 txn × 1217 systems would take
+/// minutes). Cheap up-front gate skips the transaction when nothing is stale.
+pub(crate) fn prebuild_concepts_fts(conn: &Connection) -> usize {
+    // Fast path: is there any concept-bearing code system whose FTS is not yet
+    // built? Iterates `code_systems` (~1217 rows) and only probes `concepts`
+    // for the untracked ones, so a fully-built DB confirms "nothing to do" with
+    // a cheap scan of a small table and no full `concepts` scan.
+    let needs_build: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM code_systems cs
+                 WHERE cs.id NOT IN (SELECT system_id FROM concepts_fts_built)
+                   AND EXISTS (SELECT 1 FROM concepts c WHERE c.system_id = cs.id)
+             )",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    if !needs_build {
+        // Mark any concept-less systems so the lazy ensure_concepts_fts path is
+        // O(1) for them too. Cheap upsert; no-op once every system is tracked.
+        let _ = conn.execute_batch(
+            "INSERT OR IGNORE INTO concepts_fts_built (system_id) SELECT id FROM code_systems",
+        );
+        return 0;
+    }
+
     if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
         tracing::warn!("prebuild_concepts_fts: could not begin transaction: {e}");
-        return;
+        return 0;
     }
 
     let fts_result = conn.execute(
         "INSERT INTO concepts_fts(rowid, system_id, code, display)
-         SELECT id, system_id, code, display FROM concepts",
+         SELECT id, system_id, code, display FROM concepts
+         WHERE system_id NOT IN (SELECT system_id FROM concepts_fts_built)",
         [],
     );
 
@@ -8594,30 +8653,32 @@ pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             tracing::warn!("prebuild_concepts_fts: trigram INSERT failed: {e}");
-            return;
+            return 0;
         }
     };
 
     // Also populate the word-prefix FTS (unicode61) used for short filter terms.
     if let Err(e) = conn.execute(
         "INSERT INTO concepts_word_fts(rowid, system_id, code, display)
-         SELECT id, system_id, code, display FROM concepts",
+         SELECT id, system_id, code, display FROM concepts
+         WHERE system_id NOT IN (SELECT system_id FROM concepts_fts_built)",
         [],
     ) {
         let _ = conn.execute_batch("ROLLBACK");
         tracing::warn!("prebuild_concepts_fts: word-prefix INSERT failed: {e}");
-        return;
+        return 0;
     }
 
     if let Err(e) = conn.execute(
         "INSERT INTO concepts_search_fts(rowid, system_id, code, term)
          SELECT id, system_id, code, display FROM concepts
-         WHERE display IS NOT NULL AND display != ''",
+         WHERE display IS NOT NULL AND display != ''
+           AND system_id NOT IN (SELECT system_id FROM concepts_fts_built)",
         [],
     ) {
         let _ = conn.execute_batch("ROLLBACK");
         tracing::warn!("prebuild_concepts_fts: search FTS preferred-term INSERT failed: {e}");
-        return;
+        return 0;
     }
 
     if let Err(e) = conn.execute(
@@ -8625,29 +8686,33 @@ pub(crate) fn prebuild_concepts_fts(conn: &Connection) {
          SELECT -cd.id, c.system_id, c.code, cd.value
          FROM concept_designations cd
          JOIN concepts c ON c.id = cd.concept_id
-         WHERE cd.value IS NOT NULL AND cd.value != ''",
+         WHERE cd.value IS NOT NULL AND cd.value != ''
+           AND c.system_id NOT IN (SELECT system_id FROM concepts_fts_built)",
         [],
     ) {
         let _ = conn.execute_batch("ROLLBACK");
         tracing::warn!("prebuild_concepts_fts: search FTS designation INSERT failed: {e}");
-        return;
+        return 0;
     }
 
-    // Populate the O(1) tracker so ensure_concepts_fts avoids FTS content scans.
+    // Mark the systems we just built (and any concept-less ones) so subsequent
+    // boots and the lazy path skip them. Done last so the guards above still see
+    // the pre-build tracked set.
     if let Err(e) = conn.execute_batch(
-        "INSERT OR IGNORE INTO concepts_fts_built (system_id)
-         SELECT DISTINCT id FROM code_systems",
+        "INSERT OR IGNORE INTO concepts_fts_built (system_id) SELECT DISTINCT system_id FROM concepts;
+         INSERT OR IGNORE INTO concepts_fts_built (system_id) SELECT id FROM code_systems;",
     ) {
         let _ = conn.execute_batch("ROLLBACK");
         tracing::warn!("prebuild_concepts_fts: tracker INSERT failed: {e}");
-        return;
+        return 0;
     }
 
     let _ = conn.execute_batch("COMMIT");
     tracing::info!(
         rows = n,
-        "concepts_fts pre-populated (trigram + word-prefix)"
+        "concepts_fts built incrementally (trigram + word-prefix + search)"
     );
+    n
 }
 
 /// Pre-warm the in-memory concept index from any implicit-expansion URLs
@@ -9048,6 +9113,29 @@ mod tests {
 
     fn backend() -> SqliteTerminologyBackend {
         SqliteTerminologyBackend::in_memory().expect("in-memory backend should initialise")
+    }
+
+    #[test]
+    fn truncate_url_for_probe_is_char_safe() {
+        // Short and exactly-80-char inputs pass through unchanged.
+        assert_eq!(truncate_url_for_probe("http://x/vs"), "http://x/vs");
+        let exactly_80 = "a".repeat(80);
+        assert_eq!(truncate_url_for_probe(&exactly_80), exactly_80);
+
+        // Longer input is truncated to 80 chars with an ellipsis.
+        let long = "a".repeat(81);
+        assert_eq!(
+            truncate_url_for_probe(&long),
+            format!("{}…", "a".repeat(80))
+        );
+
+        // A multibyte character straddling byte 80: the old `&u[..80]` byte slice
+        // panicked here; the char-based truncation keeps 80 chars safely.
+        let multibyte = "€".repeat(100); // 3 bytes each → byte 80 falls mid-char
+        assert_eq!(
+            truncate_url_for_probe(&multibyte),
+            format!("{}…", "€".repeat(80))
+        );
     }
 
     fn ctx() -> TenantContext {
@@ -12149,5 +12237,120 @@ mod tests {
         // `unrelated` matches on its designation alone — the reason this index
         // exists separately from concepts_fts, which indexes display only.
         assert_eq!(codes, ["data-exchange", "data-exchange1", "unrelated"]);
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// #295: the startup FTS build must be incremental and idempotent — it
+    /// builds untracked systems once, then does nothing (and never duplicates
+    /// rows) on a warm reopen. This is what makes a restart a no-op instead of a
+    /// full-corpus re-tokenise.
+    #[test]
+    fn prebuild_concepts_fts_is_incremental_and_idempotent() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::backends::sqlite::schema::apply(&conn).expect("schema should apply");
+        conn.execute_batch(
+            "INSERT INTO code_systems(id, url, created_at, updated_at)
+                 VALUES ('sys1', 'http://example.org/cs', '2026-01-01', '2026-01-01');
+             INSERT INTO concepts(id, system_id, code, display) VALUES
+                 (1, 'sys1', 'a', 'Alpha term'),
+                 (2, 'sys1', 'b', 'Beta term');
+             INSERT INTO concept_designations(id, concept_id, value) VALUES (5, 1, 'Alpha synonym');",
+        )
+        .expect("fixture should insert");
+
+        // First build: indexes both concepts and marks the system built.
+        let built = prebuild_concepts_fts(&conn);
+        assert_eq!(built, 2, "both concepts indexed on first build");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM concepts_fts"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM concepts_word_fts"), 2);
+        // 2 preferred-term rows + 1 designation row.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM concepts_search_fts"), 3);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM concepts_fts_built WHERE system_id = 'sys1'"
+            ),
+            1
+        );
+
+        // Second build over unchanged data: no work, and crucially no duplicate
+        // rows (FTS5 has no row uniqueness, so a missing guard would double them).
+        let rebuilt = prebuild_concepts_fts(&conn);
+        assert_eq!(rebuilt, 0, "warm reopen builds nothing");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM concepts_fts"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM concepts_search_fts"), 3);
+    }
+
+    /// #295: after a re-import invalidates ONE system (the four DELETEs that
+    /// `write_code_system` performs), the incremental build rebuilds only that
+    /// system — reflecting its new content — and leaves every other system's
+    /// rows untouched (no rebuild, no duplication).
+    #[test]
+    fn prebuild_concepts_fts_rebuilds_only_invalidated_system() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::backends::sqlite::schema::apply(&conn).expect("schema should apply");
+        conn.execute_batch(
+            "INSERT INTO code_systems(id, url, created_at, updated_at) VALUES
+                 ('sys1', 'http://example.org/cs1', '2026-01-01', '2026-01-01'),
+                 ('sys2', 'http://example.org/cs2', '2026-01-01', '2026-01-01');
+             INSERT INTO concepts(id, system_id, code, display) VALUES
+                 (1, 'sys1', 'a', 'Old display'),
+                 (2, 'sys2', 'z', 'Untouched');",
+        )
+        .expect("fixture should insert");
+
+        assert_eq!(prebuild_concepts_fts(&conn), 2, "both systems built");
+        let sys2_rowid: i64 = count(
+            &conn,
+            "SELECT rowid FROM concepts_fts WHERE system_id = 'sys2'",
+        );
+
+        // Simulate write_code_system re-importing sys1 with a changed display:
+        // the four per-system invalidations, then the concept content change.
+        conn.execute_batch(
+            "DELETE FROM concepts_fts        WHERE system_id = 'sys1';
+             DELETE FROM concepts_word_fts   WHERE system_id = 'sys1';
+             DELETE FROM concepts_search_fts WHERE system_id = 'sys1';
+             DELETE FROM concepts_fts_built  WHERE system_id = 'sys1';
+             UPDATE concepts SET display = 'New display' WHERE system_id = 'sys1';",
+        )
+        .expect("invalidation should apply");
+
+        // Only sys1 is untracked now, so only its one concept is rebuilt.
+        assert_eq!(prebuild_concepts_fts(&conn), 1, "only sys1 rebuilt");
+
+        // sys1 reflects the new display; the stale one is gone.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM concepts_fts WHERE system_id = 'sys1' AND display = 'New display'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM concepts_fts WHERE display = 'Old display'"
+            ),
+            0
+        );
+        // sys2 was never touched: same single row, same rowid, no duplicate.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM concepts_fts WHERE system_id = 'sys2'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT rowid FROM concepts_fts WHERE system_id = 'sys2'"
+            ),
+            sys2_rowid
+        );
     }
 }

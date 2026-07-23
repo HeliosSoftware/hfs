@@ -23,7 +23,9 @@ use helios_persistence::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use helios_persistence::core::{ResourceStorage, SettingsStore, VersionedStorage};
-use helios_persistence::error::{ConcurrencyError, ResourceError, SearchError, StorageError};
+use helios_persistence::error::{
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError,
+};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{CursorValue, PageCursor, Pagination, PaginationMode};
 use serde_json::json;
@@ -1109,4 +1111,135 @@ async fn test_minio_settings_concurrent_patches_never_lose_an_update() {
         );
     }
     assert_eq!(stored.version, writers as i64);
+}
+
+/// `delete_settings` removes the object and reports whether one was there,
+/// which is what makes the #270 legacy-key migration able to move a document
+/// rather than duplicate it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_settings_delete_is_idempotent() {
+    if skip_if_disabled("test_minio_settings_delete_is_idempotent") {
+        return;
+    }
+
+    let harness = make_prefix_backend("settings-delete").await;
+    let user = unique_user_key("delete");
+
+    // Deleting an absent document is not an error, and reports "nothing there".
+    assert!(!harness.backend.delete_settings(&user).await.unwrap());
+
+    harness
+        .backend
+        .put_settings(&user, json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert!(harness.backend.get_settings(&user).await.unwrap().is_some());
+
+    assert!(harness.backend.delete_settings(&user).await.unwrap());
+    assert!(harness.backend.get_settings(&user).await.unwrap().is_none());
+
+    // Idempotent: a second delete succeeds and reports nothing was removed.
+    assert!(!harness.backend.delete_settings(&user).await.unwrap());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #284: a missing bucket must never read as an empty store on the real client.
+//
+// These are the end-to-end anchor for the mock-level tests in
+// `src/backends/s3/tests.rs`: they exercise the real `AwsS3Client` HEAD-path
+// disambiguation (a bodyless 404 → follow-up `HeadBucket`; a `HeadBucket` 404 →
+// `BucketNotFound`) against a genuine S3 API, so the mock cannot silently drift
+// from production behaviour. A dead-endpoint test (`backend_error_handling.rs`)
+// cannot cover this — it needs a responsive server whose configured bucket is
+// simply absent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds an S3 backend pointed at a bucket that is deliberately never created.
+/// `validate_on_startup=false` lets construction succeed so the missing bucket
+/// is hit at operation time; `true` makes construction itself validate it.
+async fn make_absent_bucket_backend(validate_on_startup: bool) -> Result<S3Backend, StorageError> {
+    let shared = shared_minio().await;
+    ensure_backend_env_credentials(shared);
+
+    let bucket = format!("hfs-absent-{}", Uuid::new_v4().simple());
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant { bucket },
+        prefix: Some(format!("integration/{}", Uuid::new_v4())),
+        region: Some("us-east-1".to_string()),
+        endpoint_url: Some(shared.endpoint_url.clone()),
+        force_path_style: true,
+        allow_http: true,
+        validate_buckets_on_startup: validate_on_startup,
+        ..Default::default()
+    };
+    S3Backend::from_env_async(config).await
+}
+
+/// Against a responsive server whose bucket is missing, `read`/`create`/`count`
+/// must error — never `Ok(None)` / `Ok(_)` / `Ok(0)`. This proves the real
+/// client's HEAD-path disambiguation (not just the mock's) refuses to let a
+/// misconfigured store masquerade as an empty one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_missing_bucket_reads_and_writes_are_errors() {
+    if skip_if_disabled("test_minio_missing_bucket_reads_and_writes_are_errors") {
+        return;
+    }
+
+    let backend = make_absent_bucket_backend(false)
+        .await
+        .expect("construction must succeed when startup validation is off");
+    let tenant = tenant("minio-tenant-absent");
+
+    let read = backend.read(&tenant, "Patient", "some-id").await;
+    assert!(
+        matches!(read, Err(StorageError::Backend(_))),
+        "read against a missing bucket must be a backend error, not Ok(None): {read:?}"
+    );
+
+    let id = format!("p-{}", Uuid::new_v4());
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType":"Patient","id":id}),
+            FhirVersion::default(),
+        )
+        .await;
+    assert!(
+        matches!(created, Err(StorageError::Backend(_))),
+        "create into a missing bucket must be a backend error: {created:?}"
+    );
+
+    let counted = backend.count(&tenant, Some("Patient")).await;
+    assert!(
+        !matches!(counted, Ok(0)),
+        "count against a missing bucket must not report zero resources: {counted:?}"
+    );
+}
+
+/// `validate_buckets` (via startup validation) reports a missing bucket as a
+/// bucket-level error, not "resource not found in S3" — exercising the real
+/// `head_bucket` → `BucketNotFound` mapping end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_validate_buckets_missing_bucket_is_bucket_flavored() {
+    if skip_if_disabled("test_minio_validate_buckets_missing_bucket_is_bucket_flavored") {
+        return;
+    }
+
+    let err = make_absent_bucket_backend(true)
+        .await
+        .expect_err("startup validation must fail against a missing bucket");
+    match &err {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            assert!(
+                message.contains("bucket"),
+                "expected a bucket-flavored message, got {message:?}"
+            );
+            assert!(
+                !message.contains("resource not found in S3"),
+                "a missing bucket must not be reported as a missing resource: {message:?}"
+            );
+        }
+        other => panic!("expected Backend(Unavailable), got {other:?}"),
+    }
 }

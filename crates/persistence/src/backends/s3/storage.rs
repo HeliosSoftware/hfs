@@ -467,6 +467,10 @@ impl ResourceStorage for S3Backend {
         "s3"
     }
 
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        <Self as crate::core::Backend>::health_check(self).await
+    }
+
     fn is_cluster_shared(&self) -> bool {
         // S3 is a networked object store shared by every instance; `count` (and
         // thus the console `count_by_types` totals) reads the shared bucket, so
@@ -770,6 +774,12 @@ impl ResourceStorage for S3Backend {
     // bucket-per-tenant mode without a default system bucket there is nowhere
     // cross-tenant to keep the records, so the registry is unsupported there.
 
+    fn bulk_write_concurrency(&self) -> usize {
+        // One PUT per resource; S3 absorbs parallel writers trivially, and this
+        // turns a ~1.4k-object conformance seed from minutes into seconds.
+        32
+    }
+
     fn supports_tenant_registry(&self) -> bool {
         self.registry_location().is_some()
     }
@@ -785,13 +795,51 @@ impl ResourceStorage for S3Backend {
             if !item.key.ends_with(".json") {
                 continue;
             }
-            if let Some((record, _)) = self
+            // Registry records are direct children of the registry prefix; every
+            // tenant-scoped key is nested at least one segment deeper (see
+            // `S3Keyspace::tenant_registry_prefix`). S3 listings are recursive, so
+            // without this a tenant named `tenants` has its own resource and
+            // history objects read back as registry records (issue #271).
+            let Some(relative) = item.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if relative.contains('/') {
+                continue;
+            }
+            match self
                 .get_json_object::<crate::core::TenantRecord>(&location.bucket, &item.key)
-                .await?
+                .await
             {
-                out.push(record);
+                Ok(Some((record, _))) => out.push(record),
+                Ok(None) => {}
+                // Degrade per record only for a payload we cannot parse — a
+                // foreign object, a truncated write, a future schema change.
+                // One such object must not make the whole tenant list fail
+                // permanently, which is the unrecoverable half of #271.
+                //
+                // Transport and permission failures still propagate: silently
+                // dropping a tenant because S3 hiccuped would under-report the
+                // registry, which is worse than returning an error the caller
+                // can retry.
+                Err(StorageError::Backend(BackendError::SerializationError { message })) => {
+                    tracing::warn!(
+                        key = %item.key,
+                        error = %message,
+                        "skipping unparseable tenant registry record"
+                    );
+                }
+                Err(e) => return Err(e),
             }
         }
+        // A tenant registered before the `sanitize` fix and re-registered after it
+        // would have a record under both key shapes; report it once, keeping the
+        // earliest registration. Group by id first — `dedup_by` only collapses
+        // adjacent entries, and the display order below is by timestamp.
+        out.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        out.dedup_by(|a, b| a.id == b.id);
         out.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
@@ -805,10 +853,30 @@ impl ResourceStorage for S3Backend {
             return Ok(None);
         };
         let key = location.keyspace.tenant_registry_key(id);
-        Ok(self
+        if let Some((record, _)) = self
             .get_json_object::<crate::core::TenantRecord>(&location.bucket, &key)
             .await?
-            .map(|(record, _)| record))
+        {
+            return Ok(Some(record));
+        }
+        // Fall back to the pre-escaping key so records written before the
+        // `sanitize` fix stay readable. Only ids containing `/`, `\`, or space
+        // differ between the two shapes, so this is a miss-only extra GET for
+        // every other tenant.
+        let legacy = location.keyspace.legacy_tenant_registry_key(id);
+        if legacy == key {
+            return Ok(None);
+        }
+        // The legacy key is ambiguous: `sanitize` mapped `a/b` to `a_b`, which is
+        // also the *canonical* key of a tenant literally named `a_b`. So the key
+        // alone cannot establish ownership — the record body decides. Without
+        // this check the fallback would re-open the very cross-tenant read the
+        // escaping change closes.
+        Ok(self
+            .get_json_object::<crate::core::TenantRecord>(&location.bucket, &legacy)
+            .await?
+            .map(|(record, _)| record)
+            .filter(|record| record.id == id))
     }
 
     async fn register_tenant(
@@ -840,21 +908,39 @@ impl ResourceStorage for S3Backend {
         let location = self
             .registry_location()
             .ok_or_else(|| self.tenant_registry_unsupported())?;
+        // Delete both key shapes so deregistering a tenant registered before the
+        // `sanitize` fix actually removes its record. S3 deletes are silently
+        // idempotent, so probe each first to report whether anything was removed.
+        //
+        // The probe is not just a nicety here: the legacy key is ambiguous —
+        // `sanitize` mapped `a/b` to `a_b`, which is also the *canonical* key of
+        // a tenant named `a_b` — so the record body must confirm ownership
+        // before deleting. Skipping that would make deregistering `a/b` silently
+        // destroy `a_b`'s registration.
         let key = location.keyspace.tenant_registry_key(id);
-        // S3 deletes are silently idempotent; probe first so the caller can
-        // distinguish "removed" from "was never registered".
-        if self
-            .get_json_object::<crate::core::TenantRecord>(&location.bucket, &key)
-            .await?
-            .is_none()
-        {
-            return Ok(false);
+        let legacy = location.keyspace.legacy_tenant_registry_key(id);
+        let mut candidates = vec![key.clone()];
+        if legacy != key {
+            candidates.push(legacy);
         }
-        self.client
-            .delete_object(&location.bucket, &key)
-            .await
-            .map_err(|e| self.map_client_error(e))?;
-        Ok(true)
+        let mut removed = false;
+        for candidate in candidates {
+            let Some((record, _)) = self
+                .get_json_object::<crate::core::TenantRecord>(&location.bucket, &candidate)
+                .await?
+            else {
+                continue;
+            };
+            if record.id != id {
+                continue;
+            }
+            self.client
+                .delete_object(&location.bucket, &candidate)
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+            removed = true;
+        }
+        Ok(removed)
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {

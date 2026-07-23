@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use deadpool_postgres::{Config, Pool, Runtime, SslMode};
@@ -76,7 +77,15 @@ pub struct PostgresConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
-    /// Connection timeout in seconds.
+    /// Upper bound, in seconds, for establishing a connection to the server.
+    ///
+    /// Bounds the whole of connection establishment — DNS, TCP, TLS and the
+    /// Postgres startup/auth exchange — via deadpool's `create_timeout`, not just
+    /// the TCP handshake that tokio-postgres' own `connect_timeout` covers.
+    ///
+    /// Raise it for servers that are slow to answer a fresh connection: a cold or
+    /// loaded cluster, a cross-region failover, or a TLS handshake against a
+    /// distant proxy. Settable as `HFS_PG_CONNECT_TIMEOUT_SECS`.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
 
@@ -156,6 +165,20 @@ fn default_max_connections() -> usize {
 
 fn default_connect_timeout_secs() -> u64 {
     5
+}
+
+/// Reads `HFS_PG_CONNECT_TIMEOUT_SECS`, falling back to the default.
+///
+/// This value bounds deadpool's `create_timeout` and is therefore a hard ceiling
+/// on connection establishment. It must be reachable from every construction path
+/// — an operator whose server needs longer than the default has no other way to
+/// say so, and before this was wired up the field was dead config, so no
+/// deployment has ever had to think about it.
+fn connect_timeout_secs_from_env() -> u64 {
+    std::env::var("HFS_PG_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(default_connect_timeout_secs)
 }
 
 fn default_statement_timeout_ms() -> u64 {
@@ -268,8 +291,14 @@ impl PostgresBackend {
     }
 
     /// Creates a backend from a connection string.
+    ///
+    /// The URL carries the connection's identity (host, port, database,
+    /// credentials); `HFS_PG_CONNECT_TIMEOUT_SECS` still applies on top of it, so
+    /// a URL-configured deployment can tune connection establishment exactly as an
+    /// `HFS_PG_*`-configured one can.
     pub async fn from_connection_string(url: &str) -> StorageResult<Self> {
-        let config = Self::parse_connection_string(url)?;
+        let mut config = Self::parse_connection_string(url)?;
+        config.connect_timeout_secs = connect_timeout_secs_from_env();
         Self::new(config).await
     }
 
@@ -282,6 +311,7 @@ impl PostgresBackend {
     /// - `HFS_PG_USER` (default: "helios")
     /// - `HFS_PG_PASSWORD`
     /// - `HFS_PG_MAX_CONNECTIONS` (default: `cores * 4`, clamped to 16..=64)
+    /// - `HFS_PG_CONNECT_TIMEOUT_SECS` (default: 5)
     /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
     pub async fn from_env() -> StorageResult<Self> {
@@ -294,6 +324,10 @@ impl PostgresBackend {
             dbname: std::env::var("HFS_PG_DBNAME").unwrap_or_else(|_| default_dbname()),
             user: std::env::var("HFS_PG_USER").unwrap_or_else(|_| default_user()),
             password: std::env::var("HFS_PG_PASSWORD").ok(),
+            // The other tuning knobs are applied by `apply_env_overrides` below;
+            // `connect_timeout_secs` reads its env var through a dedicated helper so
+            // the connection-URL path can pick it up the same way.
+            connect_timeout_secs: connect_timeout_secs_from_env(),
             ..Default::default()
         };
         // Pool/timeout knobs are applied through the shared helper so this path and
@@ -314,6 +348,15 @@ impl PostgresBackend {
             PostgresSslMode::Prefer => SslMode::Prefer,
             PostgresSslMode::Require => SslMode::Require,
         });
+
+        let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+
+        // Bound the TCP handshake. NOTE: tokio-postgres applies `connect_timeout`
+        // to `TcpStream::connect` and nothing else — DNS resolution, the TLS
+        // handshake and the Postgres startup/auth exchange are all awaited
+        // unbounded. So this alone does NOT bound connection establishment; the
+        // deadpool `create` timeout below covers the rest.
+        cfg.connect_timeout = Some(connect_timeout);
 
         // Ship `statement_timeout` in the startup packet so it applies to every
         // connection the pool ever creates — including ones added as the pool grows
@@ -341,12 +384,18 @@ impl PostgresBackend {
             // that accepts TCP but stalls the startup handshake — becomes an
             // unbounded latency tail. Bound the wait and surface exhaustion as a
             // fast `Unavailable` (503) instead of a request that hangs for a minute.
+            //
+            // `create` also bounds the whole of `Manager::create` (DNS + TCP + TLS +
+            // auth). Without it, a peer that completes the TCP handshake and then
+            // never answers — a hung server, or a load balancer accepting into a
+            // blackhole — hangs the caller forever, since the kernel's SYN-retry only
+            // covers failures that never complete the handshake.
             .timeouts(deadpool_postgres::Timeouts {
                 wait: Some(std::time::Duration::from_secs(
                     config.pool_wait_timeout_secs,
                 )),
-                create: Some(std::time::Duration::from_secs(config.connect_timeout_secs)),
-                recycle: Some(std::time::Duration::from_secs(config.connect_timeout_secs)),
+                create: Some(connect_timeout),
+                recycle: Some(connect_timeout),
             })
             .runtime(Runtime::Tokio1)
             .build()
@@ -724,13 +773,16 @@ impl Backend for PostgresBackend {
                 backend_name: "postgres".to_string(),
                 message: "Failed to get connection".to_string(),
             })?;
+        // A failing constant `SELECT 1` means the backend is unreachable/broken,
+        // not a bad query — surface it as a retryable `Unavailable` (503) rather
+        // than an `Internal` (500) so a down backend reads as "try again", and
+        // so the readiness probe classifies it correctly.
         client
             .query_one("SELECT 1", &[])
             .await
-            .map_err(|e| BackendError::Internal {
+            .map_err(|e| BackendError::Unavailable {
                 backend_name: "postgres".to_string(),
                 message: format!("Health check failed: {}", e),
-                source: None,
             })?;
         Ok(())
     }

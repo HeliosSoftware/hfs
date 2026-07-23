@@ -133,12 +133,16 @@ This expression identifies systolic blood pressure observations with values abov
 
 FHIRPath provides access to terminology services through a %terminologies object. This implementation supports all standard terminology operations.
 
-**⚠️ IMPORTANT: Default Terminology Servers**
-By default, this implementation uses test terminology servers:
-- **R4/R4B**: `https://tx.fhir.org/r4/`
-- **R5**: `https://tx.fhir.org/r5/`
+**⚠️ IMPORTANT: There is no default terminology server**
 
-**DO NOT USE THESE DEFAULT SERVERS IN PRODUCTION!** They are test servers with limited resources and no SLA.
+Terminology operations send codes taken from the resource being evaluated — potentially patient data — to the terminology server. The evaluator therefore never contacts a server you did not name: if none is configured, `%terminologies.*` and `memberOf()` fail with an error telling you what to set, rather than silently calling a public server.
+
+You must point it at a terminology server you trust. Some options:
+
+- **[HTS](../hts/README.md)**, the terminology server in this workspace — run it yourself, or use `https://hts.heliossoftware.com`. HTS serves operations at the **root** of its base URL (no `/r4` or `/r5` path segment).
+- **`https://tx.fhir.org/r4/`** (or `/r5/`), HL7's public **test** server — fine for experimentation, but it is rate-limited, has no SLA, and should not be sent production data.
+
+The base URL you configure is used verbatim; no FHIR-version path segment is appended to it.
 
 **Configuring a Terminology Server:**
 ```bash
@@ -151,6 +155,20 @@ fhirpath-cli --terminology-server https://your-terminology-server.com/fhir ...
 # Via server option
 fhirpath-server --terminology-server https://your-terminology-server.com/fhir
 ```
+
+Terminology requests time out after **30 seconds** by default, so an unresponsive
+server cannot hang evaluation indefinitely. Override it with
+`FHIRPATH_TERMINOLOGY_TIMEOUT`, in whole seconds:
+
+```bash
+# Allow slow ValueSet expansions up to two minutes
+export FHIRPATH_TERMINOLOGY_TIMEOUT=120
+
+# 0 disables the timeout entirely (waits forever — use with care)
+export FHIRPATH_TERMINOLOGY_TIMEOUT=0
+```
+
+Values that cannot be parsed as a non-negative integer fall back to the 30s default.
 
 **Supported %terminologies Functions:**
 ```fhirpath
@@ -763,6 +781,8 @@ The server can be configured via command-line arguments or environment variables
 | `FHIRPATH_CORS_HEADERS` | `--cors-headers` | Allowed headers | Common headers |
 | `FHIRPATH_MAX_BODY_SIZE` | `--max-body-size` | Max request body size in bytes, measured after decompression | `10485760` |
 | `FHIRPATH_DEBUG_TRACE` | — | Enable step-by-step debug trace output | `false` |
+| `FHIRPATH_TERMINOLOGY_SERVER` | `--terminology-server` | Terminology server base URL (required for `%terminologies` and `memberOf`) | none |
+| `FHIRPATH_TERMINOLOGY_TIMEOUT` | — | Terminology request timeout in seconds (`0` disables) | `30` |
 
 #### HTTP Compression
 

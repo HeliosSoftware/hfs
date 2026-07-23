@@ -30,6 +30,13 @@ async fn main() -> anyhow::Result<()> {
                 host = %config.host,
                 storage_backend = %config.storage_backend,
                 database_url = %config.database_url,
+                // Eagerly resolve the HELIOS_OBS_MODE OnceLock at boot and stamp
+                // it into the startup line. The same-session A/B benchmark (#297)
+                // greps this to assert each arm's server actually resolved to the
+                // arm it set — a server that silently ignored the env var (e.g.
+                // built without the observability arm switch) is caught here
+                // rather than producing a clean-looking table of ~zero deltas.
+                obs_mode = ?helios_observability::mode::mode(),
                 "Starting Helios Terminology Server"
             );
             run_server(config).await
@@ -556,26 +563,24 @@ async fn run_import(args: ImportArgs) -> anyhow::Result<i32> {
             let backend = SqliteTerminologyBackend::new(&database_url)?;
             let result = run_import_for_path(&backend, &ctx, &args, rxnorm_dir).await?;
 
-            // Pre-build concept closures now so server startup only needs to
-            // rebuild the FTS index (~10–25 s) instead of also running
-            // migrate_concept_closure (~40 s for SNOMED). Without this, the
-            // combined startup time can exceed the 60-second health-check timeout.
+            // Finalize the database now — build concept closures AND the
+            // concepts FTS index — so the on-disk DB ships fully serve-ready.
+            // Server startup then finds everything already built (tracked in
+            // concepts_fts_built + closure rows present) and its
+            // finalize_after_bootstrap is a near-instant no-op, instead of
+            // re-tokenising the whole corpus inside the health-check window
+            // (issue #295). Previously only closures were pre-built here, which
+            // left the full FTS rebuild to block server startup on every boot.
+            // Runs on a blocking thread (heavy synchronous SQLite work).
             if !args.dry_run {
-                info!("Building concept closures (this may take ~40 s for SNOMED CT)…");
-                let pool = backend.pool().clone();
-                tokio::task::spawn_blocking(move || {
-                    let conn = pool.get().map_err(|e| {
-                        rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                            Some(format!("pool error: {e}")),
-                        )
-                    })?;
-                    helios_hts::backends::sqlite::schema::migrate_concept_closure(&conn)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("task join error: {e}"))?
-                .map_err(|e| anyhow::anyhow!("failed to build concept closures: {e}"))?;
-                info!("Concept closures ready");
+                info!(
+                    "Building concept closures + FTS index (this may take ~40–60 s for SNOMED CT)…"
+                );
+                tokio::task::spawn_blocking(move || backend.finalize_after_bootstrap())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("task join error: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("failed to finalize terminology database: {e}"))?;
+                info!("Concept closures + FTS index ready");
             }
 
             result

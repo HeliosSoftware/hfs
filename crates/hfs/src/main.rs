@@ -160,12 +160,19 @@ where
     let connect_timeout_ms = env("HFS_MONGODB_CONNECT_TIMEOUT_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(5000);
+    // Bounds how long an operation waits for a usable server. `connect_timeout_ms`
+    // only bounds a TCP handshake, so this is what actually decides how quickly an
+    // unreachable MongoDB surfaces an error.
+    let server_selection_timeout_ms = env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15_000);
 
     MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
         connect_timeout_ms,
+        server_selection_timeout_ms,
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
         search_offloaded,
@@ -377,12 +384,17 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5000);
+        let server_selection_timeout_ms = std::env::var("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15_000);
 
         let config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
             connect_timeout_ms,
+            server_selection_timeout_ms,
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
@@ -674,14 +686,19 @@ async fn init_auth_with_audit(
         return Ok((auth_config, None));
     }
 
-    let jwks_url = auth_config.jwks_url.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("HFS_AUTH_JWKS_URL is required when HFS_AUTH_ENABLED=true")
-    })?;
-
-    // Require issuer validation to prevent cross-service token reuse
-    if auth_config.expected_issuer.is_none() {
-        anyhow::bail!("HFS_AUTH_ISSUER is required when HFS_AUTH_ENABLED=true");
+    // Every invariant of an enabled auth config now lives on the type, so an
+    // embedder that builds one directly gets the same guarantees this binary
+    // does. Issuer validation in particular is required, both to prevent
+    // cross-service token reuse and because `iss` qualifies every per-user
+    // identity (see `helios_rest::extractors::UserKey`).
+    if let Err(errors) = auth_config.validate() {
+        anyhow::bail!("Invalid auth configuration:\n  - {}", errors.join("\n  - "));
     }
+
+    let jwks_url = auth_config
+        .jwks_url
+        .as_ref()
+        .expect("validate() guarantees a JWKS URL when auth is enabled");
 
     // Audience stays optional so an open demo deployment can accept any token
     // from its issuer, but that also means a token minted for a *different*
@@ -808,6 +825,10 @@ async fn main() -> anyhow::Result<()> {
     helios_observability::uptime::init();
     helios_observability::telemetry::init("hfs", &config.log_level);
     helios_observability::metrics::init("hfs");
+    // hfs is the one server that mounts the console traffic/tenants endpoints
+    // backed by the reqlog ring buffer, so it opts into recording. Servers that
+    // don't (hts, sof-server, fhirpath-server) leave it off and skip the cost.
+    helios_observability::reqlog::enable();
 
     if let Err(errors) = config.validate() {
         for error in &errors {
@@ -910,9 +931,15 @@ async fn main() -> anyhow::Result<()> {
 /// populated for each valid tenant. A failed seed logs and boots anyway: the
 /// in-memory registry still resolves searches; only API discovery is degraded.
 ///
-/// Only the self-indexing standalone backends (SQLite/Postgres/MongoDB) seed;
-/// the S3 primary has no search index to seed.
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+/// Standalone backends seed themselves; Elasticsearch composites seed through
+/// the composite so the writes also reach the search index. Standalone S3 is
+/// the one deployment that skips seeding — it has no search index at all.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
 async fn seed_conformance_resources<S>(backend: &S, config: &ServerConfig)
 where
     S: helios_persistence::core::ResourceStorage,
@@ -941,7 +968,12 @@ where
 /// registered tenant. Tenants are provisioned-only, so this is the complete set
 /// of valid tenants. Falls back to just the default tenant when the backend has
 /// no tenant registry (e.g. a minimal deployment).
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
 async fn provisioned_tenants<S>(backend: &S, config: &ServerConfig) -> Vec<String>
 where
     S: helios_persistence::core::ResourceStorage,
@@ -1614,8 +1646,8 @@ async fn start_sqlite_elasticsearch(
     sqlite.set_search_offloaded(true);
     let sqlite = Arc::new(sqlite);
     info!("SQLite search indexing disabled (offloaded to Elasticsearch)");
-    // Seed/refresh on the primary; the ES backend shares its registry Arc.
-    seed_conformance_resources(&*sqlite, &config).await;
+    // Refresh reads from the primary; the ES backend shares its registry Arc.
+    // Seeding waits for the composite below, so the writes also index into ES.
     spawn_sqlite_search_param_refresh(sqlite.clone(), &config);
 
     // Build Elasticsearch configuration from server config
@@ -1709,6 +1741,11 @@ async fn start_sqlite_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+
+    // Seed through the composite: the primary's own indexing is offloaded, so
+    // seeding it directly would leave the conformance resources unsearchable
+    // (empty /SearchParameter and /CompartmentDefinition, and empty UI viewers).
+    seed_conformance_resources(&*composite, &config).await;
 
     // The per-user settings store lives on the SQLite primary (Elasticsearch is
     // search-only), so it is wired from the underlying `sqlite` backend even
@@ -1865,8 +1902,8 @@ async fn start_postgres_elasticsearch(
     backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
-    // Seed/refresh on the primary; the ES backend shares its registry Arc.
-    seed_conformance_resources(&*pg, &config).await;
+    // Refresh reads from the primary; the ES backend shares its registry Arc.
+    // Seeding waits for the composite below, so the writes also index into ES.
     spawn_postgres_search_param_refresh(pg.clone(), &config);
 
     // Build Elasticsearch configuration from server config
@@ -1960,6 +1997,10 @@ async fn start_postgres_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
+    // Seed through the composite: the primary's own indexing is offloaded, so
+    // seeding it directly would leave the conformance resources unsearchable.
+    seed_conformance_resources(&*composite, &config).await;
+
     // The per-user settings store lives on the PostgreSQL primary (Elasticsearch
     // is search-only), so it is wired from the underlying `pg` backend even
     // though the app is served over the composite storage.
@@ -2035,8 +2076,8 @@ async fn start_mongodb_elasticsearch(
     // Offload search to Elasticsearch
     let mongo = Arc::new(backend);
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
-    // Seed/refresh on the primary; the ES backend shares its registry Arc.
-    seed_conformance_resources(&*mongo, &config).await;
+    // Refresh reads from the primary; the ES backend shares its registry Arc.
+    // Seeding waits for the composite below, so the writes also index into ES.
     spawn_mongodb_search_param_refresh(mongo.clone(), &config);
 
     // Build Elasticsearch configuration from server config
@@ -2129,6 +2170,10 @@ async fn start_mongodb_elasticsearch(
 
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
+
+    // Seed through the composite: the primary's own indexing is offloaded, so
+    // seeding it directly would leave the conformance resources unsearchable.
+    seed_conformance_resources(&*composite, &config).await;
 
     // The per-user settings store lives on the MongoDB primary (Elasticsearch is
     // search-only), so it is wired from the underlying `mongo` backend even
@@ -2480,6 +2525,10 @@ async fn start_s3_elasticsearch(
     let serve_audit_state = audit_state.clone();
     let composite = Arc::new(composite);
 
+    // Seed through the composite so the conformance resources land in the S3
+    // primary and get indexed into Elasticsearch — the only search index here.
+    seed_conformance_resources(&*composite, &config).await;
+
     // The per-user settings store lives on the S3 primary (Elasticsearch is
     // search-only), so it is wired from the underlying `s3` backend even though
     // the app is served over the composite storage. As in `start_s3`, a tenancy
@@ -2650,6 +2699,7 @@ mod tests {
             "HFS_MONGODB_DATABASE" => Some("inferno_suite".to_string()),
             "HFS_MONGODB_MAX_CONNECTIONS" => Some("24".to_string()),
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
+            "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
         });
 
@@ -2660,6 +2710,7 @@ mod tests {
         assert_eq!(mongo_config.database_name, "inferno_suite");
         assert_eq!(mongo_config.max_connections, 24);
         assert_eq!(mongo_config.connect_timeout_ms, 7500);
+        assert_eq!(mongo_config.server_selection_timeout_ms, 2500);
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);
