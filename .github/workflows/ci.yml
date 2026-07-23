@@ -153,7 +153,7 @@ jobs:
         timeout-minutes: 15
         env:
           RUN_MINIO_S3_TESTS: "1"
-          EXPECTED_MINIO_SETTINGS_TESTS: "4"
+          EXPECTED_MINIO_SETTINGS_TESTS: "5"
           # The single self-hosted Windows runner is a virtualized guest whose
           # CPU does not advertise SSE4.1 + PCLMULQDQ. The AWS S3 SDK's default
           # integrity protection computes a CRC32 on every upload via the
