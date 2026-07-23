@@ -300,6 +300,8 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_PG_USER` | `helios` | Database user |
 | `HFS_PG_PASSWORD` | *(none)* | Database password |
 | `HFS_PG_MAX_CONNECTIONS` | `10` | Connection pool size |
+| `HFS_PG_STATEMENT_TIMEOUT_MS` | `30000` | Server-side `statement_timeout` applied to every pooled connection. Raise it for migrations or other long-running maintenance work. |
+| `HFS_PG_POOL_WAIT_TIMEOUT_SECS` | `10` | How long a request waits for a free pooled connection before failing with 503 |
 
 **MongoDB**
 
