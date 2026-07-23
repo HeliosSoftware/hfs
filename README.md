@@ -301,6 +301,8 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_PG_PASSWORD` | *(none)* | Database password |
 | `HFS_PG_MAX_CONNECTIONS` | `10` | Connection pool size |
 | `HFS_PG_CONNECT_TIMEOUT_SECS` | `5` | How long establishing a connection may take before failing (s), covering DNS, TCP, TLS and authentication. Raise it for a server that is slow to answer a fresh connection. |
+| `HFS_PG_STATEMENT_TIMEOUT_MS` | `30000` | Server-side `statement_timeout` applied to every pooled connection. Raise it for migrations or other long-running maintenance work. |
+| `HFS_PG_POOL_WAIT_TIMEOUT_SECS` | `10` | How long a request waits for a free pooled connection before failing with 503 |
 
 **MongoDB**
 
