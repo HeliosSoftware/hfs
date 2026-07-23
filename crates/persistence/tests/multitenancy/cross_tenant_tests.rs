@@ -191,7 +191,7 @@ async fn test_resource_type_restrictions() {
         .unwrap();
 
     // restricted tenant can read Patient
-    let read = backend.read(&patient_only, "Patient", created.id()).await;
+    let _read = backend.read(&patient_only, "Patient", created.id()).await;
     // Result depends on whether restriction is enforced at read level
 
     // Create Observation
