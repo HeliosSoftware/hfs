@@ -26,10 +26,93 @@
 //! unbounded Prometheus series.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
 use axum::{extract::MatchedPath, extract::Request, middleware::Next, response::Response};
+use metrics::{Counter, Histogram};
 use tracing::Instrument;
+
+/// Label triple identifying one `(method, route, status)` metric series.
+type LabelTriple = (Cow<'static, str>, Arc<str>, Cow<'static, str>);
+
+/// Cache of resolved `(counter, histogram)` handles, keyed by label triple.
+///
+/// `metrics::counter!`/`histogram!` rebuild a `Key` (hashing the metric name and
+/// every label) and allocate a `Vec<Label>` on *every* call, then look the metric
+/// up in the recorder's registry. On the always-on metrics path — two metrics per
+/// request, every request in every mode except `Off` — that is pure repeated work:
+/// the handle for a given label triple never changes. Cache it and the hot path
+/// becomes a read-locked map lookup plus two atomic updates.
+///
+/// Bounded by construction: it is only populated for the statically-known method
+/// and status labels ([`method_label`]/[`status_label`] return `Cow::Borrowed`
+/// for those) crossed with the finite set of matched-path route templates. An
+/// exotic method/status (owned) bypasses the cache entirely, so a client cannot
+/// grow it without bound.
+static METRIC_HANDLES: LazyLock<RwLock<HashMap<LabelTriple, (Counter, Histogram)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Build the counter+histogram handles for one label triple. Only called on a
+/// cache miss (or for uncacheable exotic labels), so the `route` allocation here
+/// is amortized to once per distinct series.
+fn build_handles(
+    method: &Cow<'static, str>,
+    route: &Arc<str>,
+    status: &Cow<'static, str>,
+) -> (Counter, Histogram) {
+    let route = route.to_string();
+    let counter = metrics::counter!(
+        "http_requests_total",
+        "method" => method.clone(),
+        "route" => route.clone(),
+        "status" => status.clone(),
+    );
+    let histogram = metrics::histogram!(
+        "http_request_duration_seconds",
+        "method" => method.clone(),
+        "route" => route,
+        "status" => status.clone(),
+    );
+    (counter, histogram)
+}
+
+/// Record one request into the counter + histogram, reusing cached handles.
+fn record_metrics(
+    method: Cow<'static, str>,
+    route: Arc<str>,
+    status: Cow<'static, str>,
+    elapsed: f64,
+) {
+    // Only the bounded, statically-known labels are cacheable; exotic (owned)
+    // method/status values are recorded directly so the cache cannot grow without
+    // bound. Route is always bounded (a matched-path template or "<unmatched>").
+    let cacheable = matches!(method, Cow::Borrowed(_)) && matches!(status, Cow::Borrowed(_));
+    if cacheable {
+        let key: LabelTriple = (method.clone(), route.clone(), status.clone());
+        if let Some((counter, histogram)) = METRIC_HANDLES.read().unwrap().get(&key) {
+            counter.increment(1);
+            histogram.record(elapsed);
+            return;
+        }
+        let (counter, histogram) = build_handles(&method, &route, &status);
+        counter.increment(1);
+        histogram.record(elapsed);
+        // `entry().or_insert` tolerates a race: two threads that both miss build
+        // handles aliasing the same series, both record correctly, and the loser's
+        // handles are simply dropped.
+        METRIC_HANDLES
+            .write()
+            .unwrap()
+            .entry(key)
+            .or_insert((counter, histogram));
+        return;
+    }
+    let (counter, histogram) = build_handles(&method, &route, &status);
+    counter.increment(1);
+    histogram.record(elapsed);
+}
 
 /// Map an HTTP method to a metric label without allocating for the standard
 /// verbs.
@@ -103,11 +186,13 @@ pub async fn track(req: Request, next: Next) -> Response {
     }
 
     let method = req.method().clone();
-    let route = req
+    // `Arc<str>` (not `String`): the metric-handle cache key holds a clone of the
+    // route, and an `Arc` clone is a refcount bump rather than a fresh allocation.
+    let route: Arc<str> = req
         .extensions()
         .get::<MatchedPath>()
-        .map(|m| m.as_str().to_owned())
-        .unwrap_or_else(|| "<unmatched>".to_owned());
+        .map(|m| Arc::from(m.as_str()))
+        .unwrap_or_else(|| Arc::from("<unmatched>"));
     // Only the span and the reqlog rollup use the tenant; skip the header scan
     // and its allocation when neither is active.
     let tenant = if span_on || reqlog_on {
@@ -147,28 +232,7 @@ pub async fn track(req: Request, next: Next) -> Response {
     }
 
     if metrics_on {
-        // Labels are `Cow<'static, str>`: the standard method/status values are
-        // `Cow::Borrowed`, so cloning them for the second metric is free. Only
-        // `route` (a matched-path template that is not `'static`) still owns a
-        // clone. This keeps the always-on metrics path — recorded on every
-        // request in every mode except `Off` — from heap-allocating the method
-        // and status strings four times per request. Label values are unchanged.
-        let method = method_label(&method);
-        let status = status_label(status);
-        metrics::counter!(
-            "http_requests_total",
-            "method" => method.clone(),
-            "route" => route.clone(),
-            "status" => status.clone(),
-        )
-        .increment(1);
-        metrics::histogram!(
-            "http_request_duration_seconds",
-            "method" => method,
-            "route" => route,
-            "status" => status,
-        )
-        .record(elapsed);
+        record_metrics(method_label(&method), route, status_label(status), elapsed);
     }
 
     response
@@ -213,5 +277,43 @@ mod label_tests {
         // Uncommon code falls back to an owned render, identical to to_string().
         assert_eq!(status_label(418).as_ref(), "418");
         assert!(matches!(status_label(418), Cow::Owned(_)));
+    }
+
+    // The handle cache must stay bounded: statically-known labels are cached,
+    // exotic (owned) method/status values are recorded but never inserted, so a
+    // client sending junk methods cannot grow it without bound. (No recorder is
+    // installed in tests, so the metric ops are harmless no-ops.)
+    #[test]
+    fn cache_holds_known_labels_and_skips_exotic() {
+        // Unique routes so this test cannot collide with any other.
+        let good_route: Arc<str> = Arc::from("/__test_cacheable__");
+        record_metrics(
+            Cow::Borrowed("GET"),
+            good_route.clone(),
+            Cow::Borrowed("200"),
+            0.001,
+        );
+        let good_key: LabelTriple = (Cow::Borrowed("GET"), good_route, Cow::Borrowed("200"));
+        assert!(
+            METRIC_HANDLES.read().unwrap().contains_key(&good_key),
+            "a statically-known label triple should be cached"
+        );
+
+        let junk_route: Arc<str> = Arc::from("/__test_exotic__");
+        record_metrics(
+            Cow::Owned("PROPFIND".to_owned()),
+            junk_route.clone(),
+            Cow::Borrowed("200"),
+            0.001,
+        );
+        let junk_key: LabelTriple = (
+            Cow::Owned("PROPFIND".to_owned()),
+            junk_route,
+            Cow::Borrowed("200"),
+        );
+        assert!(
+            !METRIC_HANDLES.read().unwrap().contains_key(&junk_key),
+            "an exotic (owned) method must bypass the cache"
+        );
     }
 }
