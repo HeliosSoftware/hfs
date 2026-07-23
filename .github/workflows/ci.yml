@@ -81,7 +81,14 @@ jobs:
           # The main-thread stack already defaults to 8 MB on macOS, matching
           # the Linux `-zstack-size=8388608`, so no override is needed.
 
+      # `--all-features` enables R5, so this is the one job where the R5 FHIRPath
+      # conformance suite is live rather than compiled to its `#[cfg(not(R5))]`
+      # no-op twin. HFS_REQUIRE_R5 makes that a hard requirement here: if the
+      # feature ever stops being enabled, `r5_suite_must_not_be_a_noop` fails
+      # instead of the suite quietly verifying nothing (issue #307).
       - name: Run tests with all features
+        env:
+          HFS_REQUIRE_R5: "1"
         run: |
           cargo test --workspace --all-features
 
@@ -1305,9 +1312,40 @@ jobs:
             !target/${{ matrix.target }}/release/*.rlib
             !target/${{ matrix.target }}/release/*.so
 
+      # NOTE: `run_comprehensive_test_suite` is invoked here BY NAME as a substring
+      # filter, and `cargo test` exits 0 when a filter matches nothing. This job is
+      # also tag-only (`if: startsWith(github.ref, 'refs/tags/v')`), so a rename
+      # would not surface on any PR — the first symptom would be a release whose
+      # published conformance report is missing or stale. Rename only together with
+      # this step, and keep the verification step below.
       - name: Generate test_report.json file
         if: matrix.os == 'Linux-x86'
         run: cargo test -p helios-sof run_comprehensive_test_suite
+
+      # Anti-vacuity gate (issue #307). The report is deployed to GitHub Pages by
+      # `publish-report`, so "the step was green" must mean "a real report exists".
+      # Before this, a filter that matched no test, or a suite that returned early
+      # on a missing fixture directory, produced a green step, a warn-only upload,
+      # and a Pages deploy with no report. Nobody was paged.
+      - name: Verify SOF conformance report is present and non-vacuous
+        if: matrix.os == 'Linux-x86'
+        shell: bash
+        run: |
+          set -euo pipefail
+          report=crates/sof/test_report.json
+          if [ ! -f "$report" ]; then
+            echo "::error::[REPORT-MISSING] $report was not produced. Either the test-name filter in the previous step matched nothing (cargo test exits 0 in that case), or run_comprehensive_test_suite bailed before writing. Do not ship a release whose published conformance report is absent."
+            exit 1
+          fi
+          # Count recorded cases across all fixture files. The corpus is 22 files /
+          # 144 cases; a floor of 100 catches a shrunken or half-written report
+          # without breaking on a modest upstream trim.
+          cases=$(python3 -c "import json,sys; d=json.load(open('$report')); print(sum(len(v.get('tests',[])) for v in d.values()))")
+          echo "SOF conformance report records $cases case(s)."
+          if [ "$cases" -lt 100 ]; then
+            echo "::error::[REPORT-VACUOUS] $report records only $cases case(s), expected >=100. The fixture corpus did not fully load, so this report would understate what was verified."
+            exit 1
+          fi
 
       - name: Upload test_report.json to GitHub
         if: matrix.os == 'Linux-x86'
@@ -1315,6 +1353,9 @@ jobs:
         with:
           name: test_report
           path: crates/sof/test_report.json
+          # Default is `warn`, which let a missing report pass silently and then
+          # deploy a Pages site without it.
+          if-no-files-found: error
 
       - name: Build pysof wheel (Linux with sdist)
         if: matrix.os == 'Linux-x86'

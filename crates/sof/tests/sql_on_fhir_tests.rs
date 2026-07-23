@@ -346,42 +346,22 @@ fn test_basic_boolean_attribute() {
     }
 }
 
-#[test]
-fn test_run_basic_test_file() {
-    // Load and run a simple test case from the test suite
-    let mut test_suite_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_suite_path.push("tests/sql-on-fhir-v2/tests/basic.json");
-
-    if !test_suite_path.exists() {
-        // Skip test if test suite is not available
-        return;
-    }
-
-    let content = fs::read_to_string(test_suite_path).expect("Failed to read test file");
-    let test_case: TestCase = serde_json::from_str(&content).expect("Failed to parse test case");
-
-    // Check if we support the FHIR version
-    let supports_r4 = test_case
-        .fhir_version
-        .as_ref()
-        .map(|v| v.contains(&"4.0.1".to_string()))
-        .unwrap_or(true);
-    if !supports_r4 {
-        return; // Skip tests that don't support R4
-    }
-
-    // Create a bundle from the test resources
-    let bundle = create_test_bundle(&test_case.resources).expect("Failed to create test bundle");
-
-    // Run the first test
-    if let Some(first_test) = test_case.tests.first() {
-        let result = run_single_test(first_test, &bundle);
-        println!("Test '{}' result: {:?}", first_test.title, result);
-
-        // For now, we'll just print the result rather than assert
-        // This allows us to see what's working and what needs to be fixed
-    }
-}
+// `test_run_basic_test_file` used to live here. It was deleted in the fix for
+// issue #307 rather than repaired, because it was structurally incapable of
+// failing AND fully redundant:
+//
+//   * it read only `basic.json`, 1 of the 22 fixture files;
+//   * it ran only the FIRST of that file's 11 test cases;
+//   * it `println!`d the result instead of asserting on it;
+//   * it `return`ed silently — reported as a pass — if the fixture was missing.
+//
+// `run_comprehensive_test_suite` in `test_runner_integration.rs` already walks
+// every fixture file, runs all 144 cases including all of `basic.json`, and
+// asserts that every one passes. Rewriting this test to assert would have
+// created a second, weaker place to maintain the same claim. The two remaining
+// fixture-driven tests in this file (`test_repeat_directive` below and
+// `run_foreach_tests.rs`) are kept because they panic on a missing fixture and
+// assert on every case in their file.
 
 #[test]
 fn test_repeat_directive() {

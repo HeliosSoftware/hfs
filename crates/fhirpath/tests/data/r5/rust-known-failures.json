@@ -1,0 +1,41 @@
+{
+  "description": "Declared exclusions for the IN-PROCESS Rust FHIRPath R5 conformance suite (crates/fhirpath/tests/r5_tests.rs), read against the vendored corpus data/r5/tests-fhir-r5.xml. This is NOT known-test-failures.json: that file is passed to the external .NET fhirpath-validator.exe by .github/workflows/ci.yml and describes a different harness running against FHIR/fhir-test-cases@master. The two disagree on purpose (txTest03 is a declared failure there and passes here; HTMLChecks does not exist in the vendored corpus). The schema is kept identical so entries can be copy-pasted between them. Every entry here is enforced: an entry matching no test fails the build, and an exact entry whose test starts passing fails the build with 'delete this entry'. See issue #307.",
+  "version": "1.0.0",
+  "knownFailures": [
+    {
+      "groupName": "Precision",
+      "testName": "PrecisionDecimal",
+      "reason": "Decimal trailing zeros are not preserved, so precision() under-reports. Documented in crates/fhirpath/PRECISION_LIMITATION.md. Removable once EvaluationResult carries the source decimal's scale. Previously an in-body `if test.name == \"PrecisionDecimal\"` skip (#307)."
+    },
+    {
+      "groupName": "testConformsTo",
+      "testName": "*",
+      "reason": "conformsTo() is not implemented (no StructureDefinition-conformance evaluation in crates/fhirpath/src). Group-level because the three cases fail for one shared cause. Note testConformsTo3 is invalid=\"execution\" and therefore passes for the wrong reason, which is why wildcard entries are exempt from the now-passing check. Replaces an in-body `expression.contains(\"conformsTo(\")` substring skip that would also have swallowed any future test merely mentioning the function (#307)."
+    },
+    {
+      "groupName": "defineVariable",
+      "testName": "dvConceptMapExample",
+      "reason": "Vendored data/r5/input/conceptmap-example.json carries `identifier` as an object, but R5 ConceptMap.identifier is 0..*, so it only parses when the `xml` feature enables SingleOrVec wrappers; isDistinct() then differs between feature sets. Two defects (upstream test data, and our feature-dependent isDistinct determinism). Previously an in-body name skip (#307)."
+    },
+    {
+      "groupName": "testInheritance",
+      "testName": "testFHIRPathAsFunction11",
+      "reason": "Contested upstream: the corpus expects empty for Patient.gender.as(string) on the basis that FHIR code is not System.String; we return the value. Was previously counted as a PASS by the in-body `contested_tests` allowlist, which inflated the pass count with a known-wrong answer (#307). Removable when the upstream dispute resolves either way."
+    },
+    {
+      "groupName": "testInheritance",
+      "testName": "testFHIRPathAsFunction16",
+      "reason": "Contested upstream: same cause as testFHIRPathAsFunction11 but via ofType(string). Was previously counted as a PASS by the in-body `contested_tests` allowlist (#307)."
+    },
+    {
+      "groupName": "testTypes",
+      "testName": "testStringQuantityMonthLiteralToQuantity",
+      "reason": "Our defect, previously mislabelled 'test is wrong' and counted as a PASS (#307). '1 \\'mo\\''.toQuantity() = 1 month must be empty because UCUM 'mo' and the calendar month are not comparable; we return true, conflating UCUM units with calendar durations. Removable when Quantity comparison distinguishes calendar from UCUM duration units."
+    },
+    {
+      "groupName": "testTypes",
+      "testName": "testStringQuantityYearLiteralToQuantity",
+      "reason": "Our defect, previously mislabelled 'test is wrong' and counted as a PASS (#307). Same cause as testStringQuantityMonthLiteralToQuantity, for UCUM 'a' versus the calendar year."
+    }
+  ]
+}

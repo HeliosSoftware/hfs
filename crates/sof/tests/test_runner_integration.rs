@@ -25,6 +25,15 @@ struct Test {
     tags: Option<Vec<String>>,
     view: serde_json::Value,
     expect: Option<Vec<serde_json::Value>>,
+    // Parsed but NOT asserted. `expectColumns` pins column *ordering*, which this
+    // runner cannot see: it compares `serde_json::Value` rows, and without the
+    // `preserve_order` feature `serde_json::Map` is unordered, so the order is
+    // already lost by the time we compare. Checking it needs a raw-text compare
+    // against the emitted JSON/NDJSON.
+    //
+    // Scope, measured: exactly 1 of the 144 corpus cases declares it
+    // (`basic.json::column ordering`). Called out here rather than silently
+    // dropped, since unasserted assertions are the subject of issue #307.
     #[allow(dead_code)]
     #[serde(rename = "expectColumns")]
     expect_columns: Option<Vec<String>>,
@@ -264,26 +273,46 @@ fn run_test_file(test_file: &Path) -> Result<TestSuiteReport, Box<dyn std::error
     })
 }
 
+/// Lower bounds on the vendored SQL-on-FHIR v2 corpus.
+///
+/// The corpus is git-tracked (22 fixture files, 144 test cases at time of
+/// writing), so these are not guesses — they are a floor that catches a
+/// half-checked-out or silently emptied fixture tree. Without them, an empty
+/// directory yields `0 == 0` passes, prints `NaN%`, and reports success
+/// (issue #307). Raise them when the corpus grows.
+const MIN_FIXTURE_FILES: usize = 22;
+const MIN_TEST_CASES: usize = 144;
+
 #[test]
 fn run_comprehensive_test_suite() {
     let mut test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_dir.push("tests/sql-on-fhir-v2/tests");
 
-    if !test_dir.exists() {
-        println!("Test suite directory not found at: {:?}", test_dir);
-        return;
-    }
+    // Previously an early `return`, i.e. a silent pass. The fixtures are tracked
+    // in git, so a missing directory means a broken checkout, not an optional
+    // extra — and this test is the one that feeds the published conformance
+    // report, so a vacuous pass here becomes a vacuous public number.
+    assert!(
+        test_dir.is_dir(),
+        "SQL-on-FHIR conformance fixtures not found at {}. These are tracked in git; \
+         a missing directory means a broken checkout, not an optional test suite.",
+        test_dir.display()
+    );
 
     let mut all_reports = HashMap::new();
-    let mut total_tests = 0;
-    let mut passed_tests = 0;
+    // Explicitly `usize` so they compare directly against the corpus floors below
+    // (an inferred `i32` would not).
+    let mut total_tests: usize = 0;
+    let mut passed_tests: usize = 0;
+    let mut fixture_files: usize = 0;
 
     // Run all test files
-    for entry in fs::read_dir(test_dir).expect("Failed to read test directory") {
+    for entry in fs::read_dir(&test_dir).expect("Failed to read test directory") {
         let entry = entry.expect("Failed to read directory entry");
         let path = entry.path();
 
         if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            fixture_files += 1;
             let file_name = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -333,6 +362,22 @@ fn run_comprehensive_test_suite() {
         }
     }
 
+    // Corpus floors come BEFORE the pass/total comparison: with an empty corpus
+    // that comparison is `0 == 0` and passes, after printing a NaN success rate.
+    assert!(
+        fixture_files >= MIN_FIXTURE_FILES,
+        "only {fixture_files} fixture file(s) found in {} (expected at least \
+         {MIN_FIXTURE_FILES}). The conformance corpus has shrunk or failed to check out; \
+         refusing to report a green run over a corpus this small.",
+        test_dir.display(),
+    );
+    assert!(
+        total_tests >= MIN_TEST_CASES,
+        "only {total_tests} conformance case(s) executed (expected at least {MIN_TEST_CASES}). \
+         The fixture files are present but nearly empty, or parsing silently dropped their \
+         `tests` arrays.",
+    );
+
     println!("\n=== TEST SUMMARY ===");
     println!("Total tests: {}", total_tests);
     println!("Passed: {}", passed_tests);
@@ -341,12 +386,28 @@ fn run_comprehensive_test_suite() {
         "Success rate: {:.1}%",
         (passed_tests as f64 / total_tests as f64) * 100.0
     );
+    // Machine-readable line for the CI freshness/non-vacuity check.
+    println!("SOF-CONFORMANCE: files={fixture_files} total={total_tests} passed={passed_tests}");
 
-    // Save the test report
+    // Save the test report.
+    //
+    // This file is a published deliverable, not a scratch artifact: CI's `build`
+    // job uploads `crates/sof/test_report.json` and `publish-report` deploys it to
+    // GitHub Pages on tagged releases. It is therefore written to a path derived
+    // from CARGO_MANIFEST_DIR rather than the process CWD — the previous relative
+    // `fs::write("test_report.json", ...)` only landed in the right place because
+    // cargo happens to set CWD to the package root, so any change to how the test
+    // is invoked would have silently relocated a release artifact.
+    //
+    // Deliberately NOT moved to OUT_DIR (as issue #307 suggested): OUT_DIR is not
+    // set for integration-test binaries, and its hashed path could not be named by
+    // the workflow's `path:` upload.
+    let report_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_report.json");
     let report_json =
         serde_json::to_string_pretty(&all_reports).expect("Failed to serialize test report");
-    fs::write("test_report.json", report_json).expect("Failed to write test report");
-    println!("\nTest report saved to test_report.json");
+    fs::write(&report_path, report_json)
+        .unwrap_or_else(|e| panic!("Failed to write test report to {}: {e}", report_path.display()));
+    println!("\nTest report saved to {}", report_path.display());
 
     // Fail the test if any individual tests failed
     assert_eq!(

@@ -1,0 +1,56 @@
+{
+  "description": "Declared exclusions for the IN-PROCESS Rust FHIRPath R4 conformance suite (crates/fhirpath/tests/r4_tests.rs), read against the vendored corpus data/r4/tests-fhir-r4.xml. There is no .NET counterpart for R4 — the external validator job in .github/workflows/ci.yml is R5-only — so this file has no sibling to stay in sync with. Every entry is enforced: an entry matching no test fails the build, and an exact entry whose test starts passing fails the build with 'delete this entry'. See issue #307. NOTE: the R4 corpus contains two duplicate (group, test) name pairs (testObservations::testPolymorphismIsA and testLiterals::testLiteralString); an entry naming either would cover both tests. Neither is excluded here, but keep it in mind before adding one.",
+  "version": "1.0.0",
+  "knownFailures": [
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity1",
+      "reason": "UCUM unit conversion is not implemented, so 4.0000 'g' = 4000.0 'mg' cannot be evaluated. Removable once a UCUM conversion backend is wired into Quantity comparison. Previously hidden in the in-body `quantity_tests_to_ignore` array, which was declared nowhere (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity2",
+      "reason": "UCUM unit conversion is not implemented: 4 'g' ~ 4000 'mg' requires gram/milligram equivalence. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity4",
+      "reason": "UCUM unit conversion is not implemented: 4 'g' ~ 4040 'mg' requires gram/milligram approximate equivalence. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity5",
+      "reason": "Calendar-duration comparison: 7 days = 1 week needs no UCUM library, only calendar-duration equivalence, so this is a narrower defect than the UCUM label it was previously filed under. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity6",
+      "reason": "Mixed calendar/UCUM comparison: 7 days = 1 'wk' compares a calendar duration against a UCUM unit. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity7",
+      "reason": "Calendar-duration ordering: 6 days < 1 week needs no UCUM library, only calendar-duration comparison. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity8",
+      "reason": "Calendar-duration ordering: 8 days > 1 week needs no UCUM library, only calendar-duration comparison. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity9",
+      "reason": "UCUM dimensional arithmetic is not implemented: 2.0 'cm' * 2.0 'm' = 0.040 'm2' requires unit multiplication and derived-unit normalisation. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity10",
+      "reason": "UCUM dimensional arithmetic is not implemented: 4.0 'g' / 2.0 'm' = 2 'g/m' requires unit division. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    },
+    {
+      "groupName": "testQuantity",
+      "testName": "testQuantity11",
+      "reason": "UCUM dimensional arithmetic is not implemented: 1.0 'm' / 1.0 'm' = 1 '1' requires cancellation to the unity unit. Previously hidden in the in-body `quantity_tests_to_ignore` array (#307)."
+    }
+  ]
+}
