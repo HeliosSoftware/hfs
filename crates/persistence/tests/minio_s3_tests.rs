@@ -1243,3 +1243,53 @@ async fn test_minio_validate_buckets_missing_bucket_is_bucket_flavored() {
         other => panic!("expected Backend(Unavailable), got {other:?}"),
     }
 }
+
+/// #330: on the real SDK path, a tenant deregistered without purge must stay
+/// discoverable through count_by_tenant (delimiter LIST + per-tenant counts).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_count_by_tenant_survives_deregistration() {
+    if skip_if_disabled("test_minio_count_by_tenant_survives_deregistration") {
+        return;
+    }
+
+    let harness = make_prefix_backend("count-by-tenant").await;
+    let backend = &harness.backend;
+
+    backend.register_tenant("count-a", None).await.unwrap();
+    backend
+        .create(
+            &tenant("count-a"),
+            "Patient",
+            json!({"resourceType":"Patient","id":"p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant("count-b"),
+            "Patient",
+            json!({"resourceType":"Patient","id":"q1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant("count-b"),
+            "Observation",
+            json!({"resourceType":"Observation","id":"o1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(backend.deregister_tenant("count-a").await.unwrap());
+
+    let mut counts = backend.count_by_tenant().await.unwrap();
+    counts.sort();
+    assert_eq!(
+        counts,
+        vec![("count-a".to_string(), 1), ("count-b".to_string(), 2)]
+    );
+}
