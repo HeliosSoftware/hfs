@@ -1,0 +1,77 @@
+<!--
+  The FHIR query itself: one editable GET URL, and a visual builder whose
+  condition / include / result-control rows stay in two-way sync with it.
+  Shared by Saved Queries (#234) and Search (#255) — on the Search page this
+  same strip is where a translated natural-language query lands, which is why
+  it is editable and why running it is a separate, explicit click.
+
+  Parameter suggestions come from /ui/queries/params — a server-rendered
+  datalist fed by the SearchParameter registry, swapped per resource type.
+  The builder rows are hidden until the script hydrates them; the URL input
+  alone is the no-JS baseline.
+-->
+<p class="query-error" id="search-error" role="alert" hidden></p>
+
+<form id="saved-query-form" class="query-builder" autocomplete="off">
+  <div class="query-builder__row">
+    <span class="query-builder__tag" aria-hidden="true">
+      <span class="icon">{% include "icons/code.svg" %}</span>
+      {{ i18n.t("search-query-tag") }}
+    </span>
+    <input class="query-builder__url" name="url" required spellcheck="false"
+           placeholder="{{ i18n.t("queries-url-placeholder") }}"
+           aria-label="{{ i18n.t("queries-url-label") }}">
+    <button class="btn query-builder__copy" type="button" id="query-copy"
+            aria-label="{{ i18n.t("search-copy") }}" title="{{ i18n.t("search-copy") }}">
+      <span class="icon">{% include "icons/copy.svg" %}</span>
+    </button>
+    <details class="menu query-recent">
+      <summary class="btn query-recent__toggle">
+        <span class="icon">{% include "icons/history.svg" %}</span>
+        {{ i18n.t("queries-recent") }}
+      </summary>
+      <div class="menu__panel menu__panel--right">
+        <div class="menu__heading">{{ i18n.t("queries-recent-heading") }}</div>
+        <div id="recent-searches"
+             data-msg-empty="{{ i18n.t("queries-recent-empty") }}"
+             data-msg-delete="{{ i18n.t("queries-delete") }}"></div>
+      </div>
+    </details>
+    <button class="btn btn--primary" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
+  </div>
+
+  <datalist id="param-options"></datalist>
+  <div class="builder-sections" id="builder-sections" hidden
+       data-msg-param="{{ i18n.t("queries-param-placeholder") }}"
+       data-msg-value="{{ i18n.t("queries-value-placeholder") }}"
+       data-msg-remove="{{ i18n.t("queries-remove") }}">
+    <div class="builder-section">
+      <h3 class="builder-section__title">{{ i18n.t("queries-conditions") }}</h3>
+      <div class="builder-rows" id="builder-conditions"></div>
+      <button class="btn builder-add" type="button" data-add="condition">+ {{ i18n.t("queries-add-condition") }}</button>
+    </div>
+    <div class="builder-grid">
+      <div class="builder-section">
+        <h3 class="builder-section__title">{{ i18n.t("queries-includes") }}</h3>
+        <div class="builder-rows" id="builder-includes"></div>
+        <button class="btn builder-add" type="button" data-add="include">+ _include</button>
+      </div>
+      <div class="builder-section">
+        <h3 class="builder-section__title">{{ i18n.t("queries-result-controls") }}</h3>
+        <div class="builder-rows" id="builder-controls"></div>
+        <button class="btn builder-add" type="button" data-add="control">+ _count</button>
+      </div>
+    </div>
+  </div>
+
+  {% if show_save %}
+  <div class="query-builder__save">
+    <label class="query-form__field query-builder__name">
+      <span>{{ i18n.t("queries-name-label") }}</span>
+      <input name="name" placeholder="{{ i18n.t("queries-name-placeholder") }}">
+    </label>
+    <button class="btn" type="submit" data-intent="save">{{ i18n.t("action-save") }}</button>
+    <p class="query-builder__hint">{{ i18n.t("queries-builder-hint") }}</p>
+  </div>
+  {% endif %}
+</form>

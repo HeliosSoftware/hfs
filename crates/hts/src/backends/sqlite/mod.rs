@@ -369,29 +369,24 @@ impl SqliteTerminologyBackend {
             // per-code-system when new data is imported (see
             // fhir_bundle::write_code_system).
             if prebuild_fts {
-                // Clear the concept FTS index — it is always rebuilt
-                // synchronously by prebuild_concepts_fts below, so stale rows
-                // from a previous run must be removed first.
-                let _ = conn.execute_batch(
-                    "DELETE FROM concepts_fts;
-                     DELETE FROM concepts_fts_built;
-                     DELETE FROM concepts_word_fts;
-                     DELETE FROM concepts_search_fts;",
-                );
-
-                // Update query-planner statistics for large tables.
-                let _ = conn.execute_batch(
-                    "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
-                     ANALYZE concept_properties; ANALYZE concept_designations; \
-                     ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
-                );
-
-                // Pre-populate the concepts_fts trigram index for every code
-                // system so that text-filtered $expand requests always use the
-                // fast FTS path. This runs synchronously before the server
-                // accepts requests; for large systems (SNOMED 638K, LOINC 181K)
-                // it can take 10–25 s total.
-                value_set::prebuild_concepts_fts(&conn);
+                // Incrementally build the concepts_fts trigram index for any
+                // system not already tracked in concepts_fts_built (issue #295).
+                // No blanket wipe: per-system invalidation on (re)import keeps
+                // the tracker authoritative, so this only builds what is
+                // genuinely missing and is a no-op on a warm reopen. For a first
+                // load of large systems (SNOMED 638K, LOINC 181K) it still
+                // tokenises the full corpus once. Runs synchronously before the
+                // server accepts requests.
+                let built = value_set::prebuild_concepts_fts(&conn);
+                if built > 0 {
+                    // Update query-planner statistics only when a build ran;
+                    // stats persist on disk across reopens.
+                    let _ = conn.execute_batch(
+                        "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                         ANALYZE concept_properties; ANALYZE concept_designations; \
+                         ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+                    );
+                }
 
                 // Pre-warm the in-memory concept index from any implicit-expansion
                 // entries that are already persisted in implicit_expansion_cache.
@@ -442,9 +437,12 @@ impl SqliteTerminologyBackend {
     ///    `migrate_concept_closure` only touches systems that have hierarchy
     ///    edges but no closure rows, so unchanged systems cost nothing while a
     ///    re-imported SNOMED/LOINC system is rebuilt.
-    /// 2. Clears and rebuilds the `concepts_fts` index on the final data and
-    ///    refreshes the in-memory implicit/inline-compose indexes and planner
-    ///    statistics.
+    /// 2. Incrementally builds the `concepts_fts` index for any system not yet
+    ///    recorded in `concepts_fts_built` (missing or invalidated by a
+    ///    bootstrap re-import), and refreshes the in-memory
+    ///    implicit/inline-compose indexes — plus planner statistics only when a
+    ///    build actually ran. Unchanged systems cost nothing, so a warm restart
+    ///    does no FTS work before the server binds (issue #295).
     ///
     /// # Errors
     ///
@@ -463,20 +461,22 @@ impl SqliteTerminologyBackend {
             HtsError::StorageError(format!("Failed to rebuild concept closure: {e}"))
         })?;
 
-        // Rebuild FTS + planner stats on the final data. Mirrors the block in
-        // `new_inner` that is skipped under `new_without_fts_prebuild`.
-        let _ = conn.execute_batch(
-            "DELETE FROM concepts_fts;
-             DELETE FROM concepts_fts_built;
-             DELETE FROM concepts_word_fts;
-             DELETE FROM concepts_search_fts;",
-        );
-        let _ = conn.execute_batch(
-            "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
-             ANALYZE concept_properties; ANALYZE concept_designations; \
-             ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
-        );
-        value_set::prebuild_concepts_fts(&conn);
+        // Incrementally (re)build FTS for exactly the systems whose index is
+        // missing or was invalidated by a bootstrap re-import — NOT a blanket
+        // wipe + full rebuild on every boot (issue #295). When nothing changed
+        // (a warm restart, or an `hts import`-prepared DB) this is a near-instant
+        // no-op, so the server binds without re-tokenising the whole corpus.
+        // Only refresh planner statistics when we actually built something:
+        // ANALYZE stats persist on disk across restarts, so a no-op boot needs
+        // none.
+        let built = value_set::prebuild_concepts_fts(&conn);
+        if built > 0 {
+            let _ = conn.execute_batch(
+                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                 ANALYZE concept_properties; ANALYZE concept_designations; \
+                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+            );
+        }
         value_set::prebuild_implicit_index(&conn, &self.implicit_index);
         value_set::prebuild_inline_compose_index(&conn, &self.inline_compose_index);
         Ok(())

@@ -27,6 +27,7 @@ pub mod create;
 pub mod delete;
 pub mod health;
 pub mod history;
+pub mod nl_search;
 pub mod patch;
 pub mod purge;
 pub mod read;
@@ -40,6 +41,7 @@ pub mod subscription_event;
 pub mod subscriptions;
 pub mod update;
 pub mod user_settings;
+pub mod validate;
 pub mod versions;
 pub mod vread;
 #[cfg(feature = "subscriptions")]
@@ -78,6 +80,7 @@ pub use history::{
     delete_instance_history_handler, delete_version_handler, history_instance_handler,
     history_system_handler, history_type_handler,
 };
+pub use nl_search::nl_search_handler;
 pub use patch::patch_handler;
 pub use purge::{purge_instance_handler, purge_type_handler};
 pub use read::{head_read_handler, read_handler};
@@ -87,5 +90,8 @@ pub use reindex::{
 pub use search::{search_get_handler, search_post_handler};
 pub use update::{conditional_update_handler, update_handler};
 pub use user_settings::{get_user_settings, patch_user_settings, put_user_settings};
+pub use validate::{
+    validate_instance_get_handler, validate_instance_post_handler, validate_type_handler,
+};
 pub use versions::versions_handler;
 pub use vread::vread_handler;

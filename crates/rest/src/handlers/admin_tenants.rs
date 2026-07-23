@@ -40,6 +40,12 @@ use crate::state::AppState;
 /// into schema names / storage keys.
 const MAX_TENANT_ID_LEN: usize = 128;
 
+/// Tenant ids that name a control-plane namespace in a storage backend's
+/// keyspace. Currently the S3 sibling prefixes of `tenants/` (see
+/// `S3Keyspace`); `__system__` is checked separately as the shared-tenant
+/// sentinel.
+const RESERVED_TENANT_IDS: &[&str] = &["tenants", "resources", "history", "bulk"];
+
 /// Request body for `POST /admin/tenants`.
 #[derive(Debug, Deserialize)]
 pub struct CreateTenantBody {
@@ -103,6 +109,20 @@ fn validate_tenant_id(id: &str) -> RestResult<()> {
     if id == SYSTEM_TENANT {
         return Err(RestError::BadRequest {
             message: "'__system__' is reserved for internal shared resources".to_string(),
+        });
+    }
+    // Names that collide with a control-plane namespace in the S3 keyspace.
+    //
+    // Defense in depth and a UX guardrail only — it is *not* what makes the
+    // keyspace safe. The S3 backend is safe structurally (registry records are
+    // direct `{id}.json` children of `tenants/`, tenant data is always nested
+    // deeper), because this check is reachable from the admin API alone: the JWT
+    // tenant extractor validates nothing. See `S3Keyspace::tenant_registry_prefix`
+    // and issue #271 — do not conclude from this list that the reader-side filter
+    // is redundant.
+    if RESERVED_TENANT_IDS.contains(&id) {
+        return Err(RestError::BadRequest {
+            message: format!("'{id}' is reserved for internal use"),
         });
     }
     // Allow the characters that are safe across routing (header / URL prefix /
