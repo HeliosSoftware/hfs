@@ -45,6 +45,22 @@ test.describe("tenants", () => {
     // still exists and every backend must keep the row visible, flagged
     // unregistered, with its purge affordance intact (#252; S3 gained
     // count_by_tenant in #330 — data-discovery is universal now).
-    await expect(row.locator(".tag--muted")).toBeVisible({ timeout: 15_000 });
+    //
+    // Poll through reloads rather than watching the one swapped fragment:
+    // under a parallel suite the fragment can arrive late or carry the
+    // error banner (a pool wait while another test seeds a tenant), and a
+    // fresh GET is the retry the page itself would need.
+    await expect
+      .poll(
+        async () => {
+          await page.reload();
+          return row
+            .locator(".tag--muted")
+            .isVisible()
+            .catch(() => false);
+        },
+        { timeout: 60_000, intervals: [2_000] },
+      )
+      .toBe(true);
   });
 });
