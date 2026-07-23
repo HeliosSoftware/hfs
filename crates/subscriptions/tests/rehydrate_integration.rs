@@ -15,6 +15,7 @@
 use chrono::Utc;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::sqlite::SqliteBackend;
+use helios_persistence::core::ResourceStorage;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_subscriptions::manager::SubscriptionStatusCode;
 use helios_subscriptions::{
