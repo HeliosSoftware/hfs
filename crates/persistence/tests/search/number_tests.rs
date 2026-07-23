@@ -66,7 +66,7 @@ async fn test_number_search_eq() {
         components: vec![],
     });
 
-    let result = backend
+    let _result = backend
         .search(&tenant, &query.with_count(100))
         .await
         .unwrap();

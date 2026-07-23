@@ -321,7 +321,7 @@ async fn test_delete_is_soft_delete() {
 
     // But create_or_update with same ID creates a new version
     let patient2 = create_patient_json("Restored");
-    let (restored, created_new) = backend
+    let (restored, _created_new) = backend
         .create_or_update(&tenant, "Patient", &id, patient2, FhirVersion::default())
         .await
         .unwrap();

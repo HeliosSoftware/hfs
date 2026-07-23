@@ -6,7 +6,7 @@
 use serde_json::json;
 
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{BackendCapability, ResourceStorage};
+use helios_persistence::core::ResourceStorage;
 use helios_persistence::error::StorageError;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 

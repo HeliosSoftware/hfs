@@ -119,7 +119,7 @@ async fn test_instance_history_includes_deleted() {
         .unwrap();
 
     // Should have 2 versions: v1 (created) and v2 (deleted)
-    assert!(history.items.len() >= 1);
+    assert!(!history.items.is_empty());
 
     // If delete creates a version, the most recent should be deleted
     if history.items.len() > 1 {
@@ -467,7 +467,7 @@ async fn test_system_history_order() {
         "resourceType": "Organization",
         "name": "Third"
     });
-    let third = backend
+    let _third = backend
         .create(
             &tenant,
             "Organization",

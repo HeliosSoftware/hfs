@@ -326,6 +326,7 @@ async fn test_update_nonexistent_fails() {
         "nonexistent-id",
         tenant.tenant_id().clone(),
         json!({"resourceType": "Patient"}),
+        FhirVersion::default(),
     );
 
     let result = backend

@@ -7,7 +7,6 @@ use serde_json::json;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, VersionedStorage};
-use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 #[cfg(feature = "sqlite")]
@@ -374,7 +373,7 @@ async fn test_vread_different_resource_types() {
         .create(&tenant, "Patient", patient, FhirVersion::default())
         .await
         .unwrap();
-    let patient_v2 = backend
+    let _patient_v2 = backend
         .update(&tenant, &patient_v1, patient_v1.content().clone())
         .await
         .unwrap();
@@ -391,7 +390,7 @@ async fn test_vread_different_resource_types() {
         .unwrap();
     let mut obs_content = obs_v1.content().clone();
     obs_content["status"] = json!("final");
-    let obs_v2 = backend.update(&tenant, &obs_v1, obs_content).await.unwrap();
+    let _obs_v2 = backend.update(&tenant, &obs_v1, obs_content).await.unwrap();
 
     // VRead both versions of Patient
     let p_read_v1 = backend

@@ -200,7 +200,7 @@ async fn test_resource_type_restrictions() {
         "status": "final",
         "code": {"coding": [{"code": "test"}]}
     });
-    let obs_created = backend
+    let _obs_created = backend
         .create(&full, "Observation", obs, FhirVersion::default())
         .await
         .unwrap();
@@ -232,7 +232,7 @@ async fn test_concurrent_tenant_access() {
         (tenant_c.clone(), "C"),
     ] {
         for i in 0..10 {
-            let backend_ref = &backend;
+            let _backend_ref = &backend;
             let tenant_ref = tenant.clone();
             let patient = json!({
                 "resourceType": "Patient",

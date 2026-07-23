@@ -5,7 +5,7 @@
 
 use serde_json::json;
 
-use helios_persistence::core::{IncludeProvider, ResourceStorage, SearchProvider};
+use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{IncludeDirective, IncludeType, SearchQuery};
 
@@ -200,7 +200,7 @@ async fn test_include_iterate() {
         .unwrap();
 
     // Should include both patients and organizations
-    let included_types: std::collections::HashSet<_> =
+    let _included_types: std::collections::HashSet<_> =
         result.included.iter().map(|r| r.resource_type()).collect();
 
     // Depending on implementation, may have both Patient and Organization

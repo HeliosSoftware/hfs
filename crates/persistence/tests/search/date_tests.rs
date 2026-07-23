@@ -247,7 +247,7 @@ async fn test_date_search_range() {
 
     for resource in &result.resources.items {
         let birth_date = resource.content()["birthDate"].as_str().unwrap();
-        assert!(birth_date >= "1985-01-01" && birth_date <= "2005-12-31");
+        assert!(("1985-01-01"..="2005-12-31").contains(&birth_date));
     }
 }
 

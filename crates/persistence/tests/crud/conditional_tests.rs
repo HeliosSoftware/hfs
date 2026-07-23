@@ -6,7 +6,7 @@
 use serde_json::json;
 
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::core::ResourceStorage;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 #[cfg(feature = "sqlite")]

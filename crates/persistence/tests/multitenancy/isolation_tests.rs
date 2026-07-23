@@ -210,7 +210,7 @@ async fn test_search_isolation() {
     let tenant_b = create_tenant("tenant-b");
 
     // Create patients with same name in both tenants
-    for i in 0..3 {
+    for _i in 0..3 {
         backend
             .create(
                 &tenant_a,
@@ -222,7 +222,7 @@ async fn test_search_isolation() {
             .unwrap();
     }
 
-    for i in 0..2 {
+    for _i in 0..2 {
         backend
             .create(
                 &tenant_b,
@@ -278,6 +278,7 @@ async fn test_update_isolation() {
         created.id(),
         TenantId::new("tenant-b"),
         json!({"resourceType": "Patient"}),
+        FhirVersion::default(),
     );
 
     // Try to update from tenant B
@@ -481,7 +482,7 @@ async fn test_hierarchical_tenant_access() {
 
     // Parent with child access permission might be able to read
     // (behavior depends on implementation)
-    let read_parent = backend.read(&parent, "Patient", created.id()).await;
+    let _read_parent = backend.read(&parent, "Patient", created.id()).await;
 
     // This test documents expected hierarchical access behavior
 }
