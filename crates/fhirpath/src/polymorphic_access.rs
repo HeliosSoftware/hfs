@@ -2,6 +2,7 @@
 //!
 //! Handles accessing polymorphic FHIR elements (e.g., value[x]) in FHIRPath expressions.
 
+use helios_fhir::FhirVersion;
 use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 use std::collections::HashMap;
 
@@ -36,6 +37,10 @@ use std::collections::HashMap;
 ///
 /// * `obj` - A reference to a HashMap representing a FHIR resource or part of a resource
 /// * `field_name` - The name of the field to access, which may be a choice element base name
+/// * `version` - The FHIR version of the data being evaluated. Choice-element
+///   metadata is version-specific (`Observation.valueAttachment` exists in R5/R6
+///   but not R4), so this must be the *evaluation context's* version — never
+///   `FhirVersion::default_enabled()`. See issue #309.
 ///
 /// # Returns
 ///
@@ -45,11 +50,12 @@ use std::collections::HashMap;
 /// # Examples
 ///
 /// // For a FHIR Observation with valueQuantity:
-/// // access_polymorphic_element(observation, "value") -> Some(valueQuantity)
-/// // access_polymorphic_element(observation, "value.unit") -> Some(unit)
+/// // access_polymorphic_element(observation, "value", version) -> Some(valueQuantity)
+/// // access_polymorphic_element(observation, "value.unit", version) -> Some(unit)
 pub fn access_polymorphic_element(
     obj: &HashMap<String, EvaluationResult>,
     field_name: &str,
+    version: FhirVersion,
 ) -> Option<EvaluationResult> {
     // First, try direct access - field might already be the right name
     if let Some(value) = obj.get(field_name) {
@@ -63,9 +69,9 @@ pub fn access_polymorphic_element(
         let rest = &parts[1..].join(".");
 
         // Handle path with potential choice element as the first part
-        if is_choice_element(first_part) {
+        if is_choice_element(first_part, version) {
             // Try to resolve the choice element
-            let matches = get_polymorphic_fields(obj, first_part);
+            let matches = get_polymorphic_fields(obj, first_part, version);
 
             // Process each matching field
             for (_, value) in &matches {
@@ -75,7 +81,7 @@ pub fn access_polymorphic_element(
                 } = value
                 {
                     // Recursively resolve the rest of the path
-                    if let Some(result) = access_polymorphic_element(inner_obj, rest) {
+                    if let Some(result) = access_polymorphic_element(inner_obj, rest, version) {
                         return Some(result);
                     }
                 }
@@ -96,7 +102,9 @@ pub fn access_polymorphic_element(
                             } = value
                             {
                                 // Try to resolve the rest of the path
-                                if let Some(result) = access_polymorphic_element(inner_obj, rest) {
+                                if let Some(result) =
+                                    access_polymorphic_element(inner_obj, rest, version)
+                                {
                                     return Some(result);
                                 }
                             }
@@ -112,7 +120,7 @@ pub fn access_polymorphic_element(
                     type_info: _,
                 } = value
                 {
-                    return access_polymorphic_element(inner_obj, rest);
+                    return access_polymorphic_element(inner_obj, rest, version);
                 }
             }
         }
@@ -124,7 +132,7 @@ pub fn access_polymorphic_element(
     // Check if this could be a choice element
     // Even without metadata, we can try to find polymorphic fields
     // based on the pattern of fields in the object
-    let matching_fields = get_polymorphic_fields(obj, field_name);
+    let matching_fields = get_polymorphic_fields(obj, field_name, version);
 
     // If we found any matches, it's likely a choice element
     if !matching_fields.is_empty() {
@@ -151,6 +159,7 @@ pub fn access_polymorphic_element(
 ///
 /// * `obj` - A reference to a HashMap representing a FHIR resource or part of a resource
 /// * `base_name` - The base name of the choice element to search for
+/// * `version` - The FHIR version of the data being evaluated (see issue #309)
 ///
 /// # Returns
 ///
@@ -158,6 +167,7 @@ pub fn access_polymorphic_element(
 fn get_polymorphic_fields(
     obj: &HashMap<String, EvaluationResult>,
     base_name: &str,
+    version: FhirVersion,
 ) -> Vec<(String, EvaluationResult)> {
     let mut matches = Vec::new();
 
@@ -170,9 +180,15 @@ fn get_polymorphic_fields(
     // typed variants that are both declared in the spec and present in the
     // data. More accurate than the JSON-key prefix scan below, which can
     // match unrelated fields whose names happen to start with `base_name`.
+    //
+    // The table MUST be the one for `version` — the evaluation context's FHIR
+    // version — not `default_enabled()`. Choice-element type sets differ
+    // between versions (`Observation.valueAttachment` is R5/R6 only,
+    // `Person.deceased[x]` is R5+ only), and consulting the wrong table makes
+    // the variant present in the data invisible here. See issue #309.
     let mut consulted_field_types = false;
     if let Some(EvaluationResult::String(resource_type, _, _)) = obj.get("resourceType")
-        && let Some(table) = helios_fhir::field_types(helios_fhir::FhirVersion::default_enabled())
+        && let Some(table) = helios_fhir::field_types(version)
     {
         consulted_field_types = true;
         for (parent, field, _ty, _is_collection) in table {
@@ -344,10 +360,11 @@ fn convert_fhir_field_to_fhirpath_type(value: &EvaluationResult, suffix: &str) -
 /// # Examples
 ///
 /// ```ignore
-/// // This function is used internally by the FHIRPath evaluator
-/// assert!(is_choice_element("value"));
-/// assert!(is_choice_element("effective"));
-/// assert!(!is_choice_element("name"));
+/// // This function is used internally by the FHIRPath evaluator.
+/// // The answer is version-specific: `class` is a choice base in R4 only,
+/// // `address` in R5 only (see issue #309).
+/// assert!(is_choice_element("value", FhirVersion::R4));
+/// assert!(is_choice_element("effective", FhirVersion::R4));
 /// ```
 /// Checks if a field name represents a FHIR choice element.
 ///
@@ -359,10 +376,16 @@ fn convert_fhir_field_to_fhirpath_type(value: &EvaluationResult, suffix: &str) -
 /// # Arguments
 /// * `field_name` - The field name to check
 /// * `context_metadata` - Optional slice of known choice element names for the context
+/// * `version` - The FHIR version of the data being evaluated, used only when
+///   `context_metadata` is `None` (see issue #309)
 ///
 /// # Returns
 /// `true` if the field is a choice element, `false` otherwise
-pub fn is_choice_element_with_context(field_name: &str, context_metadata: Option<&[&str]>) -> bool {
+pub fn is_choice_element_with_context(
+    field_name: &str,
+    context_metadata: Option<&[&str]>,
+    version: FhirVersion,
+) -> bool {
     // Pattern 1: Field name contains [x] - definitely a choice element
     if field_name.contains("[x]") {
         return true;
@@ -392,35 +415,39 @@ pub fn is_choice_element_with_context(field_name: &str, context_metadata: Option
     }
 
     // Without metadata, consult the generated `FIELD_TYPES` table for the
-    // default FHIR version: `field_name` is a choice base if at least one
-    // field in any parent type has the form `<field_name><UppercaseLetter>...`.
-    is_polymorphic_base_in_default_version(field_name)
+    // *evaluated data's* FHIR version: `field_name` is a choice base if at
+    // least one field in any parent type has the form
+    // `<field_name><UppercaseLetter>...`.
+    is_polymorphic_base_in_version(field_name, version)
 }
 
-/// Convenience function that calls is_choice_element_with_context without metadata.
-/// This is less accurate but maintains backward compatibility.
-pub fn is_choice_element(field_name: &str) -> bool {
-    is_choice_element_with_context(field_name, None)
+/// Convenience wrapper over [`is_choice_element_with_context`] for callers with
+/// no choice metadata to offer.
+fn is_choice_element(field_name: &str, version: FhirVersion) -> bool {
+    is_choice_element_with_context(field_name, None, version)
 }
 
-/// Returns true when `name` is the base of a polymorphic FHIR field in the
-/// default FHIR version's generated `FIELD_TYPES` table — i.e. some declared
-/// field is `<name><UppercaseLetter>...`. Lets the no-context choice-element
-/// check return a useful answer for common polymorphic bases (`value`,
-/// `effective`, `onset`, …) instead of the always-false fallback that
-/// preceded this.
-fn is_polymorphic_base_in_default_version(name: &str) -> bool {
-    let table: &[(&str, &str, &str, bool)] = match helios_fhir::FhirVersion::default_enabled() {
-        #[cfg(feature = "R4")]
-        helios_fhir::FhirVersion::R4 => helios_fhir::r4::FIELD_TYPES,
-        #[cfg(feature = "R4B")]
-        helios_fhir::FhirVersion::R4B => helios_fhir::r4b::FIELD_TYPES,
-        #[cfg(feature = "R5")]
-        helios_fhir::FhirVersion::R5 => helios_fhir::r5::FIELD_TYPES,
-        #[cfg(feature = "R6")]
-        helios_fhir::FhirVersion::R6 => helios_fhir::r6::FIELD_TYPES,
-        #[allow(unreachable_patterns)]
-        _ => return false,
+/// Returns true when `name` is the base of a polymorphic FHIR field in
+/// `version`'s generated `FIELD_TYPES` table — i.e. some declared field is
+/// `<name><UppercaseLetter>...`. Lets the no-context choice-element check
+/// return a useful answer for common polymorphic bases (`value`, `effective`,
+/// `onset`, …) instead of the always-false fallback that preceded this.
+///
+/// The answer is version-specific and genuinely differs: `class` is a
+/// polymorphic base in R4 (`Encounter.classHistory`) but not R5, and `address`
+/// is one in R5 (`VirtualServiceDetail.addressString`) but not R4 — hence
+/// issue #309.
+///
+/// Returns `false` when `version`'s feature isn't compiled in: the honest
+/// answer is "unknown", and `false` preserves the prior behaviour for that case.
+///
+/// NOTE: this scan is *parent-unscoped* — it asks whether any parent type
+/// anywhere has such a field — which makes it loose even within a single
+/// version. Tightening that is tracked separately; this function only fixes
+/// which version's table is consulted.
+fn is_polymorphic_base_in_version(name: &str, version: FhirVersion) -> bool {
+    let Some(table) = helios_fhir::field_types(version) else {
+        return false;
     };
     table.iter().any(|(_, f, _, _)| {
         f.strip_prefix(name)
@@ -442,6 +469,10 @@ fn is_polymorphic_base_in_default_version(name: &str) -> bool {
 /// * `op` - The operation to perform: "is" or "as"
 /// * `type_name` - The name of the type to check/convert to
 /// * `namespace` - Optional namespace for the type (e.g., "System", "FHIR")
+/// * `context` - The caller's evaluation context. Used for its `fhir_version`
+///   when delegating to [`crate::resource_type`] and to the choice-element
+///   check; previously a throwaway default-version context was fabricated here,
+///   which resolved types against the wrong FHIR version (issue #309).
 ///
 /// # Returns
 ///
@@ -453,15 +484,15 @@ fn is_polymorphic_base_in_default_version(name: &str) -> bool {
 /// ```ignore
 /// // This function is used internally by the FHIRPath evaluator
 /// // to handle polymorphic type operations on FHIR choice elements
-/// let result = apply_polymorphic_type_operation(value, op_type, target_type);
-/// let result1 = apply_polymorphic_type_operation(&value, "is", "Quantity", None);
-/// let result2 = apply_polymorphic_type_operation(&value, "as", "Quantity", None);
+/// let result1 = apply_polymorphic_type_operation(&value, "is", "Quantity", None, context);
+/// let result2 = apply_polymorphic_type_operation(&value, "as", "Quantity", None, context);
 /// ```
 pub fn apply_polymorphic_type_operation(
     value: &EvaluationResult,
     op: &str,
     type_name: &str,
-    _namespace: Option<&str>,
+    namespace: Option<&str>,
+    context: &crate::EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
     // Handle empty values first
     if let EvaluationResult::Empty = value {
@@ -483,7 +514,7 @@ pub fn apply_polymorphic_type_operation(
         if items.len() != 1 {
             return Ok(EvaluationResult::Empty);
         }
-        return apply_polymorphic_type_operation(&items[0], op, type_name, _namespace);
+        return apply_polymorphic_type_operation(&items[0], op, type_name, namespace, context);
     }
 
     // Since we need to determine if the original path is a choice element
@@ -592,30 +623,26 @@ pub fn apply_polymorphic_type_operation(
         // For proper type checking, delegate to resource_type module which has type hierarchy support
         match op {
             "is" => {
-                // First try using the resource_type module for proper type checking with hierarchy support
-                if let Some(ns) = _namespace {
-                    let type_spec = crate::parser::TypeSpecifier::QualifiedIdentifier(
+                // First try using the resource_type module for proper type checking with hierarchy
+                // support. The caller's context is passed through so the type hierarchy is read
+                // for the evaluated data's FHIR version rather than a fabricated default one
+                // (issue #309); it also avoids allocating a throwaway context per `is`/`as`.
+                let type_spec = match namespace {
+                    Some(ns) => crate::parser::TypeSpecifier::QualifiedIdentifier(
                         ns.to_string(),
                         Some(type_name.to_string()),
-                    );
-                    // Create a minimal context for type checking
-                    let context = crate::EvaluationContext::new_empty_with_default_version();
-                    if let Ok(result) =
-                        crate::resource_type::is_of_type_with_context(value, &type_spec, &context)
-                    {
-                        return Ok(EvaluationResult::boolean(result));
-                    }
-                } else {
-                    let type_spec = crate::parser::TypeSpecifier::QualifiedIdentifier(
+                    ),
+                    None => crate::parser::TypeSpecifier::QualifiedIdentifier(
                         type_name.to_string(),
                         None,
-                    );
-                    let context = crate::EvaluationContext::new_empty_with_default_version();
-                    if let Ok(result) =
-                        crate::resource_type::is_of_type_with_context(value, &type_spec, &context)
-                    {
-                        return Ok(EvaluationResult::boolean(result));
-                    }
+                    ),
+                };
+                // A resolution failure deliberately falls through to the heuristics below
+                // rather than propagating — `test_as_type_operation` depends on it.
+                if let Ok(result) =
+                    crate::resource_type::is_of_type_with_context(value, &type_spec, context)
+                {
+                    return Ok(EvaluationResult::boolean(result));
                 }
 
                 // Fall back to original implementation if resource_type didn't handle it
@@ -733,7 +760,7 @@ pub fn apply_polymorphic_type_operation(
                         for key in obj.keys() {
                             if key.ends_with(type_name) && key.len() > type_name.len() {
                                 let base_name = &key[0..(key.len() - type_name.len())];
-                                if is_choice_element(base_name) {
+                                if is_choice_element(base_name, context.fhir_version) {
                                     return Ok(EvaluationResult::boolean(true));
                                 }
                             }
@@ -858,7 +885,7 @@ pub fn apply_polymorphic_type_operation(
                 // The 'as' operator returns the input value if it 'is' of the specified type,
                 // otherwise it returns Empty.
                 let is_type_result =
-                    apply_polymorphic_type_operation(value, "is", type_name, _namespace)?;
+                    apply_polymorphic_type_operation(value, "is", type_name, namespace, context)?;
                 match is_type_result {
                     EvaluationResult::Boolean(true, _, _) => Ok(value.clone()),
                     EvaluationResult::Boolean(false, _, _) => Ok(EvaluationResult::Empty),
@@ -886,6 +913,18 @@ pub fn apply_polymorphic_type_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The version these version-agnostic tests run under. They use
+    /// `valueQuantity`, which is declared in every FHIR version, so the choice
+    /// of table does not affect them.
+    fn test_version() -> FhirVersion {
+        FhirVersion::default_enabled()
+    }
+
+    /// A minimal context for the `is`/`as` tests, at the default version.
+    fn ctx() -> crate::EvaluationContext {
+        crate::EvaluationContext::new_empty(test_version())
+    }
 
     // Helper function to create a FHIR Observation with a valueQuantity
     fn create_observation_with_quantity() -> HashMap<String, EvaluationResult> {
@@ -938,7 +977,7 @@ mod tests {
         let obs = create_observation_with_quantity();
 
         // Test accessing a polymorphic element
-        let value = access_polymorphic_element(&obs, "value").unwrap();
+        let value = access_polymorphic_element(&obs, "value", test_version()).unwrap();
 
         // Verify that it correctly finds valueQuantity
         if let EvaluationResult::Object {
@@ -964,12 +1003,14 @@ mod tests {
         // Since we enhanced our polymorphic_access.rs for choice elements,
         // we'll now recognize a valueQuantity object as a Quantity type
         let result =
-            apply_polymorphic_type_operation(&value_quantity, "is", "Quantity", None).unwrap();
+            apply_polymorphic_type_operation(&value_quantity, "is", "Quantity", None, &ctx())
+                .unwrap();
         assert_eq!(result, EvaluationResult::boolean(true)); // Now tests for true
 
         // Test is(String) on valueQuantity object directly
         let result =
-            apply_polymorphic_type_operation(&value_quantity, "is", "String", None).unwrap();
+            apply_polymorphic_type_operation(&value_quantity, "is", "String", None, &ctx())
+                .unwrap();
         assert_eq!(result, EvaluationResult::boolean(false));
 
         // Test is() on the Observation object itself
@@ -977,7 +1018,8 @@ mod tests {
             map: obs,
             type_info: None,
         };
-        let result = apply_polymorphic_type_operation(&obj, "is", "Observation", None).unwrap();
+        let result =
+            apply_polymorphic_type_operation(&obj, "is", "Observation", None, &ctx()).unwrap();
         assert_eq!(result, EvaluationResult::boolean(true));
     }
 
@@ -988,13 +1030,15 @@ mod tests {
         // First, let's test as(Quantity) on the valueQuantity object directly
         let value_quantity = obs.get("valueQuantity").unwrap().clone();
         let result =
-            apply_polymorphic_type_operation(&value_quantity, "is", "Quantity", None).unwrap();
+            apply_polymorphic_type_operation(&value_quantity, "is", "Quantity", None, &ctx())
+                .unwrap();
         // The valueQuantity looks like a Quantity type now, so is(Quantity) should be true
         assert_eq!(result, EvaluationResult::boolean(true)); // Updated to true
 
         // Now since is(Quantity) is true, as(Quantity) should return the original value
         let result =
-            apply_polymorphic_type_operation(&value_quantity, "as", "Quantity", None).unwrap();
+            apply_polymorphic_type_operation(&value_quantity, "as", "Quantity", None, &ctx())
+                .unwrap();
         assert_eq!(result, value_quantity);
 
         // Test with an Observation object
@@ -1005,11 +1049,144 @@ mod tests {
 
         // Testing valueQuantity field indirectly via Quantity
         // In our updated implementation, Observation.is(Quantity) should return true if it contains a valueQuantity
-        let result = apply_polymorphic_type_operation(&obj, "is", "Quantity", None).unwrap();
+        let result =
+            apply_polymorphic_type_operation(&obj, "is", "Quantity", None, &ctx()).unwrap();
         assert_eq!(result, EvaluationResult::boolean(true)); // Should return true because it contains valueQuantity
 
         // Test for a wrong type
-        let result = apply_polymorphic_type_operation(&obj, "is", "NonExistentType", None).unwrap();
+        let result =
+            apply_polymorphic_type_operation(&obj, "is", "NonExistentType", None, &ctx()).unwrap();
         assert_eq!(result, EvaluationResult::boolean(false));
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #309 — version-specific choice-element resolution.
+    //
+    // These need two version features compiled in to say anything: the bug is
+    // "consulted the default version's table instead of the data's", which is
+    // only observable when those differ. Each assertion is two-sided (R5 says
+    // yes, R4 says no) so it cannot be satisfied by hardcoding a different
+    // default.
+    // ------------------------------------------------------------------
+
+    /// An R5-only choice variant must be found when asking for R5, and must not
+    /// be invented when asking for R4.
+    ///
+    /// `Observation.valueAttachment` is declared in R5/R6 but not R4.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[test]
+    fn get_polymorphic_fields_honours_the_requested_version() {
+        let mut attachment = HashMap::new();
+        attachment.insert(
+            "title".to_string(),
+            EvaluationResult::string("scan.pdf".to_string()),
+        );
+
+        let mut obs = HashMap::new();
+        obs.insert(
+            "resourceType".to_string(),
+            EvaluationResult::string("Observation".to_string()),
+        );
+        obs.insert(
+            "valueAttachment".to_string(),
+            EvaluationResult::Object {
+                map: attachment,
+                type_info: None,
+            },
+        );
+
+        let r5 = get_polymorphic_fields(&obs, "value", FhirVersion::R5);
+        assert_eq!(
+            r5.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["valueAttachment"],
+            "R5 declares Observation.valueAttachment, so it must resolve"
+        );
+
+        let r4 = get_polymorphic_fields(&obs, "value", FhirVersion::R4);
+        assert!(
+            r4.is_empty(),
+            "R4 does not declare Observation.valueAttachment; the R4 table must \
+             not report it. Getting a hit here would mean the version argument \
+             is ignored."
+        );
+    }
+
+    /// The same, through the entry point the evaluator actually calls.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[test]
+    fn access_polymorphic_element_honours_the_requested_version() {
+        let mut attachment = HashMap::new();
+        attachment.insert(
+            "title".to_string(),
+            EvaluationResult::string("scan.pdf".to_string()),
+        );
+
+        let mut obs = HashMap::new();
+        obs.insert(
+            "resourceType".to_string(),
+            EvaluationResult::string("Observation".to_string()),
+        );
+        obs.insert(
+            "valueAttachment".to_string(),
+            EvaluationResult::Object {
+                map: attachment,
+                type_info: None,
+            },
+        );
+
+        assert!(
+            access_polymorphic_element(&obs, "value", FhirVersion::R5).is_some(),
+            "R5 Observation.value must resolve to the Attachment (issue #309)"
+        );
+        assert!(
+            access_polymorphic_element(&obs, "value", FhirVersion::R4).is_none(),
+            "R4 has no Observation.valueAttachment to resolve to"
+        );
+    }
+
+    /// Isolates "this choice base is new in R5" from "this parent type is new
+    /// in R5": `Person` is declared in both tables (18 field rows in R4), but
+    /// only R5 gives it `deceased[x]`.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[test]
+    fn choice_base_added_in_a_later_version_on_a_shared_parent() {
+        let mut person = HashMap::new();
+        person.insert(
+            "resourceType".to_string(),
+            EvaluationResult::string("Person".to_string()),
+        );
+        person.insert(
+            "deceasedBoolean".to_string(),
+            EvaluationResult::boolean(true),
+        );
+
+        assert_eq!(
+            access_polymorphic_element(&person, "deceased", FhirVersion::R5),
+            Some(EvaluationResult::boolean(true)),
+            "Person.deceased[x] is R5+; it must resolve under R5 (issue #309)"
+        );
+        assert!(
+            access_polymorphic_element(&person, "deceased", FhirVersion::R4).is_none(),
+            "R4 Person has no deceased[x]"
+        );
+    }
+
+    /// The choice-base *classification* is version-specific too. Verified
+    /// against the generated tables: `class` is a base in R4 only
+    /// (`Encounter.classHistory`), `address` in R5 only
+    /// (`VirtualServiceDetail.addressString`), and `value` in both.
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[test]
+    fn is_polymorphic_base_is_version_specific() {
+        assert!(is_polymorphic_base_in_version("class", FhirVersion::R4));
+        assert!(!is_polymorphic_base_in_version("class", FhirVersion::R5));
+
+        assert!(!is_polymorphic_base_in_version("address", FhirVersion::R4));
+        assert!(is_polymorphic_base_in_version("address", FhirVersion::R5));
+
+        // Control: a base present in every version must stay stable, so the
+        // check does not become spuriously version-sensitive.
+        assert!(is_polymorphic_base_in_version("value", FhirVersion::R4));
+        assert!(is_polymorphic_base_in_version("value", FhirVersion::R5));
     }
 }
