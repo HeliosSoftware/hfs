@@ -235,7 +235,10 @@ pub fn parse_output_value(
             None,
         )),
         "time" => Ok(EvaluationResult::Time(output_value.to_string(), None, None)),
-        "code" => Ok(EvaluationResult::String(
+        // FHIR primitive string types. `id` is used once (R5 miscEngineTests::
+        // testContainedId); before issue #307 an unparseable output type made the
+        // whole test a silent skip, so this gap was invisible.
+        "code" | "id" => Ok(EvaluationResult::String(
             output_value.to_string(),
             None,
             None,

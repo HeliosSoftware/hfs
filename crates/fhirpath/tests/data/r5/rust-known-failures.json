@@ -3,6 +3,21 @@
   "version": "1.0.0",
   "knownFailures": [
     {
+      "groupName": "cdaTests",
+      "testName": "testHasTemplateId1",
+      "reason": "CDA is not supported. The corpus marks this group mode=\"cda\" and its input data/r5/input/ccda.json has resourceType ClinicalDocument, which is a CDA document rather than a FHIR resource, so helios-fhir's R5 Resource enum cannot deserialise it; hasTemplateIdOf() is also unimplemented (no hit in crates/fhirpath/src). Removable when a CDA model and hasTemplateIdOf() land. Previously swallowed by the blanket 'failed to load JSON resource -> SKIP' branch, which counted nothing (#307). Listed per test rather than as a wildcard so all three entries are reported for deletion the moment CDA support arrives."
+    },
+    {
+      "groupName": "cdaTests",
+      "testName": "testHasTemplateId2",
+      "reason": "CDA is not supported: same cause as testHasTemplateId1, evaluating hasTemplateIdOf() from the ClinicalDocument root. Previously swallowed by the blanket resource-load skip (#307)."
+    },
+    {
+      "groupName": "cdaTests",
+      "testName": "testHasTemplateId3",
+      "reason": "CDA is not supported: same cause as testHasTemplateId1, via recordTarget.patientRole. Note this case expects false, so it must not be scored by asserting the expression simply fails to evaluate. Previously swallowed by the blanket resource-load skip (#307)."
+    },
+    {
       "groupName": "Precision",
       "testName": "PrecisionDecimal",
       "reason": "Decimal trailing zeros are not preserved, so precision() under-reports. Documented in crates/fhirpath/PRECISION_LIMITATION.md. Removable once EvaluationResult carries the source decimal's scale. Previously an in-body `if test.name == \"PrecisionDecimal\"` skip (#307)."
