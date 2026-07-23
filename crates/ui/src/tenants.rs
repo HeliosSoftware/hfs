@@ -267,12 +267,11 @@ pub async fn rows(
             error: None,
         });
     };
-    let rows = load_rows(storage, &query.q).await.unwrap_or_default();
-    render(TenantRowsPartial {
-        i18n,
-        rows,
-        error: None,
-    })
+    let (rows, error) = match load_rows(storage, &query.q).await {
+        Ok(rows) => (rows, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    render(TenantRowsPartial { i18n, rows, error })
 }
 
 /// Returns the refreshed (unfiltered) rows fragment, with an optional error
@@ -299,8 +298,10 @@ pub async fn create(
 
     let id = form.id.trim().to_string();
     let load = |err: Option<String>| async {
-        let rows = load_rows(storage, "").await.unwrap_or_default();
-        rows_response(i18n, rows, err)
+        match load_rows(storage, "").await {
+            Ok(rows) => rows_response(i18n, rows, err),
+            Err(e) => rows_response(i18n, Vec::new(), err.or(Some(e))),
+        }
     };
 
     if let Err(msg) = validate_id(&id) {
@@ -362,8 +363,10 @@ pub async fn delete(
         let _ = storage.purge_tenant_data(&id).await;
     }
 
-    let rows = load_rows(storage, "").await.unwrap_or_default();
-    rows_response(i18n, rows, None)
+    match load_rows(storage, "").await {
+        Ok(rows) => rows_response(i18n, rows, None),
+        Err(e) => rows_response(i18n, Vec::new(), Some(e)),
+    }
 }
 
 // (helpers below)
