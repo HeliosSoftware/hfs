@@ -8,8 +8,10 @@ use serde_json::json;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+    SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
 };
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
@@ -22,7 +24,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 /// Test number search with equality.
@@ -43,20 +48,26 @@ async fn test_number_search_eq() {
         "status": "final",
         "prediction": [{"probabilityDecimal": 0.75}]
     });
-    backend.create(&tenant, "RiskAssessment", risk1).await.unwrap();
-    backend.create(&tenant, "RiskAssessment", risk2).await.unwrap();
+    backend
+        .create(&tenant, "RiskAssessment", risk1, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "RiskAssessment", risk2, FhirVersion::default())
+        .await
+        .unwrap();
 
     let query = SearchQuery::new("RiskAssessment").with_parameter(SearchParameter {
         name: "probability".to_string(),
         param_type: SearchParamType::Number,
         modifier: None,
-        values: vec![SearchValue::number(SearchPrefix::Eq, 0.5)],
+        values: vec![SearchValue::new(SearchPrefix::Eq, "0.5")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -75,14 +86,12 @@ async fn test_number_search_lt() {
         name: "probability".to_string(),
         param_type: SearchParamType::Number,
         modifier: None,
-        values: vec![SearchValue::number(SearchPrefix::Lt, 0.6)],
+        values: vec![SearchValue::new(SearchPrefix::Lt, "0.6")],
         chain: vec![],
         components: vec![],
     });
 
-    let _result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let _result = backend.search(&tenant, &query.with_count(100)).await;
 
     // Test documents expected behavior for number comparisons
 }
@@ -98,12 +107,10 @@ async fn test_number_search_gt() {
         name: "probability".to_string(),
         param_type: SearchParamType::Number,
         modifier: None,
-        values: vec![SearchValue::number(SearchPrefix::Gt, 0.4)],
+        values: vec![SearchValue::new(SearchPrefix::Gt, "0.4")],
         chain: vec![],
         components: vec![],
     });
 
-    let _result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let _result = backend.search(&tenant, &query.with_count(100)).await;
 }

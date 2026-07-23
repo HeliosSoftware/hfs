@@ -8,8 +8,10 @@ use serde_json::json;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
@@ -26,7 +28,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 #[cfg(feature = "sqlite")]
@@ -58,7 +63,10 @@ async fn seed_test_patients(backend: &SqliteBackend, tenant: &TenantContext) {
     ];
 
     for patient in patients {
-        backend.create(tenant, "Patient", patient).await.unwrap();
+        backend
+            .create(tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 }
 
@@ -96,7 +104,10 @@ async fn seed_test_observations(backend: &SqliteBackend, tenant: &TenantContext)
     ];
 
     for obs in observations {
-        backend.create(tenant, "Observation", obs).await.unwrap();
+        backend
+            .create(tenant, "Observation", obs, FhirVersion::default())
+            .await
+            .unwrap();
     }
 }
 
@@ -117,24 +128,23 @@ async fn test_token_search_system_and_code() {
         name: "identifier".to_string(),
         param_type: SearchParamType::Token,
         modifier: None,
-        values: vec![SearchValue::token(
-            Some("http://example.org/mrn"),
-            "MRN001",
-        )],
+        values: vec![SearchValue::token(Some("http://example.org/mrn"), "MRN001")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     assert_eq!(result.resources.len(), 1);
-    let identifiers = &result.resources[0].content()["identifier"];
-    let has_match = identifiers.as_array().unwrap().iter().any(|id| {
-        id["system"] == "http://example.org/mrn" && id["value"] == "MRN001"
-    });
+    let identifiers = &result.resources.items[0].content()["identifier"];
+    let has_match = identifiers
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id["system"] == "http://example.org/mrn" && id["value"] == "MRN001");
     assert!(has_match);
 }
 
@@ -157,7 +167,7 @@ async fn test_token_search_code_only() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -183,7 +193,7 @@ async fn test_token_search_system_only() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -214,12 +224,12 @@ async fn test_token_search_gender() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     assert!(!result.resources.is_empty());
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert_eq!(resource.content()["gender"], "male");
     }
 }
@@ -242,7 +252,7 @@ async fn test_token_search_gender_female() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -271,12 +281,12 @@ async fn test_token_search_status() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find observations with status=final
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert_eq!(resource.content()["status"], "final");
     }
 }
@@ -304,12 +314,12 @@ async fn test_token_search_not_modifier() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should only find female patients
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert_ne!(resource.content()["gender"], "male");
     }
 }
@@ -340,7 +350,7 @@ async fn test_token_search_or_values() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -371,7 +381,7 @@ async fn test_token_search_identifier_no_system() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -405,7 +415,7 @@ async fn test_token_search_no_results() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 

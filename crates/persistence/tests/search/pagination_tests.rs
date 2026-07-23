@@ -5,10 +5,11 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+    SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
 };
 
 #[cfg(feature = "sqlite")]
@@ -22,7 +23,10 @@ fn create_sqlite_backend() -> SqliteBackend {
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 #[cfg(feature = "sqlite")]
@@ -33,7 +37,10 @@ async fn seed_many_patients(backend: &SqliteBackend, tenant: &TenantContext, cou
             "name": [{"family": format!("Patient{:03}", i)}],
             "birthDate": format!("19{:02}-01-01", 50 + (i % 50))
         });
-        backend.create(tenant, "Patient", patient).await.unwrap();
+        backend
+            .create(tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 }
 
@@ -49,11 +56,8 @@ async fn test_pagination_count() {
     let tenant = create_tenant();
     seed_many_patients(&backend, &tenant, 20).await;
 
-    let query = SearchQuery::new("Patient");
-    let result = backend
-        .search(&tenant, &query, Pagination::new(5))
-        .await
-        .unwrap();
+    let query = SearchQuery::new("Patient").with_count(5);
+    let result = backend.search(&tenant, &query).await.unwrap();
 
     assert_eq!(result.resources.len(), 5);
 }
@@ -66,11 +70,8 @@ async fn test_pagination_total() {
     let tenant = create_tenant();
     seed_many_patients(&backend, &tenant, 20).await;
 
-    let query = SearchQuery::new("Patient");
-    let result = backend
-        .search(&tenant, &query, Pagination::new(5))
-        .await
-        .unwrap();
+    let query = SearchQuery::new("Patient").with_count(5);
+    let result = backend.search(&tenant, &query).await.unwrap();
 
     // If total is supported, it should be 20
     if let Some(total) = result.total {
@@ -91,28 +92,27 @@ async fn test_cursor_pagination_forward() {
     seed_many_patients(&backend, &tenant, 20).await;
 
     // Get first page
-    let query = SearchQuery::new("Patient");
-    let page1 = backend
-        .search(&tenant, &query, Pagination::new(5))
-        .await
-        .unwrap();
+    let query = SearchQuery::new("Patient").with_count(5);
+    let page1 = backend.search(&tenant, &query).await.unwrap();
 
     assert_eq!(page1.resources.len(), 5);
-    assert!(page1.next_cursor.is_some(), "Should have next cursor");
+    assert!(
+        page1.resources.page_info.next_cursor.is_some(),
+        "Should have next cursor"
+    );
 
     // Get second page
-    if let Some(cursor) = page1.next_cursor {
-        let page2 = backend
-            .search(&tenant, &query, Pagination::with_cursor(5, cursor))
-            .await
-            .unwrap();
+    if let Some(cursor) = page1.resources.page_info.next_cursor.clone() {
+        let mut query2 = SearchQuery::new("Patient").with_count(5);
+        query2.cursor = Some(cursor);
+        let page2 = backend.search(&tenant, &query2).await.unwrap();
 
         assert_eq!(page2.resources.len(), 5);
 
         // Pages should not overlap
         let page1_ids: std::collections::HashSet<_> =
-            page1.resources.iter().map(|r| r.id()).collect();
-        for resource in &page2.resources {
+            page1.resources.items.iter().map(|r| r.id()).collect();
+        for resource in &page2.resources.items {
             assert!(
                 !page1_ids.contains(resource.id()),
                 "Pages should not overlap"
@@ -129,22 +129,22 @@ async fn test_paginate_all_results() {
     let tenant = create_tenant();
     seed_many_patients(&backend, &tenant, 25).await;
 
-    let query = SearchQuery::new("Patient");
     let mut all_ids = std::collections::HashSet::new();
-    let mut pagination = Pagination::new(10);
+    let mut cursor: Option<String> = None;
 
     loop {
-        let page = backend.search(&tenant, &query, pagination.clone()).await.unwrap();
+        let mut query = SearchQuery::new("Patient").with_count(10);
+        query.cursor = cursor.clone();
+        let page = backend.search(&tenant, &query).await.unwrap();
 
-        for resource in &page.resources {
+        for resource in &page.resources.items {
             let inserted = all_ids.insert(resource.id().to_string());
             assert!(inserted, "Should not see duplicate resources");
         }
 
-        if let Some(cursor) = page.next_cursor {
-            pagination = Pagination::with_cursor(10, cursor);
-        } else {
-            break;
+        match page.resources.page_info.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
         }
     }
 
@@ -160,24 +160,22 @@ async fn test_last_page_no_cursor() {
     let tenant = create_tenant();
     seed_many_patients(&backend, &tenant, 8).await;
 
-    let query = SearchQuery::new("Patient");
-
     // First page of 5
-    let page1 = backend
-        .search(&tenant, &query, Pagination::new(5))
-        .await
-        .unwrap();
-    assert!(page1.next_cursor.is_some());
+    let query = SearchQuery::new("Patient").with_count(5);
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert!(page1.resources.page_info.next_cursor.is_some());
 
     // Second page of remaining 3
-    if let Some(cursor) = page1.next_cursor {
-        let page2 = backend
-            .search(&tenant, &query, Pagination::with_cursor(5, cursor))
-            .await
-            .unwrap();
+    if let Some(cursor) = page1.resources.page_info.next_cursor.clone() {
+        let mut query2 = SearchQuery::new("Patient").with_count(5);
+        query2.cursor = Some(cursor);
+        let page2 = backend.search(&tenant, &query2).await.unwrap();
 
         assert_eq!(page2.resources.len(), 3);
-        assert!(page2.next_cursor.is_none(), "Last page should have no cursor");
+        assert!(
+            page2.resources.page_info.next_cursor.is_none(),
+            "Last page should have no cursor"
+        );
     }
 }
 
@@ -194,24 +192,24 @@ async fn test_pagination_with_sort() {
     seed_many_patients(&backend, &tenant, 20).await;
 
     // Sort by family name descending
-    let query = SearchQuery::new("Patient").with_sort(SortDirective::parse("-name"));
+    let query = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("-name"))
+        .with_count(5);
 
-    let page1 = backend
-        .search(&tenant, &query, Pagination::new(5))
-        .await
-        .unwrap();
+    let page1 = backend.search(&tenant, &query).await.unwrap();
 
-    if let Some(cursor) = page1.next_cursor {
-        let page2 = backend
-            .search(&tenant, &query, Pagination::with_cursor(5, cursor))
-            .await
-            .unwrap();
+    if let Some(cursor) = page1.resources.page_info.next_cursor.clone() {
+        let mut query2 = SearchQuery::new("Patient")
+            .with_sort(SortDirective::parse("-name"))
+            .with_count(5);
+        query2.cursor = Some(cursor);
+        let page2 = backend.search(&tenant, &query2).await.unwrap();
 
         // Last item of page1 should be >= first item of page2 (descending)
-        let last_p1 = page1.resources.last().unwrap().content()["name"][0]["family"]
+        let last_p1 = page1.resources.items.last().unwrap().content()["name"][0]["family"]
             .as_str()
             .unwrap();
-        let first_p2 = page2.resources[0].content()["name"][0]["family"]
+        let first_p2 = page2.resources.items[0].content()["name"][0]["family"]
             .as_str()
             .unwrap();
 
@@ -230,23 +228,23 @@ async fn test_pagination_with_asc_sort() {
     let tenant = create_tenant();
     seed_many_patients(&backend, &tenant, 20).await;
 
-    let query = SearchQuery::new("Patient").with_sort(SortDirective::parse("name"));
+    let query = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("name"))
+        .with_count(5);
 
-    let page1 = backend
-        .search(&tenant, &query, Pagination::new(5))
-        .await
-        .unwrap();
+    let page1 = backend.search(&tenant, &query).await.unwrap();
 
-    if let Some(cursor) = page1.next_cursor {
-        let page2 = backend
-            .search(&tenant, &query, Pagination::with_cursor(5, cursor))
-            .await
-            .unwrap();
+    if let Some(cursor) = page1.resources.page_info.next_cursor.clone() {
+        let mut query2 = SearchQuery::new("Patient")
+            .with_sort(SortDirective::parse("name"))
+            .with_count(5);
+        query2.cursor = Some(cursor);
+        let page2 = backend.search(&tenant, &query2).await.unwrap();
 
-        let last_p1 = page1.resources.last().unwrap().content()["name"][0]["family"]
+        let last_p1 = page1.resources.items.last().unwrap().content()["name"][0]["family"]
             .as_str()
             .unwrap();
-        let first_p2 = page2.resources[0].content()["name"][0]["family"]
+        let first_p2 = page2.resources.items[0].content()["name"][0]["family"]
             .as_str()
             .unwrap();
 
@@ -268,14 +266,11 @@ async fn test_pagination_empty_results() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let query = SearchQuery::new("Patient");
-    let result = backend
-        .search(&tenant, &query, Pagination::new(10))
-        .await
-        .unwrap();
+    let query = SearchQuery::new("Patient").with_count(10);
+    let result = backend.search(&tenant, &query).await.unwrap();
 
     assert!(result.resources.is_empty());
-    assert!(result.next_cursor.is_none());
+    assert!(result.resources.page_info.next_cursor.is_none());
 }
 
 /// Test pagination with count larger than results.
@@ -286,14 +281,11 @@ async fn test_pagination_count_larger_than_results() {
     let tenant = create_tenant();
     seed_many_patients(&backend, &tenant, 5).await;
 
-    let query = SearchQuery::new("Patient");
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await
-        .unwrap();
+    let query = SearchQuery::new("Patient").with_count(100);
+    let result = backend.search(&tenant, &query).await.unwrap();
 
     assert_eq!(result.resources.len(), 5);
-    assert!(result.next_cursor.is_none());
+    assert!(result.resources.page_info.next_cursor.is_none());
 }
 
 /// Test pagination count of 1.
@@ -304,20 +296,20 @@ async fn test_pagination_count_one() {
     let tenant = create_tenant();
     seed_many_patients(&backend, &tenant, 5).await;
 
-    let query = SearchQuery::new("Patient");
     let mut seen = 0;
-    let mut pagination = Pagination::new(1);
+    let mut cursor: Option<String> = None;
 
     loop {
-        let page = backend.search(&tenant, &query, pagination.clone()).await.unwrap();
+        let mut query = SearchQuery::new("Patient").with_count(1);
+        query.cursor = cursor.clone();
+        let page = backend.search(&tenant, &query).await.unwrap();
 
         assert!(page.resources.len() <= 1);
         seen += page.resources.len();
 
-        if let Some(cursor) = page.next_cursor {
-            pagination = Pagination::with_cursor(1, cursor);
-        } else {
-            break;
+        match page.resources.page_info.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
         }
     }
 
@@ -336,30 +328,31 @@ async fn test_pagination_with_filter() {
     let tenant = create_tenant();
     seed_many_patients(&backend, &tenant, 50).await;
 
-    // Search for patients with birth year starting with "19"
-    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
-        name: "birthdate".to_string(),
-        param_type: SearchParamType::Date,
-        modifier: None,
-        values: vec![SearchValue::date(
-            helios_persistence::types::SearchPrefix::Sa,
-            "1970-01-01",
-        )],
-        chain: vec![],
-        components: vec![],
-    });
-
     let mut total_found = 0;
-    let mut pagination = Pagination::new(10);
+    let mut cursor: Option<String> = None;
 
     loop {
-        let page = backend.search(&tenant, &query, pagination.clone()).await.unwrap();
+        // Search for patients with birth year starting with "19"
+        let mut query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "birthdate".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::new(
+                    helios_persistence::types::SearchPrefix::Sa,
+                    "1970-01-01",
+                )],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_count(10);
+        query.cursor = cursor.clone();
+        let page = backend.search(&tenant, &query).await.unwrap();
         total_found += page.resources.len();
 
-        if let Some(cursor) = page.next_cursor {
-            pagination = Pagination::with_cursor(10, cursor);
-        } else {
-            break;
+        match page.resources.page_info.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
         }
     }
 
