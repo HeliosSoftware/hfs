@@ -57,23 +57,19 @@ static METRIC_HANDLES: LazyLock<RwLock<HashMap<LabelTriple, (Counter, Histogram)
 /// Build the counter+histogram handles for one label triple. Only called on a
 /// cache miss (or for uncacheable exotic labels), so the `route` allocation here
 /// is amortized to once per distinct series.
-fn build_handles(
-    method: &Cow<'static, str>,
-    route: &Arc<str>,
-    status: &Cow<'static, str>,
-) -> (Counter, Histogram) {
+fn build_handles(method: &str, route: &Arc<str>, status: &str) -> (Counter, Histogram) {
     let route = route.to_string();
     let counter = metrics::counter!(
         "http_requests_total",
-        "method" => method.clone(),
+        "method" => method.to_string(),
         "route" => route.clone(),
-        "status" => status.clone(),
+        "status" => status.to_string(),
     );
     let histogram = metrics::histogram!(
         "http_request_duration_seconds",
-        "method" => method.clone(),
+        "method" => method.to_string(),
         "route" => route,
-        "status" => status.clone(),
+        "status" => status.to_string(),
     );
     (counter, histogram)
 }
