@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Workspace Structure
 
-The project is a Rust workspace with 17 crates (16 default-members; `pysof` excluded from the default build):
+The project is a Rust workspace with 19 crates (18 default-members; `pysof` excluded from the default build):
 
 | Crate | Description |
 |-------|-------------|
@@ -15,6 +15,7 @@ The project is a Rust workspace with 17 crates (16 default-members; `pysof` excl
 | **`helios-fhir-macro`** | Procedural macros for FHIR functionality. |
 | **`helios-fhirpath`** | FHIRPath expression language — parser (chumsky), evaluator, CLI tool, and HTTP server. |
 | **`helios-fhirpath-support`** | Shared support utilities for FHIRPath. |
+| **`helios-fhir-validator`** | FHIR resource validation — FHIR Schema based structural/profile engine, SD→schema converter, embedded core packs (R4–R6), deferred FHIRPath-constraint and terminology-binding effects. Configured via `HFS_VALIDATION_*`. |
 | **`helios-serde`** | JSON and XML serialization for FHIR resources (`xml` feature flag). |
 | **`helios-serde-support`** | Shared serde helpers. |
 | **`helios-rest`** | FHIR RESTful API layer (Axum) — handlers, middleware, extractors, multi-tenancy routing. |
@@ -26,6 +27,7 @@ The project is a Rust workspace with 17 crates (16 default-members; `pysof` excl
 | **`helios-audit`** | Audit logging — FHIR AuditEvent with IHE BALP profiles; pluggable sinks (database, file, CloudWatch, S3). Configured via `HFS_AUDIT_*`. |
 | **`helios-subscriptions`** | FHIR topic-based Subscriptions engine — rest-hook, websocket, email, and messaging channels. Configured via `HFS_SUBSCRIPTION(S)_*`. |
 | **`helios-cds-hooks`** | CDS Hooks protocol types and async service trait (HL7 CDS Hooks v3.0.0-ballot). Standalone library. |
+| **`helios-web`** | HTMX-first web UI foundation for HFS. |
 | **`pysof`** | Python bindings (PyO3/maturin) for SQL-on-FHIR. Excluded from default workspace build. |
 
 ### Binaries
@@ -39,6 +41,7 @@ The project is a Rust workspace with 17 crates (16 default-members; `pysof` excl
 | `sof-server` | helios-sof | SQL-on-FHIR HTTP server |
 | `config-advisor` | helios-persistence | Storage configuration advisor |
 | `hts` | helios-hts | FHIR Terminology Server (HTS) |
+| `validator-cli` | helios-fhir-validator | FHIR resource validator CLI (`cli` feature) |
 
 ### Key Design Patterns
 

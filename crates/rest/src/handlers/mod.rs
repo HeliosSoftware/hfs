@@ -41,6 +41,7 @@ pub mod subscription_event;
 pub mod subscriptions;
 pub mod update;
 pub mod user_settings;
+pub mod validate;
 pub mod versions;
 pub mod vread;
 #[cfg(feature = "subscriptions")]
@@ -89,5 +90,8 @@ pub use reindex::{
 pub use search::{search_get_handler, search_post_handler};
 pub use update::{conditional_update_handler, update_handler};
 pub use user_settings::{get_user_settings, patch_user_settings, put_user_settings};
+pub use validate::{
+    validate_instance_get_handler, validate_instance_post_handler, validate_type_handler,
+};
 pub use versions::versions_handler;
 pub use vread::vread_handler;
