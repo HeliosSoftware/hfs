@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
@@ -125,11 +126,21 @@ where
         });
     }
 
-    // Try to read existing resource for version check
-    let existing = state
+    // Try to read existing resource for version check.
+    //
+    // A deleted resource is brought back to life by a subsequent update
+    // (https://hl7.org/fhir/http.html#delete), so `Gone` here is not an error:
+    // it means there is no current version to match `If-Match` against, and the
+    // storage layer restores the resource on write.
+    let existing = match state
         .storage()
         .read(tenant.context(), &resource_type, &id)
-        .await?;
+        .await
+    {
+        Ok(existing) => existing,
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+        Err(e) => return Err(e.into()),
+    };
 
     // Handle If-Match precondition
     if let Some(if_match) = conditional.if_match() {
