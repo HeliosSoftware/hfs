@@ -2482,6 +2482,16 @@ mod postgres_integration {
         assert_eq!(backend.name(), "postgres");
     }
 
+    /// Instance-level tenancy + delegation contract for PostgreSQL (#369).
+    ///
+    /// `tests/backend_capability_contract.rs` pins the constructor-free
+    /// `PostgresBackend::declared_capabilities()`. This is the other half — that
+    /// the *instance* answers the same thing through `supports()`. The #369
+    /// defect lived in a hand-rolled `matches!` ladder inside `supports()`, so a
+    /// declaration test alone would not have caught it. PostgreSQL is the one
+    /// backend whose instance assertions need a live database, and it always has
+    /// one: `create_backend()` panics rather than skipping, and CI makes
+    /// `DOCKER_HOST` mandatory.
     #[tokio::test]
     async fn postgres_integration_capabilities() {
         let backend = create_backend().await;
@@ -2496,6 +2506,30 @@ mod postgres_integration {
         assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
         assert!(backend.supports(BackendCapability::Include));
         assert!(backend.supports(BackendCapability::Revinclude));
+
+        // The #369 regression, asserted on the live instance rather than the
+        // declaration: PostgreSQL is shared-schema only.
+        assert!(backend.supports(BackendCapability::SharedSchema));
+        assert!(
+            !backend.supports(BackendCapability::SchemaPerTenant),
+            "PostgreSQL has no SET search_path / CREATE SCHEMA path; declaring schema-per-tenant \
+             overstates isolation. See #369."
+        );
+        assert!(
+            !backend.supports(BackendCapability::DatabasePerTenant),
+            "PostgreSQL has no CREATE DATABASE / per-tenant pool; declaring database-per-tenant \
+             overstates isolation. See #369."
+        );
+
+        // supports() must agree with capabilities() for every declared
+        // capability — the delegation the #369 fix relies on, checked live.
+        for capability in backend.capabilities() {
+            assert!(
+                backend.supports(capability),
+                "postgres capabilities() lists {capability:?} but supports() denies it — the two \
+                 have drifted apart (#369)."
+            );
+        }
     }
 
     // ========================================================================

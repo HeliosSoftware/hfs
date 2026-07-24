@@ -146,6 +146,24 @@ impl ReferenceHandler {
     ///
     /// This searches for references where the target resource has a matching identifier.
     /// Requires a join or subquery on the identifier search index.
+    ///
+    /// # Tenant scoping
+    ///
+    /// Every `si2` sub-select carries `si2.tenant_id = ?1`. It is load-bearing,
+    /// not defensive: without it the `EXISTS` is satisfied by *any* tenant's
+    /// identifier row whose resource id matches the reference, so
+    /// `subject:identifier=…` returns this tenant's rows on the strength of
+    /// another tenant's identifiers — a cross-tenant match oracle, and a
+    /// violation of the `tenant_id` discriminator that
+    /// [`BackendCapability::SharedSchema`](crate::core::BackendCapability::SharedSchema)
+    /// promises every query carries. The Postgres equivalent has always scoped
+    /// both levels (`postgres/search/query_builder.rs`).
+    ///
+    /// `?1` is the tenant in every param layout `QueryBuilder` produces
+    /// (see its `with_param_offset`), so reusing it consumes no binding and
+    /// leaves `param_num` arithmetic untouched. `resource_type` is deliberately
+    /// *not* constrained: `si2` describes the reference *target*, whose type
+    /// differs from the searched type.
     fn build_identifier_condition(identifier_value: &str, param_num: usize) -> SqlFragment {
         // Parse the identifier value (system|value format)
         if let Some(pipe_pos) = identifier_value.find('|') {
@@ -156,7 +174,7 @@ impl ReferenceHandler {
                 // |value - match value with no system
                 SqlFragment::with_params(
                     format!(
-                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND (si2.value_token_system IS NULL OR si2.value_token_system = '') AND si2.value_token_code = ?{})",
+                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.tenant_id = ?1 AND si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND (si2.value_token_system IS NULL OR si2.value_token_system = '') AND si2.value_token_code = ?{})",
                         param_num
                     ),
                     vec![SqlParam::string(value)],
@@ -165,7 +183,7 @@ impl ReferenceHandler {
                 // system| - match any value in system
                 SqlFragment::with_params(
                     format!(
-                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_system = ?{})",
+                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.tenant_id = ?1 AND si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_system = ?{})",
                         param_num
                     ),
                     vec![SqlParam::string(system)],
@@ -174,7 +192,7 @@ impl ReferenceHandler {
                 // system|value - exact match
                 SqlFragment::with_params(
                     format!(
-                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_system = ?{} AND si2.value_token_code = ?{})",
+                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.tenant_id = ?1 AND si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_system = ?{} AND si2.value_token_code = ?{})",
                         param_num,
                         param_num + 1
                     ),
@@ -185,7 +203,7 @@ impl ReferenceHandler {
             // Just a value - match any system
             SqlFragment::with_params(
                 format!(
-                    "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_code = ?{})",
+                    "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.tenant_id = ?1 AND si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_code = ?{})",
                     param_num
                 ),
                 vec![SqlParam::string(identifier_value)],

@@ -108,6 +108,57 @@ fn assert_exactly_one_tenancy_claim(backend: &str, declared: &[BackendCapability
     );
 }
 
+/// Asserts a live instance's `supports()` agrees with its `capabilities()`, and
+/// that its tenancy claim is exactly shared-schema.
+///
+/// The golden-list tests assert the constructor-free `declared_capabilities()`.
+/// This asserts the *instance* trait methods, because the #369 defect lived in
+/// a hand-rolled `matches!` ladder inside `supports()`. Both methods currently
+/// delegate to one declaration, so they agree — but that delegation is exactly
+/// what a regression would undo, silently, with every golden test still green.
+/// It needs no database: the SQLite/MongoDB/Elasticsearch constructors that
+/// call it open no connection.
+///
+/// Only valid for the shared-schema backends; S3's tenancy is mode-dependent and
+/// has its own coverage in `src/backends/s3/tests.rs`.
+#[cfg(any(feature = "sqlite", feature = "mongodb", feature = "elasticsearch"))]
+fn assert_shared_schema_instance_is_consistent<B: helios_persistence::core::Backend>(
+    name: &str,
+    backend: &B,
+) {
+    let capabilities = backend.capabilities();
+
+    // Every declared capability must also be reported by supports().
+    for capability in &capabilities {
+        assert!(
+            backend.supports(*capability),
+            "{name}: capabilities() lists {capability:?} but supports({capability:?}) is false — \
+             the two have drifted apart. Both must derive from one declaration per backend (#369)."
+        );
+    }
+
+    // supports() must agree with capabilities() on every tenancy topology — a
+    // re-hand-rolled supports() ladder is exactly how #369's false claim shipped.
+    for capability in TENANCY_CAPABILITIES {
+        assert_eq!(
+            backend.supports(capability),
+            capabilities.contains(&capability),
+            "{name}: supports({capability:?}) disagrees with capabilities()."
+        );
+    }
+
+    assert_exactly_one_tenancy_claim(name, &capabilities);
+    assert!(
+        backend.supports(BackendCapability::SharedSchema),
+        "{name}: separates tenants by a tenant_id discriminator and must report SharedSchema."
+    );
+    assert!(
+        !backend.supports(BackendCapability::SchemaPerTenant)
+            && !backend.supports(BackendCapability::DatabasePerTenant),
+        "{name}: must not report a per-schema or per-database isolation topology (#369)."
+    );
+}
+
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
@@ -151,7 +202,10 @@ mod postgres {
                 BackendCapability::SystemHistory,
                 BackendCapability::BasicSearch,
                 BackendCapability::DateSearch,
+                BackendCapability::QuantitySearch,
                 BackendCapability::ReferenceSearch,
+                BackendCapability::ChainedSearch,
+                BackendCapability::ReverseChaining,
                 BackendCapability::FullTextSearch,
                 BackendCapability::Sorting,
                 BackendCapability::OffsetPagination,
@@ -164,6 +218,7 @@ mod postgres {
                 BackendCapability::BulkSubmitRestWorker,
                 BackendCapability::Include,
                 BackendCapability::Revinclude,
+                BackendCapability::InDbSofRunner,
                 BackendCapability::SharedSchema,
             ],
         );
@@ -201,9 +256,14 @@ mod sqlite {
                 BackendCapability::SystemHistory,
                 BackendCapability::BasicSearch,
                 BackendCapability::DateSearch,
+                BackendCapability::QuantitySearch,
                 BackendCapability::ReferenceSearch,
+                BackendCapability::ChainedSearch,
+                BackendCapability::ReverseChaining,
+                BackendCapability::FullTextSearch,
                 BackendCapability::Sorting,
                 BackendCapability::OffsetPagination,
+                BackendCapability::CursorPagination,
                 BackendCapability::Transactions,
                 BackendCapability::OptimisticLocking,
                 BackendCapability::BulkExport,
@@ -211,16 +271,27 @@ mod sqlite {
                 BackendCapability::BulkSubmitRestWorker,
                 BackendCapability::Include,
                 BackendCapability::Revinclude,
+                BackendCapability::InDbSofRunner,
                 BackendCapability::SharedSchema,
             ],
         );
+    }
+
+    /// Instance-level counterpart to the golden-list test: proves `supports()`
+    /// and `capabilities()` agree on a real backend, not just on the
+    /// constructor-free declaration. `in_memory()` opens no file and needs no
+    /// infrastructure.
+    #[test]
+    fn sqlite_instance_supports_matches_capabilities() {
+        let backend = SqliteBackend::in_memory().expect("in-memory SQLite backend");
+        assert_shared_schema_instance_is_consistent("sqlite", &backend);
     }
 }
 
 #[cfg(feature = "mongodb")]
 mod mongodb {
     use super::*;
-    use helios_persistence::backends::mongodb::MongoBackend;
+    use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
 
     #[test]
     fn mongodb_declares_shared_schema_only() {
@@ -244,22 +315,39 @@ mod mongodb {
                 BackendCapability::SystemHistory,
                 BackendCapability::BasicSearch,
                 BackendCapability::DateSearch,
+                BackendCapability::QuantitySearch,
                 BackendCapability::ReferenceSearch,
+                BackendCapability::ChainedSearch,
+                BackendCapability::ReverseChaining,
+                BackendCapability::Include,
+                BackendCapability::Revinclude,
                 BackendCapability::Sorting,
                 BackendCapability::OffsetPagination,
                 BackendCapability::CursorPagination,
                 BackendCapability::Transactions,
                 BackendCapability::OptimisticLocking,
+                BackendCapability::BulkExport,
+                BackendCapability::InDbSofRunner,
                 BackendCapability::SharedSchema,
             ],
         );
+    }
+
+    /// Instance-level counterpart to the golden-list test. `MongoBackend::new`
+    /// validates the connection string and parks the driver client in a
+    /// `OnceCell`, connecting lazily — so this needs no MongoDB server.
+    #[test]
+    fn mongodb_instance_supports_matches_capabilities() {
+        let backend =
+            MongoBackend::new(MongoBackendConfig::default()).expect("MongoBackend from defaults");
+        assert_shared_schema_instance_is_consistent("mongodb", &backend);
     }
 }
 
 #[cfg(feature = "elasticsearch")]
 mod elasticsearch {
     use super::*;
-    use helios_persistence::backends::elasticsearch::ElasticsearchBackend;
+    use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
 
     /// Elasticsearch names indices `{prefix}_{tenant}_{type}`, which looks like a
     /// per-tenant topology. It declares `SharedSchema` because every document
@@ -288,6 +376,8 @@ mod elasticsearch {
                 BackendCapability::DateSearch,
                 BackendCapability::QuantitySearch,
                 BackendCapability::ReferenceSearch,
+                BackendCapability::ChainedSearch,
+                BackendCapability::ReverseChaining,
                 BackendCapability::FullTextSearch,
                 BackendCapability::Sorting,
                 BackendCapability::CursorPagination,
@@ -297,6 +387,15 @@ mod elasticsearch {
                 BackendCapability::SharedSchema,
             ],
         );
+    }
+
+    /// Instance-level counterpart to the golden-list test. `ElasticsearchBackend::new`
+    /// only builds the HTTP client, so this needs no Elasticsearch cluster.
+    #[test]
+    fn elasticsearch_instance_supports_matches_capabilities() {
+        let backend =
+            ElasticsearchBackend::new(ElasticsearchConfig::default()).expect("ES backend");
+        assert_shared_schema_instance_is_consistent("elasticsearch", &backend);
     }
 }
 
@@ -376,7 +475,7 @@ mod s3 {
     }
 
     #[test]
-    fn s3_declares_exactly_its_golden_capabilities() {
+    fn s3_prefix_per_tenant_declares_exactly_its_golden_capabilities() {
         assert_declares_exactly(
             "s3 (PrefixPerTenant)",
             &S3Backend::declared_capabilities_for(&prefix_mode()),
@@ -393,5 +492,32 @@ mod s3 {
                 BackendCapability::SharedSchema,
             ],
         );
+    }
+
+    /// The `BucketPerTenant` counterpart. Without it only the tenancy claim of
+    /// that mode was pinned, so any *other* capability could drift on the bucket
+    /// path unnoticed. Its golden list is the `PrefixPerTenant` one with the
+    /// tenancy variant swapped, asserted for both `default_system_bucket`
+    /// settings because that field must not influence any capability.
+    #[test]
+    fn s3_bucket_per_tenant_declares_exactly_its_golden_capabilities() {
+        for default_system_bucket in [None, Some("system")] {
+            assert_declares_exactly(
+                "s3 (BucketPerTenant)",
+                &S3Backend::declared_capabilities_for(&bucket_mode(default_system_bucket)),
+                &[
+                    BackendCapability::Crud,
+                    BackendCapability::Versioning,
+                    BackendCapability::InstanceHistory,
+                    BackendCapability::TypeHistory,
+                    BackendCapability::SystemHistory,
+                    BackendCapability::OptimisticLocking,
+                    BackendCapability::CursorPagination,
+                    BackendCapability::BulkExport,
+                    BackendCapability::BulkSubmitIngest,
+                    BackendCapability::DatabasePerTenant,
+                ],
+            );
+        }
     }
 }

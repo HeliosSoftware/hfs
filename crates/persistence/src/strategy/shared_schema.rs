@@ -1,8 +1,13 @@
 //! Shared schema tenancy strategy.
 //!
-//! In this strategy, all tenants share the same database tables with a
-//! `tenant_id` column used to filter data. This is the simplest and most
-//! common approach for multi-tenant applications.
+//! In this topology, all tenants share the same database tables with a
+//! `tenant_id` column used to filter data. This is the topology every backend
+//! in the crate actually implements.
+//!
+//! Note, however, that the type in *this* module is a SQL-text generator that
+//! no backend calls — backends apply the `tenant_id` discriminator directly, in
+//! their own query code, not through this generator. Do not mistake this type
+//! for the live code path (see issue #370).
 
 use serde::{Deserialize, Serialize};
 

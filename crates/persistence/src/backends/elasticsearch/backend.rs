@@ -182,6 +182,8 @@ impl ElasticsearchBackend {
             BackendCapability::DateSearch,
             BackendCapability::QuantitySearch,
             BackendCapability::ReferenceSearch,
+            BackendCapability::ChainedSearch,
+            BackendCapability::ReverseChaining,
             BackendCapability::FullTextSearch,
             BackendCapability::Sorting,
             BackendCapability::CursorPagination,
@@ -653,7 +655,15 @@ mod tests {
         assert!(backend.supports(BackendCapability::CursorPagination));
         assert!(backend.supports(BackendCapability::Sorting));
         assert!(!backend.supports(BackendCapability::Transactions));
-        assert!(!backend.supports(BackendCapability::ChainedSearch));
+        // Chained/`_has` search resolves via the backend-agnostic resolver over
+        // ES's `search()` (which honours `_id`), so ES declares it.
+        assert!(backend.supports(BackendCapability::ChainedSearch));
+        assert!(backend.supports(BackendCapability::ReverseChaining));
+        // No history/versioning on ES, and never a tenancy topology beyond
+        // shared-schema.
+        assert!(!backend.supports(BackendCapability::Versioning));
+        assert!(!backend.supports(BackendCapability::SchemaPerTenant));
+        assert!(!backend.supports(BackendCapability::DatabasePerTenant));
     }
 
     #[test]

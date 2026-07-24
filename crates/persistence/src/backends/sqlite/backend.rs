@@ -201,9 +201,14 @@ impl SqliteBackend {
             BackendCapability::SystemHistory,
             BackendCapability::BasicSearch,
             BackendCapability::DateSearch,
+            BackendCapability::QuantitySearch,
             BackendCapability::ReferenceSearch,
+            BackendCapability::ChainedSearch,
+            BackendCapability::ReverseChaining,
+            BackendCapability::FullTextSearch,
             BackendCapability::Sorting,
             BackendCapability::OffsetPagination,
+            BackendCapability::CursorPagination,
             BackendCapability::Transactions,
             BackendCapability::OptimisticLocking,
             BackendCapability::BulkExport,
@@ -211,6 +216,7 @@ impl SqliteBackend {
             BackendCapability::BulkSubmitRestWorker,
             BackendCapability::Include,
             BackendCapability::Revinclude,
+            BackendCapability::InDbSofRunner,
             BackendCapability::SharedSchema,
         ]
     }
@@ -793,7 +799,16 @@ mod tests {
         assert!(backend.supports(BackendCapability::BulkExport));
         assert!(backend.supports(BackendCapability::BulkSubmitIngest));
         assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
-        assert!(!backend.supports(BackendCapability::FullTextSearch));
+        // FullTextSearch is now implemented (tenant-scoped `resource_fts`); the
+        // other newly-declared capabilities are verified against the golden list
+        // in `tests/backend_capability_contract.rs`.
+        assert!(backend.supports(BackendCapability::FullTextSearch));
+        assert!(backend.supports(BackendCapability::QuantitySearch));
+        assert!(backend.supports(BackendCapability::CursorPagination));
+        assert!(backend.supports(BackendCapability::InDbSofRunner));
+        // Never a tenant-isolation topology beyond shared-schema (#369).
+        assert!(!backend.supports(BackendCapability::SchemaPerTenant));
+        assert!(!backend.supports(BackendCapability::DatabasePerTenant));
     }
 
     #[tokio::test]

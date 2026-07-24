@@ -270,7 +270,10 @@ impl PostgresBackend {
             BackendCapability::SystemHistory,
             BackendCapability::BasicSearch,
             BackendCapability::DateSearch,
+            BackendCapability::QuantitySearch,
             BackendCapability::ReferenceSearch,
+            BackendCapability::ChainedSearch,
+            BackendCapability::ReverseChaining,
             BackendCapability::FullTextSearch,
             BackendCapability::Sorting,
             BackendCapability::OffsetPagination,
@@ -283,6 +286,7 @@ impl PostgresBackend {
             BackendCapability::BulkSubmitRestWorker,
             BackendCapability::Include,
             BackendCapability::Revinclude,
+            BackendCapability::InDbSofRunner,
             BackendCapability::SharedSchema,
         ]
     }

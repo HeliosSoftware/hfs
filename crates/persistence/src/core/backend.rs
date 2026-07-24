@@ -94,12 +94,26 @@ pub enum BackendCapability {
     /// Reference search.
     ReferenceSearch,
     /// Chained search parameters.
+    ///
+    /// Declared by any backend on which a chained query resolves correctly in a
+    /// running deployment, whether the backend joins natively or the
+    /// persistence layer's backend-agnostic resolver
+    /// (`crate::search::resolve_chains`) rewrites the chain into an `_id` filter
+    /// that the backend's `search()` then executes. It therefore requires a
+    /// working `search()` that honours `_id`; a backend without search (e.g.
+    /// object-store S3) does not declare it.
     ChainedSearch,
     /// Reverse chaining (_has).
+    ///
+    /// Same basis as [`ChainedSearch`](BackendCapability::ChainedSearch): a
+    /// deployment resolves `_has` correctly, natively or via the shared
+    /// resolver, so any search-capable backend that honours `_id` declares it.
     ReverseChaining,
-    /// _include support.
+    /// `_include` support — resolved either inline by the backend's `search()`
+    /// or by the persistence/REST layer's iterative include resolver over it.
     Include,
-    /// _revinclude support.
+    /// `_revinclude` support — resolved either inline by the backend's
+    /// `search()` or by the persistence/REST layer's iterative resolver over it.
     Revinclude,
     /// Full-text search (_text, _content, :text).
     FullTextSearch,
@@ -147,6 +161,9 @@ pub enum BackendCapability {
     ///
     /// Mutually exclusive with [`SharedSchema`](BackendCapability::SharedSchema)
     /// and [`DatabasePerTenant`](BackendCapability::DatabasePerTenant).
+    ///
+    /// No backend in this crate declares this today; PostgreSQL in particular
+    /// issues no `CREATE SCHEMA` and no `SET search_path` for tenancy.
     SchemaPerTenant,
     /// Database-per-tenant multitenancy: each tenant gets a distinct physical
     /// database or storage container with its own connection, credential, and
@@ -154,8 +171,17 @@ pub enum BackendCapability {
     ///
     /// Mutually exclusive with [`SharedSchema`](BackendCapability::SharedSchema)
     /// and [`SchemaPerTenant`](BackendCapability::SchemaPerTenant).
+    ///
+    /// An S3 backend configured for `S3TenancyMode::BucketPerTenant` is the only
+    /// configuration in this crate that declares it. No SQL backend does.
     DatabasePerTenant,
-    /// Backend can compile ViewDefinitions to SQL and run them in-DB (no in-process FHIRPath eval).
+    /// Backend can compile ViewDefinitions to an in-database query and run them
+    /// in-DB with no in-process FHIRPath eval — SQL for the SQLite and
+    /// PostgreSQL backends, an aggregation pipeline for MongoDB. A backend whose
+    /// `sof_runner()` falls back to in-process evaluation (e.g. S3) does not
+    /// declare it. The compiler may reject individual ViewDefinitions as
+    /// uncompilable; the capability asserts the in-DB path exists and is wired,
+    /// not that every ViewDefinition compiles.
     InDbSofRunner,
     /// Backend supports raw SQL queries via `$sql-query-run` (Postgres, SQLite only).
     RawSqlQuery,

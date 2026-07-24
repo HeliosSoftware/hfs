@@ -3885,3 +3885,180 @@ async fn test_text_advanced_porter_stemming() {
         }
     }
 }
+
+// ============================================================================
+// Cross-tenant search isolation
+//
+// Regression tests for the `tenant_id` discriminator that
+// `BackendCapability::SharedSchema` promises every query carries. Three SQLite
+// search sub-selects previously scanned *every* tenant's rows and returned a
+// bare `resource_id`/`EXISTS` result that the tenant-filtered outer query then
+// intersected — so tenant A's row was returned whenever tenant B's same-id row
+// matched. See the `tenant_id = ?1` additions in
+// `sqlite/search/{query_builder.rs, filter_parser.rs, parameter_handlers/reference.rs}`.
+//
+// Each test is symmetric: it runs one query against two tenants that hold the
+// same resource id with tenant-unique content. The owning tenant must match
+// (proving the query and indexing work) and the other tenant must not (proving
+// isolation) — so a query-syntax mistake fails loudly rather than passing
+// vacuously.
+// ============================================================================
+mod cross_tenant_search_isolation {
+    use super::*;
+    use helios_persistence::types::SearchModifier;
+
+    #[tokio::test]
+    async fn content_fts_search_does_not_leak_across_tenants() {
+        let backend = create_backend();
+        let tenant_a = create_tenant("tenant-a");
+        let tenant_b = create_tenant("tenant-b");
+
+        backend
+            .create(
+                &tenant_a,
+                "Patient",
+                json!({"resourceType":"Patient","id":"shared","name":[{"family":"Alphafamilyone"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant_b,
+                "Patient",
+                json!({"resourceType":"Patient","id":"shared","name":[{"family":"Bravofamilytwo"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Search for tenant B's unique content.
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_content".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Bravofamilytwo")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        assert_eq!(
+            search_ids(&backend, &tenant_b, &query).await,
+            vec!["shared".to_string()],
+            "owning tenant B must match its own _content"
+        );
+        assert!(
+            search_ids(&backend, &tenant_a, &query).await.is_empty(),
+            "_content FTS leaked tenant B's content into tenant A's results"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_search_does_not_leak_across_tenants() {
+        let backend = create_backend();
+        let tenant_a = create_tenant("tenant-a");
+        let tenant_b = create_tenant("tenant-b");
+
+        backend
+            .create(
+                &tenant_a,
+                "Patient",
+                json!({"resourceType":"Patient","id":"shared","name":[{"family":"Alphafilterfam"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant_b,
+                "Patient",
+                json!({"resourceType":"Patient","id":"shared","name":[{"family":"Bravofilterfam"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // `co` (contains) is robust to how the name is normalized in the index.
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_filter".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("name co \"Bravofilterfam\"")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        assert_eq!(
+            search_ids(&backend, &tenant_b, &query).await,
+            vec!["shared".to_string()],
+            "owning tenant B must match its own _filter expression"
+        );
+        assert!(
+            search_ids(&backend, &tenant_a, &query).await.is_empty(),
+            "_filter leaked tenant B's rows into tenant A's results"
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_identifier_search_does_not_leak_across_tenants() {
+        let backend = create_backend();
+        let tenant_a = create_tenant("tenant-a");
+        let tenant_b = create_tenant("tenant-b");
+
+        // Both tenants hold Patient/pat-shared, but with different identifiers,
+        // and each has its own Observation referencing that patient.
+        for (tenant, mrn, obs_id) in [
+            (&tenant_a, "AAA-tenant-a", "obs-a"),
+            (&tenant_b, "BBB-tenant-b", "obs-b"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({
+                        "resourceType":"Patient","id":"pat-shared",
+                        "identifier":[{"system":"http://ex.org/mrn","value": mrn}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType":"Observation","id": obs_id,"status":"final",
+                        "code":{"coding":[{"code":"x"}]},
+                        "subject":{"reference":"Patient/pat-shared"}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Resolve subjects by tenant B's identifier value.
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: Some(SearchModifier::Identifier),
+            values: vec![SearchValue::token(
+                Some("http://ex.org/mrn"),
+                "BBB-tenant-b",
+            )],
+            chain: vec![],
+            components: vec![],
+        });
+
+        assert_eq!(
+            search_ids(&backend, &tenant_b, &query).await,
+            vec!["obs-b".to_string()],
+            "owning tenant B must resolve its own :identifier reference"
+        );
+        assert!(
+            search_ids(&backend, &tenant_a, &query).await.is_empty(),
+            ":identifier reference search leaked tenant B's identifier into tenant A's results"
+        );
+    }
+}
