@@ -719,6 +719,23 @@ async fn mongodb_integration_string_exact_is_case_sensitive() {
         ":exact is case-sensitive, so 'smith' must not match 'Smith'"
     );
 
+    // `:contains` is a case-insensitive substring match: "MITH" finds every
+    // spelling regardless of case.
+    let contains = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "family".to_string(),
+        param_type: SearchParamType::String,
+        modifier: Some(SearchModifier::Contains),
+        values: vec![SearchValue::eq("MITH")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &contains).await.unwrap();
+    assert_eq!(
+        result.resources.items.len(),
+        3,
+        ":contains is case-insensitive"
+    );
+
     // The default match stays case-insensitive (prefix), so it still finds all
     // three spellings.
     let insensitive = SearchQuery::new("Patient").with_parameter(SearchParameter {

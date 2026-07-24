@@ -1208,6 +1208,78 @@ mod postgres_integration {
         );
     }
 
+    /// A restored SearchParameter re-enters the tenant's registry overlay.
+    ///
+    /// Deleting a custom SearchParameter unregisters it; bringing it back with
+    /// a PUT has to reload the stored-parameter cache the way a create does,
+    /// or the parameter stays invisible to search until the process restarts.
+    #[tokio::test]
+    async fn postgres_integration_restored_search_parameter_reenters_registry() {
+        use helios_persistence::core::SearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let search_param = json!({
+            "resourceType": "SearchParameter",
+            "id": "pg-restore-sp",
+            "url": "http://example.org/fhir/SearchParameter/pg-restore-sp",
+            "name": "pgrestoresp",
+            "status": "active",
+            "code": "pgrestoresp",
+            "base": ["Observation"],
+            "type": "token",
+            "expression": "Observation.code"
+        });
+
+        backend
+            .create_or_update(
+                &tenant,
+                "SearchParameter",
+                "pg-restore-sp",
+                search_param.clone(),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        {
+            let reg = backend.search_param_registry(&tenant);
+            let registry = reg.read();
+            assert!(registry.get_param("Observation", "pgrestoresp").is_some());
+        }
+
+        backend
+            .delete(&tenant, "SearchParameter", "pg-restore-sp")
+            .await
+            .unwrap();
+        {
+            let reg = backend.search_param_registry(&tenant);
+            let registry = reg.read();
+            assert!(
+                registry.get_param("Observation", "pgrestoresp").is_none(),
+                "deleted SearchParameter should be unregistered"
+            );
+        }
+
+        backend
+            .create_or_update(
+                &tenant,
+                "SearchParameter",
+                "pg-restore-sp",
+                search_param,
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
+        assert!(
+            registry.get_param("Observation", "pgrestoresp").is_some(),
+            "restored SearchParameter should be registered again"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_delete_resource() {
         let backend = create_backend().await;

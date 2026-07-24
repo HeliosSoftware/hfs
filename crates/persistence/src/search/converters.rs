@@ -653,10 +653,17 @@ mod tests {
     fn test_convert_human_name() {
         let value = json!({
             "family": "Smith",
-            "given": ["John", "Jane"]
+            "given": ["John", "Jane"],
+            "text": "John Jane Smith"
         });
         let results = ValueConverter::convert(&value, SearchParamType::String, "name").unwrap();
-        assert_eq!(results.len(), 3); // family + 2 given
+
+        let values: Vec<&str> = results.iter().filter_map(|v| v.as_string()).collect();
+        assert_eq!(
+            values,
+            vec!["Smith", "John", "Jane", "John Jane Smith"],
+            "family, each given, and the rendered text are all indexed"
+        );
     }
 
     /// An `Address` indexes every string part, each as written — `address` is a
