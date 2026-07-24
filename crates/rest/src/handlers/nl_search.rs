@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::{PeerIp, TenantExtractor, UserKey};
+use crate::extractors::{PeerIp, SearchParams, TenantExtractor, UserKey, unknown_search_params};
 use crate::fhir_types::get_resource_type_names_for_version;
 use crate::state::AppState;
 
@@ -45,19 +45,6 @@ use crate::state::AppState;
 /// searchable vocabulary (see [`build_system_prompt`]) so it never advertises
 /// a parameter this server can't execute.
 pub const SYSTEM_PROMPT: &str = include_str!("nl_search_prompt.md");
-
-/// Result-control parameters accepted in generated queries in addition to
-/// registry-backed search parameters.
-const CONTROL_PARAMS: &[&str] = &[
-    "_count",
-    "_sort",
-    "_total",
-    "_summary",
-    "_elements",
-    "_include",
-    "_revinclude",
-    "_contained",
-];
 
 /// Request body: the natural-language text to translate.
 #[derive(Deserialize)]
@@ -437,23 +424,33 @@ pub fn validate_output(
     }
 
     // Every parameter must resolve in the registry (or be a result control).
+    // Reuse the same check the real search endpoint runs under
+    // `Prefer: handling=strict` (see `search.rs`), so nl-search accepts exactly
+    // the parameters an executed query would — result-control params, `_has`,
+    // and modifier/chain forms are all handled there rather than tracked by a
+    // local list that could drift.
     let query = output.query.trim().trim_start_matches('?').to_string();
-    for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let raw_key = pair.split('=').next().unwrap_or(pair);
-        let base_key = raw_key.split(':').next().unwrap_or(raw_key);
-        if CONTROL_PARAMS.contains(&base_key) || base_key.starts_with("_has") {
-            continue;
-        }
-        // Chained params (subject.name) validate on their head.
-        let head = base_key.split('.').next().unwrap_or(base_key);
-        if registry.get_param(&resource_type, head).is_none() {
-            warn!(param = %head, resource_type = %resource_type, "nl-search rejected unknown param");
-            return Err(RestError::UnprocessableEntity {
-                message: format!(
-                    "The translation used a search parameter {resource_type} does not have. Try rephrasing, or write the query by hand."
-                ),
-            });
-        }
+    let pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (pair.to_string(), String::new()),
+        })
+        .collect();
+    let search_params = SearchParams::from_pairs(pairs);
+    let unknown = unknown_search_params(&resource_type, &search_params, registry);
+    if !unknown.is_empty() {
+        warn!(
+            params = %unknown.join(", "),
+            resource_type = %resource_type,
+            "nl-search rejected unknown param(s)"
+        );
+        return Err(RestError::UnprocessableEntity {
+            message: format!(
+                "The translation used a search parameter {resource_type} does not have. Try rephrasing, or write the query by hand."
+            ),
+        });
     }
 
     Ok(NlSearchResponse {
@@ -728,13 +725,25 @@ mod tests {
 
     #[test]
     fn rate_limit_key_prefers_the_authenticated_principal_then_the_peer_ip() {
+        use chrono::Utc;
+        use helios_auth::Principal;
+        use helios_auth::scope::ScopeSet;
+
         let addr: IpAddr = "203.0.113.7".parse().unwrap();
-        let authenticated = UserKey("https://idp.example.com|user-123".to_string());
-        let anonymous = UserKey("local|default".to_string());
+        let authenticated = UserKey::from_principal(&Principal {
+            subject: "user-123".to_string(),
+            issuer: "https://idp.example.com".to_string(),
+            tenant_id: None,
+            scopes: ScopeSet::default(),
+            jti: None,
+            expires_at: Utc::now(),
+            custom_claims: serde_json::Map::new(),
+        });
+        let anonymous = UserKey::local();
 
         assert_eq!(
             rate_limit_key("acme", &authenticated, Some(addr)),
-            "acme|https://idp.example.com|user-123",
+            "acme|u2:23:https://idp.example.com:user-123",
             "an authenticated principal outranks the peer address"
         );
         assert_eq!(

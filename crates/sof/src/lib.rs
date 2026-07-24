@@ -757,6 +757,16 @@ pub fn get_fhir_version_string() -> &'static str {
         helios_fhir::FhirVersion::R5 => "5.0.0",
         #[cfg(feature = "R6")]
         helios_fhir::FhirVersion::R6 => "6.0.0",
+        // A `FhirVersion` variant can exist without helios-sof enabling the
+        // matching feature: another crate in the build graph (e.g. helios-audit,
+        // whose R5/R6 features alias to helios-fhir/R4B for the BALP baseline)
+        // can turn on a helios-fhir version feature that helios-sof did not.
+        // `newest_version` always comes from helios-sof's own features, so this
+        // arm is genuinely unreachable at runtime.
+        #[allow(unreachable_patterns)]
+        _ => unreachable!(
+            "get_newest_enabled_fhir_version only returns versions enabled for helios-sof"
+        ),
     }
 }
 
@@ -1042,6 +1052,14 @@ pub fn parse_view_definition_for_version(
                 })?;
             Ok(SofViewDefinition::R6(view_def))
         }
+        // The requested `FhirVersion` variant may exist (because another crate
+        // enabled a helios-fhir version feature) while helios-sof was not built
+        // with support for it. Report that rather than failing to compile.
+        #[allow(unreachable_patterns)]
+        _ => Err(SofError::InvalidViewDefinition(format!(
+            "helios-sof was not compiled with support for FHIR version {:?}",
+            version
+        ))),
     }
 }
 
@@ -1100,6 +1118,13 @@ pub fn create_bundle_from_resources_for_version(
                 })?;
             Ok(SofBundle::R6(bundle))
         }
+        // See the note in `parse_view_definition_for_version`: the variant can
+        // exist without helios-sof having the matching feature enabled.
+        #[allow(unreachable_patterns)]
+        _ => Err(SofError::InvalidViewDefinition(format!(
+            "helios-sof was not compiled with support for FHIR version {:?}",
+            version
+        ))),
     }
 }
 
@@ -2320,6 +2345,13 @@ fn parse_json_to_fhir_resource(
                 })?;
             Ok(helios_fhir::FhirResource::R6(Box::new(resource)))
         }
+        // See the note in `parse_view_definition_for_version`: the variant can
+        // exist without helios-sof having the matching feature enabled.
+        #[allow(unreachable_patterns)]
+        _ => Err(SofError::InvalidSourceContent(format!(
+            "helios-sof was not compiled with support for FHIR version {:?}",
+            version
+        ))),
     }
 }
 

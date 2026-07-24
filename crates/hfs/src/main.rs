@@ -160,12 +160,19 @@ where
     let connect_timeout_ms = env("HFS_MONGODB_CONNECT_TIMEOUT_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(5000);
+    // Bounds how long an operation waits for a usable server. `connect_timeout_ms`
+    // only bounds a TCP handshake, so this is what actually decides how quickly an
+    // unreachable MongoDB surfaces an error.
+    let server_selection_timeout_ms = env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15_000);
 
     MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
         connect_timeout_ms,
+        server_selection_timeout_ms,
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
         search_offloaded,
@@ -377,12 +384,17 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5000);
+        let server_selection_timeout_ms = std::env::var("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15_000);
 
         let config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
             connect_timeout_ms,
+            server_selection_timeout_ms,
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
@@ -531,6 +543,7 @@ async fn start_mongodb(
     // settings store: it keeps ownership of the backend Arc and wires the
     // settings-capable builder (like the SQLite/Postgres backends).
     let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
+    let ui_settings = settings_store.clone();
 
     // MongoDB primary; embedded SQLite sidecar for bulk-export job state.
     let export_bundle = {
@@ -563,7 +576,7 @@ async fn start_mongodb(
     );
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own).
-    serve(app, &config, serve_audit_state, Some(backend)).await
+    serve(app, &config, serve_audit_state, Some(backend), ui_settings).await
 }
 
 /// Fallback when mongodb feature is not enabled.
@@ -586,6 +599,7 @@ async fn serve(
     config: &ServerConfig,
     audit_state: Option<Arc<AuditMiddlewareState>>,
     ui_tenants: Option<Arc<dyn ResourceStorage>>,
+    ui_settings: Option<Arc<dyn SettingsStore>>,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "ui", not(feature = "headless")))]
     let app = {
@@ -614,13 +628,14 @@ async fn serve(
                 model: config.nl_search_model.clone(),
             },
             ui_tenants.clone(),
+            ui_settings.clone(),
             self_base_url,
             outbound_auth,
             config.default_fhir_version,
         )
     };
     #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
-    let _ = &ui_tenants;
+    let _ = (&ui_tenants, &ui_settings);
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -674,14 +689,19 @@ async fn init_auth_with_audit(
         return Ok((auth_config, None));
     }
 
-    let jwks_url = auth_config.jwks_url.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("HFS_AUTH_JWKS_URL is required when HFS_AUTH_ENABLED=true")
-    })?;
-
-    // Require issuer validation to prevent cross-service token reuse
-    if auth_config.expected_issuer.is_none() {
-        anyhow::bail!("HFS_AUTH_ISSUER is required when HFS_AUTH_ENABLED=true");
+    // Every invariant of an enabled auth config now lives on the type, so an
+    // embedder that builds one directly gets the same guarantees this binary
+    // does. Issuer validation in particular is required, both to prevent
+    // cross-service token reuse and because `iss` qualifies every per-user
+    // identity (see `helios_rest::extractors::UserKey`).
+    if let Err(errors) = auth_config.validate() {
+        anyhow::bail!("Invalid auth configuration:\n  - {}", errors.join("\n  - "));
     }
+
+    let jwks_url = auth_config
+        .jwks_url
+        .as_ref()
+        .expect("validate() guarantees a JWKS URL when auth is enabled");
 
     // Audience stays optional so an open demo deployment can accept any token
     // from its issuer, but that also means a token minted for a *different*
@@ -808,6 +828,10 @@ async fn main() -> anyhow::Result<()> {
     helios_observability::uptime::init();
     helios_observability::telemetry::init("hfs", &config.log_level);
     helios_observability::metrics::init("hfs");
+    // hfs is the one server that mounts the console traffic/tenants endpoints
+    // backed by the reqlog ring buffer, so it opts into recording. Servers that
+    // don't (hts, sof-server, fhirpath-server) leave it off and skip the cost.
+    helios_observability::reqlog::enable();
 
     if let Err(errors) = config.validate() {
         for error in &errors {
@@ -1085,6 +1109,7 @@ async fn start_sqlite(
     // The SQLite backend also hosts the per-user settings store, so it always
     // keeps ownership of the backend Arc and uses the settings-capable builder.
     let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
+    let ui_settings = settings_store.clone();
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
@@ -1103,7 +1128,7 @@ async fn start_sqlite(
         settings_store,
         ops,
     );
-    serve(app, &config, serve_audit_state, ui_tenants).await
+    serve(app, &config, serve_audit_state, ui_tenants, ui_settings).await
 }
 
 /// Constructs an embedded SQLite job store for backends that can't host job
@@ -1730,6 +1755,7 @@ async fn start_sqlite_elasticsearch(
     // search-only), so it is wired from the underlying `sqlite` backend even
     // though the app is served over the composite storage.
     let settings_store: Option<Arc<dyn SettingsStore>> = Some(sqlite.clone());
+    let ui_settings = settings_store.clone();
 
     let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, sqlite.clone()).await?;
@@ -1756,7 +1782,14 @@ async fn start_sqlite_elasticsearch(
     );
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
-    serve(app, &config, serve_audit_state, Some(composite)).await
+    serve(
+        app,
+        &config,
+        serve_audit_state,
+        Some(composite),
+        ui_settings,
+    )
+    .await
 }
 
 /// Fallback when elasticsearch feature is not enabled.
@@ -1805,6 +1838,7 @@ async fn start_postgres(
     // The PostgreSQL backend also hosts the per-user settings store, so it always
     // keeps ownership of the backend Arc and uses the settings-capable builder.
     let settings_store: Option<Arc<dyn SettingsStore>> = Some(backend.clone());
+    let ui_settings = settings_store.clone();
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
@@ -1825,7 +1859,7 @@ async fn start_postgres(
     );
     // Second handle to the same backend for the web UI's tenant-maintenance
     // read/write path (the FHIR app keeps its own).
-    serve(app, &config, serve_audit_state, Some(backend)).await
+    serve(app, &config, serve_audit_state, Some(backend), ui_settings).await
 }
 
 /// Fallback when postgres feature is not enabled.
@@ -1984,6 +2018,7 @@ async fn start_postgres_elasticsearch(
     // is search-only), so it is wired from the underlying `pg` backend even
     // though the app is served over the composite storage.
     let settings_store: Option<Arc<dyn SettingsStore>> = Some(pg.clone());
+    let ui_settings = settings_store.clone();
 
     let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
     let submit_bundle = build_bulk_submit(&config, pg.clone()).await?;
@@ -2007,7 +2042,14 @@ async fn start_postgres_elasticsearch(
     );
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
-    serve(app, &config, serve_audit_state, Some(composite)).await
+    serve(
+        app,
+        &config,
+        serve_audit_state,
+        Some(composite),
+        ui_settings,
+    )
+    .await
 }
 
 /// Fallback when postgres+elasticsearch features are not both enabled.
@@ -2158,6 +2200,7 @@ async fn start_mongodb_elasticsearch(
     // search-only), so it is wired from the underlying `mongo` backend even
     // though the app is served over the composite storage.
     let settings_store: Option<Arc<dyn SettingsStore>> = Some(mongo.clone());
+    let ui_settings = settings_store.clone();
 
     // MongoDB primary; embedded SQLite sidecar for bulk-export job state.
     let export_bundle = {
@@ -2192,7 +2235,14 @@ async fn start_mongodb_elasticsearch(
     );
     // The UI's tenant-maintenance path goes through the composite (not the
     // bare primary) so a purge also clears the offloaded search documents.
-    serve(app, &config, serve_audit_state, Some(composite)).await
+    serve(
+        app,
+        &config,
+        serve_audit_state,
+        Some(composite),
+        ui_settings,
+    )
+    .await
 }
 
 /// Fallback when mongodb+elasticsearch features are not both enabled.
@@ -2287,6 +2337,7 @@ async fn start_s3(
         );
         None
     };
+    let ui_settings = settings_store.clone();
 
     // S3 standalone can purge, but it has NO search index of any kind — its
     // SearchProvider reports search unsupported — so `$reindex` has nothing to
@@ -2309,7 +2360,7 @@ async fn start_s3(
         settings_store,
         ops,
     );
-    serve(app, &config, serve_audit_state, ui_tenants).await
+    serve(app, &config, serve_audit_state, ui_tenants, ui_settings).await
 }
 
 /// Fallback when s3 feature is not enabled.
@@ -2521,6 +2572,7 @@ async fn start_s3_elasticsearch(
         );
         None
     };
+    let ui_settings = settings_store.clone();
 
     // Reindex reads from the S3 primary and writes to Elasticsearch, which is
     // the only search index in this deployment — S3 maintains none. The
@@ -2561,7 +2613,14 @@ async fn start_s3_elasticsearch(
     );
     // The UI's tenant-maintenance path goes through the composite (not the bare
     // primary) so a purge also clears the offloaded search documents.
-    serve(app, &config, serve_audit_state, Some(composite)).await
+    serve(
+        app,
+        &config,
+        serve_audit_state,
+        Some(composite),
+        ui_settings,
+    )
+    .await
 }
 
 /// Fallback when s3+elasticsearch features are not both enabled.
@@ -2678,6 +2737,7 @@ mod tests {
             "HFS_MONGODB_DATABASE" => Some("inferno_suite".to_string()),
             "HFS_MONGODB_MAX_CONNECTIONS" => Some("24".to_string()),
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
+            "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
         });
 
@@ -2688,6 +2748,7 @@ mod tests {
         assert_eq!(mongo_config.database_name, "inferno_suite");
         assert_eq!(mongo_config.max_connections, 24);
         assert_eq!(mongo_config.connect_timeout_ms, 7500);
+        assert_eq!(mongo_config.server_selection_timeout_ms, 2500);
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);

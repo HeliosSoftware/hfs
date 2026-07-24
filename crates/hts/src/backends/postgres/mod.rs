@@ -19,7 +19,7 @@ use tracing::info;
 use crate::error::HtsError;
 use crate::import::bundle_parser::{self, ParsedCodeSystem, ParsedConceptMap, ParsedValueSet};
 use crate::import::{BundleImportBackend, ImportStats};
-use crate::traits::TerminologyMetadata;
+use crate::traits::{TerminologyCaches, TerminologyMetadata};
 use crate::types::{ExpansionContains, LookupResponse, SubsumesResponse, TranslateResponse};
 use helios_persistence::tenant::TenantContext;
 
@@ -165,37 +165,6 @@ impl PostgresTerminologyBackend {
         })
     }
 
-    /// Drop every per-instance response cache. Invoked after a successful
-    /// `import_bundle` so stale `$lookup` / `resolve_code_system` results
-    /// don't shadow newly-imported codes. Mirrors SQLite's eviction at
-    /// backends/sqlite/mod.rs (`clear_response_caches` flow).
-    pub(super) fn clear_response_caches(&self) {
-        if let Ok(mut g) = self.lookup_response_cache.write() {
-            g.clear();
-        }
-        if let Ok(mut g) = self.cs_resolved_meta_cache.write() {
-            g.clear();
-        }
-        if let Ok(mut g) = self.inline_compose_cache.write() {
-            g.clear();
-        }
-        if let Ok(mut g) = self.subsumes_response_cache.write() {
-            g.clear();
-        }
-        if let Ok(mut g) = self.translate_response_cache.write() {
-            g.clear();
-        }
-        // Iter 7k+: process-global closure COUNT(*) memo (see
-        // backends/postgres/value_set.rs::CLOSURE_COUNT_CACHE).
-        if let Ok(mut g) = self::value_set::closure_count_cache().write() {
-            g.clear();
-        }
-        // Iter 7n: process-global `?fhir_vs=isa/X` per-root prefix cache.
-        if let Ok(mut g) = self::value_set::root_prefix_cache().write() {
-            g.clear();
-        }
-    }
-
     /// Borrow the underlying `deadpool-postgres` connection pool.
     pub fn pool(&self) -> &Pool {
         &self.pool
@@ -219,6 +188,59 @@ impl PostgresTerminologyBackend {
                 HtsError::StorageError(format!("concept_closure migration: {}", error_chain(&e)))
             })?;
         Ok(())
+    }
+}
+
+impl TerminologyCaches for PostgresTerminologyBackend {
+    /// Drop every per-instance response cache plus the two process-global
+    /// closure memos, so stale `$lookup` / `$translate` / `resolve_code_system`
+    /// answers cannot shadow content that has just changed.
+    ///
+    /// Invoked after a successful `import_bundle` / `import_parsed`, from
+    /// `delete_normalized`, and — since issue #304 — from the generic CRUD
+    /// write seam. The CRUD create/update path reaches this twice (once through
+    /// the importer, once through the seam); the method is idempotent, and a
+    /// second clear of already-empty maps is not worth branching to avoid.
+    ///
+    /// # Totality is enforced by the compiler
+    ///
+    /// The destructuring below names every field with no `..` rest pattern, so
+    /// adding a sixth cache to [`PostgresTerminologyBackend`] fails to compile
+    /// (E0027) until the author names it here. This mirrors the SQLite backend,
+    /// where the same shape closes a real six-of-sixteen eviction gap.
+    fn invalidate_caches(&self) {
+        // Exhaustive by construction: no `..`. See the doc comment above.
+        let Self {
+            // Not a cache: the connection pool itself.
+            pool: _,
+            inline_compose_cache,
+            lookup_response_cache,
+            cs_resolved_meta_cache,
+            subsumes_response_cache,
+            translate_response_cache,
+        } = self;
+
+        // Clear one `RwLock`-guarded map, ignoring a poisoned lock: a poisoned
+        // cache is already unusable, and failing a write because some unrelated
+        // reader panicked would be worse than leaving it be.
+        macro_rules! clear {
+            ($($cache:expr),* $(,)?) => {
+                $(if let Ok(mut guard) = $cache.write() { guard.clear(); })*
+            };
+        }
+
+        clear!(
+            inline_compose_cache,
+            lookup_response_cache,
+            cs_resolved_meta_cache,
+            subsumes_response_cache,
+            translate_response_cache,
+            // Iter 7k+: process-global closure COUNT(*) memo (see
+            // backends/postgres/value_set.rs::CLOSURE_COUNT_CACHE).
+            self::value_set::closure_count_cache(),
+            // Iter 7n: process-global `?fhir_vs=isa/X` per-root prefix cache.
+            self::value_set::root_prefix_cache(),
+        );
     }
 }
 
@@ -470,7 +492,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
 
         // Invalidate per-instance response caches — they may now shadow
         // newly-imported codes.
-        self.clear_response_caches();
+        self.invalidate_caches();
 
         Ok(stats)
     }
@@ -556,7 +578,7 @@ impl BundleImportBackend for PostgresTerminologyBackend {
 
         // Invalidate per-instance response caches — they may reference the
         // now-deleted resource.
-        self.clear_response_caches();
+        self.invalidate_caches();
 
         Ok(())
     }

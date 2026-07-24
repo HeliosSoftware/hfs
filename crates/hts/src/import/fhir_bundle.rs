@@ -434,6 +434,36 @@ fn write_code_system(
         rusqlite::params![system_id],
     );
 
+    // Invalidate this system's concept FTS so a later filtered $expand rebuilds
+    // it from the freshly-imported concepts/designations instead of serving
+    // stale display/synonym rows. The `concepts_fts_built` tracker row MUST be
+    // cleared alongside the content: it is the authoritative "FTS current for
+    // this system" flag (both the lazy ensure_concepts_fts path and the
+    // startup incremental prebuild_concepts_fts short-circuit on it), so leaving
+    // it set would freeze stale FTS results until the next full rebuild.
+    // Runs in the same transaction as the concept upserts above, so the content
+    // and the tracker flip atomically — no window where a concurrent reader
+    // sees "built" with stale rows (issue #295). The three content tables carry
+    // an explicit system_id column, so the delete is exact: designation rows
+    // (negative `-cd.id` rowids in concepts_search_fts) are removed too, and no
+    // other system's rows are touched.
+    let _ = conn.execute(
+        "DELETE FROM concepts_fts WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    );
+    let _ = conn.execute(
+        "DELETE FROM concepts_word_fts WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    );
+    let _ = conn.execute(
+        "DELETE FROM concepts_search_fts WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    );
+    let _ = conn.execute(
+        "DELETE FROM concepts_fts_built WHERE system_id = ?1",
+        rusqlite::params![system_id],
+    );
+
     // Invalidate any cached implicit-ValueSet expansions for this code system.
     // The implicit_expansion_cache is otherwise persistent across restarts; stale
     // entries from a previous version of this system must be evicted on re-import.
@@ -533,6 +563,19 @@ fn write_value_set(
             preferred_id
         }
     };
+
+    // Drop any materialized expansion derived from the previous content of this
+    // ValueSet. `value_set_expansions` cascades on *row delete*, and the upsert
+    // below deliberately keeps the row, so without this an expansion computed
+    // from the old compose survives a re-import and is served forever. Mirrors
+    // what the PostgreSQL `write_value_set` already does. A no-op on first
+    // import; one indexed delete on re-import, negligible beside the insert work
+    // that follows.
+    conn.execute(
+        "DELETE FROM value_set_expansions WHERE value_set_id = ?1",
+        rusqlite::params![storage_id],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
 
     // Upsert keyed on (url, version): a re-import refreshes the existing row
     // for the same version without disturbing sibling versions. The composite
@@ -725,12 +768,50 @@ pub(crate) fn invalidate_expansion_cache_for_system(
 /// `/CodeSystem/version` removes every stored version of that resource.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsError> {
+    // Collect the storage ids being removed (a multi-version CodeSystem can own
+    // several rows sharing one FHIR id) so we can clear their concept FTS rows.
+    // The concepts_fts* tables have no foreign key to cascade from, so — now that
+    // startup no longer wipes and rebuilds the whole index (issue #295) —
+    // deleting a CodeSystem would otherwise orphan its FTS rows and its
+    // concepts_fts_built marker. Mirrors the per-system invalidation in
+    // write_code_system.
+    let system_ids: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM code_systems \
+             WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
+        )
+        .and_then(|mut s| {
+            s.query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
     conn.execute(
         "DELETE FROM code_systems \
          WHERE id = ?1 OR json_extract(resource_json, '$.id') = ?1",
         rusqlite::params![id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
+    for sid in &system_ids {
+        let _ = conn.execute(
+            "DELETE FROM concepts_fts WHERE system_id = ?1",
+            rusqlite::params![sid],
+        );
+        let _ = conn.execute(
+            "DELETE FROM concepts_word_fts WHERE system_id = ?1",
+            rusqlite::params![sid],
+        );
+        let _ = conn.execute(
+            "DELETE FROM concepts_search_fts WHERE system_id = ?1",
+            rusqlite::params![sid],
+        );
+        let _ = conn.execute(
+            "DELETE FROM concepts_fts_built WHERE system_id = ?1",
+            rusqlite::params![sid],
+        );
+    }
+
     crate::backends::sqlite::invalidate_cs_id_cache();
     crate::backends::sqlite::invalidate_cs_language_cache();
     Ok(())
@@ -739,8 +820,33 @@ pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsE
 /// Delete a ValueSet and its materialized expansion cache by FHIR resource `id`.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_value_set(conn: &Connection, id: &str) -> Result<(), HtsError> {
+    // Multi-version: match the plain FHIR id *and* every synthetic storage id
+    // derived from it. `write_value_set` mints `<fhir-id>|<version>` via
+    // `storage_id_for`, so matching only `id = ?1` — as this did — silently
+    // no-ops for any ValueSet that carries a `version`. Two consequences, both
+    // reachable from the REST API: `DELETE /ValueSet/{id}` returned 204 while
+    // leaving the ValueSet fully expandable, and `PUT /ValueSet/{id}` skipped
+    // the delete-then-reimport, so the FK cascade never fired and
+    // `value_set_expansions` kept serving the pre-update codes. The existing
+    // round-trip tests missed both because their ValueSet fixtures carry no
+    // `version`.
+    //
+    // The second predicate compares the segment before the first `|` for exact
+    // equality rather than using `LIKE '<id>|%'`, so an id containing a LIKE
+    // wildcard cannot over-match, and no escaping is required. FHIR ids cannot
+    // contain `|`, so the split is unambiguous.
+    //
+    // Deliberately NOT matched: `json_extract(resource_json, '$.id')`, which is
+    // what `delete_code_system` uses. ValueSets legitimately share a FHIR id
+    // across *different* canonical URLs (the tx-ecosystem fixtures do this, and
+    // `write_value_set` mints a UUID storage id for the collision), so matching
+    // on the embedded id would delete unrelated ValueSets. The remaining gap —
+    // a ValueSet stored under such a minted UUID is still not reachable by id —
+    // needs URL-based resolution and is out of scope here.
     conn.execute(
-        "DELETE FROM value_sets WHERE id = ?1",
+        "DELETE FROM value_sets \
+         WHERE id = ?1 \
+            OR (instr(id, '|') > 0 AND substr(id, 1, instr(id, '|') - 1) = ?1)",
         rusqlite::params![id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;
@@ -897,6 +1003,89 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.display.as_deref(), Some("Concept A"));
+    }
+
+    /// #295 (Leg A): re-importing a CodeSystem must invalidate that system's
+    /// concept FTS — both the content rows and the `concepts_fts_built` tracker
+    /// — so a subsequent build reflects the new data instead of serving stale
+    /// display/synonym rows. Proven directly: after a re-import the tracker row
+    /// is gone (which forces a rebuild) and the stale display is no longer
+    /// indexed; a rebuild then indexes the new display.
+    #[tokio::test]
+    async fn reimport_invalidates_concept_fts() {
+        let b = backend();
+        let ctx = ctx();
+
+        // Same id/url/version each time → a stable storage system_id, so the
+        // concept is updated in place (the case per-system invalidation covers).
+        let cs_bundle = |display: &str| {
+            format!(
+                r#"{{"resourceType":"Bundle","type":"collection","entry":[
+                    {{"resource":{{"resourceType":"CodeSystem","id":"cs-x",
+                        "url":"http://example.org/csx","version":"1.0",
+                        "status":"active","content":"complete",
+                        "concept":[{{"code":"A","display":"{display}"}}]}}}}]}}"#
+            )
+        };
+
+        let tracker_rows = |b: &SqliteTerminologyBackend| -> i64 {
+            let conn = b.pool().get().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM concepts_fts_built cfb \
+                 JOIN code_systems cs ON cfb.system_id = cs.id \
+                 WHERE cs.url = 'http://example.org/csx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let fts_display_count = |b: &SqliteTerminologyBackend, display: &str| -> i64 {
+            let conn = b.pool().get().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM concepts_fts WHERE display = ?1",
+                [display],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Import + build FTS.
+        b.import_bundle(&ctx, cs_bundle("Original A").as_bytes())
+            .await
+            .unwrap();
+        b.finalize_after_bootstrap().unwrap();
+        assert_eq!(tracker_rows(&b), 1, "system tracked after first build");
+        assert_eq!(
+            fts_display_count(&b, "Original A"),
+            1,
+            "original display indexed"
+        );
+
+        // Re-import the same system with a changed display.
+        b.import_bundle(&ctx, cs_bundle("Changed A").as_bytes())
+            .await
+            .unwrap();
+
+        // Leg A must have cleared this system's tracker row AND its FTS content.
+        assert_eq!(
+            tracker_rows(&b),
+            0,
+            "re-import must clear the concepts_fts_built tracker row"
+        );
+        assert_eq!(
+            fts_display_count(&b, "Original A"),
+            0,
+            "stale FTS content must be removed on re-import"
+        );
+
+        // A rebuild reflects the new display.
+        b.finalize_after_bootstrap().unwrap();
+        assert_eq!(tracker_rows(&b), 1, "system re-tracked after rebuild");
+        assert_eq!(
+            fts_display_count(&b, "Changed A"),
+            1,
+            "new display indexed after rebuild"
+        );
     }
 
     #[tokio::test]

@@ -36,6 +36,9 @@ helios-fhir-validator = { path = "../fhir-validator", version = "0.2.1", default
 # `/SearchParameter` and `/CompartmentDefinition` endpoints, and derives the
 # query-string extractors. Both already in the workspace dependency graph.
 serde = { version = "1", features = ["derive"] }
+
+# Warn-level breadcrumb when persisting the FHIR-version choice fails (#343).
+tracing = "0.1"
 serde_json = "1"
 
 # The UI reads conformance data (SearchParameter, CompartmentDefinition) from

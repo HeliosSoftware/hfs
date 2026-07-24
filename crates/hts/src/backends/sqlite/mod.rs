@@ -30,7 +30,7 @@ use tracing::info;
 
 use crate::error::HtsError;
 use crate::import::{BundleImportBackend, ImportStats};
-use crate::traits::TerminologyMetadata;
+use crate::traits::{TerminologyCaches, TerminologyMetadata};
 use crate::types::{LookupResponse, ValidateCodeResponse};
 use helios_persistence::tenant::TenantContext;
 
@@ -215,9 +215,16 @@ pub struct SqliteTerminologyBackend {
     /// pipeline (resolve VS, expand, search expansion, version-mismatch checks,
     /// finish_validate_code_response) is pure-functional in the request → so a
     /// per-instance memo skips spawn_blocking, pool acquisition, and the
-    /// resolve+expand SQL roundtrips. Cleared when a new backend instance is
-    /// created — no explicit invalidation required because hot-path bench loops
-    /// reuse one backend, and tests instantiate fresh ones per case.
+    /// resolve+expand SQL roundtrips. Invalidated by
+    /// [`TerminologyCaches::invalidate_caches`] on bundle import and on every
+    /// CRUD write.
+    ///
+    /// It previously carried the justification "no explicit invalidation
+    /// required because hot-path bench loops reuse one backend, and tests
+    /// instantiate fresh ones per case". That reasoning holds for the benchmark
+    /// and for tests, and fails for a server: a `PUT` that adds or retires a
+    /// code left this memo answering `$validate-code` from the superseded
+    /// content indefinitely (issue #304).
     pub(crate) validate_code_response_cache: Arc<RwLock<ValidateCodeResponseMap>>,
     /// CodeSystem URL → highest stored version, used by `$validate-code` for
     /// `x-unknown-system` detection (`build_validate_response_async`). Same
@@ -369,29 +376,24 @@ impl SqliteTerminologyBackend {
             // per-code-system when new data is imported (see
             // fhir_bundle::write_code_system).
             if prebuild_fts {
-                // Clear the concept FTS index — it is always rebuilt
-                // synchronously by prebuild_concepts_fts below, so stale rows
-                // from a previous run must be removed first.
-                let _ = conn.execute_batch(
-                    "DELETE FROM concepts_fts;
-                     DELETE FROM concepts_fts_built;
-                     DELETE FROM concepts_word_fts;
-                     DELETE FROM concepts_search_fts;",
-                );
-
-                // Update query-planner statistics for large tables.
-                let _ = conn.execute_batch(
-                    "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
-                     ANALYZE concept_properties; ANALYZE concept_designations; \
-                     ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
-                );
-
-                // Pre-populate the concepts_fts trigram index for every code
-                // system so that text-filtered $expand requests always use the
-                // fast FTS path. This runs synchronously before the server
-                // accepts requests; for large systems (SNOMED 638K, LOINC 181K)
-                // it can take 10–25 s total.
-                value_set::prebuild_concepts_fts(&conn);
+                // Incrementally build the concepts_fts trigram index for any
+                // system not already tracked in concepts_fts_built (issue #295).
+                // No blanket wipe: per-system invalidation on (re)import keeps
+                // the tracker authoritative, so this only builds what is
+                // genuinely missing and is a no-op on a warm reopen. For a first
+                // load of large systems (SNOMED 638K, LOINC 181K) it still
+                // tokenises the full corpus once. Runs synchronously before the
+                // server accepts requests.
+                let built = value_set::prebuild_concepts_fts(&conn);
+                if built > 0 {
+                    // Update query-planner statistics only when a build ran;
+                    // stats persist on disk across reopens.
+                    let _ = conn.execute_batch(
+                        "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                         ANALYZE concept_properties; ANALYZE concept_designations; \
+                         ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+                    );
+                }
 
                 // Pre-warm the in-memory concept index from any implicit-expansion
                 // entries that are already persisted in implicit_expansion_cache.
@@ -442,9 +444,12 @@ impl SqliteTerminologyBackend {
     ///    `migrate_concept_closure` only touches systems that have hierarchy
     ///    edges but no closure rows, so unchanged systems cost nothing while a
     ///    re-imported SNOMED/LOINC system is rebuilt.
-    /// 2. Clears and rebuilds the `concepts_fts` index on the final data and
-    ///    refreshes the in-memory implicit/inline-compose indexes and planner
-    ///    statistics.
+    /// 2. Incrementally builds the `concepts_fts` index for any system not yet
+    ///    recorded in `concepts_fts_built` (missing or invalidated by a
+    ///    bootstrap re-import), and refreshes the in-memory
+    ///    implicit/inline-compose indexes — plus planner statistics only when a
+    ///    build actually ran. Unchanged systems cost nothing, so a warm restart
+    ///    does no FTS work before the server binds (issue #295).
     ///
     /// # Errors
     ///
@@ -463,20 +468,22 @@ impl SqliteTerminologyBackend {
             HtsError::StorageError(format!("Failed to rebuild concept closure: {e}"))
         })?;
 
-        // Rebuild FTS + planner stats on the final data. Mirrors the block in
-        // `new_inner` that is skipped under `new_without_fts_prebuild`.
-        let _ = conn.execute_batch(
-            "DELETE FROM concepts_fts;
-             DELETE FROM concepts_fts_built;
-             DELETE FROM concepts_word_fts;
-             DELETE FROM concepts_search_fts;",
-        );
-        let _ = conn.execute_batch(
-            "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
-             ANALYZE concept_properties; ANALYZE concept_designations; \
-             ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
-        );
-        value_set::prebuild_concepts_fts(&conn);
+        // Incrementally (re)build FTS for exactly the systems whose index is
+        // missing or was invalidated by a bootstrap re-import — NOT a blanket
+        // wipe + full rebuild on every boot (issue #295). When nothing changed
+        // (a warm restart, or an `hts import`-prepared DB) this is a near-instant
+        // no-op, so the server binds without re-tokenising the whole corpus.
+        // Only refresh planner statistics when we actually built something:
+        // ANALYZE stats persist on disk across restarts, so a no-op boot needs
+        // none.
+        let built = value_set::prebuild_concepts_fts(&conn);
+        if built > 0 {
+            let _ = conn.execute_batch(
+                "ANALYZE concept_hierarchy; ANALYZE concepts; ANALYZE concept_closure; \
+                 ANALYZE concept_properties; ANALYZE concept_designations; \
+                 ANALYZE code_systems; ANALYZE value_sets; ANALYZE concept_maps;",
+            );
+        }
         value_set::prebuild_implicit_index(&conn, &self.implicit_index);
         value_set::prebuild_inline_compose_index(&conn, &self.inline_compose_index);
         Ok(())
@@ -688,32 +695,89 @@ fn code_system_version_matches(actual: &str, pattern_segments: &[&str]) -> bool 
 
 // ── BundleImportBackend ────────────────────────────────────────────────────────
 
-impl SqliteTerminologyBackend {
-    /// Evict all in-memory indexes so the next expand re-reads fresh data.
+impl TerminologyCaches for SqliteTerminologyBackend {
+    /// Evict every in-memory index and response memo so the next read re-derives
+    /// from SQLite.
     ///
-    /// Per-instance CS metadata caches: highest stored version and existence
-    /// flags both flip when a new CS row is imported.  Flushed alongside the
-    /// global `cs_language_cache` invalidation that the sync writer already
-    /// triggers.
-    fn evict_import_caches(&self) {
-        if let Ok(mut guard) = self.implicit_index.write() {
-            guard.clear();
+    /// Called after a bundle import *and* after every CRUD write (issue #304).
+    /// Previously this cleared only the four concept indexes plus two CS
+    /// metadata caches, on the argument that the response memos needed no
+    /// invalidation because "hot-path bench loops reuse one backend, and tests
+    /// instantiate fresh ones per case". That is true of the benchmark and
+    /// false of a server: a `PUT /CodeSystem/{id}` that changes a display, or
+    /// adds a code, left `lookup_response_cache` and
+    /// `validate_code_response_cache` answering from the superseded content
+    /// indefinitely.
+    ///
+    /// # Totality is enforced by the compiler
+    ///
+    /// The destructuring below names every field with no `..` rest pattern, so
+    /// adding a seventeenth cache to [`SqliteTerminologyBackend`] fails to
+    /// compile (E0027) until the author names it here and decides whether it
+    /// needs clearing. The previous drift — six of sixteen caches cleared, the
+    /// gap invisible — is not reachable from this shape.
+    fn invalidate_caches(&self) {
+        // Exhaustive by construction: no `..`. See the doc comment above.
+        let Self {
+            // Not a cache: the connection pool itself.
+            pool: _,
+            // Not a cache: a dedup guard for in-flight background index builds.
+            // Clearing it would permit duplicate populate threads, not fresher
+            // data — the threads it guards write to caches that this method is
+            // about to empty anyway.
+            bg_index_pending: _,
+            implicit_index,
+            inline_compose_index,
+            property_result_cache,
+            plain_fts_cache,
+            cs_abstract_prop_cache,
+            cs_inactive_prop_cache,
+            cs_concept_abstract_cache,
+            cs_concept_inactive_cache,
+            cs_version_for_msg_cache,
+            cs_content_cache,
+            vs_version_for_msg_cache,
+            cs_resolved_meta_cache,
+            lookup_response_cache,
+            validate_code_response_cache,
+            cs_version_for_url_cache,
+            cs_exists_cache,
+        } = self;
+
+        // Clear one `RwLock`-guarded map, ignoring a poisoned lock: a poisoned
+        // cache is already unusable, and failing a write because some unrelated
+        // reader panicked would be worse than leaving it be.
+        macro_rules! clear {
+            ($($cache:expr),* $(,)?) => {
+                $(if let Ok(mut guard) = $cache.write() { guard.clear(); })*
+            };
         }
-        if let Ok(mut guard) = self.inline_compose_index.write() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.property_result_cache.write() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.plain_fts_cache.write() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.cs_version_for_url_cache.write() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.cs_exists_cache.write() {
-            guard.clear();
-        }
+
+        clear!(
+            implicit_index,
+            inline_compose_index,
+            property_result_cache,
+            plain_fts_cache,
+            cs_abstract_prop_cache,
+            cs_inactive_prop_cache,
+            cs_concept_abstract_cache,
+            cs_concept_inactive_cache,
+            cs_version_for_msg_cache,
+            cs_content_cache,
+            vs_version_for_msg_cache,
+            cs_resolved_meta_cache,
+            lookup_response_cache,
+            validate_code_response_cache,
+            cs_version_for_url_cache,
+            cs_exists_cache,
+        );
+
+        // Process-global caches shared by every backend instance in this
+        // process. `import_code_system` / `delete_code_system` already drop
+        // these on the paths they cover; doing it here too makes the hook total
+        // regardless of which resource type was written, and both are cheap.
+        invalidate_cs_id_cache();
+        invalidate_cs_language_cache();
     }
 }
 
@@ -740,7 +804,7 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
 
         if result.is_ok() {
-            self.evict_import_caches();
+            self.invalidate_caches();
         }
 
         result
@@ -761,7 +825,7 @@ impl BundleImportBackend for SqliteTerminologyBackend {
         .map_err(|e| HtsError::Internal(format!("Blocking task error: {e}")))?;
 
         if result.is_ok() {
-            self.evict_import_caches();
+            self.invalidate_caches();
         }
 
         result

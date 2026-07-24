@@ -747,6 +747,15 @@ impl ResourceStorage for CompositeStorage {
         "composite"
     }
 
+    /// Readiness gates on the primary (CRUD) backend only. A secondary/search
+    /// backend being down is a partial degradation — core CRUD still works, so
+    /// the instance should stay in rotation rather than be pulled out entirely
+    /// (which would take down the traffic it can still serve). If the primary
+    /// system-of-record is unreachable, the instance is not ready.
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        self.primary().readiness_check().await
+    }
+
     fn is_cluster_shared(&self) -> bool {
         self.primary.is_cluster_shared()
     }
@@ -2997,6 +3006,19 @@ mod tests {
     /// The bug this whole fan-out exists to prevent: purging only the primary
     /// leaves the resource in the Elasticsearch index, where it stays
     /// searchable and keeps holding the resource's full content.
+    #[tokio::test]
+    async fn readiness_check_delegates_to_primary() {
+        // Composite readiness gates on the primary system-of-record only. The
+        // primary mock leaves the trait's default `readiness_check` (Ok) in
+        // place, so a healthy primary makes the composite ready — this exercises
+        // both the composite delegation and the default trait impl.
+        let composite = make_composite_no_secondary();
+        composite
+            .readiness_check()
+            .await
+            .expect("a composite over a healthy primary must be ready");
+    }
+
     #[tokio::test]
     async fn test_purge_reaches_every_backend() {
         let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));

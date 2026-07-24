@@ -334,6 +334,13 @@ html[data-nav="collapsed"] .brand__version {
   display: none;
 }
 
+/* Footer variant: the version selector opens upward, clear of the viewport
+   bottom edge. */
+.menu--up .menu__panel {
+  top: auto;
+  bottom: calc(100% + 8px);
+}
+
 .menu__panel {
   position: absolute;
   z-index: 10;
@@ -439,6 +446,18 @@ html[data-nav="collapsed"] .brand__version {
   font-weight: 500;
   color: var(--muted);
   text-decoration: none;
+}
+
+/* The version options are form buttons; keep them visually identical to the
+   anchor options. */
+button.menu__option {
+  width: 100%;
+  font: inherit;
+  font-weight: 500;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
 }
 
 .menu__option:hover {

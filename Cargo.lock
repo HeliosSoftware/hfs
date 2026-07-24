@@ -3300,6 +3300,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -3394,6 +3395,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "tokio",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -3580,6 +3582,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "futures",
  "helios-auth",
  "helios-fhir",
  "helios-persistence",
@@ -3621,6 +3624,7 @@ dependencies = [
  "similar",
  "tokio",
  "tower",
+ "tracing",
  "unic-langid",
 ]
 

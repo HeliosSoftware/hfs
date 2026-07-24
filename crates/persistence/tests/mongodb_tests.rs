@@ -89,6 +89,9 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.database_name, "helios");
     assert_eq!(config.max_connections, 10);
     assert_eq!(config.connect_timeout_ms, 5000);
+    // Unchanged from when this was a hardcoded constant — making it configurable
+    // must not change the default behaviour of an existing deployment.
+    assert_eq!(config.server_selection_timeout_ms, 15_000);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
 }
@@ -100,6 +103,7 @@ fn test_mongodb_config_serialization() {
         database_name: "phase2".to_string(),
         max_connections: 24,
         connect_timeout_ms: 7000,
+        server_selection_timeout_ms: 9000,
         ..Default::default()
     };
 
@@ -110,6 +114,7 @@ fn test_mongodb_config_serialization() {
     assert_eq!(decoded.database_name, "phase2");
     assert_eq!(decoded.max_connections, 24);
     assert_eq!(decoded.connect_timeout_ms, 7000);
+    assert_eq!(decoded.server_selection_timeout_ms, 9000);
 }
 
 #[test]
@@ -447,6 +452,25 @@ async fn mongodb_total_created_connections(connection_string: &str) -> Option<i6
         .get_i64("totalCreated")
         .or_else(|_| connections.get_i32("totalCreated").map(i64::from))
         .ok()
+}
+
+#[tokio::test]
+async fn mongodb_integration_readiness_check() {
+    let Some(backend) = create_backend("readiness_check").await else {
+        eprintln!(
+            "Skipping mongodb_integration_readiness_check (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    // The `/_readiness` probe delegates to `Backend::health_check` via the
+    // `ResourceStorage::readiness_check` override; a live mongo must report ready.
+    let readiness = ResourceStorage::readiness_check(&backend).await;
+    assert!(
+        readiness.is_ok(),
+        "readiness_check failed on a live mongodb: {:?}",
+        readiness.err()
+    );
 }
 
 #[tokio::test]
@@ -2997,72 +3021,10 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
     );
 }
 
-// ============================================================================
-// Backend error handling (unreachable server)
-// ============================================================================
-//
-// These tests assert that MongoDB operations fail *gracefully* — surfacing a
-// `StorageError::Backend` — when the server is unreachable, rather than
-// panicking, hanging, or returning a misleading result (e.g. a `read` that
-// reports "not found" when it never actually reached the database). Unlike the
-// rest of this suite they need no server at all: they point a backend at a dead
-// address, so they always run (in CI and locally) without Docker.
-//
-// Reusable template: any future test that needs to drive a MongoDB error path
-// can reuse [`unreachable_backend`] + [`assert_backend_error`].
-
-/// Builds a `MongoBackend` pointed at an unreachable address, with a short
-/// connect timeout so the failure surfaces promptly. Construction itself never
-/// connects (the driver's client is lazily initialised), so `new` succeeds; the
-/// error appears when an operation actually tries to reach the server.
-///
-/// `127.0.0.1:1` is a loopback port nothing listens on, so the connection is
-/// refused deterministically instead of depending on external network state.
-fn unreachable_backend() -> MongoBackend {
-    let config = MongoBackendConfig {
-        connection_string: "mongodb://127.0.0.1:1/".to_string(),
-        database_name: build_test_database_name("unreachable"),
-        connect_timeout_ms: 500,
-        ..Default::default()
-    };
-    MongoBackend::new(config).expect("client construction is lazy and must not connect")
-}
-
-/// Asserts a storage operation failed with a backend-layer error — the uniform
-/// way MongoDB surfaces an unreachable server (connection / server-selection
-/// failure) — rather than succeeding or returning a different error class.
-fn assert_backend_error<T: std::fmt::Debug>(result: Result<T, StorageError>) {
-    assert!(
-        matches!(result, Err(StorageError::Backend(_))),
-        "expected StorageError::Backend from an unreachable server, got {result:?}"
-    );
-}
-
-#[tokio::test]
-async fn mongodb_integration_unreachable_server_surfaces_backend_error() {
-    let backend = unreachable_backend();
-    let tenant = create_tenant("tenant-unreachable");
-
-    // Drive representative read and write operations concurrently, so the
-    // driver's (bounded) server-selection timeout is paid once for the whole
-    // test rather than once per call. Each must surface a backend error.
-    let read = backend.read(&tenant, "Patient", "does-not-exist");
-    let count = backend.count(&tenant, Some("Patient"));
-    let create = backend.create(
-        &tenant,
-        "Patient",
-        json!({ "resourceType": "Patient", "name": [{ "family": "Unreachable" }] }),
-        FhirVersion::default(),
-    );
-
-    let (read_result, count_result, create_result) = tokio::join!(read, count, create);
-
-    // A read against an unreachable server must error, never quietly report the
-    // resource as absent.
-    assert_backend_error(read_result);
-    assert_backend_error(count_result);
-    assert_backend_error(create_result);
-}
+// The unreachable-server test that used to live here now sits alongside the same
+// contract for every other backend, in `tests/backend_error_handling.rs`. It needs
+// no server, so it did not belong in a suite whose tests all skip without one —
+// and its `mongodb_integration_*` name implied a Docker dependency it never had.
 
 // ============================================================================
 // Per-user settings store
@@ -3093,6 +3055,33 @@ mod settings_mongo {
     pub(super) async fn backend(test_name: &str) -> Option<MongoBackend> {
         super::create_backend(test_name).await
     }
+}
+
+/// `delete_settings` removes the document and reports whether one existed —
+/// the primitive the #270 legacy-key migration uses to move a document rather
+/// than leave a duplicate copy behind.
+#[tokio::test]
+async fn mongodb_integration_settings_delete_is_idempotent() {
+    let Some(backend) = settings_mongo::backend("settings_delete").await else {
+        eprintln!(
+            "Skipping mongodb_integration_settings_delete_is_idempotent (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("delete");
+
+    // Absent is not an error, and reports "nothing removed".
+    assert!(!backend.delete_settings(&user).await.unwrap());
+
+    backend
+        .put_settings(&user, json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert!(backend.get_settings(&user).await.unwrap().is_some());
+
+    assert!(backend.delete_settings(&user).await.unwrap());
+    assert!(backend.get_settings(&user).await.unwrap().is_none());
+    assert!(!backend.delete_settings(&user).await.unwrap());
 }
 
 #[tokio::test]
