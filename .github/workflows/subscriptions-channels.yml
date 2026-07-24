@@ -14,6 +14,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_PROFILE_DEV_DEBUG: 0
+  # Self-hosted Linux runners have no local /var/run/docker.sock; testcontainers
+  # reach Docker on a remote host, same as subscriptions-smoke.yml (issue #389).
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  DOCKER_HOST_IP: ${{ secrets.DOCKER_HOST_IP }}
 
 jobs:
   matrix-setup:
@@ -89,7 +93,7 @@ jobs:
         # so dropping defaults breaks builds; this matrix exercises adding
         # additional versions to the R4 baseline.
         run: |
-          cargo test \
+          cargo test --no-fail-fast \
             --features "${{ matrix.features }}" \
             -p helios-subscriptions -p helios-rest -p helios-persistence -p helios-fhirpath
 
