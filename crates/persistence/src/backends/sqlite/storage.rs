@@ -15,7 +15,7 @@ use crate::core::transaction::{
 };
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
-    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage,
+    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage, normalize_etag,
 };
 use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
@@ -1517,13 +1517,16 @@ impl VersionedStorage for SqliteBackend {
             })
         })?;
 
-        // Check version match
-        if current.version_id() != expected_version {
+        // Check version match. `expected_version` may arrive in any ETag
+        // spelling (`W/"1"`, `"1"`, `1`), so normalise both sides — same as the
+        // MongoDB and S3 backends.
+        let expected = normalize_etag(expected_version);
+        if normalize_etag(current.version_id()) != expected {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected_version.to_string(),
+                    expected_version: expected.to_string(),
                     actual_version: current.version_id().to_string(),
                 },
             ));
@@ -1567,12 +1570,13 @@ impl VersionedStorage for SqliteBackend {
             }
         };
 
-        if current_version != expected_version {
+        let expected = normalize_etag(expected_version);
+        if normalize_etag(&current_version) != expected {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected_version.to_string(),
+                    expected_version: expected.to_string(),
                     actual_version: current_version,
                 },
             ));
