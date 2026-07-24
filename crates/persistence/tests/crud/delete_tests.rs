@@ -338,6 +338,14 @@ async fn test_delete_is_soft_delete() {
     // This should create a new resource (after deletion)
     assert!(backend.exists(&tenant, "Patient", &id).await.unwrap());
     assert_eq!(restored.content()["name"][0]["family"], "Restored");
+
+    // The restore continues the version chain rather than resetting to "1":
+    // v1 create, v2 delete, v3 restore.
+    assert_eq!(
+        restored.version_id(),
+        "3",
+        "restore should continue the version chain"
+    );
 }
 
 // ============================================================================
