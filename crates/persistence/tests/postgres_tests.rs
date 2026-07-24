@@ -1089,6 +1089,112 @@ mod postgres_integration {
         assert_eq!(resource2.content()["name"][0]["family"], "Second");
     }
 
+    /// A `PUT` onto a deleted id restores the resource instead of failing.
+    ///
+    /// FHIR permits a deleted resource to be brought back by a subsequent
+    /// update (http.html#delete). The restore continues the existing version
+    /// chain — v1 create, v2 delete, v3 restore — rather than resetting to
+    /// "1", and the resource is readable and searchable again afterwards.
+    /// This mirrors `crud::delete_tests::test_delete_is_soft_delete`, which
+    /// covers the same path on SQLite.
+    #[tokio::test]
+    async fn postgres_integration_create_or_update_restores_deleted() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "Original"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+        assert_eq!(created.version_id(), "1");
+
+        backend.delete(&tenant, "Patient", &id).await.unwrap();
+
+        let (restored, _created_new) = backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                &id,
+                json!({"resourceType": "Patient", "name": [{"family": "Restored"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(restored.content()["name"][0]["family"], "Restored");
+        assert_eq!(
+            restored.version_id(),
+            "3",
+            "restore should continue the version chain (v1 create, v2 delete, v3 restore)"
+        );
+        assert!(!restored.is_deleted());
+
+        // The resource is live again: readable, and the restore is the current
+        // version.
+        let read = backend
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .expect("restored resource must be readable");
+        assert_eq!(read.version_id(), "3");
+        assert_eq!(read.content()["name"][0]["family"], "Restored");
+        assert!(backend.exists(&tenant, "Patient", &id).await.unwrap());
+
+        // History keeps every version, including the deletion.
+        let history = backend
+            .history_instance(&tenant, "Patient", &id, &HistoryParams::new())
+            .await
+            .unwrap();
+        assert!(
+            history.items.len() >= 3,
+            "history should hold create, delete and restore, got {}",
+            history.items.len()
+        );
+    }
+
+    /// Restoring a deleted resource requires update permission.
+    #[tokio::test]
+    async fn postgres_integration_restore_deleted_requires_permission() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+        backend.delete(&tenant, "Patient", &id).await.unwrap();
+
+        // Same tenant, read-only permissions.
+        let read_only =
+            TenantContext::new(tenant.tenant_id().clone(), TenantPermissions::read_only());
+        let result = backend
+            .create_or_update(
+                &read_only,
+                "Patient",
+                &id,
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(StorageError::Tenant(_))),
+            "restore without update permission must be refused, got {:?}",
+            result.as_ref().map(|(r, _)| r.version_id())
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_delete_resource() {
         let backend = create_backend().await;

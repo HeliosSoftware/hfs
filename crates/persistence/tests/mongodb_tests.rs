@@ -32,8 +32,8 @@ use helios_persistence::error::{
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
-    SearchValue, SortDirective,
+    IncludeDirective, IncludeType, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, SearchValue, SortDirective,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -528,6 +528,192 @@ async fn mongodb_integration_create_read_update_delete() {
         read_after_delete,
         Err(StorageError::Resource(ResourceError::Gone { .. }))
     ));
+}
+
+/// A `PUT` onto a deleted id restores the resource instead of failing.
+///
+/// FHIR permits a deleted resource to be brought back by a subsequent update
+/// (http.html#delete). The restore continues the existing version chain — v1
+/// create, v2 delete, v3 restore — rather than resetting to "1", and the
+/// resource is readable again afterwards. Mirrors
+/// `crud::delete_tests::test_delete_is_soft_delete`, which covers this path on
+/// SQLite.
+#[tokio::test]
+async fn mongodb_integration_create_or_update_restores_deleted() {
+    let Some(backend) = create_backend("restore_deleted").await else {
+        eprintln!(
+            "Skipping mongodb_integration_create_or_update_restores_deleted (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-restore");
+
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Original"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let id = created.id().to_string();
+    assert_eq!(created.version_id(), "1");
+
+    backend.delete(&tenant, "Patient", &id).await.unwrap();
+
+    let (restored, _created_new) = backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            &id,
+            json!({"resourceType": "Patient", "name": [{"family": "Restored"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(restored.content()["name"][0]["family"], "Restored");
+    assert_eq!(
+        restored.version_id(),
+        "3",
+        "restore should continue the version chain (v1 create, v2 delete, v3 restore)"
+    );
+    assert!(!restored.is_deleted());
+
+    let read = backend
+        .read(&tenant, "Patient", &id)
+        .await
+        .unwrap()
+        .expect("restored resource must be readable");
+    assert_eq!(read.version_id(), "3");
+    assert_eq!(read.content()["name"][0]["family"], "Restored");
+    assert!(backend.exists(&tenant, "Patient", &id).await.unwrap());
+
+    // History keeps every version, including the deletion.
+    let history = backend
+        .history_instance(&tenant, "Patient", &id, &HistoryParams::new())
+        .await
+        .unwrap();
+    assert!(
+        history.items.len() >= 3,
+        "history should hold create, delete and restore, got {}",
+        history.items.len()
+    );
+}
+
+/// Restoring a deleted resource requires update permission.
+#[tokio::test]
+async fn mongodb_integration_restore_deleted_requires_permission() {
+    let Some(backend) = create_backend("restore_deleted_permission").await else {
+        eprintln!(
+            "Skipping mongodb_integration_restore_deleted_requires_permission (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-restore-perm");
+
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let id = created.id().to_string();
+    backend.delete(&tenant, "Patient", &id).await.unwrap();
+
+    let read_only = TenantContext::new(tenant.tenant_id().clone(), TenantPermissions::read_only());
+    let result = backend
+        .create_or_update(
+            &read_only,
+            "Patient",
+            &id,
+            json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StorageError::Tenant(_))),
+        "restore without update permission must be refused"
+    );
+}
+
+/// `:exact` is case-sensitive; the default and `:contains` string matches are
+/// not. MongoDB stores `value_string` as written and asks the server for a
+/// case-insensitive regex for the insensitive variants.
+#[tokio::test]
+async fn mongodb_integration_string_exact_is_case_sensitive() {
+    let Some(backend) = create_backend_with_full_registry("string_exact_case").await else {
+        eprintln!(
+            "Skipping mongodb_integration_string_exact_is_case_sensitive (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-exact");
+    for family in ["Smith", "SMITH", "Smithson"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": family}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let exact = |value: &str| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "family".to_string(),
+            param_type: SearchParamType::String,
+            modifier: Some(SearchModifier::Exact),
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    // Exactly the one resource spelled "Smith".
+    let result = backend.search(&tenant, &exact("Smith")).await.unwrap();
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        ":exact=Smith must match only the 'Smith' spelling"
+    );
+    assert_eq!(
+        result.resources.items[0].content()["name"][0]["family"],
+        "Smith"
+    );
+
+    // A different casing must not match.
+    let result = backend.search(&tenant, &exact("smith")).await.unwrap();
+    assert!(
+        result.resources.items.is_empty(),
+        ":exact is case-sensitive, so 'smith' must not match 'Smith'"
+    );
+
+    // The default match stays case-insensitive (prefix), so it still finds all
+    // three spellings.
+    let insensitive = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "family".to_string(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq("smith")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &insensitive).await.unwrap();
+    assert_eq!(
+        result.resources.items.len(),
+        3,
+        "default string search is case-insensitive"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

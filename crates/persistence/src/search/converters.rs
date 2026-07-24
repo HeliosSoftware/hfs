@@ -659,6 +659,34 @@ mod tests {
         assert_eq!(results.len(), 3); // family + 2 given
     }
 
+    /// An `Address` indexes every string part, each as written — `address` is a
+    /// string parameter that matches against any of them.
+    #[test]
+    fn test_convert_address() {
+        let value = json!({
+            "line": ["1 Long Street", "Apt 2"],
+            "city": "Springfield",
+            "state": "IL",
+            "postalCode": "62704",
+            "country": "USA"
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::String, "address").unwrap();
+
+        let values: Vec<&str> = results.iter().filter_map(|v| v.as_string()).collect();
+        assert_eq!(
+            values,
+            vec![
+                "1 Long Street",
+                "Apt 2",
+                "Springfield",
+                "IL",
+                "62704",
+                "USA"
+            ],
+            "every address part is indexed, preserving case"
+        );
+    }
+
     #[test]
     fn test_convert_token_coding() {
         let value = json!({
