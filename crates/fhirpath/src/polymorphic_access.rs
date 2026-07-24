@@ -1198,4 +1198,169 @@ mod tests {
         assert!(is_polymorphic_base_in_version("value", FhirVersion::R4));
         assert!(is_polymorphic_base_in_version("value", FhirVersion::R5));
     }
+
+    // ---------------------------------------------------------------------
+    // Version-agnostic coverage of the choice-element machinery.
+    //
+    // The cross-version tests above must be gated on two versions being
+    // compiled in, so they vanish from single-version builds — including the
+    // R4-only build CI measures coverage with, which left the functions this
+    // fix changed (`is_choice_element_with_context`, `is_choice_element`,
+    // `is_polymorphic_base_in_version`, and the dotted-path branch of
+    // `access_polymorphic_element`) with no direct test at all.
+    //
+    // The tests below assert only facts that hold in *every* supported
+    // version, verified against the generated `FIELD_TYPES` tables for R4,
+    // R4B, R5 and R6: `value`, `effective` and `onset` are polymorphic bases
+    // in all four, and `identifier` is a base in none. They therefore hold at
+    // `default_enabled()` whichever single version that resolves to.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn access_polymorphic_element_resolves_a_dotted_choice_path() {
+        let obs = create_observation_with_quantity();
+
+        // `value` is a choice base, so `value.unit` must reach the `unit`
+        // inside `valueQuantity` without the caller naming the typed variant.
+        let unit = access_polymorphic_element(&obs, "value.unit", test_version())
+            .expect("value.unit should resolve through valueQuantity");
+        assert_eq!(unit, EvaluationResult::string("lbs".to_string()));
+    }
+
+    #[test]
+    fn access_polymorphic_element_resolves_a_dotted_non_choice_path() {
+        let mut identifier = HashMap::new();
+        identifier.insert(
+            "system".to_string(),
+            EvaluationResult::string("http://example.org/mrn".to_string()),
+        );
+
+        let mut obs = create_observation_with_quantity();
+        obs.insert(
+            "identifier".to_string(),
+            EvaluationResult::Object {
+                map: identifier,
+                type_info: None,
+            },
+        );
+
+        // `identifier` is not a choice base in any supported version, so this
+        // takes the plain nested-object branch rather than the choice branch.
+        assert!(!is_choice_element("identifier", test_version()));
+
+        let system = access_polymorphic_element(&obs, "identifier.system", test_version())
+            .expect("identifier.system should resolve as a plain nested field");
+        assert_eq!(
+            system,
+            EvaluationResult::string("http://example.org/mrn".to_string())
+        );
+    }
+
+    #[test]
+    fn access_polymorphic_element_returns_none_for_an_unresolvable_dotted_path() {
+        let obs = create_observation_with_quantity();
+
+        // Choice branch: `value` resolves, but `valueQuantity` has no `nonesuch`.
+        assert_eq!(
+            access_polymorphic_element(&obs, "value.nonesuch", test_version()),
+            None
+        );
+
+        // Non-choice branch: the object has no `identifier` at all.
+        assert_eq!(
+            access_polymorphic_element(&obs, "identifier.system", test_version()),
+            None
+        );
+    }
+
+    #[test]
+    fn is_choice_element_with_context_honours_the_bracket_form() {
+        // An explicit `[x]` is decisive, whatever the metadata or version says.
+        let no_choices: &[&str] = &[];
+        assert!(is_choice_element_with_context(
+            "value[x]",
+            None,
+            test_version()
+        ));
+        assert!(is_choice_element_with_context(
+            "anything[x]",
+            Some(no_choices),
+            test_version()
+        ));
+    }
+
+    #[test]
+    fn is_choice_element_with_context_prefers_supplied_metadata() {
+        let metadata: &[&str] = &["value", "effective"];
+
+        // The base name itself, and a typed variant of a known base.
+        assert!(is_choice_element_with_context(
+            "value",
+            Some(metadata),
+            test_version()
+        ));
+        assert!(is_choice_element_with_context(
+            "valueQuantity",
+            Some(metadata),
+            test_version()
+        ));
+
+        // Metadata is authoritative when present: `onset` is a choice base in
+        // the generated table, but this caller did not declare it, so the
+        // table must not be consulted as a second chance.
+        assert!(!is_choice_element_with_context(
+            "onset",
+            Some(metadata),
+            test_version()
+        ));
+
+        // A prefix match without an uppercase boundary is not a typed variant.
+        assert!(!is_choice_element_with_context(
+            "values",
+            Some(metadata),
+            test_version()
+        ));
+    }
+
+    #[test]
+    fn is_choice_element_falls_back_to_the_generated_table() {
+        // With no metadata the answer comes from `version`'s FIELD_TYPES table.
+        for base in ["value", "effective", "onset"] {
+            assert!(
+                is_choice_element(base, test_version()),
+                "{base} is a polymorphic base in every supported version"
+            );
+        }
+
+        assert!(!is_choice_element("identifier", test_version()));
+        assert!(!is_choice_element_with_context(
+            "identifier",
+            None,
+            test_version()
+        ));
+    }
+
+    #[test]
+    fn type_operation_unwraps_a_singleton_collection() {
+        let obs = create_observation_with_quantity();
+        let quantity = obs
+            .get("valueQuantity")
+            .expect("fixture has valueQuantity")
+            .clone();
+
+        // A one-item collection must behave exactly as the item itself does.
+        let singleton = EvaluationResult::collection(vec![quantity.clone()]);
+        assert_eq!(
+            apply_polymorphic_type_operation(&singleton, "is", "Quantity", None, &ctx()).unwrap(),
+            apply_polymorphic_type_operation(&quantity, "is", "Quantity", None, &ctx()).unwrap(),
+            "a singleton collection should delegate to its single item"
+        );
+
+        // A multi-item collection is not a singleton, so the result is Empty.
+        let pair = EvaluationResult::collection(vec![quantity.clone(), quantity]);
+        assert_eq!(
+            apply_polymorphic_type_operation(&pair, "is", "Quantity", None, &ctx()).unwrap(),
+            EvaluationResult::Empty
+        );
+    }
 }
