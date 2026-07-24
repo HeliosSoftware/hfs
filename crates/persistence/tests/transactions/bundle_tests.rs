@@ -64,7 +64,10 @@ async fn test_bundle_create_entries() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Should have 2 response entries
     assert_eq!(result.entries.len(), 2);
@@ -101,7 +104,10 @@ async fn test_bundle_put_entries() {
         full_url: Some("urn:uuid:patient-put".to_string()),
     }];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
 
     assert_eq!(result.entries.len(), 1);
     assert!(result.entries[0].status == 201 || result.entries[0].status == 200);
@@ -144,7 +150,10 @@ async fn test_bundle_delete_entries() {
         full_url: None,
     }];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
 
     assert_eq!(result.entries.len(), 1);
     assert!(result.entries[0].status == 200 || result.entries[0].status == 204);
@@ -231,7 +240,10 @@ async fn test_bundle_mixed_operations() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
 
     assert_eq!(result.entries.len(), 3);
 
@@ -298,7 +310,10 @@ async fn test_bundle_internal_references() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
 
     assert_eq!(result.entries.len(), 2);
 
@@ -359,7 +374,10 @@ async fn test_bundle_conditional_create() {
         full_url: Some("urn:uuid:conditional".to_string()),
     }];
 
-    let result1 = backend.process_transaction(&tenant, bundle1).await.unwrap();
+    let result1 = backend
+        .process_transaction(&tenant, bundle1, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(result1.entries[0].status, 201);
 
     // Second bundle with same condition - should return existing
@@ -377,7 +395,10 @@ async fn test_bundle_conditional_create() {
         full_url: Some("urn:uuid:conditional".to_string()),
     }];
 
-    let result2 = backend.process_transaction(&tenant, bundle2).await.unwrap();
+    let result2 = backend
+        .process_transaction(&tenant, bundle2, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Should not create duplicate
     assert_ne!(result2.entries[0].status, 201);
@@ -423,7 +444,10 @@ async fn test_bundle_conditional_update_if_match() {
         full_url: None,
     }];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(result.entries[0].status, 200);
 
     // Verify update
@@ -469,7 +493,9 @@ async fn test_bundle_if_match_failure() {
         full_url: None,
     }];
 
-    let result = backend.process_transaction(&tenant, entries).await;
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
 
     // Should fail due to version mismatch: either the whole transaction errors,
     // or the offending entry carries a conflict status.
@@ -514,7 +540,9 @@ async fn test_bundle_atomicity() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await;
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
 
     // If transaction failed, no resources should be created
     if result.is_err() {
@@ -537,7 +565,9 @@ async fn test_bundle_empty() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
 
-    let result = backend.process_transaction(&tenant, vec![]).await;
+    let result = backend
+        .process_transaction(&tenant, vec![], FhirVersion::default())
+        .await;
 
     // Empty bundle should succeed with empty response
     assert!(result.is_ok());
@@ -561,7 +591,10 @@ async fn test_bundle_single_entry() {
         full_url: Some("urn:uuid:single".to_string()),
     }];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(result.entries.len(), 1);
     assert_eq!(result.entries[0].status, 201);
 }
@@ -588,7 +621,7 @@ async fn test_bundle_tenant_isolation() {
     }];
 
     let result = backend
-        .process_transaction(&tenant_a, entries)
+        .process_transaction(&tenant_a, entries, FhirVersion::default())
         .await
         .unwrap();
     // location format: "ResourceType/id/_history/version"
