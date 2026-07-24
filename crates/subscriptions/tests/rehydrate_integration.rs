@@ -280,7 +280,10 @@ async fn topic_is_registered_before_subscriptions() {
     );
     assert_eq!(report.subscriptions_registered, 1, "report: {report:?}");
     assert!(
-        engine.topic_registry().get_topic(TOPIC_URL).is_some(),
+        engine
+            .topic_registry()
+            .get_topic(TENANT_ID, TOPIC_URL)
+            .is_some(),
         "topic must be in the registry"
     );
 }
