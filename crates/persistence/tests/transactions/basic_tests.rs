@@ -260,10 +260,23 @@ async fn test_transaction_abort_multiple() {
 // ============================================================================
 
 /// Test that uncommitted changes are not visible outside transaction.
+///
+/// Runs against a file-backed database rather than the in-memory one the rest
+/// of this file uses. An in-memory backend is opened with `cache=shared` (the
+/// only way a pool can share one in-memory database), and shared-cache SQLite
+/// takes *table-level* locks: a reader on a second connection fails immediately
+/// with `SQLITE_LOCKED` ("database table is locked") while a write transaction
+/// is open, and `busy_timeout` does not apply to those locks. A file-backed
+/// database runs in WAL mode, where readers see the last committed snapshot
+/// instead of blocking — which is the configuration this isolation guarantee
+/// is actually about.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_transaction_isolation_uncommitted() {
-    let backend = create_sqlite_backend();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backend = SqliteBackend::with_config(dir.path().join("txn.db"), Default::default())
+        .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to initialize schema");
     let tenant = create_tenant();
 
     let mut tx = backend
@@ -274,9 +287,9 @@ async fn test_transaction_isolation_uncommitted() {
     let patient = json!({"resourceType": "Patient"});
     tx.create("Patient", patient).await.unwrap();
 
-    // Outside transaction, resource should not be visible (depending on isolation level)
-    // Note: This depends on the backend's isolation level implementation
+    // Outside the transaction the uncommitted row must not be visible.
     let count_outside = backend.count(&tenant, Some("Patient")).await.unwrap();
+    assert_eq!(count_outside, 0, "uncommitted create must not be visible");
 
     Box::new(tx).commit().await.unwrap();
 
