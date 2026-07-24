@@ -174,3 +174,96 @@ WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = F
 ORDER BY last_updated DESC, id ASC LIMIT 21;
 
 DROP STATISTICS IF EXISTS tmp_stx_type_param_code;
+
+\echo ''
+\echo '######## J. TOKEN Observation?code=NOT-A-LOINC — BASELINE (sparse) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                AND param_name = 'code' AND (value_token_code = 'NOT-A-LOINC')))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## K. TOKEN Observation?code=8302-2 — BASELINE (common control) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                AND param_name = 'code' AND (value_token_code = '8302-2')))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## L. DATE Encounter?date=gt2200-01-01 — BASELINE (sparse) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Encounter' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+                AND param_name = 'date' AND value_date >= '2200-01-01'))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## M. DATE Encounter?date=gt2010-01-01 — BASELINE (common control) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Encounter' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+                AND param_name = 'date' AND value_date >= '2010-01-01'))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+CREATE INDEX IF NOT EXISTS tmp_search_token_code_cover ON search_index
+  (tenant_id, resource_type, param_name, value_token_code, value_token_system)
+  INCLUDE (resource_id)
+  WHERE value_token_code IS NOT NULL;
+CREATE INDEX IF NOT EXISTS tmp_search_date_cover ON search_index
+  (tenant_id, resource_type, param_name, value_date)
+  INCLUDE (resource_id)
+  WHERE value_date IS NOT NULL;
+VACUUM (ANALYZE) search_index;
+
+\echo ''
+\echo '######## N. TOKEN Observation?code=NOT-A-LOINC — AFTER lever 1 ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                AND param_name = 'code' AND (value_token_code = 'NOT-A-LOINC')))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## O. TOKEN Observation?code=8302-2 — AFTER lever 1 (must stay fast) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Observation' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Observation'
+                AND param_name = 'code' AND (value_token_code = '8302-2')))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## P. DATE Encounter?date=gt2200-01-01 — AFTER lever 1 ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Encounter' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+                AND param_name = 'date' AND value_date >= '2200-01-01'))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+\echo ''
+\echo '######## Q. DATE Encounter?date=gt2010-01-01 — AFTER lever 1 (must stay fast) ########'
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF)
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = 'default' AND resource_type = 'Encounter' AND is_deleted = FALSE
+  AND (id IN (SELECT resource_id FROM search_index
+              WHERE tenant_id = 'default' AND resource_type = 'Encounter'
+                AND param_name = 'date' AND value_date >= '2010-01-01'))
+ORDER BY last_updated DESC, id ASC LIMIT 21;
+
+DROP INDEX IF EXISTS tmp_search_token_code_cover;
+DROP INDEX IF EXISTS tmp_search_date_cover;
