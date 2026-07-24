@@ -964,6 +964,31 @@ impl PostgresBackend {
 mod tests {
     use super::*;
 
+    // ── config builders (#355) ────────────────────────────────
+
+    #[test]
+    fn config_from_connection_string_builds_without_connecting() {
+        let cfg = PostgresBackend::config_from_connection_string(
+            "postgres://alice:s3cret@db.example.com:5433/clinical",
+        )
+        .unwrap();
+        assert_eq!(cfg.host, "db.example.com");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.dbname, "clinical");
+        // The URL cannot express a FHIR version, so the config carries the
+        // compile-time default until the caller overrides it — which is the
+        // whole point of exposing the builder separately from connecting.
+        assert_eq!(cfg.fhir_version, FhirVersion::default_enabled());
+    }
+
+    #[test]
+    fn config_from_env_builds_without_connecting() {
+        let cfg = PostgresBackend::config_from_env();
+        assert!(!cfg.host.is_empty());
+        assert!(cfg.port > 0);
+        assert_eq!(cfg.fhir_version, FhirVersion::default_enabled());
+    }
+
     // ── parse_connection_string ───────────────────────────────────
 
     #[test]
