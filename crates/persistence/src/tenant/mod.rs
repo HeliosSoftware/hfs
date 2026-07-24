@@ -12,17 +12,21 @@
 //!
 //! # Design Philosophy
 //!
-//! The persistence layer enforces tenant isolation at the type level. Every storage
-//! operation requires a `TenantContext`, making it impossible to accidentally bypass
-//! tenant boundaries. This is a deliberate design choice - there is no escape hatch.
+//! The persistence layer scopes tenant data with a `TenantContext`: every
+//! tenant-scoped storage operation requires one as its first argument, so a
+//! tenant-scoped operation cannot be constructed without it. (A few operations
+//! are intentionally cross-tenant — the admin aggregate `count_by_tenant`, the
+//! tenant-registry calls — and take no context by design.)
 //!
-//! # Tenancy Models
+//! # Tenancy Model
 //!
-//! Three isolation strategies are supported:
-//!
-//! 1. **Shared Schema** - All tenants in one database with tenant_id column
-//! 2. **Schema-per-Tenant** - Separate database schema for each tenant
-//! 3. **Database-per-Tenant** - Separate database for each tenant
+//! There is one isolation model: **shared schema with a `tenant_id`
+//! discriminator**, chosen in design discussion
+//! [#28](https://github.com/HeliosSoftware/hfs/discussions/28). Each backend
+//! applies it in its own idiom; the S3 backend additionally offers a
+//! bucket-per-tenant physical boundary. Schema-per-tenant and
+//! database-per-tenant are not offered for the SQL backends — see the crate
+//! root docs and [#370](https://github.com/HeliosSoftware/hfs/issues/370).
 //!
 //! # Examples
 //!
