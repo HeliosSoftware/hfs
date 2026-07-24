@@ -1,0 +1,114 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("search-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content_class %} content--wide{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("search-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("search-lede") }}</p>
+</section>
+
+<div class="queries-layout search-page" data-mode="{% if nl.configured %}nl{% else %}builder{% endif %}">
+  <aside class="card filter-rail" aria-label="{{ i18n.t("queries-rail-heading") }}">
+    <div class="filter-rail__search">
+      <span class="icon">{% include "icons/search.svg" %}</span>
+      <input type="search" id="type-rail-filter"
+             placeholder="{{ i18n.t("queries-rail-filter") }}"
+             aria-label="{{ i18n.t("queries-rail-filter") }}">
+    </div>
+    <div class="filter-rail__heading">{{ i18n.t("queries-rail-heading") }}</div>
+    <div class="filter-rail__list" id="type-rail-list">
+      {% for t in resource_types %}
+      <button type="button" class="filter-rail__item" data-rail-type="{{ t }}">
+        <span>{{ t }}</span>
+        <span class="count" data-count-for="{{ t }}"></span>
+      </button>
+      {% endfor %}
+    </div>
+  </aside>
+
+  <div class="queries-main">
+    <section class="card query-form-card">
+      {% if nl.configured %}
+      <!--
+        Two modes over one query (Figma "Search V1.0"): describe it, or build
+        it. Both write the same editable GET URL below, and neither runs
+        anything on its own — Run is always a separate, deliberate click.
+        Real buttons with aria-pressed; the toggle only exists when the
+        translator does, and builder mode needs no JavaScript at all.
+      -->
+      <div class="seg" role="group" aria-label="{{ i18n.t("search-mode-label") }}">
+        <button type="button" class="seg__btn" data-mode-btn="nl" aria-pressed="true">
+          <span class="icon">{% include "icons/sparkle.svg" %}</span>
+          {{ i18n.t("search-mode-nl") }}
+        </button>
+        <button type="button" class="seg__btn" data-mode-btn="builder" aria-pressed="false">
+          <span class="icon">{% include "icons/grid.svg" %}</span>
+          {{ i18n.t("search-mode-builder") }}
+        </button>
+      </div>
+
+      <!--
+        Translation only: this posts the text to /$nl-search, which returns a
+        *query*, never results. It lands in the editable strip below for the
+        user to read, correct, and run through the normal search path — no
+        silent translation, and auth/tenancy/audit stay on the path we already
+        trust.
+      -->
+      <div class="nl-pane" id="nl-pane"
+           data-msg-error="{{ i18n.t("error-generic") }}"
+           data-msg-unsupported="{{ i18n.t("search-nl-unsupported") }}"
+           data-msg-caveats="{{ i18n.t("search-nl-caveats") }}"
+           data-msg-working="{{ i18n.t("search-nl-working") }}">
+        <div class="nl-input">
+          <span class="icon nl-input__spark">{% include "icons/sparkle.svg" %}</span>
+          <input type="text" id="nl-text" maxlength="500" autocomplete="off"
+                 placeholder="{{ i18n.t("search-nl-placeholder") }}"
+                 aria-label="{{ i18n.t("search-nl-label") }}">
+          <button class="btn btn--primary" type="button" id="nl-submit">
+            <span class="icon">{% include "icons/search.svg" %}</span>
+            {{ i18n.t("action-search") }}
+          </button>
+        </div>
+        <p class="nl-pane__hint">{{ i18n.t("search-nl-hint") }}</p>
+        <div class="nl-examples">
+          <button type="button" class="chip" data-nl-example>{{ i18n.t("search-nl-example-1") }}</button>
+          <button type="button" class="chip" data-nl-example>{{ i18n.t("search-nl-example-2") }}</button>
+          <button type="button" class="chip" data-nl-example>{{ i18n.t("search-nl-example-3") }}</button>
+        </div>
+        <div class="nl-answer" id="nl-answer" hidden></div>
+      </div>
+      {% else %}
+      <!--
+        Enabled but unconfigured: advertise the feature and say exactly how to
+        switch it on. The server never hands the key to the UI — it only says
+        whether one is set — so this state is derived, not guessed.
+      -->
+      <div class="nl-setup" id="nl-setup">
+        <div class="nl-setup__head">
+          <span class="icon">{% include "icons/sparkle.svg" %}</span>
+          <h2>{{ i18n.t("search-setup-heading") }}</h2>
+        </div>
+        <p>{{ i18n.t("search-setup-body") }}</p>
+        <pre class="nl-setup__env"><code>HFS_NL_SEARCH_API_KEY=&lt;{{ i18n.t("search-setup-key-placeholder") }}&gt;
+HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
+        <p class="nl-setup__note">{{ i18n.t("search-setup-disable") }}</p>
+        <a class="btn btn--primary" href="{{ docs_url }}" target="_blank" rel="noopener">
+          {{ i18n.t("search-setup-docs") }}
+        </a>
+      </div>
+      {% endif %}
+
+      {% include "partials/search-builder.html" %}
+    </section>
+
+    {% include "partials/search-results.html" %}
+    {% include "partials/search-messages.html" %}
+  </div>
+</div>
+
+<script src="/ui/assets/saved-queries.js" defer></script>
+{% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}
+{% endblock %}

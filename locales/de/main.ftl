@@ -145,6 +145,37 @@ chart-window = Zeitfenster des Diagramms
 
 footer-copyright = © { $year } { -org-name }
 
+## Verlauf & Versionen (#236)
+
+history-heading = Verlauf & Versionen
+history-lede = Zwei Versionen einer Ressource vergleichen. Der Speicher ist vollständig versioniert; dies liest ihn über die übliche _history- und vread-API.
+history-type-label = Ressourcentyp
+history-id-label = Ressourcen-ID
+history-id-placeholder = Ressourcen-ID
+history-load = Laden
+history-tabs-label = Verlaufsbereich
+history-tab-instance = Instanz
+history-tab-type = Typ-Feed
+history-tab-system = System-Feed
+history-versions-label = Versionen
+history-pick-instance = Instanz wählen
+history-current = aktuell
+history-from = Von
+history-to = Bis
+history-show-metadata = Metadatenänderungen anzeigen
+history-empty = Laden Sie eine Ressource und wählen Sie zwei Versionen zum Vergleich.
+history-load-error = Der Verlauf dieser Ressource konnte nicht geladen werden.
+history-not-found = Kein Verlauf für diese Ressource — Typ und ID prüfen.
+history-diff-heading = { $from }
+history-metadata-hidden = { $count ->
+    [one] { $count } Metadatenänderung ausgeblendet
+   *[other] { $count } Metadatenänderungen ausgeblendet
+}
+history-textual = Vollständigen Text-Diff anzeigen
+history-only-metadata = Zwischen diesen Versionen änderten sich nur die Metadaten.
+history-identical = Diese beiden Versionen sind identisch.
+history-deleted = { $version } ist eine Löschung — es gibt nichts zu vergleichen.
+history-parse-error = Diese Versionen konnten nicht als JSON gelesen werden.
 ## Saved queries (#234)
 
 nav-saved-queries = Gespeicherte Abfragen
@@ -287,3 +318,31 @@ queries-next = Weiter
 
 queries-rail-heading = Ressourcentypen
 queries-rail-filter = Typen filtern
+
+## Suche — natürliche Sprache & visueller Builder (#255)
+
+search-heading = Suche
+search-lede = Beschreiben Sie, wonach Sie suchen, oder bauen Sie die Abfrage selbst. So oder so erhalten Sie eine FHIR-Suchabfrage, die Sie lesen, korrigieren und ausführen können.
+search-query-tag = ABFRAGE
+search-copy = Abfrage kopieren
+
+search-mode-label = Wie die Abfrage entsteht
+search-mode-nl = Natürliche Sprache
+search-mode-builder = Visueller Builder
+
+search-nl-label = Suche beschreiben
+search-nl-placeholder = Beschreiben Sie, wonach Sie suchen — z. B. Patienten namens Smith, geboren nach 1980
+search-nl-hint = Ihr Text und die Suchparameter dieses Servers gehen an das Sprachmodell. Patientendaten niemals. Die erzeugte Abfrage wird unten angezeigt — zum Prüfen und Ausführen.
+search-nl-working = Wird übersetzt…
+search-nl-caveats = Wichtig zu wissen:
+search-nl-unsupported = Das ist keine Suche, die dieser Server ausführen kann. Beschreiben Sie die Datensätze, die Sie finden möchten.
+
+search-nl-example-1 = Weibliche Patientinnen über 65 mit Diabetes-Diagnose
+search-nl-example-2 = Beobachtungen der letzten 30 Tage, neueste zuerst
+search-nl-example-3 = Laufende Fälle im Boston General
+
+search-setup-heading = Suche in natürlicher Sprache ist verfügbar
+search-setup-body = Verwandelt Beschreibungen in Alltagssprache in FHIR-Suchabfragen. Dafür wird ein API-Schlüssel für ein Sprachmodell benötigt — der Server liest ihn aus der Umgebung, und er gelangt nie auf diese Seite. Bis einer gesetzt ist, nutzen Sie den visuellen Builder unten.
+search-setup-key-placeholder = Ihr API-Schlüssel
+search-setup-disable = Um die Funktion vollständig zu entfernen — Endpunkt, Seite und diesen Hinweis — setzen Sie HFS_NL_SEARCH_ENABLED=false.
+search-setup-docs = Anleitung lesen

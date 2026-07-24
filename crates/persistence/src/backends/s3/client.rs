@@ -1,6 +1,9 @@
 //! S3 API abstraction — trait definition, request/response types, AWS SDK
 //! client implementation, and SDK error mapping.
 
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_s3::Client;
@@ -60,8 +63,21 @@ pub struct ListObjectsResult {
 /// depend on the AWS SDK error types directly.
 #[derive(Debug, Clone)]
 pub enum S3ClientError {
-    /// The requested bucket or object does not exist.
+    /// The requested object does not exist.
+    ///
+    /// This is the one "absence" the object callers may legitimately turn into
+    /// `Ok(None)` — S3 told us the key is not there. See [`Self::BucketNotFound`]
+    /// for the case that must NOT be treated this way.
     NotFound,
+    /// The *bucket* does not exist, or is not visible to these credentials.
+    ///
+    /// Deliberately distinct from [`Self::NotFound`]. A missing object means "this
+    /// resource is not stored"; a missing bucket means the store is misconfigured
+    /// and we learned nothing at all about the object. Collapsing the two would let
+    /// a typo'd or deleted bucket read as an *empty store* — every `read` returning
+    /// "resource not found" — which is the same misleading-success failure the
+    /// backend error contract forbids.
+    BucketNotFound(String),
     /// A conditional write failed because the ETag or existence precondition
     /// was not satisfied (`If-Match` or `If-None-Match: *`).
     PreconditionFailed,
@@ -130,6 +146,17 @@ pub trait S3Api: Send + Sync {
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError>;
 
+    /// Lists the distinct key groups directly under `prefix` (S3
+    /// `CommonPrefixes` with `delimiter`), following continuation tokens to
+    /// exhaustion. Each returned string is the full common prefix — `prefix`,
+    /// then one segment, then `delimiter`.
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError>;
+
     /// Generates a pre-signed `GET` URL for `key`, valid for `ttl`.
     ///
     /// The default implementation reports the capability as unsupported;
@@ -151,6 +178,19 @@ pub trait S3Api: Send + Sync {
 pub struct AwsS3Client {
     /// Underlying AWS SDK S3 client.
     client: Client,
+    /// Buckets this process has already proven to exist.
+    ///
+    /// A `HeadObject` returns a *bodyless* 404 for both a missing object and a
+    /// missing bucket, so `head_object` must confirm the bucket before it can
+    /// safely report an object as absent (see #284). That confirmation is a
+    /// second round-trip, so we cache the positive result: once a bucket is
+    /// known-good it stays that way for the process lifetime, and the probe is
+    /// skipped. Startup `validate_buckets` seeds this for every configured
+    /// bucket, so in the common configuration the probe never fires on the hot
+    /// path. Only *presence* is cached — a missing bucket is never remembered —
+    /// so this can only ever let us skip a redundant probe, never hide a
+    /// misconfigured store.
+    known_buckets: Arc<RwLock<HashSet<String>>>,
 }
 
 /// S3-compatible endpoint overrides for [`AwsS3Client`].
@@ -192,6 +232,29 @@ impl AwsS3Client {
         let s3_config = builder.build();
         Self {
             client: Client::from_conf(s3_config),
+            known_buckets: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Returns `true` if this bucket has already been proven to exist during
+    /// this process's lifetime (startup validation or an earlier probe).
+    fn bucket_known_good(&self, bucket: &str) -> bool {
+        // A poisoned lock just means "not cached" — we re-probe rather than
+        // panic. The probe is correct on its own; the cache is only an
+        // optimisation, so degrading to it is always safe.
+        self.known_buckets
+            .read()
+            .map(|set| set.contains(bucket))
+            .unwrap_or(false)
+    }
+
+    /// Records that `bucket` exists, so later `head_object` 404s on it can skip
+    /// the disambiguating `HeadBucket` probe.
+    fn remember_bucket(&self, bucket: &str) {
+        if let Ok(mut set) = self.known_buckets.write() {
+            if !set.contains(bucket) {
+                set.insert(bucket.to_string());
+            }
         }
     }
 
@@ -217,7 +280,20 @@ impl S3Api for AwsS3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(map_sdk_error)?;
+            .map_err(|err| match map_sdk_error(err) {
+                // A `HeadBucket` response is bodyless, so `map_sdk_error` sees no
+                // `<Code>` and falls through to `404 => NotFound`. But a
+                // `HeadBucket` 404 is unambiguous: there is no object in the
+                // request that could be the thing that is missing, so the only
+                // thing a 404 can mean is that the *bucket* is absent (or
+                // invisible to these credentials). Report it as such so
+                // `validate_buckets` names the bucket rather than a phantom
+                // "resource". A 403 stays `Unavailable` (access-denied is the
+                // common cause and must not be reported as a missing bucket).
+                S3ClientError::NotFound => S3ClientError::BucketNotFound(bucket.to_string()),
+                other => other,
+            })?;
+        self.remember_bucket(bucket);
         Ok(())
     }
 
@@ -234,14 +310,36 @@ impl S3Api for AwsS3Client {
             .send()
             .await
         {
-            Ok(out) => Ok(Some(ObjectMetadata {
-                etag: out.e_tag().map(|s| s.to_string()),
-                last_modified: None,
-                size: out.content_length().unwrap_or_default(),
-            })),
+            Ok(out) => {
+                // A successful HEAD proves the bucket exists; cache it so a
+                // later 404 on this bucket can skip the disambiguating probe.
+                self.remember_bucket(bucket);
+                Ok(Some(ObjectMetadata {
+                    etag: out.e_tag().map(|s| s.to_string()),
+                    last_modified: None,
+                    size: out.content_length().unwrap_or_default(),
+                }))
+            }
             Err(err) => {
                 let mapped = map_sdk_error(err);
                 if matches!(mapped, S3ClientError::NotFound) {
+                    // A bodyless HEAD 404 cannot carry `<Code>NoSuchBucket</Code>`,
+                    // so "missing object" and "missing bucket" are the same wire
+                    // signal here (#284). Reporting `Ok(None)` unconditionally would
+                    // let a typo'd or deleted bucket masquerade as an empty store —
+                    // exactly what the backend error contract forbids. Confirm the
+                    // bucket exists before concluding the object is merely absent.
+                    //
+                    // The probe is skipped once the bucket is known-good (from
+                    // startup validation or an earlier call), so it costs at most
+                    // one extra `HeadBucket` per bucket per process, not one per
+                    // request.
+                    if self.bucket_known_good(bucket) {
+                        return Ok(None);
+                    }
+                    // `head_bucket` returns `BucketNotFound` for a missing bucket
+                    // (propagated to the caller) and caches the bucket on success.
+                    self.head_bucket(bucket).await?;
                     Ok(None)
                 } else {
                     Err(mapped)
@@ -376,6 +474,42 @@ impl S3Api for AwsS3Client {
         })
     }
 
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError> {
+        let mut prefixes = Vec::new();
+        let mut continuation: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .delimiter(delimiter);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+
+            let out = req.send().await.map_err(map_sdk_error)?;
+            for common in out.common_prefixes() {
+                if let Some(p) = common.prefix() {
+                    prefixes.push(p.to_string());
+                }
+            }
+
+            match out.next_continuation_token() {
+                Some(token) => continuation = Some(token.to_string()),
+                None => break,
+            }
+        }
+
+        Ok(prefixes)
+    }
+
     async fn presign_get(
         &self,
         bucket: &str,
@@ -413,7 +547,16 @@ where
                 .map(str::to_string)
                 .unwrap_or_default();
             match code {
-                "NoSuchKey" | "NotFound" | "NoSuchBucket" => S3ClientError::NotFound,
+                // A missing bucket is a misconfiguration, not an absent object —
+                // keep it distinct so the object callers cannot swallow it into
+                // `Ok(None)`.
+                "NoSuchBucket" => S3ClientError::BucketNotFound(if message.is_empty() {
+                    "bucket does not exist".to_string()
+                } else {
+                    message
+                }),
+                // `NotFound` is what HeadObject returns for a missing key.
+                "NoSuchKey" | "NotFound" => S3ClientError::NotFound,
                 // Deliberately narrow: only a 412 is a failed precondition.
                 //
                 // S3's `ConditionalRequestConflict` (HTTP 409) looks tempting to

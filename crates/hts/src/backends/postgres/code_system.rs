@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::error::HtsError;
 use crate::traits::{
     CodeSystemOperations, ConceptDesignation, ConceptExpansionFlags, SupplementInfo,
+    TerminologyCaches,
 };
 use crate::types::{
     DesignationValue, LookupRequest, LookupResponse, PropertyValue, ResourceSearchQuery,
@@ -94,9 +95,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         // Cross-instance freshness (C3) — before any cache read, so a
         // detected epoch transition clears this backend's response caches
         // ahead of the lookup below.
-        self.epoch
-            .check_backend(|| self.clear_response_caches())
-            .await;
+        self.epoch.check_backend(|| self.invalidate_caches()).await;
 
         // Cache check — LK01-04 hot path. The same `(system, code, version,
         // lang)` tuple is replayed across 50 VUs for a 30s run; the warm-hit
@@ -676,9 +675,7 @@ impl CodeSystemOperations for PostgresTerminologyBackend {
         req: SubsumesRequest,
     ) -> Result<SubsumesResponse, HtsError> {
         // Cross-instance freshness (C3) — before any cache read.
-        self.epoch
-            .check_backend(|| self.clear_response_caches())
-            .await;
+        self.epoch.check_backend(|| self.invalidate_caches()).await;
 
         // SS01 hot-path memo. Both ancestor-check directions are folded into
         // the cached outcome; the key includes version so different versions

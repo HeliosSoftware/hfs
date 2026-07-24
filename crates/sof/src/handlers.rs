@@ -766,6 +766,16 @@ fn parse_parameters(json: serde_json::Value) -> ServerResult<RunParameters> {
                 .map_err(|e| ServerError::BadRequest(format!("Invalid R6 Parameters: {}", e)))?;
             Ok(RunParameters::R6(params))
         }
+        // A `FhirVersion` variant can exist without helios-sof enabling the
+        // matching feature: another crate in the build graph (e.g. helios-audit,
+        // whose R5/R6 features alias to helios-fhir/R4B for the BALP baseline)
+        // can turn on a helios-fhir version feature that helios-sof did not.
+        // `newest_version` always comes from helios-sof's own features, so this
+        // arm is genuinely unreachable at runtime.
+        #[allow(unreachable_patterns)]
+        _ => unreachable!(
+            "get_newest_enabled_fhir_version only returns versions enabled for helios-sof"
+        ),
     }
 }
 

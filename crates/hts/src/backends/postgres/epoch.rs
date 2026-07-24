@@ -2,7 +2,7 @@
 //! effort, Class C3).
 //!
 //! A CodeSystem/ValueSet/ConceptMap write clears this *instance's* response
-//! caches (`PostgresTerminologyBackend::clear_response_caches`,
+//! caches (`PostgresTerminologyBackend::invalidate_caches`,
 //! `AppState::clear_expand_cache`) but not another instance's — an import on
 //! A leaves B serving stale `$expand`/`$validate-code`/`$lookup`/
 //! `$translate`/`$subsumes` results indefinitely.

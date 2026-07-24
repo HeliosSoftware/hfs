@@ -241,6 +241,9 @@ where
                 .put(handlers::put_user_settings::<S>)
                 .patch(handlers::patch_user_settings::<S>),
         )
+        // Natural-language search translation (#255): returns a generated
+        // query for the client to review and run via the normal search path.
+        .route("/$nl-search", post(handlers::nl_search_handler::<S>))
         .route("/", post(handlers::batch_handler::<S>))
         // Bulk Data Export ($export) — operation routes precede the catch-all.
         .route(
@@ -291,6 +294,17 @@ where
             "/$reindex-status/{job_id}",
             get(handlers::reindex_status_handler::<S>)
                 .delete(handlers::reindex_cancel_handler::<S>),
+        )
+        // Resource validation ($validate) — operation routes precede the
+        // catch-all (matchit gives static segments priority over {id}).
+        .route(
+            "/{resource_type}/$validate",
+            post(handlers::validate_type_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$validate",
+            get(handlers::validate_instance_get_handler::<S>)
+                .post(handlers::validate_instance_post_handler::<S>),
         )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))

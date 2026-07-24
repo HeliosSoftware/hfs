@@ -980,3 +980,212 @@ async fn translate_r6_arm_returns_snomed_code() {
         .unwrap_or(false);
     assert!(result, "R6 arm should translate to SNOMED code");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Re-import refreshes filtered $expand — PostgreSQL parity for issue #295
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// #295 parity: the fix that makes SQLite rebuild its concept FTS on re-import
+/// is a no-op for PostgreSQL, which searches a live `pg_trgm` GIN index on
+/// `concepts.display` that the engine maintains transactionally on every write.
+/// This test pins that invariant — a re-imported display is reflected by a
+/// filtered `$expand` with no application-side index maintenance and no restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn reimport_changed_display_refreshes_filtered_expand_pg() {
+    let app = TestAppPg::new().await;
+
+    let bundle = |display: &str| {
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "collection",
+            "entry": [{"resource": {
+                "resourceType": "CodeSystem",
+                "url": "http://pg-295.example/cs/reindex",
+                "version": "1.0.0",
+                "status": "active",
+                "content": "complete",
+                "concept": [{"code": "x", "display": display}]
+            }}]
+        })
+        .to_string()
+    };
+
+    let expand = |filter: &str| {
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "filter", "valueString": filter},
+                {"name": "valueSet", "resource": {
+                    "resourceType": "ValueSet",
+                    "url": "http://pg-295.example/vs/reindex",
+                    "status": "active",
+                    "compose": {"include": [{"system": "http://pg-295.example/cs/reindex"}]}
+                }}
+            ]
+        })
+        .to_string()
+    };
+
+    let contains_x = |body: &serde_json::Value| -> bool {
+        body["expansion"]["contains"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|c| c["code"].as_str() == Some("x")))
+    };
+
+    app.import_bundle_ok(&bundle("originalword marker")).await;
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("originalword"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "initial expand failed: {body}");
+    assert!(contains_x(&body), "original display should match: {body}");
+
+    app.import_bundle_ok(&bundle("changedword marker")).await;
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("changedword"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "post-reimport expand failed: {body}"
+    );
+    assert!(
+        contains_x(&body),
+        "changed display should match after re-import: {body}"
+    );
+
+    let (status, body) = app
+        .post_fhir("/ValueSet/$expand", expand("originalword"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "stale-filter expand failed: {body}");
+    assert!(
+        !contains_x(&body),
+        "stale display must not match after re-import: {body}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cache invalidation on CRUD writes (issue #304)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Creating a ValueSet must un-cache the *absence* recorded for its URL by an
+/// earlier `$expand` that 404'd.
+///
+/// The handler-level negative cache (`AppState::not_found_urls`) is
+/// backend-agnostic, so this defect was identical on PostgreSQL and SQLite:
+/// `clear_expand_cache()` was called only by `POST /import` and the CRUD delete
+/// path, never by create or update. The server therefore kept answering 404 for
+/// a ValueSet it had just returned `201 Created` for, indefinitely — nothing
+/// expires that set.
+///
+/// The SQLite twin of this test lives in `operations/crud.rs`; this one exists
+/// because the eviction seam is generic over the backend and the PostgreSQL CRUD
+/// path reaches it through a different re-index route (the async importer rather
+/// than the `hts_pool` blocking path).
+#[tokio::test(flavor = "multi_thread")]
+async fn create_value_set_evicts_the_expand_negative_cache() {
+    let app = TestAppPg::new().await;
+
+    let cs_url = "http://pg-cache-test.example/cs/neg";
+    let vs_url = "http://pg-cache-test.example/vs/neg";
+
+    let cs = serde_json::json!({
+        "resourceType": "CodeSystem",
+        "url": cs_url,
+        "version": "1.0",
+        "name": "NegCacheCS",
+        "status": "active",
+        "content": "complete",
+        "concept": [{"code": "A", "display": "Alpha"}]
+    })
+    .to_string();
+    let (status, body) = app.post_fhir("/CodeSystem", cs).await;
+    assert_eq!(status, StatusCode::CREATED, "POST CodeSystem: {body}");
+
+    let expand_uri = format!("/ValueSet/$expand?url={vs_url}");
+
+    // 1. Absent → 404, which records the URL as definitively missing.
+    let (status, _) = app.get_fhir(&expand_uri).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "precondition: the ValueSet must not exist yet"
+    );
+
+    // 2. Create exactly that ValueSet.
+    let vs = serde_json::json!({
+        "resourceType": "ValueSet",
+        "url": vs_url,
+        "name": "NegCacheVS",
+        "status": "active",
+        "compose": {"include": [{"system": cs_url, "concept": [{"code": "A"}]}]}
+    })
+    .to_string();
+    let (status, body) = app.post_fhir("/ValueSet", vs).await;
+    assert_eq!(status, StatusCode::CREATED, "POST ValueSet: {body}");
+
+    // 3. It must expand now. Before the fix this stayed 404 forever.
+    let (status, body) = app.get_fhir(&expand_uri).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a just-created ValueSet must not still be reported absent: {body}"
+    );
+    assert_eq!(
+        body["expansion"]["contains"][0]["code"], "A",
+        "expansion should carry the included code: {body}"
+    );
+}
+
+/// Updating a CodeSystem must not leave `$lookup` answering from pre-update
+/// content.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_code_system_refreshes_lookup_display() {
+    let app = TestAppPg::new().await;
+
+    let cs_url = "http://pg-cache-test.example/cs/display";
+    let make_cs = |display: &str| {
+        serde_json::json!({
+            "resourceType": "CodeSystem",
+            "url": cs_url,
+            "version": "1.0",
+            "name": "DisplayCS",
+            "status": "active",
+            "content": "complete",
+            "concept": [{"code": "A", "display": display}]
+        })
+        .to_string()
+    };
+
+    let (status, body) = app.post_fhir("/CodeSystem", make_cs("Alpha")).await;
+    assert_eq!(status, StatusCode::CREATED, "POST: {body}");
+    let id = body["id"].as_str().expect("id field missing").to_owned();
+
+    let lookup_uri = format!("/CodeSystem/$lookup?system={cs_url}&code=A");
+    let display_of = |body: &serde_json::Value| -> Option<String> {
+        body["parameter"]
+            .as_array()?
+            .iter()
+            .find(|p| p["name"] == "display")
+            .and_then(|p| p["valueString"].as_str())
+            .map(str::to_owned)
+    };
+
+    // Warm the caches.
+    let (status, body) = app.get_fhir(&lookup_uri).await;
+    assert_eq!(status, StatusCode::OK, "warm lookup: {body}");
+    assert_eq!(display_of(&body).as_deref(), Some("Alpha"));
+
+    let (status, body) = app
+        .put_fhir(&format!("/CodeSystem/{id}"), make_cs("Alpha v2"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "PUT: {body}");
+
+    let (status, body) = app.get_fhir(&lookup_uri).await;
+    assert_eq!(status, StatusCode::OK, "post-update lookup: {body}");
+    assert_eq!(
+        display_of(&body).as_deref(),
+        Some("Alpha v2"),
+        "$lookup must reflect the updated display: {body}"
+    );
+}

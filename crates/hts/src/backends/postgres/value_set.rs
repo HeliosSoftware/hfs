@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::error::HtsError;
-use crate::traits::ValueSetOperations;
+use crate::traits::{TerminologyCaches, ValueSetOperations};
 use crate::types::{
     ExpandRequest, ExpandResponse, ExpansionContains, ResourceSearchQuery, ValidateCodeRequest,
     ValidateCodeResponse,
@@ -26,7 +26,7 @@ use super::code_system::build_synthetic_resource;
 // process-wide.
 //
 // Keyed by `(system_id, root_code)`. Cleared on import via
-// `PostgresTerminologyBackend::clear_response_caches`, which mirrors the
+// `PostgresTerminologyBackend::invalidate_caches`, which mirrors the
 // eviction hook used by the other per-instance caches
 // (`inline_compose_cache`, `lookup_response_cache`, ...).
 //
@@ -76,7 +76,7 @@ fn closure_count_put(system_id: &str, root_code: &str, count: u32) {
 // offset+count ≈ 1500, and [`CLOSURE_PREFIX_LEN`] gives generous headroom.
 //
 // Keyed by `fnv64(url | value_set_version)`. Cleared on import via
-// `clear_response_caches`. Bounded to `CLOSURE_PREFIX_CACHE_MAX`.
+// `invalidate_caches`. Bounded to `CLOSURE_PREFIX_CACHE_MAX`.
 pub(super) struct RootPrefix {
     system: String,
     /// Total descendant count (closure rows for this ancestor).
@@ -192,9 +192,7 @@ impl ValueSetOperations for PostgresTerminologyBackend {
         // below. Memoized (default ~1s), so this costs a mutex lock and an
         // elapsed-time comparison on every request except the rare one that
         // falls outside the memo window, not a DB round trip per request.
-        self.epoch
-            .check_backend(|| self.clear_response_caches())
-            .await;
+        self.epoch.check_backend(|| self.invalidate_caches()).await;
 
         // The `max_expansion_size` cap is intended as a guardrail against
         // unbounded materialisation: when the caller has already bounded the

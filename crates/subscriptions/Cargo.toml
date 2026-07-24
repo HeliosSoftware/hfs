@@ -35,6 +35,8 @@ serde_json.workspace = true
 # Async runtime
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 async-trait = "0.1"
+# `join_all` for the bounded-concurrency handshake pass in `rehydrate`.
+futures = "0.3"
 
 # Time
 chrono.workspace = true
@@ -62,8 +64,9 @@ tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # T2 cluster suites run against a real Postgres (testcontainers), driving
-# the engine through the shared persistence seams.
-helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["postgres"] }
+# the engine through the shared persistence seams; the rehydration
+# integration test (issue #305) needs a real SQLite `ExportDataProvider`.
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["postgres", "sqlite"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 

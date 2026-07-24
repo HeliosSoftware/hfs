@@ -40,7 +40,6 @@ fn test_postgres_config_defaults() {
     assert_eq!(config.connect_timeout_secs, 5);
     assert_eq!(config.statement_timeout_ms, 30000);
     assert!(!config.search_offloaded);
-    assert!(config.schema_name.is_none());
 }
 
 #[test]
@@ -841,6 +840,69 @@ mod postgres_integration {
     fn create_tenant(id: &str) -> TenantContext {
         let unique_id = format!("{}_{}", id, uuid::Uuid::new_v4().simple());
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
+    }
+
+    #[tokio::test]
+    async fn statement_timeout_applies_to_every_pooled_connection() {
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+
+        const POOL_SIZE: usize = 10;
+        const TIMEOUT_MS: u64 = 250;
+
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: POOL_SIZE,
+            statement_timeout_ms: TIMEOUT_MS,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        let backend =
+            std::sync::Arc::new(PostgresBackend::new(config).await.expect("create backend"));
+
+        // Hold POOL_SIZE clients across a barrier so the pool is forced to open
+        // every physical connection before any is released. deadpool creates
+        // connections lazily, so a serial check could pass while exercising only
+        // one connection. The regression this guards (#285): the pre-fix code ran
+        // `SET statement_timeout` on the single connection borrowed inside
+        // `PostgresBackend::new`, so every connection created lazily afterwards
+        // inherited the server default (usually 0 = uncapped). Shipping the GUC
+        // in the connection startup packet makes every connection carry it, which
+        // is what each task asserts below.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(POOL_SIZE));
+        let mut handles = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
+            let backend = backend.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let client = backend.get_client().await.expect("get_client");
+                barrier.wait().await;
+                let row = client
+                    .query_one("SELECT current_setting('statement_timeout')", &[])
+                    .await
+                    .expect("current_setting");
+                let value: String = row.get(0);
+                value
+            }));
+        }
+
+        for (i, h) in handles.into_iter().enumerate() {
+            let value = h.await.expect("task panicked");
+            assert_eq!(
+                value,
+                format!("{TIMEOUT_MS}ms"),
+                "pooled connection #{i} reported statement_timeout={value:?}, \
+                 expected {TIMEOUT_MS}ms — the GUC did not reach every connection"
+            );
+        }
     }
 
     // ========================================================================
@@ -2433,6 +2495,15 @@ mod postgres_integration {
 
         let result = backend.health_check().await;
         assert!(result.is_ok(), "Health check failed: {:?}", result.err());
+
+        // The `/_readiness` probe delegates to `Backend::health_check` via the
+        // `ResourceStorage::readiness_check` override; a live pg must report ready.
+        let readiness = ResourceStorage::readiness_check(&backend).await;
+        assert!(
+            readiness.is_ok(),
+            "readiness_check failed on a live postgres: {:?}",
+            readiness.err()
+        );
     }
 
     #[tokio::test]
@@ -4304,6 +4375,28 @@ mod postgres_integration {
     /// collide on the single-row-per-user `user_settings` table.
     fn unique_user_key(prefix: &str) -> String {
         format!("{}|{}", prefix, uuid::Uuid::new_v4().simple())
+    }
+
+    /// `delete_settings` removes the row and reports whether one existed —
+    /// the primitive the #270 legacy-key migration uses to move a document
+    /// rather than leave a duplicate copy behind.
+    #[tokio::test]
+    async fn postgres_integration_settings_delete_is_idempotent() {
+        let backend = create_backend().await;
+        let user = unique_user_key("delete");
+
+        // Absent is not an error, and reports "nothing removed".
+        assert!(!backend.delete_settings(&user).await.unwrap());
+
+        backend
+            .put_settings(&user, json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        assert!(backend.get_settings(&user).await.unwrap().is_some());
+
+        assert!(backend.delete_settings(&user).await.unwrap());
+        assert!(backend.get_settings(&user).await.unwrap().is_none());
+        assert!(!backend.delete_settings(&user).await.unwrap());
     }
 
     #[tokio::test]
@@ -6674,5 +6767,105 @@ mod postgres_integration {
                 "the secondary must have the resource after B's worker applied it"
             );
         }
+    }
+
+    // ========================================================================
+    // Backend error handling — a reachable but misconfigured store
+    // ========================================================================
+    //
+    // `tests/backend_error_handling.rs` covers every backend's *unreachable*
+    // case with no server at all. PostgreSQL has a gap that cannot be closed
+    // there: `PostgresBackend::new` eagerly verifies connectivity, so an
+    // unreachable server fails at construction and the caller never obtains a
+    // backend to drive. That leaves every per-operation error arm in
+    // `postgres/storage.rs` — the `internal_error(..)` mapping behind `read`,
+    // `count`, `create` and friends — completely unexercised, which is exactly
+    // the class of uncovered code that motivated this work.
+    //
+    // Reaching those arms needs a server that answers but cannot serve the
+    // query, so this test lives here, with the shared container. It mirrors the
+    // SQLite `unmigrated_store_surfaces_backend_error` test: connect to a
+    // database whose schema was never created (`new()` runs no DDL —
+    // `init_schema()` is a separate, opt-in call) and drive the core operations.
+    // Every one of them hits `relation "resources" does not exist`.
+
+    /// Operations against a reachable database with no schema must surface a
+    /// backend error — never a misleading success.
+    #[tokio::test]
+    async fn postgres_integration_unmigrated_store_surfaces_backend_error() {
+        let pg = shared_pg().await;
+
+        // A database of our own, so we can leave it unmigrated without disturbing
+        // the schema the rest of this suite shares.
+        let dbname = format!("unmigrated_{}", uuid::Uuid::new_v4().simple());
+        let admin_conn = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (admin, connection) = tokio_postgres::connect(&admin_conn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        // `batch_execute` uses the simple query protocol. `execute` would use the
+        // extended one, which wraps the statement in an implicit transaction —
+        // and CREATE DATABASE cannot run inside a transaction block.
+        admin
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .expect("create an empty database");
+
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname,
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 2,
+            ..Default::default()
+        })
+        .await
+        .expect("the server is reachable, so construction must succeed");
+
+        // init_schema() is deliberately NOT called.
+
+        let tenant = create_tenant("unmigrated");
+
+        let read = backend.read(&tenant, "Patient", "does-not-exist").await;
+        assert!(
+            !matches!(read, Ok(None)),
+            "read against an unmigrated database returned Ok(None) — a store we \
+             could not query must not be indistinguishable from one where the \
+             resource is genuinely absent"
+        );
+        assert!(
+            matches!(read, Err(StorageError::Backend(_))),
+            "expected a backend error from an unmigrated database, got {read:?}"
+        );
+
+        let count = backend.count(&tenant, Some("Patient")).await;
+        assert!(
+            !matches!(count, Ok(0)),
+            "count against an unmigrated database returned Ok(0) — 'zero resources' \
+             is a claim about data we never successfully queried"
+        );
+        assert!(
+            matches!(count, Err(StorageError::Backend(_))),
+            "expected a backend error from an unmigrated database, got {count:?}"
+        );
+
+        let create = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient" }),
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(
+            matches!(create, Err(StorageError::Backend(_))),
+            "expected a backend error from an unmigrated database, got {create:?}"
+        );
     }
 }

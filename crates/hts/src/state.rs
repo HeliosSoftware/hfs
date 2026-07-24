@@ -186,9 +186,9 @@ pub struct AppState<B: TerminologyBackend> {
     /// In-process LRU-style cache for `$expand` responses.
     ///
     /// Eliminates redundant backend work when the same expansion is requested
-    /// repeatedly (e.g. by k6 virtual users running the same script).  The
-    /// cache is never invalidated during normal server operation; after a
-    /// bundle import call [`Self::clear_expand_cache`].
+    /// repeatedly (e.g. by k6 virtual users running the same script).  Evicted
+    /// by [`Self::clear_expand_cache`] after a bundle import and after every
+    /// CRUD write.
     pub expand_cache: ExpandCache,
 
     /// Negative cache for ValueSet URLs that are definitively absent.
@@ -287,11 +287,18 @@ impl<B: TerminologyBackend> AppState<B> {
     }
 
     /// Evict all cached `$expand` results and negative-cache entries, plus the
-    /// per-AppState `$validate-code` handler-response caches (CS and VS).
+    /// per-AppState `$lookup` and `$validate-code` handler-response caches.
     ///
-    /// Call this after a successful bundle import so that expansions and
-    /// validations reflecting the new terminology data are recomputed on the
+    /// Call this after any successful mutation of terminology content — bundle
+    /// import and CRUD create/update/delete alike — so that expansions,
+    /// lookups and validations reflecting the new data are recomputed on the
     /// next request.
+    ///
+    /// This is only the *handler* tier. The backend keeps its own per-instance
+    /// memos, which a handler recomputation would otherwise read straight back;
+    /// CRUD writes therefore go through
+    /// `operations::crud::evict_caches_after_write`, which clears both tiers.
+    /// See [`crate::traits::TerminologyCaches`].
     pub fn clear_expand_cache(&self) {
         if let Ok(mut cache) = self.expand_cache.write() {
             cache.clear();

@@ -149,6 +149,37 @@ chart-window = Chart time window
 
 footer-copyright = © { $year } { -org-name }
 
+## History & Versions (#236)
+
+history-heading = History & Versions
+history-lede = Compare two versions of a resource. Storage is fully versioned; this reads it through the ordinary _history and vread API.
+history-type-label = Resource type
+history-id-label = Resource id
+history-id-placeholder = resource id
+history-load = Load
+history-tabs-label = History scope
+history-tab-instance = Instance
+history-tab-type = Type feed
+history-tab-system = System feed
+history-versions-label = Versions
+history-pick-instance = Pick an instance
+history-current = current
+history-from = From
+history-to = To
+history-show-metadata = Show metadata changes
+history-empty = Load a resource, then pick two versions to compare.
+history-load-error = Could not load that resource's history.
+history-not-found = No history for that resource — check the type and id.
+history-diff-heading = { $from }
+history-metadata-hidden = { $count ->
+    [one] { $count } metadata change hidden
+   *[other] { $count } metadata changes hidden
+}
+history-textual = Show full text diff
+history-only-metadata = Only metadata changed between these versions.
+history-identical = These two versions are identical.
+history-deleted = { $version } is a deletion — there is nothing to diff against.
+history-parse-error = Those versions could not be read as JSON.
 ## Saved queries (#234)
 
 nav-saved-queries = Saved Queries
@@ -291,3 +322,31 @@ queries-next = Next
 
 queries-rail-heading = Resource types
 queries-rail-filter = Filter types
+
+## Search — natural language & visual builder (#255)
+
+search-heading = Search
+search-lede = Describe what you're looking for, or build the query by hand. Either way you get a FHIR search query you can read, correct, and run.
+search-query-tag = QUERY
+search-copy = Copy the query
+
+search-mode-label = How to write the query
+search-mode-nl = Natural language
+search-mode-builder = Visual builder
+
+search-nl-label = Describe the search
+search-nl-placeholder = Describe what you're looking for — e.g. patients named Smith born after 1980
+search-nl-hint = Your text and this server's search parameters go to the language model. Patient data never does. The query it writes is shown below for you to check and run.
+search-nl-working = Translating…
+search-nl-caveats = Worth knowing:
+search-nl-unsupported = That isn't a search this server can run. Try describing the records you want to find.
+
+search-nl-example-1 = Female patients over 65 with a diabetes diagnosis
+search-nl-example-2 = Observations from the last 30 days, most recent first
+search-nl-example-3 = Encounters at Boston General still in progress
+
+search-setup-heading = Natural-language search is available
+search-setup-body = Turn plain-language descriptions into FHIR search queries. It needs an API key for a language model — the server reads it from the environment, and it never reaches this page. Until one is set, use the visual builder below.
+search-setup-key-placeholder = your API key
+search-setup-disable = To remove the feature entirely — endpoint, page, and this notice — set HFS_NL_SEARCH_ENABLED=false.
+search-setup-docs = Read the how-to

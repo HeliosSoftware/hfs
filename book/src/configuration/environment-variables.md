@@ -68,3 +68,21 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources (vs 404) |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
 | `HFS_REQUIRE_IF_MATCH` | `false` | Require `If-Match` header for updates |
+
+## Natural-Language Search
+
+Translates plain-language descriptions into FHIR search queries. Off unless an
+API key is set, and removable entirely. See
+[Natural-Language Search](../components/natural-language-search.md) for what is
+sent to the model (never patient data), cost, and abuse prevention.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_NL_SEARCH_ENABLED` | `true` | Master switch. `false` removes the feature: no endpoint, no UI, no mention |
+| `HFS_NL_SEARCH_API_KEY` | *(unset)* | LLM provider API key. Unset → the UI advertises the feature and how to enable it, but it does not function |
+| `HFS_NL_SEARCH_MODEL` | `claude-opus-4-8` | Model used for translation |
+| `HFS_NL_SEARCH_BASE_URL` | `https://api.anthropic.com` | Provider endpoint (proxy or self-hosted) |
+| `HFS_NL_SEARCH_RATE_LIMIT` | `10` | Requests per window, per caller |
+| `HFS_NL_SEARCH_RATE_WINDOW_SECS` | `60` | Rate-limit window (seconds) |
+| `HFS_NL_SEARCH_DAILY_LIMIT` | `200` | Requests per caller per UTC day |
+| `HFS_NL_SEARCH_MAX_CHARS` | `500` | Maximum input length (characters) |

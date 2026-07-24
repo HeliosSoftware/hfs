@@ -347,6 +347,26 @@ pub trait ResourceStorage: Send + Sync {
         false
     }
 
+    /// Cheap readiness probe of the underlying store, used by the `/_readiness`
+    /// endpoint to decide whether this instance should receive traffic.
+    ///
+    /// Returns `Ok(())` when the backend is reachable and able to serve
+    /// requests, or an [`Err`] (typically [`BackendError::Unavailable`] /
+    /// [`BackendError::ConnectionFailed`] / [`BackendError::PoolExhausted`])
+    /// when it is not. The probe must be O(1) and side-effect free — it is
+    /// polled frequently by orchestrators.
+    ///
+    /// The default implementation returns `Ok(())`, which is correct only for
+    /// backends whose availability is equivalent to process liveness
+    /// (in-memory, on-disk file, and test mocks). **Networked backends MUST
+    /// override this** to actually touch their transport (e.g. delegate to
+    /// their [`Backend::health_check`](crate::core::Backend::health_check)); a
+    /// backend that leaves the default in place would report ready even when
+    /// its database is unreachable.
+    async fn readiness_check(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Creates a new resource.
     ///
     /// # Arguments
@@ -794,6 +814,15 @@ pub trait ResourceStorage: Send + Sync {
     /// override it with a single `GROUP BY tenant_id`.
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         Ok(Vec::new())
+    }
+
+    /// How many concurrent `create` calls this backend absorbs well during bulk
+    /// writes (e.g. conformance seeding). Latency-bound backends — object
+    /// stores, networked databases — override this so a ~1.4k-resource seed is
+    /// bounded by round trips divided by this factor rather than their sum. The
+    /// default of 1 keeps single-writer backends (SQLite) strictly sequential.
+    fn bulk_write_concurrency(&self) -> usize {
+        1
     }
 
     // ---- Tenant registry (first-class tenant maintenance) ------------------

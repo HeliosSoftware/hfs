@@ -18,6 +18,10 @@ jobs:
   test-rust:
     name: Test Rust
     runs-on: [self-hosted]
+    # Bound the whole job so a genuine hang fails fast instead of parking a
+    # runner for hours. A healthy run (full all-features build + tests) fits
+    # comfortably under this.
+    timeout-minutes: 120
     steps:
       - name: Verify DOCKER_HOST is set
         if: env.DOCKER_HOST == ''
@@ -90,22 +94,90 @@ jobs:
       # preconditions would turn every concurrent settings write into a lost
       # update, and nothing else in CI would notice.
       #
-      # Same package and feature set as the step above, so the build is already
-      # cached and this costs only the MinIO container. The harness stamps
-      # `github.run_id`, so `cleanup-test-containers` reaps it.
+      # This MUST use the same `--workspace --all-features` selection as the step
+      # above so the build is already cached and this costs only the MinIO
+      # container. It previously ran `-p helios-persistence --all-features`, and
+      # `--all-features` only activates features of the *selected* packages: with
+      # only `helios-persistence` selected, `helios-fhir` picked up `R6` (via
+      # `R6 = ["helios-fhir/R6", ...]`) but not `skip-r6-download`, which nothing
+      # forwards. That is a different feature set from the step above, so it
+      # recompiled `helios-fhir` and everything downstream *and* re-ran the
+      # helios-fhir build script's R6 example download from build.fhir.org.
+      # `--test minio_s3_tests` still narrows the run to the one target.
+      # The harness stamps `github.run_id`, so `cleanup-test-containers` reaps it.
       #
       # This step must not be able to pass vacuously. `cargo test` exits 0 when a
       # name filter matches nothing ("0 passed; N filtered out"), and the suite
       # self-skips when RUN_MINIO_S3_TESTS is unset — so a renamed test or a
       # typo'd variable would leave a green step that verified nothing at all.
       # Assert the expected number of tests actually ran.
+      # This block is bash (`\` continuation, `| tee`, `if ! grep`,
+      # `set -o pipefail`), which the Windows runner's default PowerShell cannot
+      # parse, so it needs `shell: bash`. But a bare `shell: bash` resolves to the
+      # first `bash` on PATH, and on the self-hosted Windows agent that is WSL's
+      # `C:\Windows\System32\bash.exe`; with no WSL distro installed it aborts
+      # ("Windows Subsystem for Linux has no installed distributions") before it
+      # can run a single line. Git is present on every agent (checkout uses it),
+      # so point Windows at Git Bash explicitly and keep plain `shell: bash` for
+      # the Unix agents. The two steps run the identical script; exactly one fires
+      # per run via the `runner.os` guard.
+      #
+      # The Windows path MUST use the 8.3 short name `C:\Progra~1` rather than
+      # `C:\Program Files`. The runner parses a custom `shell:` string by
+      # splitting on the FIRST space into (executable, args). A space inside the
+      # executable path splits it as ("C:\Program", "Files\...bash.exe ..."), and
+      # resolving that broken "C:\Program" fragment throws "Second path fragment
+      # must not be a drive or UNC name" before the script ever runs. The
+      # space-free short path avoids the mis-split entirely.
       - name: Verify S3 conditional writes against MinIO (per-user settings)
+        if: runner.os != 'Windows'
+        shell: bash
+        timeout-minutes: 15
         env:
           RUN_MINIO_S3_TESTS: "1"
-          EXPECTED_MINIO_SETTINGS_TESTS: "4"
+          EXPECTED_MINIO_SETTINGS_TESTS: "5"
         run: |
           set -o pipefail
-          cargo test -p helios-persistence --all-features \
+          cargo test --workspace --all-features \
+            --test minio_s3_tests test_minio_settings -- --nocapture \
+            | tee minio-settings.log
+          if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then
+            echo "::error::Expected ${EXPECTED_MINIO_SETTINGS_TESTS} MinIO settings tests to run and pass."
+            echo "::error::A green step here with a different count means the conditional-write"
+            echo "::error::contract was NOT verified. Check the test names and RUN_MINIO_S3_TESTS."
+            exit 1
+          fi
+      - name: Verify S3 conditional writes against MinIO (per-user settings) (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        timeout-minutes: 15
+        env:
+          RUN_MINIO_S3_TESTS: "1"
+          EXPECTED_MINIO_SETTINGS_TESTS: "5"
+          # The single self-hosted Windows runner is a virtualized guest whose
+          # CPU does not advertise SSE4.1 + PCLMULQDQ. The AWS S3 SDK's default
+          # integrity protection computes a CRC32 on every upload via the
+          # `crc-fast` crate (aws-sdk-s3 -> aws-smithy-checksums -> crc-fast),
+          # and crc-fast 1.6.0 has no software fallback on x86_64 — it panics
+          # ("x86 features missing (SSE4.1 && PCLMULQDQ)"), failing all four
+          # tests before they can verify anything. Opt out of the default
+          # checksum calc/validation so the SDK never enters that code path.
+          # This step verifies the If-Match / If-None-Match precondition
+          # contract, not checksums, so no coverage is lost; the Linux leg above
+          # still exercises the default checksum path. Both the test's SDK
+          # client and the S3 backend build config via
+          # `aws_config::defaults(BehaviorVersion::latest())`, which reads these
+          # env vars, so setting them here is sufficient.
+          AWS_REQUEST_CHECKSUM_CALCULATION: "WHEN_REQUIRED"
+          AWS_RESPONSE_CHECKSUM_VALIDATION: "WHEN_REQUIRED"
+        # `runs-on: [self-hosted]` is unpinned, so this job can land on a Windows
+        # runner, where `run:` defaults to PowerShell and cannot parse this bash
+        # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
+        # Pin Git Bash explicitly via its 8.3 short path (see line 139) — the
+        # plain `shell: bash` alias is unreliable on this self-hosted runner.
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-features \
             --test minio_s3_tests test_minio_settings -- --nocapture \
             | tee minio-settings.log
           if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then
@@ -1688,6 +1760,13 @@ jobs:
           DEPLOY_PORT: ${{ matrix.server == 'fhirpath-server' && secrets.FHIRPATH_DEPLOY_PORT || matrix.server == 'sof-server' && secrets.SOF_DEPLOY_PORT || matrix.server == 'hts' && secrets.HTS_DEPLOY_PORT || secrets.HFS_DEPLOY_PORT || 22 }}
           SERVER_NAME: ${{ matrix.server }}
           HFS_PUBLIC_URL: ${{ secrets.HFS_PUBLIC_URL }}
+          # Terminology backend for the three FHIR services. Each binary reads its own
+          # variable name (FHIRPATH_/SOF_/HFS_TERMINOLOGY_SERVER); sof and hfs propagate
+          # theirs into the embedded FHIRPath engine. Since #217 there is no built-in
+          # default, so an unset value is not a fallback -- %terminologies, memberOf,
+          # subsumes and the :in/:not-in search modifiers all fail outright.
+          # HTS serves operations at the root of its base URL: no /r4 or /r5 segment.
+          TERMINOLOGY_SERVER_URL: https://hts.heliossoftware.com
         run: |
           # Define SSH command with proper options (runner's own key is trusted by targets)
           SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
@@ -1753,15 +1832,15 @@ jobs:
           if [ "$SERVER_NAME" = "fhirpath-server" ]; then
             SERVICE_DESCRIPTION="FHIRPath Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"FHIRPATH_SERVER_HOST=0.0.0.0\""
+            SERVICE_ENV="Environment=\"FHIRPATH_SERVER_HOST=0.0.0.0\"\nEnvironment=\"FHIRPATH_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
           elif [ "$SERVER_NAME" = "sof-server" ]; then
             SERVICE_DESCRIPTION="SQL-on-FHIR Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"SOF_SERVER_HOST=0.0.0.0\""
+            SERVICE_ENV="Environment=\"SOF_SERVER_HOST=0.0.0.0\"\nEnvironment=\"SOF_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
           elif [ "$SERVER_NAME" = "hfs" ]; then
             SERVICE_DESCRIPTION="Helios FHIR Server"
             SERVICE_EXEC_START="/opt/$SERVER_NAME/$SERVER_NAME --host 0.0.0.0"
-            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\""
+            SERVICE_ENV="Environment=\"HFS_SERVER_HOST=0.0.0.0\"\nEnvironment=\"HFS_BASE_URL=${HFS_PUBLIC_URL}\"\nEnvironment=\"HFS_TERMINOLOGY_SERVER=${TERMINOLOGY_SERVER_URL}\""
           elif [ "$SERVER_NAME" = "hts" ]; then
             SERVICE_DESCRIPTION="Helios Terminology Server"
             # hts uses a subcommand CLI: host/port/db flags live under `run`

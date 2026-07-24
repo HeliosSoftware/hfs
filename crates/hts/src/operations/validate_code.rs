@@ -1170,13 +1170,16 @@ async fn build_validate_response_async<B: TerminologyBackend>(
     lenient_display_validation: bool,
 ) -> Value {
     // For inactive concepts whose underlying status is more specific than
-    // "inactive" (e.g. `retired`, `deprecated`, `withdrawn`), the IG
-    // `inactive/validate-inactive-3*` fixtures expect TWO warning issues:
-    // one with text "...has a status of inactive..." (the canonical wording
-    // already emitted by the backend) AND a second with text using the
-    // specific status code (e.g. "...has a status of retired..."). Detect
-    // that case here by looking up the concept's `status` property and
-    // appending a second issue when needed.
+    // "inactive" (e.g. `retired`, `deprecated`, `withdrawn`), merge the two
+    // facts into the single canonical warning IN PLACE: rewrite the generic
+    // "...has a status of inactive..." issue the backend emitted to
+    // "...has a status of {specific_status} and inactive..." (e.g. "retired and
+    // inactive"). The reference server (tx.fhir.org) emits ONE combined
+    // `INACTIVE_CONCEPT_FOUND` warning whose status token is the join of the
+    // property status and the literal `inactive`, not two separate issues. We
+    // also surface the specific status as the top-level `concept_status`
+    // parameter. Idempotent: once merged, `already_has_specific` matches and
+    // re-entry is a no-op.
     if resp.inactive == Some(true) {
         let inferred_system = resp.system.clone();
         let lookup_system: Option<&str> = system.or(inferred_system.as_deref());
@@ -1195,23 +1198,17 @@ async fn build_validate_response_async<B: TerminologyBackend>(
                             .contains(&format!("has a status of {specific_status} and"))
                 });
                 if !already_has_specific {
-                    let inactive_issue = resp.issues.iter().find(|i| {
+                    // Rewrite the generic issue's text in place — preserving its
+                    // severity / fhir_code / tx_code / expression / location /
+                    // message_id — so a single merged warning names both the
+                    // specific status and `inactive`. Push nothing.
+                    if let Some(issue) = resp.issues.iter_mut().find(|i| {
                         i.message_id.as_deref() == Some("INACTIVE_CONCEPT_FOUND")
                             && i.text.contains("has a status of inactive")
-                    });
-                    if let Some(template) = inactive_issue.cloned() {
-                        let new_text = format!(
-                            "The concept '{cd}' has a status of {specific_status} and its use should be reviewed"
+                    }) {
+                        issue.text = format!(
+                            "The concept '{cd}' has a status of {specific_status} and inactive and its use should be reviewed"
                         );
-                        resp.issues.push(ValidationIssue {
-                            severity: template.severity,
-                            fhir_code: template.fhir_code,
-                            tx_code: template.tx_code,
-                            text: new_text,
-                            expression: template.expression,
-                            location: template.location,
-                            message_id: template.message_id,
-                        });
                     }
                 }
             }
@@ -2212,28 +2209,25 @@ pub(crate) async fn process_validate_code<B: TerminologyBackend>(
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.cs_validate_code_handler_cache, key) {
-            let key_short: String = key.chars().take(100).collect();
-            tracing::info!(
+            // Field exprs are evaluated only when the probe target is enabled,
+            // so the truncating alloc costs nothing at the default level.
+            tracing::debug!(
                 target: "hts::probe",
                 "VC_CACHE: path=cs hit=true cache_key={}",
-                key_short,
+                key.chars().take(100).collect::<String>(),
             );
             return Ok((*cached).clone());
         }
     }
-    {
-        let (skip, key_short, key_len) = match cache_key.as_ref() {
-            Some(k) => (false, k.chars().take(100).collect::<String>(), k.len()),
-            None => (true, String::new(), 0usize),
-        };
-        tracing::info!(
-            target: "hts::probe",
-            "VC_CACHE: path=cs hit=false skip={} key_len={} cache_key={}",
-            skip,
-            key_len,
-            key_short,
-        );
-    }
+    tracing::debug!(
+        target: "hts::probe",
+        "VC_CACHE: path=cs hit=false skip={} key_len={} cache_key={}",
+        cache_key.is_none(),
+        cache_key.as_ref().map_or(0, |k| k.len()),
+        cache_key
+            .as_ref()
+            .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
+    );
     let result = process_validate_code_inner(state, params).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
@@ -2464,16 +2458,17 @@ async fn process_validate_code_inner<B: TerminologyBackend>(
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
             .and_then(|p| p.get("valueCodeableConcept"))
             .cloned();
-        // The IG fixtures expect the LAST matching coding to win (when several
+        // The IG fixtures expect the FIRST matching coding to win (when several
         // codings in a CodeableConcept all validate, the response echoes the
-        // last one). Iterate in reverse so the earliest "yes" we find is the
-        // last entry in the input.
+        // first one in input order, matching the reference server's
+        // document-order processing). Iterate forward and return on the first
+        // "yes".
         let cc_explicit_version = find_str_param(&params, "version");
         let cs_lenient = params
             .iter()
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("lenient-display-validation"))
             .and_then(|p| p.get("valueBoolean").and_then(|v| v.as_bool()));
-        for (system, code) in codings.into_iter().rev() {
+        for (system, code) in codings.into_iter() {
             // Resolved per coding: the version pins are keyed by system canonical
             // (`system-version=<url>|<version>`), and a CodeableConcept may carry
             // codings from several systems, so the effective version can differ
@@ -3652,7 +3647,7 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
         .unwrap_or(false);
 
     // Extract the input coding/code (priority: coding → code → codeableConcept).
-    // For CodeableConcept, try each coding last-to-first (IG "last match wins").
+    // For CodeableConcept, try each coding first-to-last (IG "first match wins").
     let cc_value = find_codeable_concept_param(&params);
     let coding_attempts: Vec<(Option<String>, String, Option<String>, RequestPath)> =
         if let Some((sys, cd, disp, _ver)) = extract_coding_full(&params, "coding") {
@@ -3676,7 +3671,6 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
             }
             entries
                 .iter()
-                .rev()
                 .filter_map(|c| {
                     let code = c.get("code").and_then(|v| v.as_str())?.to_string();
                     let system = c
@@ -3759,8 +3753,9 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
                 }
             }
         }
-        // All attempts failed MIME syntax check — emit not-in-vs for the last code.
-        if let Some((_, in_code, in_display, path)) = coding_attempts.last() {
+        // All attempts failed MIME syntax check — emit not-in-vs for the first
+        // code (matching first-wins coding selection).
+        if let Some((_, in_code, in_display, path)) = coding_attempts.first() {
             let req = ValidateCodeRequest {
                 url: Some(url.clone()),
                 value_set_version: vs_resource
@@ -3828,9 +3823,8 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
     };
     let expansion = ValueSetOperations::expand(state.backend(), &ctx, expand_req).await?;
 
-    // Try each coding attempt (last-to-first for CodeableConcept) until one
+    // Try each coding attempt (first-to-last for CodeableConcept) until one
     // is found in the inline VS expansion.
-    let mut last_miss: Option<(Option<String>, String, Option<String>)> = None;
     for (in_system, in_code, in_display) in coding_attempts
         .iter()
         .map(|(s, c, d, _)| (s.clone(), c.clone(), d.clone()))
@@ -3952,11 +3946,14 @@ async fn process_inline_vs_validate_code<B: TerminologyBackend>(
             .await;
             return Ok(value);
         }
-
-        last_miss = Some((in_system, in_code, in_display));
     }
 
-    let (in_system, in_code, in_display) = last_miss.unwrap_or_else(|| (None, String::new(), None));
+    // Membership miss for every coding — echo the FIRST input coding (matching
+    // first-wins selection) in the not-in-vs issue.
+    let (in_system, in_code, in_display) = coding_attempts
+        .first()
+        .map(|(s, c, d, _)| (s.clone(), c.clone(), d.clone()))
+        .unwrap_or_else(|| (None, String::new(), None));
     let resolved_system = in_system.clone();
 
     // Membership miss for every coding — emit the IG `not-in-vs` issue text.
@@ -4114,30 +4111,25 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     let cache_key = build_validate_code_cache_key(&params);
     if let Some(ref key) = cache_key {
         if let Some(cached) = validate_code_cache_get(&state.vs_validate_code_handler_cache, key) {
-            // Probe: cache hit on VS path.
-            let key_short: String = key.chars().take(100).collect();
-            tracing::info!(
+            // Field exprs evaluated only when the probe target is enabled.
+            tracing::debug!(
                 target: "hts::probe",
                 "VC_CACHE: path=vs hit=true cache_key={}",
-                key_short,
+                key.chars().take(100).collect::<String>(),
             );
             return Ok((*cached).clone());
         }
     }
     // Probe: cache miss (or skipped) on VS path. Capture key length / shape.
-    {
-        let (skip, key_short, key_len) = match cache_key.as_ref() {
-            Some(k) => (false, k.chars().take(100).collect::<String>(), k.len()),
-            None => (true, String::new(), 0usize),
-        };
-        tracing::info!(
-            target: "hts::probe",
-            "VC_CACHE: path=vs hit=false skip={} key_len={} cache_key={}",
-            skip,
-            key_len,
-            key_short,
-        );
-    }
+    tracing::debug!(
+        target: "hts::probe",
+        "VC_CACHE: path=vs hit=false skip={} key_len={} cache_key={}",
+        cache_key.is_none(),
+        cache_key.as_ref().map_or(0, |k| k.len()),
+        cache_key
+            .as_ref()
+            .map_or(String::new(), |k| k.chars().take(100).collect::<String>()),
+    );
     let result = process_vs_validate_code_inner(state, params).await;
     if let (Ok(value), Some(key)) = (&result, cache_key) {
         validate_code_cache_put(
@@ -5225,6 +5217,11 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         let coding_entries = cc_value
             .as_ref()
             .and_then(coding_entries_from_codeable_concept);
+        // Keep-first per (system,code): when a CodeableConcept carries two
+        // codings sharing the same (system,code) but different display/version
+        // (e.g. `overload/validate-good2a`), first-wins coding selection must
+        // echo the FIRST coding's display/version, so these maps must retain the
+        // first occurrence, not the last (`.collect()` would keep the last).
         let coding_displays: std::collections::HashMap<(String, String), String> = coding_entries
             .as_ref()
             .map(|arr| {
@@ -5235,7 +5232,10 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         let d = c.get("display").and_then(|v| v.as_str())?.to_string();
                         Some(((s, cd), d))
                     })
-                    .collect()
+                    .fold(std::collections::HashMap::new(), |mut m, (k, v)| {
+                        m.entry(k).or_insert(v);
+                        m
+                    })
             })
             .unwrap_or_default();
         let coding_versions: std::collections::HashMap<(String, String), String> = coding_entries
@@ -5248,13 +5248,17 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                         let v = c.get("version").and_then(|v| v.as_str())?.to_string();
                         Some(((s, cd), v))
                     })
-                    .collect()
+                    .fold(std::collections::HashMap::new(), |mut m, (k, v)| {
+                        m.entry(k).or_insert(v);
+                        m
+                    })
             })
             .unwrap_or_default();
-        // The IG fixtures expect the LAST matching coding to win (when several
+        // The IG fixtures expect the FIRST matching coding to win (when several
         // codings in a CodeableConcept all validate, the response echoes the
-        // last one). Iterate in reverse so the earliest "yes" we find is the
-        // last entry in the input.
+        // first one in input order, matching the reference server's
+        // document-order processing). Iterate forward and return on the first
+        // "yes".
         //
         // Also track per-coding `unknown-code` failures (codes that don't
         // exist in their CS) so we can surface them in the response even when
@@ -5265,15 +5269,17 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
         // bad coding's `Unknown_Code_in_Version` error +
         // `None_of_the_provided_codes_are_in_the_value_set_one` info.
         let cc_req_version = find_str_param(&params, "version").or(system_version.clone());
-        // Map (system, code) → original CC index (preserved through reverse
-        // iteration) so per-coding failure issues reference
-        // `CodeableConcept.coding[N]` with the input order's N.
+        // Map (system, code) → original CC index so per-coding failure issues
+        // reference `CodeableConcept.coding[N]` with the input order's N. Keep
+        // the FIRST occurrence to match first-wins coding selection.
         let coding_index: std::collections::HashMap<(String, String), usize> = codings
             .iter()
             .enumerate()
-            .map(|(i, (s, c))| ((s.clone(), c.clone()), i))
-            .collect();
-        for (system, code) in codings.clone().into_iter().rev() {
+            .fold(std::collections::HashMap::new(), |mut m, (i, (s, c))| {
+                m.entry((s.clone(), c.clone())).or_insert(i);
+                m
+            });
+        for (system, code) in codings.clone().into_iter() {
             // Prefer the per-coding version (embedded in the CC) over the
             // top-level `version` parameter so that version-mismatch detection
             // fires correctly for each coding.
@@ -7236,6 +7242,258 @@ mod tests {
         let params = json["parameter"].as_array().unwrap();
         let result = params.iter().find(|p| p["name"] == "result").unwrap();
         assert_eq!(result["valueBoolean"], true);
+    }
+
+    // ── #339 Group C: CodeableConcept first-matching-coding wins ──────────────
+
+    #[tokio::test]
+    async fn cs_validate_codeable_concept_echoes_first_matching_coding() {
+        // When several codings all validate, the response must echo the FIRST
+        // coding in input order (not the last). Guards the `.rev()` removal in
+        // the CS CodeableConcept path.
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at)
+                 VALUES ('cs-cc', 'http://example.org/cc', '1.0', 'CC CS',
+                         'active', 'complete', '2024-01-01', '2024-01-01');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (1, 'cs-cc', 'code1', 'Display 1'),
+                        (2, 'cs-cc', 'code2', 'Display 2'),
+                        (3, 'cs-cc', 'code3', 'Display 3');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        let app = Router::new()
+            .route(
+                "/CodeSystem/$validate-code",
+                post(validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "codeableConcept",
+                "valueCodeableConcept": {
+                    "coding": [
+                        {"system": "http://example.org/cc", "code": "code1", "display": "Display 1"},
+                        {"system": "http://example.org/cc", "code": "code2", "display": "Display 2"},
+                        {"system": "http://example.org/cc", "code": "code3", "display": "Display 3"}
+                    ]
+                }
+            }]
+        });
+
+        let resp = post_json(app, "/CodeSystem/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        assert_eq!(
+            params.iter().find(|p| p["name"] == "result").unwrap()["valueBoolean"],
+            true
+        );
+        assert_eq!(
+            params.iter().find(|p| p["name"] == "code").unwrap()["valueCode"],
+            "code1",
+            "first matching coding must win"
+        );
+        assert_eq!(
+            params.iter().find(|p| p["name"] == "display").unwrap()["valueString"],
+            "Display 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn vs_validate_codeable_concept_echoes_first_matching_coding() {
+        // VS-path counterpart: make_vs_app's VS contains both A and B, so a CC
+        // with codings [B, A] (both valid) must echo the FIRST one, B.
+        let app = make_vs_app();
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/vs"},
+                {
+                    "name": "codeableConcept",
+                    "valueCodeableConcept": {
+                        "coding": [
+                            {"system": "http://example.org/cs", "code": "B", "display": "Beta"},
+                            {"system": "http://example.org/cs", "code": "A", "display": "Alpha"}
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        assert_eq!(
+            params.iter().find(|p| p["name"] == "result").unwrap()["valueBoolean"],
+            true
+        );
+        assert_eq!(
+            params.iter().find(|p| p["name"] == "code").unwrap()["valueCode"],
+            "B",
+            "first matching coding must win"
+        );
+    }
+
+    // ── #339 Group B: keep-first display/version for a duplicate (system,code) ─
+
+    #[tokio::test]
+    async fn vs_validate_duplicate_coding_echoes_first_coding_version() {
+        // Mirrors `overload/validate-good2a`: two codings share (overload,code2)
+        // but pin different versions ("2.0" then "1.0"). First-wins selection +
+        // keep-first version map must echo the FIRST coding's version, "2.0".
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at)
+                 VALUES ('ov1', 'http://example.org/overload', '1.0', 'Overload',
+                         'active', 'complete', '2024-01-01', '2024-01-01'),
+                        ('ov2', 'http://example.org/overload', '2.0', 'Overload',
+                         'active', 'complete', '2024-01-01', '2024-01-01');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (1, 'ov1', 'code2', 'Display 2'),
+                        (2, 'ov2', 'code2', 'Display #2');
+
+                 INSERT INTO value_sets
+                     (id, url, name, status, compose_json, created_at, updated_at)
+                 VALUES ('vs-ov', 'http://example.org/vs-ov', 'OverloadVS', 'active',
+                         '{\"include\":[{\"system\":\"http://example.org/overload\"}]}',
+                         '2024-01-01', '2024-01-01');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        let app = Router::new()
+            .route(
+                "/ValueSet/$validate-code",
+                post(vs_validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/vs-ov"},
+                {
+                    "name": "codeableConcept",
+                    "valueCodeableConcept": {
+                        "coding": [
+                            {"system": "http://example.org/overload", "code": "code2",
+                             "version": "2.0", "display": "Display #2"},
+                            {"system": "http://example.org/overload", "code": "code2",
+                             "version": "1.0", "display": "Display 2"}
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+        assert_eq!(
+            params.iter().find(|p| p["name"] == "result").unwrap()["valueBoolean"],
+            true
+        );
+        assert_eq!(
+            params
+                .iter()
+                .find(|p| p["name"] == "version")
+                .expect("version echoed")["valueString"],
+            "2.0",
+            "first coding's pinned version must win"
+        );
+    }
+
+    // ── #339 Group A: retired+inactive merges into ONE status issue ───────────
+
+    #[tokio::test]
+    async fn vs_validate_retired_inactive_concept_emits_single_merged_issue() {
+        // A concept that is both retired (status property) and inactive must
+        // yield ONE merged "...has a status of retired and inactive..." warning,
+        // not two separate ("...inactive..." + "...retired...") issues.
+        let backend = SqliteTerminologyBackend::in_memory().unwrap();
+        {
+            let conn = backend.pool().get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO code_systems
+                     (id, url, version, name, status, content, created_at, updated_at)
+                 VALUES ('cs-ret', 'http://example.org/ret', '1.0', 'RetCS',
+                         'active', 'complete', '2024-01-01', '2024-01-01');
+
+                 INSERT INTO concepts (id, system_id, code, display)
+                 VALUES (1, 'cs-ret', 'OLD', 'Old Concept');
+
+                 INSERT INTO concept_properties (id, concept_id, property, value_type, value)
+                 VALUES (1, 1, 'status', 'code', 'retired');
+
+                 INSERT INTO value_sets
+                     (id, url, name, status, compose_json, created_at, updated_at)
+                 VALUES ('vs-ret', 'http://example.org/vs-ret', 'RetVS', 'active',
+                         '{\"include\":[{\"system\":\"http://example.org/ret\"}]}',
+                         '2024-01-01', '2024-01-01');",
+            )
+            .unwrap();
+        }
+        let state = AppState::new(backend);
+        let app = Router::new()
+            .route(
+                "/ValueSet/$validate-code",
+                post(vs_validate_code_handler::<SqliteTerminologyBackend>),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/vs-ret"},
+                {"name": "system", "valueUri": "http://example.org/ret"},
+                {"name": "code", "valueCode": "OLD"}
+            ]
+        });
+
+        let resp = post_json(app, "/ValueSet/$validate-code", body).await;
+        assert_eq!(resp.status(), 200);
+        let json = body_json(resp).await;
+        let params = json["parameter"].as_array().unwrap();
+
+        let status_issue_texts: Vec<String> = params
+            .iter()
+            .find(|p| p["name"] == "issues")
+            .and_then(|p| p["resource"]["issue"].as_array())
+            .map(|issues| {
+                issues
+                    .iter()
+                    .filter_map(|i| i["details"]["text"].as_str())
+                    .filter(|t| t.contains("has a status of"))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert_eq!(
+            status_issue_texts.len(),
+            1,
+            "expected exactly one merged status issue, got {status_issue_texts:?}"
+        );
+        assert!(
+            status_issue_texts[0].contains("has a status of retired and inactive"),
+            "status issue must merge retired+inactive: {}",
+            status_issue_texts[0]
+        );
     }
 
     #[tokio::test]

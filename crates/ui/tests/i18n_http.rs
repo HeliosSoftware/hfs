@@ -15,6 +15,11 @@ fn app() -> Router {
         Router::new(),
         "9.9.9",
         None,
+        helios_ui::NlSearch {
+            enabled: true,
+            configured: true,
+            model: "test-model".to_string(),
+        },
         None,
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
