@@ -2625,6 +2625,7 @@ impl MongoBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_resource_in_bundle_transaction(
         &self,
         db: &mongodb::Database,
