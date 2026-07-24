@@ -11,6 +11,15 @@
 (function () {
   "use strict";
 
+  /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
+  var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  function fhirHeaders(extra) {
+    var h = { Accept: "application/fhir+json" };
+    if (TENANT) h["X-Tenant-ID"] = TENANT;
+    if (extra) for (var k in extra) h[k] = extra[k];
+    return h;
+  }
+
   var root = document.getElementById("resources");
   var modal = document.getElementById("resource-modal");
   if (!root || !modal || !window.fetch) return;
@@ -162,7 +171,7 @@
     subject.textContent = type + "/" + id;
     openModal();
     editorBody.innerHTML = "";
-    fetch("/" + type + "/" + id, { headers: { Accept: "application/fhir+json" } })
+    fetch("/" + type + "/" + id, { headers: fhirHeaders() })
       .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
       .then(renderEditor)
       .catch(function () { say(messages.msgLoadError, "error"); });
@@ -229,7 +238,7 @@
       var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
       fetch(url, {
         method: creating ? "POST" : "PUT",
-        headers: { "Content-Type": "application/fhir+json", Accept: "application/fhir+json" },
+        headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
         body: JSON.stringify(doc),
       })
         .then(function (r) {
@@ -249,7 +258,7 @@
   document.getElementById("resource-delete").addEventListener("click", function () {
     if (!current.id) { closeModal(); return; }
     if (!window.confirm(messages.msgConfirmDelete)) return;
-    fetch("/" + current.type + "/" + current.id, { method: "DELETE" })
+    fetch("/" + current.type + "/" + current.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (r) {
         if (r.ok || r.status === 204) { closeModal(); location.reload(); }
         else say(String(r.status), "error");
@@ -275,7 +284,7 @@
     document.getElementById("resource-history-subject").textContent =
       current.type + "/" + current.id;
     fetch("/" + current.type + "/" + current.id + "/_history", {
-      headers: { Accept: "application/fhir+json" },
+      headers: fhirHeaders(),
     })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (bundle) { renderVersions((bundle && bundle.entry) || []); })

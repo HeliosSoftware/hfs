@@ -20,6 +20,15 @@
 (function () {
   "use strict";
 
+  /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
+  var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  function fhirHeaders(extra) {
+    var h = { Accept: "application/fhir+json" };
+    if (TENANT) h["X-Tenant-ID"] = TENANT;
+    if (extra) for (var k in extra) h[k] = extra[k];
+    return h;
+  }
+
   var root = document.getElementById("editor");
   if (!root || !window.fetch) return;
 
@@ -86,7 +95,7 @@
         .then(function (html) { body.innerHTML = html; applyView(); });
     }
     return fetch("/" + resourceType + "/" + resourceId, {
-      headers: { Accept: "application/fhir+json" },
+      headers: fhirHeaders(),
     })
       .then(function (response) {
         if (!response.ok) throw new Error(String(response.status));
@@ -125,7 +134,7 @@
   function loadVersions() {
     if (!versionsHost || !resourceId) return;
     fetch("/" + resourceType + "/" + resourceId + "/_history", {
-      headers: { Accept: "application/fhir+json" },
+      headers: fhirHeaders(),
     })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (bundle) {
@@ -345,10 +354,7 @@
 
       fetch(url, {
         method: isNew ? "POST" : "PUT",
-        headers: {
-          "Content-Type": "application/fhir+json",
-          Accept: "application/fhir+json",
-        },
+        headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
         body: doc,
       })
         .then(function (response) {
@@ -383,7 +389,7 @@
     if (!parsed.id) return;
     if (!window.confirm(messages.msgConfirmDelete)) return;
 
-    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE" })
+    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (response) {
         if (response.ok) window.location.href = "/ui/queries";
       })

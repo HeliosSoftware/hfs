@@ -30,6 +30,13 @@
   "use strict";
 
   var SETTINGS = "/_user/settings";
+  /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
+  var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  function fhirHeaders() {
+    var h = { Accept: "application/fhir+json" };
+    if (TENANT) h["X-Tenant-ID"] = TENANT;
+    return h;
+  }
   var MAX_RETRIES = 2;
   var MAX_RECENT = 10;
 
@@ -391,7 +398,7 @@
           encodeURIComponent(slot.dataset.countFor) +
           "?_summary=count&_total=accurate",
         {
-          headers: { Accept: "application/fhir+json" },
+          headers: fhirHeaders(),
           credentials: "same-origin",
         }
       )
@@ -616,7 +623,7 @@
       window.open(path, "_blank", "noopener");
     } else {
       fetch(path, {
-        headers: { Accept: "application/fhir+json" },
+        headers: fhirHeaders(),
         credentials: "same-origin",
       })
         .then(function (response) {
