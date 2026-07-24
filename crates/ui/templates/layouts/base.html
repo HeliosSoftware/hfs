@@ -103,10 +103,10 @@
         <span class="nav-item__label">{{ i18n.t("nav-search") }}</span>
       </span>
       {% endif %}
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-resource-editor") }}">
+      <a class="nav-item" href="/ui/editor"{% if active_page == "editor" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resource-editor") }}">
         <span class="icon">{% include "icons/pencil.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-resource-editor") }}</span>
-      </span>
+      </a>
       <a class="nav-item" href="/ui/history" title="{{ i18n.t("nav-history-versions") }}">
         <span class="icon">{% include "icons/history.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-history-versions") }}</span>

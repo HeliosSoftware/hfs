@@ -3612,6 +3612,7 @@ dependencies = [
  "fluent-templates",
  "helios-auth",
  "helios-fhir",
+ "helios-fhir-validator",
  "helios-observability",
  "helios-persistence",
  "http-body-util",

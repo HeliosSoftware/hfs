@@ -38,8 +38,10 @@
 
 mod compartments;
 mod conformance;
+mod editor;
 mod history;
 mod i18n;
+mod json_view;
 mod search_params;
 mod tenants;
 
@@ -395,6 +397,13 @@ pub fn mount_with_conformance_source(
         .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/compartments", get(compartments_page))
+        // Schema-driven resource editor (#264). One POST endpoint applies every
+        // structural mutation and re-renders: the document rides with it.
+        .route("/ui/editor", get(editor::page))
+        .route(
+            "/ui/editor/render",
+            axum::routing::post(editor::render_body),
+        )
         .route("/ui/status", get(status))
         .route("/ui/history", get(history_page))
         // The diff is computed server-side (the decision in

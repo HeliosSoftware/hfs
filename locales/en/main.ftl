@@ -350,3 +350,47 @@ search-setup-body = Turn plain-language descriptions into FHIR search queries. I
 search-setup-key-placeholder = your API key
 search-setup-disable = To remove the feature entirely — endpoint, page, and this notice — set HFS_NL_SEARCH_ENABLED=false.
 search-setup-docs = Read the how-to
+
+## Resource editor (#264)
+
+editor-heading = Resource editor
+editor-lede = Edit a resource against its schema: add any element the schema allows, at any depth — including extensions, on any node that accepts one.
+editor-title = Edit resource
+editor-view-label = How to edit
+editor-view-form = Guided form
+editor-view-json = JSON
+editor-save = Save changes
+editor-delete = Delete
+editor-remove = Remove this node
+editor-saved = Saved.
+editor-load-error = Could not load that resource.
+editor-confirm-delete = Delete this resource? This cannot be undone.
+editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
+editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+
+editor-add = Add element
+editor-add-filter = Filter elements
+editor-add-another = add another
+editor-pick-type = Pick a type…
+editor-extension-url = Extension URL
+editor-add-extension = Add extension
+
+editor-valid = No issues.
+editor-issues = { $count ->
+    [one] { $count } issue
+   *[other] { $count } issues
+}
+
+editor-modifier-badge = modifier
+editor-modifier-warning = A modifier extension changes the meaning of this resource. A system that does not recognise it must refuse to process the resource.
+editor-unknown-badge = not in schema
+editor-unknown-hint = The schema does not describe this element. It is shown so it is not silently lost, and it is kept on save.
+
+editor-primitive-extension-badge = + extension
+editor-primitive-extension-hint = This value carries extensions of its own (a `_` sibling in the JSON). They are kept when you save.
+
+editor-collapse-all = Collapse all
+editor-expand-all = Expand all
+editor-edit-raw = Edit raw
+editor-versions = Versions
+editor-versions-none = No prior versions.
