@@ -351,8 +351,8 @@ async fn nl_search_configured_renders_the_translator_over_an_editable_query() {
     assert!(!html.contains("readonly"));
     // The key itself never reaches the page.
     assert!(!html.contains("HFS_NL_SEARCH_API_KEY"));
-    // Enabled → the sidebar links the page.
-    assert!(html.contains(r#"href="/ui/search""#));
+    // The route renders; the search surface now lives inside Resources, so
+    // there is no separate Search nav entry (#282).
 }
 
 /* The resource editor (#264). The endpoint takes the whole in-flight document
@@ -363,39 +363,6 @@ async fn edit(form: &str) -> String {
     let response = app()
         .oneshot(
             Request::post("/ui/editor/render")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from(form.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    body_text(response).await
-}
-
-/* History & Versions (#236). The diff is computed server-side; these post two
- * versions the way the browser does after fetching them from _history. */
-
-#[tokio::test]
-async fn history_page_renders_the_shell() {
-    let response = app()
-        .oneshot(Request::get("/ui/history").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let html = body_text(response).await;
-    assert!(html.contains("<!doctype html>"));
-    // Brett's tabs and the version rail.
-    assert!(html.contains(r#"data-tab="instance""#));
-    assert!(html.contains(r#"id="history-versions""#));
-    assert!(html.contains("history.js"));
-}
-
-async fn diff(form: &str) -> String {
-    let response = app()
-        .oneshot(
-            Request::post("/ui/history/diff")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(Body::from(form.to_string()))
                 .unwrap(),
@@ -539,6 +506,39 @@ async fn editor_keeps_the_users_text_when_the_json_is_broken() {
     assert!(html.contains("resourceType"));
 }
 
+/* History & Versions (#236). The diff is computed server-side; these post two
+ * versions the way the browser does after fetching them from _history. */
+
+#[tokio::test]
+async fn history_page_renders_the_shell() {
+    let response = app()
+        .oneshot(Request::get("/ui/history").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    // Brett's tabs and the version rail.
+    assert!(html.contains(r#"data-tab="instance""#));
+    assert!(html.contains(r#"id="history-versions""#));
+    assert!(html.contains("history.js"));
+}
+
+async fn diff(form: &str) -> String {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/history/diff")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_text(response).await
+}
+
 #[tokio::test]
 async fn diff_shows_a_rename_in_both_layers_and_hides_metadata() {
     // v3 -> v4: family Smith -> Smythe, and the meta churn that should be hidden.
@@ -588,6 +588,50 @@ async fn identical_versions_say_so() {
 async fn unparseable_versions_report_an_error_not_an_empty_diff() {
     let html = diff("from=%7Bnope&to=%7B%7D").await;
     assert!(html.contains("history__banner--error"));
+}
+
+/* Resources workspace (#282): the nav submenu + the page that ties the type
+ * filter, search, and edit modal together. */
+
+#[tokio::test]
+async fn resources_page_has_the_filter_search_and_create_button() {
+    let response = app()
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The type filter rail, the search builder, and the Create button.
+    assert!(html.contains(r#"id="type-rail-list""#));
+    assert!(html.contains(r#"id="saved-query-form""#));
+    assert!(html.contains(r#"id="resource-create""#));
+    // The edit modal shell, with its Edit / History tabs.
+    assert!(html.contains(r#"id="resource-modal""#));
+    assert!(html.contains(r#"data-modal-tab="history""#));
+    // The nav carries a flat Resources entry, marked current on this page
+    // (matching Brett's flat sidebar — the type picker is the page's own rail).
+    assert!(html.contains(r#"href="/ui/resources" aria-current="page""#));
+}
+
+#[tokio::test]
+async fn resources_deep_links_focus_the_selected_type() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/resources?type=Observation")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The rail marks the deep-linked type, and Create targets it. The type
+    // list is the nav panel now (part of the menu), not a card in the content.
+    assert!(html.contains(r#"data-selected-type="Observation""#));
+    assert!(html.contains(r#"nav-panel__item--on" data-rail-type="Observation""#));
+    assert!(html.contains(r#"class="nav-panel""#));
 }
 
 #[tokio::test]

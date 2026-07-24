@@ -395,3 +395,19 @@ editor-expand-all = Expand all
 editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
+
+## Resources workspace (#282)
+
+resources-heading = Resources
+resources-lede = Browse, search, create, and edit FHIR resources. Search in natural language or build the query by hand, then open any result to edit it.
+resources-create = Create new
+resources-save-blocked = Fix the validation issues before saving.
+resources-save-invalid = The JSON is not valid — fix it before saving.
+resources-edit-title = Edit resource
+resources-tab-edit = Edit
+resources-tab-history = History
+resources-types-heading = Resource types
+
+queries-saved-group = Saved
+
+nav-collapse = Collapse menu

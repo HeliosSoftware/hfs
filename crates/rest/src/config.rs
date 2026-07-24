@@ -37,7 +37,7 @@
 //! | `HFS_VALIDATION_UNKNOWN_PROFILE` | warn | Unresolvable profiles: warn, error, or ignore |
 //! | `HFS_VALIDATION_CONSTRAINTS` | true | Evaluate FHIRPath invariants |
 //! | `HFS_VALIDATION_SUPPRESS_CONSTRAINTS` | dom-6 | Comma-separated constraint ids to skip |
-//! | `HFS_VALIDATION_TERMINOLOGY` | off | Required-binding checks: off or remote (`$validate-code` against `HFS_TERMINOLOGY_SERVER`) |
+//! | `HFS_VALIDATION_TERMINOLOGY` | embedded | Required-binding checks: embedded (offline FHIR core value sets), remote (`$validate-code` against `HFS_TERMINOLOGY_SERVER`), or off |
 //! | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | 3000 | Per-check terminology timeout |
 //! | `HFS_VALIDATION_TERMINOLOGY_FAIL` | open | Terminology outage posture: open (warn) or closed (error) |
 //! | `HFS_VALIDATION_STORED_PROFILES` | true | Maintain per-tenant profile registries from stored StructureDefinitions |
@@ -478,8 +478,9 @@ pub struct ValidationConfig {
     pub constraints: bool,
     /// Constraint ids never evaluated (comma-separated in the env var).
     pub suppress_constraints: Vec<String>,
-    /// Terminology binding checking: `off` or `remote`
-    /// (`remote` uses `HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code`).
+    /// Terminology binding checking: `embedded` (default — offline checks
+    /// against the FHIR core value sets embedded in helios-fhir-validator),
+    /// `remote` (`HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code`), or `off`.
     pub terminology: String,
     /// Per-check terminology timeout, in milliseconds.
     pub terminology_timeout_ms: u64,
@@ -499,7 +500,7 @@ impl Default for ValidationConfig {
             unknown_profile: "warn".to_string(),
             constraints: true,
             suppress_constraints: vec!["dom-6".to_string()],
-            terminology: "off".to_string(),
+            terminology: "embedded".to_string(),
             terminology_timeout_ms: 3000,
             terminology_fail: "open".to_string(),
             stored_profiles: true,
@@ -566,9 +567,9 @@ impl ValidationConfig {
                 self.unknown_profile
             ));
         }
-        if !matches!(self.terminology.as_str(), "off" | "remote") {
+        if !matches!(self.terminology.as_str(), "off" | "embedded" | "remote") {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|remote)",
+                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote)",
                 self.terminology
             ));
         }

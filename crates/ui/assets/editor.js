@@ -20,6 +20,15 @@
 (function () {
   "use strict";
 
+  /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
+  var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  function fhirHeaders(extra) {
+    var h = { Accept: "application/fhir+json" };
+    if (TENANT) h["X-Tenant-ID"] = TENANT;
+    if (extra) for (var k in extra) h[k] = extra[k];
+    return h;
+  }
+
   var root = document.getElementById("editor");
   if (!root || !window.fetch) return;
 
@@ -60,8 +69,14 @@
       });
   }
 
-  /* The in-flight document. It only ever comes from the server's fragment. */
+  /* The in-flight document. Normally the server's fragment (the hidden field),
+     but while the raw editor is open its textarea is the source of truth — the
+     field only catches up when you toggle "Edit raw" back off, so a Save typed
+     directly in raw mode must read the textarea. */
   function currentDocument() {
+    var raw = document.getElementById("editor-json-raw");
+    var source = document.getElementById("editor-source");
+    if (raw && !raw.hidden && source) return source.value;
     var field = document.getElementById("editor-doc");
     return field ? field.value : "{}";
   }
@@ -80,7 +95,7 @@
         .then(function (html) { body.innerHTML = html; applyView(); });
     }
     return fetch("/" + resourceType + "/" + resourceId, {
-      headers: { Accept: "application/fhir+json" },
+      headers: fhirHeaders(),
     })
       .then(function (response) {
         if (!response.ok) throw new Error(String(response.status));
@@ -119,7 +134,7 @@
   function loadVersions() {
     if (!versionsHost || !resourceId) return;
     fetch("/" + resourceType + "/" + resourceId + "/_history", {
-      headers: { Accept: "application/fhir+json" },
+      headers: fhirHeaders(),
     })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (bundle) {
@@ -319,45 +334,54 @@
     try {
       parsed = JSON.parse(doc);
     } catch (error) {
-      say(String(error), "error");
+      say(messages.msgSaveInvalid || String(error), "error");
       return;
     }
 
-    var isNew = !parsed.id;
-    var url = "/" + resourceType + (isNew ? "" : "/" + parsed.id);
+    // Validate the exact document being saved by re-rendering it (this also
+    // commits a raw edit), then refuse to persist a new version while the
+    // editor reports any issue — an invalid resource must not reach history.
+    send("").then(function () {
+      var form = document.getElementById("editor-form");
+      var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
+      if (errors > 0) {
+        say(messages.msgSaveBlocked, "error");
+        return;
+      }
 
-    fetch(url, {
-      method: isNew ? "POST" : "PUT",
-      headers: {
-        "Content-Type": "application/fhir+json",
-        Accept: "application/fhir+json",
-      },
-      body: doc,
-    })
-      .then(function (response) {
-        return response.json().then(function (payload) {
-          return { ok: response.ok, payload: payload };
+      var isNew = !parsed.id;
+      var url = "/" + resourceType + (isNew ? "" : "/" + parsed.id);
+
+      fetch(url, {
+        method: isNew ? "POST" : "PUT",
+        headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
+        body: doc,
+      })
+        .then(function (response) {
+          return response.json().then(function (payload) {
+            return { ok: response.ok, payload: payload };
+          });
+        })
+        .then(function (result) {
+          if (!result.ok) {
+            // The server refused it. Show its OperationOutcome, not our guess.
+            var issue = result.payload && result.payload.issue && result.payload.issue[0];
+            say(
+              (issue && (issue.diagnostics || (issue.details && issue.details.text))) ||
+                "",
+              "error"
+            );
+            return;
+          }
+          say(messages.msgSaved, "ok");
+          if (result.payload && result.payload.id && !parsed.id) {
+            resourceId = result.payload.id;
+          }
+        })
+        .catch(function (error) {
+          say(String(error), "error");
         });
-      })
-      .then(function (result) {
-        if (!result.ok) {
-          // The server refused it. Show its OperationOutcome, not our guess.
-          var issue = result.payload && result.payload.issue && result.payload.issue[0];
-          say(
-            (issue && (issue.diagnostics || (issue.details && issue.details.text))) ||
-              "",
-            "error"
-          );
-          return;
-        }
-        say(messages.msgSaved, "ok");
-        if (result.payload && result.payload.id && !parsed.id) {
-          resourceId = result.payload.id;
-        }
-      })
-      .catch(function (error) {
-        say(String(error), "error");
-      });
+    });
   }
 
   function remove_resource() {
@@ -365,7 +389,7 @@
     if (!parsed.id) return;
     if (!window.confirm(messages.msgConfirmDelete)) return;
 
-    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE" })
+    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (response) {
         if (response.ok) window.location.href = "/ui/queries";
       })

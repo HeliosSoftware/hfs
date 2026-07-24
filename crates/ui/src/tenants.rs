@@ -92,8 +92,6 @@ struct TenantsPage {
     error: Option<String>,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
-    /// Whether the sidebar links to the natural-language search page (#255).
-    nl_enabled: bool,
 }
 
 #[derive(Template)]
@@ -230,7 +228,6 @@ pub async fn page(
             available: false,
             error: None,
             active_page: "tenants",
-            nl_enabled: state.nl.enabled,
         });
     };
 
@@ -251,7 +248,6 @@ pub async fn page(
         available: true,
         error,
         active_page: "tenants",
-        nl_enabled: state.nl.enabled,
     })
 }
 

@@ -94,7 +94,6 @@ pub struct EditorPage {
     pub status: crate::Status,
     pub i18n: I18n,
     pub active_page: &'static str,
-    pub nl_enabled: bool,
     pub resource_type: String,
     pub resource_id: String,
 }
@@ -160,7 +159,6 @@ pub async fn page(
         status: crate::current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "editor",
-        nl_enabled: state.nl.enabled,
         resource_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
         resource_id: query.id.unwrap_or_default(),
     })
@@ -267,8 +265,18 @@ fn build_body(
     // continuous validation affordable at all.
     let resolver: Arc<dyn helios_fhir_validator::SchemaResolver> = Arc::clone(&registry) as _;
     let validator = Validator::new(resolver);
-    let SyncOutcome { errors, .. } =
-        validator.validate_sync(&document, &ValidationOptions::default());
+    let SyncOutcome {
+        mut errors,
+        deferred,
+    } = validator.validate_sync(&document, &ValidationOptions::default());
+
+    // Required-binding checks against the embedded core value sets (offline, no
+    // terminology server), so an out-of-value-set code — e.g. gender
+    // "masculino" — surfaces in the editor exactly as it does at `$validate`.
+    errors.extend(
+        helios_fhir_validator::core_terminology(helios_fhir::FhirVersion::default())
+            .required_binding_errors(&deferred),
+    );
 
     // Anchor each issue to its node. The validator reports `Patient.name.0.given`
     // and our rows are keyed on `name.0.given`, so this is string equality —

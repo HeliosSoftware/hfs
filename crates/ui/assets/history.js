@@ -12,6 +12,15 @@
 (function () {
   "use strict";
 
+  /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
+  var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
+  function fhirHeaders(extra) {
+    var h = { Accept: "application/fhir+json" };
+    if (TENANT) h["X-Tenant-ID"] = TENANT;
+    if (extra) for (var k in extra) h[k] = extra[k];
+    return h;
+  }
+
   var root = document.getElementById("history");
   if (!root || !window.fetch) return;
 
@@ -39,7 +48,7 @@
     pathEl.textContent = "/" + type + "/" + id + "/_history";
 
     fetch("/" + type + "/" + id + "/_history", {
-      headers: { Accept: "application/fhir+json" },
+      headers: fhirHeaders(),
     })
       .then(function (response) {
         if (response.status === 404) throw new Error("not-found");

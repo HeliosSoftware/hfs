@@ -422,9 +422,21 @@
     railList.addEventListener("click", function (event) {
       var item = event.target.closest("[data-rail-type]");
       if (!item || !urlInput) return;
-      urlInput.value = "GET /" + item.dataset.railType;
+      var type = item.dataset.railType;
+      // Keep the Resources page's selected type in sync so "Create new" targets
+      // it and the rail shows which type is active. (Both absent on the Saved
+      // Queries page, where this rail only drives the search.)
+      var panel = document.getElementById("resources");
+      if (panel) panel.dataset.selectedType = type;
+      var createBtn = document.getElementById("resource-create");
+      if (createBtn) createBtn.dataset.type = type;
+      railList.querySelectorAll(".nav-panel__item--on").forEach(function (el) {
+        el.classList.remove("nav-panel__item--on");
+      });
+      item.classList.add("nav-panel__item--on");
+      urlInput.value = "GET /" + type;
       renderBuilder();
-      runSearch("/" + encodeURIComponent(item.dataset.railType), false);
+      runSearch("/" + encodeURIComponent(type), false);
     });
   }
   if (railFilter && railList) {
@@ -683,6 +695,43 @@
   function renderRecent(doc) {
     if (!recentHost) return;
     recentHost.textContent = "";
+
+    // Saved (named) queries come first — the same document, surfaced in the
+    // one dropdown so Resources has both saved and recent in reach (#282).
+    var byType = savedQueries(doc);
+    var savedRows = [];
+    Object.keys(byType)
+      .sort()
+      .forEach(function (type) {
+        var entries = byType[type] || {};
+        Object.keys(entries).forEach(function (id) {
+          var entry = entries[id] || {};
+          if (entry.query === undefined) return;
+          savedRows.push({ type: type, name: entry.name || id, query: entry.query });
+        });
+      });
+
+    if (savedRows.length) {
+      var heading = document.createElement("div");
+      heading.className = "recent-group";
+      heading.textContent = recentHost.dataset.msgSaved || "Saved";
+      recentHost.appendChild(heading);
+      savedRows.forEach(function (row) {
+        var path = searchPath(row.type, row.query);
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "recent-item__query recent-item__saved";
+        btn.dataset.savedLoad = path;
+        btn.textContent = row.name;
+        btn.title = "GET " + path;
+        recentHost.appendChild(btn);
+      });
+      var recentHeading = document.createElement("div");
+      recentHeading.className = "recent-group";
+      recentHeading.textContent = recentHost.dataset.msgRecentGroup || "Recent";
+      recentHost.appendChild(recentHeading);
+    }
+
     var list = recentSearches(doc);
 
     if (!list.length) {
@@ -938,6 +987,15 @@
 
   if (recentHost) {
     recentHost.addEventListener("click", function (event) {
+      // A saved query carries its full path — load it straight into the builder.
+      var saved = event.target.closest("[data-saved-load]");
+      if (saved) {
+        loadIntoBuilder(saved.dataset.savedLoad);
+        var box = recentHost.closest("details");
+        if (box) box.open = false;
+        if (urlInput) urlInput.focus();
+        return;
+      }
       var load = event.target.closest("[data-recent-load]");
       var del = event.target.closest("[data-recent-delete]");
       if (!load && !del) return;

@@ -68,6 +68,7 @@ pub mod engine;
 pub mod packs;
 pub mod resolver;
 pub mod schema;
+pub mod terminology;
 
 #[cfg(feature = "fhirpath")]
 pub mod fhirpath_effects;
@@ -86,3 +87,4 @@ pub use engine::{
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};
+pub use terminology::{CoreTerminology, core_terminology};

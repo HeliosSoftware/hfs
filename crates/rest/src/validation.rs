@@ -91,7 +91,11 @@ impl ValidationService {
     /// Build a service from `HFS_VALIDATION_*` configuration.
     /// `terminology_server` is `HFS_TERMINOLOGY_SERVER` (required for
     /// `terminology = remote`; the config validator enforces the pairing).
-    pub fn from_config(config: &ValidationConfig, terminology_server: Option<&str>) -> Self {
+    pub fn from_config(
+        config: &ValidationConfig,
+        terminology_server: Option<&str>,
+        version: helios_fhir::FhirVersion,
+    ) -> Self {
         let mode = match config.mode.as_str() {
             "log" => ValidationMode::Log,
             "enforce" => ValidationMode::Enforce,
@@ -108,6 +112,13 @@ impl ValidationService {
                     base.to_string(),
                     Duration::from_millis(config.terminology_timeout_ms),
                 ))),
+                // Offline required-binding checks against the FHIR core value
+                // sets embedded in helios-fhir-validator (no server needed).
+                ("embedded", _) => {
+                    let provider: Arc<dyn TerminologyProvider> =
+                        helios_fhir_validator::core_terminology(version);
+                    Some(provider)
+                }
                 _ => None,
             };
         Self {

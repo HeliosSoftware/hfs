@@ -379,8 +379,6 @@ struct IndexPage {
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
-    /// Whether the sidebar links to the natural-language search page (#255).
-    nl_enabled: bool,
 }
 
 /// Search page (#255, Figma "Search V1.0"): natural language and the visual
@@ -395,7 +393,6 @@ struct SearchPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    nl_enabled: bool,
     /// Feature state; `configured` picks between the working pane and setup.
     nl: NlSearch,
     /// How-to page for the unconfigured state (docs live in the book).
@@ -403,6 +400,22 @@ struct SearchPage {
     resource_types: Vec<String>,
     /// The saved-query controls are the Saved Queries page's job, not this
     /// page's (see `partials/search-builder.html`).
+    show_save: bool,
+}
+
+/// Resources page (#282): type filter + search + edit modal, on one screen.
+#[derive(Template)]
+#[template(path = "pages/resources.html")]
+struct ResourcesPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+    nl: NlSearch,
+    docs_url: &'static str,
+    resource_types: Vec<String>,
+    selected_type: String,
+    /// The search-builder partial's save controls are the Saved Queries page's
+    /// job, not this one's.
     show_save: bool,
 }
 
@@ -415,7 +428,6 @@ struct QueriesPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    nl_enabled: bool,
     /// The version's resource types for the picker rail, from the spec
     /// CompartmentDefinitions already vendored for the compartment viewer.
     /// Counts hydrate client-side via `_summary=count`.
@@ -432,7 +444,6 @@ struct SearchParametersPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    nl_enabled: bool,
     view: search_params::SpView,
 }
 
@@ -445,7 +456,6 @@ struct CompartmentsPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    nl_enabled: bool,
     view: compartments::CmpView,
 }
 
@@ -454,6 +464,22 @@ struct CompartmentsPage {
 struct StatusPartial {
     status: Status,
     i18n: I18n,
+}
+
+/// One `<option>` in the search-builder's parameter datalist.
+struct ParamOption {
+    code: String,
+    type_label: String,
+}
+
+/// Parameter suggestions for the search builder (`/ui/queries/params`),
+/// rendered from the same registry snapshot the SearchParameter viewer
+/// reads. An HTML fragment the page swaps per resource type — hypermedia,
+/// not a UI-facing JSON API.
+#[derive(Template)]
+#[template(path = "partials/param-options.html")]
+struct ParamOptionsPartial {
+    params: Vec<ParamOption>,
 }
 
 /// History & Versions screen (#236, Figma "History & Versions"): the version
@@ -466,7 +492,6 @@ struct HistoryPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-    nl_enabled: bool,
 }
 
 /// The rendered diff fragment, swapped in when the version selection changes.
@@ -485,22 +510,6 @@ struct HistoryDiffFragment {
     /// The two documents could not be parsed — the fragment says so instead of
     /// rendering an empty diff.
     parse_error: bool,
-}
-
-/// One `<option>` in the search-builder's parameter datalist.
-struct ParamOption {
-    code: String,
-    type_label: String,
-}
-
-/// Parameter suggestions for the search builder (`/ui/queries/params`),
-/// rendered from the same registry snapshot the SearchParameter viewer
-/// reads. An HTML fragment the page swaps per resource type — hypermedia,
-/// not a UI-facing JSON API.
-#[derive(Template)]
-#[template(path = "partials/param-options.html")]
-struct ParamOptionsPartial {
-    params: Vec<ParamOption>,
 }
 
 /// Mounts the web UI under `/ui`, falling back to the FHIR REST app for every
@@ -578,6 +587,8 @@ pub fn mount_with_conformance_source(
 
     let mut router = Router::new()
         .route("/ui", get(index))
+        // Resources workspace (#282): the type filter + search + edit modal.
+        .route("/ui/resources", get(resources))
         .route("/ui/queries", get(queries))
         .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
@@ -836,18 +847,7 @@ async fn index(
     let window = query_value(query.as_deref(), "window")
         .and_then(|slug| DashboardWindow::from_slug(&slug))
         .unwrap_or_default();
-    render(
-        build_index_page(
-            state.version,
-            locale,
-            selected,
-            window,
-            state.nl.enabled,
-            rv.0,
-            &rt,
-        )
-        .await,
-    )
+    render(build_index_page(state.version, locale, selected, window, rv.0, &rt).await)
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -865,7 +865,6 @@ async fn search(
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search",
-        nl_enabled: state.nl.enabled,
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
         resource_types,
@@ -888,10 +887,46 @@ async fn queries(
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "queries",
-        nl_enabled: state.nl.enabled,
         resource_types,
         show_save: true,
     })
+}
+
+/// Resources page (#282): the primary read/write workspace. Ties together the
+/// type filter, the search (natural-language + visual builder), and — on a
+/// result click — the edit modal that reuses the schema-driven editor, with
+/// save / delete / version history / diff. The pieces are the same partials the
+/// Search and Editor pages render; this page is the place they come together.
+async fn resources(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    Query(query): Query<ResourcesQuery>,
+) -> Response {
+    let resource_types = state
+        .compartments
+        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
+        .await;
+    render(ResourcesPage {
+        status: current_status(state.version, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "resources",
+        nl: (*state.nl).clone(),
+        docs_url: NL_SEARCH_DOCS,
+        resource_types,
+        // The type the rail opens focused on (from the nav submenu deep link).
+        selected_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
+        show_save: false,
+    })
+}
+
+/// Query string for the Resources page: an optional pre-selected type, so the
+/// nav submenu can deep-link `/ui/resources?type=Observation`.
+#[derive(Deserialize, Default)]
+struct ResourcesQuery {
+    #[serde(rename = "type")]
+    resource_type: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -968,7 +1003,6 @@ async fn search_parameters(
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
-        nl_enabled: state.nl.enabled,
         view: search_params::build_view(&snapshot, &query),
     })
 }
@@ -1012,7 +1046,6 @@ async fn compartments_page(
             status: current_status(state.version, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "compartments",
-            nl_enabled: state.nl.enabled,
             view,
         }),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -1039,7 +1072,6 @@ async fn status(
                 locale,
                 None,
                 DashboardWindow::default(),
-                state.nl.enabled,
                 rv.0,
                 &rt,
             )
@@ -1059,7 +1091,6 @@ async fn history_page(
         status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "history",
-        nl_enabled: state.nl.enabled,
     })
 }
 
@@ -1125,7 +1156,6 @@ async fn build_index_page(
     locale: RequestLocale,
     selected: Option<String>,
     window: DashboardWindow,
-    nl_enabled: bool,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
@@ -1143,7 +1173,6 @@ async fn build_index_page(
         windows,
         i18n,
         active_page: "home",
-        nl_enabled,
     }
 }
 
@@ -1508,7 +1537,6 @@ mod tests {
             windows,
             i18n,
             active_page: "home",
-            nl_enabled: true,
         }
     }
 
@@ -1627,7 +1655,6 @@ mod tests {
             },
             i18n: i18n("en"),
             active_page: "queries",
-            nl_enabled: true,
             show_save: true,
             resource_types: vec!["Patient".to_string(), "Observation".to_string()],
         }
@@ -1648,9 +1675,9 @@ mod tests {
         assert!(html.contains(r#"data-rail-type="Patient""#));
         assert!(html.contains(r#"data-rail-type="Observation""#));
         assert!(html.contains(r#"data-count-for="Patient""#));
-        // This page, not Home, carries aria-current in the sidebar.
-        assert!(html.contains(r#"href="/ui/queries" aria-current="page""#));
-        assert!(!html.contains(r#"href="/ui" aria-current="page""#));
+        // Saved Queries has no nav entry any more (#282 folded search / editor
+        // / history / saved-queries into Resources); the route still renders.
+        assert!(!html.contains(r#"href="/ui/queries" aria-current="page""#));
         // The delete-confirm string reaches the script with its {name} slot.
         assert!(html.contains("{name}"));
     }
@@ -1667,7 +1694,6 @@ mod tests {
             },
             i18n: i18n("es"),
             active_page: "queries",
-            nl_enabled: true,
             show_save: true,
             resource_types: vec!["Patient".to_string()],
         }

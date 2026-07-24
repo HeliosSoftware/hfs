@@ -391,3 +391,20 @@ editor-expand-all = Expandir todo
 editor-edit-raw = Editar crudo
 editor-versions = Versiones
 editor-versions-none = Sin versiones anteriores.
+## Historial y versiones (#236)
+
+## Espacio de recursos (#282)
+
+resources-heading = Recursos
+resources-lede = Explora, busca, crea y edita recursos FHIR. Busca en lenguaje natural o arma la consulta a mano, y abre cualquier resultado para editarlo.
+resources-create = Crear nuevo
+resources-save-blocked = Corrige los problemas de validación antes de guardar.
+resources-save-invalid = El JSON no es válido — corrígelo antes de guardar.
+resources-edit-title = Editar recurso
+resources-tab-edit = Editar
+resources-tab-history = Historial
+resources-types-heading = Tipos de recurso
+
+queries-saved-group = Guardadas
+
+nav-collapse = Colapsar menú

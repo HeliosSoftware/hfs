@@ -7,7 +7,7 @@
   it back and the server hands back a new one, so a key we never render is also
   a key we never destroy.
 -->
-<form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML">
+<form id="editor-form" hx-post="/ui/editor/render" hx-target="#editor-body" hx-swap="innerHTML" data-error-count="{{ error_count }}">
   <input type="hidden" name="doc" id="editor-doc" value="{{ document }}">
   <input type="hidden" name="op" id="editor-op" value="">
   <input type="hidden" name="path" id="editor-path" value="">
