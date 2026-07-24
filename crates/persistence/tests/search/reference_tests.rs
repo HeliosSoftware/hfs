@@ -7,7 +7,9 @@ use serde_json::json;
 
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use helios_persistence::types::{
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+};
 
 use helios_fhir::FhirVersion;
 
@@ -163,11 +165,13 @@ async fn test_reference_search_type_modifier() {
     let tenant = create_tenant();
     seed_test_data(&backend, &tenant).await;
 
-    // Search with :Patient modifier
+    // Search with :Patient modifier. The type modifier is carried as
+    // `SearchModifier::Type` — the REST layer splits `subject:Patient` into the
+    // parameter name plus the modifier before the query reaches a backend.
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
-        name: "subject:Patient".to_string(),
+        name: "subject".to_string(),
         param_type: SearchParamType::Reference,
-        modifier: None,
+        modifier: Some(SearchModifier::Type("Patient".to_string())),
         values: vec![SearchValue::eq("patient-1")],
         chain: vec![],
         components: vec![],

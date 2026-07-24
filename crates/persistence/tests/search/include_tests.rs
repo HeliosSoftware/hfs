@@ -5,7 +5,10 @@
 
 use serde_json::json;
 
-use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::core::{
+    ResourceStorage, SearchProvider, SearchResult, resolve_includes_iterative,
+};
+use helios_persistence::error::StorageResult;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{IncludeDirective, IncludeType, SearchQuery};
 
@@ -17,6 +20,29 @@ use helios_persistence::backends::sqlite::SqliteBackend;
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
     super::make_sqlite_backend()
+}
+
+/// Runs a search and resolves `_include`/`_revinclude` the way the REST layer
+/// does.
+///
+/// SQLite's `search()` deliberately returns an empty `included` — include
+/// resolution is a separate, backend-agnostic step
+/// ([`resolve_includes_iterative`]) that the REST search handler runs for
+/// backends that do not resolve inline. Tests must go through the same path or
+/// they only ever observe an empty `included`.
+#[cfg(feature = "sqlite")]
+async fn search_with_includes(
+    backend: &SqliteBackend,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> StorageResult<SearchResult> {
+    let mut result = backend.search(tenant, query).await?;
+    if !query.includes.is_empty() && result.included.is_empty() {
+        result.included =
+            resolve_includes_iterative(backend, tenant, &result.resources.items, &query.includes)
+                .await?;
+    }
+    Ok(result)
 }
 
 fn create_tenant() -> TenantContext {
@@ -123,8 +149,7 @@ async fn test_include_basic() {
         iterate: false,
     });
 
-    let result = backend
-        .search(&tenant, &query.with_count(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -156,8 +181,7 @@ async fn test_include_with_target_type() {
         iterate: false,
     });
 
-    let result = backend
-        .search(&tenant, &query.with_count(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -192,8 +216,7 @@ async fn test_include_iterate() {
             iterate: true, // This follows references in included patients
         });
 
-    let result = backend
-        .search(&tenant, &query.with_count(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -225,8 +248,7 @@ async fn test_revinclude_basic() {
         iterate: false,
     });
 
-    let result = backend
-        .search(&tenant, &query.with_count(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -268,8 +290,7 @@ async fn test_revinclude_filtered() {
             iterate: false,
         });
 
-    let result = backend
-        .search(&tenant, &query.with_count(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -398,8 +419,7 @@ async fn test_include_iterate_recursive_depth() {
             iterate: true, // Recursively include parent organizations
         });
 
-    let result = backend
-        .search(&tenant, &query.with_count(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -517,7 +537,7 @@ async fn test_include_iterate_cycle_detection() {
         });
 
     // This should complete without infinite loop
-    let result = backend.search(&tenant, &query.with_count(100)).await;
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100)).await;
 
     // Should succeed (cycle detected) or fail gracefully
     match result {
@@ -583,8 +603,7 @@ async fn test_include_iterate_max_depth() {
             iterate: true,
         });
 
-    let result = backend
-        .search(&tenant, &query.with_count(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -632,8 +651,7 @@ async fn test_include_no_references() {
         iterate: false,
     });
 
-    let result = backend
-        .search(&tenant, &query.with_count(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 

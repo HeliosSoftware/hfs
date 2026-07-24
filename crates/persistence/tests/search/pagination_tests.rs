@@ -191,14 +191,18 @@ async fn test_pagination_with_sort() {
 
     // Sort by family name descending
     let query = SearchQuery::new("Patient")
-        .with_sort(SortDirective::parse("-name"))
+        .with_sort(SortDirective::parse("-name").with_param_type(Some(SearchParamType::String)))
         .with_count(5);
 
     let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert!(
+        page1.resources.page_info.next_cursor.is_some(),
+        "20 patients at _count=5 must yield a next-page cursor"
+    );
 
     if let Some(cursor) = page1.resources.page_info.next_cursor.clone() {
         let mut query2 = SearchQuery::new("Patient")
-            .with_sort(SortDirective::parse("-name"))
+            .with_sort(SortDirective::parse("-name").with_param_type(Some(SearchParamType::String)))
             .with_count(5);
         query2.cursor = Some(cursor);
         let page2 = backend.search(&tenant, &query2).await.unwrap();
@@ -227,14 +231,18 @@ async fn test_pagination_with_asc_sort() {
     seed_many_patients(&backend, &tenant, 20).await;
 
     let query = SearchQuery::new("Patient")
-        .with_sort(SortDirective::parse("name"))
+        .with_sort(SortDirective::parse("name").with_param_type(Some(SearchParamType::String)))
         .with_count(5);
 
     let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert!(
+        page1.resources.page_info.next_cursor.is_some(),
+        "20 patients at _count=5 must yield a next-page cursor"
+    );
 
     if let Some(cursor) = page1.resources.page_info.next_cursor.clone() {
         let mut query2 = SearchQuery::new("Patient")
-            .with_sort(SortDirective::parse("name"))
+            .with_sort(SortDirective::parse("name").with_param_type(Some(SearchParamType::String)))
             .with_count(5);
         query2.cursor = Some(cursor);
         let page2 = backend.search(&tenant, &query2).await.unwrap();
