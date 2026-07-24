@@ -338,7 +338,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | **Multitenancy**                                                            |
 | Shared Schema                                                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ✓   |
 | Schema-per-Tenant                                                           | ✗      | ○          | ○       | ✗         | ✗     | ✗             | ✗   |
-| Database-per-Tenant                                                         | ✓      | ○          | ○       | ○         | ○     | ○             | ✓   |
+| Database-per-Tenant                                                         | ✗      | ○          | ○       | ○         | ○     | ○             | ✓   |
 | Row-Level Security                                                          | ✗      | ○          | ✗       | ✗         | ✗     | ✗             | ✗   |
 | **[Search Parameters](https://build.fhir.org/search.html#ptypes)**          |
 | [String](https://build.fhir.org/search.html#string)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
@@ -502,14 +502,14 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### PostgreSQL
 
-Full-featured relational backend for production deployments with JSONB storage, full-text search, and advanced multi-tenant isolation strategies.
+Full-featured relational backend for production deployments with JSONB storage and full-text search.
 
 - Full CRUD operations with ACID transactions
 - Full-text search via PostgreSQL's tsvector/tsquery
 - All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
 - Chained parameters and reverse chaining (`_has`)
 - `_include` and `_revinclude` resolution
-- Multi-tenant support (shared schema, schema-per-tenant, database-per-tenant)
+- Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
 **Prerequisites:** A running PostgreSQL instance (14+).
 
@@ -538,7 +538,7 @@ PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarant
 - Full-text search with relevance scoring (`_text`, `_content`) via Elasticsearch
 - All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
 - Advanced text search with stemming, boolean operators, and proximity matching (`:text-advanced`)
-- Multi-tenant support (shared schema, schema-per-tenant, database-per-tenant)
+- Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
 **Prerequisites:** Running PostgreSQL (14+) and Elasticsearch 8.x instances.
 
@@ -1008,9 +1008,9 @@ cargo test -p helios-persistence --test s3_tests --features s3
 
 ### Phase 3: Tenancy Strategies ✓
 
-- [x] Shared schema strategy with RLS support
-- [x] Schema-per-tenant strategy with PostgreSQL search_path
-- [x] Database-per-tenant strategy with pool management
+- [x] Shared schema strategy with RLS support (SQL generators in `src/strategy/`; not wired into any backend — see #370)
+- [x] Schema-per-tenant strategy with PostgreSQL search_path (SQL generators in `src/strategy/`; not wired into any backend — see #370)
+- [x] Database-per-tenant strategy with pool management (SQL generators in `src/strategy/`; not wired into any backend — see #370)
 
 ### Phase 4: SQLite Backend ✓
 

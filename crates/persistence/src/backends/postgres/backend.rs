@@ -240,6 +240,53 @@ impl PostgresConfig {
 }
 
 impl PostgresBackend {
+    /// The capabilities this backend declares.
+    ///
+    /// Invariant across every valid configuration of the backend, so it is
+    /// exposed as a constructor-free associated function: [`PostgresBackend::new`]
+    /// eagerly verifies connectivity, and without this the declaration would be
+    /// unreachable — and therefore untestable — without a live PostgreSQL.
+    ///
+    /// Both [`Backend::supports`] and [`Backend::capabilities`] delegate here so
+    /// the two answers cannot drift apart. They were previously two separately
+    /// hand-maintained lists; that duplication is how issue #369's false claim
+    /// came to be written twice.
+    ///
+    /// # Tenancy
+    ///
+    /// `SharedSchema` **only**, and deliberately so. Every tenant's records live
+    /// in one `resources` table keyed by `(tenant_id, resource_type, id)` with a
+    /// `tenant_id` discriminator that every query filters on; no schema or
+    /// database switching exists in any code path. This is the strategy chosen in
+    /// design discussion #28 — it is a decision, not a gap, so please do not
+    /// "restore" `SchemaPerTenant` / `DatabasePerTenant` here as a bug fix.
+    /// Advertising either of them is what issue #369 corrected.
+    pub fn declared_capabilities() -> Vec<BackendCapability> {
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::Versioning,
+            BackendCapability::InstanceHistory,
+            BackendCapability::TypeHistory,
+            BackendCapability::SystemHistory,
+            BackendCapability::BasicSearch,
+            BackendCapability::DateSearch,
+            BackendCapability::ReferenceSearch,
+            BackendCapability::FullTextSearch,
+            BackendCapability::Sorting,
+            BackendCapability::OffsetPagination,
+            BackendCapability::CursorPagination,
+            BackendCapability::Transactions,
+            BackendCapability::OptimisticLocking,
+            BackendCapability::PessimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
+            BackendCapability::Include,
+            BackendCapability::Revinclude,
+            BackendCapability::SharedSchema,
+        ]
+    }
+
     /// Creates a new PostgreSQL backend with the given configuration.
     pub async fn new(config: PostgresConfig) -> StorageResult<Self> {
         let pool = Self::create_pool(&config)?;
@@ -694,60 +741,11 @@ impl Backend for PostgresBackend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        matches!(
-            capability,
-            BackendCapability::Crud
-                | BackendCapability::Versioning
-                | BackendCapability::InstanceHistory
-                | BackendCapability::TypeHistory
-                | BackendCapability::SystemHistory
-                | BackendCapability::BasicSearch
-                | BackendCapability::DateSearch
-                | BackendCapability::ReferenceSearch
-                | BackendCapability::FullTextSearch
-                | BackendCapability::Sorting
-                | BackendCapability::OffsetPagination
-                | BackendCapability::CursorPagination
-                | BackendCapability::Transactions
-                | BackendCapability::OptimisticLocking
-                | BackendCapability::PessimisticLocking
-                | BackendCapability::BulkExport
-                | BackendCapability::BulkSubmitIngest
-                | BackendCapability::BulkSubmitRestWorker
-                | BackendCapability::Include
-                | BackendCapability::Revinclude
-                | BackendCapability::SharedSchema
-                | BackendCapability::SchemaPerTenant
-                | BackendCapability::DatabasePerTenant
-        )
+        Self::declared_capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::Versioning,
-            BackendCapability::InstanceHistory,
-            BackendCapability::TypeHistory,
-            BackendCapability::SystemHistory,
-            BackendCapability::BasicSearch,
-            BackendCapability::DateSearch,
-            BackendCapability::ReferenceSearch,
-            BackendCapability::FullTextSearch,
-            BackendCapability::Sorting,
-            BackendCapability::OffsetPagination,
-            BackendCapability::CursorPagination,
-            BackendCapability::Transactions,
-            BackendCapability::OptimisticLocking,
-            BackendCapability::PessimisticLocking,
-            BackendCapability::BulkExport,
-            BackendCapability::BulkSubmitIngest,
-            BackendCapability::BulkSubmitRestWorker,
-            BackendCapability::Include,
-            BackendCapability::Revinclude,
-            BackendCapability::SharedSchema,
-            BackendCapability::SchemaPerTenant,
-            BackendCapability::DatabasePerTenant,
-        ]
+        Self::declared_capabilities()
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {

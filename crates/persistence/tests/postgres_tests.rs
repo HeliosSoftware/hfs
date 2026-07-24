@@ -9,7 +9,7 @@
 #![cfg(feature = "postgres")]
 
 use helios_persistence::backends::postgres::PostgresConfig;
-use helios_persistence::core::{BackendCapability, BackendKind};
+use helios_persistence::core::BackendKind;
 
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
@@ -60,46 +60,24 @@ fn test_postgres_config_serialization() {
 // Backend Capability Tests (no PostgreSQL instance required)
 // ============================================================================
 
-// NOTE: These tests verify capability declarations. They cannot construct a
-// PostgresBackend without a real database (the constructor connects immediately).
-// We verify via config + trait bounds instead.
+// NOTE: capability *declarations* are asserted in
+// `tests/backend_capability_contract.rs`, against the constructor-free
+// `PostgresBackend::declared_capabilities()`. They live there rather than here
+// because a `PostgresBackend` cannot be constructed without a real database
+// (the constructor connects immediately), and because the assertions are
+// cross-backend.
+//
+// A `test_postgres_expected_capabilities` used to live here. It listed the
+// capabilities by hand and then asserted `!expected.is_empty()` — which passes
+// for any non-empty list, so it verified nothing while reading like a contract.
+// Worse, its hand list was a third copy of the false `SchemaPerTenant` /
+// `DatabasePerTenant` claim corrected in #369. Deleted rather than repaired.
 
 #[test]
 fn test_postgres_config_backend_kind() {
     // Verify BackendKind::Postgres exists and is usable
     let kind = BackendKind::Postgres;
     assert_eq!(format!("{}", kind), "postgres");
-}
-
-#[test]
-fn test_postgres_expected_capabilities() {
-    // Verify the capability enum variants that PostgreSQL should support exist
-    let expected = [
-        BackendCapability::Crud,
-        BackendCapability::Versioning,
-        BackendCapability::InstanceHistory,
-        BackendCapability::TypeHistory,
-        BackendCapability::SystemHistory,
-        BackendCapability::BasicSearch,
-        BackendCapability::DateSearch,
-        BackendCapability::ReferenceSearch,
-        BackendCapability::FullTextSearch,
-        BackendCapability::Sorting,
-        BackendCapability::OffsetPagination,
-        BackendCapability::CursorPagination,
-        BackendCapability::Transactions,
-        BackendCapability::OptimisticLocking,
-        BackendCapability::BulkExport,
-        BackendCapability::BulkSubmitIngest,
-        BackendCapability::BulkSubmitRestWorker,
-        BackendCapability::Include,
-        BackendCapability::Revinclude,
-        BackendCapability::SharedSchema,
-        BackendCapability::SchemaPerTenant,
-        BackendCapability::DatabasePerTenant,
-    ];
-    // This is a compile-time check: all variants exist
-    assert!(!expected.is_empty());
 }
 
 // ============================================================================

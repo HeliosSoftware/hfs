@@ -31,7 +31,7 @@ use crate::core::history::{
 };
 use crate::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
 use crate::core::user_settings::SettingsStore;
-use crate::core::{ResourceStorage, VersionedStorage};
+use crate::core::{Backend, BackendCapability, ResourceStorage, VersionedStorage};
 use crate::error::{
     BackendError, BulkSubmitError, ConcurrencyError, ResourceError, SearchError, StorageError,
     TenantError, TransactionError,
@@ -2477,5 +2477,87 @@ async fn count_by_tenant_discovers_data_without_registration() {
     assert_eq!(
         counts,
         vec![("tenant-a".to_string(), 3), ("tenant-b".to_string(), 1)]
+    );
+}
+
+// ── Tenancy capability declaration (issue #369) ──────────────────────────────
+//
+// S3 is the one backend whose tenant-placement topology is a property of the
+// *instance* rather than of the backend type, so these assert the composition
+// `capabilities(&self)` performs — the mode-parameterised list is covered
+// separately, without a client, in `tests/backend_capability_contract.rs`.
+
+/// `PrefixPerTenant` shares one bucket across tenants, so it declares
+/// `SharedSchema` and must not claim the physical isolation it does not have.
+#[test]
+fn prefix_per_tenant_instance_declares_shared_schema_only() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+
+    assert!(backend.supports(BackendCapability::SharedSchema));
+    assert!(!backend.supports(BackendCapability::DatabasePerTenant));
+    assert!(!backend.supports(BackendCapability::SchemaPerTenant));
+
+    let declared = backend.capabilities();
+    assert!(declared.contains(&BackendCapability::SharedSchema));
+    assert!(!declared.contains(&BackendCapability::DatabasePerTenant));
+}
+
+/// `BucketPerTenant` gives each tenant a dedicated bucket, so it declares
+/// `DatabasePerTenant` — and must not *also* claim `SharedSchema` merely
+/// because a `default_system_bucket` exists for cross-tenant state.
+#[test]
+fn bucket_per_tenant_instance_declares_database_per_tenant_only() {
+    let backend = make_bucket_backend(Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ])));
+
+    assert!(backend.supports(BackendCapability::DatabasePerTenant));
+    assert!(!backend.supports(BackendCapability::SharedSchema));
+    assert!(!backend.supports(BackendCapability::SchemaPerTenant));
+
+    let declared = backend.capabilities();
+    assert!(declared.contains(&BackendCapability::DatabasePerTenant));
+    assert!(!declared.contains(&BackendCapability::SharedSchema));
+}
+
+/// The behavioural warrant for the two declarations above: bucket-per-tenant
+/// really does resolve distinct buckets, and prefix-per-tenant really does
+/// share one bucket while separating tenants by key prefix.
+#[test]
+fn tenant_location_matches_the_declared_tenancy_topology() {
+    let bucket_backend = make_bucket_backend(Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ])));
+    let a = bucket_backend
+        .tenant_location(&tenant("tenant-a"))
+        .expect("tenant-a location");
+    let b = bucket_backend
+        .tenant_location(&tenant("tenant-b"))
+        .expect("tenant-b location");
+    assert_ne!(
+        a.bucket, b.bucket,
+        "BucketPerTenant must resolve a dedicated bucket per tenant"
+    );
+
+    let prefix_backend =
+        make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let a = prefix_backend
+        .tenant_location(&tenant("tenant-a"))
+        .expect("tenant-a location");
+    let b = prefix_backend
+        .tenant_location(&tenant("tenant-b"))
+        .expect("tenant-b location");
+    assert_eq!(
+        a.bucket, b.bucket,
+        "PrefixPerTenant must share one bucket across tenants"
+    );
+    assert_ne!(
+        a.keyspace.resources_prefix(),
+        b.keyspace.resources_prefix(),
+        "PrefixPerTenant must separate tenants by key prefix"
     );
 }
