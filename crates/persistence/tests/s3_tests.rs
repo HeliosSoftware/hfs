@@ -170,7 +170,10 @@ async fn test_aws_bundle_bulk_export_and_submit() {
         resource: Some(json!({"resourceType":"Patient","id":format!("b-{}", Uuid::new_v4())})),
         ..Default::default()
     }];
-    let bundle = backend.process_batch(&tenant, entries).await.unwrap();
+    let bundle = backend
+        .process_batch(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(bundle.entries.len(), 1);
     assert_eq!(bundle.entries[0].status, 201);
 
