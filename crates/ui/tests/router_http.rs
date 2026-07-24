@@ -34,6 +34,7 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
         Some(std::path::PathBuf::from("../../data")),
         nl,
         None,
+        None,
         std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
             std::path::Path::new("../../data"),
         )),
@@ -145,6 +146,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         "9.9.9",
         Some(std::path::PathBuf::from("../../data")),
         nl(true, true),
+        None,
         None,
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
@@ -584,4 +586,21 @@ async fn identical_versions_say_so() {
 async fn unparseable_versions_report_an_error_not_an_empty_diff() {
     let html = diff("from=%7Bnope&to=%7B%7D").await;
     assert!(html.contains("history__banner--error"));
+}
+
+#[tokio::test]
+async fn version_selector_lists_the_enabled_versions() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    // A real disclosure, not the old static chip: one POST form per compiled-in
+    // version, with the effective version marked current.
+    assert!(html.contains(r#"action="/ui/version""#));
+    assert!(html.contains(r#"name="version" value="R4""#));
+    assert!(html.contains(r#"aria-current="true""#));
+    // The default label is server-derived, not hardcoded markup.
+    assert!(html.contains("FHIR R4"));
 }

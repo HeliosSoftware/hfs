@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{WebState, current_status, render};
+use crate::{RequestVersion, WebState, current_status, render};
 
 /// One row of the tenant table (a registry record joined with its live count).
 struct TenantRow {
@@ -211,10 +211,11 @@ async fn load_rows(storage: &Arc<dyn ResourceStorage>, q: &str) -> Result<Vec<Te
 pub async fn page(
     State(state): State<WebState>,
     locale: RequestLocale,
+    rv: RequestVersion,
     Query(query): Query<TenantsQuery>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let status = current_status(state.version);
+    let status = current_status(state.version, rv.0);
 
     let Some(storage) = state.tenants.as_ref() else {
         return render(TenantsPage {

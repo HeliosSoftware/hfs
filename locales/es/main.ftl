@@ -127,6 +127,7 @@ theme-light = Tema claro
 theme-dark = Tema oscuro
 
 fhir-version = FHIR { $version }
+fhir-version-heading = Versión FHIR
 
 card-resource-types = Tipos de recursos
 card-resource-types-sub = habilitados para { $version }

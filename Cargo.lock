@@ -3624,6 +3624,7 @@ dependencies = [
  "similar",
  "tokio",
  "tower",
+ "tracing",
  "unic-langid",
 ]
 
