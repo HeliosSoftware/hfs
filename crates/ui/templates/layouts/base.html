@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ i18n.t("app-title") }}{% endblock %}</title>
   <link rel="stylesheet" href="/ui/assets/app.css">
+  <!-- The effective tenant for browser-issued FHIR calls (#344). -->
+  <meta name="hfs-tenant" content="{{ status.tenant_id() }}">
   <!-- No `defer`: these attributes must land on <html> before first paint,
        or the stored theme / collapsed-nav flashes its default first. -->
   <script src="/ui/assets/theme.js"></script>
@@ -39,38 +41,29 @@
     </div>
 
     <!--
-      Tenant selector. A <details> disclosure so the dropdown works without
-      JavaScript. The tenant list is sample data until the handler grows a
-      read path into helios-persistence (README: "Left for follow-up work").
+      Tenant selector (#344). A <details> disclosure — works without
+      JavaScript. The label is the effective tenant (the user's stored choice,
+      validated against the registry, else the server default). The options are
+      lazily fetched from the registry by htmx when the menu first opens; with
+      JavaScript disabled the panel offers the tenant-maintenance page instead.
     -->
     <details class="menu">
       <summary class="selector">
-        <span class="avatar">AH</span>
-        <span class="selector__label">Acme Health</span>
+        <span class="avatar">{{ status.tenant_initials() }}</span>
+        <span class="selector__label">{{ status.tenant_label() }}</span>
         <span class="selector__chevrons">
           <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
           <span class="icon">{% include "icons/chevron-down.svg" %}</span>
         </span>
       </summary>
       <div class="menu__panel">
-        <label class="menu__search">
-          {% include "icons/search.svg" %}
-          <input type="search" placeholder="{{ i18n.t("tenant-search-placeholder") }}">
-        </label>
         <div class="menu__heading">{{ i18n.t("tenant-heading") }}</div>
-        <a class="menu__option" href="#">
-          <span class="avatar">{% include "icons/building.svg" %}</span>
-          {{ i18n.t("tenant-all") }}
-        </a>
-        <a class="menu__option" href="#" aria-current="true">
-          <span class="avatar">AH</span>
-          Acme Health
-          <span class="check">{% include "icons/check.svg" %}</span>
-        </a>
-        <a class="menu__option" href="#">
-          <span class="avatar">MM</span>
-          Mercy Medical
-        </a>
+        <div hx-get="/ui/tenant/options" hx-trigger="toggle once from:closest details" hx-swap="outerHTML">
+          <a class="menu__option" href="/ui/tenants">
+            <span class="avatar">{% include "icons/building.svg" %}</span>
+            {{ i18n.t("nav-tenants") }}
+          </a>
+        </div>
       </div>
     </details>
 

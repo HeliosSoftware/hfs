@@ -117,18 +117,23 @@ struct WebState {
     data_dir: Option<PathBuf>,
     /// The server's default FHIR version, used when seeding a new tenant.
     fhir_version: helios_fhir::FhirVersion,
+    /// The server's default tenant id — the fallback when no stored choice
+    /// exists (#344).
+    default_tenant: String,
     /// Per-user settings, for the persisted FHIR-version choice (#343). `None`
     /// when the backend has no settings store; the selector then applies
     /// per-page only.
     settings: Option<Arc<dyn SettingsStore>>,
 }
 
-/// The settings key holding the user's FHIR-version choice, and the user key
-/// the settings resolve under. The key mirrors `helios-rest`'s `UserKey`
-/// post-#270 encoding — `u2:{issuer_len}:{issuer}:{subject}` from an
-/// authenticated principal, or this local fallback when auth is disabled (`/ui` also sits outside the auth
-/// layer today — #320 tracks the authenticated modes).
+/// The settings keys holding the user's FHIR-version and tenant choices, and
+/// the user key the settings resolve under. The key mirrors `helios-rest`'s
+/// `UserKey` post-#270 encoding — `u2:{issuer_len}:{issuer}:{subject}` from an
+/// authenticated principal, `l2:` when auth is disabled (`/ui` also sits
+/// outside the auth layer today; #320 tracks the authenticated modes). Keep in
+/// step with `crates/rest/src/extractors/user.rs`.
 const SETTINGS_VERSION_KEY: &str = "fhirVersion";
+const SETTINGS_TENANT_KEY: &str = "tenantId";
 const LOCAL_USER_KEY: &str = "l2:";
 
 fn settings_user_key(principal: Option<&helios_auth::Principal>) -> String {
@@ -140,7 +145,7 @@ fn settings_user_key(principal: Option<&helios_auth::Principal>) -> String {
 
 /// The FHIR version this request renders under: the user's stored choice when
 /// one exists and is compiled in, the server default otherwise. Resolved once
-/// per request by [`resolve_version`]; explicit `?version=` query parameters
+/// per request by [`resolve_prefs`]; explicit `?version=` query parameters
 /// still override it per page.
 #[derive(Clone, Copy)]
 pub(crate) struct RequestVersion(pub(crate) helios_fhir::FhirVersion);
@@ -163,28 +168,81 @@ where
     }
 }
 
-/// Middleware: stamps [`RequestVersion`] from the user's stored settings (one
-/// settings read per page load, the documented cost model of that store),
-/// falling back to the server default.
-async fn resolve_version(
+/// The tenant this request renders under (#344): the user's stored choice when
+/// it is still a provisioned tenant, the server default otherwise. Carries the
+/// registry display name for the selector label.
+#[derive(Clone)]
+pub(crate) struct RequestTenant {
+    pub(crate) id: String,
+    pub(crate) display: Option<String>,
+}
+
+impl<S> axum::extract::FromRequestParts<S> for RequestTenant
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<RequestTenant>()
+            .cloned()
+            .unwrap_or(RequestTenant {
+                id: "default".to_string(),
+                display: None,
+            }))
+    }
+}
+
+/// Middleware: stamps [`RequestVersion`] and [`RequestTenant`] from the user's
+/// stored settings — one settings read per page load, the documented cost model
+/// of that store — falling back to the server defaults. A stored tenant that is
+/// no longer provisioned falls back too, keeping the provisioned-only model.
+async fn resolve_prefs(
     State(state): State<WebState>,
     mut request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
-    let mut effective = state.fhir_version;
-    if let Some(store) = &state.settings {
-        let user = settings_user_key(request.extensions().get::<helios_auth::Principal>());
-        if let Ok(Some(stored)) = store.get_settings(&user).await
-            && let Some(choice) = stored
-                .document
-                .get(SETTINGS_VERSION_KEY)
-                .and_then(|v| v.as_str())
-                .and_then(search_params::version_from_str)
+    let mut version = state.fhir_version;
+    let mut tenant = RequestTenant {
+        id: state.default_tenant.clone(),
+        display: None,
+    };
+    let document = match &state.settings {
+        Some(store) => {
+            let user = settings_user_key(request.extensions().get::<helios_auth::Principal>());
+            match store.get_settings(&user).await {
+                Ok(stored) => stored.map(|s| s.document),
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
+    if let Some(document) = &document {
+        if let Some(choice) = document
+            .get(SETTINGS_VERSION_KEY)
+            .and_then(|v| v.as_str())
+            .and_then(search_params::version_from_str)
         {
-            effective = choice;
+            version = choice;
+        }
+        if let Some(choice) = document.get(SETTINGS_TENANT_KEY).and_then(|v| v.as_str())
+            && choice != tenant.id
+            && let Some(registry) = &state.tenants
+            && let Ok(Some(record)) = registry.get_tenant(choice).await
+        {
+            tenant = RequestTenant {
+                id: record.id,
+                display: record.display_name,
+            };
         }
     }
-    request.extensions_mut().insert(RequestVersion(effective));
+    request.extensions_mut().insert(RequestVersion(version));
+    request.extensions_mut().insert(tenant);
     next.run(request).await
 }
 
@@ -194,8 +252,13 @@ async fn resolve_version(
 pub(crate) struct Status {
     pub(crate) version: &'static str,
     checked_at: u64,
-    /// The server's default FHIR version — the sidebar selector's label.
+    /// The effective FHIR version for this request — the sidebar selector's
+    /// label (#343).
     fhir_version: helios_fhir::FhirVersion,
+    /// The effective tenant for this request — the tenant selector's label
+    /// (#344).
+    tenant_id: String,
+    tenant_display: Option<String>,
 }
 
 impl Status {
@@ -212,6 +275,34 @@ impl Status {
             .into_iter()
             .map(|v| v.as_str())
             .collect()
+    }
+
+    /// The effective tenant id, for the `hfs-tenant` meta tag browser calls
+    /// read (#344).
+    pub(crate) fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    /// The effective tenant's display label: its registry display name, or the
+    /// id when none is set.
+    pub(crate) fn tenant_label(&self) -> &str {
+        self.tenant_display.as_deref().unwrap_or(&self.tenant_id)
+    }
+
+    /// Up-to-two-letter avatar initials from the tenant label.
+    pub(crate) fn tenant_initials(&self) -> String {
+        let letters: String = self
+            .tenant_label()
+            .split([' ', '-', '_', '/'])
+            .filter(|w| !w.is_empty())
+            .take(2)
+            .filter_map(|w| w.chars().next())
+            .collect();
+        if letters.is_empty() {
+            "?".to_string()
+        } else {
+            letters.to_uppercase()
+        }
     }
 }
 
@@ -435,6 +526,7 @@ pub fn mount(
     nl: NlSearch,
     tenants: Option<Arc<dyn ResourceStorage>>,
     settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
     self_base_url: String,
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
@@ -450,6 +542,7 @@ pub fn mount(
         nl,
         tenants,
         settings,
+        default_tenant,
         source,
         fhir_version,
     )
@@ -468,6 +561,7 @@ pub fn mount_with_conformance_source(
     nl: NlSearch,
     tenants: Option<Arc<dyn ResourceStorage>>,
     settings: Option<Arc<dyn SettingsStore>>,
+    default_tenant: String,
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
 ) -> Router {
@@ -505,7 +599,11 @@ pub fn mount_with_conformance_source(
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))
         // Persists the sidebar's FHIR-version choice (#343) and redirects back.
-        .route("/ui/version", axum::routing::post(set_version));
+        .route("/ui/version", axum::routing::post(set_version))
+        // The tenant selector (#344): lazily-loaded options and the persisted
+        // choice, mirroring /ui/version.
+        .route("/ui/tenant/options", get(tenant_options))
+        .route("/ui/tenant", axum::routing::post(set_tenant));
 
     if nl_enabled {
         router = router.route("/ui/search", get(search));
@@ -520,6 +618,7 @@ pub fn mount_with_conformance_source(
         settings,
         data_dir,
         fhir_version,
+        default_tenant,
     };
 
     router
@@ -532,10 +631,7 @@ pub fn mount_with_conformance_source(
         .layer(middleware::from_fn(i18n::negotiate_locale))
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            resolve_version,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
         .with_state(state)
         .fallback_service(fhir_app)
 }
@@ -594,6 +690,120 @@ async fn set_version(
     axum::response::Redirect::to(&target).into_response()
 }
 
+/// One option row of the tenant selector menu.
+struct TenantOption {
+    id: String,
+    label: String,
+    initials: String,
+    current: bool,
+}
+
+/// The tenant selector's options, loaded when the menu opens (htmx) so pages
+/// do not pay a registry listing per load.
+#[derive(Template)]
+#[template(path = "partials/tenant-options.html")]
+struct TenantOptionsPartial {
+    options: Vec<TenantOption>,
+}
+
+fn initials_of(label: &str) -> String {
+    let letters: String = label
+        .split([' ', '-', '_', '/'])
+        .filter(|w| !w.is_empty())
+        .take(2)
+        .filter_map(|w| w.chars().next())
+        .collect();
+    if letters.is_empty() {
+        "?".to_string()
+    } else {
+        letters.to_uppercase()
+    }
+}
+
+/// `GET /ui/tenant/options` — the registry's provisioned tenants as selector
+/// options, with the effective tenant marked current.
+async fn tenant_options(State(state): State<WebState>, rt: RequestTenant) -> Response {
+    let mut options = Vec::new();
+    if let Some(registry) = &state.tenants
+        && let Ok(records) = registry.list_tenants().await
+    {
+        for record in records {
+            let label = record
+                .display_name
+                .clone()
+                .unwrap_or_else(|| record.id.clone());
+            options.push(TenantOption {
+                current: record.id == rt.id,
+                initials: initials_of(&label),
+                id: record.id,
+                label,
+            });
+        }
+    }
+    if !options.iter().any(|o| o.current) {
+        let label = rt.display.clone().unwrap_or_else(|| rt.id.clone());
+        options.insert(
+            0,
+            TenantOption {
+                current: true,
+                initials: initials_of(&label),
+                id: rt.id.clone(),
+                label,
+            },
+        );
+    }
+    render(TenantOptionsPartial { options })
+}
+
+/// Form body for `POST /ui/tenant` — the tenant selector's submit.
+#[derive(Deserialize)]
+struct TenantForm {
+    tenant: String,
+}
+
+/// Persists the tenant choice to the user's settings document and bounces back
+/// to the referring page. Only provisioned tenants are accepted (#252's model);
+/// anything else is rejected rather than stored.
+async fn set_tenant(
+    State(state): State<WebState>,
+    headers: axum::http::HeaderMap,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::Form(form): axum::Form<TenantForm>,
+) -> Response {
+    let choice = form.tenant.trim();
+    let known = choice == state.default_tenant
+        || match &state.tenants {
+            Some(registry) => matches!(registry.get_tenant(choice).await, Ok(Some(_))),
+            None => false,
+        };
+    if !known {
+        return (StatusCode::BAD_REQUEST, "unknown tenant").into_response();
+    }
+
+    if let Some(store) = &state.settings {
+        let user = settings_user_key(principal.as_ref().map(|e| &e.0));
+        if let Err(e) = store
+            .patch_settings(
+                &user,
+                serde_json::json!({ SETTINGS_TENANT_KEY: choice }),
+                None,
+            )
+            .await
+        {
+            tracing::warn!("persisting tenant choice failed: {e}");
+        }
+    }
+
+    let back = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| r.parse::<axum::http::Uri>().ok())
+        .map(|u| u.path().to_string())
+        .filter(|p| p.starts_with("/ui"))
+        .unwrap_or_else(|| "/ui".to_string());
+    axum::response::Redirect::to(&back).into_response()
+}
+
 /// The how-to page for natural-language search, linked from the setup state.
 const NL_SEARCH_DOCS: &str =
     "https://heliossoftware.github.io/hfs/components/natural-language-search.html";
@@ -619,6 +829,7 @@ async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
+    rt: RequestTenant,
     RawQuery(query): RawQuery,
 ) -> Response {
     let selected = query_value(query.as_deref(), "type");
@@ -633,6 +844,7 @@ async fn index(
             window,
             state.nl.enabled,
             rv.0,
+            &rt,
         )
         .await,
     )
@@ -643,13 +855,14 @@ async fn search(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
+    rt: RequestTenant,
 ) -> Response {
     let resource_types = state
         .compartments
-        .resource_type_names(helios_fhir::FhirVersion::default())
+        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
         .await;
     render(SearchPage {
-        status: current_status(state.version, rv.0),
+        status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search",
         nl_enabled: state.nl.enabled,
@@ -665,13 +878,14 @@ async fn queries(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
+    rt: RequestTenant,
 ) -> Response {
     let resource_types = state
         .compartments
-        .resource_type_names(helios_fhir::FhirVersion::default())
+        .resource_type_names(&rt.id, helios_fhir::FhirVersion::default())
         .await;
     render(QueriesPage {
-        status: current_status(state.version, rv.0),
+        status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "queries",
         nl_enabled: state.nl.enabled,
@@ -691,11 +905,12 @@ struct ParamsCatalogQuery {
 /// `DomainResource`-level ones), from the default-version snapshot.
 async fn query_params_catalog(
     State(state): State<WebState>,
+    rt: RequestTenant,
     Query(raw): Query<ParamsCatalogQuery>,
 ) -> Response {
     let snapshot = state
         .sp_catalog
-        .snapshot(helios_fhir::FhirVersion::default())
+        .snapshot(&rt.id, helios_fhir::FhirVersion::default())
         .await;
     let resource_type = raw.resource_type.unwrap_or_default();
     let mut params: Vec<ParamOption> = snapshot
@@ -732,6 +947,7 @@ async fn search_parameters(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
+    rt: RequestTenant,
     Query(raw): Query<SearchParametersQuery>,
 ) -> Response {
     let query = search_params::SpQuery {
@@ -744,9 +960,12 @@ async fn search_parameters(
         page: raw.page.unwrap_or(1),
         sel: raw.sel.filter(|s| !s.is_empty()),
     };
-    let snapshot = state.sp_catalog.snapshot(query.fhir_version()).await;
+    let snapshot = state
+        .sp_catalog
+        .snapshot(&rt.id, query.fhir_version())
+        .await;
     render(SearchParametersPage {
-        status: current_status(state.version, rv.0),
+        status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
         nl_enabled: state.nl.enabled,
@@ -772,6 +991,7 @@ async fn compartments_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
+    rt: RequestTenant,
     Query(raw): Query<CompartmentsQuery>,
 ) -> Response {
     let query = compartments::CmpQuery {
@@ -783,10 +1003,13 @@ async fn compartments_page(
         id: raw.id,
         target: raw.target,
     };
-    let defs = state.compartments.definitions(query.fhir_version()).await;
+    let defs = state
+        .compartments
+        .definitions(&rt.id, query.fhir_version())
+        .await;
     match compartments::build_view(&query, &defs) {
         Some(view) => render(CompartmentsPage {
-            status: current_status(state.version, rv.0),
+            status: current_status(state.version, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "compartments",
             nl_enabled: state.nl.enabled,
@@ -802,9 +1025,10 @@ async fn status(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
+    rt: RequestTenant,
     HxRequest(is_htmx): HxRequest,
 ) -> Response {
-    let status = current_status(state.version, rv.0);
+    let status = current_status(state.version, rv.0, &rt);
     let i18n = I18n::new(locale);
     if is_htmx {
         render(StatusPartial { status, i18n })
@@ -817,6 +1041,7 @@ async fn status(
                 DashboardWindow::default(),
                 state.nl.enabled,
                 rv.0,
+                &rt,
             )
             .await,
         )
@@ -828,9 +1053,10 @@ async fn history_page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
+    rt: RequestTenant,
 ) -> Response {
     render(HistoryPage {
-        status: current_status(state.version, rv.0),
+        status: current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "history",
         nl_enabled: state.nl.enabled,
@@ -901,10 +1127,11 @@ async fn build_index_page(
     window: DashboardWindow,
     nl_enabled: bool,
     fhir_version: helios_fhir::FhirVersion,
+    tenant: &RequestTenant,
 ) -> IndexPage {
-    let status = current_status(version, fhir_version);
+    let status = current_status(version, fhir_version, tenant);
     let i18n = I18n::new(locale);
-    let snapshot = helios_observability::dashboard::snapshot(window)
+    let snapshot = helios_observability::dashboard::snapshot(window, &tenant.id)
         .await
         .unwrap_or_else(|| sample_snapshot(window));
     let (metrics, chart, legend, windows) = build_dashboard(&snapshot, selected.as_deref());
@@ -1226,11 +1453,14 @@ fn bucket_floor_utc(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
 pub(crate) fn current_status(
     version: &'static str,
     fhir_version: helios_fhir::FhirVersion,
+    tenant: &RequestTenant,
 ) -> Status {
     Status {
         version,
         checked_at: unix_timestamp_seconds(),
         fhir_version,
+        tenant_id: tenant.id.clone(),
+        tenant_display: tenant.display.clone(),
     }
 }
 
@@ -1269,6 +1499,8 @@ mod tests {
                 version,
                 checked_at,
                 fhir_version: helios_fhir::FhirVersion::R4,
+                tenant_id: "default".to_string(),
+                tenant_display: None,
             },
             metrics,
             chart,
@@ -1321,6 +1553,8 @@ mod tests {
                 version: "1.2.3",
                 checked_at: 42,
                 fhir_version: helios_fhir::FhirVersion::R4,
+                tenant_id: "default".to_string(),
+                tenant_display: None,
             },
             i18n: i18n("en"),
         }
@@ -1388,6 +1622,8 @@ mod tests {
                 version: "1.2.3",
                 checked_at: 42,
                 fhir_version: helios_fhir::FhirVersion::R4,
+                tenant_id: "default".to_string(),
+                tenant_display: None,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -1426,6 +1662,8 @@ mod tests {
                 version: "1.2.3",
                 checked_at: 42,
                 fhir_version: helios_fhir::FhirVersion::R4,
+                tenant_id: "default".to_string(),
+                tenant_display: None,
             },
             i18n: i18n("es"),
             active_page: "queries",
