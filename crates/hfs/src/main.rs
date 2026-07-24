@@ -629,6 +629,7 @@ async fn serve(
             },
             ui_tenants.clone(),
             ui_settings.clone(),
+            config.default_tenant.clone(),
             self_base_url,
             outbound_auth,
             config.default_fhir_version,

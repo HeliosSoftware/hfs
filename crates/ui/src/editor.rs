@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{RequestVersion, WebState, render};
+use crate::{RequestTenant, RequestVersion, WebState, render};
 
 /// One line of the editor tree. The tree is flattened here rather than rendered
 /// recursively: Askama has no recursive includes, and a flat list with an
@@ -152,10 +152,11 @@ pub async fn page(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
+    rt: RequestTenant,
     Query(query): Query<EditorQuery>,
 ) -> Response {
     render(EditorPage {
-        status: crate::current_status(state.version, rv.0),
+        status: crate::current_status(state.version, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "editor",
         resource_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
