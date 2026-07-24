@@ -181,6 +181,7 @@
     current = { type: type, id: "" };
     subject.textContent = type + " · " + "new";
     openModal();
+    editorBody.innerHTML = "";
     renderEditor({ resourceType: type });
   }
 

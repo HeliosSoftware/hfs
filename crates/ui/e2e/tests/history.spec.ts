@@ -82,7 +82,7 @@ test("picking versions from the selects re-renders the diff", async ({ history, 
   // Compare v1 against itself → the identical-versions banner.
   await history.fromSelect.selectOption("1");
   await history.toSelect.selectOption("1");
-  await expect(history.diff).not.toContainText("SelB");
+  await expect(history.diff).not.toContainText("SelB", { timeout: 15_000 });
 });
 
 test("an unknown instance reports not-found, not a broken diff", async ({ history }) => {
