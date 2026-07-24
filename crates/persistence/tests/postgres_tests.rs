@@ -1146,15 +1146,28 @@ mod postgres_integration {
         assert_eq!(read.content()["name"][0]["family"], "Restored");
         assert!(backend.exists(&tenant, "Patient", &id).await.unwrap());
 
-        // History keeps every version, including the deletion.
+        // History keeps every version, including the deletion — which is only
+        // returned when `include_deleted` is set (deleted versions are filtered out
+        // by default on every backend).
         let history = backend
-            .history_instance(&tenant, "Patient", &id, &HistoryParams::new())
+            .history_instance(
+                &tenant,
+                "Patient",
+                &id,
+                &HistoryParams::new().include_deleted(true),
+            )
             .await
             .unwrap();
+        assert_eq!(
+            history.items.len(),
+            3,
+            "history should hold create, delete and restore"
+        );
+        assert_eq!(history.items[0].resource.version_id(), "3");
+        assert!(!history.items[0].resource.is_deleted());
         assert!(
-            history.items.len() >= 3,
-            "history should hold create, delete and restore, got {}",
-            history.items.len()
+            history.items[1].resource.is_deleted(),
+            "the middle version is the deletion"
         );
     }
 
