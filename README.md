@@ -301,6 +301,8 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_PG_PASSWORD` | *(none)* | Database password |
 | `HFS_PG_MAX_CONNECTIONS` | `10` | Connection pool size |
 | `HFS_PG_CONNECT_TIMEOUT_SECS` | `5` | How long establishing a connection may take before failing (s), covering DNS, TCP, TLS and authentication. Raise it for a server that is slow to answer a fresh connection. |
+| `HFS_PG_STATEMENT_TIMEOUT_MS` | `30000` | Server-side `statement_timeout` applied to every pooled connection. Raise it for migrations or other long-running maintenance work. |
+| `HFS_PG_POOL_WAIT_TIMEOUT_SECS` | `10` | How long a request waits for a free pooled connection before failing with 503 |
 
 **MongoDB**
 
@@ -363,12 +365,14 @@ JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HF
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | `false` | Enable the FHIR Messaging subscription channel |
 | `HFS_SUBSCRIPTION_MESSAGE_SOURCE_ENDPOINT` | `HFS_BASE_URL` | Source endpoint URL used in outbound FHIR message headers |
 | `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | `false` | Allow subscription deliveries to private or loopback endpoints; intended for local development and CI only |
+| `HFS_SUBSCRIPTION_REHYDRATE` | `true` | Reload stored `Subscription`/`SubscriptionTopic` resources into the engine at startup, so subscriptions keep delivering across a restart |
+| `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | `true` | Re-run the activation handshake for stored `requested` subscriptions during rehydration |
 | `HFS_BULK_EXPORT_ENABLED` | `true` | Enable the [Bulk Data Export](crates/rest/README.md#bulk-data-export) `$export` operation; when `false`, all `$export` endpoints return `501` |
 | `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Bulk export output store: `local-fs` or `s3`. See the [rest crate README](crates/rest/README.md#bulk-data-export) for the full `HFS_BULK_EXPORT_*` table |
 | `HFS_BULK_SUBMIT_ENABLED` | `true` | Enable the Bulk Data Submit `$bulk-submit` operation (HFS as Data Consumer — fetches a provider manifest and ingests it); when `false`, all `$bulk-submit` endpoints return `501`. Available on `sqlite`/`postgres` (+ `-elasticsearch` composites). See the "Bulk Data Submit" section of `CLAUDE.md` for the full `HFS_BULK_SUBMIT_*` table |
 | `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Bulk submit status-artifact store: `local-fs` or `s3` |
 
-The SMTP delivery channel (`HFS_SUBSCRIPTION_SMTP_*`) and delivery-retry tuning (`HFS_SUBSCRIPTION_HANDSHAKE_*`) are documented in the [helios-subscriptions README](crates/subscriptions/README.md).
+The SMTP delivery channel (`HFS_SUBSCRIPTION_SMTP_*`), delivery-retry tuning (`HFS_SUBSCRIPTION_HANDSHAKE_*`), and the remaining startup-rehydration knobs (`HFS_SUBSCRIPTION_REHYDRATE_*`) are documented in the [helios-subscriptions README](crates/subscriptions/README.md).
 
 For detailed backend setup instructions (building from source, Docker commands, and search offloading architecture), see the [persistence crate documentation](crates/persistence/README.md#building--running-storage-backends).
 

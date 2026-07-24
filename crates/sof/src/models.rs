@@ -632,6 +632,13 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
         RunParameters::R5(_) => params_json.get("R5"),
         #[cfg(feature = "R6")]
         RunParameters::R6(_) => params_json.get("R6"),
+        // A variant can exist without helios-sof enabling the matching feature
+        // (another crate in the build graph can turn on a helios-fhir version
+        // feature that helios-sof did not), but `RunParameters` values are only
+        // ever built by helios-sof's own feature-gated constructors, so this
+        // arm is genuinely unreachable at runtime.
+        #[allow(unreachable_patterns)]
+        _ => unreachable!("RunParameters is only constructed for versions enabled in helios-sof"),
     }
     .unwrap_or(&params_json);
 

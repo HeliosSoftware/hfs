@@ -126,6 +126,12 @@ where
         });
     }
 
+    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    state
+        .validation()
+        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .await?;
+
     // Try to read existing resource for version check.
     //
     // A deleted resource is brought back to life by a subsequent update
@@ -179,6 +185,15 @@ where
             fhir_version,
         )
         .await?;
+
+    // Stored StructureDefinitions feed the tenant's profile registry.
+    if resource_type == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            fhir_version,
+            stored.content(),
+        );
+    }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
     let status = if created {
@@ -286,6 +301,12 @@ where
             });
         }
     }
+
+    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    state
+        .validation()
+        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .await?;
 
     let result = state
         .storage()

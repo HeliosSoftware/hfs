@@ -125,6 +125,13 @@ pub enum RestError {
         message: String,
     },
 
+    /// Resource validation failed in enforce mode (HTTP 422). Carries the
+    /// full multi-issue OperationOutcome from the validator.
+    ValidationFailed {
+        /// The OperationOutcome to return as the response body.
+        outcome: serde_json::Value,
+    },
+
     /// Unauthorized — missing or invalid authentication (HTTP 401).
     Unauthorized {
         /// Error message.
@@ -247,6 +254,9 @@ impl fmt::Display for RestError {
             RestError::UnprocessableEntity { message } => {
                 write!(f, "Unprocessable entity: {}", message)
             }
+            RestError::ValidationFailed { .. } => {
+                write!(f, "Resource validation failed")
+            }
             RestError::Unauthorized { message } => {
                 write!(f, "Unauthorized: {}", message)
             }
@@ -354,6 +364,11 @@ impl RestError {
                 "processing",
                 message.clone(),
             ),
+            RestError::ValidationFailed { .. } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "processing",
+                "Resource validation failed".to_string(),
+            ),
             RestError::Unauthorized { message } => {
                 (StatusCode::UNAUTHORIZED, "login", message.clone())
             }
@@ -410,6 +425,12 @@ impl RestError {
 
 impl IntoResponse for RestError {
     fn into_response(self) -> Response {
+        // ValidationFailed carries a fully-formed OperationOutcome (potentially
+        // many issues from the write-path validator); surface it verbatim
+        // rather than collapsing it to the generic single-issue shape.
+        if let RestError::ValidationFailed { outcome } = &self {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(outcome.clone())).into_response();
+        }
         let (status, code, details) = self.client_response();
         let operation_outcome = create_operation_outcome("error", code, &details);
 

@@ -1,0 +1,96 @@
+{
+  "desc": "base keyword - inheritance",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Complex": {
+      "elements": {
+        "value": {"type": "string"}
+      }
+    },
+    "ComplexChild": {
+      "base": "Complex",
+      "elements": {
+        "quantity": {"type": "string"}
+      }
+    },
+    "Resource": {
+      "elements": {
+        "resourceType": {"type": "string"},
+        "id": {"type": "string"}
+      }
+    },
+    "DomainResource": {
+      "base": "Resource",
+      "elements": {
+        "narrative": {"type": "string"}
+      }
+    },
+    "Patient": {
+      "base": "DomainResource",
+      "elements": {
+        "status": {"type": "string"},
+        "complex": {"type": "ComplexChild"}
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "own property",
+      "data": {
+        "resourceType": "Patient",
+        "status": "active"
+      }
+    },
+    {
+      "desc": "father property",
+      "data": {
+        "resourceType": "Patient",
+        "narrative": "ok"
+      }
+    },
+    {
+      "desc": "grandfather property",
+      "data": {
+        "resourceType": "Patient",
+        "id": "pt-1"
+      }
+    },
+    {
+      "desc": "complex type property",
+      "data": {
+        "resourceType": "Patient",
+        "complex": {"quantity": "ok"}
+      }
+    },
+    {
+      "desc": "complex type inherited property",
+      "data": {
+        "resourceType": "Patient",
+        "complex": {"value": "ok"}
+      }
+    },
+    {
+      "desc": "complex type property and inherited property",
+      "data": {
+        "resourceType": "Patient",
+        "complex": {"value": "ok", "quantity": "ok"}
+      }
+    },
+    {
+      "desc": "complex type unknonw",
+      "data": {
+        "resourceType": "Patient",
+        "complex": {
+          "unknown": "not-ok",
+          "value": "ok",
+          "quantity": "ok"
+        }
+      },
+      "errors": [{
+          "message": "unknown is unknown",
+          "path": "Patient.complex.unknown",
+          "type": "unknown-element"
+      }]
+    }
+  ]
+}

@@ -1,0 +1,165 @@
+{
+  "desc": "required keyword",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Resource": {
+      "required": ["requiredElement", "anotherRequiredElement"],
+      "elements": {
+        "resourceType": {"type": "string"},
+        "requiredElement": {"type": "string"},
+        "anotherRequiredElement": {"type": "string"},
+        "optionalElement": {"type": "string"},
+        "elementForProfile": {"type": "string"}
+      }
+    },
+    "Profile": {
+      "base": "Resource",
+      "required": ["elementForProfile", "localElement"],
+      "elements": {
+        "localElement": {"type": "string"}
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "required satisfied",
+      "data": {
+        "resourceType": "Resource",
+        "requiredElement": "ok",
+        "anotherRequiredElement": "ok"
+      }
+    },
+    {
+      "desc": "one required missed element",
+      "data": {
+        "resourceType": "Resource",
+        "requiredElement": "ok"
+      },
+      "errors": [
+        {
+          "message": "anotherRequiredElement is required",
+          "type": "required",
+          "path": "Resource.anotherRequiredElement"
+        }
+      ]
+    },
+    {
+      "desc": "another required missed element",
+      "data": {
+        "resourceType": "Resource",
+        "anotherRequiredElement": "ok"
+      },
+      "errors": [
+        {
+          "message": "requiredElement is required",
+          "type": "required",
+          "path": "Resource.requiredElement"
+        }
+      ]
+    },
+    {
+      "desc": "both required missed element",
+      "data": {
+        "resourceType": "Resource"
+      },
+      "errors": [
+        {
+          "message": "requiredElement is required",
+          "type": "required",
+          "path": "Resource.requiredElement"
+        },
+        {
+          "message": "anotherRequiredElement is required",
+          "type": "required",
+          "path": "Resource.anotherRequiredElement"
+        }
+      ]
+    },
+    {
+      "desc": "required ok in profile",
+      "data": {
+        "resourceType": "Profile",
+        "localElement": "ok",
+        "elementForProfile": "ok",
+        "requiredElement": "ok",
+        "anotherRequiredElement": "ok"
+      }
+    },
+    {
+      "desc": "one parent required missed in profile",
+      "data": {
+        "resourceType": "Profile",
+        "localElement": "ok",
+        "elementForProfile": "ok",
+        "anotherRequiredElement": "ok"
+      },
+      "errors": [
+        {
+          "message": "requiredElement is required",
+          "type": "required",
+          "path": "Profile.requiredElement"
+        }
+      ]
+    },
+    {
+      "desc": "both parent required missed in profile",
+      "data": {
+        "resourceType": "Profile",
+        "localElement": "ok",
+        "elementForProfile": "ok"
+      },
+      "errors": [
+        {
+          "message": "requiredElement is required",
+          "type": "required",
+          "path": "Profile.requiredElement"
+        },
+        {
+          "message": "anotherRequiredElement is required",
+          "type": "required",
+          "path": "Profile.anotherRequiredElement"
+        }
+      ]
+    },
+    {
+      "desc": "elementForProfile missed in profile",
+      "data": {
+        "resourceType": "Profile",
+        "requiredElement": "ok",
+        "anotherRequiredElement": "ok",
+        "localElement": "ok"
+      },
+      "errors": [
+        {
+          "message": "elementForProfile is required",
+          "type": "required",
+          "path": "Profile.elementForProfile"
+        }
+      ]
+    },
+    {
+      "desc": "all required missed in profile",
+      "data": {
+        "resourceType": "Profile",
+        "localElement": "ok"
+      },
+      "errors": [
+        {
+          "message": "requiredElement is required",
+          "type": "required",
+          "path": "Profile.requiredElement"
+        },
+        {
+          "message": "anotherRequiredElement is required",
+          "type": "required",
+          "path": "Profile.anotherRequiredElement"
+        },
+        {
+          "message": "elementForProfile is required",
+          "path": "Profile.elementForProfile",
+          "type": "required"
+        }
+     ]
+    }
+  ]
+}

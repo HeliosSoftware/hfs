@@ -1,0 +1,54 @@
+{
+  "desc": "fixed and pattern keywords — Helios extended (message wording is ours: scalars render bare, composites render as compact JSON)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Patient": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "gender": { "type": "string", "fixed": "male" },
+        "maritalStatus": {
+          "pattern": { "system": "http://x" },
+          "elements": {
+            "text": { "type": "string" },
+            "system": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "fixed satisfied",
+      "data": { "resourceType": "Patient", "gender": "male" }
+    },
+    {
+      "desc": "fixed violated",
+      "data": { "resourceType": "Patient", "gender": "female" },
+      "errors": [
+        {
+          "type": "fixed-value",
+          "path": "Patient.gender",
+          "message": "Expected value to be exactly equal to 'fixed' pattern 'male', but got: 'female'"
+        }
+      ]
+    },
+    {
+      "desc": "pattern satisfied with extra keys",
+      "data": {
+        "resourceType": "Patient",
+        "maritalStatus": { "system": "http://x", "text": "M" }
+      }
+    },
+    {
+      "desc": "pattern violated",
+      "data": { "resourceType": "Patient", "maritalStatus": { "text": "M" } },
+      "errors": [
+        {
+          "type": "pattern-value",
+          "path": "Patient.maritalStatus",
+          "message": "Expected value to match 'pattern' '{\"system\":\"http://x\"}', but got: '{\"text\":\"M\"}'"
+        }
+      ]
+    }
+  ]
+}

@@ -40,6 +40,10 @@ pub enum IssueType {
     Required,
     /// Value out of range.
     Value,
+    /// FHIRPath invariant violation.
+    Invariant,
+    /// Invalid code / failed terminology binding.
+    CodeInvalid,
     /// Resource not found.
     NotFound,
     /// Resource was deleted.
@@ -78,6 +82,8 @@ impl IssueType {
             IssueType::Structure => "structure",
             IssueType::Required => "required",
             IssueType::Value => "value",
+            IssueType::Invariant => "invariant",
+            IssueType::CodeInvalid => "code-invalid",
             IssueType::NotFound => "not-found",
             IssueType::Deleted => "deleted",
             IssueType::MultipleMatches => "multiple-matches",
