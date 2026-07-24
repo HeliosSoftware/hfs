@@ -172,7 +172,6 @@ async fn test_create_different_resource_types() {
 /// Test that creating without create permission fails.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-#[ignore = "#306: storage layer does not enforce TenantPermissions (no permission checks in any backend); asserts an authz property persistence does not implement — see PR #361"]
 async fn test_create_without_permission_fails() {
     let backend = create_sqlite_backend();
     let tenant = TenantContext::new(TenantId::new("test"), TenantPermissions::read_only());

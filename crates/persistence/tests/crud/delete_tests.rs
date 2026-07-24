@@ -190,7 +190,6 @@ async fn test_delete_already_deleted_fails() {
 /// Test that deleting without permission fails.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-#[ignore = "#306: storage layer does not enforce TenantPermissions (no permission checks in any backend); asserts an authz property persistence does not implement — see PR #361"]
 async fn test_delete_without_permission_fails() {
     let backend = create_sqlite_backend();
     let full_access = TenantContext::new(

@@ -18,7 +18,7 @@ use crate::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, StorageResult,
 };
 use crate::search::reindex::{ReindexSource, ResourcePage};
-use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+use crate::tenant::{Operation, TenantContext, TenantId, TenantPermissions};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, Pagination, PaginationMode, ResourceMethod,
     StoredResource,
@@ -428,6 +428,8 @@ impl S3Backend {
         id: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Update, resource_type)?;
+
         let location = self.tenant_location(tenant)?;
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
@@ -587,6 +589,8 @@ impl ResourceStorage for S3Backend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
         let location = self.tenant_location(tenant)?;
 
         let id = resource
@@ -706,8 +710,10 @@ impl ResourceStorage for S3Backend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let location = self.tenant_location(tenant)?;
         let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let location = self.tenant_location(tenant)?;
         let id = current.id();
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
@@ -785,6 +791,8 @@ impl ResourceStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let location = self.tenant_location(tenant)?;
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 

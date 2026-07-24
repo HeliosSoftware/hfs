@@ -19,7 +19,7 @@ use crate::core::{
 use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::tenant::TenantContext;
+use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
@@ -87,6 +87,8 @@ impl ResourceStorage for PostgresBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -279,9 +281,11 @@ impl ResourceStorage for PostgresBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = current.resource_type();
         let id = current.id();
 
         // Check that the resource still exists with the expected version
@@ -393,6 +397,8 @@ impl ResourceStorage for PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -856,6 +862,8 @@ impl PostgresBackend {
         id: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Update, resource_type)?;
+
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 

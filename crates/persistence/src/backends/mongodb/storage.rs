@@ -25,7 +25,7 @@ use crate::error::{
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::tenant::TenantContext;
+use crate::tenant::{Operation, TenantContext};
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
 use super::MongoBackend;
@@ -554,6 +554,8 @@ impl ResourceStorage for MongoBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -813,12 +815,14 @@ impl ResourceStorage for MongoBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
         let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = current.resource_type();
         let id = current.id();
 
         let current_filter = doc! {
@@ -1002,6 +1006,8 @@ impl ResourceStorage for MongoBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -1628,6 +1634,8 @@ impl MongoBackend {
         id: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Update, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -2131,6 +2139,8 @@ impl VersionedStorage for MongoBackend {
         id: &str,
         expected_version: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
