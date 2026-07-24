@@ -200,3 +200,33 @@ async fn embedded_assets_carry_no_cache_so_rebuilt_css_is_never_stale() {
         .unwrap();
     assert!(cc.contains("no-cache"), "got {cc}");
 }
+
+/// A storage failure must surface as the error banner, never as an empty
+/// 'no tenants' table that hides every row and purge affordance. A store
+/// whose schema was never initialised makes every query fail, standing in
+/// for a transient error (e.g. a pool wait under concurrent seeding).
+#[tokio::test]
+async fn storage_failure_renders_the_error_banner_not_a_silent_empty_table() {
+    let broken: Arc<dyn ResourceStorage> =
+        Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+
+    let (status, body) = get(&broken, "/ui/tenants/rows?q=").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("form-error"), "rows fragment: {body}");
+
+    let (status, body) = post_form(&broken, "id=acme&display_name=").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("form-error"), "create fragment: {body}");
+
+    let res = app(&broken)
+        .oneshot(
+            Request::delete("/ui/tenants/acme")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_text(res).await;
+    assert!(body.contains("form-error"), "delete fragment: {body}");
+}
