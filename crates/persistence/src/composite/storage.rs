@@ -674,7 +674,12 @@ impl CompositeStorage {
     }
 
     /// Syncs bundle results to secondaries by extracting resource info from responses.
-    async fn sync_bundle_results(&self, tenant: &TenantContext, result: &BundleResult) {
+    async fn sync_bundle_results(
+        &self,
+        tenant: &TenantContext,
+        result: &BundleResult,
+        fhir_version: FhirVersion,
+    ) {
         for entry_result in &result.entries {
             // Only sync successful mutating operations that have a resource body
             if let Some(ref resource_json) = entry_result.resource {
@@ -690,12 +695,6 @@ impl CompositeStorage {
                 if resource_type.is_empty() || resource_id.is_empty() {
                     continue;
                 }
-
-                let fhir_version = resource_json
-                    .get("meta")
-                    .and_then(|m| m.get("profile"))
-                    .map(|_| FhirVersion::default_enabled())
-                    .unwrap_or_else(FhirVersion::default_enabled);
 
                 if let Err(e) = self
                     .sync_to_secondaries(SyncEvent::Create {
@@ -1673,6 +1672,7 @@ impl BundleProvider for CompositeStorage {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError> {
         let provider =
             self.bundle_provider
@@ -1682,10 +1682,13 @@ impl BundleProvider for CompositeStorage {
                     message: "BundleProvider not available on composite primary".to_string(),
                 })?;
 
-        let result = provider.process_transaction(tenant, entries).await?;
+        let result = provider
+            .process_transaction(tenant, entries, fhir_version)
+            .await?;
 
         // Sync successful entries to secondaries by reading resources from primary
-        self.sync_bundle_results(tenant, &result).await;
+        self.sync_bundle_results(tenant, &result, fhir_version)
+            .await;
 
         Ok(result)
     }
@@ -1694,6 +1697,7 @@ impl BundleProvider for CompositeStorage {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleResult> {
         let provider = self.bundle_provider.as_ref().ok_or_else(|| {
             StorageError::Backend(BackendError::UnsupportedCapability {
@@ -1702,10 +1706,13 @@ impl BundleProvider for CompositeStorage {
             })
         })?;
 
-        let result = provider.process_batch(tenant, entries).await?;
+        let result = provider
+            .process_batch(tenant, entries, fhir_version)
+            .await?;
 
         // Sync successful entries to secondaries
-        self.sync_bundle_results(tenant, &result).await;
+        self.sync_bundle_results(tenant, &result, fhir_version)
+            .await;
 
         Ok(result)
     }
@@ -3673,7 +3680,9 @@ mod tests {
         use crate::core::BundleProvider;
         let composite = make_composite_no_secondary();
         let tenant = make_tenant();
-        let result = composite.process_batch(&tenant, vec![]).await;
+        let result = composite
+            .process_batch(&tenant, vec![], helios_fhir::FhirVersion::default())
+            .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
@@ -3688,7 +3697,9 @@ mod tests {
         use crate::core::BundleProvider;
         let composite = make_composite_no_secondary();
         let tenant = make_tenant();
-        let result = composite.process_transaction(&tenant, vec![]).await;
+        let result = composite
+            .process_transaction(&tenant, vec![], helios_fhir::FhirVersion::default())
+            .await;
         assert!(result.is_err());
     }
 

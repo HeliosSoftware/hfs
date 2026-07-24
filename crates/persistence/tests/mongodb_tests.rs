@@ -168,7 +168,10 @@ async fn mongodb_integration_transaction_bundle_topology_behavior() {
 
     let tenant = create_tenant("tenant-bundle-topology");
 
-    match backend.process_transaction(&tenant, vec![]).await {
+    match backend
+        .process_transaction(&tenant, vec![], FhirVersion::default())
+        .await
+    {
         Ok(bundle_result) => assert!(bundle_result.entries.is_empty()),
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
@@ -184,7 +187,9 @@ async fn test_mongodb_bundle_provider_batch_not_supported() {
     let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
     let tenant = create_tenant("tenant-bundle-batch");
 
-    let result = backend.process_batch(&tenant, vec![]).await;
+    let result = backend
+        .process_batch(&tenant, vec![], FhirVersion::default())
+        .await;
     assert!(matches!(
         result,
         Err(StorageError::Backend(
@@ -199,7 +204,10 @@ async fn process_transaction_or_skip(
     entries: Vec<BundleEntry>,
     test_name: &str,
 ) -> Option<BundleResult> {
-    match backend.process_transaction(tenant, entries).await {
+    match backend
+        .process_transaction(tenant, entries, FhirVersion::default())
+        .await
+    {
         Ok(result) => Some(result),
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
@@ -952,7 +960,10 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         full_url: None,
     }];
 
-    match backend.process_transaction(&tenant, bad_if_match).await {
+    match backend
+        .process_transaction(&tenant, bad_if_match, FhirVersion::default())
+        .await
+    {
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping mongodb_integration_transaction_bundle_conditional_headers/if-match-bad (MongoDB topology does not support transactions)"
@@ -1029,7 +1040,10 @@ async fn mongodb_integration_transaction_bundle_rolls_back_on_failure() {
         },
     ];
 
-    match backend.process_transaction(&tenant, entries).await {
+    match backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+    {
         Err(TransactionError::UnsupportedIsolationLevel { .. }) => {
             eprintln!(
                 "Skipping mongodb_integration_transaction_bundle_rolls_back_on_failure (MongoDB topology does not support transactions)"

@@ -75,7 +75,7 @@ where
     }
 
     // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);

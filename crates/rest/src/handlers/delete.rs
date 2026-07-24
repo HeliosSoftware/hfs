@@ -70,7 +70,7 @@ where
     let fhir_version = existing_resource
         .as_ref()
         .map(|stored| stored.fhir_version())
-        .unwrap_or_else(|| version.storage_version());
+        .unwrap_or_else(|| version.storage_version_or(state.config().default_fhir_version));
 
     // Perform the delete
     state
