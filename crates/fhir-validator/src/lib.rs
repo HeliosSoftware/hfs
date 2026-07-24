@@ -62,15 +62,21 @@
 //!   references core extension URLs report `unknown-schema` when exercised.
 
 pub mod converter;
+pub mod editor;
 pub mod effects;
 pub mod engine;
 pub mod packs;
 pub mod resolver;
 pub mod schema;
+pub mod terminology;
 
 #[cfg(feature = "fhirpath")]
 pub mod fhirpath_effects;
 
+pub use editor::{
+    Addable, AddableKind, Path, Present, Step, add_element, add_extension, addable, choose_type,
+    node_at, path_from_string, path_to_string, present_children, remove_at, schema_at, set_value,
+};
 pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,
     EffectHandlers, TerminologyError, TerminologyProvider,
@@ -81,3 +87,4 @@ pub use engine::{
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};
+pub use terminology::{CoreTerminology, core_terminology};

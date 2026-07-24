@@ -44,7 +44,7 @@ use crate::state::AppState;
 ///   ]
 /// }
 /// ```
-pub async fn versions_handler<S>(State(_state): State<AppState<S>>) -> RestResult<Response>
+pub async fn versions_handler<S>(State(state): State<AppState<S>>) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
 {
@@ -52,7 +52,7 @@ where
 
     // Get all enabled versions
     let enabled_versions = FhirVersion::enabled_versions();
-    let default_version = FhirVersion::default_enabled();
+    let default_version = state.config().default_fhir_version;
 
     // Build version parameters
     let mut parameters: Vec<serde_json::Value> = enabled_versions

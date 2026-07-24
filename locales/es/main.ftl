@@ -127,6 +127,7 @@ theme-light = Tema claro
 theme-dark = Tema oscuro
 
 fhir-version = FHIR { $version }
+fhir-version-heading = Versión FHIR
 
 card-resource-types = Tipos de recursos
 card-resource-types-sub = habilitados para { $version }
@@ -346,3 +347,64 @@ search-setup-body = Convierte descripciones en lenguaje llano en consultas de b�
 search-setup-key-placeholder = tu clave de API
 search-setup-disable = Para eliminar la función por completo — endpoint, página y este aviso — define HFS_NL_SEARCH_ENABLED=false.
 search-setup-docs = Leer el instructivo
+
+## Editor de recursos (#264)
+
+editor-heading = Editor de recursos
+editor-lede = Edita un recurso contra su esquema: añade cualquier elemento que el esquema permita, a cualquier profundidad — incluidas extensiones, en cualquier nodo que las acepte.
+editor-title = Editar recurso
+editor-view-label = Cómo editar
+editor-view-form = Formulario guiado
+editor-view-json = JSON
+editor-save = Guardar cambios
+editor-delete = Eliminar
+editor-remove = Quitar este nodo
+editor-saved = Guardado.
+editor-load-error = No se pudo cargar ese recurso.
+editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
+editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
+editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
+
+editor-add = Añadir elemento
+editor-add-filter = Filtrar elementos
+editor-add-another = añadir otro
+editor-pick-type = Elige un tipo…
+editor-extension-url = URL de la extensión
+editor-add-extension = Añadir extensión
+
+editor-valid = Sin problemas.
+editor-issues = { $count ->
+    [one] { $count } problema
+   *[other] { $count } problemas
+}
+
+editor-modifier-badge = modificadora
+editor-modifier-warning = Una extensión modificadora cambia el significado del recurso. Un sistema que no la reconozca debe negarse a procesarlo.
+editor-unknown-badge = fuera del esquema
+editor-unknown-hint = El esquema no describe este elemento. Se muestra para que no se pierda en silencio, y se conserva al guardar.
+
+editor-primitive-extension-badge = + extensión
+editor-primitive-extension-hint = Este valor lleva extensiones propias (un hermano `_` en el JSON). Se conservan al guardar.
+
+editor-collapse-all = Colapsar todo
+editor-expand-all = Expandir todo
+editor-edit-raw = Editar crudo
+editor-versions = Versiones
+editor-versions-none = Sin versiones anteriores.
+## Historial y versiones (#236)
+
+## Espacio de recursos (#282)
+
+resources-heading = Recursos
+resources-lede = Explora, busca, crea y edita recursos FHIR. Busca en lenguaje natural o arma la consulta a mano, y abre cualquier resultado para editarlo.
+resources-create = Crear nuevo
+resources-save-blocked = Corrige los problemas de validación antes de guardar.
+resources-save-invalid = El JSON no es válido — corrígelo antes de guardar.
+resources-edit-title = Editar recurso
+resources-tab-edit = Editar
+resources-tab-history = Historial
+resources-types-heading = Tipos de recurso
+
+queries-saved-group = Guardadas
+
+nav-collapse = Colapsar menú

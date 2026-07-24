@@ -2684,13 +2684,14 @@ impl BundleProvider for PostgresBackend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
 
         // Start a transaction
         let mut tx = self
-            .begin_transaction(tenant, TransactionOptions::new())
+            .begin_transaction(tenant, TransactionOptions::new().fhir_version(fhir_version))
             .await
             .map_err(|e| TransactionError::RolledBack {
                 reason: format!("Failed to begin transaction: {}", e),
@@ -2771,12 +2772,13 @@ impl BundleProvider for PostgresBackend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleResult> {
         let mut results = Vec::with_capacity(entries.len());
 
         // Process each entry independently
         for entry in &entries {
-            let result = self.process_batch_entry(tenant, entry).await;
+            let result = self.process_batch_entry(tenant, entry, fhir_version).await;
             results.push(result);
         }
 
@@ -2891,8 +2893,12 @@ impl PostgresBackend {
         &self,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> BundleEntryResult {
-        match self.process_batch_entry_inner(tenant, entry).await {
+        match self
+            .process_batch_entry_inner(tenant, entry, fhir_version)
+            .await
+        {
             Ok(result) => result,
             Err(e) => BundleEntryResult::error(
                 500,
@@ -2908,6 +2914,7 @@ impl PostgresBackend {
         &self,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleEntryResult> {
         match entry.method {
             BundleMethod::Get => {
@@ -2943,12 +2950,7 @@ impl PostgresBackend {
                     })?;
 
                 let created = self
-                    .create(
-                        tenant,
-                        &resource_type,
-                        resource,
-                        FhirVersion::default_enabled(),
-                    )
+                    .create(tenant, &resource_type, resource, fhir_version)
                     .await?;
                 Ok(BundleEntryResult::created(created))
             }
@@ -2961,13 +2963,7 @@ impl PostgresBackend {
 
                 let (resource_type, id) = self.parse_url(&entry.url)?;
                 let (stored, _created) = self
-                    .create_or_update(
-                        tenant,
-                        &resource_type,
-                        &id,
-                        resource,
-                        FhirVersion::default_enabled(),
-                    )
+                    .create_or_update(tenant, &resource_type, &id, resource, fhir_version)
                     .await?;
                 Ok(BundleEntryResult::ok(stored))
             }

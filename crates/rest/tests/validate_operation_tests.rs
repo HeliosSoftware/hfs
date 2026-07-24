@@ -94,6 +94,56 @@ async fn validate_valid_patient_returns_all_clear() {
     );
 }
 
+/// A `code` bound `required` to `administrative-gender` must be one of the four
+/// FHIR codes. `masculino` is a Spanish *display* of `male`, not a code — the
+/// embedded core value sets (default `HFS_VALIDATION_TERMINOLOGY=embedded`,
+/// no terminology server) reject it.
+#[tokio::test]
+async fn validate_rejects_a_code_outside_a_required_binding() {
+    let (server, _backend) = create_test_server().await;
+    let response = server
+        .post("/Patient/$validate")
+        .json(&json!({
+            "resourceType": "Patient",
+            "name": [{ "family": "Garcia", "given": ["Ana"] }],
+            "gender": "masculino"
+        }))
+        .await;
+
+    response.assert_status_ok();
+    let outcome: Value = response.json();
+    let issues = outcome["issue"].as_array().expect("issues");
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["code"] == "code-invalid" && i["expression"][0] == "Patient.gender"),
+        "gender 'masculino' must fail the administrative-gender required binding: {outcome:#}"
+    );
+}
+
+/// The same resource with a real code validates clean — proves the binding
+/// check accepts in-value-set codes, not just rejects.
+#[tokio::test]
+async fn validate_accepts_a_valid_bound_code() {
+    let (server, _backend) = create_test_server().await;
+    let response = server
+        .post("/Patient/$validate")
+        .json(&json!({
+            "resourceType": "Patient",
+            "name": [{ "family": "Garcia", "given": ["Ana"] }],
+            "gender": "male"
+        }))
+        .await;
+
+    response.assert_status_ok();
+    let outcome: Value = response.json();
+    let issues = outcome["issue"].as_array().expect("issues");
+    assert!(
+        !issues.iter().any(|i| i["code"] == "code-invalid"),
+        "a valid administrative-gender code must not raise a binding issue: {outcome:#}"
+    );
+}
+
 #[tokio::test]
 async fn validate_reports_structural_issues_with_expressions() {
     let (server, _backend) = create_test_server().await;

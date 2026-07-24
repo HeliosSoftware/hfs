@@ -1,31 +1,25 @@
 name: UI Tests
 
-# PLACEHOLDER — browser-level UI testing for `crates/ui` (helios-ui).
+# Browser-level conformance for crates/ui (helios-ui), per issue #249:
+# WCAG 2.2 AA via axe-core, theme behavior, progressive enhancement, and the
+# no-CDN invariants — the class of behavior tower::oneshot tests cannot reach.
 #
-# Scope and status
-# ---------------
-# `crates/ui` is a server-rendered Askama + htmx UI. Today it is covered only by
-# `tower::oneshot` router tests (`crates/ui/tests/{router_http,i18n_http}.rs`),
-# which assert over response *strings*. They cannot execute `assets/theme.js`,
-# so first-paint theming, the `/_user/settings` merge-patch, htmx swaps, and
-# WCAG conformance are all untested.
-#
-# This workflow is the agreed CI seat for that coverage. It is intentionally a
-# no-op-friendly skeleton: it builds and boots the UI, smoke-checks that `/ui`
-# serves, and then runs the Playwright suite **only once it exists** at
-# `crates/ui/e2e`. Until then the "run" steps skip and the job stays green, so
-# this can live on `main` without gating anyone.
-#
-# Owner: @angela-helios — see the tracking issue for the strategy, the tool
-# evaluation, and the phased rollout.
+# Runner model (matches Inferno/HTS): this self-hosted pool talks to a *remote*
+# Docker daemon over DOCKER_HOST, so there is no local /var/run/docker.sock and
+# bind mounts of the runner's filesystem do not reach the daemon. We therefore
+# build hfs on the host, start the Playwright container on the remote daemon,
+# and `docker cp` the pieces in. hfs and Chromium both run inside that one
+# container, so they share its localhost — no cross-host networking needed. The
+# image ships the browsers and their system libraries (no sudo, no --with-deps).
 
 on:
-  workflow_dispatch:
   pull_request:
-    branches: [main]
+    branches: [main, "feat/**"]
     paths:
       - "crates/ui/**"
+      - "locales/**"
       - ".github/workflows/ui-tests.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ui-tests-${{ github.ref }}
@@ -34,14 +28,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
-  CARGO_PROFILE_DEV_DEBUG: 0
-  # The suite drives a real browser against this origin.
-  HFS_UI_BASE_URL: http://127.0.0.1:8080
-  E2E_DIR: crates/ui/e2e
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  # Keep in step with @playwright/test in crates/ui/e2e/package.json.
+  PLAYWRIGHT_IMAGE: mcr.microsoft.com/playwright:v1.49.1-noble
+  RUN_CONTAINER: ui-e2e-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   ui-tests:
-    name: Browser tests (helios-ui)
+    name: helios-ui browser suite
+    # Linux only: the pool also has Windows runners where dtolnay/rust-toolchain
+    # fails (it runs through bash/WSL), and the Playwright image is Linux.
     runs-on: [self-hosted, Linux]
     steps:
       - name: Checkout code
@@ -54,91 +50,51 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Configure Rust linker (Linux)
+      - name: Configure Rust to use LLD
         run: |
           mkdir -p ~/.cargo
           rm -f ~/.cargo/config.toml
           echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
 
-      # Cheap guard that keeps working while the browser suite is still empty:
-      # the existing router tests must pass before we bother booting a browser.
-      - name: Router/i18n tests (helios-ui)
+      # The fast inner ring: routing / i18n / headers over tower::oneshot.
+      - name: cargo test -p helios-ui
         run: cargo test -p helios-ui
 
-      - name: Detect the browser suite
-        id: detect
-        run: |
-          if [ -f "${E2E_DIR}/package.json" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=UI browser suite not present::No ${E2E_DIR}/package.json yet — skipping browser tests. See the UI testing strategy issue."
-          fi
-
-      - name: Build hfs with the UI feature
-        if: steps.detect.outputs.present == 'true'
+      - name: Build hfs (ui feature)
         run: cargo build -p helios-hfs --features ui
 
-      - name: Set up Node
-        if: steps.detect.outputs.present == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: ${{ env.E2E_DIR }}/package-lock.json
-
-      - name: Install browser suite deps
-        if: steps.detect.outputs.present == 'true'
-        working-directory: ${{ env.E2E_DIR }}
+      # The browser ring, inside the Playwright container on the remote daemon.
+      # boot.mjs starts the copied-in hfs and Playwright drives it — both live in
+      # the container, sharing its localhost.
+      - name: Run browser suite (Playwright)
         run: |
-          npm ci
-          npx playwright install --with-deps chromium
+          set -euo pipefail
+          docker rm -f "$RUN_CONTAINER" 2>/dev/null || true
+          # 2g shm: Chromium and the tmpfs-backed SQLite DB share /dev/shm, and
+          # per-tenant conformance seeding overflows docker's 64m default.
+          docker run -d --name "$RUN_CONTAINER" --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+          docker exec "$RUN_CONTAINER" mkdir -p /work/target/debug /work/crates/ui
+          docker cp target/debug/hfs "$RUN_CONTAINER":/work/target/debug/hfs
+          docker cp data "$RUN_CONTAINER":/work/data
+          docker cp crates/ui/e2e "$RUN_CONTAINER":/work/crates/ui/e2e
+          docker exec -e CI=1 -w /work/crates/ui/e2e "$RUN_CONTAINER" \
+            bash -c "npm ci && npx playwright test"
 
-      - name: Boot hfs and wait for /ui
-        if: steps.detect.outputs.present == 'true'
+      - name: Copy Playwright report out
+        if: always()
         run: |
-          HFS_LOG_LEVEL=warn ./target/debug/hfs > "${RUNNER_TEMP}/hfs.log" 2>&1 &
-          echo "$!" > "${RUNNER_TEMP}/hfs.pid"
-          for _ in $(seq 1 60); do
-            if curl -sf -o /dev/null "${HFS_UI_BASE_URL}/ui"; then
-              echo "UI is up"; exit 0
-            fi
-            sleep 1
-          done
-          echo "::error title=hfs did not serve /ui::Server never became ready"
-          cat "${RUNNER_TEMP}/hfs.log" || true
-          exit 1
-
-      - name: Run browser tests
-        if: steps.detect.outputs.present == 'true'
-        working-directory: ${{ env.E2E_DIR }}
-        run: npx playwright test
-
-      - name: Stop hfs
-        if: always() && steps.detect.outputs.present == 'true'
-        run: |
-          if [ -f "${RUNNER_TEMP}/hfs.pid" ]; then
-            kill "$(cat "${RUNNER_TEMP}/hfs.pid")" 2>/dev/null || true
-          fi
+          docker cp "$RUN_CONTAINER":/work/crates/ui/e2e/playwright-report \
+            ./crates/ui/e2e/playwright-report 2>/dev/null || true
 
       - name: Upload Playwright report
-        if: always() && steps.detect.outputs.present == 'true'
-        uses: actions/upload-artifact@v7
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
           name: playwright-report
-          path: |
-            ${{ env.E2E_DIR }}/playwright-report
-            ${{ env.E2E_DIR }}/test-results
+          path: crates/ui/e2e/playwright-report/
           retention-days: 7
-          if-no-files-found: ignore
 
-      - name: Upload server log
-        if: failure() && steps.detect.outputs.present == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: hfs-server-log
-          path: ${{ runner.temp }}/hfs.log
-          retention-days: 7
-          if-no-files-found: ignore
+      - name: Remove Playwright container
+        if: always()
+        run: docker rm -f "$RUN_CONTAINER" 2>/dev/null || true

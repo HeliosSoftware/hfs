@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -41,6 +40,7 @@ impl BundleProvider for S3Backend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError> {
         let mut entries = entries;
         let mut reference_map: HashMap<String, String> = HashMap::new();
@@ -91,7 +91,7 @@ impl BundleProvider for S3Backend {
         // Phase 3: Execute ALL entries concurrently.
         let futs: Vec<_> = entries
             .iter()
-            .map(|entry| self.execute_bundle_entry(tenant, entry))
+            .map(|entry| self.execute_bundle_entry(tenant, entry, fhir_version))
             .collect();
 
         let outcomes = futures::future::join_all(futs).await;
@@ -150,10 +150,11 @@ impl BundleProvider for S3Backend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> crate::error::StorageResult<BundleResult> {
         let futs: Vec<_> = entries
             .iter()
-            .map(|entry| self.process_batch_entry(tenant, entry))
+            .map(|entry| self.process_batch_entry(tenant, entry, fhir_version))
             .collect();
 
         let results = futures::future::join_all(futs).await;
@@ -173,8 +174,9 @@ impl S3Backend {
         &self,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> BundleEntryResult {
-        match self.execute_bundle_entry(tenant, entry).await {
+        match self.execute_bundle_entry(tenant, entry, fhir_version).await {
             Ok((result, _)) => result,
             Err(err) => Self::bundle_error_result(&err),
         }
@@ -186,6 +188,7 @@ impl S3Backend {
         &self,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> crate::error::StorageResult<(BundleEntryResult, Option<CompensationAction>)> {
         match entry.method {
             BundleMethod::Get => {
@@ -233,12 +236,7 @@ impl S3Backend {
                     .to_string();
 
                 let created = self
-                    .create(
-                        tenant,
-                        &resource_type,
-                        resource,
-                        FhirVersion::default_enabled(),
-                    )
+                    .create(tenant, &resource_type, resource, fhir_version)
                     .await?;
 
                 Ok((
@@ -278,13 +276,7 @@ impl S3Backend {
                     ))
                 } else {
                     let (stored, created) = self
-                        .create_or_update(
-                            tenant,
-                            &resource_type,
-                            &id,
-                            resource,
-                            FhirVersion::default_enabled(),
-                        )
+                        .create_or_update(tenant, &resource_type, &id, resource, fhir_version)
                         .await?;
 
                     let result = if created {

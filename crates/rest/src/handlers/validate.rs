@@ -232,7 +232,7 @@ where
     let inputs = unwrap_inputs(Some(body), &query)?;
     respond(
         &state,
-        version.storage_version(),
+        version.storage_version_or(state.config().default_fhir_version),
         inputs,
         &resource_type,
         tenant.tenant_id(),
@@ -266,7 +266,7 @@ where
     inputs.resource = Some(stored.content().clone());
     respond(
         &state,
-        version.storage_version(),
+        version.storage_version_or(state.config().default_fhir_version),
         inputs,
         &resource_type,
         tenant.tenant_id(),
@@ -292,7 +292,7 @@ where
     let inputs = unwrap_inputs(Some(body), &query)?;
     respond(
         &state,
-        version.storage_version(),
+        version.storage_version_or(state.config().default_fhir_version),
         inputs,
         &resource_type,
         tenant.tenant_id(),

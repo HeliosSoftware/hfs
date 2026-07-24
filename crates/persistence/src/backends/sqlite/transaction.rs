@@ -45,6 +45,8 @@ pub struct SqliteTransaction {
     search_extractor: Arc<SearchParameterExtractor>,
     /// When true, search indexing is offloaded to a secondary backend.
     search_offloaded: bool,
+    /// The FHIR version writes in this transaction are stamped with.
+    fhir_version: FhirVersion,
 }
 
 impl std::fmt::Debug for SqliteTransaction {
@@ -63,6 +65,7 @@ impl SqliteTransaction {
         tenant: TenantContext,
         search_extractor: Arc<SearchParameterExtractor>,
         search_offloaded: bool,
+        fhir_version: FhirVersion,
     ) -> StorageResult<Self> {
         // Start the transaction
         conn.execute("BEGIN IMMEDIATE", []).map_err(|e| {
@@ -77,6 +80,7 @@ impl SqliteTransaction {
             tenant,
             search_extractor,
             search_offloaded,
+            fhir_version,
         })
     }
 
@@ -217,9 +221,7 @@ impl Transaction for SqliteTransaction {
         let last_updated = now.to_rfc3339();
         let version_id = "1";
 
-        // Use default FHIR version for transaction operations
-        let fhir_version = FhirVersion::default_enabled();
-        let fhir_version_str = fhir_version.as_mime_param();
+        let fhir_version_str = self.fhir_version.as_mime_param();
 
         // Insert the resource
         conn.execute(
@@ -249,7 +251,7 @@ impl Transaction for SqliteTransaction {
             now,
             now,
             None,
-            fhir_version,
+            self.fhir_version,
         ))
     }
 
@@ -554,7 +556,7 @@ impl TransactionProvider for SqliteBackend {
     async fn begin_transaction(
         &self,
         tenant: &TenantContext,
-        _options: TransactionOptions,
+        options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
         let conn = self.get_connection()?;
         SqliteTransaction::new(
@@ -562,6 +564,7 @@ impl TransactionProvider for SqliteBackend {
             tenant.clone(),
             Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
             self.is_search_offloaded(),
+            options.fhir_version.unwrap_or(self.config().fhir_version),
         )
     }
 }
