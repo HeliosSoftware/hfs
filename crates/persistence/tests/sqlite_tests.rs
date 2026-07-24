@@ -4060,5 +4060,29 @@ mod cross_tenant_search_isolation {
             search_ids(&backend, &tenant_a, &query).await.is_empty(),
             ":identifier reference search leaked tenant B's identifier into tenant A's results"
         );
+
+        // A versioned reference resolves to the same target (version-agnostic
+        // matching, as for an unmodified reference search).
+        backend
+            .create(
+                &tenant_b,
+                "Observation",
+                json!({
+                    "resourceType":"Observation","id":"obs-b-versioned","status":"final",
+                    "code":{"coding":[{"code":"x"}]},
+                    "subject":{"reference":"Patient/pat-shared/_history/1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut ids = search_ids(&backend, &tenant_b, &query).await;
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["obs-b".to_string(), "obs-b-versioned".to_string()],
+            ":identifier must match a versioned reference to the same target"
+        );
     }
 }
