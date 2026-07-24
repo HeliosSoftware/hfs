@@ -1927,7 +1927,10 @@ impl MongoBackend {
 
         match &value.value {
             IndexValue::String(v) => {
-                doc.insert("value_string", v.to_lowercase());
+                // Stored as written: `:exact` is case-sensitive, and the
+                // insensitive variants use a case-insensitive regex instead of
+                // a pre-lowercased value.
+                doc.insert("value_string", v.clone());
             }
             IndexValue::Token {
                 system,

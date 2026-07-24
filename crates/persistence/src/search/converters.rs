@@ -277,6 +277,15 @@ impl ValueConverter {
     }
 
     /// Converts a value to string type.
+    ///
+    /// Values are indexed **as written**, preserving case and accents. The
+    /// case- and accent-insensitive comparisons that string search defaults to
+    /// are done at query time — every backend either matches the folded
+    /// companion value (`value_string_folded` / `search_params.string.folded`,
+    /// written by the index writers via [`crate::search::fold_text`]) or applies
+    /// a case-insensitive comparison to this raw value. Folding here instead
+    /// would make `:exact` — which is defined as case- and accent-sensitive —
+    /// impossible to answer, because the original spelling would be gone.
     fn convert_to_string(
         value: &Value,
         _param_name: &str,
@@ -285,43 +294,43 @@ impl ValueConverter {
 
         match value {
             Value::String(s) => {
-                results.push(IndexValue::string(s.to_lowercase()));
+                results.push(IndexValue::string(s.as_str()));
             }
             Value::Object(obj) => {
                 // HumanName
                 if let Some(family) = obj.get("family").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(family.to_lowercase()));
+                    results.push(IndexValue::string(family));
                 }
                 if let Some(given) = obj.get("given").and_then(|v| v.as_array()) {
                     for g in given {
                         if let Some(s) = g.as_str() {
-                            results.push(IndexValue::string(s.to_lowercase()));
+                            results.push(IndexValue::string(s));
                         }
                     }
                 }
                 if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(text.to_lowercase()));
+                    results.push(IndexValue::string(text));
                 }
 
                 // Address
                 if let Some(line) = obj.get("line").and_then(|v| v.as_array()) {
                     for l in line {
                         if let Some(s) = l.as_str() {
-                            results.push(IndexValue::string(s.to_lowercase()));
+                            results.push(IndexValue::string(s));
                         }
                     }
                 }
                 if let Some(city) = obj.get("city").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(city.to_lowercase()));
+                    results.push(IndexValue::string(city));
                 }
                 if let Some(state) = obj.get("state").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(state.to_lowercase()));
+                    results.push(IndexValue::string(state));
                 }
                 if let Some(postal) = obj.get("postalCode").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(postal.to_lowercase()));
+                    results.push(IndexValue::string(postal));
                 }
                 if let Some(country) = obj.get("country").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::string(country.to_lowercase()));
+                    results.push(IndexValue::string(country));
                 }
             }
             _ => {}
@@ -636,7 +645,8 @@ mod tests {
         let value = json!("Smith");
         let results = ValueConverter::convert(&value, SearchParamType::String, "name").unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_string(), Some("smith")); // Lowercased
+        // Indexed as written: `:exact` needs the original spelling.
+        assert_eq!(results[0].as_string(), Some("Smith"));
     }
 
     #[test]

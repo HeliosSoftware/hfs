@@ -150,7 +150,14 @@ async fn test_string_search_exact() {
         .await
         .unwrap();
 
-    // Should only match exact "Smith", not "SMITH" or "Smithson"
+    // Should only match exact "Smith", not "SMITH" or "Smithson". Asserting the
+    // count as well keeps the loop below from passing vacuously on an empty
+    // result set — which is exactly how a broken `:exact` fails.
+    assert_eq!(
+        result.resources.len(),
+        2,
+        "the two 'Smith' patients must match :exact=Smith"
+    );
     for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"].as_str().unwrap();
         assert_eq!(family, "Smith", "Should only match exact 'Smith'");
