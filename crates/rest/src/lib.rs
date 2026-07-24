@@ -188,6 +188,8 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing::info;
+#[cfg(feature = "subscriptions")]
+use tracing::warn;
 
 /// Creates the Axum application with default configuration.
 ///
@@ -807,7 +809,9 @@ where
                 outbound_auth_provider,
             );
             info!("Subscriptions engine ENABLED");
-            state.with_subscription_engine(Arc::new(engine))
+            let engine = Arc::new(engine);
+            spawn_subscription_rehydration(Arc::clone(&engine), Arc::clone(&storage_arc), &config);
+            state.with_subscription_engine(engine)
         } else {
             state
         }
@@ -958,6 +962,97 @@ where
 
     // Apply remaining middleware
     router.layer(service_builder)
+}
+
+/// Spawns the startup rehydration of the subscription engine (issue #305).
+///
+/// The engine's registries are in-memory and were previously populated *only*
+/// by live write handlers, so every restart silently stopped delivery for
+/// already-stored subscriptions. This replays stored `SubscriptionTopic`,
+/// R4-backport `Basic`, and `Subscription` resources back into the engine.
+///
+/// Wired here, in `build_app`, rather than in `crates/hfs/src/main.rs` (as the
+/// issue suggested) because this is the single funnel every backend start path
+/// goes through — SQLite, PostgreSQL, MongoDB, S3, and each Elasticsearch
+/// composite — and it is the only place that holds both the engine and the
+/// storage handle. Wiring it in `main.rs` would need eight call sites and could
+/// not reach the engine, which is constructed and moved into `AppState` here.
+///
+/// It runs in the background rather than blocking startup: registration is
+/// fast, but activating `requested` subscriptions performs handshakes with
+/// retry and backoff against endpoints that may be unreachable, which could
+/// otherwise delay serving by minutes. The trade-off is a brief window after
+/// boot in which a just-restarted server has not yet re-registered every
+/// subscription; the completion summary is logged.
+#[cfg(feature = "subscriptions")]
+fn spawn_subscription_rehydration<S>(
+    engine: Arc<helios_subscriptions::SubscriptionEngine>,
+    storage: Arc<S>,
+    config: &ServerConfig,
+) where
+    S: ResourceStorage + helios_persistence::core::ExportDataProvider + Send + Sync + 'static,
+{
+    let rehydrate_config = build_rehydration_config_from_env();
+    if !rehydrate_config.enabled {
+        info!("Subscription rehydration is DISABLED (HFS_SUBSCRIPTION_REHYDRATE=false)");
+        return;
+    }
+
+    // `build_app` is synchronous and is also called from non-async contexts
+    // (embedders, doc examples). `tokio::spawn` panics outside a runtime, so
+    // degrade to a warning instead of taking the process down.
+    if tokio::runtime::Handle::try_current().is_err() {
+        warn!(
+            "No Tokio runtime available at app construction; skipping subscription \
+             rehydration. Stored subscriptions will not deliver until re-written."
+        );
+        return;
+    }
+
+    let default_tenant = config.default_tenant.clone();
+    let default_version = config.default_fhir_version;
+    tokio::spawn(async move {
+        engine
+            .rehydrate(
+                storage.as_ref(),
+                &default_tenant,
+                default_version,
+                &rehydrate_config,
+            )
+            .await;
+    });
+}
+
+/// Builds the rehydration tuning from `HFS_SUBSCRIPTION_REHYDRATE*`.
+#[cfg(feature = "subscriptions")]
+fn build_rehydration_config_from_env() -> helios_subscriptions::RehydrationConfig {
+    let defaults = helios_subscriptions::RehydrationConfig::default();
+    helios_subscriptions::RehydrationConfig {
+        enabled: subscription_bool_from_env("HFS_SUBSCRIPTION_REHYDRATE", defaults.enabled),
+        batch_size: subscription_u32_from_env(
+            "HFS_SUBSCRIPTION_REHYDRATE_BATCH_SIZE",
+            defaults.batch_size,
+        )
+        .max(1),
+        handshake_requested: subscription_bool_from_env(
+            "HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE",
+            defaults.handshake_requested,
+        ),
+        max_concurrent_handshakes: subscription_u32_from_env(
+            "HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE_CONCURRENCY",
+            defaults.max_concurrent_handshakes as u32,
+        )
+        .max(1) as usize,
+    }
+}
+
+/// Parses a boolean env var, treating `false`/`0` (case-insensitive) as false
+/// and any other set value as true. Mirrors `HFS_SUBSCRIPTIONS_ENABLED`.
+#[cfg(feature = "subscriptions")]
+fn subscription_bool_from_env(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
+        .unwrap_or(default)
 }
 
 #[cfg(feature = "subscriptions")]

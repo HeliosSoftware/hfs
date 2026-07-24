@@ -94,9 +94,17 @@ jobs:
       # preconditions would turn every concurrent settings write into a lost
       # update, and nothing else in CI would notice.
       #
-      # Same package and feature set as the step above, so the build is already
-      # cached and this costs only the MinIO container. The harness stamps
-      # `github.run_id`, so `cleanup-test-containers` reaps it.
+      # This MUST use the same `--workspace --all-features` selection as the step
+      # above so the build is already cached and this costs only the MinIO
+      # container. It previously ran `-p helios-persistence --all-features`, and
+      # `--all-features` only activates features of the *selected* packages: with
+      # only `helios-persistence` selected, `helios-fhir` picked up `R6` (via
+      # `R6 = ["helios-fhir/R6", ...]`) but not `skip-r6-download`, which nothing
+      # forwards. That is a different feature set from the step above, so it
+      # recompiled `helios-fhir` and everything downstream *and* re-ran the
+      # helios-fhir build script's R6 example download from build.fhir.org.
+      # `--test minio_s3_tests` still narrows the run to the one target.
+      # The harness stamps `github.run_id`, so `cleanup-test-containers` reaps it.
       #
       # This step must not be able to pass vacuously. `cargo test` exits 0 when a
       # name filter matches nothing ("0 passed; N filtered out"), and the suite
@@ -130,7 +138,7 @@ jobs:
           EXPECTED_MINIO_SETTINGS_TESTS: "5"
         run: |
           set -o pipefail
-          cargo test -p helios-persistence --all-features \
+          cargo test --workspace --all-features \
             --test minio_s3_tests test_minio_settings -- --nocapture \
             | tee minio-settings.log
           if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then
@@ -145,7 +153,7 @@ jobs:
         timeout-minutes: 15
         env:
           RUN_MINIO_S3_TESTS: "1"
-          EXPECTED_MINIO_SETTINGS_TESTS: "4"
+          EXPECTED_MINIO_SETTINGS_TESTS: "5"
           # The single self-hosted Windows runner is a virtualized guest whose
           # CPU does not advertise SSE4.1 + PCLMULQDQ. The AWS S3 SDK's default
           # integrity protection computes a CRC32 on every upload via the
@@ -169,7 +177,7 @@ jobs:
         # plain `shell: bash` alias is unreliable on this self-hosted runner.
         run: |
           set -o pipefail
-          cargo test -p helios-persistence --all-features \
+          cargo test --workspace --all-features \
             --test minio_s3_tests test_minio_settings -- --nocapture \
             | tee minio-settings.log
           if ! grep -qE "test result: ok\. ${EXPECTED_MINIO_SETTINGS_TESTS} passed" minio-settings.log; then

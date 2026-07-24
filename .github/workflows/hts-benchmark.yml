@@ -85,6 +85,27 @@ on:
         description: "Repeats per arm (interleaved; deltas paired & medianed across them)"
         required: false
         default: "1"
+      # ── Version arm (issue #298) ─────────────────────────────────────────
+      # Every arm above is an env-var switch on ONE binary, so it can only
+      # price instrumentation. To price *code* — how much of the regression
+      # since v0.2.0 the current branch has actually recovered — set this to a
+      # git ref and add `baseline` to obs_arms. A second binary is built from
+      # that ref and run as the `baseline` arm, interleaved and paired like any
+      # other, e.g.:
+      #   obs_arms="baseline off default"  baseline_ref=v0.2.0  rounds=3
+      # Then baseline→default is what the branch costs vs the old release, and
+      # off→default is what observability costs today — the two numbers #298
+      # needs kept apart.
+      #
+      # sqlite only: arms must be rolled back to a pristine database between
+      # binary versions (see .github/scripts/obs-ab/run-arms.sh), which is a
+      # file copy for sqlite and a full re-clone for postgres. A postgres leg
+      # with baseline_ref set fails fast rather than reporting cross-migrated
+      # numbers.
+      baseline_ref:
+        description: "Git ref for the `baseline` version arm (e.g. v0.2.0). Blank = no version arm. sqlite only."
+        required: false
+        default: ""
       tx_benchmark_ref:
         description: "tx-benchmark git ref (blank = our fork's default branch; set to pin a specific baseline)"
         required: false
@@ -119,6 +140,16 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
+      # A version arm needs the database rolled back between binary versions
+      # (run-arms.sh). For sqlite that is a file copy; for postgres it would be
+      # a full re-clone of a multi-GB database, which is not implemented. Fail
+      # here rather than after the ~hour of import that precedes the arm loop.
+      - name: Reject unsupported baseline_ref / backend combination
+        if: inputs.baseline_ref != '' && (inputs.backend == 'all' || inputs.backend == 'postgres')
+        run: |
+          echo "::error::baseline_ref is supported on the sqlite backend only (got backend='${{ inputs.backend }}'). Re-dispatch with backend=sqlite."
+          exit 1
+
       - name: Resolve matrix from backend input
         id: matrix
         run: |
@@ -180,6 +211,42 @@ jobs:
           path: target/debug/hts
           retention-days: 1
 
+      # ── Version arm: a second binary from an older ref (issue #298) ────────
+      # Checked out into its own directory with its own target dir. Sharing
+      # either with the main build would be self-defeating: two source trees in
+      # one target dir make cargo rebuild the world on every alternation, and
+      # the artifact paths would collide.
+      - name: Checkout baseline ref
+        if: inputs.baseline_ref != ''
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.baseline_ref }}
+          path: baseline-src
+          clean: false
+
+      - name: Build baseline binary (${{ inputs.baseline_ref }})
+        if: inputs.baseline_ref != ''
+        working-directory: baseline-src
+        run: |
+          set -euo pipefail
+          echo "Building baseline from ref: ${{ inputs.baseline_ref }} ($(git rev-parse --short HEAD))"
+          # Same feature selection as the current-binary build above, so the two
+          # arms differ by source revision and nothing else.
+          if [ "${{ matrix.backend }}" = "postgres" ]; then
+            cargo build -p helios-hts --target-dir "$GITHUB_WORKSPACE/baseline-target" \
+              --no-default-features --features "postgres,R4"
+          else
+            cargo build -p helios-hts --target-dir "$GITHUB_WORKSPACE/baseline-target"
+          fi
+
+      - name: Upload baseline binary
+        if: inputs.baseline_ref != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: hts-bench-baseline-${{ matrix.backend }}-${{ github.run_id }}
+          path: baseline-target/debug/hts
+          retention-days: 1
+
   # ────────────────────────────────────────────────────────────────────────────
   # Run preflight + benchmark per backend.
   # ────────────────────────────────────────────────────────────────────────────
@@ -223,6 +290,17 @@ jobs:
 
       - name: Make binary executable
         run: chmod +x ./hts
+
+      - name: Download baseline HTS binary
+        if: inputs.baseline_ref != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: hts-bench-baseline-${{ matrix.backend }}-${{ github.run_id }}
+          path: baseline-bin
+
+      - name: Make baseline binary executable
+        if: inputs.baseline_ref != ''
+        run: chmod +x ./baseline-bin/hts
 
       # ── Postgres: remote Docker host discovery ───────────────────────────
       # The container binds to `-p 0:5432` so the remote Docker daemon picks
@@ -406,9 +484,42 @@ jobs:
           echo "Importing licensed terminology (directory auto-detects SNOMED RF2 / LOINC / RxNorm)..."
           ./hts import "$LICENSED_DIR" --batch-size 500
 
+      # ── Pristine DB snapshot (version arm only) ──────────────────────────
+      # With a version arm in the ladder the database can no longer simply be
+      # shared: the two binaries run different startup migration sets against
+      # it (HEAD adds authority_rank and concepts_search_fts), so whichever arm
+      # ran first would leave the next one measuring a mutated database. Take
+      # one pristine copy here; run-arms.sh restores it before every arm.
+      - name: Snapshot pristine database
+        if: inputs.baseline_ref != ''
+        run: |
+          set -euo pipefail
+          DB="$HTS_DATABASE_URL"
+          if [ ! -f "$DB" ]; then
+            echo "::error::Expected sqlite database at $DB after import"
+            exit 1
+          fi
+          # The importer has exited, so sqlite should already have checkpointed
+          # and removed the WAL. If one survived (unclean exit), fold it in —
+          # copying the .db alone would silently drop its most recent writes.
+          if [ -f "$DB-wal" ]; then
+            echo "WAL present after import; checkpointing before snapshot"
+            sqlite3 "$DB" "PRAGMA wal_checkpoint(TRUNCATE);" || {
+              echo "::error::Could not checkpoint $DB-wal; snapshot would be incomplete"
+              exit 1
+            }
+          fi
+          cp "$DB" "$DB.pristine"
+          echo "DB_SNAPSHOT=$DB.pristine" >> "$GITHUB_ENV"
+          echo "Snapshot: $(du -h "$DB.pristine" | cut -f1) at $DB.pristine"
+          # The snapshot doubles this leg's database footprint, and disk
+          # exhaustion on the shared runner is a recurring failure here.
+          df -h "$(dirname "$DB")" | tail -1
+
       # ── Tools (k6) ───────────────────────────────────────────────────────
       # The server is started, restarted per arm, and stopped by the arm-loop
-      # script below — not here — so one warmed database is shared across arms.
+      # script below — not here — so one warmed database is shared across arms
+      # (or restored from the snapshot above, when a version arm is present).
 
       - name: Install k6
         uses: grafana/setup-k6-action@v1
@@ -474,6 +585,10 @@ jobs:
         working-directory: tx-benchmark
         env:
           HTS_BIN: ${{ github.workspace }}/hts
+          # Empty unless a version arm was requested; run-arms.sh refuses to run
+          # a `baseline` arm without it rather than silently reusing HTS_BIN.
+          # DB_SNAPSHOT reaches the script via $GITHUB_ENV (snapshot step above).
+          BASELINE_BIN: ${{ inputs.baseline_ref != '' && format('{0}/baseline-bin/hts', github.workspace) || '' }}
           PORT: ${{ matrix.port }}
           BACKEND: ${{ matrix.backend }}
           RUN_ID: ${{ github.run_id }}
@@ -519,6 +634,7 @@ jobs:
             --rounds "${{ inputs.rounds || '1' }}" \
             --backend "${{ matrix.backend }}" \
             --commit "${{ github.sha }}" \
+            --baseline-ref "${{ inputs.baseline_ref }}" \
             --csv-out "results/${{ github.run_id }}/obs-ab-${{ matrix.backend }}.csv" \
             >> "$GITHUB_STEP_SUMMARY"
 
@@ -550,6 +666,12 @@ jobs:
       - name: Stop any leftover HTS server
         if: always()
         run: fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+
+      # The snapshot is a full second copy of a multi-GB database; leaving it on
+      # a shared self-hosted runner is how the next run hits "no space left".
+      - name: Remove pristine DB snapshot
+        if: always() && inputs.baseline_ref != ''
+        run: rm -f "${DB_SNAPSHOT:-}" || true
 
       - name: Stop ephemeral Postgres
         if: always() && matrix.backend == 'postgres'

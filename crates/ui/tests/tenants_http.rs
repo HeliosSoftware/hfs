@@ -33,6 +33,7 @@ fn app(store: &Arc<dyn ResourceStorage>) -> Router {
         None,
         helios_ui::NlSearch::default(),
         Some(Arc::clone(store)),
+        None,
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
     )
@@ -169,6 +170,7 @@ async fn page_reports_registry_unavailable_without_a_store() {
         None,
         helios_ui::NlSearch::default(),
         None,
+        None,
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
     )
@@ -229,4 +231,61 @@ async fn storage_failure_renders_the_error_banner_not_a_silent_empty_table() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = body_text(res).await;
     assert!(body.contains("form-error"), "delete fragment: {body}");
+}
+
+#[tokio::test]
+async fn version_choice_persists_to_user_settings_and_redirects_back() {
+    use helios_persistence::core::SettingsStore;
+
+    let backend = Arc::new({
+        let b = SqliteBackend::in_memory().expect("in-memory sqlite");
+        b.init_schema().expect("init schema");
+        b
+    });
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        None,
+        Some(backend.clone() as Arc<dyn SettingsStore>),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        FhirVersion::R4,
+    );
+
+    // Selecting a version persists it and bounces back to the referring page.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/version")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::REFERER, "http://localhost/ui/search-parameters")
+                .body(Body::from("version=R4"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        res.headers().get(header::LOCATION).unwrap(),
+        "/ui/search-parameters"
+    );
+    let stored = backend
+        .get_settings("l2:")
+        .await
+        .expect("settings read")
+        .expect("document stored");
+    assert_eq!(stored.document["fhirVersion"], "R4");
+
+    // A version this build does not carry is rejected, not stored.
+    let res = app
+        .oneshot(
+            Request::post("/ui/version")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("version=R9"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
