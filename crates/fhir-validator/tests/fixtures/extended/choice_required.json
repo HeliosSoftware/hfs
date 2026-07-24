@@ -1,0 +1,33 @@
+{
+  "desc": "required satisfied by any declared choice branch — Helios extended (converter maps min>=1 on foo[x] to required:[foo])",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "boolean": { "kind": "primitive-type" },
+    "Observation": {
+      "required": ["value"],
+      "elements": {
+        "resourceType": { "type": "string" },
+        "value": { "choices": ["valueString", "valueBoolean"] },
+        "valueString": { "choiceOf": "value", "type": "string" },
+        "valueBoolean": { "choiceOf": "value", "type": "boolean" }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "branch presence satisfies the group requirement",
+      "data": { "resourceType": "Observation", "valueString": "ok" }
+    },
+    {
+      "desc": "other branch also satisfies",
+      "data": { "resourceType": "Observation", "valueBoolean": true }
+    },
+    {
+      "desc": "missing entirely",
+      "data": { "resourceType": "Observation" },
+      "errors": [
+        { "type": "required", "path": "Observation.value", "message": "value is required" }
+      ]
+    }
+  ]
+}

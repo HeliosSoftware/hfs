@@ -767,6 +767,77 @@ impl ResourceStorage for S3Backend {
         Ok(count)
     }
 
+    async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+        // Feeds tenant discovery on the maintenance page (#330): tenants whose
+        // data outlives their registration must stay visible and purgeable.
+        //
+        // LIST-only by design — one delimiter LIST enumerates the tenant
+        // prefixes, then paginated LISTs count each tenant's current-pointer
+        // objects. No per-object GETs (see #326), which means delete tombstones
+        // are counted too: a tombstone is still an object in the bucket, and
+        // "this tenant still has purgeable data" is exactly what this count
+        // exists to say.
+        //
+        // `BucketPerTenant` stays unsupported (empty result), matching the
+        // tenant-registry carve-out for that mode: tenants live in a static
+        // bucket map there, so there is no bucket to discover strays in.
+        let super::config::S3TenancyMode::PrefixPerTenant { bucket } = &self.config.tenancy_mode
+        else {
+            return Ok(Vec::new());
+        };
+
+        let root = match self.global_prefix() {
+            Some(prefix) => format!("{}/", prefix),
+            None => String::new(),
+        };
+
+        let tenant_prefixes = self
+            .client
+            .list_common_prefixes(bucket, &root, "/")
+            .await
+            .map_err(|e| self.map_client_error(e))?;
+
+        let mut out = Vec::new();
+        for tenant_prefix in tenant_prefixes {
+            let segment = tenant_prefix
+                .strip_prefix(&root)
+                .unwrap_or(&tenant_prefix)
+                .trim_end_matches('/');
+            if segment.is_empty() {
+                continue;
+            }
+
+            // Only the resources namespace: non-tenant top-level groups (the
+            // tenant registry, user settings, bulk-submit state) have no
+            // `resources/` subtree and naturally count zero.
+            let resources_prefix = format!("{}resources/", tenant_prefix);
+            let mut count = 0u64;
+            let mut continuation: Option<String> = None;
+            loop {
+                let page = self
+                    .client
+                    .list_objects(bucket, &resources_prefix, continuation.as_deref(), None)
+                    .await
+                    .map_err(|e| self.map_client_error(e))?;
+                count += page
+                    .items
+                    .iter()
+                    .filter(|item| item.key.ends_with("/current.json"))
+                    .count() as u64;
+                match page.next_continuation_token {
+                    Some(token) => continuation = Some(token),
+                    None => break,
+                }
+            }
+
+            if count > 0 {
+                out.push((segment.to_string(), count));
+            }
+        }
+
+        Ok(out)
+    }
+
     // ---- Tenant registry ----------------------------------------------------
     //
     // One JSON object per registered tenant at `[prefix/]tenants/<id>.json`,

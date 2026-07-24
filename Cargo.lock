@@ -3248,6 +3248,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-fhir-validator"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "clap",
+ "flate2",
+ "helios-fhir",
+ "helios-fhirpath",
+ "indexmap 2.14.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "helios-fhirpath"
 version = "0.2.1"
 dependencies = [
@@ -3457,6 +3473,7 @@ dependencies = [
  "helios-audit",
  "helios-auth",
  "helios-fhir",
+ "helios-fhir-validator",
  "helios-observability",
  "helios-persistence",
  "helios-serde",
@@ -3565,6 +3582,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "futures",
  "helios-auth",
  "helios-fhir",
  "helios-persistence",
@@ -3594,6 +3612,7 @@ dependencies = [
  "fluent-templates",
  "helios-auth",
  "helios-fhir",
+ "helios-fhir-validator",
  "helios-observability",
  "helios-persistence",
  "http-body-util",
@@ -3605,6 +3624,7 @@ dependencies = [
  "similar",
  "tokio",
  "tower",
+ "tracing",
  "unic-langid",
 ]
 

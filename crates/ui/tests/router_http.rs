@@ -34,6 +34,8 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
         Some(std::path::PathBuf::from("../../data")),
         nl,
         None,
+        None,
+        "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
             std::path::Path::new("../../data"),
         )),
@@ -146,6 +148,8 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         Some(std::path::PathBuf::from("../../data")),
         nl(true, true),
         None,
+        None,
+        "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
     )
@@ -351,6 +355,24 @@ async fn nl_search_configured_renders_the_translator_over_an_editable_query() {
     assert!(html.contains(r#"href="/ui/search""#));
 }
 
+/* The resource editor (#264). The endpoint takes the whole in-flight document
+ * plus one mutation and hands back the re-rendered body — so these drive it the
+ * way the browser does. */
+
+async fn edit(form: &str) -> String {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/editor/render")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_text(response).await
+}
+
 /* History & Versions (#236). The diff is computed server-side; these post two
  * versions the way the browser does after fetching them from _history. */
 
@@ -382,6 +404,139 @@ async fn diff(form: &str) -> String {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     body_text(response).await
+}
+
+#[tokio::test]
+async fn editor_page_renders_the_shell() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Brett's three panels on one screen: JSON, guided form, version rail.
+    assert!(html.contains(r#"id="editor-body""#));
+    assert!(html.contains(r#"id="editor-versions""#));
+    // The resource is fetched by the browser from the FHIR API; the UI crate
+    // never touches storage.
+    assert!(html.contains(r#"data-type="Patient""#));
+}
+
+#[tokio::test]
+async fn editor_offers_what_the_schema_allows_and_hides_what_is_spent() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%2C%22gender%22%3A%22male%22%7D&op=").await;
+
+    // Elements the schema allows, offered by name.
+    assert!(html.contains(r#"data-name="birthDate""#));
+    assert!(html.contains(r#"data-name="identifier""#));
+    // gender is set and does not repeat: not offered again.
+    assert!(!html.contains(r#"data-name="gender""#));
+    // A value[x] is a type pick, and its concrete arms are never fields.
+    assert!(html.contains(r#"data-declarer="deceased""#));
+    assert!(!html.contains(r#"data-name="deceasedBoolean""#));
+}
+
+/// The JSON view sits beside the guided form (Brett's layout), line-numbered
+/// and foldable — a textarea cannot do either.
+#[tokio::test]
+async fn editor_renders_a_foldable_line_numbered_json_view() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22Duck%22%7D%5D%7D&op=")
+            .await;
+
+    // JSON and the guided form are both present — side by side, not toggled.
+    assert!(html.contains("json-view"));
+    assert!(html.contains("editor-tree"));
+    // Line numbers in the gutter.
+    assert!(html.contains("json-line__num"));
+    // A fold arrow on the object and on the name array.
+    assert!(html.contains("json-line--foldable"));
+    assert!(html.contains("data-fold="));
+    // Syntax highlighting: keys and strings are tokenised.
+    assert!(html.contains("jt--key"));
+    assert!(html.contains("jt--string"));
+}
+
+#[tokio::test]
+async fn editor_adds_a_node_and_hands_back_the_new_document() {
+    // Add a name to an empty Patient.
+    let html = edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=add&path=&name=name").await;
+
+    // The new node is rendered, and it can take an extension — the case that
+    // matters, and the one the surveyed editors cannot do.
+    assert!(html.contains(r#"data-path="name.0""#));
+    assert!(
+        html.contains(r#"data-path="name.0.extension""#) || html.contains(r#"data-add="name.0""#)
+    );
+}
+
+/// The differentiator: an extension, by URL, at an arbitrary node, on a
+/// resource that carries no profile at all.
+#[tokio::test]
+async fn editor_attaches_an_ad_hoc_extension_to_a_name() {
+    let doc = "%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22Duck%22%7D%5D%7D";
+    let html = edit(&format!(
+        "doc={doc}&op=extension&path=name.0&url=http%3A%2F%2Fexample.org%2Fmine"
+    ))
+    .await;
+
+    // It landed on the name, not on the resource root.
+    assert!(html.contains(r#"data-path="name.0.extension.0""#));
+    assert!(html.contains("http://example.org/mine"));
+    // And a fresh extension offers every value[x] arm.
+    assert!(html.contains(r#"data-declarer="value""#));
+}
+
+/// The data-loss bug every editor surveyed for #264 has: an extended primitive
+/// lives in two keys. Ours round-trips it, because the document is the state
+/// and we never project it through a form.
+#[tokio::test]
+async fn editor_never_loses_a_key_it_does_not_render() {
+    let doc = "%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%221934-06-09%22%2C%22_birthDate%22%3A%7B%22extension%22%3A%5B%7B%22url%22%3A%22http%3A%2F%2Fexample.org%2Fprecision%22%2C%22valueCode%22%3A%22day%22%7D%5D%7D%7D";
+    let html = edit(&format!("doc={doc}&op=add&path=&name=gender")).await;
+
+    // The `_birthDate` sibling survived a structural mutation.
+    assert!(html.contains("_birthDate"));
+    assert!(html.contains("http://example.org/precision"));
+}
+
+/// Structural validation runs on every mutation and the issue lands on the row
+/// that owns it — the anchoring other editors have to reconstruct by fuzzy
+/// string matching, and that we get by construction.
+///
+/// Note what this does *not* cover: a bad *code* (`gender: "masculino"`) is a
+/// terminology binding, and bindings are deferred to the async effects pass
+/// (design doc §6). The live loop is the cheap structural pass; terminology is
+/// checked on save.
+#[tokio::test]
+async fn editor_validates_on_every_mutation_and_anchors_the_issue() {
+    // An element the schema does not have: caught by the structural pass.
+    let doc = "%7B%22resourceType%22%3A%22Patient%22%2C%22notAnElement%22%3A%22x%22%7D";
+    let html = edit(&format!("doc={doc}&op=")).await;
+
+    assert!(
+        html.contains("editor-row--error"),
+        "the row knows it is wrong"
+    );
+    assert!(html.contains("editor-row__error"), "and says why, in place");
+    // It is still rendered, and still in the document: we surface what we
+    // cannot model, we do not delete it.
+    assert!(html.contains(r#"data-path="notAnElement""#));
+}
+
+#[tokio::test]
+async fn editor_keeps_the_users_text_when_the_json_is_broken() {
+    let html = edit("doc=%7B%22resourceType%22%3A&op=").await;
+
+    assert!(html.contains("editor__parse-error"));
+    // Their text is handed straight back, not discarded.
+    assert!(html.contains("resourceType"));
 }
 
 #[tokio::test]
@@ -433,4 +588,21 @@ async fn identical_versions_say_so() {
 async fn unparseable_versions_report_an_error_not_an_empty_diff() {
     let html = diff("from=%7Bnope&to=%7B%7D").await;
     assert!(html.contains("history__banner--error"));
+}
+
+#[tokio::test]
+async fn version_selector_lists_the_enabled_versions() {
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+
+    // A real disclosure, not the old static chip: one POST form per compiled-in
+    // version, with the effective version marked current.
+    assert!(html.contains(r#"action="/ui/version""#));
+    assert!(html.contains(r#"name="version" value="R4""#));
+    assert!(html.contains(r#"aria-current="true""#));
+    // The default label is server-derived, not hardcoded markup.
+    assert!(html.contains("FHIR R4"));
 }

@@ -27,6 +27,7 @@ pub mod evaluator;
 pub mod event;
 pub mod manager;
 pub mod notification;
+pub mod rehydrate;
 pub mod topics;
 
 // Re-export key types for convenience.
@@ -37,3 +38,4 @@ pub use config::{MessagingSettings, SubscriptionConfig};
 pub use engine::SubscriptionEngine;
 pub use error::SubscriptionError;
 pub use event::{ResourceEvent, ResourceEventType};
+pub use rehydrate::{RehydrationConfig, RehydrationReport};

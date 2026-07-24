@@ -146,6 +146,17 @@ pub trait S3Api: Send + Sync {
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError>;
 
+    /// Lists the distinct key groups directly under `prefix` (S3
+    /// `CommonPrefixes` with `delimiter`), following continuation tokens to
+    /// exhaustion. Each returned string is the full common prefix — `prefix`,
+    /// then one segment, then `delimiter`.
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError>;
+
     /// Generates a pre-signed `GET` URL for `key`, valid for `ttl`.
     ///
     /// The default implementation reports the capability as unsupported;
@@ -461,6 +472,42 @@ impl S3Api for AwsS3Client {
             items,
             next_continuation_token: out.next_continuation_token().map(|s| s.to_string()),
         })
+    }
+
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError> {
+        let mut prefixes = Vec::new();
+        let mut continuation: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .delimiter(delimiter);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+
+            let out = req.send().await.map_err(map_sdk_error)?;
+            for common in out.common_prefixes() {
+                if let Some(p) = common.prefix() {
+                    prefixes.push(p.to_string());
+                }
+            }
+
+            match out.next_continuation_token() {
+                Some(token) => continuation = Some(token.to_string()),
+                None => break,
+            }
+        }
+
+        Ok(prefixes)
     }
 
     async fn presign_get(

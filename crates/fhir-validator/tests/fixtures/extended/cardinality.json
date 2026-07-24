@@ -1,0 +1,40 @@
+{
+  "desc": "numeric array cardinality — Helios extended",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Patient": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "name": {
+          "array": true,
+          "min": 2,
+          "max": 3,
+          "elements": { "text": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "within bounds",
+      "data": { "resourceType": "Patient", "name": [{ "text": "a" }, { "text": "b" }] }
+    },
+    {
+      "desc": "below min",
+      "data": { "resourceType": "Patient", "name": [{ "text": "a" }] },
+      "errors": [
+        { "type": "min", "path": "Patient.name", "message": "expected 2 > 1" }
+      ]
+    },
+    {
+      "desc": "above max",
+      "data": {
+        "resourceType": "Patient",
+        "name": [{ "text": "a" }, { "text": "b" }, { "text": "c" }, { "text": "d" }]
+      },
+      "errors": [
+        { "type": "max", "path": "Patient.name", "message": "expected 3 < 4" }
+      ]
+    }
+  ]
+}

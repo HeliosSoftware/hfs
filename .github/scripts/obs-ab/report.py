@@ -55,7 +55,14 @@ ERR_VOID = 0.01
 
 # What each adjacency attributes, given the arm switch semantics. Keyed by
 # (from_arm, to_arm). Anything not listed is labelled "bundled".
+#
+# `baseline` is not an instrumentation switch — it is a different binary, built
+# from the workflow's `baseline_ref`. Any adjacency touching it prices ALL code
+# change across that revision range, so it must never be read as the cost of
+# whatever component the neighbouring arm names.
 ADJACENCY_MEANING = {
+    ("baseline", "off"): "all code change since baseline_ref, instrumentation excluded",
+    ("baseline", "default"): "all code change since baseline_ref, instrumentation included",
     ("off", "default"): "metrics (clean isolate)",
     ("default", "no-span"): "reqlog (span still off in bench)",
     ("no-span", "full"): "span",
@@ -186,6 +193,11 @@ def main() -> int:
     ap.add_argument("--commit", default="")
     ap.add_argument("--build", default="debug (opt-level 0)")
     ap.add_argument("--csv-out", default="")
+    ap.add_argument(
+        "--baseline-ref",
+        default="",
+        help="git ref the `baseline` version arm was built from, if present",
+    )
     args = ap.parse_args()
 
     arms = [a for a in args.arms.replace(",", " ").split() if a]
@@ -201,6 +213,11 @@ def main() -> int:
     out.append(f"| **Arms** | `{' → '.join(arms)}` |")
     out.append(f"| **Rounds** | {args.rounds} (interleaved; deltas paired within a round) |")
     out.append(f"| **Build** | **{args.build} — ratios/direction only, NOT release magnitude** |")
+    if "baseline" in arms:
+        out.append(
+            f"| **Baseline arm** | separate binary built from "
+            f"`{args.baseline_ref or '(ref not recorded)'}` |"
+        )
     out.append("")
     out.append(
         "> In the benchmark `default` = metrics-only (no OTLP exporter → span off; "
@@ -208,6 +225,18 @@ def main() -> int:
         "component (metrics); later hops bundle span/reqlog/probe-logs. Primary "
         "metric below is **VU=1 p50** (purest per-request cost); RPS is the headline."
     )
+    if "baseline" in arms:
+        out.append("")
+        out.append(
+            "> **Reading the `baseline` arm.** It is a different *binary*, not a "
+            "different switch, so any delta against it prices every code change in "
+            "the range — not one component. The database is imported once by the "
+            "CURRENT binary and restored pristine before each arm, so the corpus is "
+            "held identical: this measures old serving code over new data, and is "
+            "**not** a reproduction of that release. Deltas against `off` and "
+            "`default` bracket the same range with instrumentation excluded and "
+            "included respectively."
+        )
     out.append("")
 
     if not data:
