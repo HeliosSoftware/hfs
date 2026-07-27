@@ -17,7 +17,11 @@ env:
 jobs:
   test-rust:
     name: Test Rust
-    runs-on: [self-hosted]
+    # TEMPORARY (Windows repro experiment): normally `[self-hosted]`, which
+    # lands on whichever agent is free. Pinned to the Windows agent so the
+    # S3+ES suite (un-skipped unconditionally below) is guaranteed to run
+    # there. Revert to `[self-hosted]` once the failure is captured.
+    runs-on: [self-hosted, Windows]
     # Bound the whole job so a genuine hang fails fast instead of parking a
     # runner for hours. A healthy run (full all-features build + tests) fits
     # comfortably under this.
@@ -85,13 +89,15 @@ jobs:
         env:
           # Un-skips the S3+ES composite suite (s3_es_tests.rs), which had
           # never run in CI — nothing set this variable, so every run passed it
-          # vacuously (#390). Linux-only for now: the suite drives the AWS S3
-          # SDK, whose default checksum path (crc-fast) panics on the Windows
-          # agent's CPU (no SSE4.1/PCLMULQDQ — see the Windows MinIO step's
-          # AWS_REQUEST_CHECKSUM_CALCULATION workaround), and the ES container
-          # is unproven on that agent. On non-Linux landings the suite still
-          # skips silently; loud-failure hardening is #390 PR B.
-          RUN_MINIO_S3_ES_TESTS: ${{ runner.os == 'Linux' && '1' || '' }}
+          # vacuously (#390).
+          #
+          # TEMPORARY (Windows repro experiment): this was
+          # `${{ runner.os == 'Linux' && '1' || '' }}`, which left the suite
+          # skipping on the Windows agent. Set unconditionally, together with
+          # the Windows pin on `runs-on` above, so the suite actually executes
+          # there and we can capture the real failure signature instead of
+          # assuming it. Revert both once the output is captured.
+          RUN_MINIO_S3_ES_TESTS: "1"
         run: |
           cargo test --workspace --all-features
 
