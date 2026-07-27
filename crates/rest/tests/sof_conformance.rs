@@ -125,6 +125,35 @@ mod sof_conformance_tests {
         fixtures
     }
 
+    /// Lower bounds on the vendored SQL-on-FHIR v2 corpus (22 files / 144 cases
+    /// at time of writing). The `PASS_FLOOR` ratchet below counts *passes*, so it
+    /// is trivially satisfied by a corpus that shrank — 132 passes out of 132
+    /// remaining cases looks identical to 132 out of 144. These floors make a
+    /// silently emptied or half-checked-out fixture tree loud instead (issue #307).
+    const MIN_FIXTURE_FILES: usize = 22;
+    const MIN_TEST_CASES: usize = 144;
+
+    /// Asserts the corpus actually loaded before any pass-count ratchet is trusted.
+    fn assert_corpus_intact(fixtures: &[Fixture], backend: &str) {
+        let cases: usize = fixtures.iter().map(|f| f.tests.len()).sum();
+        assert!(
+            fixtures.len() >= MIN_FIXTURE_FILES,
+            "{backend}: only {} fixture file(s) loaded (expected at least {MIN_FIXTURE_FILES}). \
+             The conformance corpus has shrunk or failed to check out; a pass-count floor \
+             cannot detect that on its own.",
+            fixtures.len(),
+        );
+        assert!(
+            cases >= MIN_TEST_CASES,
+            "{backend}: only {cases} conformance case(s) loaded (expected at least \
+             {MIN_TEST_CASES}). Fixture files are present but nearly empty.",
+        );
+        eprintln!(
+            "SOF-CONFORMANCE-{backend}: files={} cases={cases}",
+            fixtures.len()
+        );
+    }
+
     // =========================================================================
     // Test infrastructure
     // =========================================================================
@@ -280,6 +309,7 @@ mod sof_conformance_tests {
     #[tokio::test]
     async fn test_sof_v2_conformance_in_db_sqlite() {
         let fixtures = load_fixtures();
+        assert_corpus_intact(&fixtures, "sqlite");
 
         let mut passed = 0usize;
         let mut failed = 0usize;

@@ -420,33 +420,53 @@ fn test_r4_test_suite() {
     // Parse the XML using common parser
     let doc = parse_test_xml(&contents).expect("Failed to parse test XML");
 
-    // Define test resource files that will be used
-    let resource_files = vec![
-        "patient-example.json",
-        "observation-example.json",
-        "questionnaire-example.json",
-        "valueset-example-expansion.json",
-    ];
-
-    // Verify that we can load all necessary JSON test files
-    println!("Checking test resources (loaded from JSON versions):");
     let loader = R4ResourceLoader;
-    for file in resource_files {
-        let json_file = file;
-        match loader.load_resource(file) {
-            Ok(_) => println!("  - {} → {} loaded successfully", file, json_file),
-            Err(e) => println!("  - {} → {} failed to load: {}", file, json_file, e),
-        }
-    }
 
     // Find all test groups
     let test_groups = find_test_groups(&doc.root_element());
     println!("Found {} test groups", test_groups.len());
 
-    let mut total_tests = 0;
-    let mut passed_tests = 0;
-    let mut skipped_tests = 0;
-    let mut failed_tests = 0; // Explicitly track failures
+    // Verify every input file the corpus actually references is present. This
+    // replaces a hardcoded list that was only printed, never asserted: a missing
+    // input silently skipped every test that needed it, and `patient-example.json`
+    // alone backs 653 of the 683 R4 tests (issue #307).
+    //
+    // Only presence is asserted; a file that exists but fails to deserialise is
+    // scored as a per-test failure below, which can be declared with a reason.
+    let mut referenced: Vec<&str> = test_groups
+        .iter()
+        .flat_map(|(_, tests)| tests.iter())
+        .map(|t| t.input_file.as_str())
+        .filter(|f| !f.is_empty())
+        .collect();
+    referenced.sort_unstable();
+    referenced.dedup();
+
+    let input_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/r4/input");
+    let missing: Vec<&str> = referenced
+        .iter()
+        .copied()
+        .filter(|f| !input_dir.join(f).is_file())
+        .collect();
+    println!(
+        "Checking R4 test resources: {} referenced by the corpus, {} missing",
+        referenced.len(),
+        missing.len()
+    );
+    assert!(
+        missing.is_empty(),
+        "R4: {} input resource(s) referenced by tests-fhir-r4.xml are missing from {}. \
+         Every test that needs one would be silently skipped:\n  {}",
+        missing.len(),
+        input_dir.display(),
+        missing.join("\n  "),
+    );
+
+    // Declared exclusions (issue #307).
+    let mut known = KnownFailures::parse("R4", include_str!("data/r4/rust-known-failures.json"));
+    println!("Declared exclusions: {}", known.len());
+
+    let mut tally = Tally::default();
 
     // For each test group
     for (group_name, tests) in test_groups {
@@ -454,18 +474,14 @@ fn test_r4_test_suite() {
 
         // For each test in the group
         for test in tests {
-            total_tests += 1;
-
-            // Skip tests with empty expressions
+            // Skip tests with empty expressions. This is the ONLY structural skip:
+            // there is nothing to evaluate. Every other former skip is now a
+            // declared exclusion (issue #307).
             if test.expression.is_empty() {
                 println!("  SKIP: {} - Empty expression", test.name);
-                skipped_tests += 1;
+                tally.record(Outcome::Skipped);
                 continue;
             }
-
-            // For now, we'll try to run tests that don't require resources
-            // These typically include literals, boolean logic, and other
-            // expressions that don't access FHIR resources
 
             // Create the appropriate context for this test
             let mut context = if test.input_file.is_empty() {
@@ -491,11 +507,30 @@ fn test_r4_test_suite() {
                         ctx
                     }
                     Err(e) => {
-                        println!(
-                            "  SKIP: {} - '{}' - Failed to load JSON resource for {}: {}",
-                            test.name, test.expression, test.input_file, e
-                        );
-                        skipped_tests += 1;
+                        // The file is known to exist (asserted above), so this is a
+                        // parse/model failure — a real defect, not a reason to stop
+                        // checking.
+                        let detail =
+                            format!("failed to load input resource {}: {}", test.input_file, e);
+                        match known.lookup(&group_name, &test.name, true) {
+                            Some(reason) => {
+                                println!("  KNOWN FAIL: {} - {}", test.name, reason);
+                                tally
+                                    .excluded
+                                    .push(format!("{}::{} — {}", group_name, test.name, reason));
+                                tally.record(Outcome::KnownFail);
+                            }
+                            None => {
+                                println!(
+                                    "  FAIL: {} - '{}' - {}",
+                                    test.name, test.expression, detail
+                                );
+                                tally
+                                    .failures
+                                    .push(format!("{}::{} — {}", group_name, test.name, detail));
+                                tally.record(Outcome::Fail);
+                            }
+                        }
                         continue;
                     }
                 }
@@ -510,53 +545,49 @@ fn test_r4_test_suite() {
                 setup_patient_extension_context(&mut context, &test.name);
             }
 
-            // Parse expected outputs from test def
+            // Parse expected outputs from test def. An output type the harness
+            // cannot parse is a harness gap, not a passing test — score it so it
+            // must be declared rather than silently dropped (issue #307).
             let mut expected_results: Vec<EvaluationResult> = Vec::new();
-            let mut skip_test = false;
+            let mut parse_error: Option<String> = None;
             for (output_type, output_value) in &test.outputs {
                 match parse_output_value(output_type, output_value, loader.get_fhir_version()) {
                     Ok(result) => expected_results.push(result),
                     Err(e) => {
-                        println!("  SKIP: {} - {}", test.name, e);
-                        skipped_tests += 1;
-                        skip_test = true;
+                        parse_error = Some(format!("could not parse expected output: {e}"));
                         break;
                     }
                 }
             }
-            if skip_test {
+            if parse_error.is_none() && expected_results.is_empty() && !test.outputs.is_empty() {
+                parse_error = Some("could not parse expected outputs".to_string());
+            }
+            if let Some(detail) = parse_error {
+                match known.lookup(&group_name, &test.name, true) {
+                    Some(reason) => {
+                        println!("  KNOWN FAIL: {} - {}", test.name, reason);
+                        tally
+                            .excluded
+                            .push(format!("{}::{} — {}", group_name, test.name, reason));
+                        tally.record(Outcome::KnownFail);
+                    }
+                    None => {
+                        println!("  FAIL: {} - '{}' - {}", test.name, test.expression, detail);
+                        tally
+                            .failures
+                            .push(format!("{}::{} — {}", group_name, test.name, detail));
+                        tally.record(Outcome::Fail);
+                    }
+                }
                 continue;
             }
 
-            // For tests with no expected outputs, they may be checking for empty result or just syntax
-            if expected_results.is_empty() && !test.outputs.is_empty() {
-                println!("  SKIP: {} - Could not parse expected outputs", test.name);
-                skipped_tests += 1;
-                continue;
-            }
-
-            // Skip specific UCUM quantity tests that we're not implementing yet
-            let quantity_tests_to_ignore = [
-                "testQuantity1",
-                "testQuantity2",
-                "testQuantity4",
-                "testQuantity5",
-                "testQuantity6",
-                "testQuantity7",
-                "testQuantity8",
-                "testQuantity9",
-                "testQuantity10",
-                "testQuantity11",
-            ];
-
-            if quantity_tests_to_ignore.contains(&test.name.as_str()) {
-                println!(
-                    "  SKIP (UCUM not implemented): {} - '{}'",
-                    test.name, test.expression
-                );
-                skipped_tests += 1;
-                continue;
-            }
+            // The `quantity_tests_to_ignore` array that used to sit here — ten UCUM
+            // and calendar-duration cases, declared nowhere — is gone. Moving it into
+            // data/r4/rust-known-failures.json (issue #307) put it under enforcement,
+            // which immediately proved every entry obsolete: UCUM conversion and
+            // calendar-duration comparison are implemented, and all eleven
+            // testQuantity tests pass. They are now scored like any other test.
 
             // Run the test
             let is_predicate_test = test.predicate == "true";
@@ -570,119 +601,85 @@ fn test_r4_test_suite() {
             // Determine if this test expects an error
             let expects_error = !test.invalid.is_empty();
 
-            if expects_error {
-                // This test is expected to produce an error
+            // Decide the verdict, then score it once through the exclusions file.
+            let verdict: Result<(), String> = if expects_error {
+                // The corpus says this expression must fail to evaluate.
                 match test_run_result {
-                    Ok(_) => {
-                        // Expected an error, but got Ok. This is a failure.
-                        if !test.invalid.is_empty() {
-                            println!(
-                                "  FAIL (expected error '{}'): {} - '{}' - Got Ok instead of error",
-                                test.invalid, test.name, test.expression
-                            );
-                        } else {
-                            println!(
-                                "  FAIL (expected error): {} - '{}' - Got Ok instead of error",
-                                test.name, test.expression
-                            );
-                        }
-                        failed_tests += 1;
-                    }
+                    Ok(_) => Err(format!(
+                        "expected error '{}' but evaluation succeeded",
+                        test.invalid
+                    )),
                     Err(e) => {
-                        // Expected an error and got an error. This is a pass for an invalid test.
-                        if !test.invalid.is_empty() {
-                            println!(
-                                "  PASS (invalid test): {} - '{}' - Correctly failed with: {}",
-                                test.name, test.expression, e
-                            );
-                        } else {
-                            println!(
-                                "  PASS (error expected): {} - '{}' - Correctly failed with: {}",
-                                test.name, test.expression, e
-                            );
-                        }
-                        passed_tests += 1;
+                        println!(
+                            "  PASS (invalid test): {} - '{}' - Correctly failed with: {}",
+                            test.name, test.expression, e
+                        );
+                        Ok(())
                     }
                 }
             } else if test.outputs.is_empty() {
-                // Special case: tests with no outputs should expect empty result
-                // We need to evaluate the expression directly since run_fhir_test doesn't return the result
+                // No <output> elements means "must evaluate to the empty
+                // collection", not "any error is acceptable" — the corpus marks
+                // expressions that must error with the `invalid` attribute, handled
+                // above. This arm used to score `Err` as a PASS, hiding evaluator
+                // errors across the 35 R4 tests in this class (issue #307).
                 match helios_fhirpath::evaluate_expression(&test.expression, &context) {
-                    Ok(result) => {
-                        // Check if the result is actually empty
-                        match &result {
-                            EvaluationResult::Empty => {
-                                println!("  PASS: {} - '{}'", test.name, test.expression);
-                                passed_tests += 1;
-                            }
-                            _ => {
-                                println!(
-                                    "  FAIL: {} - '{}' - Expected empty result, got: {:?}",
-                                    test.name, test.expression, result
-                                );
-                                failed_tests += 1;
-                            }
-                        }
+                    Ok(EvaluationResult::Empty) => {
+                        println!("  PASS: {} - '{}'", test.name, test.expression);
+                        Ok(())
                     }
-                    Err(e) => {
-                        // If it failed with an error and there are no outputs,
-                        // this is likely an expected error (like negative precision)
-                        println!(
-                            "  PASS (no output expected): {} - '{}' - Got error: {}",
-                            test.name, test.expression, e
-                        );
-                        passed_tests += 1;
-                    }
+                    Ok(result) => Err(format!("expected empty result, got: {result:?}")),
+                    Err(e) => Err(format!(
+                        "expected empty result, evaluation errored: {e}. \
+                         (The corpus marks expressions that must error with `invalid`; \
+                         this test is not one of them.)"
+                    )),
                 }
             } else {
-                // This test is expected to be valid with specific outputs
+                // Declared outputs: run_fhir_test already compared them.
                 match test_run_result {
                     Ok(_) => {
-                        // Test ran successfully, expected_results should have been compared by run_fhir_r4_test
-                        // If run_fhir_r4_test returned Ok, it means the outputs matched.
                         println!("  PASS: {} - '{}'", test.name, test.expression);
-                        passed_tests += 1;
+                        Ok(())
                     }
-                    Err(e) => {
-                        // Test was expected to be valid but failed.
-                        // Classify as FAIL or NOT IMPLEMENTED.
-                        if e.contains("Unsupported function called")
-                            || e.contains("Not yet implemented")
-                        {
-                            println!(
-                                "  NOT IMPLEMENTED: {} - '{}' - {}",
-                                test.name, test.expression, e
-                            );
-                            failed_tests += 1;
-                        } else {
-                            println!("  FAIL: {} - '{}' - {}", test.name, test.expression, e);
-                            failed_tests += 1;
-                        }
-                    }
+                    Err(e) => Err(e),
                 }
+            };
+
+            match verdict {
+                Ok(()) => {
+                    // Record the pass against the exclusions file too: an entry
+                    // naming a test that now passes is obsolete and must be deleted.
+                    let _ = known.lookup(&group_name, &test.name, false);
+                    tally.record(Outcome::Pass);
+                }
+                Err(detail) => match known.lookup(&group_name, &test.name, true) {
+                    Some(reason) => {
+                        println!(
+                            "  KNOWN FAIL: {} - '{}' - {} [declared: {}]",
+                            test.name, test.expression, detail, reason
+                        );
+                        tally
+                            .excluded
+                            .push(format!("{}::{} — {}", group_name, test.name, reason));
+                        tally.record(Outcome::KnownFail);
+                    }
+                    None => {
+                        println!("  FAIL: {} - '{}' - {}", test.name, test.expression, detail);
+                        tally
+                            .failures
+                            .push(format!("{}::{} — {}", group_name, test.name, detail));
+                        tally.record(Outcome::Fail);
+                    }
+                },
             }
         }
     }
 
-    println!("\nTest Summary:");
-    println!("  Total tests: {}", total_tests);
-    println!("  Passed: {}", passed_tests);
-    println!("  Skipped/Not Implemented: {}", skipped_tests);
-    println!("  Failed: {}", failed_tests);
+    tally.report("R4");
 
-    // Print detailed info about failures
-    if failed_tests > 0 {
-        println!("\nERROR: Some tests failed due to unimplemented features or bugs.");
-        println!("See the 'NOT IMPLEMENTED' tests above for details on what needs to be fixed.");
-    }
-
-    // We're now enforcing that tests must pass to ensure implementation is complete
-    assert_eq!(
-        failed_tests, 0,
-        "Some tests failed - {} unimplemented features need to be addressed",
-        failed_tests
-    );
-
-    // Make sure we found some tests
-    assert!(total_tests > 0, "No tests found");
+    // Floors sit just under the current corpus size (683 tests in 75 groups) so an
+    // upstream trim does not break the build, while a corpus that failed to load
+    // cannot produce a green run.
+    tally.assert_conformant(&known, 650, 550);
 }
