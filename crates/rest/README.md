@@ -216,7 +216,13 @@ them, and exposes results through a status manifest.
   backend — no separate job store to configure.
 - **Status manifest**: emits `output[]`, `outcome[]`, and `deleted[]` arrays (each
   entry carries `url`, `count`, and `fileSize`), plus `requiresAccessToken`,
-  `transactionTime`, and an always-present `link[]` (single, non-paginated).
+  `transactionTime`, and `link[]`.
+- **Status pagination**: entries are split across pages of
+  `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` (default `1000`); when more remain, `link[]`
+  carries one `{"relation": "next", "url": ".../bulk-submit-status/{token}?page=N"}`
+  entry and every other manifest field repeats identically on each page. Pages are
+  fetched from the same status URL with `?page=N` (1-based); an out-of-range page is
+  `404` and a malformed one `400`. Set the page size to `0` to disable pagination.
 
 Configured via `HFS_BULK_SUBMIT_*` environment variables:
 
@@ -230,6 +236,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact-URL lifetime, seconds. |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention after completion, seconds. |
 | `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll. |
+| `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max `output` + `outcome` + `deleted` entries per status-manifest page; further pages are chained by `link[]` `next`. `0` disables pagination. |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit-worker pool size. |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers. |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (kick-off returns `429` if exceeded). |

@@ -55,6 +55,7 @@ At least one of `submissionStatus` or `manifestUrl` must be populated.
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention in seconds |
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact URL lifetime in seconds |
+| `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max entries per status-manifest page; `0` disables pagination |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | none | OAuth client_id for fetching protected provider files |
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | none | PEM key for `private_key_jwt` client assertion |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | `ES384` or `RS384` |
@@ -74,5 +75,9 @@ Job state reuses the same backend as the FHIR resources. SQLite shares `./data/h
 - JWE decryption for `fileEncryptionKey` supports `dir` plus `A128GCM` or `A256GCM` compact JWE files when built with `bulk-submit-jwe`.
 - Build JWE support with `cargo build -p helios-hfs --features bulk-submit-jwe`.
 - Without the feature, or for other JWE algorithms, encrypted files record a `not-supported` manifest-level error while unencrypted manifests proceed.
-- Status `link` and pagination: HFS returns a single, non-paginated status manifest; the `link` array is always present and empty.
+- Status `link` and pagination: the status manifest is paginated at `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE`
+  entries (`output` + `outcome` + `deleted` combined). When more remain, `link` carries a single
+  `{relation: next, url: .../bulk-submit-status/{token}?page=N}` entry; every other manifest field repeats
+  identically on each page. Fetch pages from the status URL with `?page=N` (1-based) — out of range is `404`,
+  malformed is `400`. Page size `0` disables pagination and yields one manifest with an empty `link`.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
