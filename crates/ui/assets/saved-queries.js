@@ -1171,6 +1171,7 @@
     open: document.getElementById("query-results-open"),
     prev: document.getElementById("query-results-prev"),
     next: document.getElementById("query-results-next"),
+    sort: document.getElementById("query-results-sort"),
   };
 
   /* Compact display heuristics for common FHIR shapes (HumanName,
@@ -1198,6 +1199,17 @@
     var json = JSON.stringify(value);
     return json.length > 60 ? json.slice(0, 60) + "…" : json;
   }
+
+  /* Typed default columns (#416): common fields per resource type when the
+   * query names no _elements; unknown types keep the compact id/updated view. */
+  var DEFAULT_COLUMNS = {
+    Patient: ["name", "gender", "birthDate", "managingOrganization"],
+    Practitioner: ["name", "gender"],
+    Organization: ["name", "type"],
+    Observation: ["code", "status", "subject"],
+    Encounter: ["status", "class", "subject"],
+    Condition: ["code", "clinicalStatus", "subject"],
+  };
 
   function elementColumns(query) {
     var columns = [];
@@ -1273,6 +1285,7 @@
     results.meta.textContent = meta;
 
     var columns = elementColumns(parsed.query);
+    if (!columns.length) columns = DEFAULT_COLUMNS[parsed.type] || [];
     var headRow = document.createElement("tr");
     var th = document.createElement("th");
     th.textContent = "id";
@@ -1312,6 +1325,15 @@
     });
 
     if (!primary.length) results.note.textContent = card.dataset.msgEmpty;
+
+    if (results.sort) {
+      var sortValue = "";
+      splitQuery(parsed.query).forEach(function (part) {
+        if (part.key === "_sort") sortValue = part.value;
+      });
+      results.sort.value = sortValue;
+      if (results.sort.value !== sortValue) results.sort.value = "";
+    }
 
     var prevUrl = pagerLink(body, "previous");
     var nextUrl = pagerLink(body, "next");
@@ -1357,6 +1379,20 @@
     results.card.addEventListener("click", function (event) {
       var pager = event.target.closest("button[data-url]");
       if (pager) runSearch(pager.dataset.url, false);
+    });
+
+  /* Sort re-runs the current results path with the picked `_sort` (#416). */
+  results.sort &&
+    results.sort.addEventListener("change", function () {
+      var current = results.open && results.open.getAttribute("href");
+      if (!current) return;
+      var parsed = parseSearchUrl(current);
+      if (!parsed) return;
+      var parts = (parsed.query || "").split("&").filter(function (p) {
+        return p && p.indexOf("_sort=") !== 0;
+      });
+      if (results.sort.value) parts.push("_sort=" + results.sort.value);
+      runSearch(searchPath(parsed.type, parts.join("&")), false);
     });
 
   /* ---- Recent searches & the saved list -------------------------------- */
