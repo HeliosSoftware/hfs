@@ -362,6 +362,113 @@
     return input;
   }
 
+  /* Applicable colon modifiers per parameter type (#415); comparator
+   * prefixes only apply to the ordered families. Unknown or unregistered
+   * params keep the full lists. */
+  var MODS_BY_TYPE = {
+    string: ["exact", "contains", "missing"],
+    token: ["text", "not", "in", "not-in", "of-type", "missing"],
+    reference: ["identifier", "missing"],
+    uri: ["below", "above", "missing"],
+    date: ["missing"],
+    number: ["missing"],
+    quantity: ["missing"],
+    composite: ["missing"],
+    special: ["missing"],
+  };
+  var PREFIX_TYPES = ["date", "number", "quantity"];
+
+  function applicableMods(paramType) {
+    return MODS_BY_TYPE[paramType] || COLON_MODIFIERS;
+  }
+  function applicablePrefixes(paramType) {
+    if (!paramType) return PREFIXES;
+    return PREFIX_TYPES.indexOf(paramType) >= 0 ? PREFIXES : [];
+  }
+
+  /* Rebuilds a row's modifier select and MODIFY chips for its param type. */
+  function refreshModifierControls(row, paramType) {
+    var modifier = row.querySelector(".builder-row__modifier");
+    if (!modifier) return;
+    var selected = modifier.value;
+    var mods = applicableMods(paramType);
+    var prefixes = applicablePrefixes(paramType);
+    modifier.textContent = "";
+    option(modifier, "", sections.dataset.msgMatchIs, !selected);
+    mods.forEach(function (m) {
+      option(modifier, m, ":" + m, selected === m);
+    });
+    prefixes.forEach(function (p) {
+      option(modifier, p, p, selected === p);
+    });
+    /* A modifier from a pasted URL stays selectable even when the type
+     * would not offer it. */
+    if (selected && mods.indexOf(selected) < 0 && prefixes.indexOf(selected) < 0) {
+      option(modifier, selected, ":" + selected, true);
+    }
+    var panel = row.querySelector(".builder-row__modpanel");
+    if (panel) fillModPanel(panel, row, mods);
+  }
+
+  /* Best-effort param type for a row's modifier target, from the cached
+   * registry metadata. Empty string (unknown) keeps the full lists. */
+  function rowParamType(row) {
+    var base = sections.dataset.type || "";
+    var leafEl = row.querySelector(".builder-row__cparam");
+    if (row.classList.contains("builder-row--has")) {
+      var t = row.querySelector(".builder-row__htype").value.trim();
+      var leaf = leafEl.value.trim();
+      return (((PARAM_META[t] || {})[leaf] || {}).type) || "";
+    }
+    if (row.classList.contains("builder-row--chain")) {
+      var chainLeaf = leafEl.value.trim();
+      for (var cached in PARAM_META) {
+        var m = PARAM_META[cached][chainLeaf];
+        if (m) return m.type;
+      }
+      return "";
+    }
+    var key = row.querySelector(".builder-row__key");
+    if (!key) return "";
+    return (((PARAM_META[base] || {})[key.value.trim()] || {}).type) || "";
+  }
+
+  /* Re-gates a row's modifier controls when its param type changed. */
+  function regateModifiers(row) {
+    var t = rowParamType(row);
+    if (row.dataset.modType === t) return;
+    row.dataset.modType = t;
+    refreshModifierControls(row, t);
+  }
+
+  /* The MODIFY panel: each applicable modifier as a chip with its
+   * plain-language explanation; clicking one selects it in the row. */
+  function fillModPanel(panel, row, mods) {
+    panel.textContent = "";
+    var heading = document.createElement("span");
+    heading.className = "builder-row__modheading";
+    heading.textContent = sections.dataset.msgModifyHeading;
+    panel.appendChild(heading);
+    var current = row.querySelector(".builder-row__modifier").value;
+    mods.forEach(function (m) {
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "builder-row__modchip";
+      chip.dataset.modChip = m;
+      var code = document.createElement("strong");
+      code.textContent = ":" + m;
+      chip.appendChild(code);
+      var desc = document.createElement("span");
+      var msgKey = "msgMod" + m.replace(/(^|-)([a-z])/g, function (_, __, c) {
+        return c.toUpperCase();
+      });
+      desc.textContent = sections.dataset[msgKey] || "";
+      chip.appendChild(desc);
+      chip.setAttribute("aria-pressed", current === m ? "true" : "false");
+      panel.appendChild(chip);
+    });
+  }
+
   /* FHIR's OR is a comma list on one parameter (`name=Smith,Jones`): the
    * value column stacks one input per alternative, plus the `+ or` button. */
   function appendValues(row, rawValue) {
@@ -401,6 +508,15 @@
 
     appendValues(row, value);
 
+    var adv = document.createElement("button");
+    adv.type = "button";
+    adv.className = "builder-row__adv";
+    adv.dataset.toggleMods = "true";
+    adv.title = sections.dataset.msgModifyHeading;
+    adv.setAttribute("aria-expanded", "false");
+    adv.textContent = "⚙";
+    row.appendChild(adv);
+
     var remove = document.createElement("button");
     remove.type = "button";
     remove.className = "builder-row__remove";
@@ -408,6 +524,11 @@
     remove.setAttribute("aria-label", sections.dataset.msgRemove);
     remove.textContent = "×";
     row.appendChild(remove);
+
+    var panel = document.createElement("div");
+    panel.className = "builder-row__modpanel";
+    panel.hidden = true;
+    row.appendChild(panel);
   }
 
   /* Forward chain: one hop segment per reference —
@@ -656,6 +777,7 @@
         if (!key || !drill) return;
         var m = meta[key.value.trim()];
         drill.hidden = !(m && m.type === "reference");
+        regateModifiers(row);
       });
   }
 
@@ -725,6 +847,14 @@
 
     if (kind === "condition") {
       appendValues(row, value);
+      var adv = document.createElement("button");
+      adv.type = "button";
+      adv.className = "builder-row__adv";
+      adv.dataset.toggleMods = "true";
+      adv.title = sections.dataset.msgModifyHeading;
+      adv.setAttribute("aria-expanded", "false");
+      adv.textContent = "⚙";
+      row.appendChild(adv);
     } else {
       var valueInput = document.createElement("input");
       valueInput.className = "builder-row__value";
@@ -741,6 +871,13 @@
     remove.setAttribute("aria-label", sections.dataset.msgRemove);
     remove.textContent = "×";
     row.appendChild(remove);
+
+    if (kind === "condition") {
+      var panel = document.createElement("div");
+      panel.className = "builder-row__modpanel";
+      panel.hidden = true;
+      row.appendChild(panel);
+    }
 
     return row;
   }
@@ -851,13 +988,39 @@
         updateUrl();
         if (event.target.classList.contains("builder-row__key")) {
           refreshChainAffordances();
+          regateModifiers(event.target.closest(".builder-row"));
         }
       }
     });
     sections.addEventListener("click", function (event) {
       var remove = event.target.closest("[data-remove-row]");
       var drillFrom = event.target.closest("[data-chain-from]");
+      var toggleMods = event.target.closest("[data-toggle-mods]");
+      var modChip = event.target.closest("[data-mod-chip]");
       var addOr = event.target.closest("[data-add-or]");
+      if (toggleMods) {
+        var modRow = toggleMods.closest(".builder-row");
+        var modPanel = modRow.querySelector(".builder-row__modpanel");
+        regateModifiers(modRow);
+        if (modPanel.hidden) {
+          refreshModifierControls(modRow, modRow.dataset.modType || "");
+        }
+        modPanel.hidden = !modPanel.hidden;
+        toggleMods.setAttribute("aria-expanded", modPanel.hidden ? "false" : "true");
+        return;
+      }
+      if (modChip) {
+        var chipRow = modChip.closest(".builder-row");
+        var sel = chipRow.querySelector(".builder-row__modifier");
+        sel.value = sel.value === modChip.dataset.modChip ? "" : modChip.dataset.modChip;
+        fillModPanel(
+          chipRow.querySelector(".builder-row__modpanel"),
+          chipRow,
+          applicableMods(chipRow.dataset.modType || ""),
+        );
+        updateUrl();
+        return;
+      }
       var removeOr = event.target.closest("[data-remove-or]");
       var add = event.target.closest("[data-add]");
       if (addOr) {

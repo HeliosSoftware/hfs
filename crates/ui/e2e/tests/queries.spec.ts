@@ -222,6 +222,37 @@ test.describe("query builder", () => {
     );
   });
 
+  /* ---- modifier panel (#415) ------------------------------------------ */
+
+  test("the modifier select gates to the parameter type", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name=x");
+    const row = queries.builder.conditionRows.first();
+    // string param: :contains offered, date prefixes are not
+    await expect
+      .poll(async () => row.locator(".builder-row__modifier option").allTextContents())
+      .toContain(":contains");
+    const opts = await row.locator(".builder-row__modifier option").allTextContents();
+    expect(opts).not.toContain("ge");
+    expect(opts).not.toContain(":in");
+  });
+
+  test("the MODIFY panel explains chips and clicking one applies it", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?name=ann");
+    const row = queries.builder.conditionRows.first();
+    await row.locator("[data-toggle-mods]").click();
+    const panel = row.locator(".builder-row__modpanel");
+    await expect(panel).toBeVisible();
+    const chip = panel.locator("[data-mod-chip=contains]");
+    await expect(chip).toContainText(":contains");
+    await expect(chip).toContainText("anywhere");
+
+    await chip.click();
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("contains");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name:contains=ann");
+  });
+
   test("picking a type swaps in that type's parameter datalist", async ({ queries }) => {
     await queries.railItem("Patient").click();
     // /ui/queries/params fills #param-options for the picked type.

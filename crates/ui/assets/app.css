@@ -3741,3 +3741,72 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
   background: var(--accent-soft);
 }
 
+/* MODIFY panel (#415): explained modifier chips under the row. */
+.builder-row__adv {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--surface-border);
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.builder-row__adv:hover,
+.builder-row__adv[aria-expanded="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.builder-row__modpanel {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 0 2px;
+}
+
+.builder-row__modheading {
+  color: var(--muted);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.builder-row__modchip {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 3px 10px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.builder-row__modchip strong {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.builder-row__modchip:hover {
+  border-color: var(--accent);
+}
+
+.builder-row__modchip[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.builder-row__modchip[aria-pressed="true"] strong {
+  color: var(--accent);
+}
