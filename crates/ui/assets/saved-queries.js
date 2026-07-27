@@ -340,6 +340,46 @@
   }
 
   /* Modifier select + value input + remove button, shared by every row kind. */
+  /* One value input inside a row's OR stack (#414). The per-value remove
+   * only renders when the stack has siblings. */
+  function orValueInput(host, value) {
+    var wrap = document.createElement("span");
+    wrap.className = "builder-row__orvalue";
+    var input = document.createElement("input");
+    input.className = "builder-row__value";
+    input.value = value;
+    input.placeholder = sections.dataset.msgValue;
+    input.spellcheck = false;
+    wrap.appendChild(input);
+    var rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "builder-row__remove builder-row__remove--or";
+    rm.dataset.removeOr = "true";
+    rm.setAttribute("aria-label", sections.dataset.msgRemove);
+    rm.textContent = "×";
+    wrap.appendChild(rm);
+    host.appendChild(wrap);
+    return input;
+  }
+
+  /* FHIR's OR is a comma list on one parameter (`name=Smith,Jones`): the
+   * value column stacks one input per alternative, plus the `+ or` button. */
+  function appendValues(row, rawValue) {
+    var host = document.createElement("span");
+    host.className = "builder-row__values";
+    rawValue.split(",").forEach(function (v) {
+      orValueInput(host, v);
+    });
+    row.appendChild(host);
+
+    var addOr = document.createElement("button");
+    addOr.type = "button";
+    addOr.className = "builder-row__or";
+    addOr.dataset.addOr = "true";
+    addOr.textContent = sections.dataset.msgOr;
+    row.appendChild(addOr);
+  }
+
   function appendTail(row, part) {
     var value = part.value;
     var selectedMod = part.modifier;
@@ -359,12 +399,7 @@
     });
     row.appendChild(modifier);
 
-    var valueInput = document.createElement("input");
-    valueInput.className = "builder-row__value";
-    valueInput.value = value;
-    valueInput.placeholder = sections.dataset.msgValue;
-    valueInput.spellcheck = false;
-    row.appendChild(valueInput);
+    appendValues(row, value);
 
     var remove = document.createElement("button");
     remove.type = "button";
@@ -688,12 +723,16 @@
       row.appendChild(modifier);
     }
 
-    var valueInput = document.createElement("input");
-    valueInput.className = "builder-row__value";
-    valueInput.value = value;
-    valueInput.placeholder = sections.dataset.msgValue;
-    valueInput.spellcheck = false;
-    row.appendChild(valueInput);
+    if (kind === "condition") {
+      appendValues(row, value);
+    } else {
+      var valueInput = document.createElement("input");
+      valueInput.className = "builder-row__value";
+      valueInput.value = value;
+      valueInput.placeholder = sections.dataset.msgValue;
+      valueInput.spellcheck = false;
+      row.appendChild(valueInput);
+    }
 
     var remove = document.createElement("button");
     remove.type = "button";
@@ -788,9 +827,16 @@
       if (!key) return;
       var modifierEl = row.querySelector(".builder-row__modifier");
       var mod = modifierEl ? modifierEl.value : "";
-      var value = row.querySelector(".builder-row__value").value.trim();
-      if (PREFIXES.indexOf(mod) >= 0) value = mod + value;
-      else if (mod) key += ":" + mod;
+      var isPrefix = PREFIXES.indexOf(mod) >= 0;
+      var values = [];
+      row.querySelectorAll(".builder-row__value").forEach(function (vi) {
+        var v = vi.value.trim();
+        if (!v) return;
+        if (isPrefix && !PREFIX_RE.test(v)) v = mod + v;
+        values.push(v);
+      });
+      var value = values.join(",");
+      if (!isPrefix && mod) key += ":" + mod;
       parts.push(key + "=" + value);
     });
     urlInput.value =
@@ -811,7 +857,22 @@
     sections.addEventListener("click", function (event) {
       var remove = event.target.closest("[data-remove-row]");
       var drillFrom = event.target.closest("[data-chain-from]");
+      var addOr = event.target.closest("[data-add-or]");
+      var removeOr = event.target.closest("[data-remove-or]");
       var add = event.target.closest("[data-add]");
+      if (addOr) {
+        var orHost = addOr.closest(".builder-row").querySelector(".builder-row__values");
+        orValueInput(orHost, "").focus();
+        return;
+      }
+      if (removeOr) {
+        var orWrap = removeOr.closest(".builder-row__orvalue");
+        if (orWrap.parentElement.children.length > 1) {
+          orWrap.remove();
+          updateUrl();
+        }
+        return;
+      }
       if (remove) {
         remove.closest(".builder-row").remove();
         updateUrl();

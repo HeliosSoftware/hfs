@@ -3699,3 +3699,45 @@ html[data-nav="collapsed"] body.has-nav-panel {
   grid-template-columns: 76px 232px 1fr;
 }
 html[data-nav="collapsed"] .menu__panel { left: 0; }
+
+/* OR value stacks (#414): one input per comma alternative. */
+.builder-row__values {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.builder-row__orvalue {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.builder-row__orvalue .builder-row__value {
+  flex: 1;
+}
+
+.builder-row__orvalue:only-child .builder-row__remove--or {
+  visibility: hidden;
+}
+
+.builder-row__or {
+  flex-shrink: 0;
+  align-self: flex-start;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.builder-row__or:hover {
+  background: var(--accent-soft);
+}
+
