@@ -277,6 +277,16 @@ async fn queries_param_catalog_is_a_registry_fed_fragment() {
     // Not applicable to Patient.
     assert!(!html.contains(r#"value="clinical-status""#));
     assert!(!html.contains("<html"), "fragment, not a page");
+
+    // Chaining metadata (#394): each option carries its type, and reference
+    // params list their target resource types.
+    assert!(html.contains(r#"data-type="date""#));
+    let gp = html
+        .lines()
+        .find(|l| l.contains(r#"value="general-practitioner""#))
+        .expect("general-practitioner option");
+    assert!(gp.contains(r#"data-type="reference""#), "{gp}");
+    assert!(gp.contains("Practitioner"), "targets in data-targets: {gp}");
 }
 
 /* Natural-language search (#255) has three states, and the difference between

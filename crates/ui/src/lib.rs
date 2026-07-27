@@ -470,6 +470,9 @@ struct StatusPartial {
 struct ParamOption {
     code: String,
     type_label: String,
+    /// Comma-joined target resource types (reference params only, else empty) —
+    /// the builder's chaining controls read these as `data-targets`.
+    targets: String,
 }
 
 /// Parameter suggestions for the search builder (`/ui/queries/params`),
@@ -955,6 +958,7 @@ async fn query_params_catalog(
         .map(|p| ParamOption {
             code: p.code.clone(),
             type_label: p.param_type.to_string(),
+            targets: p.target.as_deref().unwrap_or_default().join(","),
         })
         .collect();
     params.sort_by(|a, b| a.code.cmp(&b.code));
@@ -1737,10 +1741,12 @@ mod tests {
                 ParamOption {
                     code: "birthdate".into(),
                     type_label: "date".into(),
+                    targets: String::new(),
                 },
                 ParamOption {
-                    code: "name".into(),
-                    type_label: "string".into(),
+                    code: "general-practitioner".into(),
+                    type_label: "reference".into(),
+                    targets: "Organization,Practitioner".into(),
                 },
             ],
         }
@@ -1748,7 +1754,9 @@ mod tests {
         .expect("partial renders");
 
         assert!(html.contains(r#"<datalist id="param-options">"#));
-        assert!(html.contains(r#"<option value="birthdate" label="date">"#));
+        assert!(html.contains(r#"value="birthdate""#));
+        assert!(html.contains(r#"data-type="date""#));
+        assert!(html.contains(r#"data-targets="Organization,Practitioner""#));
         assert!(!html.contains("<html"), "fragment, not a page");
     }
 
