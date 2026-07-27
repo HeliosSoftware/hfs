@@ -836,8 +836,15 @@ impl ResourceStorage for CompositeStorage {
 
         let (stored, created) = result?;
 
-        // Sync to secondaries
-        let event = if created {
+        // Sync to secondaries.
+        //
+        // A `PUT` onto a deleted id restores the resource, which the primary
+        // reports as `created` even though it continues the existing version
+        // chain (a genuine create is always version "1"). Secondaries already
+        // hold a row for that id, so a restore has to sync as an update —
+        // backends whose `create` rejects an existing id would otherwise drop
+        // the write and go stale.
+        let event = if created && stored.version_id() == "1" {
             SyncEvent::Create {
                 resource_type: resource_type.to_string(),
                 resource_id: id.to_string(),

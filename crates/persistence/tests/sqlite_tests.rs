@@ -2993,11 +2993,44 @@ async fn test_search_parameter_delete_unregisters() {
         .unwrap();
 
     // Verify it's unregistered
+    {
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
+        assert!(
+            registry.get_param("Observation", "todelete").is_none(),
+            "Deleted SearchParameter should be unregistered"
+        );
+    }
+
+    // Restoring it with a PUT puts it back in the tenant's overlay: the restore
+    // path has to invalidate the registry the same way a create does.
+    let restored = json!({
+        "resourceType": "SearchParameter",
+        "id": "to-delete",
+        "url": "http://example.org/fhir/SearchParameter/to-delete",
+        "name": "todelete",
+        "status": "active",
+        "code": "todelete",
+        "base": ["Observation"],
+        "type": "token",
+        "expression": "Observation.code"
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "SearchParameter",
+            "to-delete",
+            restored,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
     let reg = backend.search_param_registry(&tenant);
     let registry = reg.read();
     assert!(
-        registry.get_param("Observation", "todelete").is_none(),
-        "Deleted SearchParameter should be unregistered"
+        registry.get_param("Observation", "todelete").is_some(),
+        "Restored SearchParameter should be registered again"
     );
 }
 

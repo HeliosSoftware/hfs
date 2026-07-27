@@ -15,13 +15,13 @@ use crate::core::transaction::{
 };
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
-    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage,
+    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage, normalize_etag,
 };
 use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::tenant::TenantContext;
+use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
@@ -83,6 +83,8 @@ impl ResourceStorage for SqliteBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -180,22 +182,31 @@ impl ResourceStorage for SqliteBackend {
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
         // Check if exists
-        let existing = self.read(tenant, resource_type, id).await?;
-
-        if let Some(current) = existing {
+        match self.read(tenant, resource_type, id).await {
             // Update existing (preserves original FHIR version)
-            let updated = self.update(tenant, &current, resource).await?;
-            Ok((updated, false))
-        } else {
-            // Create new with specific ID
-            let mut resource = resource;
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert("id".to_string(), Value::String(id.to_string()));
+            Ok(Some(current)) => {
+                let updated = self.update(tenant, &current, resource).await?;
+                Ok((updated, false))
             }
-            let created = self
-                .create(tenant, resource_type, resource, fhir_version)
-                .await?;
-            Ok((created, true))
+            // Create new with specific ID
+            Ok(None) => {
+                let mut resource = resource;
+                if let Some(obj) = resource.as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.to_string()));
+                }
+                let created = self
+                    .create(tenant, resource_type, resource, fhir_version)
+                    .await?;
+                Ok((created, true))
+            }
+            // A deleted resource is brought back to life by a subsequent update
+            // (FHIR http.html#delete), continuing the existing version chain
+            // rather than being rejected with `Gone`.
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                let restored = self.restore_deleted(tenant, resource_type, id, resource)?;
+                Ok((restored, true))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -282,9 +293,11 @@ impl ResourceStorage for SqliteBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = current.resource_type();
         let id = current.id();
 
         // Check that the resource still exists with the expected version
@@ -396,6 +409,8 @@ impl ResourceStorage for SqliteBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -880,6 +895,121 @@ impl ResourceStorage for SqliteBackend {
 
 // Search Index Helpers
 impl SqliteBackend {
+    /// Brings a soft-deleted resource back to life with new content.
+    ///
+    /// FHIR permits a deleted resource to be restored by a subsequent update
+    /// ([http.html#delete](https://hl7.org/fhir/http.html#delete)), so a `PUT`
+    /// onto a deleted id must succeed instead of failing with `Gone`. The
+    /// restored resource continues the existing version chain (the deletion
+    /// record keeps its version, the restore gets the next one) and keeps the
+    /// FHIR version the resource was originally stored under.
+    ///
+    /// Returns `NotFound` if no deleted row is present — the caller has already
+    /// established one exists, so that only happens under a concurrent write.
+    fn restore_deleted(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let row: Result<(String, String), _> = conn.query_row(
+            "SELECT version_id, fhir_version FROM resources
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 1",
+            params![tenant_id, resource_type, id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+
+        let (deleted_version, fhir_version_str) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+            Err(e) => {
+                return Err(internal_error(format!(
+                    "Failed to read deleted resource: {}",
+                    e
+                )));
+            }
+        };
+
+        let new_version: u64 = deleted_version.parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Ensure the resource has correct type and id
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+
+        let data = serde_json::to_vec(&resource)
+            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
+
+        let now = Utc::now();
+        let last_updated = now.to_rfc3339();
+
+        conn.execute(
+            "UPDATE resources
+             SET version_id = ?1, data = ?2, last_updated = ?3, is_deleted = 0, deleted_at = NULL
+             WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6",
+            params![
+                new_version_str,
+                data,
+                last_updated,
+                tenant_id,
+                resource_type,
+                id
+            ],
+        )
+        .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
+
+        conn.execute(
+            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![tenant_id, resource_type, id, new_version_str, data, last_updated, fhir_version_str],
+        )
+        .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
+
+        // The delete dropped the search index entries; rebuild them for the
+        // resource that is live again.
+        self.delete_search_index(&conn, tenant_id, resource_type, id)?;
+        self.index_resource(&conn, tenant_id, resource_type, id, &resource)?;
+
+        // A restored *active* SearchParameter re-enters this tenant's overlay.
+        if resource_type == "SearchParameter"
+            && crate::search::search_parameter_create_affects_overlay(&resource)
+        {
+            self.tenant_registries().invalidate(tenant_id);
+        }
+
+        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            tenant.tenant_id().clone(),
+            resource,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
     /// Index a resource for search.
     ///
     /// This method uses the SearchParameterExtractor to dynamically extract
@@ -1387,13 +1517,16 @@ impl VersionedStorage for SqliteBackend {
             })
         })?;
 
-        // Check version match
-        if current.version_id() != expected_version {
+        // Check version match. `expected_version` may arrive in any ETag
+        // spelling (`W/"1"`, `"1"`, `1`), so normalise both sides — same as the
+        // MongoDB and S3 backends.
+        let expected = normalize_etag(expected_version);
+        if normalize_etag(current.version_id()) != expected {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected_version.to_string(),
+                    expected_version: expected.to_string(),
                     actual_version: current.version_id().to_string(),
                 },
             ));
@@ -1437,12 +1570,13 @@ impl VersionedStorage for SqliteBackend {
             }
         };
 
-        if current_version != expected_version {
+        let expected = normalize_etag(expected_version);
+        if normalize_etag(&current_version) != expected {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected_version.to_string(),
+                    expected_version: expected.to_string(),
                     actual_version: current_version,
                 },
             ));

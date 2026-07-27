@@ -5,9 +5,10 @@
 
 use serde_json::json;
 
+use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use helios_persistence::types::{Pagination, SearchQuery};
+use helios_persistence::types::SearchQuery;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
@@ -49,7 +50,10 @@ async fn test_create_isolation() {
 
     // Create patient in tenant A
     let patient = create_patient_json("TenantA Patient");
-    let created = backend.create(&tenant_a, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant_a, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Tenant A can read it
     let read_a = backend
@@ -76,10 +80,23 @@ async fn test_exists_isolation() {
     let tenant_b = create_tenant("tenant-b");
 
     let patient = create_patient_json("Test");
-    let created = backend.create(&tenant_a, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant_a, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
-    assert!(backend.exists(&tenant_a, "Patient", created.id()).await.unwrap());
-    assert!(!backend.exists(&tenant_b, "Patient", created.id()).await.unwrap());
+    assert!(
+        backend
+            .exists(&tenant_a, "Patient", created.id())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .exists(&tenant_b, "Patient", created.id())
+            .await
+            .unwrap()
+    );
 }
 
 /// Test that read_batch only returns resources from the correct tenant.
@@ -93,17 +110,33 @@ async fn test_read_batch_isolation() {
 
     // Create patients in tenant A
     let p1 = backend
-        .create(&tenant_a, "Patient", create_patient_json("A1"))
+        .create(
+            &tenant_a,
+            "Patient",
+            create_patient_json("A1"),
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
     let p2 = backend
-        .create(&tenant_a, "Patient", create_patient_json("A2"))
+        .create(
+            &tenant_a,
+            "Patient",
+            create_patient_json("A2"),
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
     // Create patient in tenant B with known ID
     backend
-        .create_or_update(&tenant_b, "Patient", "b-patient", create_patient_json("B1"))
+        .create_or_update(
+            &tenant_b,
+            "Patient",
+            "b-patient",
+            create_patient_json("B1"),
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -133,7 +166,12 @@ async fn test_count_isolation() {
     // Create 5 patients in tenant A
     for i in 0..5 {
         backend
-            .create(&tenant_a, "Patient", create_patient_json(&format!("A{}", i)))
+            .create(
+                &tenant_a,
+                "Patient",
+                create_patient_json(&format!("A{}", i)),
+                FhirVersion::default(),
+            )
             .await
             .unwrap();
     }
@@ -141,7 +179,12 @@ async fn test_count_isolation() {
     // Create 3 patients in tenant B
     for i in 0..3 {
         backend
-            .create(&tenant_b, "Patient", create_patient_json(&format!("B{}", i)))
+            .create(
+                &tenant_b,
+                "Patient",
+                create_patient_json(&format!("B{}", i)),
+                FhirVersion::default(),
+            )
             .await
             .unwrap();
     }
@@ -167,40 +210,44 @@ async fn test_search_isolation() {
     let tenant_b = create_tenant("tenant-b");
 
     // Create patients with same name in both tenants
-    for i in 0..3 {
+    for _i in 0..3 {
         backend
-            .create(&tenant_a, "Patient", create_patient_json("Smith"))
+            .create(
+                &tenant_a,
+                "Patient",
+                create_patient_json("Smith"),
+                FhirVersion::default(),
+            )
             .await
             .unwrap();
     }
 
-    for i in 0..2 {
+    for _i in 0..2 {
         backend
-            .create(&tenant_b, "Patient", create_patient_json("Smith"))
+            .create(
+                &tenant_b,
+                "Patient",
+                create_patient_json("Smith"),
+                FhirVersion::default(),
+            )
             .await
             .unwrap();
     }
 
     // Search in each tenant
-    let query = SearchQuery::new("Patient");
+    let query = SearchQuery::new("Patient").with_count(100);
 
-    let result_a = backend
-        .search(&tenant_a, &query, Pagination::new(100))
-        .await
-        .unwrap();
-    let result_b = backend
-        .search(&tenant_b, &query, Pagination::new(100))
-        .await
-        .unwrap();
+    let result_a = backend.search(&tenant_a, &query).await.unwrap();
+    let result_b = backend.search(&tenant_b, &query).await.unwrap();
 
     // Each tenant should only see their own
     assert_eq!(result_a.resources.len(), 3);
-    for resource in &result_a.resources {
+    for resource in &result_a.resources.items {
         assert_eq!(resource.tenant_id().as_str(), "tenant-a");
     }
 
     assert_eq!(result_b.resources.len(), 2);
-    for resource in &result_b.resources {
+    for resource in &result_b.resources.items {
         assert_eq!(resource.tenant_id().as_str(), "tenant-b");
     }
 }
@@ -220,7 +267,10 @@ async fn test_update_isolation() {
 
     // Create in tenant A
     let patient = create_patient_json("Original");
-    let created = backend.create(&tenant_a, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant_a, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Create a fake resource with same ID but tenant B's context
     let fake_resource = helios_persistence::types::StoredResource::new(
@@ -228,11 +278,16 @@ async fn test_update_isolation() {
         created.id(),
         TenantId::new("tenant-b"),
         json!({"resourceType": "Patient"}),
+        FhirVersion::default(),
     );
 
     // Try to update from tenant B
     let result = backend
-        .update(&tenant_b, &fake_resource, json!({"resourceType": "Patient", "name": [{"family": "Hacked"}]}))
+        .update(
+            &tenant_b,
+            &fake_resource,
+            json!({"resourceType": "Patient", "name": [{"family": "Hacked"}]}),
+        )
         .await;
 
     // Should fail
@@ -258,7 +313,10 @@ async fn test_delete_isolation() {
 
     // Create in tenant A
     let patient = create_patient_json("TenantA");
-    let created = backend.create(&tenant_a, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&tenant_a, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Try to delete from tenant B
     let result = backend.delete(&tenant_b, "Patient", created.id()).await;
@@ -267,7 +325,12 @@ async fn test_delete_isolation() {
     assert!(result.is_err());
 
     // Resource should still exist in tenant A
-    assert!(backend.exists(&tenant_a, "Patient", created.id()).await.unwrap());
+    assert!(
+        backend
+            .exists(&tenant_a, "Patient", created.id())
+            .await
+            .unwrap()
+    );
 }
 
 // ============================================================================
@@ -294,11 +357,23 @@ async fn test_same_id_different_tenants() {
     });
 
     backend
-        .create_or_update(&tenant_a, "Patient", "shared-id", patient_a)
+        .create_or_update(
+            &tenant_a,
+            "Patient",
+            "shared-id",
+            patient_a,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
     backend
-        .create_or_update(&tenant_b, "Patient", "shared-id", patient_b)
+        .create_or_update(
+            &tenant_b,
+            "Patient",
+            "shared-id",
+            patient_b,
+            FhirVersion::default(),
+        )
         .await
         .unwrap();
 
@@ -331,7 +406,7 @@ async fn test_system_tenant_access() {
     let backend = create_sqlite_backend();
 
     let system = TenantContext::system();
-    let tenant_a = create_tenant("tenant-a");
+    let _tenant_a = create_tenant("tenant-a");
 
     // Create shared resource in system tenant
     let value_set = json!({
@@ -339,7 +414,7 @@ async fn test_system_tenant_access() {
         "name": "SharedValueSet"
     });
     let created = backend
-        .create(&system, "ValueSet", value_set)
+        .create(&system, "ValueSet", value_set, FhirVersion::default())
         .await
         .unwrap();
 
@@ -369,7 +444,7 @@ async fn test_cannot_modify_system_resources() {
         "name": "SystemValueSet"
     });
     let created = backend
-        .create(&system, "ValueSet", value_set)
+        .create(&system, "ValueSet", value_set, FhirVersion::default())
         .await
         .unwrap();
 
@@ -400,13 +475,14 @@ async fn test_hierarchical_tenant_access() {
 
     // Create in child tenant
     let patient = create_patient_json("ChildPatient");
-    let created = backend.create(&child, "Patient", patient).await.unwrap();
+    let created = backend
+        .create(&child, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Parent with child access permission might be able to read
     // (behavior depends on implementation)
-    let read_parent = backend
-        .read(&parent, "Patient", created.id())
-        .await;
+    let _read_parent = backend.read(&parent, "Patient", created.id()).await;
 
     // This test documents expected hierarchical access behavior
 }

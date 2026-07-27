@@ -16,7 +16,7 @@ use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
 };
 use crate::search::SearchParameterExtractor;
-use crate::tenant::TenantContext;
+use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
 use super::SqliteBackend;
@@ -168,6 +168,9 @@ impl Transaction for SqliteTransaction {
         resource_type: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        self.tenant
+            .check_permission(Operation::Create, resource_type)?;
+
         if !self.active {
             return Err(StorageError::Transaction(
                 TransactionError::InvalidTransaction,
@@ -320,6 +323,9 @@ impl Transaction for SqliteTransaction {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        self.tenant
+            .check_permission(Operation::Update, current.resource_type())?;
+
         if !self.active {
             return Err(StorageError::Transaction(
                 TransactionError::InvalidTransaction,
@@ -431,6 +437,9 @@ impl Transaction for SqliteTransaction {
     }
 
     async fn delete(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
+        self.tenant
+            .check_permission(Operation::Delete, resource_type)?;
+
         if !self.active {
             return Err(StorageError::Transaction(
                 TransactionError::InvalidTransaction,

@@ -847,19 +847,24 @@ impl MongoBackend {
             }));
         }
 
-        let lowered = value.value.to_lowercase();
+        // `value_string` holds the value as written, so the insensitive
+        // variants ask Mongo for a case-insensitive regex (`$options: "i"`)
+        // rather than relying on a pre-lowercased index. `:exact` compares the
+        // raw value, which is what makes it case-sensitive per the spec.
         match param.modifier.as_ref() {
             None => Ok(doc! {
                 "value_string": {
-                    "$regex": format!("^{}", regex_escape(&lowered))
+                    "$regex": format!("^{}", regex_escape(&value.value)),
+                    "$options": "i"
                 }
             }),
-            Some(SearchModifier::Exact) => Ok(doc! { "value_string": lowered }),
+            Some(SearchModifier::Exact) => Ok(doc! { "value_string": value.value.as_str() }),
             // `:text` on a string is a case-insensitive partial match,
             // implemented here as a substring match (same as `:contains`).
             Some(SearchModifier::Contains | SearchModifier::Text) => Ok(doc! {
                 "value_string": {
-                    "$regex": regex_escape(&lowered)
+                    "$regex": regex_escape(&value.value),
+                    "$options": "i"
                 }
             }),
             Some(other) => Err(StorageError::Search(SearchError::UnsupportedModifier {

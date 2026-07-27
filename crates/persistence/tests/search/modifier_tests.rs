@@ -8,21 +8,24 @@ use serde_json::json;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
 
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
-    let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
-    backend.init_schema().expect("Failed to initialize schema");
-    backend
+    super::make_sqlite_backend()
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 // ============================================================================
@@ -39,8 +42,14 @@ async fn test_missing_true() {
     // Create patients - some with birthDate, some without
     let with_date = json!({"resourceType": "Patient", "birthDate": "1980-01-15"});
     let without_date = json!({"resourceType": "Patient", "name": [{"family": "No Date"}]});
-    backend.create(&tenant, "Patient", with_date).await.unwrap();
-    backend.create(&tenant, "Patient", without_date).await.unwrap();
+    backend
+        .create(&tenant, "Patient", with_date, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", without_date, FhirVersion::default())
+        .await
+        .unwrap();
 
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "birthdate".to_string(),
@@ -52,12 +61,12 @@ async fn test_missing_true() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should only find patients without birthDate
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert!(
             resource.content().get("birthDate").is_none()
                 || resource.content()["birthDate"].is_null()
@@ -74,8 +83,14 @@ async fn test_missing_false() {
 
     let with_date = json!({"resourceType": "Patient", "birthDate": "1980-01-15"});
     let without_date = json!({"resourceType": "Patient", "name": [{"family": "No Date"}]});
-    backend.create(&tenant, "Patient", with_date).await.unwrap();
-    backend.create(&tenant, "Patient", without_date).await.unwrap();
+    backend
+        .create(&tenant, "Patient", with_date, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", without_date, FhirVersion::default())
+        .await
+        .unwrap();
 
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "birthdate".to_string(),
@@ -87,12 +102,12 @@ async fn test_missing_false() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should only find patients with birthDate
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert!(resource.content().get("birthDate").is_some());
     }
 }
@@ -111,9 +126,18 @@ async fn test_not_modifier() {
     let male = json!({"resourceType": "Patient", "gender": "male"});
     let female = json!({"resourceType": "Patient", "gender": "female"});
     let unknown = json!({"resourceType": "Patient", "gender": "unknown"});
-    backend.create(&tenant, "Patient", male).await.unwrap();
-    backend.create(&tenant, "Patient", female).await.unwrap();
-    backend.create(&tenant, "Patient", unknown).await.unwrap();
+    backend
+        .create(&tenant, "Patient", male, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", female, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", unknown, FhirVersion::default())
+        .await
+        .unwrap();
 
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "gender".to_string(),
@@ -125,12 +149,12 @@ async fn test_not_modifier() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find female and unknown, not male
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert_ne!(resource.content()["gender"], "male");
     }
 }
@@ -154,7 +178,10 @@ async fn test_text_modifier() {
             "text": "Patient heart rate measurement during exercise"
         }
     });
-    backend.create(&tenant, "Observation", obs).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs, FhirVersion::default())
+        .await
+        .unwrap();
 
     // :text modifier searches the display/text fields
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -166,9 +193,7 @@ async fn test_text_modifier() {
         components: vec![],
     });
 
-    let _result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let _result = backend.search(&tenant, &query.with_count(100)).await;
 
     // Test documents expected text search behavior
 }
@@ -190,7 +215,16 @@ async fn test_identifier_modifier() {
         "id": "patient-123",
         "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN001"}]
     });
-    backend.create_or_update(&tenant, "Patient", "patient-123", patient).await.unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-123",
+            patient,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Create observation referencing patient
     let obs = json!({
@@ -199,7 +233,10 @@ async fn test_identifier_modifier() {
         "subject": {"reference": "Patient/patient-123"},
         "code": {"coding": [{"code": "test"}]}
     });
-    backend.create(&tenant, "Observation", obs).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search using :identifier modifier
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -214,9 +251,7 @@ async fn test_identifier_modifier() {
         components: vec![],
     });
 
-    let _result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let _result = backend.search(&tenant, &query.with_count(100)).await;
 }
 
 // ============================================================================
@@ -248,7 +283,10 @@ async fn test_of_type_modifier_three_part_format() {
             "value": "123-45-6789"
         }]
     });
-    backend.create(&tenant, "Patient", patient_with_ssn).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient_with_ssn, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Create patient with typed identifier (MRN)
     let patient_with_mrn = json!({
@@ -264,7 +302,10 @@ async fn test_of_type_modifier_three_part_format() {
             "value": "MRN-001"
         }]
     });
-    backend.create(&tenant, "Patient", patient_with_mrn).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient_with_mrn, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for SSN type identifier with :of-type modifier
     // Format: identifier:of-type=[type-system]|[type-code]|[value]
@@ -281,20 +322,18 @@ async fn test_of_type_modifier_three_part_format() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // Test documents expected :of-type behavior
     // When implemented, should only match the SSN identifier
     match result {
         Ok(result) => {
             // If implemented, verify only SSN patient is returned
-            for resource in &result.resources {
+            for resource in &result.resources.items {
                 let identifiers = resource.content()["identifier"].as_array().unwrap();
-                let has_ssn = identifiers.iter().any(|id| {
-                    id["type"]["coding"][0]["code"] == "SS"
-                });
+                let has_ssn = identifiers
+                    .iter()
+                    .any(|id| id["type"]["coding"][0]["code"] == "SS");
                 assert!(has_ssn, "Should only match SSN identifiers");
             }
         }
@@ -327,7 +366,10 @@ async fn test_text_advanced_simple_term() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_headache).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_headache, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_migraine = json!({
         "resourceType": "Observation",
@@ -340,7 +382,10 @@ async fn test_text_advanced_simple_term() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_migraine).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_migraine, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for "headache" using :text-advanced
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -352,9 +397,7 @@ async fn test_text_advanced_simple_term() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // FTS5 availability is required for :text-advanced
     // If FTS5 is available, should find the headache observation
@@ -362,7 +405,7 @@ async fn test_text_advanced_simple_term() {
         // FTS5 available - should match via porter stemming
         if !result.resources.is_empty() {
             assert_eq!(result.resources.len(), 1);
-            let code = result.resources[0].content()["code"]["coding"][0]["display"].as_str();
+            let code = result.resources.items[0].content()["code"]["coding"][0]["display"].as_str();
             assert!(code.unwrap().contains("Headache"));
         }
     }
@@ -387,7 +430,10 @@ async fn test_text_advanced_or_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_headache).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_headache, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_migraine = json!({
         "resourceType": "Observation",
@@ -400,7 +446,10 @@ async fn test_text_advanced_or_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_migraine).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_migraine, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_other = json!({
         "resourceType": "Observation",
@@ -413,7 +462,10 @@ async fn test_text_advanced_or_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_other).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_other, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for "headache OR migraine" using :text-advanced
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -425,14 +477,16 @@ async fn test_text_advanced_or_operator() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available, should find both headache and migraine
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 2, "Should find both headache and migraine");
+            assert_eq!(
+                result.resources.len(),
+                2,
+                "Should find both headache and migraine"
+            );
         }
     }
 }
@@ -456,7 +510,15 @@ async fn test_text_advanced_phrase_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_heart_failure).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            obs_heart_failure,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     let obs_heart_rate = json!({
         "resourceType": "Observation",
@@ -469,7 +531,15 @@ async fn test_text_advanced_phrase_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_heart_rate).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            obs_heart_rate,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Search for exact phrase "heart failure"
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -481,15 +551,18 @@ async fn test_text_advanced_phrase_match() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available, should only match exact phrase
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 1, "Should only find heart failure, not heart rate");
-            let display = result.resources[0].content()["code"]["coding"][0]["display"].as_str();
+            assert_eq!(
+                result.resources.len(),
+                1,
+                "Should only find heart failure, not heart rate"
+            );
+            let display =
+                result.resources.items[0].content()["code"]["coding"][0]["display"].as_str();
             assert!(display.unwrap().contains("failure"));
         }
     }
@@ -514,7 +587,10 @@ async fn test_text_advanced_prefix_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_cardio).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_cardio, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_cardiac = json!({
         "resourceType": "Observation",
@@ -527,7 +603,10 @@ async fn test_text_advanced_prefix_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_cardiac).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_cardiac, FhirVersion::default())
+        .await
+        .unwrap();
 
     let obs_fracture = json!({
         "resourceType": "Observation",
@@ -540,7 +619,10 @@ async fn test_text_advanced_prefix_match() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_fracture).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_fracture, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for prefix "cardi*" (matches cardiac, cardiovascular)
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -552,14 +634,16 @@ async fn test_text_advanced_prefix_match() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available, should match both cardi* terms
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 2, "Should find cardiovascular and cardiac");
+            assert_eq!(
+                result.resources.len(),
+                2,
+                "Should find cardiovascular and cardiac"
+            );
         }
     }
 }
@@ -583,7 +667,15 @@ async fn test_text_advanced_not_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_heart_surgery).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            obs_heart_surgery,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     let obs_heart_failure = json!({
         "resourceType": "Observation",
@@ -596,7 +688,15 @@ async fn test_text_advanced_not_operator() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_heart_failure).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            obs_heart_failure,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Search for "heart" but NOT "surgery"
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -608,15 +708,18 @@ async fn test_text_advanced_not_operator() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available, should only match heart failure (not surgery)
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 1, "Should find heart failure but not heart surgery");
-            let display = result.resources[0].content()["code"]["coding"][0]["display"].as_str();
+            assert_eq!(
+                result.resources.len(),
+                1,
+                "Should find heart failure but not heart surgery"
+            );
+            let display =
+                result.resources.items[0].content()["code"]["coding"][0]["display"].as_str();
             assert!(display.unwrap().contains("failure"));
         }
     }
@@ -641,7 +744,10 @@ async fn test_text_advanced_stemming() {
             }]
         }
     });
-    backend.create(&tenant, "Observation", obs_running).await.unwrap();
+    backend
+        .create(&tenant, "Observation", obs_running, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for "run" - should match "running" via porter stemming
     let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
@@ -653,14 +759,16 @@ async fn test_text_advanced_stemming() {
         components: vec![],
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = backend.search(&tenant, &query.with_count(100)).await;
 
     // If FTS5 is available with porter stemmer, should match "running"
     if let Ok(result) = result {
         if !result.resources.is_empty() {
-            assert_eq!(result.resources.len(), 1, "Should find 'running' when searching for 'run'");
+            assert_eq!(
+                result.resources.len(),
+                1,
+                "Should find 'running' when searching for 'run'"
+            );
         }
     }
 }
@@ -696,7 +804,10 @@ async fn test_of_type_modifier_type_discrimination() {
             }
         ]
     });
-    backend.create(&tenant, "Patient", patient).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     // Search for DL (driver's license) type - should match
     let dl_query = SearchQuery::new("Patient").with_parameter(SearchParameter {
@@ -727,6 +838,6 @@ async fn test_of_type_modifier_type_discrimination() {
     });
 
     // Test documents expected behavior when :of-type is implemented
-    let _dl_result = backend.search(&tenant, &dl_query, Pagination::new(100)).await;
-    let _pp_result = backend.search(&tenant, &pp_query, Pagination::new(100)).await;
+    let _dl_result = backend.search(&tenant, &dl_query.with_count(100)).await;
+    let _pp_result = backend.search(&tenant, &pp_query.with_count(100)).await;
 }

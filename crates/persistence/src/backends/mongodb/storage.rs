@@ -25,7 +25,7 @@ use crate::error::{
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::tenant::TenantContext;
+use crate::tenant::{Operation, TenantContext};
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
 use super::MongoBackend;
@@ -554,6 +554,8 @@ impl ResourceStorage for MongoBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -716,20 +718,34 @@ impl ResourceStorage for MongoBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<(StoredResource, bool)> {
-        let existing = self.read(tenant, resource_type, id).await?;
-
-        if let Some(current) = existing {
-            let updated = self.update(tenant, &current, resource).await?;
-            Ok((updated, false))
-        } else {
-            let mut resource = resource;
-            if let Some(obj) = resource.as_object_mut() {
-                obj.insert("id".to_string(), Value::String(id.to_string()));
+        // Check if exists
+        match self.read(tenant, resource_type, id).await {
+            // Update existing (preserves original FHIR version)
+            Ok(Some(current)) => {
+                let updated = self.update(tenant, &current, resource).await?;
+                Ok((updated, false))
             }
-            let created = self
-                .create(tenant, resource_type, resource, fhir_version)
-                .await?;
-            Ok((created, true))
+            // Create new with specific ID
+            Ok(None) => {
+                let mut resource = resource;
+                if let Some(obj) = resource.as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.to_string()));
+                }
+                let created = self
+                    .create(tenant, resource_type, resource, fhir_version)
+                    .await?;
+                Ok((created, true))
+            }
+            // A deleted resource is brought back to life by a subsequent update
+            // (FHIR http.html#delete), continuing the existing version chain
+            // rather than being rejected with `Gone`.
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                let restored = self
+                    .restore_deleted(tenant, resource_type, id, resource)
+                    .await?;
+                Ok((restored, true))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -799,12 +815,14 @@ impl ResourceStorage for MongoBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
         let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = current.resource_type();
         let id = current.id();
 
         let current_filter = doc! {
@@ -988,6 +1006,8 @@ impl ResourceStorage for MongoBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
@@ -1595,6 +1615,181 @@ async fn grouped_string_counts(
 }
 
 impl MongoBackend {
+    /// Brings a soft-deleted resource back to life with new content.
+    ///
+    /// FHIR permits a deleted resource to be restored by a subsequent update
+    /// ([http.html#delete](https://hl7.org/fhir/http.html#delete)), so a `PUT`
+    /// onto a deleted id must succeed instead of failing with `Gone`. The
+    /// restored resource continues the existing version chain (the deletion
+    /// record keeps its version, the restore gets the next one) and keeps the
+    /// FHIR version the resource was originally stored under.
+    ///
+    /// Returns `NotFound` if no deleted document is present — the caller has
+    /// already established one exists, so that only happens under a concurrent
+    /// write.
+    async fn restore_deleted(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let (mut session, transaction_active) = begin_best_effort_multi_write_session(&db).await;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let deleted_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "is_deleted": true,
+        };
+
+        let maybe_deleted = if let Some(active_session) = session.as_mut() {
+            resources
+                .find_one(deleted_filter.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to read deleted resource (session): {}", e))
+                })?
+        } else {
+            resources
+                .find_one(deleted_filter)
+                .await
+                .map_err(|e| internal_error(format!("Failed to read deleted resource: {}", e)))?
+        };
+
+        let Some(deleted_doc) = maybe_deleted else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        };
+
+        let deleted_version = deleted_doc
+            .get_str("version_id")
+            .map_err(|e| internal_error(format!("Missing current version: {}", e)))?
+            .to_string();
+        let new_version = next_version(&deleted_version)?;
+
+        // The restore keeps the FHIR version the resource was stored under.
+        let fhir_version_str = deleted_doc
+            .get_str("fhir_version")
+            .unwrap_or("4.0")
+            .to_string();
+        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+        let mut resource = resource;
+        ensure_resource_identity(resource_type, id, &mut resource);
+        let payload = value_to_document(&resource)?;
+
+        let now = Utc::now();
+        let now_bson = chrono_to_bson(now);
+        let created_at = extract_created_at(&deleted_doc, now);
+
+        let restore_filter = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &deleted_version,
+            "is_deleted": true,
+        };
+        let restore_doc = doc! {
+            "$set": {
+                "version_id": &new_version,
+                "data": Bson::Document(payload.clone()),
+                "last_updated": now_bson,
+                "is_deleted": false,
+                "deleted_at": Bson::Null,
+            }
+        };
+
+        let update_result = if let Some(active_session) = session.as_mut() {
+            resources
+                .update_one(restore_filter.clone(), restore_doc.clone())
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to restore resource (session): {}", e))
+                })?
+        } else {
+            resources
+                .update_one(restore_filter, restore_doc)
+                .await
+                .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?
+        };
+
+        if update_result.matched_count == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        let history_doc = doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "id": id,
+            "version_id": &new_version,
+            "data": Bson::Document(payload),
+            "created_at": chrono_to_bson(created_at),
+            "last_updated": now_bson,
+            "is_deleted": false,
+            "deleted_at": Bson::Null,
+            "fhir_version": fhir_version_str,
+        };
+
+        if let Some(active_session) = session.as_mut() {
+            history
+                .insert_one(history_doc)
+                .session(active_session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!(
+                        "Failed to insert restore history row (session): {}",
+                        e
+                    ))
+                })?;
+        } else {
+            history.insert_one(history_doc).await.map_err(|e| {
+                internal_error(format!("Failed to insert restore history row: {}", e))
+            })?;
+        }
+
+        // The delete dropped the search index entries; rebuild them for the
+        // resource that is live again (`index_resource` clears stale rows first).
+        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
+            .await?;
+
+        // A restored SearchParameter re-enters a tenant's overlay: refresh the
+        // stored-param cache and drop registries.
+        if resource_type == "SearchParameter" {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version,
+            tenant.tenant_id().clone(),
+            resource,
+            created_at,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
     pub(crate) async fn index_resource(
         &self,
         db: &mongodb::Database,
@@ -1732,7 +1927,10 @@ impl MongoBackend {
 
         match &value.value {
             IndexValue::String(v) => {
-                doc.insert("value_string", v.to_lowercase());
+                // Stored as written: `:exact` is case-sensitive, and the
+                // insensitive variants use a case-insensitive regex instead of
+                // a pre-lowercased value.
+                doc.insert("value_string", v.clone());
             }
             IndexValue::Token {
                 system,
@@ -1944,6 +2142,8 @@ impl VersionedStorage for MongoBackend {
         id: &str,
         expected_version: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();

@@ -81,6 +81,74 @@ jobs:
           # The main-thread stack already defaults to 8 MB on macOS, matching
           # the Linux `-zstack-size=8388608`, so no override is needed.
 
+      # Guard against the #306 failure mode: a `tests/<dir>/mod.rs` that declares
+      # submodules but is never compiled because no top-level `tests/*.rs` file
+      # declares `mod <dir>;`. Cargo builds only top-level `tests/*.rs` as test
+      # binaries, so such a subtree is invisible — it silently stops compiling
+      # and running with zero signal. This is exactly how ~24 persistence
+      # integration files rotted unnoticed. Fail loudly instead.
+      #
+      # Exceptions:
+      #   * `common` — the idiomatic on-demand shared-helper module; cargo itself
+      #     special-cases `tests/common/mod.rs` and it is included via `mod common;`
+      #     only in the test files that need it, so a missing top-level declarer is
+      #     expected, not a bug.
+      #   * `pysof` — excluded from the default workspace build (`cargo test
+      #     --workspace` skips it), so its own dead `tests/integration/` subtree is
+      #     tracked separately rather than gating this job.
+      # This is bash (`set -euo pipefail`, `< <(find ...)` process substitution),
+      # which the Windows runner's default PowerShell cannot parse. A bare
+      # `shell: bash` resolves to WSL bash on the self-hosted Windows agent, which
+      # has no distro installed and aborts before running a line — so, exactly like
+      # the MinIO step below, split into a Unix step (`shell: bash`) and a Windows
+      # step pointed at Git Bash via the space-free 8.3 short path. Both run the
+      # identical script; the "Test Rust" job can land on either OS, and exactly one
+      # fires per run via the `runner.os` guard.
+      - name: Guard against unreferenced test subdirectories
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r modrs; do
+            dir=$(basename "$(dirname "$modrs")")
+            tests_dir=$(dirname "$(dirname "$modrs")")
+            crate=$(echo "$modrs" | sed -E 's#^crates/([^/]+)/.*#\1#')
+            [ "$dir" = "common" ] && continue
+            [ "$crate" = "pysof" ] && continue
+            if ! grep -rqE "^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;" "$tests_dir"/*.rs 2>/dev/null; then
+              echo "::error file=${modrs}::${modrs} exists but no top-level ${tests_dir}/*.rs declares 'mod ${dir};' — this suite never compiles or runs (see issue #306)."
+              fail=1
+            fi
+          done < <(find crates/*/tests -mindepth 2 -maxdepth 2 -name mod.rs | sort)
+          if [ "$fail" -ne 0 ]; then
+            echo "Unreferenced test subdirectories found. Add a top-level 'tests/<dir>_suite.rs' with 'mod <dir>;'."
+            exit 1
+          fi
+          echo "All test subdirectories are wired into a top-level test binary."
+      - name: Guard against unreferenced test subdirectories (Windows)
+        if: runner.os == 'Windows'
+        shell: 'C:\Progra~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r modrs; do
+            dir=$(basename "$(dirname "$modrs")")
+            tests_dir=$(dirname "$(dirname "$modrs")")
+            crate=$(echo "$modrs" | sed -E 's#^crates/([^/]+)/.*#\1#')
+            [ "$dir" = "common" ] && continue
+            [ "$crate" = "pysof" ] && continue
+            if ! grep -rqE "^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+${dir}[[:space:]]*;" "$tests_dir"/*.rs 2>/dev/null; then
+              echo "::error file=${modrs}::${modrs} exists but no top-level ${tests_dir}/*.rs declares 'mod ${dir};' — this suite never compiles or runs (see issue #306)."
+              fail=1
+            fi
+          done < <(find crates/*/tests -mindepth 2 -maxdepth 2 -name mod.rs | sort)
+          if [ "$fail" -ne 0 ]; then
+            echo "Unreferenced test subdirectories found. Add a top-level 'tests/<dir>_suite.rs' with 'mod <dir>;'."
+            exit 1
+          fi
+          echo "All test subdirectories are wired into a top-level test binary."
+
       - name: Run tests with all features
         run: |
           cargo test --workspace --all-features
