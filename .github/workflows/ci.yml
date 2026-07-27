@@ -87,35 +87,29 @@ jobs:
           # never run in CI — nothing set this variable, so every run passed it
           # vacuously (#390).
           #
-          # Linux-only, and the gate is now down to exactly one cause, measured
-          # rather than assumed. Run 30303350382 removed this gate and pinned
-          # the job to the Windows agent: 8 of 10 tests panicked in
-          # `crc-fast-1.6.0/src/arch/mod.rs:121` with "x86 features missing
-          # (SSE4.1 && PCLMULQDQ)". The agent is a virtualized guest without
-          # those instructions, and crc-fast 1.6.0 gates its software fallback
-          # behind `#[cfg(target_arch = "x86")]`, so on x86_64 the fallback
-          # never compiles and the arm falls straight into a panic. The AWS S3
-          # SDK reaches it via aws-sdk-s3 -> aws-smithy-checksums -> crc-fast
-          # on every upload (see the Windows MinIO step's
-          # AWS_REQUEST_CHECKSUM_CALCULATION workaround, which dodges the same
-          # code path). The only two tests that passed are the two that never
-          # PUT an object.
+          # Unconditional, on every agent. It was briefly gated to Linux, for
+          # one measured reason that no longer applies. Run 30303350382 pinned
+          # this job to the Windows agent with the gate removed: 8 of 10 tests
+          # panicked in `crc-fast-1.6.0/src/arch/mod.rs:121` with "x86 features
+          # missing (SSE4.1 && PCLMULQDQ)". That agent is a virtualized guest
+          # without those instructions, and crc-fast 1.6.0 gates its software
+          # fallback behind `#[cfg(target_arch = "x86")]` — so on x86_64 the
+          # fallback never compiles and the arm falls straight into a panic.
+          # The AWS S3 SDK reaches it on every upload via aws-sdk-s3 ->
+          # aws-smithy-checksums -> crc-fast; the only two tests that passed
+          # were the two that never PUT an object.
           #
-          # That same run disproved the other half of this gate: Elasticsearch
-          # works fine on the Windows agent. `s3_es_test_read_missing_returns_none`
-          # passed, and it goes through `make_harness()` — ES testcontainer
-          # start, backend construction, and `initialize()` — so the container
-          # is proven, not unproven.
+          # crc-fast fixed the fallback in 1.7.1. aws-smithy-checksums 0.63.12
+          # pinned `crc-fast ~1.6.0`, so reaching the fix meant moving
+          # aws-sdk-s3 to 1.122.0 (-> checksums 0.64.4 -> crc-fast 1.9.0),
+          # which this PR does. Elasticsearch was never a blocker: that same
+          # run had `s3_es_test_read_missing_returns_none` pass, which runs the
+          # whole `make_harness()` path including ES container start and
+          # `initialize()`.
           #
-          # crc-fast fixed the fallback in 1.7.1, but aws-smithy-checksums
-          # 0.63.12 pins `crc-fast ~1.6.0`, so the fix is only reachable by
-          # moving aws-sdk-s3 to >= 1.122.0 (which pulls checksums 0.64.x ->
-          # crc-fast 1.9.0). Once that bump lands, this expression becomes an
-          # unconditional "1" and the suite runs on every agent.
-          #
-          # On non-Linux landings the suite still skips silently; loud-failure
-          # hardening is #390 PR B.
-          RUN_MINIO_S3_ES_TESTS: ${{ runner.os == 'Linux' && '1' || '' }}
+          # Keep this unconditional. Re-gating it to one OS is what let the
+          # suite pass vacuously for its entire existence (#390).
+          RUN_MINIO_S3_ES_TESTS: "1"
         run: |
           cargo test --workspace --all-features
 
