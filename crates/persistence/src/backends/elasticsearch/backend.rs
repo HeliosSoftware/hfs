@@ -151,6 +151,49 @@ impl Debug for ElasticsearchBackend {
 }
 
 impl ElasticsearchBackend {
+    /// The capabilities this backend declares.
+    ///
+    /// Invariant across every valid configuration, so it is exposed as a
+    /// constructor-free associated function. Both [`Backend::supports`] and
+    /// [`Backend::capabilities`] delegate here so the two answers cannot drift
+    /// apart.
+    ///
+    /// # Tenancy
+    ///
+    /// `SharedSchema`, and the reasoning is worth recording because this
+    /// backend looks superficially like a per-tenant topology.
+    /// [`index_name`](Self::index_name) does give each tenant its own index
+    /// (`{prefix}_{tenant}_{type}`), but every document also carries a
+    /// `tenant_id` keyword field that every query filters on with a `term`
+    /// clause. More importantly the separation is a *naming* convention within
+    /// a single cluster reached by a single credential, with no per-index
+    /// policy, quota, or storage boundary in play — a logical partition, not a
+    /// physical one. It therefore declares `SharedSchema`, the weaker of the
+    /// two candidate claims.
+    ///
+    /// Whether the enum should grow a "namespace-per-tenant within one service"
+    /// topology that fits this case (and S3 `BucketPerTenant`) more precisely is
+    /// tracked as a follow-up to issue #369; it is deliberately not decided
+    /// here, since doing so would *strengthen* an isolation claim.
+    pub fn declared_capabilities() -> Vec<BackendCapability> {
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::BasicSearch,
+            BackendCapability::DateSearch,
+            BackendCapability::QuantitySearch,
+            BackendCapability::ReferenceSearch,
+            BackendCapability::ChainedSearch,
+            BackendCapability::ReverseChaining,
+            BackendCapability::FullTextSearch,
+            BackendCapability::Sorting,
+            BackendCapability::CursorPagination,
+            BackendCapability::OffsetPagination,
+            BackendCapability::Include,
+            BackendCapability::Revinclude,
+            BackendCapability::SharedSchema,
+        ]
+    }
+
     /// Creates a new Elasticsearch backend with the given configuration.
     pub fn new(config: ElasticsearchConfig) -> StorageResult<Self> {
         let client = Self::build_client(&config)?;
@@ -340,38 +383,11 @@ impl Backend for ElasticsearchBackend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        matches!(
-            capability,
-            BackendCapability::Crud
-                | BackendCapability::BasicSearch
-                | BackendCapability::DateSearch
-                | BackendCapability::QuantitySearch
-                | BackendCapability::ReferenceSearch
-                | BackendCapability::FullTextSearch
-                | BackendCapability::Sorting
-                | BackendCapability::CursorPagination
-                | BackendCapability::OffsetPagination
-                | BackendCapability::Include
-                | BackendCapability::Revinclude
-                | BackendCapability::SharedSchema
-        )
+        Self::declared_capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::BasicSearch,
-            BackendCapability::DateSearch,
-            BackendCapability::QuantitySearch,
-            BackendCapability::ReferenceSearch,
-            BackendCapability::FullTextSearch,
-            BackendCapability::Sorting,
-            BackendCapability::CursorPagination,
-            BackendCapability::OffsetPagination,
-            BackendCapability::Include,
-            BackendCapability::Revinclude,
-            BackendCapability::SharedSchema,
-        ]
+        Self::declared_capabilities()
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {
@@ -639,7 +655,15 @@ mod tests {
         assert!(backend.supports(BackendCapability::CursorPagination));
         assert!(backend.supports(BackendCapability::Sorting));
         assert!(!backend.supports(BackendCapability::Transactions));
-        assert!(!backend.supports(BackendCapability::ChainedSearch));
+        // Chained/`_has` search resolves via the backend-agnostic resolver over
+        // ES's `search()` (which honours `_id`), so ES declares it.
+        assert!(backend.supports(BackendCapability::ChainedSearch));
+        assert!(backend.supports(BackendCapability::ReverseChaining));
+        // No history/versioning on ES, and never a tenancy topology beyond
+        // shared-schema.
+        assert!(!backend.supports(BackendCapability::Versioning));
+        assert!(!backend.supports(BackendCapability::SchemaPerTenant));
+        assert!(!backend.supports(BackendCapability::DatabasePerTenant));
     }
 
     #[test]

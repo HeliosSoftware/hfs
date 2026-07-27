@@ -1,8 +1,13 @@
-//! Database-per-tenant tenancy strategy.
+//! Database-per-tenant tenancy: SQL/name generation only, not wired into any
+//! backend (see issue #370).
 //!
-//! In this strategy, each tenant has a completely separate database,
-//! providing the highest level of isolation. This approach is suitable
-//! for enterprise customers with strict data isolation requirements.
+//! The types here generate per-tenant database names and connection strings
+//! from a tenant ID. They execute nothing and connect to nothing; no backend
+//! consumes them. In this design each tenant *would* have a completely separate
+//! database, but that topology is not implemented anywhere. Every backend in
+//! the crate instead separates tenants by a `tenant_id` discriminator within
+//! shared tables (the one per-tenant *container* that exists is the S3
+//! backend's `BucketPerTenant` mode, in `backends::s3`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -204,11 +209,20 @@ impl DatabasePerTenantConfig {
     }
 }
 
-/// Database-per-tenant tenancy strategy implementation.
+/// Database-per-tenant tenancy strategy — SQL/name generation only.
 ///
-/// This strategy provides complete isolation by maintaining separate
-/// databases for each tenant. It's the most resource-intensive but
-/// offers the strongest isolation guarantees.
+/// <div class="warning">
+///
+/// This type is not connected to any storage backend and provides no isolation
+/// guarantee. It generates per-tenant database names and connection strings; it
+/// opens no connections and no backend consumes it. See issue #370.
+///
+/// </div>
+///
+/// As a design, this strategy would provide isolation by maintaining separate
+/// databases for each tenant — the most resource-intensive topology — but that
+/// behavior is not deployed. The following describes the intended design, not
+/// runtime behavior.
 ///
 /// # Connection Management
 ///

@@ -485,9 +485,18 @@ impl FilterSqlGenerator {
         // Determine the column and condition based on parameter and operator
         let (_column, condition, sql_value) = self.build_condition(param, op, value, param_num);
 
+        // `tenant_id = ?1` is not optional — see the sibling non-`_filter` path
+        // in `query_builder::build_parameter_condition`, which has always
+        // carried it. Without it this sub-select scans every tenant's
+        // `search_index` and returns a bare `resource_id` set that the outer
+        // query intersects with this tenant's resources, so tenant A's
+        // Patient/123 is returned whenever tenant B's Patient/123 matches — a
+        // cross-tenant match oracle. `?1` is the tenant in every param layout
+        // this builder produces (see `QueryBuilder::with_param_offset`),
+        // so reusing it adds no binding and does not disturb `param_offset`.
         SqlFragment::with_params(
             format!(
-                "resource_id IN (SELECT resource_id FROM search_index WHERE param_name = '{}' AND {})",
+                "resource_id IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND param_name = '{}' AND {})",
                 param, condition
             ),
             vec![SqlParam::string(&sql_value)],

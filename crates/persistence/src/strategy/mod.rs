@@ -1,22 +1,25 @@
-//! Multitenancy strategy implementations.
+//! Tenancy SQL/name generators — not wired into any backend (see issue #370).
 //!
-//! This module provides three tenancy isolation strategies:
+//! Nothing in this module is on a live code path. These are configuration
+//! builders and SQL-string/name generators; no backend consumes a
+//! [`TenancyStrategy`] and no configuration selects one. Every backend in the
+//! crate does shared-schema multitenancy — all tenants' records live together,
+//! separated by a `tenant_id` discriminator filtered on every query — and the
+//! only per-tenant storage *container* implemented anywhere is the S3 backend's
+//! `S3TenancyMode::BucketPerTenant` (which lives in `backends::s3`, not here).
 //!
-//! - [`SharedSchemaStrategy`] - All tenants in one schema with tenant_id column
-//! - [`SchemaPerTenantStrategy`] - Separate database schema per tenant
-//! - [`DatabasePerTenantStrategy`] - Separate database per tenant
+//! The types are:
 //!
-//! # Choosing a Strategy
-//!
-//! | Strategy | Isolation | Performance | Scalability | Complexity |
-//! |----------|-----------|-------------|-------------|------------|
-//! | Shared Schema | Low | High | Medium | Low |
-//! | Schema-per-Tenant | Medium | Medium | Medium | Medium |
-//! | Database-per-Tenant | High | Low | High | High |
+//! - [`SharedSchemaStrategy`] - Emits tenant_id filters + optional RLS SQL text
+//! - [`SchemaPerTenantStrategy`] - Emits schema names / `search_path` SQL (not
+//!   implemented by any backend)
+//! - [`DatabasePerTenantStrategy`] - Emits per-tenant database names / connection
+//!   strings (not implemented by any backend)
 //!
 //! ## Shared Schema
 //!
-//! Best for:
+//! This is the topology every backend actually implements, though backends do
+//! it directly rather than through this generator. The generator would suit:
 //! - Many small tenants with similar data patterns
 //! - Simple deployment and maintenance
 //! - Cost-sensitive environments
@@ -24,11 +27,11 @@
 //! Considerations:
 //! - All tenants share resources (connections, indexes)
 //! - Requires careful index design (tenant_id should be leading)
-//! - Row-Level Security can add additional protection
+//! - Row-Level Security SQL can be generated, but no backend executes it
 //!
 //! ## Schema-per-Tenant
 //!
-//! Best for:
+//! Not implemented by any backend. If it were wired up it would suit:
 //! - Medium number of tenants
 //! - Need for logical isolation
 //! - Tenant-specific customizations
@@ -40,17 +43,20 @@
 //!
 //! ## Database-per-Tenant
 //!
-//! Best for:
-//! - Enterprise customers requiring complete isolation
-//! - Regulatory requirements (data residency)
+//! Not implemented by any SQL backend. If it were wired up it would suit:
+//! - Tenants requiring a separate database or storage container
+//! - Data-residency needs
 //! - Tenants with very different usage patterns
 //!
 //! Considerations:
 //! - Highest resource usage (connection pools per tenant)
 //! - Most complex operations (migrations across databases)
-//! - Best data isolation and portability
+//! - Strongest data isolation and portability
 //!
 //! # Example
+//!
+//! This constructs the strategy *config* types; it does not change where any
+//! tenant's data is stored (see issue #370).
 //!
 //! ```
 //! use helios_persistence::strategy::{
@@ -97,17 +103,30 @@ use crate::tenant::TenantId;
 
 /// The tenancy strategy configuration.
 ///
-/// This enum defines how tenant isolation is implemented at the database level.
+/// This enum names a tenant-placement *topology type*. It describes what a
+/// strategy would generate, not what any running deployment does.
+///
+/// <div class="warning">
+///
+/// This describes a topology type, not a live deployment, and is not an
+/// isolation assurance. No backend consumes a `TenancyStrategy`; constructing
+/// one changes nothing about where tenant data is stored. To learn what a
+/// running backend actually does, query `Backend::capabilities()`. See issue
+/// #370.
+///
+/// </div>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TenancyStrategy {
-    /// All tenants share the same schema with a tenant_id column.
+    /// All tenants share the same schema with a tenant_id column. This is the
+    /// topology every backend implements (directly, not via this generator).
     SharedSchema(SharedSchemaConfig),
 
-    /// Each tenant has a separate database schema.
+    /// Each tenant has a separate database schema. Not implemented by any
+    /// backend.
     SchemaPerTenant(SchemaPerTenantConfig),
 
-    /// Each tenant has a separate database.
+    /// Each tenant has a separate database. Not implemented by any backend.
     DatabasePerTenant(DatabasePerTenantConfig),
 }
 
@@ -129,6 +148,15 @@ impl fmt::Display for TenancyStrategy {
 
 impl TenancyStrategy {
     /// Returns the isolation level of this strategy.
+    ///
+    /// <div class="warning">
+    ///
+    /// This reports the isolation level of a topology *type*, not of a live
+    /// deployment, and is not an isolation assurance. No backend consumes a
+    /// `TenancyStrategy`; query `Backend::capabilities()` for what a running
+    /// backend actually does. See issue #370.
+    ///
+    /// </div>
     pub fn isolation_level(&self) -> IsolationLevel {
         match self {
             TenancyStrategy::SharedSchema(_) => IsolationLevel::Logical,
@@ -148,6 +176,15 @@ impl TenancyStrategy {
 }
 
 /// Level of tenant isolation.
+///
+/// <div class="warning">
+///
+/// This describes a topology type, not a live deployment, and is not an
+/// isolation assurance. No backend consumes a `TenancyStrategy`; query
+/// `Backend::capabilities()` for what a running backend actually does. See
+/// issue #370.
+///
+/// </div>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IsolationLevel {
     /// Logical isolation via tenant_id column.

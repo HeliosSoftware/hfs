@@ -178,6 +178,49 @@ impl Default for SqliteBackendConfig {
 }
 
 impl SqliteBackend {
+    /// The capabilities this backend declares.
+    ///
+    /// Invariant across every valid configuration, so it is exposed as a
+    /// constructor-free associated function. Both [`Backend::supports`] and
+    /// [`Backend::capabilities`] delegate here so the two answers cannot drift
+    /// apart.
+    ///
+    /// # Tenancy
+    ///
+    /// `SharedSchema` only: one `resources` table keyed by
+    /// `(tenant_id, resource_type, id)` with a `tenant_id` discriminator. There
+    /// is no per-tenant database file or `ATTACH` logic anywhere in this
+    /// backend, so it declares neither `SchemaPerTenant` nor
+    /// `DatabasePerTenant`.
+    pub fn declared_capabilities() -> Vec<BackendCapability> {
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::Versioning,
+            BackendCapability::InstanceHistory,
+            BackendCapability::TypeHistory,
+            BackendCapability::SystemHistory,
+            BackendCapability::BasicSearch,
+            BackendCapability::DateSearch,
+            BackendCapability::QuantitySearch,
+            BackendCapability::ReferenceSearch,
+            BackendCapability::ChainedSearch,
+            BackendCapability::ReverseChaining,
+            BackendCapability::FullTextSearch,
+            BackendCapability::Sorting,
+            BackendCapability::OffsetPagination,
+            BackendCapability::CursorPagination,
+            BackendCapability::Transactions,
+            BackendCapability::OptimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
+            BackendCapability::Include,
+            BackendCapability::Revinclude,
+            BackendCapability::InDbSofRunner,
+            BackendCapability::SharedSchema,
+        ]
+    }
+
     /// Creates a new in-memory SQLite backend.
     pub fn in_memory() -> StorageResult<Self> {
         Self::with_config(":memory:", SqliteBackendConfig::default())
@@ -515,50 +558,11 @@ impl Backend for SqliteBackend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        matches!(
-            capability,
-            BackendCapability::Crud
-                | BackendCapability::Versioning
-                | BackendCapability::InstanceHistory
-                | BackendCapability::TypeHistory
-                | BackendCapability::SystemHistory
-                | BackendCapability::BasicSearch
-                | BackendCapability::DateSearch
-                | BackendCapability::ReferenceSearch
-                | BackendCapability::Sorting
-                | BackendCapability::OffsetPagination
-                | BackendCapability::Transactions
-                | BackendCapability::OptimisticLocking
-                | BackendCapability::BulkExport
-                | BackendCapability::BulkSubmitIngest
-                | BackendCapability::BulkSubmitRestWorker
-                | BackendCapability::Include
-                | BackendCapability::Revinclude
-                | BackendCapability::SharedSchema
-        )
+        Self::declared_capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::Versioning,
-            BackendCapability::InstanceHistory,
-            BackendCapability::TypeHistory,
-            BackendCapability::SystemHistory,
-            BackendCapability::BasicSearch,
-            BackendCapability::DateSearch,
-            BackendCapability::ReferenceSearch,
-            BackendCapability::Sorting,
-            BackendCapability::OffsetPagination,
-            BackendCapability::Transactions,
-            BackendCapability::OptimisticLocking,
-            BackendCapability::BulkExport,
-            BackendCapability::BulkSubmitIngest,
-            BackendCapability::BulkSubmitRestWorker,
-            BackendCapability::Include,
-            BackendCapability::Revinclude,
-            BackendCapability::SharedSchema,
-        ]
+        Self::declared_capabilities()
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {
@@ -795,7 +799,16 @@ mod tests {
         assert!(backend.supports(BackendCapability::BulkExport));
         assert!(backend.supports(BackendCapability::BulkSubmitIngest));
         assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
-        assert!(!backend.supports(BackendCapability::FullTextSearch));
+        // FullTextSearch is now implemented (tenant-scoped `resource_fts`); the
+        // other newly-declared capabilities are verified against the golden list
+        // in `tests/backend_capability_contract.rs`.
+        assert!(backend.supports(BackendCapability::FullTextSearch));
+        assert!(backend.supports(BackendCapability::QuantitySearch));
+        assert!(backend.supports(BackendCapability::CursorPagination));
+        assert!(backend.supports(BackendCapability::InDbSofRunner));
+        // Never a tenant-isolation topology beyond shared-schema (#369).
+        assert!(!backend.supports(BackendCapability::SchemaPerTenant));
+        assert!(!backend.supports(BackendCapability::DatabasePerTenant));
     }
 
     #[tokio::test]

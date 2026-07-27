@@ -2,6 +2,19 @@
 //!
 //! This module defines the [`CapabilityMatrix`] which maps backends to their
 //! support levels for each capability. This drives test execution decisions.
+//!
+//! # This file is documentation only — it enforces nothing
+//!
+//! Cargo never compiles it. No test target declares `mod common;`, so this
+//! entire directory is dead scaffolding (see `tests/backend_error_handling.rs`,
+//! which records the same thing). Nothing here has ever been executed, which is
+//! precisely why this matrix and the backends' own declarations were free to
+//! drift apart until issue #369 caught it.
+//!
+//! The real, executed gate on what each backend advertises is
+//! `tests/backend_capability_contract.rs`. Edits here are bookkeeping — do not
+//! mistake them for reconciliation. Whether this matrix and the surrounding
+//! harness get wired up or deleted is tracked in #306 / #361.
 
 use std::collections::HashMap;
 
@@ -159,8 +172,13 @@ impl CapabilityMatrix {
                     SupportLevel::Implemented,
                 ),
                 (BackendCapability::SharedSchema, SupportLevel::Implemented),
-                (BackendCapability::SchemaPerTenant, SupportLevel::Planned),
-                (BackendCapability::DatabasePerTenant, SupportLevel::Planned),
+                // Not `Planned`: design discussion #28 chose shared-schema for
+                // Postgres and declined these. See #369.
+                (BackendCapability::SchemaPerTenant, SupportLevel::NotPlanned),
+                (
+                    BackendCapability::DatabasePerTenant,
+                    SupportLevel::NotPlanned,
+                ),
             ],
         );
 
@@ -309,6 +327,14 @@ impl CapabilityMatrix {
                 (BackendCapability::Sorting, SupportLevel::NotPlanned),
                 (BackendCapability::BulkExport, SupportLevel::Implemented),
                 (BackendCapability::BulkSubmitIngest, SupportLevel::Implemented),
+                // S3 tenancy is mode-dependent (`S3TenancyMode`): a
+                // `PrefixPerTenant` instance is shared-schema, a
+                // `BucketPerTenant` instance is database-per-tenant, and an
+                // instance declares exactly one. This matrix is keyed by
+                // `BackendKind`, so it structurally cannot express that — both
+                // rows read `Implemented`, which is true of the backend and
+                // false of every individual deployment. See #369 and
+                // `S3Backend::declared_capabilities_for`.
                 (BackendCapability::SharedSchema, SupportLevel::Implemented),
                 (BackendCapability::SchemaPerTenant, SupportLevel::NotPlanned),
                 (BackendCapability::DatabasePerTenant, SupportLevel::Implemented),

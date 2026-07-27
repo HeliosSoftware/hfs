@@ -146,7 +146,55 @@ impl ReferenceHandler {
     ///
     /// This searches for references where the target resource has a matching identifier.
     /// Requires a join or subquery on the identifier search index.
+    ///
+    /// # Shape: uncorrelated `IN`, not a correlated `EXISTS`
+    ///
+    /// The `si2` sub-select yields the target's `Type/id`, and the *enclosing*
+    /// row's `value_reference` is compared against that set from the outer
+    /// scope. It deliberately does **not** correlate into the sub-select: this
+    /// condition is embedded in a `SELECT … FROM search_index` and `si2` is
+    /// itself `search_index`, so an unqualified `value_reference` written
+    /// *inside* the sub-select binds to `si2`'s own column (innermost scope
+    /// wins), not to the referencing row's. `si2` rows are `identifier` rows,
+    /// whose `value_reference` is NULL, so the correlated form was always
+    /// false and `:identifier` matched nothing at all.
+    ///
+    /// Matching is version-agnostic, like [`Self::build_reference_condition`]:
+    /// a stored `Patient/p1/_history/2` is normalized to `Patient/p1` before
+    /// comparison. Absolute-URL references are not resolved (unchanged).
+    ///
+    /// # Tenant scoping
+    ///
+    /// Every `si2` sub-select carries `si2.tenant_id = ?1`. It is load-bearing,
+    /// not defensive: without it the sub-select yields *any* tenant's target,
+    /// so `subject:identifier=…` returns this tenant's rows on the strength of
+    /// another tenant's identifiers — a cross-tenant match oracle, and a
+    /// violation of the `tenant_id` discriminator that
+    /// [`BackendCapability::SharedSchema`](crate::core::BackendCapability::SharedSchema)
+    /// promises every query carries. The Postgres equivalent has always scoped
+    /// both levels (`postgres/search/query_builder.rs`).
+    ///
+    /// `?1` is the tenant in every param layout `QueryBuilder` produces
+    /// (see its `with_param_offset`), so reusing it consumes no binding and
+    /// leaves `param_num` arithmetic untouched. `si2.resource_type` is
+    /// deliberately *not* constrained to the searched type: `si2` describes the
+    /// reference *target*, whose type differs — it is instead concatenated into
+    /// the compared `Type/id`, which is what pins the match to the right target.
     fn build_identifier_condition(identifier_value: &str, param_num: usize) -> SqlFragment {
+        // The enclosing row's reference, stripped of any `/_history/<v>` suffix.
+        const REF_BASE: &str = "CASE WHEN INSTR(value_reference, '/_history/') > 0 \
+             THEN SUBSTR(value_reference, 1, INSTR(value_reference, '/_history/') - 1) \
+             ELSE value_reference END";
+
+        // Builds `<ref-base> IN (SELECT Type/id FROM search_index si2 WHERE ... AND <pred>)`.
+        fn target_in(pred: String) -> String {
+            format!(
+                "{REF_BASE} IN (SELECT si2.resource_type || '/' || si2.resource_id \
+                 FROM search_index si2 \
+                 WHERE si2.tenant_id = ?1 AND si2.param_name = 'identifier' AND {pred})"
+            )
+        }
+
         // Parse the identifier value (system|value format)
         if let Some(pipe_pos) = identifier_value.find('|') {
             let system = &identifier_value[..pipe_pos];
@@ -155,39 +203,33 @@ impl ReferenceHandler {
             if system.is_empty() {
                 // |value - match value with no system
                 SqlFragment::with_params(
-                    format!(
-                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND (si2.value_token_system IS NULL OR si2.value_token_system = '') AND si2.value_token_code = ?{})",
-                        param_num
-                    ),
+                    target_in(format!(
+                        "(si2.value_token_system IS NULL OR si2.value_token_system = '') \
+                         AND si2.value_token_code = ?{param_num}"
+                    )),
                     vec![SqlParam::string(value)],
                 )
             } else if value.is_empty() {
                 // system| - match any value in system
                 SqlFragment::with_params(
-                    format!(
-                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_system = ?{})",
-                        param_num
-                    ),
+                    target_in(format!("si2.value_token_system = ?{param_num}")),
                     vec![SqlParam::string(system)],
                 )
             } else {
                 // system|value - exact match
                 SqlFragment::with_params(
-                    format!(
-                        "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_system = ?{} AND si2.value_token_code = ?{})",
+                    target_in(format!(
+                        "si2.value_token_system = ?{} AND si2.value_token_code = ?{}",
                         param_num,
                         param_num + 1
-                    ),
+                    )),
                     vec![SqlParam::string(system), SqlParam::string(value)],
                 )
             }
         } else {
             // Just a value - match any system
             SqlFragment::with_params(
-                format!(
-                    "EXISTS (SELECT 1 FROM search_index si2 WHERE si2.resource_id = SUBSTR(value_reference, INSTR(value_reference, '/') + 1) AND si2.param_name = 'identifier' AND si2.value_token_code = ?{})",
-                    param_num
-                ),
+                target_in(format!("si2.value_token_code = ?{param_num}")),
                 vec![SqlParam::string(identifier_value)],
             )
         }
@@ -304,9 +346,32 @@ mod tests {
     #[test]
     fn test_reference_identifier_modifier() {
         let value = SearchValue::new(SearchPrefix::Eq, "http://example.org|12345");
-        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::Identifier), 0);
+        // Offset 2 is what `QueryBuilder` passes: ?1 = tenant, ?2 = resource type.
+        let frag = ReferenceHandler::build_sql(&value, Some(&SearchModifier::Identifier), 2);
 
-        assert!(frag.sql.contains("EXISTS"));
-        assert!(frag.sql.contains("identifier"));
+        assert!(frag.sql.contains("si2.param_name = 'identifier'"));
+        assert!(frag.sql.contains("si2.value_token_system = ?3"));
+        assert!(frag.sql.contains("si2.value_token_code = ?4"));
+        assert_eq!(frag.params.len(), 2);
+
+        // The sub-select is uncorrelated and yields the target's `Type/id`; the
+        // referencing row's `value_reference` is compared from the outer scope.
+        // Written inside the sub-select it would bind to `si2`'s own (NULL)
+        // column instead, which is what made `:identifier` match nothing.
+        assert!(
+            frag.sql
+                .contains("IN (SELECT si2.resource_type || '/' || si2.resource_id"),
+            "identifier match must compare against the target's Type/id: {}",
+            frag.sql
+        );
+        let subselect_start = frag.sql.find("(SELECT si2").expect("sub-select");
+        assert!(
+            !frag.sql[subselect_start..].contains("value_reference"),
+            "`value_reference` inside the sub-select would resolve to si2's own column: {}",
+            frag.sql
+        );
+
+        // Tenant scoping is load-bearing (see `build_identifier_condition`).
+        assert!(frag.sql.contains("si2.tenant_id = ?1"));
     }
 }

@@ -7,7 +7,8 @@
 //! # Features
 //!
 //! - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-//! - **Multitenancy**: Three isolation strategies (shared schema, schema-per-tenant, database-per-tenant)
+//! - **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on
+//!   every backend; the S3 backend additionally offers a bucket-per-tenant mode
 //! - **Full FHIR Search**: All parameter types, modifiers, chaining, _include/_revinclude
 //! - **Versioning**: Full resource history with optimistic locking
 //! - **Transactions**: ACID transactions with bundle support
@@ -41,7 +42,8 @@
 //! - [`types`] - Core types for stored resources and search
 //! - [`error`] - Error types for all operations
 //! - [`core`] - Storage traits and abstractions
-//! - [`strategy`] - Tenancy isolation strategies (shared schema, schema-per-tenant, database-per-tenant)
+//! - [`strategy`] - Tenancy isolation strategy types and SQL generators (not
+//!   wired into any backend — see #370)
 //! - [`backends`] - Backend implementations (SQLite, PostgreSQL, etc.)
 //!
 //! # Quick Start
@@ -185,7 +187,15 @@ pub use core::{
     TransactionProvider, VersionedStorage,
 };
 
-// Re-export tenancy strategies
+// Re-export tenancy strategies.
+//
+// These are configuration builders and SQL-string generators. No backend calls
+// them: constructing a `SchemaPerTenantStrategy` or `DatabasePerTenantStrategy`
+// does not configure, enable, or switch on schema-per-tenant or
+// database-per-tenant behavior anywhere in this crate. Every SQL backend does
+// shared-schema multitenancy via a `tenant_id` discriminator column, and
+// `Backend::capabilities()` reports accordingly (see #369). Whether these types
+// get wired up or removed is tracked in #370.
 pub use strategy::{
     DatabasePerTenantConfig, DatabasePerTenantStrategy, IsolationLevel, SchemaPerTenantConfig,
     SchemaPerTenantStrategy, SharedSchemaConfig, SharedSchemaStrategy, TenancyStrategy,

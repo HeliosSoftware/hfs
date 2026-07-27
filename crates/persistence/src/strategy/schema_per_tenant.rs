@@ -1,8 +1,12 @@
-//! Schema-per-tenant tenancy strategy.
+//! Schema-per-tenant tenancy: SQL/name generation only, not wired into any
+//! backend (see issue #370).
 //!
-//! In this strategy, each tenant has a separate PostgreSQL schema.
-//! This provides logical isolation while sharing the same database
-//! and connection pool.
+//! The types here generate PostgreSQL schema names and `search_path` SQL from a
+//! tenant ID. They execute nothing and connect to nothing; no backend consumes
+//! them. In this design each tenant *would* have a separate PostgreSQL schema,
+//! but that topology is not implemented anywhere. Every backend in the crate
+//! instead separates tenants by a `tenant_id` discriminator within shared
+//! tables.
 
 use serde::{Deserialize, Serialize};
 
@@ -128,11 +132,20 @@ impl SchemaPerTenantConfig {
     }
 }
 
-/// Schema-per-tenant tenancy strategy implementation.
+/// Schema-per-tenant tenancy strategy — SQL/name generation only.
 ///
-/// This strategy uses PostgreSQL schemas to isolate tenant data.
-/// Each tenant has its own schema, and the connection's `search_path`
-/// is set to include the tenant's schema.
+/// <div class="warning">
+///
+/// This type is not connected to any storage backend and provides no isolation
+/// guarantee. It generates schema names and `search_path` SQL; it opens no
+/// connections and no backend consumes it. See issue #370.
+///
+/// </div>
+///
+/// As a design, this strategy would use PostgreSQL schemas to isolate tenant
+/// data — each tenant with its own schema, the connection's `search_path` set
+/// to include it — but that behavior is not deployed. The following describes
+/// the intended design, not runtime behavior.
 ///
 /// # Schema Naming
 ///
