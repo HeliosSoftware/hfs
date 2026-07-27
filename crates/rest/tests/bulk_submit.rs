@@ -20,7 +20,7 @@ use helios_persistence::core::{
 use helios_persistence::error::StorageResult;
 use helios_rest::ServerConfig;
 use helios_rest::bulk_export_auth::BearerScopeAuth;
-use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
+use helios_rest::config::{BulkSubmitConfig, MultitenancyConfig, TenantRoutingMode};
 use serde_json::{Value, json};
 
 /// A fetcher that serves a fixed manifest + NDJSON from memory.
@@ -90,6 +90,18 @@ async fn create_submit_server() -> (
     Arc<LocalFsOutputStore>,
     tempfile::TempDir,
 ) {
+    create_submit_server_with(BulkSubmitConfig::default()).await
+}
+
+async fn create_submit_server_with(
+    bulk_submit: BulkSubmitConfig,
+) -> (
+    TestServer,
+    Arc<SqliteBackend>,
+    Arc<MockFetcher>,
+    Arc<LocalFsOutputStore>,
+    tempfile::TempDir,
+) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -118,6 +130,7 @@ async fn create_submit_server() -> (
         },
         base_url: "http://localhost:8080".to_string(),
         default_tenant: "test-tenant".to_string(),
+        bulk_submit,
         ..ServerConfig::for_testing()
     };
 
@@ -173,6 +186,31 @@ fn status_body() -> Value {
             {"name": "submissionId", "valueString": "it-1"}
         ]
     })
+}
+
+/// Kicks off a submission plus its status request and returns the poll path.
+async fn start_and_get_poll_path(server: &TestServer) -> String {
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let status = server
+        .post("/$bulk-submit-status")
+        .json(&status_body())
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    status
+        .headers()
+        .get("content-location")
+        .expect("Content-Location")
+        .to_str()
+        .unwrap()
+        .trim_start_matches("http://localhost:8080")
+        .to_string()
 }
 
 #[tokio::test]
@@ -320,4 +358,83 @@ async fn test_full_lifecycle_ingests_and_polls() {
         server.get(poll_path).await.status_code(),
         StatusCode::NOT_FOUND
     );
+}
+
+// ── Status-poll pacing: Retry-After + rate limiting (issue #399) ──────────────
+
+#[tokio::test]
+async fn test_in_progress_poll_advertises_the_configured_retry_after() {
+    let (server, ..) = create_submit_server_with(BulkSubmitConfig {
+        retry_after_secs: 7,
+        ..BulkSubmitConfig::default()
+    })
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    // The worker has not run, so the submission is still in progress.
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "7",
+        "the in-progress poll must advertise HFS_BULK_SUBMIT_RETRY_AFTER"
+    );
+}
+
+#[tokio::test]
+async fn test_poll_beyond_the_rate_limit_returns_429_with_retry_after() {
+    // Spec (build.fhir.org submit.html): Data Consumers SHOULD rate-limit the
+    // status endpoint and return Retry-After so clients back off.
+    let (server, ..) = create_submit_server_with(BulkSubmitConfig {
+        poll_rate_limit: 2,
+        poll_rate_window_secs: 60,
+        ..BulkSubmitConfig::default()
+    })
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    for _ in 0..2 {
+        assert_eq!(
+            server.get(&poll_path).await.status_code(),
+            StatusCode::ACCEPTED,
+            "polls within the limit must be served"
+        );
+    }
+
+    let throttled = server.get(&poll_path).await;
+    assert_eq!(throttled.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    let secs: u64 = throttled
+        .headers()
+        .get("retry-after")
+        .expect("429 must carry Retry-After")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Retry-After must be delta-seconds");
+    assert!(
+        (1..=60).contains(&secs),
+        "Retry-After must point inside the rate window, got {secs}"
+    );
+    // The rejection is a FHIR OperationOutcome, not an empty body.
+    let outcome: Value = throttled.json();
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    assert_eq!(outcome["issue"][0]["code"], "throttled");
+}
+
+#[tokio::test]
+async fn test_poll_rate_limit_of_zero_disables_throttling() {
+    let (server, ..) = create_submit_server_with(BulkSubmitConfig {
+        poll_rate_limit: 0,
+        ..BulkSubmitConfig::default()
+    })
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    for _ in 0..12 {
+        assert_eq!(
+            server.get(&poll_path).await.status_code(),
+            StatusCode::ACCEPTED,
+            "poll rate limiting must be off when the limit is 0"
+        );
+    }
 }
