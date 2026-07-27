@@ -306,6 +306,7 @@ queries-add-condition = Bedingung hinzufügen
 queries-includes = Includes
 queries-result-controls = Ergebnis-Steuerung
 queries-remove = Entfernen
+queries-match-is = ist
 queries-chain-into = Nach einer Eigenschaft der referenzierten Ressource filtern
 queries-chain-any-target = beliebig
 queries-has-pill = hat eine verknüpfte

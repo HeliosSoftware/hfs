@@ -310,6 +310,7 @@ queries-add-condition = Add condition
 queries-includes = Includes
 queries-result-controls = Result controls
 queries-remove = Remove
+queries-match-is = is
 queries-chain-into = Filter by a property of the referenced resource
 queries-chain-any-target = any
 queries-has-pill = has a related

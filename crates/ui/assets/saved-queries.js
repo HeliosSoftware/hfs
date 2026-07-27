@@ -346,7 +346,7 @@
     }
     var modifier = document.createElement("select");
     modifier.className = "builder-row__modifier";
-    option(modifier, "", "—", !selectedMod);
+    option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
     COLON_MODIFIERS.forEach(function (m) {
       option(modifier, m, ":" + m, selectedMod === m);
     });
@@ -555,7 +555,7 @@
     if (kind !== "control") {
       var modifier = document.createElement("select");
       modifier.className = "builder-row__modifier";
-      option(modifier, "", "—", !selectedMod);
+      option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
       if (kind === "include") {
         option(modifier, "iterate", ":iterate", selectedMod === "iterate");
       } else {
