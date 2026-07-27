@@ -46,6 +46,37 @@ test.describe("query builder", () => {
       .not.toBe(firstPage.join());
   });
 
+  /// Chained search end to end (#406): the two chain directions meet on the
+  /// patient in the middle — Practitioner <- Patient (generalPractitioner)
+  /// <- Observation (subject) — and the combined query returns exactly it.
+  test("a combined chain and _has query runs and returns the linked patient", async ({
+    queries,
+    request,
+  }) => {
+    // Unique per run: the suite may reuse a persistent dev server.
+    const tag = Date.now().toString(36);
+    const gp = await createResource(request, "Practitioner", {
+      name: [{ family: `ChainSmith${tag}` }],
+    });
+    const patient = await createResource(request, "Patient", {
+      name: [{ family: "ChainLinked" }],
+      generalPractitioner: [{ reference: `Practitioner/${gp}` }],
+    });
+    await createResource(request, "Observation", {
+      status: "final",
+      code: { coding: [{ code: `chain-94-${tag}` }] },
+      subject: { reference: `Patient/${patient}` },
+    });
+
+    await queries.goto();
+    await queries.builder.run(
+      `Patient?_has:Observation:patient:code=chain-94-${tag}&general-practitioner.name=ChainSmith${tag}`,
+    );
+    await queries.results.waitShown();
+    await expect(queries.results.rows).toHaveCount(1);
+    await expect(queries.results.rows.first()).toContainText(patient);
+  });
+
   test("adding a condition row hydrates the builder", async ({ queries }) => {
     // The builder sections are hidden until there's a base query to parse.
     await queries.builder.setUrl("Patient");
