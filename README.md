@@ -369,8 +369,8 @@ JWT/bearer auth (`HFS_AUTH_*`, e.g. `HFS_AUTH_ENABLED`, `HFS_AUTH_JWKS_URL`, `HF
 | `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | `true` | Re-run the activation handshake for stored `requested` subscriptions during rehydration |
 | `HFS_BULK_EXPORT_ENABLED` | `true` | Enable the [Bulk Data Export](crates/rest/README.md#bulk-data-export) `$export` operation; when `false`, all `$export` endpoints return `501` |
 | `HFS_BULK_EXPORT_OUTPUT_BACKEND` | `local-fs` | Bulk export output store: `local-fs` or `s3`. See the [rest crate README](crates/rest/README.md#bulk-data-export) for the full `HFS_BULK_EXPORT_*` table |
-| `HFS_BULK_SUBMIT_ENABLED` | `true` | Enable the Bulk Data Submit `$bulk-submit` operation (HFS as Data Consumer — fetches a provider manifest and ingests it); when `false`, all `$bulk-submit` endpoints return `501`. Available on `sqlite`/`postgres` (+ `-elasticsearch` composites). See the "Bulk Data Submit" section of `CLAUDE.md` for the full `HFS_BULK_SUBMIT_*` table |
-| `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Bulk submit status-artifact store: `local-fs` or `s3` |
+| `HFS_BULK_SUBMIT_ENABLED` | `true` | Enable the [Bulk Data Submit](crates/rest/README.md#bulk-data-submit) `$bulk-submit` operation (HFS as Data Consumer — fetches a provider manifest and ingests it); when `false`, all `$bulk-submit` endpoints return `501`. Available on `sqlite`/`postgres` (+ `-elasticsearch` composites) |
+| `HFS_BULK_SUBMIT_OUTPUT_BACKEND` | `local-fs` | Bulk submit status-artifact store: `local-fs` or `s3`. See the [rest crate README](crates/rest/README.md#bulk-data-submit) for the full `HFS_BULK_SUBMIT_*` table |
 
 The SMTP delivery channel (`HFS_SUBSCRIPTION_SMTP_*`), delivery-retry tuning (`HFS_SUBSCRIPTION_HANDSHAKE_*`), and the remaining startup-rehydration knobs (`HFS_SUBSCRIPTION_REHYDRATE_*`) are documented in the [helios-subscriptions README](crates/subscriptions/README.md).
 

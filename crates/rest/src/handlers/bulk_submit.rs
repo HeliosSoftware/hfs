@@ -6,7 +6,8 @@
 //! poll / cancel; and `GET /bulk-submit-file/{token}/{part}` serves HFS-hosted
 //! status-manifest artifacts.
 //!
-//! See `submit.html` (Argo25 branch of the Bulk Data IG).
+//! Implements the FHIR Bulk Data Access **Submit** operation:
+//! <https://build.fhir.org/ig/HL7/bulk-data/en/submit.html>.
 
 use std::time::Duration;
 
@@ -604,7 +605,7 @@ where
         return Response::builder()
             .status(StatusCode::ACCEPTED)
             .header("X-Progress", format!("processing {pct}% complete"))
-            .header("Retry-After", "120")
+            .header("Retry-After", cfg.retry_after_secs.to_string())
             .body(Body::empty())
             .map_err(|e| RestError::InternalError {
                 message: e.to_string(),
@@ -625,9 +626,12 @@ where
     let base = state.base_url().trim_end_matches('/');
 
     let mut output_arr = Vec::new();
-    let mut error_arr = Vec::new();
+    let mut outcome_arr = Vec::new();
     let mut deleted_arr = Vec::new();
-    let mut requires_token = cfg.requires_access_token != "false";
+    // `requiresAccessToken` describes whether retrieving *any* file requires a
+    // token. Seed from the configured posture, then OR in each file — never let a
+    // single open file clear a token requirement set by another file or the config.
+    let mut requires_token = cfg.requires_access_token == "true";
 
     for f in &files {
         let resource_type = f
@@ -650,20 +654,23 @@ where
         // `/bulk-submit-file/{poll_token}/{part}` surface so downloads are gated by
         // submit ownership + `system/bulk-submit` — never the export-file surface.
         // Pre-signed URLs (S3) are capability URLs and are used as-is.
+        requires_token |= dl.requires_access_token;
         let url = if dl.requires_access_token {
-            requires_token = true;
             format!(
                 "{base}/bulk-submit-file/{token}/{resource_type}-{}",
                 f.part_index
             )
         } else {
-            requires_token = false;
             dl.url
         };
         let url = serde_json::Value::String(url);
         match f.file_type.as_str() {
             "output" => {
-                let mut entry = json!({ "url": url, "count": f.line_count });
+                let mut entry = json!({
+                    "url": url,
+                    "count": f.line_count,
+                    "fileSize": f.byte_count,
+                });
                 if let Some(rt) = &f.resource_type {
                     entry["type"] = json!(rt);
                 }
@@ -676,15 +683,20 @@ where
                 let mut entry = json!({
                     "url": url,
                     "count": f.line_count,
+                    "fileSize": f.byte_count,
                     "manifestUrl": f.manifest_url.clone().unwrap_or_default(),
                 });
                 if let Some(cs) = &f.count_severity {
                     entry["countSeverity"] = severity_array(cs);
                 }
-                error_arr.push(entry);
+                outcome_arr.push(entry);
             }
             "deleted" => {
-                deleted_arr.push(json!({ "url": url, "count": f.line_count }));
+                deleted_arr.push(json!({
+                    "url": url,
+                    "count": f.line_count,
+                    "fileSize": f.byte_count,
+                }));
             }
             _ => {}
         }
@@ -696,7 +708,7 @@ where
         "requiresAccessToken": requires_token,
         "outputFormat": "application/fhir+ndjson",
         "output": output_arr,
-        "error": error_arr,
+        "outcome": outcome_arr,
         "deleted": deleted_arr,
         // `link` is part of the status-manifest schema; HFS returns a single,
         // non-paginated manifest, so it is always empty.
