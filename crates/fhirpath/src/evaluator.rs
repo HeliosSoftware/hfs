@@ -2069,17 +2069,6 @@ fn evaluate_invocation(
                         // Check if this field exists directly in the object
                         let exists_directly = obj.contains_key(name.as_str());
 
-                        // Check if it would be found through polymorphic access
-                        let _found_polymorphically = if !exists_directly {
-                            crate::polymorphic_access::access_polymorphic_element(
-                                obj,
-                                name.as_str(),
-                            )
-                            .is_some()
-                        } else {
-                            false
-                        };
-
                         // If the field exists directly but could also be a polymorphic field name
                         if exists_directly
                             && could_be_typed_polymorphic_field(name.as_str(), obj, context)
@@ -2096,10 +2085,14 @@ fn evaluate_invocation(
                         return Ok(result.clone()); // Direct access succeeded
                     }
 
-                    // Try polymorphic access for FHIR choice elements
-                    if let Some(result) =
-                        crate::polymorphic_access::access_polymorphic_element(obj, name.as_str())
-                    {
+                    // Try polymorphic access for FHIR choice elements. The context's
+                    // FHIR version selects the choice-element metadata table — using
+                    // the build default here resolved R5/R6 data against R4 (#309).
+                    if let Some(result) = crate::polymorphic_access::access_polymorphic_element(
+                        obj,
+                        name.as_str(),
+                        context.fhir_version,
+                    ) {
                         return Ok(result); // Return polymorphic result
                     }
 
@@ -7986,6 +7979,7 @@ fn apply_type_operation(
             op,
             &type_name_for_poly,
             namespace_for_poly_opt,
+            context,
         );
 
         if op == "as" && context.is_strict_mode && actual_value != &EvaluationResult::Empty {

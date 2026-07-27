@@ -655,7 +655,9 @@ mod string_search {
         let body: Value = response.json();
 
         let entries = get_bundle_entries(&body);
-        // Should match exactly "Smith"
+        // Should match exactly "Smith" — and must actually match something, or
+        // the per-entry check below would pass on an empty bundle.
+        assert_eq!(entries.len(), 2, "both 'Smith' patients must match");
         for entry in &entries {
             let family = entry["resource"]["name"][0]["family"].as_str().unwrap();
             assert_eq!(family, "Smith");

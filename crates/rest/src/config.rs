@@ -37,7 +37,7 @@
 //! | `HFS_VALIDATION_UNKNOWN_PROFILE` | warn | Unresolvable profiles: warn, error, or ignore |
 //! | `HFS_VALIDATION_CONSTRAINTS` | true | Evaluate FHIRPath invariants |
 //! | `HFS_VALIDATION_SUPPRESS_CONSTRAINTS` | dom-6 | Comma-separated constraint ids to skip |
-//! | `HFS_VALIDATION_TERMINOLOGY` | off | Required-binding checks: off or remote (`$validate-code` against `HFS_TERMINOLOGY_SERVER`) |
+//! | `HFS_VALIDATION_TERMINOLOGY` | embedded | Required-binding checks: embedded (offline FHIR core value sets), remote (`$validate-code` against `HFS_TERMINOLOGY_SERVER`), or off |
 //! | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | 3000 | Per-check terminology timeout |
 //! | `HFS_VALIDATION_TERMINOLOGY_FAIL` | open | Terminology outage posture: open (warn) or closed (error) |
 //! | `HFS_VALIDATION_STORED_PROFILES` | true | Maintain per-tenant profile registries from stored StructureDefinitions |
@@ -478,8 +478,9 @@ pub struct ValidationConfig {
     pub constraints: bool,
     /// Constraint ids never evaluated (comma-separated in the env var).
     pub suppress_constraints: Vec<String>,
-    /// Terminology binding checking: `off` or `remote`
-    /// (`remote` uses `HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code`).
+    /// Terminology binding checking: `embedded` (default — offline checks
+    /// against the FHIR core value sets embedded in helios-fhir-validator),
+    /// `remote` (`HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code`), or `off`.
     pub terminology: String,
     /// Per-check terminology timeout, in milliseconds.
     pub terminology_timeout_ms: u64,
@@ -499,7 +500,7 @@ impl Default for ValidationConfig {
             unknown_profile: "warn".to_string(),
             constraints: true,
             suppress_constraints: vec!["dom-6".to_string()],
-            terminology: "off".to_string(),
+            terminology: "embedded".to_string(),
             terminology_timeout_ms: 3000,
             terminology_fail: "open".to_string(),
             stored_profiles: true,
@@ -566,9 +567,9 @@ impl ValidationConfig {
                 self.unknown_profile
             ));
         }
-        if !matches!(self.terminology.as_str(), "off" | "remote") {
+        if !matches!(self.terminology.as_str(), "off" | "embedded" | "remote") {
             errors.push(format!(
-                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|remote)",
+                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote)",
                 self.terminology
             ));
         }
@@ -594,7 +595,7 @@ impl ValidationConfig {
 ///
 /// HFS acts as the Data Consumer: it accepts submissions, fetches the referenced
 /// manifests/files, ingests them, and serves a status manifest whose
-/// `output`/`error`/`deleted` artifacts are written to the output store below.
+/// `output`/`outcome`/`deleted` artifacts are written to the output store below.
 #[derive(Debug, Clone)]
 pub struct BulkSubmitConfig {
     /// Master switch — when `false`, the `$bulk-submit` endpoints return `501`.
@@ -635,6 +636,8 @@ pub struct BulkSubmitConfig {
     pub signing_alg: String,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,
+    /// `Retry-After` (seconds) advertised on an in-progress status poll.
+    pub retry_after_secs: u64,
 }
 
 impl Default for BulkSubmitConfig {
@@ -659,6 +662,7 @@ impl Default for BulkSubmitConfig {
             private_key: None,
             signing_alg: "ES384".to_string(),
             outbound_scope: "system/*.rs".to_string(),
+            retry_after_secs: 120,
         }
     }
 }
@@ -725,6 +729,7 @@ impl BulkSubmitConfig {
             signing_alg: std::env::var("HFS_BULK_SUBMIT_SIGNING_ALG").unwrap_or(d.signing_alg),
             outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
                 .unwrap_or(d.outbound_scope),
+            retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
         }
     }
 

@@ -33,6 +33,8 @@ fn app(store: &Arc<dyn ResourceStorage>) -> Router {
         None,
         helios_ui::NlSearch::default(),
         Some(Arc::clone(store)),
+        None,
+        "default".to_string(),
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
     )
@@ -169,6 +171,8 @@ async fn page_reports_registry_unavailable_without_a_store() {
         None,
         helios_ui::NlSearch::default(),
         None,
+        None,
+        "default".to_string(),
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
     )
@@ -199,4 +203,184 @@ async fn embedded_assets_carry_no_cache_so_rebuilt_css_is_never_stale() {
         .to_str()
         .unwrap();
     assert!(cc.contains("no-cache"), "got {cc}");
+}
+
+/// A storage failure must surface as the error banner, never as an empty
+/// 'no tenants' table that hides every row and purge affordance. A store
+/// whose schema was never initialised makes every query fail, standing in
+/// for a transient error (e.g. a pool wait under concurrent seeding).
+#[tokio::test]
+async fn storage_failure_renders_the_error_banner_not_a_silent_empty_table() {
+    let broken: Arc<dyn ResourceStorage> =
+        Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+
+    let (status, body) = get(&broken, "/ui/tenants/rows?q=").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("form-error"), "rows fragment: {body}");
+
+    let (status, body) = post_form(&broken, "id=acme&display_name=").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("form-error"), "create fragment: {body}");
+
+    let res = app(&broken)
+        .oneshot(
+            Request::delete("/ui/tenants/acme")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_text(res).await;
+    assert!(body.contains("form-error"), "delete fragment: {body}");
+}
+
+#[tokio::test]
+async fn version_choice_persists_to_user_settings_and_redirects_back() {
+    use helios_persistence::core::SettingsStore;
+
+    let backend = Arc::new({
+        let b = SqliteBackend::in_memory().expect("in-memory sqlite");
+        b.init_schema().expect("init schema");
+        b
+    });
+    let app = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        None,
+        Some(backend.clone() as Arc<dyn SettingsStore>),
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        FhirVersion::R4,
+    );
+
+    // Selecting a version persists it and bounces back to the referring page.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/ui/version")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::REFERER, "http://localhost/ui/search-parameters")
+                .body(Body::from("version=R4"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        res.headers().get(header::LOCATION).unwrap(),
+        "/ui/search-parameters"
+    );
+    let stored = backend
+        .get_settings("l2:")
+        .await
+        .expect("settings read")
+        .expect("document stored");
+    assert_eq!(stored.document["fhirVersion"], "R4");
+
+    // A version this build does not carry is rejected, not stored.
+    let res = app
+        .oneshot(
+            Request::post("/ui/version")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("version=R9"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn tenant_choice_persists_and_the_selector_follows_it() {
+    use helios_persistence::core::SettingsStore;
+
+    let backend = Arc::new({
+        let b = SqliteBackend::in_memory().expect("in-memory sqlite");
+        b.init_schema().expect("init schema");
+        b
+    });
+    backend
+        .register_tenant("acme", Some("Acme Health"))
+        .await
+        .expect("register tenant");
+    let app = || {
+        helios_ui::mount_with_conformance_source(
+            Router::new(),
+            "9.9.9",
+            None,
+            helios_ui::NlSearch::default(),
+            Some(backend.clone() as Arc<dyn ResourceStorage>),
+            Some(backend.clone() as Arc<dyn SettingsStore>),
+            "default".to_string(),
+            Arc::new(helios_ui::StaticConformanceSource::empty()),
+            FhirVersion::R4,
+        )
+    };
+
+    // The options fragment lists the registered tenant, with the effective
+    // (default) tenant present and marked current.
+    let res = app()
+        .oneshot(
+            Request::get("/ui/tenant/options")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let html = body_text(res).await;
+    assert!(html.contains(r#"name="tenant" value="acme""#));
+    assert!(html.contains("Acme Health"));
+    assert!(html.contains(r#"aria-current="true""#));
+    assert!(!html.contains("<html"), "fragment, not a page");
+
+    // Choosing a provisioned tenant persists it and bounces back.
+    let res = app()
+        .oneshot(
+            Request::post("/ui/tenant")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::REFERER, "http://localhost/ui/queries")
+                .body(Body::from("tenant=acme"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    assert_eq!(res.headers().get(header::LOCATION).unwrap(), "/ui/queries");
+    let stored = backend
+        .get_settings("l2:")
+        .await
+        .expect("settings read")
+        .expect("document stored");
+    assert_eq!(stored.document["tenantId"], "acme");
+
+    // The stored choice now drives the selector label on every page.
+    let res = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(res).await;
+    assert!(
+        html.contains("Acme Health"),
+        "label follows the stored tenant"
+    );
+    assert!(
+        html.contains(r#"content="acme""#),
+        "meta tag carries the id"
+    );
+
+    // An unprovisioned tenant is rejected, not stored.
+    let res = app()
+        .oneshot(
+            Request::post("/ui/tenant")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("tenant=made-up"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }

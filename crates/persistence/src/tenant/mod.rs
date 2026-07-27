@@ -8,7 +8,7 @@
 //! - [`TenantId`] - Opaque tenant identifier with hierarchical namespace support
 //! - [`TenantContext`] - Validated context required for all storage operations
 //! - [`TenantPermissions`] - Defines what operations a tenant can perform
-//! - [`TenancyModel`] - Determines how resources are isolated between tenants
+//! - [`TenancyModel`] - Whether a resource type is tenant-scoped or shared across tenants
 //!
 //! # Design Philosophy
 //!
@@ -18,15 +18,22 @@
 //! are intentionally cross-tenant — the admin aggregate `count_by_tenant`, the
 //! tenant-registry calls — and take no context by design.)
 //!
-//! # Tenancy Model
+//! # Tenant Placement
 //!
-//! There is one isolation model: **shared schema with a `tenant_id`
-//! discriminator**, chosen in design discussion
-//! [#28](https://github.com/HeliosSoftware/hfs/discussions/28). Each backend
-//! applies it in its own idiom; the S3 backend additionally offers a
-//! bucket-per-tenant physical boundary. Schema-per-tenant and
-//! database-per-tenant are not offered for the SQL backends — see the crate
-//! root docs and [#370](https://github.com/HeliosSoftware/hfs/issues/370).
+//! Every backend in this crate stores all tenants' records together in one
+//! set of tables, collections, or indices, separated by a `tenant_id`
+//! discriminator that every query filters on — the shared-schema model chosen
+//! in design discussion
+//! [#28](https://github.com/HeliosSoftware/hfs/discussions/28). Isolation is
+//! logical and enforced at the query level; no backend gives a tenant its own
+//! database schema or its own database. The sole exception is the S3 backend's
+//! `S3TenancyMode::BucketPerTenant`, which maps each tenant to a dedicated
+//! bucket (S3's default `PrefixPerTenant` mode is shared storage). A backend
+//! reports its tenant placement through `Backend::capabilities()`.
+//!
+//! Note that `TenancyModel` is a *different* axis: it selects whether a given
+//! resource *type* is tenant-scoped or shared across tenants, not where a
+//! tenant's records physically live.
 //!
 //! # Examples
 //!

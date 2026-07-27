@@ -13,7 +13,7 @@ use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
 };
 use crate::search::SearchParameterExtractor;
-use crate::tenant::TenantContext;
+use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
 use super::PostgresBackend;
@@ -48,6 +48,8 @@ pub struct PostgresTransaction {
     search_extractor: Arc<SearchParameterExtractor>,
     /// When true, search indexing is offloaded to a secondary backend.
     search_offloaded: bool,
+    /// The FHIR version writes in this transaction are stamped with.
+    fhir_version: FhirVersion,
 }
 
 impl std::fmt::Debug for PostgresTransaction {
@@ -66,6 +68,7 @@ impl PostgresTransaction {
         tenant: TenantContext,
         search_extractor: Arc<SearchParameterExtractor>,
         search_offloaded: bool,
+        fhir_version: FhirVersion,
     ) -> StorageResult<Self> {
         // Start the transaction
         client.execute("BEGIN", &[]).await.map_err(|e| {
@@ -80,6 +83,7 @@ impl PostgresTransaction {
             tenant,
             search_extractor,
             search_offloaded,
+            fhir_version,
         })
     }
 
@@ -147,6 +151,9 @@ impl Transaction for PostgresTransaction {
         resource_type: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        self.tenant
+            .check_permission(Operation::Create, resource_type)?;
+
         if !self.active {
             return Err(StorageError::Transaction(
                 TransactionError::InvalidTransaction,
@@ -191,8 +198,7 @@ impl Transaction for PostgresTransaction {
 
         let now = Utc::now();
         let version_id = "1";
-        let fhir_version = FhirVersion::default_enabled();
-        let fhir_version_str = fhir_version.as_mime_param();
+        let fhir_version_str = self.fhir_version.as_mime_param();
         let is_deleted = false;
 
         // Insert the resource
@@ -228,7 +234,7 @@ impl Transaction for PostgresTransaction {
             now,
             now,
             None,
-            fhir_version,
+            self.fhir_version,
         ))
     }
 
@@ -292,6 +298,9 @@ impl Transaction for PostgresTransaction {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        self.tenant
+            .check_permission(Operation::Update, current.resource_type())?;
+
         if !self.active {
             return Err(StorageError::Transaction(
                 TransactionError::InvalidTransaction,
@@ -398,6 +407,9 @@ impl Transaction for PostgresTransaction {
     }
 
     async fn delete(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
+        self.tenant
+            .check_permission(Operation::Delete, resource_type)?;
+
         if !self.active {
             return Err(StorageError::Transaction(
                 TransactionError::InvalidTransaction,
@@ -557,7 +569,7 @@ impl TransactionProvider for PostgresBackend {
     async fn begin_transaction(
         &self,
         tenant: &TenantContext,
-        _options: TransactionOptions,
+        options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
         let client = self.get_client().await?;
         PostgresTransaction::new(
@@ -565,6 +577,7 @@ impl TransactionProvider for PostgresBackend {
             tenant.clone(),
             std::sync::Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
             self.is_search_offloaded(),
+            options.fhir_version.unwrap_or(self.config().fhir_version),
         )
         .await
     }

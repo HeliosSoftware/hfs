@@ -64,16 +64,17 @@ Work that is currently underway or planned for the near term.
 
 | Area | Item | Status |
 |------|------|--------|
-| **Standards** | FHIR Validation engine | 🔵 Design |
-| **Developer Experience** | Administrative UI — web-based management console for server configuration and monitoring | 🔵 Design |
+| **Standards** | FHIR Validation engine | 🟡 In progress |
+| **Developer Experience** | Administrative UI — web-based management console for server configuration and monitoring | 🟡 In progress |
+| **Deployment** | Cluster support — multi-instance deployment behind a load balancer, with cluster-safe state | 🟡 In progress |
 | **Documentation** | [Project documentation website](https://github.com/HeliosSoftware/hfs/tree/docs/book-updates) | 🟡 In progress |
 
 ### Discussion Documents
 
-We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These will be published as GitHub Discussions:
+We are actively developing community discussion documents on the following topics to gather feedback before implementation begins. These are published as GitHub Discussions:
 
-- **Validation** — Establishing the strategy for StructureDefinition-based validation and profiles
-- **Clustered / multi-instance deployment** — How HFS should behave when run as multiple instances behind a load balancer, and where the boundary lies between state that can safely stay in process memory and state that must be externalized to shared infrastructure. Considerations include: cluster-aware WebSocket Subscription delivery, where connected clients are tracked in process memory today ([#170](https://github.com/HeliosSoftware/hfs/issues/170)); database-backed SQL-on-FHIR export job state, so status URLs survive restarts and are visible across instances ([#169](https://github.com/HeliosSoftware/hfs/issues/169)); and per-instance observability (Prometheus `/metrics`, OTLP traces) with correct tenant isolation when resource data comes from a shared database but traffic metrics are per-instance ([#150](https://github.com/HeliosSoftware/hfs/issues/150)). Authentication is *not* on this list: `helios-auth` validates tokens locally and holds no cross-instance state ([#205](https://github.com/HeliosSoftware/hfs/issues/205))
+- **[Validation](https://github.com/HeliosSoftware/hfs/discussions/215)** — Establishing the strategy for StructureDefinition-based validation and profiles
+- **[Clustered / multi-instance deployment](https://github.com/HeliosSoftware/hfs/discussions/223)** — How HFS should behave when run as multiple instances behind a load balancer, and where the boundary lies between state that can safely stay in process memory and state that must be externalized to shared infrastructure. Considerations include: cluster-aware WebSocket Subscription delivery, where connected clients are tracked in process memory today ([#170](https://github.com/HeliosSoftware/hfs/issues/170)); database-backed SQL-on-FHIR export job state, so status URLs survive restarts and are visible across instances ([#169](https://github.com/HeliosSoftware/hfs/issues/169)); and per-instance observability (Prometheus `/metrics`, OTLP traces) with correct tenant isolation when resource data comes from a shared database but traffic metrics are per-instance ([#150](https://github.com/HeliosSoftware/hfs/issues/150)). Authentication is *not* on this list: `helios-auth` validates tokens locally and holds no cross-instance state ([#205](https://github.com/HeliosSoftware/hfs/issues/205))
 
 ---
 

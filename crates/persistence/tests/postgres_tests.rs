@@ -9,7 +9,7 @@
 #![cfg(feature = "postgres")]
 
 use helios_persistence::backends::postgres::PostgresConfig;
-use helios_persistence::core::{BackendCapability, BackendKind};
+use helios_persistence::core::BackendKind;
 
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
@@ -60,46 +60,24 @@ fn test_postgres_config_serialization() {
 // Backend Capability Tests (no PostgreSQL instance required)
 // ============================================================================
 
-// NOTE: These tests verify capability declarations. They cannot construct a
-// PostgresBackend without a real database (the constructor connects immediately).
-// We verify via config + trait bounds instead.
+// NOTE: capability *declarations* are asserted in
+// `tests/backend_capability_contract.rs`, against the constructor-free
+// `PostgresBackend::declared_capabilities()`. They live there rather than here
+// because a `PostgresBackend` cannot be constructed without a real database
+// (the constructor connects immediately), and because the assertions are
+// cross-backend.
+//
+// A `test_postgres_expected_capabilities` used to live here. It listed the
+// capabilities by hand and then asserted `!expected.is_empty()` — which passes
+// for any non-empty list, so it verified nothing while reading like a contract.
+// Worse, its hand list was a third copy of the false `SchemaPerTenant` /
+// `DatabasePerTenant` claim corrected in #369. Deleted rather than repaired.
 
 #[test]
 fn test_postgres_config_backend_kind() {
     // Verify BackendKind::Postgres exists and is usable
     let kind = BackendKind::Postgres;
     assert_eq!(format!("{}", kind), "postgres");
-}
-
-#[test]
-fn test_postgres_expected_capabilities() {
-    // Verify the capability enum variants that PostgreSQL should support exist
-    let expected = [
-        BackendCapability::Crud,
-        BackendCapability::Versioning,
-        BackendCapability::InstanceHistory,
-        BackendCapability::TypeHistory,
-        BackendCapability::SystemHistory,
-        BackendCapability::BasicSearch,
-        BackendCapability::DateSearch,
-        BackendCapability::ReferenceSearch,
-        BackendCapability::FullTextSearch,
-        BackendCapability::Sorting,
-        BackendCapability::OffsetPagination,
-        BackendCapability::CursorPagination,
-        BackendCapability::Transactions,
-        BackendCapability::OptimisticLocking,
-        BackendCapability::BulkExport,
-        BackendCapability::BulkSubmitIngest,
-        BackendCapability::BulkSubmitRestWorker,
-        BackendCapability::Include,
-        BackendCapability::Revinclude,
-        BackendCapability::SharedSchema,
-        BackendCapability::SchemaPerTenant,
-        BackendCapability::DatabasePerTenant,
-    ];
-    // This is a compile-time check: all variants exist
-    assert!(!expected.is_empty());
 }
 
 // ============================================================================
@@ -1087,6 +1065,197 @@ mod postgres_integration {
 
         assert!(!was_created2);
         assert_eq!(resource2.content()["name"][0]["family"], "Second");
+    }
+
+    /// A `PUT` onto a deleted id restores the resource instead of failing.
+    ///
+    /// FHIR permits a deleted resource to be brought back by a subsequent
+    /// update (http.html#delete). The restore continues the existing version
+    /// chain — v1 create, v2 delete, v3 restore — rather than resetting to
+    /// "1", and the resource is readable and searchable again afterwards.
+    /// This mirrors `crud::delete_tests::test_delete_is_soft_delete`, which
+    /// covers the same path on SQLite.
+    #[tokio::test]
+    async fn postgres_integration_create_or_update_restores_deleted() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "Original"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+        assert_eq!(created.version_id(), "1");
+
+        backend.delete(&tenant, "Patient", &id).await.unwrap();
+
+        let (restored, _created_new) = backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                &id,
+                json!({"resourceType": "Patient", "name": [{"family": "Restored"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(restored.content()["name"][0]["family"], "Restored");
+        assert_eq!(
+            restored.version_id(),
+            "3",
+            "restore should continue the version chain (v1 create, v2 delete, v3 restore)"
+        );
+        assert!(!restored.is_deleted());
+
+        // The resource is live again: readable, and the restore is the current
+        // version.
+        let read = backend
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .expect("restored resource must be readable");
+        assert_eq!(read.version_id(), "3");
+        assert_eq!(read.content()["name"][0]["family"], "Restored");
+        assert!(backend.exists(&tenant, "Patient", &id).await.unwrap());
+
+        // History keeps every version, including the deletion — which is only
+        // returned when `include_deleted` is set (deleted versions are filtered out
+        // by default on every backend).
+        let history = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                &id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            history.items.len(),
+            3,
+            "history should hold create, delete and restore"
+        );
+        assert_eq!(history.items[0].resource.version_id(), "3");
+        assert!(!history.items[0].resource.is_deleted());
+        assert!(
+            history.items[1].resource.is_deleted(),
+            "the middle version is the deletion"
+        );
+    }
+
+    /// Restoring a deleted resource requires update permission.
+    #[tokio::test]
+    async fn postgres_integration_restore_deleted_requires_permission() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+        backend.delete(&tenant, "Patient", &id).await.unwrap();
+
+        // Same tenant, read-only permissions.
+        let read_only =
+            TenantContext::new(tenant.tenant_id().clone(), TenantPermissions::read_only());
+        let result = backend
+            .create_or_update(
+                &read_only,
+                "Patient",
+                &id,
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(StorageError::Tenant(_))),
+            "restore without update permission must be refused, got {:?}",
+            result.as_ref().map(|(r, _)| r.version_id())
+        );
+    }
+
+    /// A restored SearchParameter re-enters the tenant's registry overlay.
+    ///
+    /// Deleting a custom SearchParameter unregisters it; bringing it back with
+    /// a PUT has to reload the stored-parameter cache the way a create does,
+    /// or the parameter stays invisible to search until the process restarts.
+    #[tokio::test]
+    async fn postgres_integration_restored_search_parameter_reenters_registry() {
+        use helios_persistence::core::SearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let search_param = json!({
+            "resourceType": "SearchParameter",
+            "id": "pg-restore-sp",
+            "url": "http://example.org/fhir/SearchParameter/pg-restore-sp",
+            "name": "pgrestoresp",
+            "status": "active",
+            "code": "pgrestoresp",
+            "base": ["Observation"],
+            "type": "token",
+            "expression": "Observation.code"
+        });
+
+        backend
+            .create_or_update(
+                &tenant,
+                "SearchParameter",
+                "pg-restore-sp",
+                search_param.clone(),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        {
+            let reg = backend.search_param_registry(&tenant);
+            let registry = reg.read();
+            assert!(registry.get_param("Observation", "pgrestoresp").is_some());
+        }
+
+        backend
+            .delete(&tenant, "SearchParameter", "pg-restore-sp")
+            .await
+            .unwrap();
+        {
+            let reg = backend.search_param_registry(&tenant);
+            let registry = reg.read();
+            assert!(
+                registry.get_param("Observation", "pgrestoresp").is_none(),
+                "deleted SearchParameter should be unregistered"
+            );
+        }
+
+        backend
+            .create_or_update(
+                &tenant,
+                "SearchParameter",
+                "pg-restore-sp",
+                search_param,
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
+        assert!(
+            registry.get_param("Observation", "pgrestoresp").is_some(),
+            "restored SearchParameter should be registered again"
+        );
     }
 
     #[tokio::test]
@@ -2504,6 +2673,16 @@ mod postgres_integration {
         assert_eq!(backend.name(), "postgres");
     }
 
+    /// Instance-level tenancy + delegation contract for PostgreSQL (#369).
+    ///
+    /// `tests/backend_capability_contract.rs` pins the constructor-free
+    /// `PostgresBackend::declared_capabilities()`. This is the other half — that
+    /// the *instance* answers the same thing through `supports()`. The #369
+    /// defect lived in a hand-rolled `matches!` ladder inside `supports()`, so a
+    /// declaration test alone would not have caught it. PostgreSQL is the one
+    /// backend whose instance assertions need a live database, and it always has
+    /// one: `create_backend()` panics rather than skipping, and CI makes
+    /// `DOCKER_HOST` mandatory.
     #[tokio::test]
     async fn postgres_integration_capabilities() {
         let backend = create_backend().await;
@@ -2518,6 +2697,30 @@ mod postgres_integration {
         assert!(backend.supports(BackendCapability::BulkSubmitRestWorker));
         assert!(backend.supports(BackendCapability::Include));
         assert!(backend.supports(BackendCapability::Revinclude));
+
+        // The #369 regression, asserted on the live instance rather than the
+        // declaration: PostgreSQL is shared-schema only.
+        assert!(backend.supports(BackendCapability::SharedSchema));
+        assert!(
+            !backend.supports(BackendCapability::SchemaPerTenant),
+            "PostgreSQL has no SET search_path / CREATE SCHEMA path; declaring schema-per-tenant \
+             overstates isolation. See #369."
+        );
+        assert!(
+            !backend.supports(BackendCapability::DatabasePerTenant),
+            "PostgreSQL has no CREATE DATABASE / per-tenant pool; declaring database-per-tenant \
+             overstates isolation. See #369."
+        );
+
+        // supports() must agree with capabilities() for every declared
+        // capability — the delegation the #369 fix relies on, checked live.
+        for capability in backend.capabilities() {
+            assert!(
+                backend.supports(capability),
+                "postgres capabilities() lists {capability:?} but supports() denies it — the two \
+                 have drifted apart (#369)."
+            );
+        }
     }
 
     // ========================================================================

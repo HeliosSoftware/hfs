@@ -240,6 +240,57 @@ impl PostgresConfig {
 }
 
 impl PostgresBackend {
+    /// The capabilities this backend declares.
+    ///
+    /// Invariant across every valid configuration of the backend, so it is
+    /// exposed as a constructor-free associated function: [`PostgresBackend::new`]
+    /// eagerly verifies connectivity, and without this the declaration would be
+    /// unreachable — and therefore untestable — without a live PostgreSQL.
+    ///
+    /// Both [`Backend::supports`] and [`Backend::capabilities`] delegate here so
+    /// the two answers cannot drift apart. They were previously two separately
+    /// hand-maintained lists; that duplication is how issue #369's false claim
+    /// came to be written twice.
+    ///
+    /// # Tenancy
+    ///
+    /// `SharedSchema` **only**, and deliberately so. Every tenant's records live
+    /// in one `resources` table keyed by `(tenant_id, resource_type, id)` with a
+    /// `tenant_id` discriminator that every query filters on; no schema or
+    /// database switching exists in any code path. This is the strategy chosen in
+    /// design discussion #28 — it is a decision, not a gap, so please do not
+    /// "restore" `SchemaPerTenant` / `DatabasePerTenant` here as a bug fix.
+    /// Advertising either of them is what issue #369 corrected.
+    pub fn declared_capabilities() -> Vec<BackendCapability> {
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::Versioning,
+            BackendCapability::InstanceHistory,
+            BackendCapability::TypeHistory,
+            BackendCapability::SystemHistory,
+            BackendCapability::BasicSearch,
+            BackendCapability::DateSearch,
+            BackendCapability::QuantitySearch,
+            BackendCapability::ReferenceSearch,
+            BackendCapability::ChainedSearch,
+            BackendCapability::ReverseChaining,
+            BackendCapability::FullTextSearch,
+            BackendCapability::Sorting,
+            BackendCapability::OffsetPagination,
+            BackendCapability::CursorPagination,
+            BackendCapability::Transactions,
+            BackendCapability::OptimisticLocking,
+            BackendCapability::PessimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::BulkSubmitIngest,
+            BackendCapability::BulkSubmitRestWorker,
+            BackendCapability::Include,
+            BackendCapability::Revinclude,
+            BackendCapability::InDbSofRunner,
+            BackendCapability::SharedSchema,
+        ]
+    }
+
     /// Creates a new PostgreSQL backend with the given configuration.
     pub async fn new(config: PostgresConfig) -> StorageResult<Self> {
         let pool = Self::create_pool(&config)?;
@@ -292,9 +343,17 @@ impl PostgresBackend {
     /// a URL-configured deployment can tune connection establishment exactly as an
     /// `HFS_PG_*`-configured one can.
     pub async fn from_connection_string(url: &str) -> StorageResult<Self> {
+        Self::new(Self::config_from_connection_string(url)?).await
+    }
+
+    /// Builds the configuration `from_connection_string` would connect with,
+    /// without connecting. Callers that need to override config fields the URL
+    /// cannot express (e.g. the server's default FHIR version) adjust the
+    /// returned config and pass it to [`PostgresBackend::new`].
+    pub fn config_from_connection_string(url: &str) -> StorageResult<PostgresConfig> {
         let mut config = Self::parse_connection_string(url)?;
         config.connect_timeout_secs = connect_timeout_secs_from_env();
-        Self::new(config).await
+        Ok(config)
     }
 
     /// Creates a backend from environment variables.
@@ -310,6 +369,13 @@ impl PostgresBackend {
     /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
     pub async fn from_env() -> StorageResult<Self> {
+        Self::new(Self::config_from_env()).await
+    }
+
+    /// Builds the configuration `from_env` would connect with, without
+    /// connecting. Same override contract as
+    /// [`PostgresBackend::config_from_connection_string`].
+    pub fn config_from_env() -> PostgresConfig {
         let mut config = PostgresConfig {
             host: std::env::var("HFS_PG_HOST").unwrap_or_else(|_| default_host()),
             port: std::env::var("HFS_PG_PORT")
@@ -328,7 +394,7 @@ impl PostgresBackend {
         // Pool/timeout knobs are applied through the shared helper so this path and
         // the connection-URL path cannot drift apart again.
         config.apply_env_overrides();
-        Self::new(config).await
+        config
     }
 
     fn create_pool(config: &PostgresConfig) -> StorageResult<Pool> {
@@ -694,60 +760,11 @@ impl Backend for PostgresBackend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        matches!(
-            capability,
-            BackendCapability::Crud
-                | BackendCapability::Versioning
-                | BackendCapability::InstanceHistory
-                | BackendCapability::TypeHistory
-                | BackendCapability::SystemHistory
-                | BackendCapability::BasicSearch
-                | BackendCapability::DateSearch
-                | BackendCapability::ReferenceSearch
-                | BackendCapability::FullTextSearch
-                | BackendCapability::Sorting
-                | BackendCapability::OffsetPagination
-                | BackendCapability::CursorPagination
-                | BackendCapability::Transactions
-                | BackendCapability::OptimisticLocking
-                | BackendCapability::PessimisticLocking
-                | BackendCapability::BulkExport
-                | BackendCapability::BulkSubmitIngest
-                | BackendCapability::BulkSubmitRestWorker
-                | BackendCapability::Include
-                | BackendCapability::Revinclude
-                | BackendCapability::SharedSchema
-                | BackendCapability::SchemaPerTenant
-                | BackendCapability::DatabasePerTenant
-        )
+        Self::declared_capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::Versioning,
-            BackendCapability::InstanceHistory,
-            BackendCapability::TypeHistory,
-            BackendCapability::SystemHistory,
-            BackendCapability::BasicSearch,
-            BackendCapability::DateSearch,
-            BackendCapability::ReferenceSearch,
-            BackendCapability::FullTextSearch,
-            BackendCapability::Sorting,
-            BackendCapability::OffsetPagination,
-            BackendCapability::CursorPagination,
-            BackendCapability::Transactions,
-            BackendCapability::OptimisticLocking,
-            BackendCapability::PessimisticLocking,
-            BackendCapability::BulkExport,
-            BackendCapability::BulkSubmitIngest,
-            BackendCapability::BulkSubmitRestWorker,
-            BackendCapability::Include,
-            BackendCapability::Revinclude,
-            BackendCapability::SharedSchema,
-            BackendCapability::SchemaPerTenant,
-            BackendCapability::DatabasePerTenant,
-        ]
+        Self::declared_capabilities()
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {
@@ -950,6 +967,31 @@ impl PostgresBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── config builders (#355) ────────────────────────────────
+
+    #[test]
+    fn config_from_connection_string_builds_without_connecting() {
+        let cfg = PostgresBackend::config_from_connection_string(
+            "postgres://alice:s3cret@db.example.com:5433/clinical",
+        )
+        .unwrap();
+        assert_eq!(cfg.host, "db.example.com");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.dbname, "clinical");
+        // The URL cannot express a FHIR version, so the config carries the
+        // compile-time default until the caller overrides it — which is the
+        // whole point of exposing the builder separately from connecting.
+        assert_eq!(cfg.fhir_version, FhirVersion::default_enabled());
+    }
+
+    #[test]
+    fn config_from_env_builds_without_connecting() {
+        let cfg = PostgresBackend::config_from_env();
+        assert!(!cfg.host.is_empty());
+        assert!(cfg.port > 0);
+        assert_eq!(cfg.fhir_version, FhirVersion::default_enabled());
+    }
 
     // ── parse_connection_string ───────────────────────────────────
 

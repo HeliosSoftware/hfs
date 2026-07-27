@@ -80,9 +80,7 @@ where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
 {
     // Determine which version to describe (from Accept header or default)
-    let fhir_version = version
-        .accept_version()
-        .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+    let fhir_version = version.accept_version_or(state.config().default_fhir_version);
 
     debug!(
         fhir_version = %fhir_version,

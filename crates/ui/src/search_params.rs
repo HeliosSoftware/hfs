@@ -26,9 +26,12 @@ pub(crate) const PAGE_SIZE: usize = 50;
 /// model, one per enabled FHIR version. The data comes from the server's own
 /// `GET /SearchParameter` endpoint (storage is the source of truth), fetched
 /// once per version and cached for the process lifetime.
+/// Cache key: the tenant the snapshot was fetched for, and the version.
+type TenantVersion = (String, FhirVersion);
+
 pub(crate) struct SpCatalog {
     source: Arc<dyn ConformanceSource>,
-    versions: Mutex<HashMap<FhirVersion, Arc<VersionSnapshot>>>,
+    versions: Mutex<HashMap<TenantVersion, Arc<VersionSnapshot>>>,
 }
 
 pub(crate) struct VersionSnapshot {
@@ -47,12 +50,13 @@ impl SpCatalog {
         }
     }
 
-    /// Returns the snapshot for a version, fetching it on first use.
-    pub async fn snapshot(&self, version: FhirVersion) -> Arc<VersionSnapshot> {
-        if let Some(cached) = self.versions.lock().expect("catalog lock").get(&version) {
+    /// Returns the snapshot for a tenant + version, fetching it on first use.
+    pub async fn snapshot(&self, tenant: &str, version: FhirVersion) -> Arc<VersionSnapshot> {
+        let key = (tenant.to_string(), version);
+        if let Some(cached) = self.versions.lock().expect("catalog lock").get(&key) {
             return cached.clone();
         }
-        let built = Arc::new(fetch_snapshot(&*self.source, version).await);
+        let built = Arc::new(fetch_snapshot(&*self.source, version, tenant).await);
         // A failed fetch (`spec_loaded == false`) is served degraded for this
         // request only — caching it would pin the page to the failure until
         // restart.
@@ -63,14 +67,18 @@ impl SpCatalog {
         self.versions
             .lock()
             .expect("catalog lock")
-            .entry(version)
+            .entry(key)
             .or_insert_with(|| built.clone())
             .clone()
     }
 }
 
-async fn fetch_snapshot(source: &dyn ConformanceSource, version: FhirVersion) -> VersionSnapshot {
-    match source.fetch("SearchParameter", version).await {
+async fn fetch_snapshot(
+    source: &dyn ConformanceSource,
+    version: FhirVersion,
+    tenant: &str,
+) -> VersionSnapshot {
+    match source.fetch("SearchParameter", version, tenant).await {
         Ok(resources) => build_snapshot(version, resources, true),
         Err(_) => build_snapshot(version, Vec::new(), false),
     }
