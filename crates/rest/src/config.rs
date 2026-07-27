@@ -32,6 +32,15 @@
 //! | `HFS_TENANT_REQUIRE_PROVISIONED` | false | Reject tenants not provisioned via the admin API (registry backends only) |
 //! | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name for tenant (future use) |
 //! | `HFS_TERMINOLOGY_SERVER` | (none) | HTS base URL for `:in`/`:not-in` search and FHIRPath terminology functions |
+//! | `HFS_VALIDATION_MODE` | off | Write-path validation: off, log, or enforce (422 on invalid) |
+//! | `HFS_VALIDATION_META_PROFILES` | true | Validate against `meta.profile` claims |
+//! | `HFS_VALIDATION_UNKNOWN_PROFILE` | warn | Unresolvable profiles: warn, error, or ignore |
+//! | `HFS_VALIDATION_CONSTRAINTS` | true | Evaluate FHIRPath invariants |
+//! | `HFS_VALIDATION_SUPPRESS_CONSTRAINTS` | dom-6 | Comma-separated constraint ids to skip |
+//! | `HFS_VALIDATION_TERMINOLOGY` | embedded | Required-binding checks: embedded (offline FHIR core value sets), remote (`$validate-code` against `HFS_TERMINOLOGY_SERVER`), or off |
+//! | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | 3000 | Per-check terminology timeout |
+//! | `HFS_VALIDATION_TERMINOLOGY_FAIL` | open | Terminology outage posture: open (warn) or closed (error) |
+//! | `HFS_VALIDATION_STORED_PROFILES` | true | Maintain per-tenant profile registries from stored StructureDefinitions |
 //!
 //! # Example
 //!
@@ -450,12 +459,143 @@ impl BulkExportConfig {
     }
 }
 
+/// Resource validation configuration, loaded from `HFS_VALIDATION_*`
+/// environment variables.
+///
+/// The `$validate` operation is always available; these settings gate the
+/// **write-path** behavior (create/update/batch) and tune the shared
+/// validation service.
+#[derive(Debug, Clone)]
+pub struct ValidationConfig {
+    /// Write-path behavior: `off` (skip), `log` (validate, log issues,
+    /// proceed), or `enforce` (reject invalid resources with `422`).
+    pub mode: String,
+    /// Validate against the profiles a resource claims in `meta.profile`.
+    pub meta_profiles: bool,
+    /// Unresolvable profile references: `warn`, `error`, or `ignore`.
+    pub unknown_profile: String,
+    /// Evaluate FHIRPath invariant constraints.
+    pub constraints: bool,
+    /// Constraint ids never evaluated (comma-separated in the env var).
+    pub suppress_constraints: Vec<String>,
+    /// Terminology binding checking: `embedded` (default — offline checks
+    /// against the FHIR core value sets embedded in helios-fhir-validator),
+    /// `remote` (`HFS_TERMINOLOGY_SERVER`'s `ValueSet/$validate-code`), or `off`.
+    pub terminology: String,
+    /// Per-check terminology timeout, in milliseconds.
+    pub terminology_timeout_ms: u64,
+    /// Terminology outages: `open` (warn and proceed) or `closed`
+    /// (treat as validation errors).
+    pub terminology_fail: String,
+    /// Maintain per-tenant profile registries from stored
+    /// StructureDefinitions (updated on StructureDefinition writes).
+    pub stored_profiles: bool,
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            mode: "off".to_string(),
+            meta_profiles: true,
+            unknown_profile: "warn".to_string(),
+            constraints: true,
+            suppress_constraints: vec!["dom-6".to_string()],
+            terminology: "embedded".to_string(),
+            terminology_timeout_ms: 3000,
+            terminology_fail: "open".to_string(),
+            stored_profiles: true,
+        }
+    }
+}
+
+impl ValidationConfig {
+    /// Loads validation configuration from `HFS_VALIDATION_*` env vars.
+    pub fn from_env() -> Self {
+        fn env_bool(key: &str, default: bool) -> bool {
+            std::env::var(key)
+                .map(|s| {
+                    let s = s.to_lowercase();
+                    s == "true" || s == "1"
+                })
+                .unwrap_or(default)
+        }
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let d = Self::default();
+        Self {
+            mode: std::env::var("HFS_VALIDATION_MODE").unwrap_or(d.mode),
+            meta_profiles: env_bool("HFS_VALIDATION_META_PROFILES", d.meta_profiles),
+            unknown_profile: std::env::var("HFS_VALIDATION_UNKNOWN_PROFILE")
+                .unwrap_or(d.unknown_profile),
+            constraints: env_bool("HFS_VALIDATION_CONSTRAINTS", d.constraints),
+            suppress_constraints: std::env::var("HFS_VALIDATION_SUPPRESS_CONSTRAINTS")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or(d.suppress_constraints),
+            terminology: std::env::var("HFS_VALIDATION_TERMINOLOGY").unwrap_or(d.terminology),
+            terminology_timeout_ms: env_u64(
+                "HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS",
+                d.terminology_timeout_ms,
+            ),
+            terminology_fail: std::env::var("HFS_VALIDATION_TERMINOLOGY_FAIL")
+                .unwrap_or(d.terminology_fail),
+            stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
+        }
+    }
+
+    /// Validates the validation configuration.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if !matches!(self.mode.as_str(), "off" | "log" | "enforce") {
+            errors.push(format!(
+                "HFS_VALIDATION_MODE '{}' invalid (expected off|log|enforce)",
+                self.mode
+            ));
+        }
+        if !matches!(self.unknown_profile.as_str(), "warn" | "error" | "ignore") {
+            errors.push(format!(
+                "HFS_VALIDATION_UNKNOWN_PROFILE '{}' invalid (expected warn|error|ignore)",
+                self.unknown_profile
+            ));
+        }
+        if !matches!(self.terminology.as_str(), "off" | "embedded" | "remote") {
+            errors.push(format!(
+                "HFS_VALIDATION_TERMINOLOGY '{}' invalid (expected off|embedded|remote)",
+                self.terminology
+            ));
+        }
+        if !matches!(self.terminology_fail.as_str(), "open" | "closed") {
+            errors.push(format!(
+                "HFS_VALIDATION_TERMINOLOGY_FAIL '{}' invalid (expected open|closed)",
+                self.terminology_fail
+            ));
+        }
+        if self.terminology_timeout_ms == 0 {
+            errors.push("HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS must be > 0".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
 /// Bulk Data **Submit** (`$bulk-submit`) configuration, loaded from
 /// `HFS_BULK_SUBMIT_*` environment variables.
 ///
 /// HFS acts as the Data Consumer: it accepts submissions, fetches the referenced
 /// manifests/files, ingests them, and serves a status manifest whose
-/// `output`/`error`/`deleted` artifacts are written to the output store below.
+/// `output`/`outcome`/`deleted` artifacts are written to the output store below.
 #[derive(Debug, Clone)]
 pub struct BulkSubmitConfig {
     /// Master switch — when `false`, the `$bulk-submit` endpoints return `501`.
@@ -496,6 +636,8 @@ pub struct BulkSubmitConfig {
     pub signing_alg: String,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,
+    /// `Retry-After` (seconds) advertised on an in-progress status poll.
+    pub retry_after_secs: u64,
 }
 
 impl Default for BulkSubmitConfig {
@@ -520,6 +662,7 @@ impl Default for BulkSubmitConfig {
             private_key: None,
             signing_alg: "ES384".to_string(),
             outbound_scope: "system/*.rs".to_string(),
+            retry_after_secs: 120,
         }
     }
 }
@@ -586,6 +729,7 @@ impl BulkSubmitConfig {
             signing_alg: std::env::var("HFS_BULK_SUBMIT_SIGNING_ALG").unwrap_or(d.signing_alg),
             outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
                 .unwrap_or(d.outbound_scope),
+            retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
         }
     }
 
@@ -940,6 +1084,10 @@ pub struct ServerConfig {
     /// Bulk data submit configuration (loaded from environment variables).
     #[arg(skip)]
     pub bulk_submit: BulkSubmitConfig,
+
+    /// Resource validation configuration (loaded from environment variables).
+    #[arg(skip)]
+    pub validation: ValidationConfig,
 }
 
 impl ServerConfig {
@@ -1006,6 +1154,7 @@ impl Default for ServerConfig {
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),
+            validation: ValidationConfig::default(),
         }
     }
 }
@@ -1024,6 +1173,8 @@ impl ServerConfig {
         config.bulk_export = BulkExportConfig::from_env();
         // Load bulk submit config from environment
         config.bulk_submit = BulkSubmitConfig::from_env();
+        // Load validation config from environment
+        config.validation = ValidationConfig::from_env();
         config
     }
 
@@ -1067,6 +1218,17 @@ impl ServerConfig {
 
         if let Err(mut submit_errors) = self.bulk_submit.validate() {
             errors.append(&mut submit_errors);
+        }
+
+        if let Err(mut validation_errors) = self.validation.validate() {
+            errors.append(&mut validation_errors);
+        }
+
+        // Remote terminology checking needs a terminology server to call.
+        if self.validation.terminology == "remote" && self.terminology_server.is_none() {
+            errors.push(
+                "HFS_VALIDATION_TERMINOLOGY=remote requires HFS_TERMINOLOGY_SERVER".to_string(),
+            );
         }
 
         if errors.is_empty() {
@@ -1136,6 +1298,7 @@ impl ServerConfig {
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
             bulk_submit: BulkSubmitConfig::default(),
+            validation: ValidationConfig::default(),
         }
     }
 

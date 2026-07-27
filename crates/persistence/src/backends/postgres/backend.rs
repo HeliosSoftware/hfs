@@ -109,10 +109,6 @@ pub struct PostgresConfig {
     /// When true, search indexing is offloaded to a secondary backend.
     #[serde(default)]
     pub search_offloaded: bool,
-
-    /// Optional schema name for schema-per-tenant isolation.
-    #[serde(default)]
-    pub schema_name: Option<String>,
 }
 
 /// SSL mode for PostgreSQL connections.
@@ -209,7 +205,6 @@ impl Default for PostgresConfig {
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
-            schema_name: None,
         }
     }
 }
@@ -297,9 +292,17 @@ impl PostgresBackend {
     /// a URL-configured deployment can tune connection establishment exactly as an
     /// `HFS_PG_*`-configured one can.
     pub async fn from_connection_string(url: &str) -> StorageResult<Self> {
+        Self::new(Self::config_from_connection_string(url)?).await
+    }
+
+    /// Builds the configuration `from_connection_string` would connect with,
+    /// without connecting. Callers that need to override config fields the URL
+    /// cannot express (e.g. the server's default FHIR version) adjust the
+    /// returned config and pass it to [`PostgresBackend::new`].
+    pub fn config_from_connection_string(url: &str) -> StorageResult<PostgresConfig> {
         let mut config = Self::parse_connection_string(url)?;
         config.connect_timeout_secs = connect_timeout_secs_from_env();
-        Self::new(config).await
+        Ok(config)
     }
 
     /// Creates a backend from environment variables.
@@ -315,6 +318,13 @@ impl PostgresBackend {
     /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
     pub async fn from_env() -> StorageResult<Self> {
+        Self::new(Self::config_from_env()).await
+    }
+
+    /// Builds the configuration `from_env` would connect with, without
+    /// connecting. Same override contract as
+    /// [`PostgresBackend::config_from_connection_string`].
+    pub fn config_from_env() -> PostgresConfig {
         let mut config = PostgresConfig {
             host: std::env::var("HFS_PG_HOST").unwrap_or_else(|_| default_host()),
             port: std::env::var("HFS_PG_PORT")
@@ -333,7 +343,7 @@ impl PostgresBackend {
         // Pool/timeout knobs are applied through the shared helper so this path and
         // the connection-URL path cannot drift apart again.
         config.apply_env_overrides();
-        Self::new(config).await
+        config
     }
 
     fn create_pool(config: &PostgresConfig) -> StorageResult<Pool> {
@@ -605,7 +615,14 @@ impl PostgresBackend {
     }
 
     /// Get a client from the pool.
-    pub(crate) async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
+    ///
+    /// `#[doc(hidden)] pub` rather than `pub(crate)` only so the out-of-crate
+    /// pool-timeout regression test (`tests/postgres_tests.rs`) can hold several
+    /// pooled connections at once. It hands out a raw connection that bypasses
+    /// tenant scoping, so it is not stable API — workspace callers should use the
+    /// `ResourceStorage`/`SearchProvider` methods instead.
+    #[doc(hidden)]
+    pub async fn get_client(&self) -> StorageResult<deadpool_postgres::Client> {
         use deadpool_postgres::{PoolError, TimeoutType};
 
         self.pool.get().await.map_err(|e| match e {
@@ -948,6 +965,31 @@ impl PostgresBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── config builders (#355) ────────────────────────────────
+
+    #[test]
+    fn config_from_connection_string_builds_without_connecting() {
+        let cfg = PostgresBackend::config_from_connection_string(
+            "postgres://alice:s3cret@db.example.com:5433/clinical",
+        )
+        .unwrap();
+        assert_eq!(cfg.host, "db.example.com");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.dbname, "clinical");
+        // The URL cannot express a FHIR version, so the config carries the
+        // compile-time default until the caller overrides it — which is the
+        // whole point of exposing the builder separately from connecting.
+        assert_eq!(cfg.fhir_version, FhirVersion::default_enabled());
+    }
+
+    #[test]
+    fn config_from_env_builds_without_connecting() {
+        let cfg = PostgresBackend::config_from_env();
+        assert!(!cfg.host.is_empty());
+        assert!(cfg.port > 0);
+        assert_eq!(cfg.fhir_version, FhirVersion::default_enabled());
+    }
 
     // ── parse_connection_string ───────────────────────────────────
 

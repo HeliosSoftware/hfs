@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ i18n.t("app-title") }}{% endblock %}</title>
   <link rel="stylesheet" href="/ui/assets/app.css">
+  <!-- The effective tenant for browser-issued FHIR calls (#344). -->
+  <meta name="hfs-tenant" content="{{ status.tenant_id() }}">
   <!-- No `defer`: these attributes must land on <html> before first paint,
        or the stored theme / collapsed-nav flashes its default first. -->
   <script src="/ui/assets/theme.js"></script>
@@ -12,7 +14,7 @@
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">
     <div class="brand">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
@@ -39,38 +41,29 @@
     </div>
 
     <!--
-      Tenant selector. A <details> disclosure so the dropdown works without
-      JavaScript. The tenant list is sample data until the handler grows a
-      read path into helios-persistence (README: "Left for follow-up work").
+      Tenant selector (#344). A <details> disclosure — works without
+      JavaScript. The label is the effective tenant (the user's stored choice,
+      validated against the registry, else the server default). The options are
+      lazily fetched from the registry by htmx when the menu first opens; with
+      JavaScript disabled the panel offers the tenant-maintenance page instead.
     -->
     <details class="menu">
       <summary class="selector">
-        <span class="avatar">AH</span>
-        <span class="selector__label">Acme Health</span>
+        <span class="avatar">{{ status.tenant_initials() }}</span>
+        <span class="selector__label">{{ status.tenant_label() }}</span>
         <span class="selector__chevrons">
           <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
           <span class="icon">{% include "icons/chevron-down.svg" %}</span>
         </span>
       </summary>
       <div class="menu__panel">
-        <label class="menu__search">
-          {% include "icons/search.svg" %}
-          <input type="search" placeholder="{{ i18n.t("tenant-search-placeholder") }}">
-        </label>
         <div class="menu__heading">{{ i18n.t("tenant-heading") }}</div>
-        <a class="menu__option" href="#">
-          <span class="avatar">{% include "icons/building.svg" %}</span>
-          {{ i18n.t("tenant-all") }}
-        </a>
-        <a class="menu__option" href="#" aria-current="true">
-          <span class="avatar">AH</span>
-          Acme Health
-          <span class="check">{% include "icons/check.svg" %}</span>
-        </a>
-        <a class="menu__option" href="#">
-          <span class="avatar">MM</span>
-          Mercy Medical
-        </a>
+        <div hx-get="/ui/tenant/options" hx-trigger="toggle once from:closest details" hx-swap="outerHTML">
+          <a class="menu__option" href="/ui/tenants">
+            <span class="avatar">{% include "icons/building.svg" %}</span>
+            {{ i18n.t("nav-tenants") }}
+          </a>
+        </div>
       </div>
     </details>
 
@@ -82,34 +75,16 @@
         <span class="icon">{% include "icons/home.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-home") }}</span>
       </a>
-      <a class="nav-item" href="/ui/queries"{% if active_page == "queries" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-saved-queries") }}">
-        <span class="icon">{% include "icons/bookmark.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-saved-queries") }}</span>
-      </a>
       <!--
-        Search is a real page only when natural-language search is enabled
-        (#255). With HFS_NL_SEARCH_ENABLED=false the route is not mounted and
-        the entry stays as it was: a coming-soon placeholder that says nothing
-        about the feature.
+        Resources (#282): the primary read/write workspace, and the one entry
+        for it. Searching, editing, and version history all live inside
+        Resources — on the page and in its edit modal — so they have no separate
+        nav entries. Their routes stay reachable by URL (/ui/search, /ui/editor,
+        /ui/history, /ui/queries); they are just not in the menu.
       -->
-      {% if nl_enabled %}
-      <a class="nav-item" href="/ui/search"{% if active_page == "search" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-search") }}">
-        <span class="icon">{% include "icons/search.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-search") }}</span>
-      </a>
-      {% else %}
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-search") }}">
-        <span class="icon">{% include "icons/search.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-search") }}</span>
-      </span>
-      {% endif %}
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-resource-editor") }}">
-        <span class="icon">{% include "icons/pencil.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-resource-editor") }}</span>
-      </span>
-      <a class="nav-item" href="/ui/history" title="{{ i18n.t("nav-history-versions") }}">
-        <span class="icon">{% include "icons/history.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-history-versions") }}</span>
+      <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resources") }}">
+        <span class="icon">{% include "icons/layers.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-resources") }}</span>
       </a>
       <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
         <span class="icon">{% include "icons/compartments.svg" %}</span>
@@ -139,9 +114,9 @@
         <span class="icon">{% include "icons/shield.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-capability-conformance") }}</span>
       </span>
-      <a class="nav-item" href="/ui/search-parameters"{% if active_page == "search-parameters" %} aria-current="page"{% endif %}>
+      <a class="nav-item" href="/ui/search-parameters"{% if active_page == "search-parameters" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-search-parameters") }}">
         <span class="icon">{% include "icons/search.svg" %}</span>
-        {{ i18n.t("nav-search-parameters") }}
+        <span class="nav-item__label">{{ i18n.t("nav-search-parameters") }}</span>
       </a>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-admin-ops") }}">
         <span class="icon">{% include "icons/sliders.svg" %}</span>
@@ -160,20 +135,45 @@
     </nav>
 
     <!--
-      FHIR version selector — outline-only so it still pops. Static until
-      version switching has a server-side read path.
+      FHIR version selector (#343). A <details> disclosure like the tenant
+      selector, so it works without JavaScript. The label is the server's
+      default version; each option re-loads the current page with `?version=` —
+      the pages with a version dimension (SearchParameters, Compartments)
+      switch, the rest ignore it.
     -->
     <div class="sidebar__foot">
-      <div class="selector selector--outline">
-        <span class="icon">{% include "icons/hierarchy.svg" %}</span>
-        <span class="selector__label">{{ i18n.t_arg("fhir-version", "version", "R4".to_string()) }}</span>
-        <span class="selector__chevrons">
-          <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
-          <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-        </span>
-      </div>
+      <details class="menu menu--up">
+        <summary class="selector selector--outline">
+          <span class="icon">{% include "icons/hierarchy.svg" %}</span>
+          <span class="selector__label">{{ i18n.t_arg("fhir-version", "version", status.fhir_version_label().to_string()) }}</span>
+          <span class="selector__chevrons">
+            <span class="icon icon--flip">{% include "icons/chevron-down.svg" %}</span>
+            <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+          </span>
+        </summary>
+        <div class="menu__panel">
+          <div class="menu__heading">{{ i18n.t("fhir-version-heading") }}</div>
+          {% for v in status.enabled_version_labels() %}
+          <form method="post" action="/ui/version">
+            <input type="hidden" name="version" value="{{ v }}">
+            <button type="submit" class="menu__option"{% if v == status.fhir_version_label() %} aria-current="true"{% endif %}>
+              <span class="avatar">{% include "icons/hierarchy.svg" %}</span>
+              {{ v }}
+              {% if v == status.fhir_version_label() %}<span class="check">{% include "icons/check.svg" %}</span>{% endif %}
+            </button>
+          </form>
+          {% endfor %}
+        </div>
+      </details>
     </div>
   </aside>
+
+  <!--
+    Optional secondary panel, flush against the sidebar and styled as part of
+    the menu (Brett's Resources frame): the Resources page fills it with the
+    resource-type list. Absent on every other page.
+  -->
+  {% block nav_panel %}{% endblock %}
 
   <div class="pane">
     <header class="topbar">

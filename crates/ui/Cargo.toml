@@ -14,10 +14,10 @@ keywords = ["helios-software", "fhir", "ui", "htmx"]
 # (SearchParameter + CompartmentDefinition fetched from the FHIR API) cover
 # exactly the versions the server is built with. R4 is the workspace default.
 default = ["R4"]
-R4 = ["helios-fhir/R4"]
-R4B = ["helios-fhir/R4B"]
-R5 = ["helios-fhir/R5"]
-R6 = ["helios-fhir/R6"]
+R4 = ["helios-fhir/R4", "helios-fhir-validator/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhir-validator/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhir-validator/R5"]
+R6 = ["helios-fhir/R6", "helios-fhir-validator/R6"]
 
 [dependencies]
 # Read paths into the rest of the workspace: the SearchParameter spec loader
@@ -26,10 +26,19 @@ R6 = ["helios-fhir/R6"]
 # reverse.
 helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
 
+# The FHIR Schema IR and the editor projection (#264, on top of #232). The
+# resolver is a synchronous hashmap lookup, and FHIRPath is an optional feature
+# we deliberately do not take: the live editing loop needs the cheap structural
+# pass, not the async effects pass.
+helios-fhir-validator = { path = "../fhir-validator", version = "0.2.1", default-features = false }
+
 # Deserializes the FHIR resources fetched from the server's own
 # `/SearchParameter` and `/CompartmentDefinition` endpoints, and derives the
 # query-string extractors. Both already in the workspace dependency graph.
 serde = { version = "1", features = ["derive"] }
+
+# Warn-level breadcrumb when persisting the FHIR-version choice fails (#343).
+tracing = "0.1"
 serde_json = "1"
 
 # The UI reads conformance data (SearchParameter, CompartmentDefinition) from
@@ -61,7 +70,10 @@ axum-htmx = { version = "0.8", features = ["auto-vary"] }
 # Static assets (htmx, CSS) embedded into the binary at compile time so the
 # server has no runtime CDN dependency and works in air-gapped deployments.
 # `axum-embed` serves them with precompressed (br/gzip/deflate) negotiation.
-rust-embed = "8"
+# `debug-embed` makes debug builds embed too (the default reads them from the
+# source tree at runtime), so the binary is self-contained wherever it runs —
+# notably the e2e container, which has the binary but not the asset folder.
+rust-embed = { version = "8", features = ["debug-embed"] }
 axum-embed = "0.1"
 
 # Fluent message catalogs (locales/<locale>/main.ftl at the workspace root),
@@ -69,6 +81,16 @@ axum-embed = "0.1"
 # See docs/multi-language.md for the i18n rules of the road.
 fluent-templates = "0.13"
 unic-langid = { version = "0.9", features = ["macros"] }
+
+# History & Versions diff rendering (#236, decision recorded in
+# docs/history-diff-rendering.md). Two layers, both server-side:
+#  - json-patch: the semantic field-level view. Already in the workspace lock
+#    (a default dep of helios-rest/helios-persistence), so zero new transitive
+#    weight; it is the exact inverse of the RFC 6902 PATCH the server applies.
+#  - similar: the textual word-level view over pretty-printed JSON. No HTML
+#    formatter of its own — we iterate its changes into an Askama template.
+json-patch = "3"
+similar = { version = "2", features = ["inline"] }
 
 # Storage-agnostic dashboard snapshot registry. The server registers a
 # provider (backed by the persistence layer) at startup; this crate reads the
@@ -82,15 +104,6 @@ helios-observability = { path = "../observability", version = "0.2.1" }
 # depends on the rest of the server, never the reverse.
 helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
 
-# History & Versions diff rendering (#236, decision recorded in
-# docs/history-diff-rendering.md). Two layers, both server-side:
-#  - json-patch: the semantic field-level view. Already in the workspace lock
-#    (a default dep of helios-rest/helios-persistence), so zero new transitive
-#    weight; it is the exact inverse of the RFC 6902 PATCH the server applies.
-#  - similar: the textual word-level view over pretty-printed JSON. No HTML
-#    formatter of its own — we iterate its changes into an Askama template.
-json-patch = "3"
-similar = { version = "2", features = ["inline"] }
 
 [dev-dependencies]
 # Parses the .ftl sources so tests can enforce key-set parity across locales.

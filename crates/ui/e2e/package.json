@@ -1,0 +1,16 @@
+{
+  "name": "helios-ui-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Browser-level (Playwright + axe-core) conformance tests for crates/ui (helios-ui). Self-contained: nothing here touches the cargo workspace.",
+  "scripts": {
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "report": "playwright show-report",
+    "install-browsers": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.10.1",
+    "@playwright/test": "1.49.1"
+  }
+}

@@ -10,6 +10,9 @@
 //!
 //! [`TerminologyBackend`]: crate::traits::TerminologyBackend
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
@@ -61,7 +64,21 @@ pub use postgres::PostgresTerminologyBackend;
 /// `$validate-code` resolving against the authoritative row while `$lookup`
 /// reads `resource_json` from the truncated copy. That incoherence is what
 /// let this bug class persist.
-pub(crate) fn cs_precedence_order_by(alias: &str) -> String {
+pub(crate) fn cs_precedence_order_by(alias: &str) -> Cow<'static, str> {
+    // This clause is spliced into a `format!`-built SQL string at ~40 hot-path
+    // resolver call sites, once (or more) per request. Only three aliases are
+    // ever passed (`"code_systems"`, `"s"`, `"value_sets"` is vs-only), so cache
+    // their rendered form and rebuild only for an unexpected alias. The cached
+    // value is produced by the same `build_cs_precedence_order_by` as the
+    // fallback, so the SQL text is identical whichever branch is taken.
+    match alias {
+        "code_systems" => Cow::Borrowed(CS_ORDER_BY_CODE_SYSTEMS.as_str()),
+        "s" => Cow::Borrowed(CS_ORDER_BY_S.as_str()),
+        other => Cow::Owned(build_cs_precedence_order_by(other)),
+    }
+}
+
+fn build_cs_precedence_order_by(alias: &str) -> String {
     format!(
         "(CASE COALESCE({alias}.content, 'complete') \
               WHEN 'complete'    THEN 0 \
@@ -79,6 +96,10 @@ pub(crate) fn cs_precedence_order_by(alias: &str) -> String {
     )
 }
 
+static CS_ORDER_BY_CODE_SYSTEMS: LazyLock<String> =
+    LazyLock::new(|| build_cs_precedence_order_by("code_systems"));
+static CS_ORDER_BY_S: LazyLock<String> = LazyLock::new(|| build_cs_precedence_order_by("s"));
+
 /// Precedence among `value_sets` rows sharing one canonical URL.
 ///
 /// The ValueSet analogue of [`cs_precedence_order_by`]. `value_sets` has no
@@ -88,13 +109,25 @@ pub(crate) fn cs_precedence_order_by(alias: &str) -> String {
 ///
 /// This matters for the same reason: `hl7.fhir.r4.core` re-ships 603 THO
 /// ValueSets under canonical URLs it does not own.
-pub(crate) fn vs_precedence_order_by(alias: &str) -> String {
+pub(crate) fn vs_precedence_order_by(alias: &str) -> Cow<'static, str> {
+    // Only `"value_sets"` is ever passed; cache it and rebuild for any other.
+    // Same builder feeds cache and fallback, so the SQL text is identical.
+    match alias {
+        "value_sets" => Cow::Borrowed(VS_ORDER_BY_VALUE_SETS.as_str()),
+        other => Cow::Owned(build_vs_precedence_order_by(other)),
+    }
+}
+
+fn build_vs_precedence_order_by(alias: &str) -> String {
     format!(
         "COALESCE({alias}.authority_rank, 0), \
          COALESCE({alias}.version, '') DESC, \
          {alias}.id",
     )
 }
+
+static VS_ORDER_BY_VALUE_SETS: LazyLock<String> =
+    LazyLock::new(|| build_vs_precedence_order_by("value_sets"));
 
 /// True when `ver` is the sentinel `current` (case-insensitive).
 ///
@@ -105,4 +138,73 @@ pub(crate) fn vs_precedence_order_by(alias: &str) -> String {
 /// `sqlite/code_system.rs` / `postgres/code_system.rs`.
 pub(super) fn code_system_version_is_current(ver: &str) -> bool {
     ver.eq_ignore_ascii_case("current")
+}
+
+#[cfg(test)]
+mod precedence_tests {
+    use super::*;
+
+    // Locks the exact ORDER BY text. The precedence order is the single arbiter
+    // of which same-canonical-URL row wins (content > has-concepts > authority >
+    // version > id); a silent change to this string would re-open the
+    // resolution-incoherence bug class #200 closed. These literals are the
+    // clause as it shipped, so both the cached fast path and the owned fallback
+    // are asserted byte-for-byte.
+    const CS_EXPECTED_CODE_SYSTEMS: &str = "(CASE COALESCE(code_systems.content, 'complete') \
+              WHEN 'complete'    THEN 0 \
+              WHEN 'supplement'  THEN 0 \
+              WHEN 'fragment'    THEN 1 \
+              WHEN 'example'     THEN 1 \
+              WHEN 'not-present' THEN 2 \
+              ELSE 1 END), \
+         (CASE WHEN EXISTS \
+             (SELECT 1 FROM concepts hc WHERE hc.system_id = code_systems.id) \
+             THEN 0 ELSE 1 END), \
+         COALESCE(code_systems.authority_rank, 0), \
+         COALESCE(code_systems.version, '') DESC, \
+         code_systems.id";
+
+    #[test]
+    fn cs_precedence_cached_and_fallback_match_shipped_sql() {
+        // Cached fast paths (the only aliases used in the codebase).
+        assert_eq!(
+            &*cs_precedence_order_by("code_systems"),
+            CS_EXPECTED_CODE_SYSTEMS
+        );
+        assert_eq!(
+            &*cs_precedence_order_by("s"),
+            CS_EXPECTED_CODE_SYSTEMS
+                .replace("code_systems", "s")
+                .as_str()
+        );
+        // Fallback (unexpected alias) renders through the same builder, so it is
+        // byte-identical to the cached form with the alias substituted.
+        assert_eq!(
+            &*cs_precedence_order_by("cs"),
+            CS_EXPECTED_CODE_SYSTEMS
+                .replace("code_systems", "cs")
+                .as_str()
+        );
+        // The cached value equals a fresh build — no drift between the two paths.
+        assert_eq!(
+            &*cs_precedence_order_by("code_systems"),
+            build_cs_precedence_order_by("code_systems").as_str()
+        );
+    }
+
+    #[test]
+    fn vs_precedence_cached_and_fallback_match_shipped_sql() {
+        const VS_EXPECTED: &str = "COALESCE(value_sets.authority_rank, 0), \
+         COALESCE(value_sets.version, '') DESC, \
+         value_sets.id";
+        assert_eq!(&*vs_precedence_order_by("value_sets"), VS_EXPECTED);
+        assert_eq!(
+            &*vs_precedence_order_by("s"),
+            VS_EXPECTED.replace("value_sets", "s").as_str()
+        );
+        assert_eq!(
+            &*vs_precedence_order_by("value_sets"),
+            build_vs_precedence_order_by("value_sets").as_str()
+        );
+    }
 }

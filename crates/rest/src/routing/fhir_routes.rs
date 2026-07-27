@@ -295,6 +295,17 @@ where
             get(handlers::reindex_status_handler::<S>)
                 .delete(handlers::reindex_cancel_handler::<S>),
         )
+        // Resource validation ($validate) — operation routes precede the
+        // catch-all (matchit gives static segments priority over {id}).
+        .route(
+            "/{resource_type}/$validate",
+            post(handlers::validate_type_handler::<S>),
+        )
+        .route(
+            "/{resource_type}/{id}/$validate",
+            get(handlers::validate_instance_get_handler::<S>)
+                .post(handlers::validate_instance_post_handler::<S>),
+        )
         // Type-level routes
         .route("/{resource_type}", get(handlers::search_get_handler::<S>))
         .route("/{resource_type}", post(handlers::create_handler::<S>))

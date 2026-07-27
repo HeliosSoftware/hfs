@@ -275,7 +275,17 @@ async fn test_full_lifecycle_ingests_and_polls() {
     let manifest: Value = done.json();
     assert_eq!(manifest["submissionId"], "it-1");
     assert!(manifest["output"].is_array());
+    // Spec (build.fhir.org submit.html): the OperationOutcome array is `outcome`,
+    // output entries carry `fileSize`, and `link` is always present.
+    assert!(manifest["outcome"].is_array());
     assert!(manifest["link"].is_array());
+    assert!(
+        manifest["output"][0]["fileSize"].is_number(),
+        "output entry must carry fileSize, got {}",
+        manifest["output"][0]
+    );
+    // Every local-fs artifact is token-gated, so requiresAccessToken aggregates true.
+    assert_eq!(manifest["requiresAccessToken"], true);
     // HFS-served (local-fs) artifacts MUST be advertised on the submit-file
     // surface, not the export-file surface.
     let out_url = manifest["output"][0]["url"].as_str().unwrap();

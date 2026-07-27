@@ -75,7 +75,7 @@ where
     }
 
     // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
@@ -104,6 +104,12 @@ where
         });
     }
 
+    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    state
+        .validation()
+        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .await?;
+
     // Check for conditional create
     if let Some(search_params) = conditional.if_none_exist() {
         debug!(search_params = %search_params, "Processing conditional create");
@@ -122,6 +128,15 @@ where
         use helios_persistence::core::ConditionalCreateResult;
         return match result {
             ConditionalCreateResult::Created(stored) => {
+                // Stored StructureDefinitions feed the tenant's profile
+                // registry.
+                if resource_type == "StructureDefinition" {
+                    state.validation().upsert_stored_profile(
+                        tenant.tenant_id(),
+                        fhir_version,
+                        stored.content(),
+                    );
+                }
                 let headers = ResourceHeaders::from_stored(&stored, &state);
                 let location = format!("{}/{}/{}", state.base_url(), resource_type, stored.id());
 
@@ -191,6 +206,15 @@ where
         .storage()
         .create(tenant.context(), &resource_type, resource, fhir_version)
         .await?;
+
+    // Stored StructureDefinitions feed the tenant's profile registry.
+    if resource_type == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            fhir_version,
+            stored.content(),
+        );
+    }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
     let location = format!("{}/{}/{}", state.base_url(), resource_type, stored.id());

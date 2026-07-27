@@ -6,6 +6,7 @@
 //! exports spans over OTLP via `tracing-opentelemetry`. Call [`shutdown`] during
 //! graceful shutdown to flush buffered spans.
 
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -33,12 +34,35 @@ fn default_directives(level: &str) -> String {
     level.to_string()
 }
 
+/// Build the `EnvFilter`, honoring `RUST_LOG` only when it is set to a
+/// non-empty value.
+///
+/// `EnvFilter::try_from_default_env()` treats a *set-but-empty* `RUST_LOG`
+/// (`RUST_LOG=""`, as opposed to unset) as a valid filter that enables nothing,
+/// silently silencing all output — including a server's startup line. That is a
+/// footgun for operators, and it broke the obs-A/B benchmark harness, which
+/// launches its non-probe arms with an empty `RUST_LOG` and then greps the
+/// startup log to confirm which arm is active. Treat empty/whitespace-only
+/// `RUST_LOG` as unset and fall back to the process default level; an unparseable
+/// value also falls back, as before.
+fn env_filter_from(rust_log: Option<&str>, log_level: &str) -> EnvFilter {
+    match rust_log {
+        Some(v) if !v.trim().is_empty() => {
+            EnvFilter::try_new(v).unwrap_or_else(|_| EnvFilter::new(default_directives(log_level)))
+        }
+        _ => EnvFilter::new(default_directives(log_level)),
+    }
+}
+
 /// Initialize logging/tracing for a server process. `service_name` is used as
 /// the OTel resource service name (overridable by `OTEL_SERVICE_NAME`). Call
 /// once per process.
 pub fn init(service_name: &str, log_level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_directives(log_level)));
+    let filter = env_filter_from(std::env::var("RUST_LOG").ok().as_deref(), log_level);
+    // Only colorize when stdout is a real terminal. Emitting ANSI escapes into a
+    // redirected file / journald / CloudWatch corrupts the text — and it made the
+    // obs-A/B harness unable to grep the `obs_mode=` stamp out of the arm logs.
+    let use_ansi = std::io::stdout().is_terminal();
 
     #[cfg(feature = "otel")]
     {
@@ -47,7 +71,7 @@ pub fn init(service_name: &str, log_level: &str) {
             let tracer = provider.tracer("helios");
             tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt::layer())
+                .with(fmt::layer().with_ansi(use_ansi))
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .init();
             let _ = PROVIDER.set(provider);
@@ -61,7 +85,7 @@ pub fn init(service_name: &str, log_level: &str) {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer())
+        .with(fmt::layer().with_ansi(use_ansi))
         .init();
     let _ = service_name;
 }
@@ -105,4 +129,38 @@ fn build_otlp_tracer(service_name: &str) -> Option<opentelemetry_sdk::trace::Sdk
 
     opentelemetry::global::set_tracer_provider(provider.clone());
     Some(provider)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnvFilter, env_filter_from};
+
+    // Empty / whitespace / unset RUST_LOG must all fall back to the process
+    // default level, so the startup line (and everything at that level) is
+    // still emitted. A set-but-empty RUST_LOG previously enabled nothing.
+    #[test]
+    fn empty_or_unset_rust_log_falls_back_to_default_level() {
+        for rust_log in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                env_filter_from(rust_log, "info").to_string(),
+                "info",
+                "RUST_LOG={rust_log:?} should behave as unset"
+            );
+        }
+    }
+
+    #[test]
+    fn non_empty_rust_log_is_honored() {
+        assert_eq!(env_filter_from(Some("debug"), "info").to_string(), "debug");
+        assert_eq!(
+            env_filter_from(Some("warn,hts=trace"), "info").to_string(),
+            EnvFilter::new("warn,hts=trace").to_string()
+        );
+    }
+
+    #[test]
+    fn unparseable_rust_log_falls_back_to_default_level() {
+        // `@@@` is not a valid directive; fall back rather than panic.
+        assert_eq!(env_filter_from(Some("@@@"), "info").to_string(), "info");
+    }
 }

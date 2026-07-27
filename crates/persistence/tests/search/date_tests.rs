@@ -8,8 +8,10 @@ use serde_json::json;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+    SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
 };
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
@@ -20,13 +22,14 @@ use helios_persistence::backends::sqlite::SqliteBackend;
 
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
-    let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
-    backend.init_schema().expect("Failed to initialize schema");
-    backend
+    super::make_sqlite_backend()
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 #[cfg(feature = "sqlite")]
@@ -40,7 +43,10 @@ async fn seed_test_patients(backend: &SqliteBackend, tenant: &TenantContext) {
     ];
 
     for patient in patients {
-        backend.create(tenant, "Patient", patient).await.unwrap();
+        backend
+            .create(tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 }
 
@@ -60,18 +66,18 @@ async fn test_date_search_eq() {
         name: "birthdate".to_string(),
         param_type: SearchParamType::Date,
         modifier: None,
-        values: vec![SearchValue::date(SearchPrefix::Eq, "1980-01-15")],
+        values: vec![SearchValue::new(SearchPrefix::Eq, "1980-01-15")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     assert!(!result.resources.is_empty());
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert_eq!(resource.content()["birthDate"], "1980-01-15");
     }
 }
@@ -92,20 +98,24 @@ async fn test_date_search_lt() {
         name: "birthdate".to_string(),
         param_type: SearchParamType::Date,
         modifier: None,
-        values: vec![SearchValue::date(SearchPrefix::Lt, "1985-01-01")],
+        values: vec![SearchValue::new(SearchPrefix::Lt, "1985-01-01")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find patients born before 1985
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let birth_date = resource.content()["birthDate"].as_str().unwrap();
-        assert!(birth_date < "1985-01-01", "Birth date {} should be < 1985-01-01", birth_date);
+        assert!(
+            birth_date < "1985-01-01",
+            "Birth date {} should be < 1985-01-01",
+            birth_date
+        );
     }
 }
 
@@ -121,19 +131,23 @@ async fn test_date_search_gt() {
         name: "birthdate".to_string(),
         param_type: SearchParamType::Date,
         modifier: None,
-        values: vec![SearchValue::date(SearchPrefix::Gt, "2000-01-01")],
+        values: vec![SearchValue::new(SearchPrefix::Gt, "2000-01-01")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let birth_date = resource.content()["birthDate"].as_str().unwrap();
-        assert!(birth_date > "2000-01-01", "Birth date {} should be > 2000-01-01", birth_date);
+        assert!(
+            birth_date > "2000-01-01",
+            "Birth date {} should be > 2000-01-01",
+            birth_date
+        );
     }
 }
 
@@ -149,17 +163,17 @@ async fn test_date_search_le() {
         name: "birthdate".to_string(),
         param_type: SearchParamType::Date,
         modifier: None,
-        values: vec![SearchValue::date(SearchPrefix::Le, "1990-06-30")],
+        values: vec![SearchValue::new(SearchPrefix::Le, "1990-06-30")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let birth_date = resource.content()["birthDate"].as_str().unwrap();
         assert!(birth_date <= "1990-06-30");
     }
@@ -177,17 +191,17 @@ async fn test_date_search_ge() {
         name: "birthdate".to_string(),
         param_type: SearchParamType::Date,
         modifier: None,
-        values: vec![SearchValue::date(SearchPrefix::Ge, "2000-01-01")],
+        values: vec![SearchValue::new(SearchPrefix::Ge, "2000-01-01")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let birth_date = resource.content()["birthDate"].as_str().unwrap();
         assert!(birth_date >= "2000-01-01");
     }
@@ -211,27 +225,27 @@ async fn test_date_search_range() {
             name: "birthdate".to_string(),
             param_type: SearchParamType::Date,
             modifier: None,
-            values: vec![SearchValue::date(SearchPrefix::Ge, "1985-01-01")],
+            values: vec![SearchValue::new(SearchPrefix::Ge, "1985-01-01")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_parameter(SearchParameter {
             name: "birthdate".to_string(),
             param_type: SearchParamType::Date,
             modifier: None,
-            values: vec![SearchValue::date(SearchPrefix::Le, "2005-12-31")],
+            values: vec![SearchValue::new(SearchPrefix::Le, "2005-12-31")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let birth_date = resource.content()["birthDate"].as_str().unwrap();
-        assert!(birth_date >= "1985-01-01" && birth_date <= "2005-12-31");
+        assert!(("1985-01-01"..="2005-12-31").contains(&birth_date));
     }
 }
 
@@ -252,18 +266,18 @@ async fn test_date_search_year_precision() {
         name: "birthdate".to_string(),
         param_type: SearchParamType::Date,
         modifier: None,
-        values: vec![SearchValue::date(SearchPrefix::Eq, "1990")],
+        values: vec![SearchValue::new(SearchPrefix::Eq, "1990")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find patient with birthDate 1990-06-30
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let birth_date = resource.content()["birthDate"].as_str().unwrap();
         assert!(birth_date.starts_with("1990"));
     }

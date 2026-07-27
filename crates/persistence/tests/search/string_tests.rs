@@ -8,8 +8,10 @@ use serde_json::json;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
 };
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
@@ -20,13 +22,14 @@ use helios_persistence::backends::sqlite::SqliteBackend;
 
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
-    let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
-    backend.init_schema().expect("Failed to initialize schema");
-    backend
+    super::make_sqlite_backend()
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 #[cfg(feature = "sqlite")]
@@ -42,7 +45,10 @@ async fn seed_test_patients(backend: &SqliteBackend, tenant: &TenantContext) {
     ];
 
     for patient in patients {
-        backend.create(tenant, "Patient", patient).await.unwrap();
+        backend
+            .create(tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
     }
 }
 
@@ -69,7 +75,7 @@ async fn test_string_search_default() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -77,7 +83,7 @@ async fn test_string_search_default() {
     assert!(result.resources.len() >= 2);
 
     // All results should have family name starting with "smith" (case-insensitive)
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"]
             .as_str()
             .unwrap()
@@ -109,7 +115,7 @@ async fn test_string_search_case_insensitive() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -140,12 +146,19 @@ async fn test_string_search_exact() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
-    // Should only match exact "Smith", not "SMITH" or "Smithson"
-    for resource in &result.resources {
+    // Should only match exact "Smith", not "SMITH" or "Smithson". Asserting the
+    // count as well keeps the loop below from passing vacuously on an empty
+    // result set — which is exactly how a broken `:exact` fails.
+    assert_eq!(
+        result.resources.len(),
+        2,
+        "the two 'Smith' patients must match :exact=Smith"
+    );
+    for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"].as_str().unwrap();
         assert_eq!(family, "Smith", "Should only match exact 'Smith'");
     }
@@ -170,7 +183,7 @@ async fn test_string_search_exact_case_sensitive() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -201,13 +214,13 @@ async fn test_string_search_contains() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should match "Smithson" and "Johnson"
     assert!(result.resources.len() >= 2);
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"]
             .as_str()
             .unwrap()
@@ -243,12 +256,12 @@ async fn test_string_search_given_name() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     assert!(!result.resources.is_empty());
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let given = &resource.content()["name"][0]["given"];
         let names: Vec<&str> = given
             .as_array()
@@ -283,7 +296,7 @@ async fn test_string_search_combined_name() {
             modifier: None,
             values: vec![SearchValue::eq("Smith")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_parameter(SearchParameter {
             name: "given".to_string(),
@@ -291,17 +304,17 @@ async fn test_string_search_combined_name() {
             modifier: None,
             values: vec![SearchValue::eq("John")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should only match John Smith (not Jane Smith or other Smiths)
     assert!(!result.resources.is_empty());
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"]
             .as_str()
             .unwrap()
@@ -333,7 +346,7 @@ async fn test_string_search_apostrophe() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -360,7 +373,7 @@ async fn test_string_search_spaces() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -391,12 +404,12 @@ async fn test_string_search_or_values() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should match both Smith variants and Johnson
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"]
             .as_str()
             .unwrap()
@@ -432,7 +445,7 @@ async fn test_string_search_no_results() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -456,7 +469,7 @@ async fn test_string_search_empty_storage() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -490,14 +503,17 @@ async fn test_multivalue_or_semantics() {
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find resources matching EITHER Smith or Johnson
-    assert!(!result.resources.is_empty(), "Should find matching resources");
+    assert!(
+        !result.resources.is_empty(),
+        "Should find matching resources"
+    );
 
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"]
             .as_str()
             .unwrap()
@@ -530,7 +546,7 @@ async fn test_multivalue_and_semantics() {
             modifier: None,
             values: vec![SearchValue::eq("Smith")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_parameter(SearchParameter {
             name: "given".to_string(),
@@ -538,16 +554,16 @@ async fn test_multivalue_and_semantics() {
             modifier: None,
             values: vec![SearchValue::eq("John")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should only find resources matching BOTH conditions
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"]
             .as_str()
             .unwrap()
@@ -593,7 +609,7 @@ async fn test_multivalue_combined_and_or_semantics() {
             modifier: None,
             values: vec![SearchValue::eq("Smith"), SearchValue::eq("Johnson")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_parameter(SearchParameter {
             name: "given".to_string(),
@@ -601,16 +617,16 @@ async fn test_multivalue_combined_and_or_semantics() {
             modifier: None,
             values: vec![SearchValue::eq("John")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find John Smith but not Jane Smith (wrong given) or Emily Johnson (wrong given)
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let family = resource.content()["name"][0]["family"]
             .as_str()
             .unwrap()
@@ -658,7 +674,7 @@ async fn test_repeated_parameter_and_semantics() {
             modifier: None,
             values: vec![SearchValue::eq("Jo")], // Matches "John", "Joseph", etc.
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_parameter(SearchParameter {
             name: "given".to_string(),
@@ -666,17 +682,17 @@ async fn test_repeated_parameter_and_semantics() {
             modifier: None,
             values: vec![SearchValue::eq("Ja")], // Matches "Jacob", "Jane", "James", etc.
             chain: vec![],
-        components: vec![],
+            components: vec![],
         });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find "John Jacob Smith" (has both John and Jacob)
     // Should NOT find "John Smith" (only John, no Ja*) or "Jane Smith" (only Jane, no Jo*)
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         let given = &resource.content()["name"][0]["given"];
         let given_names: Vec<String> = given
             .as_array()

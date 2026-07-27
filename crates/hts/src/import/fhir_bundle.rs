@@ -564,6 +564,19 @@ fn write_value_set(
         }
     };
 
+    // Drop any materialized expansion derived from the previous content of this
+    // ValueSet. `value_set_expansions` cascades on *row delete*, and the upsert
+    // below deliberately keeps the row, so without this an expansion computed
+    // from the old compose survives a re-import and is served forever. Mirrors
+    // what the PostgreSQL `write_value_set` already does. A no-op on first
+    // import; one indexed delete on re-import, negligible beside the insert work
+    // that follows.
+    conn.execute(
+        "DELETE FROM value_set_expansions WHERE value_set_id = ?1",
+        rusqlite::params![storage_id],
+    )
+    .map_err(|e| HtsError::StorageError(e.to_string()))?;
+
     // Upsert keyed on (url, version): a re-import refreshes the existing row
     // for the same version without disturbing sibling versions. The composite
     // UNIQUE index on (url, COALESCE(version,'')) guarantees one storage row
@@ -807,8 +820,33 @@ pub(crate) fn delete_code_system(conn: &Connection, id: &str) -> Result<(), HtsE
 /// Delete a ValueSet and its materialized expansion cache by FHIR resource `id`.
 #[cfg(feature = "sqlite")]
 pub(crate) fn delete_value_set(conn: &Connection, id: &str) -> Result<(), HtsError> {
+    // Multi-version: match the plain FHIR id *and* every synthetic storage id
+    // derived from it. `write_value_set` mints `<fhir-id>|<version>` via
+    // `storage_id_for`, so matching only `id = ?1` — as this did — silently
+    // no-ops for any ValueSet that carries a `version`. Two consequences, both
+    // reachable from the REST API: `DELETE /ValueSet/{id}` returned 204 while
+    // leaving the ValueSet fully expandable, and `PUT /ValueSet/{id}` skipped
+    // the delete-then-reimport, so the FK cascade never fired and
+    // `value_set_expansions` kept serving the pre-update codes. The existing
+    // round-trip tests missed both because their ValueSet fixtures carry no
+    // `version`.
+    //
+    // The second predicate compares the segment before the first `|` for exact
+    // equality rather than using `LIKE '<id>|%'`, so an id containing a LIKE
+    // wildcard cannot over-match, and no escaping is required. FHIR ids cannot
+    // contain `|`, so the split is unambiguous.
+    //
+    // Deliberately NOT matched: `json_extract(resource_json, '$.id')`, which is
+    // what `delete_code_system` uses. ValueSets legitimately share a FHIR id
+    // across *different* canonical URLs (the tx-ecosystem fixtures do this, and
+    // `write_value_set` mints a UUID storage id for the collision), so matching
+    // on the embedded id would delete unrelated ValueSets. The remaining gap —
+    // a ValueSet stored under such a minted UUID is still not reachable by id —
+    // needs URL-based resolution and is out of scope here.
     conn.execute(
-        "DELETE FROM value_sets WHERE id = ?1",
+        "DELETE FROM value_sets \
+         WHERE id = ?1 \
+            OR (instr(id, '|') > 0 AND substr(id, 1, instr(id, '|') - 1) = ?1)",
         rusqlite::params![id],
     )
     .map_err(|e| HtsError::StorageError(e.to_string()))?;

@@ -373,6 +373,31 @@ impl S3Api for MockS3Client {
             next_continuation_token,
         })
     }
+
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError> {
+        let state = self.state.lock().unwrap();
+        if !state.buckets.contains(bucket) {
+            return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
+        let mut prefixes: Vec<String> = state
+            .objects
+            .keys()
+            .filter(|(b, key)| b == bucket && key.starts_with(prefix))
+            .filter_map(|(_, key)| {
+                key[prefix.len()..]
+                    .split_once(delimiter)
+                    .map(|(segment, _)| format!("{prefix}{segment}{delimiter}"))
+            })
+            .collect();
+        prefixes.sort();
+        prefixes.dedup();
+        Ok(prefixes)
+    }
 }
 
 /// Constructs a `PrefixPerTenant` backend backed by the given mock client.
@@ -744,7 +769,10 @@ async fn bundle_batch_mixed_results() {
         },
     ];
 
-    let result = backend.process_batch(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_batch(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(result.entries.len(), 2);
     assert_eq!(result.entries[0].status, 201);
     assert_eq!(result.entries[1].status, 404);
@@ -776,7 +804,10 @@ async fn bundle_transaction_success_and_reference_resolution() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await.unwrap();
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(result.entries.len(), 2);
 
     let obs = backend
@@ -814,7 +845,9 @@ async fn bundle_transaction_failure_rolls_back() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await;
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
     assert!(matches!(result, Err(TransactionError::BundleError { .. })));
 
     let read = backend.read(&tenant, "Patient", "rollback-me").await;
@@ -848,7 +881,9 @@ async fn bundle_transaction_reports_rollback_failure() {
         },
     ];
 
-    let result = backend.process_transaction(&tenant, entries).await;
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await;
     match result {
         Err(TransactionError::BundleError { message, .. }) => {
             assert!(message.contains("rollback failed"));
@@ -2380,4 +2415,77 @@ async fn list_tenants_skips_an_unreadable_record_instead_of_failing() {
         .await
         .expect("one unreadable record must not fail the whole listing");
     assert_eq!(listed, vec![acme]);
+}
+
+/// #330: a deregistered tenant's leftover data must stay discoverable.
+///  enumerates tenant prefixes with a delimiter LIST and
+/// counts each tenant's current-pointer objects — LIST-only, no per-object
+/// GETs, which also means delete tombstones count (they are purgeable data).
+#[tokio::test]
+async fn count_by_tenant_discovers_data_without_registration() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    // tenant-a: three current pointers — a live resource, an updated resource
+    // (history versions must not inflate the count), and a delete tombstone.
+    let a = tenant("tenant-a");
+    backend
+        .create(
+            &a,
+            "Patient",
+            json!({"resourceType":"Patient","id":"p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let p2 = backend
+        .create(
+            &a,
+            "Patient",
+            json!({"resourceType":"Patient","id":"p2"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .update(
+            &a,
+            &p2,
+            json!({"resourceType":"Patient","id":"p2","active":true}),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &a,
+            "Observation",
+            json!({"resourceType":"Observation","id":"o1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&a, "Observation", "o1").await.unwrap();
+
+    // tenant-b: data with no registration — the deregistered-tenant scenario.
+    backend
+        .create(
+            &tenant("tenant-b"),
+            "Patient",
+            json!({"resourceType":"Patient","id":"q1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Registered but empty: a registry object under tenants/ with no
+    // resources/ subtree — must not surface as a data-discovered tenant here
+    // (the maintenance page merges registrations separately).
+    backend.register_tenant("tenant-c", None).await.unwrap();
+
+    let mut counts = backend.count_by_tenant().await.unwrap();
+    counts.sort();
+    assert_eq!(
+        counts,
+        vec![("tenant-a".to_string(), 3), ("tenant-b".to_string(), 1)]
+    );
 }

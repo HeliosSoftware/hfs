@@ -1,0 +1,63 @@
+[package]
+name = "helios-fhir-validator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "FHIR resource validator for HFS — FHIR Schema based structural and profile validation"
+homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/fhir-validator"
+keywords = ["helios-software", "hl7", "fhir", "validation", "fhir-schema"]
+
+[features]
+default = ["R4"]
+R4 = ["helios-fhir/R4", "helios-fhirpath?/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath?/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath?/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath?/R6"]
+# FHIRPath-backed ConstraintEvaluator (pulls in helios-fhirpath).
+fhirpath = ["dep:helios-fhirpath"]
+# Enables the generate-schema-packs binary (dev-time; reads the FHIR spec
+# bundles from crates/fhir-gen/resources and writes packs/).
+gen-packs = []
+# Enables the validator-cli binary.
+cli = ["dep:clap"]
+
+[dependencies]
+helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
+# `rc` enables Deserialize/Serialize for Arc<T> — element schemas are shared
+# by reference across cooperative schema sets.
+serde = { workspace = true, features = ["rc"] }
+# `preserve_order` is load-bearing: the conformance contract requires errors
+# to be emitted in document key order.
+serde_json = { workspace = true, features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
+# Schema pack (de)compression.
+flate2 = "1"
+# Primitive value regexes (FHIR spec patterns carried in the packs).
+regex = "1"
+# Dyn-compatible async TerminologyProvider.
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"], optional = true }
+helios-fhirpath = { path = "../fhirpath", version = "0.2.1", optional = true, default-features = false }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[[bin]]
+name = "generate-schema-packs"
+path = "src/bin/generate_schema_packs.rs"
+required-features = ["gen-packs"]
+
+[[bin]]
+name = "generate-terminology"
+path = "src/bin/generate_terminology.rs"
+required-features = ["gen-packs"]
+
+[[bin]]
+name = "validator-cli"
+path = "src/bin/validator_cli.rs"
+required-features = ["cli"]

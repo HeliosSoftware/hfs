@@ -422,6 +422,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let vd: helios_fhir::r6::ViewDefinition = serde_json::from_str(&view_content)?;
             SofViewDefinition::R6(vd)
         }
+        // A `FhirVersion` variant can exist without helios-sof enabling the
+        // matching feature: another crate in the build graph (e.g. helios-audit,
+        // whose R5/R6 features alias to helios-fhir/R4B for the BALP baseline)
+        // can turn on a helios-fhir version feature that helios-sof did not.
+        // Unlike the guarded matches over `get_newest_enabled_fhir_version()`,
+        // this arm is reachable: `--fhir-version` accepts any variant clap can
+        // see, so reject the unsupported version instead of panicking.
+        #[allow(unreachable_patterns)]
+        other => {
+            return Err(format!(
+                "FHIR version {other:?} is not enabled for SQL-on-FHIR in this build"
+            )
+            .into());
+        }
     };
 
     // Check if we should use streaming mode for NDJSON

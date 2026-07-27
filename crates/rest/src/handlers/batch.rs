@@ -22,7 +22,7 @@ use serde_json::Value;
 use tracing::{debug, error, warn};
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::TenantExtractor;
+use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::prefer::PreferHeader;
 use crate::state::AppState;
@@ -52,6 +52,7 @@ use crate::state::AppState;
 pub async fn batch_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
+    version: FhirVersionExtractor,
     prefer: PreferHeader,
     request: Request,
 ) -> RestResult<Response>
@@ -61,6 +62,11 @@ where
     // Extract the Principal from request extensions (set by auth middleware).
     // If present, per-entry scope checks will be enforced.
     let principal = request.extensions().get::<Principal>().cloned();
+
+    // One bundle, one version: every entry the bundle creates or updates is
+    // stamped with the request's negotiated version, exactly as a
+    // single-resource endpoint would stamp it (#350).
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Parse the body as JSON
     let bundle: Value = serde_json::from_slice(
@@ -94,9 +100,27 @@ where
             })?;
 
     match bundle_type {
-        "batch" => process_batch(&state, tenant, &prefer, &bundle, principal.as_ref()).await,
+        "batch" => {
+            process_batch(
+                &state,
+                tenant,
+                fhir_version,
+                &prefer,
+                &bundle,
+                principal.as_ref(),
+            )
+            .await
+        }
         "transaction" => {
-            process_transaction(&state, tenant, &prefer, &bundle, principal.as_ref()).await
+            process_transaction(
+                &state,
+                tenant,
+                fhir_version,
+                &prefer,
+                &bundle,
+                principal.as_ref(),
+            )
+            .await
         }
         _ => Err(RestError::BadRequest {
             message: format!(
@@ -111,6 +135,7 @@ where
 async fn process_batch<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
+    fhir_version: FhirVersion,
     prefer: &PreferHeader,
     bundle: &Value,
     principal: Option<&Principal>,
@@ -134,7 +159,8 @@ where
     let mut response_entries = Vec::with_capacity(entries.len());
 
     for (index, entry) in entries.iter().enumerate() {
-        let result = process_batch_entry(state, &tenant, entry, index, principal).await;
+        let result =
+            process_batch_entry(state, &tenant, fhir_version, entry, index, principal).await;
         let correlation_details = EntryAuditCorrelation::from_bundle(&correlation, index);
         emit_batch_entry_audit(
             state,
@@ -172,6 +198,7 @@ where
 async fn process_transaction<S>(
     state: &AppState<S>,
     tenant: TenantExtractor,
+    fhir_version: FhirVersion,
     prefer: &PreferHeader,
     bundle: &Value,
     principal: Option<&Principal>,
@@ -227,6 +254,25 @@ where
         }
     }
 
+    // Write-path validation: transactions are atomic, so any invalid write
+    // entry rejects the whole bundle before anything executes.
+    for (index, entry, _) in &indexed_entries {
+        if !matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
+            continue;
+        }
+        let Some(resource) = &entry.resource else {
+            continue;
+        };
+        let (resource_type, _) =
+            parse_request_url(&entry.url).map_err(|e| RestError::BadRequest {
+                message: format!("Entry {}: {}", index, e),
+            })?;
+        state
+            .validation()
+            .check_write(tenant.tenant_id(), fhir_version, &resource_type, resource)
+            .await?;
+    }
+
     // Sort by processing order: DELETE -> POST -> PUT/PATCH -> GET
     indexed_entries.sort_by_key(|(_, entry, _)| method_processing_order(&entry.method));
 
@@ -243,11 +289,28 @@ where
     // Call the persistence layer
     let result = state
         .storage()
-        .process_transaction(tenant.context(), entries_for_processing)
+        .process_transaction(tenant.context(), entries_for_processing, fhir_version)
         .await;
 
     match result {
         Ok(bundle_result) => {
+            // Stored StructureDefinitions feed the tenant's profile
+            // registry. The request content is what was stored (modulo
+            // server-assigned id/meta, which the converter does not read).
+            for (_, entry, _) in &indexed_entries {
+                if matches!(entry.method, BundleMethod::Post | BundleMethod::Put)
+                    && let Some(resource) = &entry.resource
+                    && resource.get("resourceType").and_then(Value::as_str)
+                        == Some("StructureDefinition")
+                {
+                    state.validation().upsert_stored_profile(
+                        tenant.tenant_id(),
+                        fhir_version,
+                        resource,
+                    );
+                }
+            }
+
             // Reorder results back to original entry order
             let mut ordered_results: Vec<(usize, &BundleEntry, &BundleEntryResult)> =
                 indexed_entries
@@ -319,6 +382,7 @@ where
 async fn process_batch_entry<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
     entry: &Value,
     index: usize,
     principal: Option<&Principal>,
@@ -389,18 +453,30 @@ where
                 }
             };
 
-            // Use default FHIR version for batch operations
-            match state
-                .storage()
-                .create(
-                    tenant.context(),
-                    &resource_type,
-                    resource,
-                    FhirVersion::default_enabled(),
-                )
+            // Write-path validation (per-entry outcome in batch semantics).
+            if let Err(e) = state
+                .validation()
+                .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
                 .await
             {
-                Ok(stored) => BundleEntryResult::created(stored),
+                return create_error_result(422, &validation_failure_message(&e));
+            }
+
+            match state
+                .storage()
+                .create(tenant.context(), &resource_type, resource, fhir_version)
+                .await
+            {
+                Ok(stored) => {
+                    if resource_type == "StructureDefinition" {
+                        state.validation().upsert_stored_profile(
+                            tenant.tenant_id(),
+                            fhir_version,
+                            stored.content(),
+                        );
+                    }
+                    BundleEntryResult::created(stored)
+                }
                 Err(e) => {
                     let (status, message) = entry_error(e);
                     create_error_result(status, &message)
@@ -416,7 +492,15 @@ where
                 }
             };
 
-            // Use default FHIR version for batch operations
+            // Write-path validation (per-entry outcome in batch semantics).
+            if let Err(e) = state
+                .validation()
+                .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+                .await
+            {
+                return create_error_result(422, &validation_failure_message(&e));
+            }
+
             match state
                 .storage()
                 .create_or_update(
@@ -424,11 +508,18 @@ where
                     &resource_type,
                     &id,
                     resource,
-                    FhirVersion::default_enabled(),
+                    fhir_version,
                 )
                 .await
             {
                 Ok((stored, created)) => {
+                    if resource_type == "StructureDefinition" {
+                        state.validation().upsert_stored_profile(
+                            tenant.tenant_id(),
+                            fhir_version,
+                            stored.content(),
+                        );
+                    }
                     if created {
                         BundleEntryResult::created(stored)
                     } else {
@@ -681,6 +772,33 @@ fn parse_request_url(url: &str) -> Result<(String, String), String> {
 }
 
 /// Creates an error BundleEntryResult.
+/// Flatten an enforce-mode validation failure into a per-entry message
+/// (batch entry outcomes are message-based).
+fn validation_failure_message(error: &RestError) -> String {
+    if let RestError::ValidationFailed { outcome } = error {
+        let details: Vec<String> = outcome
+            .get("issue")
+            .and_then(|i| i.as_array())
+            .map(|issues| {
+                issues
+                    .iter()
+                    .filter_map(|issue| {
+                        issue
+                            .get("details")
+                            .and_then(|d| d.get("text"))
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !details.is_empty() {
+            return format!("Validation failed: {}", details.join("; "));
+        }
+    }
+    format!("Validation failed: {error}")
+}
+
 fn create_error_result(status: u16, message: &str) -> BundleEntryResult {
     let outcome = serde_json::json!({
         "resourceType": "OperationOutcome",

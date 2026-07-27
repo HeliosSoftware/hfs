@@ -376,8 +376,8 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | Multiple fields                                                             | ✓      | ✓          | ◐       | ✗         | ○     | ✓             | ✗   |
 | **[Bulk Operations](https://hl7.org/fhir/uv/bulkdata/)**                    |
 | [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ◐   |
-| [Bulk Submit ingest](https://hackmd.io/@argonaut/rJoqHZrPle)                | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
-| [Bulk Submit REST worker](https://hackmd.io/@argonaut/rJoqHZrPle)           | ✓      | ✓          | ✗       | ✗         | ✗     | ✗             | ✗   |
+| [Bulk Submit ingest](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)                | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
+| [Bulk Submit REST worker](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)           | ✓      | ✓          | ✗       | ✗         | ✗     | ✗             | ✗   |
 
 **Notes on partial cells:**
 

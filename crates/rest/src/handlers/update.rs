@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::error::{ResourceError, StorageError};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
@@ -76,7 +77,7 @@ where
     }
 
     // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
@@ -125,11 +126,27 @@ where
         });
     }
 
-    // Try to read existing resource for version check
-    let existing = state
+    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    state
+        .validation()
+        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .await?;
+
+    // Try to read existing resource for version check.
+    //
+    // A deleted resource is brought back to life by a subsequent update
+    // (https://hl7.org/fhir/http.html#delete), so `Gone` here is not an error:
+    // it means there is no current version to match `If-Match` against, and the
+    // storage layer restores the resource on write.
+    let existing = match state
         .storage()
         .read(tenant.context(), &resource_type, &id)
-        .await?;
+        .await
+    {
+        Ok(existing) => existing,
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+        Err(e) => return Err(e.into()),
+    };
 
     // Handle If-Match precondition
     if let Some(if_match) = conditional.if_match() {
@@ -168,6 +185,15 @@ where
             fhir_version,
         )
         .await?;
+
+    // Stored StructureDefinitions feed the tenant's profile registry.
+    if resource_type == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            fhir_version,
+            stored.content(),
+        );
+    }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
     let status = if created {
@@ -244,7 +270,7 @@ where
     S: ResourceStorage + ConditionalStorage + Send + Sync,
 {
     // Determine FHIR version from header or use server default
-    let fhir_version = version.storage_version();
+    let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Negotiate response format from Accept header
     let negotiated = negotiate_format(&req_headers, None);
@@ -275,6 +301,12 @@ where
             });
         }
     }
+
+    // Write-path validation (HFS_VALIDATION_MODE: off | log | enforce).
+    state
+        .validation()
+        .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
+        .await?;
 
     let result = state
         .storage()

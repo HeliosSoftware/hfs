@@ -34,7 +34,6 @@ fn test_postgres_config_defaults() {
     assert_eq!(config.connect_timeout_secs, 5);
     assert_eq!(config.statement_timeout_ms, 30000);
     assert!(!config.search_offloaded);
-    assert!(config.schema_name.is_none());
 }
 
 #[test]
@@ -833,6 +832,69 @@ mod postgres_integration {
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
     }
 
+    #[tokio::test]
+    async fn statement_timeout_applies_to_every_pooled_connection() {
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+
+        const POOL_SIZE: usize = 10;
+        const TIMEOUT_MS: u64 = 250;
+
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: POOL_SIZE,
+            statement_timeout_ms: TIMEOUT_MS,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        let backend =
+            std::sync::Arc::new(PostgresBackend::new(config).await.expect("create backend"));
+
+        // Hold POOL_SIZE clients across a barrier so the pool is forced to open
+        // every physical connection before any is released. deadpool creates
+        // connections lazily, so a serial check could pass while exercising only
+        // one connection. The regression this guards (#285): the pre-fix code ran
+        // `SET statement_timeout` on the single connection borrowed inside
+        // `PostgresBackend::new`, so every connection created lazily afterwards
+        // inherited the server default (usually 0 = uncapped). Shipping the GUC
+        // in the connection startup packet makes every connection carry it, which
+        // is what each task asserts below.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(POOL_SIZE));
+        let mut handles = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
+            let backend = backend.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let client = backend.get_client().await.expect("get_client");
+                barrier.wait().await;
+                let row = client
+                    .query_one("SELECT current_setting('statement_timeout')", &[])
+                    .await
+                    .expect("current_setting");
+                let value: String = row.get(0);
+                value
+            }));
+        }
+
+        for (i, h) in handles.into_iter().enumerate() {
+            let value = h.await.expect("task panicked");
+            assert_eq!(
+                value,
+                format!("{TIMEOUT_MS}ms"),
+                "pooled connection #{i} reported statement_timeout={value:?}, \
+                 expected {TIMEOUT_MS}ms — the GUC did not reach every connection"
+            );
+        }
+    }
+
     // ========================================================================
     // CRUD Tests
     // ========================================================================
@@ -1025,6 +1087,197 @@ mod postgres_integration {
 
         assert!(!was_created2);
         assert_eq!(resource2.content()["name"][0]["family"], "Second");
+    }
+
+    /// A `PUT` onto a deleted id restores the resource instead of failing.
+    ///
+    /// FHIR permits a deleted resource to be brought back by a subsequent
+    /// update (http.html#delete). The restore continues the existing version
+    /// chain — v1 create, v2 delete, v3 restore — rather than resetting to
+    /// "1", and the resource is readable and searchable again afterwards.
+    /// This mirrors `crud::delete_tests::test_delete_is_soft_delete`, which
+    /// covers the same path on SQLite.
+    #[tokio::test]
+    async fn postgres_integration_create_or_update_restores_deleted() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": "Original"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+        assert_eq!(created.version_id(), "1");
+
+        backend.delete(&tenant, "Patient", &id).await.unwrap();
+
+        let (restored, _created_new) = backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                &id,
+                json!({"resourceType": "Patient", "name": [{"family": "Restored"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(restored.content()["name"][0]["family"], "Restored");
+        assert_eq!(
+            restored.version_id(),
+            "3",
+            "restore should continue the version chain (v1 create, v2 delete, v3 restore)"
+        );
+        assert!(!restored.is_deleted());
+
+        // The resource is live again: readable, and the restore is the current
+        // version.
+        let read = backend
+            .read(&tenant, "Patient", &id)
+            .await
+            .unwrap()
+            .expect("restored resource must be readable");
+        assert_eq!(read.version_id(), "3");
+        assert_eq!(read.content()["name"][0]["family"], "Restored");
+        assert!(backend.exists(&tenant, "Patient", &id).await.unwrap());
+
+        // History keeps every version, including the deletion — which is only
+        // returned when `include_deleted` is set (deleted versions are filtered out
+        // by default on every backend).
+        let history = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                &id,
+                &HistoryParams::new().include_deleted(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            history.items.len(),
+            3,
+            "history should hold create, delete and restore"
+        );
+        assert_eq!(history.items[0].resource.version_id(), "3");
+        assert!(!history.items[0].resource.is_deleted());
+        assert!(
+            history.items[1].resource.is_deleted(),
+            "the middle version is the deletion"
+        );
+    }
+
+    /// Restoring a deleted resource requires update permission.
+    #[tokio::test]
+    async fn postgres_integration_restore_deleted_requires_permission() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = created.id().to_string();
+        backend.delete(&tenant, "Patient", &id).await.unwrap();
+
+        // Same tenant, read-only permissions.
+        let read_only =
+            TenantContext::new(tenant.tenant_id().clone(), TenantPermissions::read_only());
+        let result = backend
+            .create_or_update(
+                &read_only,
+                "Patient",
+                &id,
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(StorageError::Tenant(_))),
+            "restore without update permission must be refused, got {:?}",
+            result.as_ref().map(|(r, _)| r.version_id())
+        );
+    }
+
+    /// A restored SearchParameter re-enters the tenant's registry overlay.
+    ///
+    /// Deleting a custom SearchParameter unregisters it; bringing it back with
+    /// a PUT has to reload the stored-parameter cache the way a create does,
+    /// or the parameter stays invisible to search until the process restarts.
+    #[tokio::test]
+    async fn postgres_integration_restored_search_parameter_reenters_registry() {
+        use helios_persistence::core::SearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let search_param = json!({
+            "resourceType": "SearchParameter",
+            "id": "pg-restore-sp",
+            "url": "http://example.org/fhir/SearchParameter/pg-restore-sp",
+            "name": "pgrestoresp",
+            "status": "active",
+            "code": "pgrestoresp",
+            "base": ["Observation"],
+            "type": "token",
+            "expression": "Observation.code"
+        });
+
+        backend
+            .create_or_update(
+                &tenant,
+                "SearchParameter",
+                "pg-restore-sp",
+                search_param.clone(),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        {
+            let reg = backend.search_param_registry(&tenant);
+            let registry = reg.read();
+            assert!(registry.get_param("Observation", "pgrestoresp").is_some());
+        }
+
+        backend
+            .delete(&tenant, "SearchParameter", "pg-restore-sp")
+            .await
+            .unwrap();
+        {
+            let reg = backend.search_param_registry(&tenant);
+            let registry = reg.read();
+            assert!(
+                registry.get_param("Observation", "pgrestoresp").is_none(),
+                "deleted SearchParameter should be unregistered"
+            );
+        }
+
+        backend
+            .create_or_update(
+                &tenant,
+                "SearchParameter",
+                "pg-restore-sp",
+                search_param,
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let reg = backend.search_param_registry(&tenant);
+        let registry = reg.read();
+        assert!(
+            registry.get_param("Observation", "pgrestoresp").is_some(),
+            "restored SearchParameter should be registered again"
+        );
     }
 
     #[tokio::test]

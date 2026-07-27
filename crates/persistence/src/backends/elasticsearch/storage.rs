@@ -15,7 +15,7 @@ use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::tenant::TenantContext;
+use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
 use super::backend::ElasticsearchBackend;
@@ -486,6 +486,8 @@ impl ResourceStorage for ElasticsearchBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
         let tenant_id = tenant.tenant_id().as_str();
 
         let id = resource
@@ -787,8 +789,10 @@ impl ResourceStorage for ElasticsearchBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let tenant_id = tenant.tenant_id().as_str();
         let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let tenant_id = tenant.tenant_id().as_str();
         let id = current.id();
         let new_version: u64 = current.version_id().parse::<u64>().unwrap_or(0) + 1;
         let version_id = new_version.to_string();
@@ -860,6 +864,8 @@ impl ResourceStorage for ElasticsearchBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let tenant_id = tenant.tenant_id().as_str();
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);

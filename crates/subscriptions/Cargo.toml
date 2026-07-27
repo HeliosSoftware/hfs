@@ -32,6 +32,8 @@ serde_json.workspace = true
 # Async runtime
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 async-trait = "0.1"
+# `join_all` for the bounded-concurrency handshake pass in `rehydrate`.
+futures = "0.3"
 
 # Time
 chrono.workspace = true
@@ -58,6 +60,9 @@ dashmap = "6"
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Real SQLite backend for the rehydration integration test (issue #305): the
+# rehydration path is only meaningful against an actual `ExportDataProvider`.
+helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["sqlite"] }
 
 # `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
 # Windows test runs don't need SIGTERM cleanup, so drop the feature there.
