@@ -1,7 +1,8 @@
 //! Bulk submit types and traits.
 //!
 //! This module provides types and traits for implementing Bulk Data Submit
-//! as specified in the [Bulk Submit](https://hackmd.io/@argonaut/rJoqHZrPle) specification.
+//! as specified in the HL7 FHIR Bulk Data Access
+//! [Submit operation](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html).
 //!
 //! # Overview
 //!
