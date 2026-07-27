@@ -142,20 +142,44 @@ test.describe("query builder", () => {
     );
   });
 
-  test("multi-level chains stay as raw conditions and survive round-trip", async ({
+  test("a multi-level chain hydrates into hop segments and round-trips", async ({
     queries,
   }) => {
-    const url = "Patient?general-practitioner.organization.name=Acme";
-    await queries.builder.setUrl(url);
-    // No dedicated controls for two hops (follow-up): the key stays intact.
-    await expect(queries.builder.chainRows).toHaveCount(0);
-    const row = queries.builder.conditionRows.first();
-    await expect(row.locator(".builder-row__key")).toHaveValue(
-      "general-practitioner.organization.name",
+    await queries.builder.setUrl("Patient?general-practitioner.organization.name=Acme");
+    await expect(queries.builder.chainRows).toHaveCount(1);
+    const row = queries.builder.chainRows.first();
+    const hops = row.locator(".builder-row__hopseg");
+    await expect(hops).toHaveCount(2);
+    await expect(hops.nth(0).locator(".builder-row__chainref")).toHaveValue(
+      "general-practitioner",
     );
+    await expect(hops.nth(1).locator(".builder-row__chainref")).toHaveValue("organization");
+    await expect(row.locator(".builder-row__cparam")).toHaveValue("name");
+
     await row.locator(".builder-row__value").fill("Beta");
     await expect(queries.builder.url).toHaveValue(
       "GET /Patient?general-practitioner.organization.name=Beta",
+    );
+  });
+
+  test("drilling deeper appends a hop when the leaf is a reference", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?general-practitioner.name=x");
+    const row = queries.builder.chainRows.first();
+    const leaf = row.locator(".builder-row__cparam");
+    await leaf.fill("organization");
+    // organization is a reference param on the target types, so the
+    // drill-deeper affordance appears.
+    const deeper = row.locator("[data-chain-deeper]");
+    await expect(deeper).toBeVisible();
+    await deeper.click();
+
+    await expect(row.locator(".builder-row__hopseg")).toHaveCount(2);
+    await leaf.fill("name");
+    await row.locator(".builder-row__value").fill("Acme");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?general-practitioner.organization.name=Acme",
     );
   });
 

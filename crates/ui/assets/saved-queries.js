@@ -258,22 +258,26 @@
     }
     var dot = rawKey.indexOf(".");
     if (dot > 0) {
-      /* ref-param[:Type].leaf[:modifier] — forward chain, one level. */
-      var head = rawKey.slice(0, dot);
-      var tail = rawKey.slice(dot + 1);
-      var headColon = head.indexOf(":");
-      var tailColon = tail.indexOf(":");
-      if (tail.indexOf(".") < 0) {
+      /* ref[:Type].ref[:Type]…​.leaf[:modifier] — forward chain, any depth.
+       * Every segment but the last is a reference hop with an optional type
+       * qualifier; the modifier belongs to the leaf. */
+      var segs = rawKey.split(".");
+      var hops = segs.slice(0, -1).map(function (seg) {
+        var c = seg.indexOf(":");
         return {
-          kind: "chain",
-          refParam: headColon < 0 ? head : head.slice(0, headColon),
-          targetType: headColon < 0 ? "" : head.slice(headColon + 1),
-          key: tailColon < 0 ? tail : tail.slice(0, tailColon),
-          modifier: tailColon < 0 ? "" : tail.slice(tailColon + 1),
-          value: value,
+          ref: c < 0 ? seg : seg.slice(0, c),
+          type: c < 0 ? "" : seg.slice(c + 1),
         };
-      }
-      return { kind: "condition", key: rawKey, modifier: "", value: value };
+      });
+      var last = segs[segs.length - 1];
+      var lastColon = last.indexOf(":");
+      return {
+        kind: "chain",
+        hops: hops,
+        key: lastColon < 0 ? last : last.slice(0, lastColon),
+        modifier: lastColon < 0 ? "" : last.slice(lastColon + 1),
+        value: value,
+      };
     }
     var colon = rawKey.indexOf(":");
     return {
@@ -371,66 +375,181 @@
     row.appendChild(remove);
   }
 
-  /* Forward chain: ref-param › [target type] . [target param] op value.
-   * Serializes to `ref.param=` or `ref:Type.param=` (one hop). */
+  /* Forward chain: one hop segment per reference —
+   * `ref › [type]` … then the leaf param, operator, and value. Serializes to
+   * `ref.leaf=`, `ref:Type.leaf=`, or deeper (`ref.ref2.leaf=`), matching the
+   * numbered-levels panel in the design; the drill-deeper affordance appends
+   * a hop when the leaf itself is a reference. */
   function chainRow(part) {
     var row = document.createElement("div");
     row.className = "builder-row builder-row--chain";
+    var hops = (part.hops || []).map(function (h) {
+      return { ref: h.ref, type: h.type };
+    });
 
-    var ref = document.createElement("input");
-    ref.className = "builder-row__key builder-row__chainref";
-    ref.value = part.refParam;
-    ref.setAttribute("list", "param-options");
-    ref.placeholder = sections.dataset.msgParam;
-    ref.spellcheck = false;
-    row.appendChild(ref);
-
-    row.appendChild(chainLabel("›"));
-
-    var target = document.createElement("select");
-    target.className = "builder-row__ctype";
-    row.appendChild(target);
+    var hopsHost = document.createElement("span");
+    hopsHost.className = "builder-row__hops";
+    row.appendChild(hopsHost);
 
     var leaf = listedInput(row, sections.dataset.msgParam, part.key);
     leaf.input.className = "builder-row__cparam";
     row.appendChild(leaf.input);
 
+    var deeper = document.createElement("button");
+    deeper.type = "button";
+    deeper.className = "builder-row__drill";
+    deeper.dataset.chainDeeper = "true";
+    deeper.title = sections.dataset.msgChainInto;
+    deeper.textContent = "›";
+    deeper.hidden = true;
+    row.appendChild(deeper);
+
     appendTail(row, part);
 
     var base = sections.dataset.type || "";
-    function resolvedTarget(targets) {
-      return target.value || (targets.length === 1 ? targets[0] : "");
-    }
-    function refillTargets() {
-      fetchParams(base).then(function (meta) {
-        var targets = ((meta[ref.value.trim()] || {}).targets || []).slice();
-        target.textContent = "";
-        option(target, "", sections.dataset.msgAnyTarget, part.targetType === "");
-        targets.forEach(function (t) {
-          option(target, t, t, part.targetType === t);
+
+    /* Candidate resource types feeding hop k: the selected type of the
+     * previous hop, else all of its registry targets (base type at k=0). */
+    function parentTypes(k, done) {
+      if (k === 0) return done([base]);
+      var prev = hops[k - 1];
+      if (prev.type) return done([prev.type]);
+      parentTypes(k - 1, function (grand) {
+        var pending = grand.length;
+        var out = [];
+        if (!pending) return done([]);
+        grand.forEach(function (g) {
+          fetchParams(g).then(function (meta) {
+            (((meta[prev.ref] || {}).targets) || []).forEach(function (t) {
+              if (out.indexOf(t) < 0) out.push(t);
+            });
+            if (--pending === 0) done(out);
+          });
         });
-        /* An explicit type from a pasted URL stays selectable even if the
-         * registry does not list it. */
-        if (part.targetType && targets.indexOf(part.targetType) < 0) {
-          option(target, part.targetType, part.targetType, true);
-        }
-        refillLeaf(targets);
       });
     }
-    function refillLeaf(targets) {
-      var t = resolvedTarget(targets || []);
-      if (!t) return;
-      fetchParams(t).then(function (meta) {
-        fillList(leaf.list, Object.keys(meta).sort());
+
+    function segRefill(k) {
+      var seg = hopsHost.children[k];
+      if (!seg) return;
+      var refInput = seg.querySelector(".builder-row__chainref");
+      var typeSel = seg.querySelector(".builder-row__ctype");
+      parentTypes(k, function (parents) {
+        /* Ref-param suggestions: reference params across the parents. */
+        var list = seg.querySelector("datalist");
+        var pending = parents.length;
+        var codes = [];
+        if (!pending) return;
+        parents.forEach(function (p) {
+          fetchParams(p).then(function (meta) {
+            Object.keys(meta).forEach(function (code) {
+              if (meta[code].type === "reference" && codes.indexOf(code) < 0) {
+                codes.push(code);
+              }
+            });
+            if (--pending === 0) fillList(list, codes.sort());
+          });
+        });
+        /* Target-type options for this hop's qualifier. */
+        var chosen = hops[k].type;
+        var tPending = parents.length;
+        var targets = [];
+        parents.forEach(function (p) {
+          fetchParams(p).then(function (meta) {
+            (((meta[refInput.value.trim()] || {}).targets) || []).forEach(function (t) {
+              if (targets.indexOf(t) < 0) targets.push(t);
+            });
+            if (--tPending === 0) {
+              typeSel.textContent = "";
+              option(typeSel, "", sections.dataset.msgAnyTarget, chosen === "");
+              targets.forEach(function (t) {
+                option(typeSel, t, t, chosen === t);
+              });
+              if (chosen && targets.indexOf(chosen) < 0) {
+                option(typeSel, chosen, chosen, true);
+              }
+            }
+          });
+        });
       });
     }
-    ref.addEventListener("input", refillTargets);
-    target.addEventListener("change", function () {
-      part.targetType = target.value;
-      refillLeaf([]);
+
+    function leafTypes(done) {
+      parentTypes(hops.length, done);
+    }
+
+    function refillLeaf() {
+      leafTypes(function (types) {
+        var pending = types.length;
+        var codes = [];
+        var anyRef = false;
+        if (!pending) return;
+        types.forEach(function (t) {
+          fetchParams(t).then(function (meta) {
+            Object.keys(meta).forEach(function (code) {
+              if (codes.indexOf(code) < 0) codes.push(code);
+            });
+            var m = meta[leaf.input.value.trim()];
+            if (m && m.type === "reference") anyRef = true;
+            if (--pending === 0) {
+              fillList(leaf.list, codes.sort());
+              deeper.hidden = !anyRef;
+            }
+          });
+        });
+      });
+    }
+
+    function addSegment(k) {
+      var seg = document.createElement("span");
+      seg.className = "builder-row__hopseg";
+
+      var ref = listedInput(seg, sections.dataset.msgParam, hops[k].ref);
+      ref.input.className = "builder-row__key builder-row__chainref";
+      if (k === 0) ref.input.setAttribute("list", "param-options");
+      seg.appendChild(ref.input);
+
+      seg.appendChild(chainLabel("›"));
+
+      var typeSel = document.createElement("select");
+      typeSel.className = "builder-row__ctype";
+      seg.appendChild(typeSel);
+
+      ref.input.addEventListener("input", function () {
+        hops[k].ref = ref.input.value.trim();
+        segRefill(k);
+        refillLeaf();
+      });
+      typeSel.addEventListener("change", function () {
+        hops[k].type = typeSel.value;
+        for (var j = k + 1; j < hops.length; j++) segRefill(j);
+        refillLeaf();
+        updateUrl();
+      });
+
+      hopsHost.appendChild(seg);
+      segRefill(k);
+    }
+
+    hops.forEach(function (_, k) {
+      addSegment(k);
+    });
+    refillLeaf();
+
+    leaf.input.addEventListener("input", refillLeaf);
+    deeper.addEventListener("click", function () {
+      var refName = leaf.input.value.trim();
+      if (!refName) return;
+      hops.push({ ref: refName, type: "" });
+      leaf.input.value = "";
+      addSegment(hops.length - 1);
+      refillLeaf();
+      leaf.input.focus();
       updateUrl();
     });
-    refillTargets();
+
+    /* updateUrl reads the hops through the row's DOM state. */
+    row.chainHops = hops;
 
     return row;
   }
@@ -646,11 +765,17 @@
     sections.querySelectorAll(".builder-row").forEach(function (row) {
       var key;
       if (row.classList.contains("builder-row--chain")) {
-        var ref = row.querySelector(".builder-row__chainref").value.trim();
-        var ctype = row.querySelector(".builder-row__ctype").value;
+        var segs = row.querySelectorAll(".builder-row__hopseg");
         var leaf = row.querySelector(".builder-row__cparam").value.trim();
-        if (!ref || !leaf) return;
-        key = ref + (ctype ? ":" + ctype : "") + "." + leaf;
+        if (!segs.length || !leaf) return;
+        var pieces = [];
+        for (var si = 0; si < segs.length; si++) {
+          var ref = segs[si].querySelector(".builder-row__chainref").value.trim();
+          if (!ref) return;
+          var ctype = segs[si].querySelector(".builder-row__ctype").value;
+          pieces.push(ref + (ctype ? ":" + ctype : ""));
+        }
+        key = pieces.join(".") + "." + leaf;
       } else if (row.classList.contains("builder-row--has")) {
         var htype = row.querySelector(".builder-row__htype").value.trim();
         var href = row.querySelector(".builder-row__href").value.trim();
@@ -698,8 +823,7 @@
         var kept = from.querySelector(".builder-row__value").value.trim();
         var chain = chainRow({
           kind: "chain",
-          refParam: refParam,
-          targetType: "",
+          hops: [{ ref: refParam, type: "" }],
           key: "",
           modifier: "",
           value: kept,
