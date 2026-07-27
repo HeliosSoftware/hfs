@@ -17,7 +17,12 @@ env:
 jobs:
   test-rust:
     name: Test Rust
-    runs-on: [self-hosted]
+    # TEMPORARY (verification of the crc-fast fix): normally `[self-hosted]`.
+    # Pinned to the Windows agent so the S3+ES suite is guaranteed to run on
+    # the agent that produced the crc-fast panic in run 30303350382, proving
+    # the aws-sdk-s3 1.122.0 bump actually fixes it. Revert to `[self-hosted]`
+    # once 10/10 is confirmed.
+    runs-on: [self-hosted, Windows]
     # Bound the whole job so a genuine hang fails fast instead of parking a
     # runner for hours. A healthy run (full all-features build + tests) fits
     # comfortably under this.
