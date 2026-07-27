@@ -241,12 +241,40 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
+| `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | Private key(s) for asymmetric JWE key management — PEM (PKCS#8/PKCS#1/SEC1) or a JWK / JWK Set. |
 
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
-`HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set. JWE-encrypted
-files (`fileEncryptionKey`) are supported for `dir` + `A128GCM`/`A256GCM` when built
-with the `bulk-submit-jwe` feature.
+`HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set.
+
+#### Encrypted submissions (`fileEncryptionKey`)
+
+JWE decryption is built unconditionally — the old `bulk-submit-jwe` feature is a
+deprecated no-op. When a submission carries a `fileEncryptionKey`, both the
+manifest and every output/deleted file are decrypted by the
+[`jwe`](src/jwe.rs) module (pure RustCrypto, no OpenSSL):
+
+| Layer | Supported |
+|-------|-----------|
+| `alg` | `dir`, `A128KW`/`A192KW`/`A256KW`, `A128GCMKW`/`A192GCMKW`/`A256GCMKW`, `RSA-OAEP`, `RSA-OAEP-256`, `ECDH-ES`, `ECDH-ES+A128KW`/`+A192KW`/`+A256KW` |
+| `enc` | `A128GCM`/`A192GCM`/`A256GCM`, `A128CBC-HS256`/`A192CBC-HS384`/`A256CBC-HS512` |
+| Serialization | compact, flattened JSON, general JSON |
+| Compression | `zip: "DEF"` |
+
+`RSA1_5` (RFC 8725 deprecation) and `PBES2-*` (no shared password in this flow)
+are rejected with an error naming the algorithm, as is any other unknown `alg`
+or `enc`.
+
+`fileEncryptionKey.value` is accepted as base64url key material, an `oct` JWK, or
+— matching the spec's "JSON Web Encryption structure to deliver a Content
+Encryption Key" — a JWE that wraps the CEK. That last form, and any file using
+`RSA-OAEP*`/`ECDH-ES*` directly, needs a local private key in
+`HFS_BULK_SUBMIT_DECRYPTION_KEY`; `dir` and the `A*KW` families work from the
+provider-supplied symmetric key alone and need no configuration.
+
+A file that arrives in cleartext despite a `fileEncryptionKey` is rejected. A
+cleartext *manifest* is accepted with a warning, since manifests carry URLs
+rather than PHI and providers commonly leave them unencrypted.
 
 ### SQL-on-FHIR Async Export
 

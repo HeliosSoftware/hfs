@@ -59,6 +59,7 @@ At least one of `submissionStatus` or `manifestUrl` must be populated.
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | none | PEM key for `private_key_jwt` client assertion |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | `ES384` or `RS384` |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens; never `system/bulk-submit` |
+| `HFS_BULK_SUBMIT_DECRYPTION_KEY` | none | Private key(s) for asymmetric JWE `fileEncryptionKey` unwrapping — PEM (PKCS#8/PKCS#1/SEC1) or a JWK / JWK Set |
 
 Job state reuses the same backend as the FHIR resources. SQLite shares `./data/hfs.db`; PostgreSQL shares `HFS_DATABASE_URL`. Bulk submit is available on `sqlite`, `postgres`, and their `-elasticsearch` composites. Other backends return `501`. The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubmitProvider` ingestion engine) and `BulkSubmitRestWorker` (full `$bulk-submit` REST worker/job-store): SQLite and Postgres advertise both, while S3 advertises only `BulkSubmitIngest` and never owns REST-worker job state.
 
@@ -71,8 +72,11 @@ Job state reuses the same backend as the FHIR resources. SQLite shares `./data/h
 - Partial success remains `200` with a populated `error[]` array of OperationOutcome NDJSON.
 - Per-resource issues carry the `artifact-relatedArtifact` extension.
 - `import` directives use upsert-by-id with last-write-wins, matching `replace`. `merge` semantics are a documented follow-up.
-- JWE decryption for `fileEncryptionKey` supports `dir` plus `A128GCM` or `A256GCM` compact JWE files when built with `bulk-submit-jwe`.
-- Build JWE support with `cargo build -p helios-hfs --features bulk-submit-jwe`.
-- Without the feature, or for other JWE algorithms, encrypted files record a `not-supported` manifest-level error while unencrypted manifests proceed.
+- JWE decryption for `fileEncryptionKey` is built unconditionally; the `bulk-submit-jwe` feature is a deprecated no-op.
+- Both the manifest and each output/deleted file are decrypted. A plaintext file is rejected when a key was supplied; a plaintext manifest is tolerated with a warning.
+- Supported `alg`: `dir`, `A128KW`/`A192KW`/`A256KW`, `A128GCMKW`/`A192GCMKW`/`A256GCMKW`, `RSA-OAEP`, `RSA-OAEP-256`, `ECDH-ES` and `ECDH-ES+A128KW`/`+A192KW`/`+A256KW`.
+- Supported `enc`: `A128GCM`/`A192GCM`/`A256GCM`, `A128CBC-HS256`/`A192CBC-HS384`/`A256CBC-HS512`. `zip: "DEF"` is inflated. Compact plus flattened/general JSON serializations are accepted.
+- `RSA1_5` and `PBES2-*` are deliberately rejected; the error names the algorithm.
+- `fileEncryptionKey.value` may be base64url key material, an `oct` JWK, or itself a JWE delivering the CEK. The last form needs `HFS_BULK_SUBMIT_DECRYPTION_KEY` (PEM or JWK/JWK Set) — as do `RSA-OAEP*`/`ECDH-ES*` files.
 - Status `link` and pagination: HFS returns a single, non-paginated status manifest; the `link` array is always present and empty.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.

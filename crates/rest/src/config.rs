@@ -634,6 +634,12 @@ pub struct BulkSubmitConfig {
     pub private_key: Option<String>,
     /// Signing algorithm for the client assertion (`ES384` or `RS384`).
     pub signing_alg: String,
+    /// Private key(s) HFS decrypts asymmetrically addressed JWEs with — PEM
+    /// (PKCS#8/PKCS#1/SEC1) or a JWK / JWK Set. Only needed when a Data Provider
+    /// delivers the `fileEncryptionKey` content-encryption key wrapped to an HFS
+    /// public key (`RSA-OAEP*` / `ECDH-ES*`); `dir` and the `A*KW` families use
+    /// the symmetric key in `fileEncryptionKey.value` and need no configuration.
+    pub decryption_key: Option<String>,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,
     /// `Retry-After` (seconds) advertised on an in-progress status poll.
@@ -661,6 +667,7 @@ impl Default for BulkSubmitConfig {
             client_id: None,
             private_key: None,
             signing_alg: "ES384".to_string(),
+            decryption_key: None,
             outbound_scope: "system/*.rs".to_string(),
             retry_after_secs: 120,
         }
@@ -727,6 +734,9 @@ impl BulkSubmitConfig {
             client_id: std::env::var("HFS_BULK_SUBMIT_CLIENT_ID").ok(),
             private_key: std::env::var("HFS_BULK_SUBMIT_PRIVATE_KEY").ok(),
             signing_alg: std::env::var("HFS_BULK_SUBMIT_SIGNING_ALG").unwrap_or(d.signing_alg),
+            decryption_key: std::env::var("HFS_BULK_SUBMIT_DECRYPTION_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
                 .unwrap_or(d.outbound_scope),
             retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
@@ -786,6 +796,12 @@ impl BulkSubmitConfig {
         }
         if self.cleanup_interval_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_CLEANUP_INTERVAL must be > 0".to_string());
+        }
+        if let Some(material) = &self.decryption_key {
+            // Fail at startup rather than mid-submission on an unusable key.
+            if let Err(e) = crate::jwe::load_private_keys(material) {
+                errors.push(format!("HFS_BULK_SUBMIT_DECRYPTION_KEY is invalid: {e}"));
+            }
         }
         if errors.is_empty() {
             Ok(())
