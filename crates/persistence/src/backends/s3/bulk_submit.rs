@@ -670,9 +670,9 @@ impl S3Backend {
                         ));
                     }
 
-                    let updated = self
-                        .update(tenant, &current, entry.resource.clone())
-                        .await?;
+                    // Update the resource, honoring the submission's import mode.
+                    let content = options.content_for_update(current.content(), &entry.resource);
+                    let updated = self.update(tenant, &current, content).await?;
 
                     let change = SubmissionChange::update(
                         manifest_id,

@@ -4918,4 +4918,109 @@ mod postgres_integration {
             "expected a backend error from an unmigrated database, got {create:?}"
         );
     }
+    /// The `import` / `metadata` kickoff directives must survive the PostgreSQL
+    /// round-trip and reach the worker, and `merge` must actually merge.
+    ///
+    /// This is the Postgres half of the coverage in
+    /// `core::bulk_submit_worker::tests` (which runs on SQLite): the plumbing is
+    /// shared but the SQL is not, so a typo in the new columns would otherwise
+    /// only surface in production.
+    #[tokio::test]
+    async fn postgres_bulk_submit_import_directives_round_trip() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, IMPORT_MODE_PARAMETER_URL, ImportMode,
+            ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitClaimStrategy,
+            SubmitWorkerStorage,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_import");
+        let sub_id = SubmissionId::generate("pg-import-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/m.json"), None)
+            .await
+            .unwrap();
+
+        let directives = vec![(IMPORT_MODE_PARAMETER_URL.to_string(), "merge".to_string())];
+        let metadata = vec![("https://ex/context".to_string(), "batch-7".to_string())];
+        backend
+            .set_manifest_fetch_params(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                ManifestFetchParams {
+                    fhir_base_url: Some("https://provider/fhir"),
+                    import_directives: &directives,
+                    metadata: &metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Claim the manifest the way the worker does, then read its view back.
+        let lease = backend
+            .claim_next_manifest(
+                &helios_persistence::core::WorkerId::new("pg-import-worker"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.import_directives, directives);
+        assert_eq!(view.metadata, metadata);
+        assert_eq!(
+            ImportMode::from_directives(&view.import_directives),
+            ImportMode::Merge
+        );
+
+        // And the resolved mode changes what ingestion writes.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "pg-merge-1",
+                    "gender": "female",
+                    "name": [{"family": "Stale"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let entry = NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "pg-merge-1", "name": [{"family": "New"}]}),
+        );
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                vec![entry],
+                &BulkProcessingOptions::new().with_import_mode(ImportMode::Merge),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success());
+
+        let stored = backend
+            .read(&tenant, "Patient", "pg-merge-1")
+            .await
+            .unwrap()
+            .expect("patient still stored");
+        assert_eq!(stored.content()["name"], json!([{"family": "New"}]));
+        assert_eq!(
+            stored.content()["gender"],
+            json!("female"),
+            "merge must retain elements the submission omitted"
+        );
+    }
 }
