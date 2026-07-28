@@ -307,6 +307,7 @@ queries-includes = Includes
 queries-result-controls = Controles de resultado
 queries-remove = Quitar
 queries-match-is = es
+queries-or = + o
 queries-chain-into = Filtrar por una propiedad del recurso referenciado
 queries-chain-any-target = cualquiera
 queries-has-pill = tiene un recurso relacionado

@@ -214,6 +214,45 @@ test.describe("query builder", () => {
     );
   });
 
+  /* ---- OR values (#414) ------------------------------------------------ */
+
+  test("comma OR values hydrate as stacked inputs and round-trip", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name=Smith,Jones");
+    const row = queries.builder.conditionRows.first();
+    const values = row.locator(".builder-row__value");
+    await expect(values).toHaveCount(2);
+    await expect(values.nth(0)).toHaveValue("Smith");
+    await expect(values.nth(1)).toHaveValue("Jones");
+
+    await values.nth(1).fill("Garcia");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name=Smith,Garcia");
+  });
+
+  test("the + or button stacks a value; the per-value × removes it", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?name=Smith");
+    const row = queries.builder.conditionRows.first();
+    await row.locator("[data-add-or]").click();
+    await row.locator(".builder-row__value").nth(1).fill("Jones");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name=Smith,Jones");
+
+    await row.locator("[data-remove-or]").first().click();
+    await expect(row.locator(".builder-row__value")).toHaveCount(1);
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name=Jones");
+  });
+
+  test("comparator OR values keep a prefix per alternative", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?birthdate=ge1980-01-01,le1990-12-31");
+    const row = queries.builder.conditionRows.first();
+    await expect(row.locator(".builder-row__value")).toHaveCount(2);
+    // The second alternative keeps its own comparator on round-trip.
+    await row.locator(".builder-row__value").nth(0).fill("ge1985-01-01");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?birthdate=ge1985-01-01,le1990-12-31",
+    );
+  });
+
   test("picking a type swaps in that type's parameter datalist", async ({ queries }) => {
     await queries.railItem("Patient").click();
     // /ui/queries/params fills #param-options for the picked type.
