@@ -276,7 +276,15 @@ fn parse_search_parameter(
     value: &str,
     registry: &SearchParameterRegistry,
 ) -> Result<SearchParameter, RestError> {
-    let (param_name, modifier) = parse_parameter_name(name);
+    // A dotted name is a chained parameter, and a colon inside it
+    // (`subject:Patient.name`) is the chain's type qualifier — modifier
+    // parsing must not eat it (it used to keep `subject` and drop the whole
+    // `.name` tail, turning the chain into a plain reference search).
+    let (param_name, modifier) = if name.contains('.') {
+        (name, None)
+    } else {
+        parse_parameter_name(name)
+    };
 
     // Check for chained parameters (e.g., "patient.name" or "subject:Patient.name")
     let (base_name, chain) = parse_chain(param_name);

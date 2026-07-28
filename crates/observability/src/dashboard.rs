@@ -153,7 +153,7 @@ pub trait DashboardProvider: Send + Sync {
     /// Compute a fresh snapshot over `window`. Called per dashboard page load, so
     /// implementations keep the query fan-out bounded (a handful of resource
     /// types) and degrade gracefully — returning zeros — rather than erroring.
-    async fn snapshot(&self, window: DashboardWindow) -> DashboardSnapshot;
+    async fn snapshot(&self, window: DashboardWindow, tenant: &str) -> DashboardSnapshot;
 }
 
 static PROVIDER: RwLock<Option<Arc<dyn DashboardProvider>>> = RwLock::new(None);
@@ -179,7 +179,7 @@ struct CacheEntry {
     computing: bool,
 }
 
-type SnapCache = Arc<RwLock<std::collections::HashMap<DashboardWindow, CacheEntry>>>;
+type SnapCache = Arc<RwLock<std::collections::HashMap<(DashboardWindow, String), CacheEntry>>>;
 
 static CACHE: std::sync::LazyLock<SnapCache> = std::sync::LazyLock::new(SnapCache::default);
 
@@ -202,9 +202,17 @@ const COLD_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
 /// page loads O(1) even on backends where computing the snapshot walks storage
 /// (the S3 primary reads one object per resource — minutes once conformance
 /// seeding has populated the store, #326).
-pub async fn snapshot(window: DashboardWindow) -> Option<DashboardSnapshot> {
+pub async fn snapshot(window: DashboardWindow, tenant: &str) -> Option<DashboardSnapshot> {
     let provider = provider()?;
-    snapshot_via(CACHE.clone(), provider, window, CACHE_TTL, COLD_WAIT).await
+    snapshot_via(
+        CACHE.clone(),
+        provider,
+        window,
+        tenant,
+        CACHE_TTL,
+        COLD_WAIT,
+    )
+    .await
 }
 
 /// [`snapshot`] with the cache, provider, and timings injected, so the serve
@@ -213,14 +221,16 @@ async fn snapshot_via(
     cache: SnapCache,
     provider: Arc<dyn DashboardProvider>,
     window: DashboardWindow,
+    tenant: &str,
     ttl: std::time::Duration,
     cold_wait: std::time::Duration,
 ) -> Option<DashboardSnapshot> {
+    let key = (window, tenant.to_string());
     // One pass under the lock: serve fresh hits, note staleness, and claim the
     // compute slot if nobody holds it.
     let (cached, spawn_compute) = {
         let mut guard = cache.write().ok()?;
-        let entry = guard.entry(window).or_insert(CacheEntry {
+        let entry = guard.entry(key.clone()).or_insert(CacheEntry {
             value: None,
             computing: false,
         });
@@ -238,10 +248,12 @@ async fn snapshot_via(
 
     if spawn_compute {
         let cache = cache.clone();
+        let key = key.clone();
+        let tenant = tenant.to_string();
         tokio::spawn(async move {
-            let value = provider.snapshot(window).await;
+            let value = provider.snapshot(window, &tenant).await;
             if let Ok(mut guard) = cache.write()
-                && let Some(entry) = guard.get_mut(&window)
+                && let Some(entry) = guard.get_mut(&key)
             {
                 entry.value = Some((std::time::Instant::now(), value));
                 entry.computing = false;
@@ -259,7 +271,7 @@ async fn snapshot_via(
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         if let Ok(guard) = cache.read()
-            && let Some(value) = guard.get(&window).and_then(|e| e.value.as_ref())
+            && let Some(value) = guard.get(&key).and_then(|e| e.value.as_ref())
         {
             return Some(value.1.clone());
         }
@@ -292,7 +304,7 @@ mod tests {
 
     #[async_trait]
     impl DashboardProvider for Counting {
-        async fn snapshot(&self, window: DashboardWindow) -> DashboardSnapshot {
+        async fn snapshot(&self, window: DashboardWindow, _tenant: &str) -> DashboardSnapshot {
             let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
@@ -316,6 +328,7 @@ mod tests {
             cache.clone(),
             provider.clone(),
             DashboardWindow::LastHour,
+            "default",
             ttl,
             cold,
         )
@@ -327,6 +340,7 @@ mod tests {
             cache,
             provider.clone(),
             DashboardWindow::LastHour,
+            "default",
             ttl,
             cold,
         )
@@ -351,6 +365,7 @@ mod tests {
             cache.clone(),
             provider.clone(),
             DashboardWindow::LastDay,
+            "default",
             ttl,
             cold,
         )
@@ -362,6 +377,7 @@ mod tests {
             cache.clone(),
             provider.clone(),
             DashboardWindow::LastDay,
+            "default",
             ttl,
             cold,
         )
@@ -376,9 +392,16 @@ mod tests {
                 break;
             }
         }
-        let refreshed = snapshot_via(cache, provider.clone(), DashboardWindow::LastDay, ttl, cold)
-            .await
-            .expect("refreshed value");
+        let refreshed = snapshot_via(
+            cache,
+            provider.clone(),
+            DashboardWindow::LastDay,
+            "default",
+            ttl,
+            cold,
+        )
+        .await
+        .expect("refreshed value");
         assert!(
             refreshed.total_resources >= 2,
             "got {}",
@@ -397,6 +420,7 @@ mod tests {
             cache.clone(),
             provider.clone(),
             DashboardWindow::LastMonth,
+            "default",
             ttl,
             cold,
         )
@@ -411,6 +435,7 @@ mod tests {
             cache,
             provider.clone(),
             DashboardWindow::LastMonth,
+            "default",
             ttl,
             cold,
         )
@@ -430,7 +455,7 @@ mod tests {
 
     #[async_trait]
     impl DashboardProvider for Fixed {
-        async fn snapshot(&self, window: DashboardWindow) -> DashboardSnapshot {
+        async fn snapshot(&self, window: DashboardWindow, _tenant: &str) -> DashboardSnapshot {
             DashboardSnapshot {
                 fhir_version: "R4".to_string(),
                 total_resources: 42,
@@ -453,7 +478,7 @@ mod tests {
     async fn registered_provider_snapshot_round_trips() {
         set_provider(Arc::new(Fixed));
 
-        let snap = snapshot(DashboardWindow::LastHour)
+        let snap = snapshot(DashboardWindow::LastHour, "default")
             .await
             .expect("provider registered");
         assert_eq!(snap.total_resources, 42);

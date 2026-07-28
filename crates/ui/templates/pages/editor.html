@@ -1,0 +1,65 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("editor-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content_class %} content--wide{% endblock %}
+
+{% block content %}
+<!--
+  Resource editor (#264), following the Figma "Resources - Edit" frame: the
+  Guided form / JSON toggle, the version rail, Save & Delete. The shell is
+  Brett's; what fills the Guided form is not a fixed list of friendly fields but
+  the resource's actual schema, so it can add a second address, an extension on
+  a name, or a value[x] the designer never thought of.
+
+  The resource is fetched by the browser from the ordinary FHIR API and posted
+  to /ui/editor/render — the UI crate never touches storage.
+-->
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("editor-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("editor-lede") }}</p>
+</section>
+
+<div class="editor" id="editor"
+     data-type="{{ resource_type }}"
+     data-id="{{ resource_id }}"
+     data-msg-load-error="{{ i18n.t("editor-load-error") }}"
+     data-msg-saved="{{ i18n.t("editor-saved") }}"
+     data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"
+     data-msg-save-blocked="{{ i18n.t("resources-save-blocked") }}"
+     data-msg-save-invalid="{{ i18n.t("resources-save-invalid") }}">
+
+  <div class="editor__bar">
+    <div class="editor__title">
+      <h2>{{ i18n.t("editor-title") }}</h2>
+      <span class="editor__subject" id="editor-subject"></span>
+    </div>
+
+    <div class="editor__actions">
+      <button type="button" class="btn" id="editor-delete">{{ i18n.t("editor-delete") }}</button>
+      <button type="button" class="btn btn--primary" id="editor-save">{{ i18n.t("editor-save") }}</button>
+    </div>
+  </div>
+
+  <div class="editor__status" id="editor-status" role="status"></div>
+
+  <!--
+    Three panels on one screen, following Brett's Resource Editor: the JSON and
+    the guided form side by side over one document, and a version rail. The body
+    (JSON + form) is server-rendered and swapped whole on every mutation; the
+    version rail is hydrated from the ordinary _history API.
+  -->
+  <div class="editor__layout">
+    <div class="editor__body" id="editor-body"></div>
+
+    <aside class="card editor-versions" id="editor-versions" aria-label="{{ i18n.t("editor-versions") }}">
+      <div class="card-head"><h3><span class="icon">{% include "icons/history.svg" %}</span> {{ i18n.t("editor-versions") }}</h3></div>
+      <div class="editor-versions__list" id="editor-versions-list"
+           data-msg-current="{{ i18n.t("history-current") }}"
+           data-msg-none="{{ i18n.t("editor-versions-none") }}"></div>
+    </aside>
+  </div>
+</div>
+
+<script src="/ui/assets/editor.js" defer></script>
+{% endblock %}

@@ -3512,6 +3512,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -3630,6 +3631,7 @@ dependencies = [
  "fluent-templates",
  "helios-auth",
  "helios-fhir",
+ "helios-fhir-validator",
  "helios-observability",
  "helios-persistence",
  "http-body-util",
@@ -3641,6 +3643,7 @@ dependencies = [
  "similar",
  "tokio",
  "tower",
+ "tracing",
  "unic-langid",
 ]
 

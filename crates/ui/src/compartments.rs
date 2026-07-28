@@ -53,9 +53,12 @@ pub(crate) struct CompartmentResource {
 /// Lazily-fetched, process-lifetime CompartmentDefinitions, one set per enabled
 /// FHIR version. Fetched from the server's own endpoint once per version and
 /// cached; sorted by compartment code.
+/// Cache key: the tenant the definitions were fetched for, and the version.
+type TenantVersion = (String, FhirVersion);
+
 pub(crate) struct CompartmentCatalog {
     source: Arc<dyn ConformanceSource>,
-    cache: Mutex<HashMap<FhirVersion, Arc<Vec<CompartmentDef>>>>,
+    cache: Mutex<HashMap<TenantVersion, Arc<Vec<CompartmentDef>>>>,
 }
 
 impl CompartmentCatalog {
@@ -68,11 +71,19 @@ impl CompartmentCatalog {
 
     /// The definitions for a version, fetching on first use. A failed fetch
     /// yields an empty set (the page degrades to a warning).
-    pub async fn definitions(&self, version: FhirVersion) -> Arc<Vec<CompartmentDef>> {
-        if let Some(cached) = self.cache.lock().expect("compartment lock").get(&version) {
+    pub async fn definitions(
+        &self,
+        tenant: &str,
+        version: FhirVersion,
+    ) -> Arc<Vec<CompartmentDef>> {
+        let key = (tenant.to_string(), version);
+        if let Some(cached) = self.cache.lock().expect("compartment lock").get(&key) {
             return cached.clone();
         }
-        let fetched = self.source.fetch("CompartmentDefinition", version).await;
+        let fetched = self
+            .source
+            .fetch("CompartmentDefinition", version, tenant)
+            .await;
         let fetch_ok = fetched.is_ok();
         let mut defs: Vec<CompartmentDef> = match fetched {
             Ok(resources) => resources
@@ -91,7 +102,7 @@ impl CompartmentCatalog {
         self.cache
             .lock()
             .expect("compartment lock")
-            .entry(version)
+            .entry(key)
             .or_insert_with(|| built.clone())
             .clone()
     }
@@ -99,8 +110,8 @@ impl CompartmentCatalog {
     /// Every resource type of the version, from the first CompartmentDefinition
     /// (each enumerates the full set — 145 in R4). Used by the queries page's
     /// resource picker rail.
-    pub async fn resource_type_names(&self, version: FhirVersion) -> Vec<String> {
-        self.definitions(version)
+    pub async fn resource_type_names(&self, tenant: &str, version: FhirVersion) -> Vec<String> {
+        self.definitions(tenant, version)
             .await
             .first()
             .map(|def| def.resource.iter().map(|r| r.code.clone()).collect())

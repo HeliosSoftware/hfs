@@ -131,6 +131,7 @@ theme-light = Light theme
 theme-dark = Dark theme
 
 fhir-version = FHIR { $version }
+fhir-version-heading = FHIR version
 
 card-resource-types = Resource types
 card-resource-types-sub = enabled for { $version }
@@ -309,6 +310,32 @@ queries-add-condition = Add condition
 queries-includes = Includes
 queries-result-controls = Result controls
 queries-remove = Remove
+queries-match-is = is
+queries-or = + or
+queries-sort-label = Sort
+queries-sort-default = Default
+queries-sort-recent = Most recent
+queries-sort-oldest = Oldest
+queries-sort-id = ID
+queries-modify-heading = Modifiers
+queries-mod-exact = whole value incl. case & accents
+queries-mod-contains = match anywhere in the text
+queries-mod-missing = field is present / absent
+queries-mod-text = advanced text handling
+queries-mod-not = none of the values match
+queries-mod-above = this or an ancestor
+queries-mod-below = this or a descendant
+queries-mod-in = member of the value set
+queries-mod-not-in = not a member of the value set
+queries-mod-identifier = match the reference by identifier
+queries-mod-of-type = match identifier type, system and value
+queries-chain-into = Filter by a property of the referenced resource
+queries-chain-any-target = any
+queries-has-pill = has a related
+queries-has-type-placeholder = resource type
+queries-has-via = linked via
+queries-has-where = where its
+queries-add-has = ⧉ Filter a resource that links here
 queries-param-placeholder = parameter
 queries-value-placeholder = value
 queries-results = Results
@@ -350,3 +377,63 @@ search-setup-body = Turn plain-language descriptions into FHIR search queries. I
 search-setup-key-placeholder = your API key
 search-setup-disable = To remove the feature entirely — endpoint, page, and this notice — set HFS_NL_SEARCH_ENABLED=false.
 search-setup-docs = Read the how-to
+
+## Resource editor (#264)
+
+editor-heading = Resource editor
+editor-lede = Edit a resource against its schema: add any element the schema allows, at any depth — including extensions, on any node that accepts one.
+editor-title = Edit resource
+editor-view-label = How to edit
+editor-view-form = Guided form
+editor-view-json = JSON
+editor-save = Save changes
+editor-delete = Delete
+editor-remove = Remove this node
+editor-saved = Saved.
+editor-load-error = Could not load that resource.
+editor-confirm-delete = Delete this resource? This cannot be undone.
+editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
+editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+
+editor-add = Add element
+editor-add-filter = Filter elements
+editor-add-another = add another
+editor-pick-type = Pick a type…
+editor-extension-url = Extension URL
+editor-add-extension = Add extension
+
+editor-valid = No issues.
+editor-issues = { $count ->
+    [one] { $count } issue
+   *[other] { $count } issues
+}
+
+editor-modifier-badge = modifier
+editor-modifier-warning = A modifier extension changes the meaning of this resource. A system that does not recognise it must refuse to process the resource.
+editor-unknown-badge = not in schema
+editor-unknown-hint = The schema does not describe this element. It is shown so it is not silently lost, and it is kept on save.
+
+editor-primitive-extension-badge = + extension
+editor-primitive-extension-hint = This value carries extensions of its own (a `_` sibling in the JSON). They are kept when you save.
+
+editor-collapse-all = Collapse all
+editor-expand-all = Expand all
+editor-edit-raw = Edit raw
+editor-versions = Versions
+editor-versions-none = No prior versions.
+
+## Resources workspace (#282)
+
+resources-heading = Resources
+resources-lede = Browse, search, create, and edit FHIR resources. Search in natural language or build the query by hand, then open any result to edit it.
+resources-create = Create new
+resources-save-blocked = Fix the validation issues before saving.
+resources-save-invalid = The JSON is not valid — fix it before saving.
+resources-edit-title = Edit resource
+resources-tab-edit = Edit
+resources-tab-history = History
+resources-types-heading = Resource types
+
+queries-saved-group = Saved
+
+nav-collapse = Collapse menu

@@ -158,10 +158,15 @@ pub enum RestError {
         message: String,
     },
 
-    /// Too many requests — e.g. a concurrent submission is in progress (HTTP 429).
+    /// Too many requests — e.g. a concurrent submission is in progress, or a
+    /// rate limiter rejected the call (HTTP 429).
     TooManyRequests {
         /// Error message.
         message: String,
+        /// Delta-seconds to advertise in `Retry-After`. `None` when the server
+        /// has no honest estimate — better silent than a made-up number the
+        /// client would sleep on.
+        retry_after_secs: Option<u64>,
     },
 
     /// Backend temporarily over capacity — e.g. the database connection pool is
@@ -272,7 +277,7 @@ impl fmt::Display for RestError {
             RestError::Conflict { message } => {
                 write!(f, "Conflict: {}", message)
             }
-            RestError::TooManyRequests { message } => {
+            RestError::TooManyRequests { message, .. } => {
                 write!(f, "Too many requests: {}", message)
             }
             RestError::ServiceUnavailable { message } => {
@@ -384,7 +389,7 @@ impl RestError {
                 format!("Method {} not allowed on {}", method, resource_type),
             ),
             RestError::Conflict { message } => (StatusCode::CONFLICT, "conflict", message.clone()),
-            RestError::TooManyRequests { message } => {
+            RestError::TooManyRequests { message, .. } => {
                 (StatusCode::TOO_MANY_REQUESTS, "throttled", message.clone())
             }
             RestError::ServiceUnavailable { message } => (
@@ -461,6 +466,23 @@ impl IntoResponse for RestError {
                 Json(operation_outcome),
             )
                 .into_response();
+        }
+
+        // A throttled response carries the back-off the limiter computed, so the
+        // client knows when it may poll again instead of guessing (issue #399).
+        if let RestError::TooManyRequests {
+            retry_after_secs: Some(secs),
+            ..
+        } = &self
+        {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                return (
+                    status,
+                    [(axum::http::header::RETRY_AFTER, value)],
+                    Json(operation_outcome),
+                )
+                    .into_response();
+            }
         }
 
         (status, Json(operation_outcome)).into_response()
@@ -949,6 +971,7 @@ mod tests {
     fn test_too_many_requests_display() {
         let err = RestError::TooManyRequests {
             message: "submission in progress".to_string(),
+            retry_after_secs: None,
         };
         assert_eq!(err.to_string(), "Too many requests: submission in progress");
     }
@@ -968,9 +991,34 @@ mod tests {
     fn test_too_many_requests_into_response_status() {
         let resp = RestError::TooManyRequests {
             message: "x".to_string(),
+            retry_after_secs: None,
         }
         .into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "no Retry-After when the server has no estimate to give"
+        );
+    }
+
+    #[test]
+    fn test_too_many_requests_carries_retry_after_when_known() {
+        // Spec (build.fhir.org submit.html): a rate-limited status poll SHOULD
+        // tell the client when to come back (issue #399).
+        let resp = RestError::TooManyRequests {
+            message: "slow down".to_string(),
+            retry_after_secs: Some(42),
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .expect("throttled response must carry Retry-After"),
+            "42"
+        );
     }
 
     // ── StorageError::BulkSubmit → RestError mapping ──────────────

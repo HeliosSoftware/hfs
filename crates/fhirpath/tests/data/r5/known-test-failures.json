@@ -1,5 +1,5 @@
 {
-  "description": "Known test failures for FHIR R5 FhirPath Validator",
+  "description": "Known test failures for the EXTERNAL .NET FhirPath Validator (fhirpath-validator.exe), consumed by the 'Run FhirPath Validation with FHIR Test Cases' and 'Audit conformance coverage' steps in .github/workflows/ci.yml via --known-failures. It describes that harness running against the separately checked-out FHIR/fhir-test-cases@master corpus — NOT the vendored tests-fhir-r5.xml in this directory, and NOT the in-process Rust suite in crates/fhirpath/tests/r5_tests.rs. Those two harnesses have genuinely different pass sets (txTest03 is a declared failure here and passes in-process; the HTMLChecks group does not exist in the vendored corpus at all), so the Rust suite reads its own rust-known-failures.json instead. The schema is identical between the two files so an entry can be copy-pasted when a limitation affects both. See issue #307.",
   "version": "1.0.0",
   "knownFailures": [
     {

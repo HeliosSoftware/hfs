@@ -14,12 +14,12 @@ use crate::core::transaction::{
 };
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
-    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage,
+    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage, normalize_etag,
 };
 use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
-use crate::tenant::TenantContext;
+use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
@@ -154,6 +154,8 @@ impl ResourceStorage for PostgresBackend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -261,22 +263,33 @@ impl ResourceStorage for PostgresBackend {
         let mut attempts = 0;
         loop {
             // Check if exists
-            let existing = self.read(tenant, resource_type, id).await?;
-
-            let result = if let Some(current) = existing {
+            let result = match self.read(tenant, resource_type, id).await {
                 // Update existing (preserves original FHIR version)
-                self.update(tenant, &current, resource.clone())
+                Ok(Some(current)) => self
+                    .update(tenant, &current, resource.clone())
                     .await
-                    .map(|updated| (updated, false))
-            } else {
+                    .map(|updated| (updated, false)),
                 // Create new with specific ID
-                let mut resource = resource.clone();
-                if let Some(obj) = resource.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.to_string()));
+                Ok(None) => {
+                    let mut resource = resource.clone();
+                    if let Some(obj) = resource.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.to_string()));
+                    }
+                    self.create(tenant, resource_type, resource, fhir_version)
+                        .await
+                        .map(|created| (created, true))
                 }
-                self.create(tenant, resource_type, resource, fhir_version)
+                // A deleted resource is brought back to life by a subsequent update
+                // (FHIR http.html#delete), continuing the existing version chain
+                // rather than being rejected with `Gone`. The restore is a write
+                // like the others, so it takes part in the CAS retry below: a
+                // racing un-delete surfaces as AlreadyExists and is retried from
+                // a fresh read rather than failing the caller.
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => self
+                    .restore_deleted(tenant, resource_type, id, resource.clone())
                     .await
-                    .map(|created| (created, true))
+                    .map(|restored| (restored, true)),
+                Err(e) => Err(e),
             };
 
             match result {
@@ -356,9 +369,13 @@ impl ResourceStorage for PostgresBackend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        // `mut` because the version-guarded CAS below runs in a transaction,
+        // and `client.transaction()` takes `&mut self`.
         let mut client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = current.resource_type();
         let id = current.id();
 
         // The new version is derived from the version the caller read; the
@@ -480,6 +497,10 @@ impl ResourceStorage for PostgresBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
+        // `mut` because the version-guarded CAS below runs in a transaction,
+        // and `client.transaction()` takes `&mut self`.
         let mut client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -980,6 +1001,120 @@ impl ResourceStorage for PostgresBackend {
 // ============================================================================
 
 impl PostgresBackend {
+    /// Brings a soft-deleted resource back to life with new content.
+    ///
+    /// FHIR permits a deleted resource to be restored by a subsequent update
+    /// ([http.html#delete](https://hl7.org/fhir/http.html#delete)), so a `PUT`
+    /// onto a deleted id must succeed instead of failing with `Gone`. The
+    /// restored resource continues the existing version chain (the deletion
+    /// record keeps its version, the restore gets the next one) and keeps the
+    /// FHIR version the resource was originally stored under.
+    ///
+    /// Returns `NotFound` if no deleted row is present — the caller has already
+    /// established one exists, so that only happens under a concurrent write.
+    async fn restore_deleted(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let row = client
+            .query_opt(
+                "SELECT version_id, fhir_version FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = TRUE",
+                &[&tenant_id, &resource_type, &id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to read deleted resource: {}", e)))?;
+
+        let (deleted_version, fhir_version_str) = match row {
+            Some(row) => (row.get::<_, String>(0), row.get::<_, String>(1)),
+            None => {
+                return Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                }));
+            }
+        };
+
+        let new_version: u64 = deleted_version.parse().unwrap_or(0) + 1;
+        let new_version_str = new_version.to_string();
+
+        // Ensure the resource has correct type and id
+        let mut resource = resource;
+        if let Some(obj) = resource.as_object_mut() {
+            obj.insert(
+                "resourceType".to_string(),
+                Value::String(resource_type.to_string()),
+            );
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+
+        let now = Utc::now();
+        let is_deleted = false;
+
+        client
+            .execute(
+                "UPDATE resources
+                 SET version_id = $1, data = $2, last_updated = $3, is_deleted = FALSE, deleted_at = NULL
+                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
+                &[
+                    &new_version_str,
+                    &resource,
+                    &now,
+                    &tenant_id,
+                    &resource_type,
+                    &id,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to restore resource: {}", e)))?;
+
+        client
+            .execute(
+                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[&tenant_id, &resource_type, &id, &new_version_str, &resource, &now, &is_deleted, &fhir_version_str],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to insert restore history: {}", e)))?;
+
+        // The delete dropped the search index entries; rebuild them for the
+        // resource that is live again.
+        self.delete_search_index(&client, tenant_id, resource_type, id)
+            .await?;
+        self.index_resource(&client, tenant_id, resource_type, id, &resource)
+            .await?;
+
+        // A restored SearchParameter re-enters the tenant overlays.
+        if resource_type == "SearchParameter" {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+
+        Ok(StoredResource::from_storage(
+            resource_type,
+            id,
+            new_version_str,
+            tenant.tenant_id().clone(),
+            resource,
+            now,
+            now,
+            None,
+            fhir_version,
+        ))
+    }
+
     /// Index a resource for search.
     ///
     /// This method uses the SearchParameterExtractor to dynamically extract
@@ -1301,13 +1436,16 @@ impl VersionedStorage for PostgresBackend {
             })
         })?;
 
-        // Check version match
-        if current.version_id() != expected_version {
+        // Check version match. `expected_version` may arrive in any ETag
+        // spelling (`W/"1"`, `"1"`, `1`), so normalise both sides — same as the
+        // MongoDB and S3 backends.
+        let expected = normalize_etag(expected_version);
+        if normalize_etag(current.version_id()) != expected {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected_version.to_string(),
+                    expected_version: expected.to_string(),
                     actual_version: current.version_id().to_string(),
                 },
             ));
@@ -1347,12 +1485,13 @@ impl VersionedStorage for PostgresBackend {
             }
         };
 
-        if current_version != expected_version {
+        let expected = normalize_etag(expected_version);
+        if normalize_etag(&current_version) != expected {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected_version.to_string(),
+                    expected_version: expected.to_string(),
                     actual_version: current_version,
                 },
             ));
@@ -2702,13 +2841,14 @@ impl BundleProvider for PostgresBackend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
 
         // Start a transaction
         let mut tx = self
-            .begin_transaction(tenant, TransactionOptions::new())
+            .begin_transaction(tenant, TransactionOptions::new().fhir_version(fhir_version))
             .await
             .map_err(|e| TransactionError::RolledBack {
                 reason: format!("Failed to begin transaction: {}", e),
@@ -2789,12 +2929,13 @@ impl BundleProvider for PostgresBackend {
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleResult> {
         let mut results = Vec::with_capacity(entries.len());
 
         // Process each entry independently
         for entry in &entries {
-            let result = self.process_batch_entry(tenant, entry).await;
+            let result = self.process_batch_entry(tenant, entry, fhir_version).await;
             results.push(result);
         }
 
@@ -2909,8 +3050,12 @@ impl PostgresBackend {
         &self,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> BundleEntryResult {
-        match self.process_batch_entry_inner(tenant, entry).await {
+        match self
+            .process_batch_entry_inner(tenant, entry, fhir_version)
+            .await
+        {
             Ok(result) => result,
             Err(e) => BundleEntryResult::error(
                 500,
@@ -2926,6 +3071,7 @@ impl PostgresBackend {
         &self,
         tenant: &TenantContext,
         entry: &BundleEntry,
+        fhir_version: helios_fhir::FhirVersion,
     ) -> StorageResult<BundleEntryResult> {
         match entry.method {
             BundleMethod::Get => {
@@ -2961,12 +3107,7 @@ impl PostgresBackend {
                     })?;
 
                 let created = self
-                    .create(
-                        tenant,
-                        &resource_type,
-                        resource,
-                        FhirVersion::default_enabled(),
-                    )
+                    .create(tenant, &resource_type, resource, fhir_version)
                     .await?;
                 Ok(BundleEntryResult::created(created))
             }
@@ -2979,13 +3120,7 @@ impl PostgresBackend {
 
                 let (resource_type, id) = self.parse_url(&entry.url)?;
                 let (stored, _created) = self
-                    .create_or_update(
-                        tenant,
-                        &resource_type,
-                        &id,
-                        resource,
-                        FhirVersion::default_enabled(),
-                    )
+                    .create_or_update(tenant, &resource_type, &id, resource, fhir_version)
                     .await?;
                 Ok(BundleEntryResult::ok(stored))
             }

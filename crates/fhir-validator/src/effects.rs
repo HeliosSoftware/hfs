@@ -298,7 +298,7 @@ async fn execute_bindings(
 
 /// Determine the coded shape: the element's declared type wins, inference
 /// from the value is the fallback (mirroring the reference validator).
-fn coded_value(value: &Value, type_hint: Option<&str>) -> Option<CodedValue> {
+pub(crate) fn coded_value(value: &Value, type_hint: Option<&str>) -> Option<CodedValue> {
     match type_hint {
         Some("code") | Some("string") | Some("uri") | Some("canonical") => {
             value.as_str().map(|s| CodedValue::Code(s.to_string()))

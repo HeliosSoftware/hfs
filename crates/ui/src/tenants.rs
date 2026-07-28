@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{WebState, current_status, render};
+use crate::{RequestTenant, RequestVersion, WebState, current_status, render};
 
 /// One row of the tenant table (a registry record joined with its live count).
 struct TenantRow {
@@ -92,8 +92,6 @@ struct TenantsPage {
     error: Option<String>,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
-    /// Whether the sidebar links to the natural-language search page (#255).
-    nl_enabled: bool,
 }
 
 #[derive(Template)]
@@ -211,10 +209,12 @@ async fn load_rows(storage: &Arc<dyn ResourceStorage>, q: &str) -> Result<Vec<Te
 pub async fn page(
     State(state): State<WebState>,
     locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
     Query(query): Query<TenantsQuery>,
 ) -> Response {
     let i18n = I18n::new(locale);
-    let status = current_status(state.version);
+    let status = current_status(state.version, rv.0, &rt);
 
     let Some(storage) = state.tenants.as_ref() else {
         return render(TenantsPage {
@@ -228,7 +228,6 @@ pub async fn page(
             available: false,
             error: None,
             active_page: "tenants",
-            nl_enabled: state.nl.enabled,
         });
     };
 
@@ -249,7 +248,6 @@ pub async fn page(
         available: true,
         error,
         active_page: "tenants",
-        nl_enabled: state.nl.enabled,
     })
 }
 
@@ -267,12 +265,11 @@ pub async fn rows(
             error: None,
         });
     };
-    let rows = load_rows(storage, &query.q).await.unwrap_or_default();
-    render(TenantRowsPartial {
-        i18n,
-        rows,
-        error: None,
-    })
+    let (rows, error) = match load_rows(storage, &query.q).await {
+        Ok(rows) => (rows, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    render(TenantRowsPartial { i18n, rows, error })
 }
 
 /// Returns the refreshed (unfiltered) rows fragment, with an optional error
@@ -299,8 +296,10 @@ pub async fn create(
 
     let id = form.id.trim().to_string();
     let load = |err: Option<String>| async {
-        let rows = load_rows(storage, "").await.unwrap_or_default();
-        rows_response(i18n, rows, err)
+        match load_rows(storage, "").await {
+            Ok(rows) => rows_response(i18n, rows, err),
+            Err(e) => rows_response(i18n, Vec::new(), err.or(Some(e))),
+        }
     };
 
     if let Err(msg) = validate_id(&id) {
@@ -362,8 +361,10 @@ pub async fn delete(
         let _ = storage.purge_tenant_data(&id).await;
     }
 
-    let rows = load_rows(storage, "").await.unwrap_or_default();
-    rows_response(i18n, rows, None)
+    match load_rows(storage, "").await {
+        Ok(rows) => rows_response(i18n, rows, None),
+        Err(e) => rows_response(i18n, Vec::new(), Some(e)),
+    }
 }
 
 // (helpers below)

@@ -127,6 +127,7 @@ theme-light = Helles Design
 theme-dark = Dunkles Design
 
 fhir-version = FHIR { $version }
+fhir-version-heading = FHIR-Version
 
 card-resource-types = Ressourcentypen
 card-resource-types-sub = aktiviert für { $version }
@@ -305,6 +306,32 @@ queries-add-condition = Bedingung hinzufügen
 queries-includes = Includes
 queries-result-controls = Ergebnis-Steuerung
 queries-remove = Entfernen
+queries-match-is = ist
+queries-or = + oder
+queries-sort-label = Sortierung
+queries-sort-default = Standard
+queries-sort-recent = Neueste zuerst
+queries-sort-oldest = Älteste zuerst
+queries-sort-id = ID
+queries-modify-heading = Modifikatoren
+queries-mod-exact = ganzer Wert inkl. Groß-/Kleinschreibung & Akzente
+queries-mod-contains = Treffer irgendwo im Text
+queries-mod-missing = Feld ist vorhanden / fehlt
+queries-mod-text = erweiterte Textbehandlung
+queries-mod-not = keiner der Werte trifft zu
+queries-mod-above = dieser oder ein Vorfahr
+queries-mod-below = dieser oder ein Nachfahre
+queries-mod-in = Mitglied des Value Sets
+queries-mod-not-in = kein Mitglied des Value Sets
+queries-mod-identifier = Referenz nach Identifier abgleichen
+queries-mod-of-type = Identifier-Typ, -System und -Wert abgleichen
+queries-chain-into = Nach einer Eigenschaft der referenzierten Ressource filtern
+queries-chain-any-target = beliebig
+queries-has-pill = hat eine verknüpfte
+queries-has-type-placeholder = Ressourcentyp
+queries-has-via = verknüpft über
+queries-has-where = wobei ihr
+queries-add-has = ⧉ Eine hierher verweisende Ressource filtern
 queries-param-placeholder = Parameter
 queries-value-placeholder = Wert
 queries-results = Ergebnisse
@@ -346,3 +373,64 @@ search-setup-body = Verwandelt Beschreibungen in Alltagssprache in FHIR-Suchabfr
 search-setup-key-placeholder = Ihr API-Schlüssel
 search-setup-disable = Um die Funktion vollständig zu entfernen — Endpunkt, Seite und diesen Hinweis — setzen Sie HFS_NL_SEARCH_ENABLED=false.
 search-setup-docs = Anleitung lesen
+
+## Ressourcen-Editor (#264)
+
+editor-heading = Ressourcen-Editor
+editor-lede = Bearbeiten Sie eine Ressource anhand ihres Schemas: fügen Sie jedes vom Schema erlaubte Element in beliebiger Tiefe hinzu — auch Extensions, an jedem Knoten, der sie zulässt.
+editor-title = Ressource bearbeiten
+editor-view-label = Bearbeitungsmodus
+editor-view-form = Geführtes Formular
+editor-view-json = JSON
+editor-save = Änderungen speichern
+editor-delete = Löschen
+editor-remove = Diesen Knoten entfernen
+editor-saved = Gespeichert.
+editor-load-error = Diese Ressource konnte nicht geladen werden.
+editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
+editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
+editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
+
+editor-add = Element hinzufügen
+editor-add-filter = Elemente filtern
+editor-add-another = weiteres hinzufügen
+editor-pick-type = Typ wählen…
+editor-extension-url = Extension-URL
+editor-add-extension = Extension hinzufügen
+
+editor-valid = Keine Probleme.
+editor-issues = { $count ->
+    [one] { $count } Problem
+   *[other] { $count } Probleme
+}
+
+editor-modifier-badge = Modifier
+editor-modifier-warning = Eine Modifier-Extension ändert die Bedeutung der Ressource. Ein System, das sie nicht kennt, muss die Verarbeitung verweigern.
+editor-unknown-badge = nicht im Schema
+editor-unknown-hint = Das Schema beschreibt dieses Element nicht. Es wird angezeigt, damit es nicht stillschweigend verloren geht, und beim Speichern erhalten.
+
+editor-primitive-extension-badge = + Extension
+editor-primitive-extension-hint = Dieser Wert trägt eigene Extensions (ein `_`-Geschwister im JSON). Sie bleiben beim Speichern erhalten.
+
+editor-collapse-all = Alle einklappen
+editor-expand-all = Alle ausklappen
+editor-edit-raw = Rohtext bearbeiten
+editor-versions = Versionen
+editor-versions-none = Keine früheren Versionen.
+## Verlauf & Versionen (#236)
+
+## Ressourcen-Arbeitsbereich (#282)
+
+resources-heading = Ressourcen
+resources-lede = FHIR-Ressourcen durchsuchen, suchen, erstellen und bearbeiten. In natürlicher Sprache suchen oder die Abfrage selbst bauen, dann ein Ergebnis zum Bearbeiten öffnen.
+resources-create = Neu erstellen
+resources-save-blocked = Beheben Sie die Validierungsprobleme vor dem Speichern.
+resources-save-invalid = Das JSON ist ungültig — beheben Sie es vor dem Speichern.
+resources-edit-title = Ressource bearbeiten
+resources-tab-edit = Bearbeiten
+resources-tab-history = Verlauf
+resources-types-heading = Ressourcentypen
+
+queries-saved-group = Gespeichert
+
+nav-collapse = Menü einklappen

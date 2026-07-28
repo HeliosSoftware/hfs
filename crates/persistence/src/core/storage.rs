@@ -12,7 +12,7 @@ use helios_fhir::FhirVersion;
 use serde_json::Value;
 
 use crate::core::sof_runner::SofRunner;
-use crate::error::{BackendError, StorageError, StorageResult};
+use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
@@ -502,13 +502,26 @@ pub trait ResourceStorage: Send + Sync {
     /// # Returns
     ///
     /// `true` if the resource exists and is not deleted, `false` otherwise.
+    ///
+    /// A soft-deleted resource is reported as `false`, never as an error.
+    /// `read` is allowed to surface a deleted resource as
+    /// `StorageError::Resource(Gone)` (documented optional behavior, and what
+    /// SQLite/PostgreSQL/S3 do), so this default implementation must translate
+    /// that into `Ok(false)` rather than propagating it with `?`. Propagating it
+    /// would contradict the "`false` otherwise" contract above and make
+    /// `exists` disagree with MongoDB, which overrides this method and answers
+    /// `Ok(false)` for a deleted resource. Genuine failures still propagate.
     async fn exists(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         id: &str,
     ) -> StorageResult<bool> {
-        Ok(self.read(tenant, resource_type, id).await?.is_some())
+        match self.read(tenant, resource_type, id).await {
+            Ok(found) => Ok(found.is_some()),
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Reads multiple resources by their IDs.

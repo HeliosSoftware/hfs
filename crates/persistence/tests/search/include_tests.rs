@@ -5,24 +5,51 @@
 
 use serde_json::json;
 
-use helios_persistence::core::{IncludeProvider, ResourceStorage, SearchProvider};
-use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use helios_persistence::types::{
-    IncludeDirective, IncludeType, Pagination, SearchQuery,
+use helios_persistence::core::{
+    ResourceStorage, SearchProvider, SearchResult, resolve_includes_iterative,
 };
+use helios_persistence::error::StorageResult;
+use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+use helios_persistence::types::{IncludeDirective, IncludeType, SearchQuery};
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
 
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
-    let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
-    backend.init_schema().expect("Failed to initialize schema");
-    backend
+    super::make_sqlite_backend()
+}
+
+/// Runs a search and resolves `_include`/`_revinclude` the way the REST layer
+/// does.
+///
+/// SQLite's `search()` deliberately returns an empty `included` — include
+/// resolution is a separate, backend-agnostic step
+/// ([`resolve_includes_iterative`]) that the REST search handler runs for
+/// backends that do not resolve inline. Tests must go through the same path or
+/// they only ever observe an empty `included`.
+#[cfg(feature = "sqlite")]
+async fn search_with_includes(
+    backend: &SqliteBackend,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> StorageResult<SearchResult> {
+    let mut result = backend.search(tenant, query).await?;
+    if !query.includes.is_empty() && result.included.is_empty() {
+        result.included =
+            resolve_includes_iterative(backend, tenant, &result.resources.items, &query.includes)
+                .await?;
+    }
+    Ok(result)
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 #[cfg(feature = "sqlite")]
@@ -33,7 +60,16 @@ async fn seed_include_data(backend: &SqliteBackend, tenant: &TenantContext) {
         "id": "org-hospital",
         "name": "Test Hospital"
     });
-    backend.create_or_update(tenant, "Organization", "org-hospital", org).await.unwrap();
+    backend
+        .create_or_update(
+            tenant,
+            "Organization",
+            "org-hospital",
+            org,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Create patients with organization references
     let patient1 = json!({
@@ -48,8 +84,26 @@ async fn seed_include_data(backend: &SqliteBackend, tenant: &TenantContext) {
         "name": [{"family": "Jones"}],
         "managingOrganization": {"reference": "Organization/org-hospital"}
     });
-    backend.create_or_update(tenant, "Patient", "patient-1", patient1).await.unwrap();
-    backend.create_or_update(tenant, "Patient", "patient-2", patient2).await.unwrap();
+    backend
+        .create_or_update(
+            tenant,
+            "Patient",
+            "patient-1",
+            patient1,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create_or_update(
+            tenant,
+            "Patient",
+            "patient-2",
+            patient2,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Create observations referencing patients
     let obs1 = json!({
@@ -64,8 +118,14 @@ async fn seed_include_data(backend: &SqliteBackend, tenant: &TenantContext) {
         "subject": {"reference": "Patient/patient-1"},
         "code": {"coding": [{"code": "test2"}]}
     });
-    backend.create(tenant, "Observation", obs1).await.unwrap();
-    backend.create(tenant, "Observation", obs2).await.unwrap();
+    backend
+        .create(tenant, "Observation", obs1, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(tenant, "Observation", obs2, FhirVersion::default())
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -89,8 +149,7 @@ async fn test_include_basic() {
         iterate: false,
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -122,8 +181,7 @@ async fn test_include_with_target_type() {
         iterate: false,
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -158,13 +216,12 @@ async fn test_include_iterate() {
             iterate: true, // This follows references in included patients
         });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should include both patients and organizations
-    let included_types: std::collections::HashSet<_> =
+    let _included_types: std::collections::HashSet<_> =
         result.included.iter().map(|r| r.resource_type()).collect();
 
     // Depending on implementation, may have both Patient and Organization
@@ -191,14 +248,13 @@ async fn test_revinclude_basic() {
         iterate: false,
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should have patients in resources
     assert!(!result.resources.is_empty());
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         assert_eq!(resource.resource_type(), "Patient");
     }
 
@@ -224,7 +280,7 @@ async fn test_revinclude_filtered() {
             modifier: None,
             values: vec![helios_persistence::types::SearchValue::eq("patient-1")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_include(IncludeDirective {
             include_type: IncludeType::Revinclude,
@@ -234,8 +290,7 @@ async fn test_revinclude_filtered() {
             iterate: false,
         });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -275,7 +330,16 @@ async fn test_include_iterate_recursive_depth() {
         "id": "org-grandparent",
         "name": "Grandparent Org"
     });
-    backend.create_or_update(&tenant, "Organization", "org-grandparent", grandparent).await.unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-grandparent",
+            grandparent,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     let parent = json!({
         "resourceType": "Organization",
@@ -283,7 +347,16 @@ async fn test_include_iterate_recursive_depth() {
         "name": "Parent Org",
         "partOf": {"reference": "Organization/org-grandparent"}
     });
-    backend.create_or_update(&tenant, "Organization", "org-parent", parent).await.unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-parent",
+            parent,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     let child = json!({
         "resourceType": "Organization",
@@ -291,7 +364,16 @@ async fn test_include_iterate_recursive_depth() {
         "name": "Child Org",
         "partOf": {"reference": "Organization/org-parent"}
     });
-    backend.create_or_update(&tenant, "Organization", "org-child", child).await.unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-child",
+            child,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Create patient at child org
     let patient = json!({
@@ -299,7 +381,16 @@ async fn test_include_iterate_recursive_depth() {
         "id": "patient-org-chain",
         "managingOrganization": {"reference": "Organization/org-child"}
     });
-    backend.create_or_update(&tenant, "Patient", "patient-org-chain", patient).await.unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-org-chain",
+            patient,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Search with :iterate to follow the organization hierarchy
     let query = SearchQuery::new("Patient")
@@ -307,9 +398,11 @@ async fn test_include_iterate_recursive_depth() {
             name: "_id".to_string(),
             param_type: helios_persistence::types::SearchParamType::Token,
             modifier: None,
-            values: vec![helios_persistence::types::SearchValue::eq("patient-org-chain")],
+            values: vec![helios_persistence::types::SearchValue::eq(
+                "patient-org-chain",
+            )],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_include(IncludeDirective {
             include_type: IncludeType::Include,
@@ -326,23 +419,27 @@ async fn test_include_iterate_recursive_depth() {
             iterate: true, // Recursively include parent organizations
         });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should have the patient as the main result
     assert_eq!(result.resources.len(), 1);
-    assert_eq!(result.resources[0].resource_type(), "Patient");
+    assert_eq!(result.resources.items[0].resource_type(), "Patient");
 
     // Should include organizations from the chain
     // The depth of inclusion depends on implementation limits
-    let org_count = result.included.iter()
+    let org_count = result
+        .included
+        .iter()
         .filter(|r| r.resource_type() == "Organization")
         .count();
 
     // At minimum, should include the direct organization reference
-    assert!(org_count >= 1, "Should include at least the direct organization");
+    assert!(
+        org_count >= 1,
+        "Should include at least the direct organization"
+    );
 }
 
 /// Test :iterate modifier handles circular references safely.
@@ -379,11 +476,47 @@ async fn test_include_iterate_cycle_detection() {
     });
 
     // Create in order that allows references (order matters for some backends)
-    backend.create_or_update(&tenant, "Organization", "org-cycle-a", org_a.clone()).await.unwrap();
-    backend.create_or_update(&tenant, "Organization", "org-cycle-b", org_b).await.unwrap();
-    backend.create_or_update(&tenant, "Organization", "org-cycle-c", org_c).await.unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-cycle-a",
+            org_a.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-cycle-b",
+            org_b,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-cycle-c",
+            org_c,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
     // Update A to complete the cycle
-    backend.create_or_update(&tenant, "Organization", "org-cycle-a", org_a).await.unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-cycle-a",
+            org_a,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
 
     // Search with :iterate - should not hang or overflow
     let query = SearchQuery::new("Organization")
@@ -393,7 +526,7 @@ async fn test_include_iterate_cycle_detection() {
             modifier: None,
             values: vec![helios_persistence::types::SearchValue::eq("org-cycle-a")],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_include(IncludeDirective {
             include_type: IncludeType::Include,
@@ -404,19 +537,19 @@ async fn test_include_iterate_cycle_detection() {
         });
 
     // This should complete without infinite loop
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
-        .await;
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100)).await;
 
     // Should succeed (cycle detected) or fail gracefully
     match result {
         Ok(result) => {
             // Implementation detected cycle and returned finite results
             // Should have at most 3 unique organizations
-            let unique_ids: std::collections::HashSet<_> = result.included.iter()
-                .map(|r| r.id())
-                .collect();
-            assert!(unique_ids.len() <= 3, "Should not have more than 3 orgs (cycle detected)");
+            let unique_ids: std::collections::HashSet<_> =
+                result.included.iter().map(|r| r.id()).collect();
+            assert!(
+                unique_ids.len() <= 3,
+                "Should not have more than 3 orgs (cycle detected)"
+            );
         }
         Err(_) => {
             // Implementation may return error for detected cycles - also acceptable
@@ -443,7 +576,10 @@ async fn test_include_iterate_max_depth() {
         if let Some(ref parent) = prev_id {
             location["partOf"] = json!({"reference": format!("Location/{}", parent)});
         }
-        backend.create_or_update(&tenant, "Location", &id, location).await.unwrap();
+        backend
+            .create_or_update(&tenant, "Location", &id, location, FhirVersion::default())
+            .await
+            .unwrap();
         prev_id = Some(id);
     }
 
@@ -453,9 +589,11 @@ async fn test_include_iterate_max_depth() {
             name: "_id".to_string(),
             param_type: helios_persistence::types::SearchParamType::Token,
             modifier: None,
-            values: vec![helios_persistence::types::SearchValue::eq("location-depth-8")],
+            values: vec![helios_persistence::types::SearchValue::eq(
+                "location-depth-8",
+            )],
             chain: vec![],
-        components: vec![],
+            components: vec![],
         })
         .with_include(IncludeDirective {
             include_type: IncludeType::Include,
@@ -465,8 +603,7 @@ async fn test_include_iterate_max_depth() {
             iterate: true,
         });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -475,7 +612,9 @@ async fn test_include_iterate_max_depth() {
 
     // Implementation may limit depth (commonly 4-6 levels)
     // This test documents that depth limiting works
-    let included_locations = result.included.iter()
+    let included_locations = result
+        .included
+        .iter()
         .filter(|r| r.resource_type() == "Location")
         .count();
 
@@ -499,7 +638,10 @@ async fn test_include_no_references() {
         "resourceType": "Patient",
         "name": [{"family": "NoOrg"}]
     });
-    backend.create(&tenant, "Patient", patient).await.unwrap();
+    backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
+        .await
+        .unwrap();
 
     let query = SearchQuery::new("Patient").with_include(IncludeDirective {
         include_type: IncludeType::Include,
@@ -509,8 +651,7 @@ async fn test_include_no_references() {
         iterate: false,
     });
 
-    let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
         .await
         .unwrap();
 

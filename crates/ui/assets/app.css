@@ -46,7 +46,8 @@
   /* Text */
   --text: #101010;
   --text-strong: #000000;
-  --muted: #a0a0a0;
+  /* WCAG 2.2 AA: muted body text must clear 4.5:1 on the light surfaces. */
+  --muted: #6a6a6a;
   /* Embossed dividers: dark line + light line underneath */
   --divider: #e4e4e4;
   --divider-glint: #ffffff;
@@ -56,6 +57,14 @@
   --grid-line: #dcdcdc;
   --accent: #33b8ff;
   --accent-soft: rgb(51 184 255 / 15%);
+  /* A darker cast of the accent for the one place the light celeste can't work:
+     a solid fill behind white text (primary buttons). #33b8ff carries white at
+     only 2.2:1; this clears 4.5:1 while staying in the brand's blue. */
+  --accent-strong: #0f77bd;
+  /* Accent *text* on the soft-accent tint (the selected rail item). Needs the
+     opposite move per theme — darker on the light tint, lighter on the dark —
+     so it is theme-specific (see the dark block). */
+  --accent-text: #0a5f96;
   /* Menu panel input */
   --input-bg: #f5f5f5;
 
@@ -72,6 +81,11 @@
   --surface-border: rgb(255 255 255 / 8%);
   --text: #ffffff;
   --text-strong: #ffffff;
+  /* On the dark surfaces the lighter grey already clears 4.5:1; keep it (the
+     light-theme override above would be too dark to read here). */
+  --muted: #a0a0a0;
+  /* Selected-item accent text on the dark tint: lighter, to clear 4.5:1. */
+  --accent-text: #7cc9ff;
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
   --outline: #353535;
@@ -320,6 +334,13 @@ html[data-nav="collapsed"] .brand__version {
   display: none;
 }
 
+/* Footer variant: the version selector opens upward, clear of the viewport
+   bottom edge. */
+.menu--up .menu__panel {
+  top: auto;
+  bottom: calc(100% + 8px);
+}
+
 .menu__panel {
   position: absolute;
   z-index: 10;
@@ -427,6 +448,18 @@ html[data-nav="collapsed"] .brand__version {
   text-decoration: none;
 }
 
+/* The version options are form buttons; keep them visually identical to the
+   anchor options. */
+button.menu__option {
+  width: 100%;
+  font: inherit;
+  font-weight: 500;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
 .menu__option:hover {
   color: var(--text-strong);
 }
@@ -507,8 +540,10 @@ html[data-nav="collapsed"] .brand__version {
 .theme-toggle button {
   display: grid;
   place-items: center;
-  width: 20px;
-  height: 20px;
+  /* WCAG 2.2 AA, SC 2.5.8 (Target Size Minimum): each toggle is a >=24x24
+     target. The icon inside stays small; only the hit area grows. */
+  width: 24px;
+  height: 24px;
   padding: 0;
   border: 1px solid transparent;
   border-radius: 50%;
@@ -639,6 +674,15 @@ html[data-nav="collapsed"] .brand__version {
   width: 42px;
   padding: 0;
   justify-content: center;
+}
+
+/* A pill rendered as a real <button> (e.g. the chart-expand affordance) keeps
+   the pill look but sheds the native button chrome and inherits type. */
+button.pill {
+  appearance: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
 }
 
 .chart {
@@ -1342,12 +1386,12 @@ html[data-nav="collapsed"] .brand__version {
   height: 36px;
   padding: 0 18px;
   color: #ffffff;
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
 }
 
 .btn--primary:hover {
-  background: var(--accent);
+  background: var(--accent-strong);
   filter: brightness(1.08);
 }
 
@@ -1766,6 +1810,8 @@ html[data-nav="collapsed"] .brand__version {
 }
 
 .filter-rail__item {
+  /* WCAG 2.2 target-size floor - font fallback must not shrink rows below it. */
+  min-height: 24px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2464,6 +2510,83 @@ html[data-nav="collapsed"] .brand__version {
   align-self: flex-start;
 }
 
+/* Chaining rows (#394): forward chains and _has carry extra controls, so
+ * they wrap; the shared input skin comes from the selectors above. */
+.builder-row--chain,
+.builder-row--has {
+  flex-wrap: wrap;
+}
+
+.builder-row__ctype,
+.builder-row__cparam,
+.builder-row__chainref,
+.builder-row__htype,
+.builder-row__href {
+  height: 32px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  outline: none;
+  width: 150px;
+}
+
+.builder-row__ctype {
+  width: 130px;
+  font-family: inherit;
+  color: var(--muted);
+}
+
+.builder-row__ctype:focus,
+.builder-row__cparam:focus,
+.builder-row__chainref:focus,
+.builder-row__htype:focus,
+.builder-row__href:focus {
+  border-color: var(--accent);
+}
+
+.builder-row__chainlabel {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.builder-pill {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.builder-row__drill {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--surface-border);
+  border-radius: 7px;
+  background: none;
+  color: var(--accent);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.builder-row__drill:hover {
+  background: var(--accent-soft);
+}
+
 /* In-page results card */
 
 .query-results {
@@ -2773,4 +2896,943 @@ button.filter-rail__item {
   .query-builder__tag {
     display: none;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   Resource editor (#264, Figma "Resources - Edit").
+
+   Brett's shell — the Guided form / JSON toggle, Save & Delete — with a tree
+   that is generated from the resource's schema rather than from a fixed list of
+   friendly fields. Extensions are tinted, not exiled: they are ordinary
+   elements and they render inline with everything else.
+   --------------------------------------------------------------------------- */
+
+.editor__bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 18px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  box-shadow: var(--surface-shadow);
+}
+
+.editor__title h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.editor__subject {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.editor__actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.editor__status {
+  min-height: 20px;
+  margin: 10px 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.editor__status--ok {
+  color: var(--accent);
+}
+
+.editor__status--error {
+  color: var(--text);
+}
+
+/* Three panels on one screen (Brett's Resource Editor): JSON + guided form side
+   by side, with a version rail to the right. */
+.editor__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 240px;
+  gap: 16px;
+  align-items: start;
+}
+
+.editor__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.editor-json,
+.editor-form {
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.card-head h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.card-head__tools {
+  display: flex;
+  gap: 6px;
+}
+
+.editor-json__act {
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--surface-border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.editor-json__act:hover { color: var(--text); }
+.editor-json__act--on { color: var(--accent); border-color: var(--accent); }
+
+.editor-tree { padding: 12px 14px; }
+
+/* ---- the foldable JSON view ---- */
+
+.json-view {
+  padding: 10px 0;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.json-line {
+  display: flex;
+  align-items: baseline;
+  white-space: pre;
+}
+
+.json-line:hover { background: var(--input-bg); }
+
+.json-line__num {
+  flex: 0 0 auto;
+  width: 40px;
+  padding-right: 10px;
+  text-align: right;
+  color: var(--muted);
+  opacity: 0.6;
+  user-select: none;
+}
+
+.json-line__fold {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
+  color: var(--muted);
+  user-select: none;
+}
+
+.json-line__arrow {
+  cursor: pointer;
+  display: inline-block;
+  transition: transform 0.1s;
+}
+
+.json-line--collapsed .json-line__arrow { transform: rotate(-90deg); }
+
+.json-line__code { min-width: 0; }
+
+/* The summary shows only on a collapsed opener. */
+.json-line__summary { display: none; color: var(--muted); }
+.json-line--collapsed .json-line__summary { display: inline; padding-left: 2px; }
+
+/* Syntax highlighting. */
+.jt--key { color: var(--accent); }
+.jt--string { color: #1a7f37; }
+.jt--number { color: #cf222e; }
+.jt--bool,
+.jt--null { color: #8250df; font-weight: 600; }
+.jt--punct { color: var(--muted); }
+
+/* ---- version rail ---- */
+
+.editor-versions { padding: 0; }
+
+.editor-versions__list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px;
+}
+
+.editor-version {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.editor-version:hover { background: var(--input-bg); }
+.editor-version--current { border-color: var(--surface-border); }
+.editor-version--current .editor-version__id { color: var(--accent); }
+
+.editor-version__id { font-size: 13px; font-weight: 600; color: var(--text); }
+.editor-version__meta { font-size: 11px; color: var(--muted); }
+.editor-versions__none { padding: 10px; font-size: 12px; color: var(--muted); }
+
+.editor-validity {
+  font-size: 12px;
+  font-weight: 600;
+  color: #cf222e;
+}
+.editor-validity--ok { color: var(--accent); }
+
+.editor__parse-error {
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  background: var(--input-bg);
+  border: 1px solid var(--muted);
+  border-radius: 10px;
+}
+
+.editor__parse-error code {
+  display: block;
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ---- the tree ---- */
+
+.editor-row {
+  padding: 3px 0;
+  border-left: 1px solid transparent;
+}
+
+.editor-row__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.editor-row__label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.editor-row__type {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.editor-row__input {
+  flex: 1;
+  min-width: 0;
+  max-width: 420px;
+  height: 28px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+.editor-row__input:focus {
+  border-color: var(--accent);
+}
+
+.editor-row__del {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.editor-row__del:hover {
+  color: var(--text);
+  border-color: var(--surface-border);
+}
+
+/* Extensions are normal FHIR. Tinted, not exiled. */
+.editor-row--extension > .editor-row__head .editor-row__label {
+  color: var(--accent);
+}
+
+/* A modifier extension changes the meaning of the resource: an unrecognised
+   one must stop processing. It gets an outline, not a tint. */
+.editor-row--modifier {
+  border-left: 2px solid var(--muted);
+  padding-left: 6px;
+}
+
+.editor-row__warn {
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-strong);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  cursor: help;
+}
+
+.editor-row__warn--muted {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--surface-border);
+}
+
+.editor-row--error .editor-row__input {
+  border-color: #cf222e;
+}
+
+.editor-row__error {
+  margin: 2px 0 4px 0;
+  font-size: 12px;
+  color: #cf222e;
+}
+
+/* ---- "what can I add here?" ---- */
+
+.editor-add {
+  margin: 2px 0 6px;
+}
+
+.editor-add__toggle {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px dashed var(--surface-border);
+  border-radius: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.editor-add__toggle::-webkit-details-marker {
+  display: none;
+}
+
+.editor-add__toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.editor-add__panel {
+  max-width: 520px;
+  margin-top: 6px;
+  padding: 10px;
+  background: var(--bg-content);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+}
+
+.editor-add__filter {
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  margin-bottom: 8px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+.editor-add__list {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.editor-add__item,
+.editor-add__choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.editor-add__item:hover {
+  background: var(--accent-soft);
+}
+
+.editor-add__name em {
+  color: var(--accent);
+  font-style: normal;
+}
+
+.editor-add__type,
+.editor-add__again {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.editor-add__choice select {
+  margin-left: auto;
+  height: 26px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+}
+
+/* The ad-hoc extension: any URL, at any node. The thing the surveyed editors
+   cannot do without a profile. */
+.editor-add__ext {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--surface-border);
+}
+
+.editor-add__ext label {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.editor-add__ext-url {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+/* ---- source view & validity rail ---- */
+
+.editor__source {
+  width: 100%;
+  min-height: 460px;
+  padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  outline: none;
+  resize: vertical;
+}
+
+.editor__source-hint {
+  margin: 8px 2px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.editor__side {
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  box-shadow: var(--surface-shadow);
+}
+
+.editor__validity {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.editor__validity--ok {
+  color: var(--accent);
+}
+
+.editor__orphan {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #cf222e;
+}
+
+@media (max-width: 1100px) {
+  .editor__panes {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Resources workspace (#282): the nav submenu, the Create-button page head, and
+   the Edit Resource modal (shadowbox).
+   --------------------------------------------------------------------------- */
+
+/* Page head with an action on the right (Create new). */
+.page-head--row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.filter-rail__item--on {
+  background: var(--accent-soft);
+  color: var(--text-strong);
+}
+
+/* ---- the Edit Resource modal (shadowbox) ---- */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgb(0 0 0 / 45%);
+}
+
+.modal__box {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(1200px, 100%);
+  max-height: 90vh;
+  background: var(--bg-content);
+  border: 1px solid var(--surface-border);
+  border-radius: 18px;
+  box-shadow: 0 24px 64px rgb(0 0 0 / 30%);
+  overflow: hidden;
+}
+
+.modal__head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.modal__title h2 {
+  margin: 0;
+  font-size: 16px;
+  color: var(--text-strong);
+}
+
+.modal__subject {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.modal__tabs {
+  display: flex;
+  gap: 4px;
+  margin-left: 8px;
+}
+
+.modal__tab {
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.modal__tab--on {
+  color: var(--text-strong);
+  background: var(--input-bg);
+  border-color: var(--surface-border);
+}
+
+.modal__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.modal__x {
+  width: 34px;
+  height: 34px;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  cursor: pointer;
+}
+.modal__x:hover { color: var(--text); }
+
+.modal__status {
+  padding: 0 18px;
+  font-size: 13px;
+}
+.modal__status:not(:empty) { padding: 10px 18px; }
+.modal__status--ok {
+  color: #1a7f37;
+  font-weight: 600;
+  background: #eaf6ec;
+}
+.modal__status--error {
+  color: #cf222e;
+  font-weight: 600;
+  background: #ffebe9;
+  border-top: 1px solid #ffcdca;
+  border-bottom: 1px solid #ffcdca;
+}
+
+.modal__body {
+  padding: 16px 18px;
+  overflow-y: auto;
+}
+
+/* The embedded editor's own bar (subject + view toggle) is redundant inside the
+   modal, which already has a title and actions — hide it. */
+.modal__body .editor__bar,
+.modal__body .editor__layout > .editor-versions {
+  display: none;
+}
+.modal__body .editor__layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@media (max-width: 900px) {
+  .modal__box { max-height: 96vh; }
+  .modal__head { flex-wrap: wrap; }
+}
+
+/* ---------------------------------------------------------------------------
+   Resources: the resource-type panel as part of the menu (#282, Brett's
+   "Resources" frame). A secondary column flush against the sidebar — same
+   surface, no card — with the search + results in the content column.
+   --------------------------------------------------------------------------- */
+
+/* Three columns when a nav panel is present: sidebar, the panel, content. */
+body.has-nav-panel {
+  grid-template-columns: 250px 232px 1fr;
+}
+
+.nav-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 100vh;
+  padding: 20px 16px;
+  border-right: 1px solid var(--divider);
+  box-shadow: 1px 0 0 var(--divider-glint);
+  overflow-y: auto;
+}
+
+.nav-panel__head {
+  padding: 4px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.nav-panel__search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 12px;
+  color: var(--muted);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+}
+
+.nav-panel__search input {
+  width: 100%;
+  /* WCAG 2.2 target-size floor - font fallback must not shrink it below it. */
+  min-height: 24px;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+}
+
+.nav-panel__list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 4px;
+}
+
+.nav-panel__item {
+  /* WCAG 2.2 target-size floor - font fallback must not shrink rows below it. */
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.nav-panel__item:hover { background: var(--input-bg); }
+
+.nav-panel__item--on {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.nav-panel__item .count {
+  font-size: 12px;
+  color: var(--muted);
+}
+.nav-panel__item--on .count { color: var(--accent-text); }
+
+/* The Create-new primary button (blue + plus), top-right of the page head. */
+.resources-create {
+  flex: none;
+}
+
+@media (max-width: 1100px) {
+  body.has-nav-panel { grid-template-columns: 250px 1fr; }
+  .nav-panel { display: none; }
+}
+
+/* Saved / Recent group headings inside the Recent dropdown (#282). */
+.recent-group {
+  margin: 8px 4px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.recent-group:first-child { margin-top: 0; }
+.recent-item__saved {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-weight: 500;
+}
+
+/* ---------------------------------------------------------------------------
+   Collapsed sidebar + the Resources type panel. The sidebar collapse itself is
+   driven by `data-nav="collapsed"` (the block near the top of this file). Here
+   we only add the 3-column grid variant: when the type panel is present, the
+   collapsed sidebar rail must keep the panel and content in their own columns
+   (otherwise the content wraps below the two rails).
+   --------------------------------------------------------------------------- */
+html[data-nav="collapsed"] body.has-nav-panel {
+  grid-template-columns: 76px 232px 1fr;
+}
+html[data-nav="collapsed"] .menu__panel { left: 0; }
+
+/* OR value stacks (#414): one input per comma alternative. */
+.builder-row__values {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.builder-row__orvalue {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.builder-row__orvalue .builder-row__value {
+  flex: 1;
+}
+
+.builder-row__orvalue:only-child .builder-row__remove--or {
+  visibility: hidden;
+}
+
+.builder-row__or {
+  flex-shrink: 0;
+  align-self: flex-start;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.builder-row__or:hover {
+  background: var(--accent-soft);
+}
+
+/* MODIFY panel (#415): explained modifier chips under the row. */
+.builder-row__adv {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--surface-border);
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.builder-row__adv:hover,
+.builder-row__adv[aria-expanded="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.builder-row__modpanel {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 0 2px;
+}
+
+.builder-row__modheading {
+  color: var(--muted);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.builder-row__modchip {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 3px 10px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.builder-row__modchip strong {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.builder-row__modchip:hover {
+  border-color: var(--accent);
+}
+
+.builder-row__modchip[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.builder-row__modchip[aria-pressed="true"] strong {
+  color: var(--accent);
+}
+
+/* Results sort (#416). */
+.query-results__sort {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.query-results__sort select {
+  height: 30px;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 12.5px;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
 }

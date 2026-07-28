@@ -7,7 +7,8 @@
 //! # Features
 //!
 //! - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-//! - **Multitenancy**: Three isolation strategies (shared schema, schema-per-tenant, database-per-tenant)
+//! - **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on
+//!   every backend; the S3 backend additionally offers a bucket-per-tenant mode
 //! - **Full FHIR Search**: All parameter types, modifiers, chaining, _include/_revinclude
 //! - **Versioning**: Full resource history with optimistic locking
 //! - **Transactions**: ACID transactions with bundle support
@@ -41,8 +42,39 @@
 //! - [`types`] - Core types for stored resources and search
 //! - [`error`] - Error types for all operations
 //! - [`core`] - Storage traits and abstractions
-//! - [`strategy`] - Tenancy isolation strategies (shared schema, schema-per-tenant, database-per-tenant)
 //! - [`backends`] - Backend implementations (SQLite, PostgreSQL, etc.)
+//!
+//! # Tenant Isolation
+//!
+//! There is one isolation model: **shared schema with a `tenant_id`
+//! discriminator**, chosen deliberately in design discussion
+//! [#28](https://github.com/HeliosSoftware/hfs/discussions/28), which surveyed
+//! schema-per-tenant and database-per-tenant and selected shared-schema as the
+//! pragmatic choice for SQL-backed FHIR persistence.
+//!
+//! Every tenant-scoped operation on [`core::ResourceStorage`] takes a
+//! [`tenant::TenantContext`] as its first argument, so such an operation cannot
+//! be *constructed* without tenant scope. This is a guarantee about call sites,
+//! not about the SQL each backend emits: the `tenant_id` predicate itself is
+//! hand-written per query, and a handful of methods are intentionally
+//! cross-tenant (e.g. the admin aggregate `count_by_tenant`, the tenant
+//! registry calls) and take no context by design. The control on the emitted
+//! predicate is review, not the type system; a database-enforced layer
+//! (PostgreSQL RLS) is tracked in
+//! [#381](https://github.com/HeliosSoftware/hfs/issues/381).
+//!
+//! Each backend applies the discriminator in its own idiom: a `tenant_id`
+//! column and leading-column composite indexes (SQLite, PostgreSQL), a
+//! `tenant_id` field (MongoDB), a per-tenant index plus a `tenant_id` term
+//! filter (Elasticsearch), and a tenant-scoped key prefix (S3).
+//!
+//! The S3 backend additionally supports a per-tenant *physical* boundary — a
+//! dedicated bucket, with its own IAM/policy surface — via
+//! `S3TenancyMode::BucketPerTenant` (tenants absent from the bucket map fall
+//! back to the shared system bucket). Schema-per-tenant and database-per-tenant
+//! are **not** offered for the SQL backends; unwired SQL generators for them
+//! were removed in
+//! [#370](https://github.com/HeliosSoftware/hfs/issues/370).
 //!
 //! # Quick Start
 //!
@@ -148,7 +180,6 @@ pub mod core;
 pub mod error;
 pub mod search;
 pub mod sof;
-pub mod strategy;
 pub mod tenant;
 #[cfg(test)]
 pub(crate) mod test_audit;
@@ -185,12 +216,13 @@ pub use core::{
     TransactionProvider, VersionedStorage,
 };
 
-// Re-export tenancy strategies
-pub use strategy::{
-    DatabasePerTenantConfig, DatabasePerTenantStrategy, IsolationLevel, SchemaPerTenantConfig,
-    SchemaPerTenantStrategy, SharedSchemaConfig, SharedSchemaStrategy, TenancyStrategy,
-    TenantResolution, TenantResolver,
-};
+// NOTE: `IsolationLevel` is deliberately NOT re-exported here. This path used to
+// resolve to the removed tenancy enum (`Logical | Schema | Physical`), which
+// shadowed the live transaction enum of the same name at
+// [`core::IsolationLevel`] (`ReadCommitted | RepeatableRead | Serializable |
+// Snapshot`). Re-exporting the transaction one under the vacated path would keep
+// the name alive while silently changing its meaning for any downstream user —
+// the worst kind of break, because it compiles. Reach it at its own path.
 
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

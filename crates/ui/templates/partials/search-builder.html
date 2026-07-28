@@ -34,21 +34,47 @@
         <div class="menu__heading">{{ i18n.t("queries-recent-heading") }}</div>
         <div id="recent-searches"
              data-msg-empty="{{ i18n.t("queries-recent-empty") }}"
-             data-msg-delete="{{ i18n.t("queries-delete") }}"></div>
+             data-msg-delete="{{ i18n.t("queries-delete") }}"
+             data-msg-saved="{{ i18n.t("queries-saved-group") }}"
+             data-msg-recent-group="{{ i18n.t("queries-recent") }}"></div>
       </div>
     </details>
     <button class="btn btn--primary" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
   </div>
 
   <datalist id="param-options"></datalist>
+  <datalist id="resource-type-options">
+    {% for t in resource_types %}<option value="{{ t }}"></option>{% endfor %}
+  </datalist>
   <div class="builder-sections" id="builder-sections" hidden
        data-msg-param="{{ i18n.t("queries-param-placeholder") }}"
        data-msg-value="{{ i18n.t("queries-value-placeholder") }}"
-       data-msg-remove="{{ i18n.t("queries-remove") }}">
+       data-msg-remove="{{ i18n.t("queries-remove") }}"
+       data-msg-chain-into="{{ i18n.t("queries-chain-into") }}"
+       data-msg-any-target="{{ i18n.t("queries-chain-any-target") }}"
+       data-msg-has-pill="{{ i18n.t("queries-has-pill") }}"
+       data-msg-has-type="{{ i18n.t("queries-has-type-placeholder") }}"
+       data-msg-has-via="{{ i18n.t("queries-has-via") }}"
+       data-msg-has-where="{{ i18n.t("queries-has-where") }}"
+       data-msg-match-is="{{ i18n.t("queries-match-is") }}"
+       data-msg-or="{{ i18n.t("queries-or") }}"
+       data-msg-modify-heading="{{ i18n.t("queries-modify-heading") }}"
+       data-msg-mod-exact="{{ i18n.t("queries-mod-exact") }}"
+       data-msg-mod-contains="{{ i18n.t("queries-mod-contains") }}"
+       data-msg-mod-missing="{{ i18n.t("queries-mod-missing") }}"
+       data-msg-mod-text="{{ i18n.t("queries-mod-text") }}"
+       data-msg-mod-not="{{ i18n.t("queries-mod-not") }}"
+       data-msg-mod-above="{{ i18n.t("queries-mod-above") }}"
+       data-msg-mod-below="{{ i18n.t("queries-mod-below") }}"
+       data-msg-mod-in="{{ i18n.t("queries-mod-in") }}"
+       data-msg-mod-not-in="{{ i18n.t("queries-mod-not-in") }}"
+       data-msg-mod-identifier="{{ i18n.t("queries-mod-identifier") }}"
+       data-msg-mod-of-type="{{ i18n.t("queries-mod-of-type") }}">
     <div class="builder-section">
       <h3 class="builder-section__title">{{ i18n.t("queries-conditions") }}</h3>
       <div class="builder-rows" id="builder-conditions"></div>
       <button class="btn builder-add" type="button" data-add="condition">+ {{ i18n.t("queries-add-condition") }}</button>
+      <button class="btn builder-add" type="button" data-add="has">{{ i18n.t("queries-add-has") }}</button>
     </div>
     <div class="builder-grid">
       <div class="builder-section">

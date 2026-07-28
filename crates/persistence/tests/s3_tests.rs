@@ -66,9 +66,19 @@ fn make_bucket_per_tenant_backend(prefix: String) -> Option<S3Backend> {
     Some(S3Backend::from_env(config).expect("create bucket-per-tenant S3 backend"))
 }
 
+/// Capabilities that do not depend on how tenants are placed.
+///
+/// `S3Backend::declared_capabilities()` (no argument) was removed in #369: S3's
+/// tenant-placement topology is a property of the configured
+/// [`S3TenancyMode`], so a single mode-independent answer was necessarily false
+/// in one direction whichever mode an instance ran. The per-mode tenancy claims
+/// are asserted in `tests/backend_capability_contract.rs`.
 #[test]
 fn test_s3_capabilities_declared() {
-    let capabilities = S3Backend::declared_capabilities();
+    let mode = S3TenancyMode::PrefixPerTenant {
+        bucket: "declared-capabilities".to_string(),
+    };
+    let capabilities = S3Backend::declared_capabilities_for(&mode);
 
     assert!(capabilities.contains(&BackendCapability::Crud));
     assert!(capabilities.contains(&BackendCapability::Versioning));
@@ -80,6 +90,21 @@ fn test_s3_capabilities_declared() {
     assert!(!capabilities.contains(&BackendCapability::BulkSubmitRestWorker));
     assert!(!capabilities.contains(&BackendCapability::BasicSearch));
     assert!(!capabilities.contains(&BackendCapability::Transactions));
+
+    // Tenancy is mode-derived: a shared bucket is not physical isolation.
+    assert!(capabilities.contains(&BackendCapability::SharedSchema));
+    assert!(!capabilities.contains(&BackendCapability::DatabasePerTenant));
+
+    let bucket_mode = S3TenancyMode::BucketPerTenant {
+        tenant_bucket_map: std::collections::HashMap::from([(
+            "tenant-a".to_string(),
+            "bucket-a".to_string(),
+        )]),
+        default_system_bucket: None,
+    };
+    let bucket_capabilities = S3Backend::declared_capabilities_for(&bucket_mode);
+    assert!(bucket_capabilities.contains(&BackendCapability::DatabasePerTenant));
+    assert!(!bucket_capabilities.contains(&BackendCapability::SharedSchema));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -170,7 +195,10 @@ async fn test_aws_bundle_bulk_export_and_submit() {
         resource: Some(json!({"resourceType":"Patient","id":format!("b-{}", Uuid::new_v4())})),
         ..Default::default()
     }];
-    let bundle = backend.process_batch(&tenant, entries).await.unwrap();
+    let bundle = backend
+        .process_batch(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
     assert_eq!(bundle.entries.len(), 1);
     assert_eq!(bundle.entries[0].status, 201);
 
