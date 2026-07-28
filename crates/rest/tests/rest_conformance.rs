@@ -753,18 +753,48 @@ mod conditional_update {
             {"op": "replace", "path": "/name/0/family", "value": "Patched"}
         ]);
 
+        // `.json()` would overwrite the content type with `application/json`,
+        // which the patch handler rejects with 415. `.bytes()` leaves it alone,
+        // so set it explicitly with `.content_type()`.
         let response = server
             .patch("/Patient/patient-1")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
-            .add_header(
-                CONTENT_TYPE,
-                HeaderValue::from_static("application/json-patch+json"),
-            )
+            .content_type("application/json-patch+json")
             .add_header(IF_MATCH, HeaderValue::from_str(&list).unwrap())
-            .json(&patch)
+            .bytes(serde_json::to_vec(&patch).unwrap().into())
             .await;
 
         response.assert_status_ok();
+
+        // The patch must actually have been applied — a 200 alone would also be
+        // consistent with the precondition being skipped entirely.
+        let read = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: serde_json::Value = read.json();
+        assert_eq!(body["name"][0]["family"], "Patched");
+    }
+
+    /// A PATCH whose `If-Match` list matches nothing must be refused.
+    #[tokio::test]
+    async fn test_patch_multi_valued_if_match_fails_when_none_match() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let patch = json!([
+            {"op": "replace", "path": "/name/0/family", "value": "Patched"}
+        ]);
+
+        let response = server
+            .patch("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .content_type("application/json-patch+json")
+            .add_header(IF_MATCH, HeaderValue::from_static("W/\"98\", W/\"99\""))
+            .bytes(serde_json::to_vec(&patch).unwrap().into())
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
     }
 
     /// Reads the current `ETag` for a resource.
