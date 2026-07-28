@@ -643,6 +643,11 @@ pub struct BulkSubmitConfig {
     /// Larger result sets are split across pages chained by the manifest's
     /// `link[]` `next` relation. `0` disables pagination (single manifest).
     pub manifest_page_size: u32,
+    /// Status polls allowed per client, per submission, per rate window.
+    /// `0` disables poll rate limiting.
+    pub poll_rate_limit: u32,
+    /// Sliding window for [`Self::poll_rate_limit`], in seconds.
+    pub poll_rate_window_secs: u64,
 }
 
 impl Default for BulkSubmitConfig {
@@ -669,6 +674,11 @@ impl Default for BulkSubmitConfig {
             outbound_scope: "system/*.rs".to_string(),
             retry_after_secs: 120,
             manifest_page_size: 1000,
+            // A client honouring the advertised Retry-After polls twice an
+            // hour, so 10 polls a minute is far above any well-behaved cadence
+            // and only bites on a hammering loop.
+            poll_rate_limit: 10,
+            poll_rate_window_secs: 60,
         }
     }
 }
@@ -737,6 +747,11 @@ impl BulkSubmitConfig {
                 .unwrap_or(d.outbound_scope),
             retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
             manifest_page_size: env_u32("HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE", d.manifest_page_size),
+            poll_rate_limit: env_u32("HFS_BULK_SUBMIT_POLL_RATE_LIMIT", d.poll_rate_limit),
+            poll_rate_window_secs: env_u64(
+                "HFS_BULK_SUBMIT_POLL_RATE_WINDOW",
+                d.poll_rate_window_secs,
+            ),
         }
     }
 
@@ -793,6 +808,12 @@ impl BulkSubmitConfig {
         }
         if self.cleanup_interval_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_CLEANUP_INTERVAL must be > 0".to_string());
+        }
+        if self.poll_rate_limit > 0 && self.poll_rate_window_secs == 0 {
+            errors.push(
+                "HFS_BULK_SUBMIT_POLL_RATE_WINDOW must be > 0 when POLL_RATE_LIMIT is set"
+                    .to_string(),
+            );
         }
         if errors.is_empty() {
             Ok(())

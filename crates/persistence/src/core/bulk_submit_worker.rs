@@ -21,7 +21,7 @@ use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    StreamingBulkSubmitProvider, SubmissionId,
+    ImportMode, StreamingBulkSubmitProvider, SubmissionId,
 };
 use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
 use crate::error::StorageResult;
@@ -65,10 +65,43 @@ pub struct ManifestWorkerView {
     pub oauth_metadata_urls: Vec<String>,
     /// JWE file-encryption key descriptor, if the provider encrypts files.
     pub file_encryption_key: Option<Value>,
+    /// Pre-coordinated `import` processing directives as
+    /// `(parameterUrl, parameterValue)` pairs. Resolve with
+    /// [`ImportMode::from_directives`].
+    pub import_directives: Vec<(String, String)>,
+    /// Pre-coordinated `metadata` parts as `(parameterUrl, parameterValue)` pairs.
+    ///
+    /// The IG defines these as data the Data Provider passes to the Data Consumer
+    /// without prescribing any processing; HFS retains them verbatim alongside the
+    /// manifest and surfaces them to the worker (which logs them) so deployment- or
+    /// IG-specific handling can be layered on without another migration.
+    pub metadata: Vec<(String, String)>,
     /// Resume cursor: lines already processed for this manifest.
     pub last_processed_line: u64,
     /// FHIR version this submission ingests against.
     pub fhir_version: FhirVersion,
+}
+
+/// The kickoff-supplied parameters a worker needs to fetch and ingest a manifest.
+///
+/// Bundled into a struct because they are written together by the kickoff handler
+/// and read back together by [`SubmitWorkerStorage::get_manifest_for_worker`].
+#[derive(Debug, Clone, Default)]
+pub struct ManifestFetchParams<'a> {
+    /// Base URL for resolving relative references in ingested resources.
+    pub fhir_base_url: Option<&'a str>,
+    /// The kickoff `outputFormat` (MIME), used to derive the FHIR version.
+    pub output_format: Option<&'a str>,
+    /// HTTP headers the Data Provider asked us to include when fetching files.
+    pub file_request_headers: &'a [(String, String)],
+    /// OAuth 2.0 metadata endpoints for acquiring file-retrieval tokens.
+    pub oauth_metadata_urls: &'a [String],
+    /// JWE file-encryption key descriptor, if the provider encrypts files.
+    pub file_encryption_key: Option<&'a Value>,
+    /// `import` directives as `(parameterUrl, parameterValue)` pairs.
+    pub import_directives: &'a [(String, String)],
+    /// `metadata` parts as `(parameterUrl, parameterValue)` pairs.
+    pub metadata: &'a [(String, String)],
 }
 
 /// A finalized status-manifest artifact (output / error / deleted NDJSON part) to record.
@@ -197,19 +230,14 @@ pub trait SubmitWorkerStorage: Send + Sync {
     /// Persists the remote-fetch parameters for a manifest that the kickoff handler
     /// added via [`crate::core::bulk_submit::BulkSubmitProvider::add_manifest`].
     ///
-    /// `file_request_headers` / `oauth_metadata_urls` are stored as JSON arrays;
-    /// `file_encryption_key` as a JSON object.
-    #[allow(clippy::too_many_arguments)]
+    /// `file_request_headers` / `oauth_metadata_urls` / `import_directives` /
+    /// `metadata` are stored as JSON arrays; `file_encryption_key` as a JSON object.
     async fn set_manifest_fetch_params(
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
         manifest_id: &str,
-        fhir_base_url: Option<&str>,
-        output_format: Option<&str>,
-        file_request_headers: &[(String, String)],
-        oauth_metadata_urls: &[String],
-        file_encryption_key: Option<&Value>,
+        params: ManifestFetchParams<'_>,
     ) -> StorageResult<()>;
 
     /// Marks a previously-submitted manifest (identified by its submitted
@@ -390,7 +418,19 @@ where
             }
         };
 
-        let opts = BulkProcessingOptions::new();
+        // Apply the pre-coordinated `import` directives the Data Provider sent at
+        // kickoff. `metadata` carries no processing semantics of its own — it is
+        // retained with the manifest and surfaced here for operators.
+        let import_mode = ImportMode::from_directives(&view.import_directives);
+        if !view.metadata.is_empty() {
+            tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                metadata = ?view.metadata,
+                "ingesting manifest with submission metadata"
+            );
+        }
+        let opts = BulkProcessingOptions::new().with_import_mode(import_mode);
         let mut processed: u64 = 0;
         let mut failed: u64 = 0;
 
@@ -864,6 +904,7 @@ mod tests {
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::bulk_submit::BulkSubmitProvider;
     use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest};
+    use crate::core::storage::ResourceStorage;
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
     use std::time::Duration as StdDuration;
 
@@ -1069,6 +1110,144 @@ mod tests {
         // A manifest-level error artifact was recorded.
         let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
         assert!(files.iter().any(|f| f.file_type == "error"));
+    }
+
+    /// Seeds a submission whose single manifest carries the given `import` directives.
+    async fn seed_with_import(
+        backend: &Arc<SqliteBackend>,
+        tenant: &TenantContext,
+        directives: &[(String, String)],
+    ) -> SubmissionId {
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(tenant, &sub_id, Some("http://provider/manifest.json"), None)
+            .await
+            .unwrap();
+        backend
+            .set_manifest_fetch_params(
+                tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                ManifestFetchParams {
+                    import_directives: directives,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sub_id
+    }
+
+    /// A fetcher serving one NDJSON file of `Patient` resources.
+    fn patient_fetcher(ndjson: &str) -> Arc<MockFetcher> {
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/p.ndjson".to_string(),
+            ndjson.as_bytes().to_vec(),
+        );
+        Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "http://provider/p.ndjson".to_string(),
+                    count: Some(1),
+                }],
+                deleted: vec![],
+            },
+        })
+    }
+
+    /// Ingests a partial Patient over an existing one and returns the stored content.
+    async fn ingest_over_existing(directives: &[(String, String)]) -> Value {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://x",
+        ));
+        let tenant = tenant();
+
+        // An existing Patient carrying a name the submission never mentions.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p1",
+                    "name": [{"family": "Original"}],
+                    "gender": "female"
+                }),
+                helios_fhir::FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+
+        let sub_id = seed_with_import(&backend, &tenant, directives).await;
+        let fetcher =
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"p1\",\"gender\":\"male\"}\n");
+        let worker = DefaultSubmitWorker::new(backend.clone(), fetcher, output, WorkerId::new("w"));
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(
+            backend
+                .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
+                .await
+                .unwrap()
+                .success,
+            1
+        );
+        backend
+            .read(&tenant, "Patient", "p1")
+            .await
+            .unwrap()
+            .expect("patient still stored")
+            .content()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn test_import_mode_merge_retains_unsubmitted_elements() {
+        let stored = ingest_over_existing(&[(
+            crate::core::bulk_submit::IMPORT_MODE_PARAMETER_URL.to_string(),
+            "merge".to_string(),
+        )])
+        .await;
+        assert_eq!(stored["gender"], json!("male"));
+        assert_eq!(stored["name"], json!([{"family": "Original"}]));
+    }
+
+    #[tokio::test]
+    async fn test_import_mode_replace_is_the_default() {
+        // Explicit `replace` and no directive at all must behave identically:
+        // the submitted resource wins wholesale.
+        for directives in [
+            vec![(
+                crate::core::bulk_submit::IMPORT_MODE_PARAMETER_URL.to_string(),
+                "replace".to_string(),
+            )],
+            vec![],
+        ] {
+            let stored = ingest_over_existing(&directives).await;
+            assert_eq!(stored["gender"], json!("male"));
+            assert!(
+                stored.get("name").is_none(),
+                "replace must not retain unsubmitted elements, got {stored}"
+            );
+        }
     }
 
     #[tokio::test]

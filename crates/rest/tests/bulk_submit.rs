@@ -132,7 +132,7 @@ async fn create_submit_server() -> (
 
 async fn create_submit_server_with(
     fetcher: Arc<MockFetcher>,
-    submit_config: BulkSubmitConfig,
+    bulk_submit: BulkSubmitConfig,
 ) -> (
     TestServer,
     Arc<SqliteBackend>,
@@ -167,7 +167,7 @@ async fn create_submit_server_with(
         },
         base_url: "http://localhost:8080".to_string(),
         default_tenant: "test-tenant".to_string(),
-        bulk_submit: submit_config,
+        bulk_submit,
         ..ServerConfig::for_testing()
     };
 
@@ -223,6 +223,31 @@ fn status_body() -> Value {
             {"name": "submissionId", "valueString": "it-1"}
         ]
     })
+}
+
+/// Kicks off a submission plus its status request and returns the poll path.
+async fn start_and_get_poll_path(server: &TestServer) -> String {
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let status = server
+        .post("/$bulk-submit-status")
+        .json(&status_body())
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    status
+        .headers()
+        .get("content-location")
+        .expect("Content-Location")
+        .to_str()
+        .unwrap()
+        .trim_start_matches("http://localhost:8080")
+        .to_string()
 }
 
 #[tokio::test]
@@ -433,6 +458,114 @@ async fn test_pagination_disabled_returns_single_manifest() {
 }
 
 #[tokio::test]
+async fn test_strict_handling_accepts_recognized_import_mode() {
+    // Only *unrecognized* directives are rejected under strict handling — the
+    // import mode HFS publishes is honored regardless of posture.
+    let (server, ..) = create_submit_server().await;
+    let mut body = kickoff_body();
+    body["parameter"].as_array_mut().unwrap().push(json!({
+        "name": "import",
+        "part": [
+            {"name": "parameterUrl", "valueUri": "https://helios.software/import-mode"},
+            {"name": "parameterValue", "valueString": "merge"}
+        ]
+    }));
+    let resp = server
+        .post("/$bulk-submit")
+        .add_header("Prefer", "handling=strict")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_unsupported_import_mode_value_rejected() {
+    // A directive we recognize with a value we cannot honor is a 400 even under
+    // lenient handling — silently ingesting under the wrong mode would corrupt data.
+    let (server, ..) = create_submit_server().await;
+    let mut body = kickoff_body();
+    body["parameter"].as_array_mut().unwrap().push(json!({
+        "name": "import",
+        "part": [
+            {"name": "parameterUrl", "valueUri": "https://helios.software/import-mode"},
+            {"name": "parameterValue", "valueString": "upsert"}
+        ]
+    }));
+    let resp = server.post("/$bulk-submit").json(&body).await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+}
+
+/// Kicks off a submission over a pre-existing `sub-p1` and returns its stored
+/// content after ingestion, so `replace` and `merge` can be compared end-to-end.
+async fn ingest_with_import_mode(mode: Option<&str>) -> Value {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server().await;
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    // Already stored: a Patient with a `gender` the submission never mentions.
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "sub-p1",
+                "gender": "female",
+                "name": [{"family": "Stale"}]
+            }),
+            helios_fhir::FhirVersion::default_enabled(),
+        )
+        .await
+        .expect("seed patient");
+
+    let mut body = kickoff_body();
+    if let Some(mode) = mode {
+        body["parameter"].as_array_mut().unwrap().push(json!({
+            "name": "import",
+            "part": [
+                {"name": "parameterUrl", "valueUri": "https://helios.software/import-mode"},
+                {"name": "parameterValue", "valueString": mode}
+            ]
+        }));
+    }
+    assert_eq!(
+        server.post("/$bulk-submit").json(&body).await.status_code(),
+        StatusCode::OK
+    );
+    drain_submit(&backend, &fetcher, &output).await;
+
+    backend
+        .read(&tenant, "Patient", "sub-p1")
+        .await
+        .unwrap()
+        .expect("patient still stored")
+        .content()
+        .clone()
+}
+
+#[tokio::test]
+async fn test_import_mode_merge_applied_to_ingestion() {
+    let stored = ingest_with_import_mode(Some("merge")).await;
+    // Submitted element wins...
+    assert_eq!(stored["name"], json!([{"family": "A"}]));
+    // ...and the element the submission omitted survives.
+    assert_eq!(stored["gender"], json!("female"));
+}
+
+#[tokio::test]
+async fn test_import_mode_replace_applied_to_ingestion() {
+    for mode in [Some("replace"), None] {
+        let stored = ingest_with_import_mode(mode).await;
+        assert_eq!(stored["name"], json!([{"family": "A"}]));
+        assert!(
+            stored.get("gender").is_none(),
+            "replace must not retain unsubmitted elements, got {stored}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_full_lifecycle_ingests_and_polls() {
     let (server, backend, fetcher, output, _tmp) = create_submit_server().await;
 
@@ -520,4 +653,92 @@ async fn test_full_lifecycle_ingests_and_polls() {
         server.get(poll_path).await.status_code(),
         StatusCode::NOT_FOUND
     );
+}
+
+// ── Status-poll pacing: Retry-After + rate limiting (issue #399) ──────────────
+
+#[tokio::test]
+async fn test_in_progress_poll_advertises_the_configured_retry_after() {
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            retry_after_secs: 7,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    // The worker has not run, so the submission is still in progress.
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "7",
+        "the in-progress poll must advertise HFS_BULK_SUBMIT_RETRY_AFTER"
+    );
+}
+
+#[tokio::test]
+async fn test_poll_beyond_the_rate_limit_returns_429_with_retry_after() {
+    // Spec (build.fhir.org submit.html): Data Consumers SHOULD rate-limit the
+    // status endpoint and return Retry-After so clients back off.
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            poll_rate_limit: 2,
+            poll_rate_window_secs: 60,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    for _ in 0..2 {
+        assert_eq!(
+            server.get(&poll_path).await.status_code(),
+            StatusCode::ACCEPTED,
+            "polls within the limit must be served"
+        );
+    }
+
+    let throttled = server.get(&poll_path).await;
+    assert_eq!(throttled.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    let secs: u64 = throttled
+        .headers()
+        .get("retry-after")
+        .expect("429 must carry Retry-After")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Retry-After must be delta-seconds");
+    assert!(
+        (1..=60).contains(&secs),
+        "Retry-After must point inside the rate window, got {secs}"
+    );
+    // The rejection is a FHIR OperationOutcome, not an empty body.
+    let outcome: Value = throttled.json();
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    assert_eq!(outcome["issue"][0]["code"], "throttled");
+}
+
+#[tokio::test]
+async fn test_poll_rate_limit_of_zero_disables_throttling() {
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            poll_rate_limit: 0,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    for _ in 0..12 {
+        assert_eq!(
+            server.get(&poll_path).await.status_code(),
+            StatusCode::ACCEPTED,
+            "poll rate limiting must be off when the limit is 0"
+        );
+    }
 }

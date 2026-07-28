@@ -20,8 +20,8 @@ use crate::core::bulk_submit::{
     SubmissionManifest, SubmissionStatus, SubmissionSummary,
 };
 use crate::core::bulk_submit_worker::{
-    ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
-    SubmitFileRow, SubmitWorkerStorage,
+    ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
+    SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -859,10 +859,9 @@ impl SqliteBackend {
                     );
                     self.record_change(tenant, submission_id, &change).await?;
 
-                    // Update the resource
-                    let updated = self
-                        .update(tenant, &current, entry.resource.clone())
-                        .await?;
+                    // Update the resource, honoring the submission's import mode.
+                    let content = options.content_for_update(current.content(), &entry.resource);
+                    let updated = self.update(tenant, &current, content).await?;
 
                     Ok(BulkEntryResult::success(
                         entry.line_number,
@@ -1381,11 +1380,14 @@ impl SubmitWorkerStorage for SqliteBackend {
             Option<String>,
             Option<String>,
             i64,
+            Option<String>,
+            Option<String>,
         );
         let row: Row = conn
             .query_row(
                 "SELECT manifest_url, fhir_base_url, output_format, file_request_headers,
-                        oauth_metadata_urls, file_encryption_key, last_processed_line
+                        oauth_metadata_urls, file_encryption_key, last_processed_line,
+                        import_directives, submission_metadata
                  FROM bulk_manifests
                  WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
                    AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
@@ -1406,6 +1408,8 @@ impl SubmitWorkerStorage for SqliteBackend {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )
@@ -1419,6 +1423,8 @@ impl SubmitWorkerStorage for SqliteBackend {
             oauth_json,
             encryption_json,
             last_processed_line,
+            import_json,
+            metadata_json,
         ) = row;
 
         let file_request_headers: Vec<(String, String)> = headers_json
@@ -1432,6 +1438,14 @@ impl SubmitWorkerStorage for SqliteBackend {
         let file_encryption_key: Option<Value> = encryption_json
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
+        let import_directives: Vec<(String, String)> = import_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let metadata: Vec<(String, String)> = metadata_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
         let fhir_version = fhir_version_from_output_format(output_format.as_deref());
 
         Ok(ManifestWorkerView {
@@ -1442,6 +1456,8 @@ impl SubmitWorkerStorage for SqliteBackend {
             file_request_headers,
             oauth_metadata_urls,
             file_encryption_key,
+            import_directives,
+            metadata,
             last_processed_line: last_processed_line.max(0) as u64,
             fhir_version,
         })
@@ -1619,27 +1635,31 @@ impl SubmitWorkerStorage for SqliteBackend {
         tenant: &TenantContext,
         id: &SubmissionId,
         manifest_id: &str,
-        fhir_base_url: Option<&str>,
-        output_format: Option<&str>,
-        file_request_headers: &[(String, String)],
-        oauth_metadata_urls: &[String],
-        file_encryption_key: Option<&Value>,
+        fetch: ManifestFetchParams<'_>,
     ) -> StorageResult<()> {
         let conn = self.get_connection()?;
-        let headers_json = serde_json::to_string(file_request_headers).ok();
-        let oauth_json = serde_json::to_string(oauth_metadata_urls).ok();
-        let encryption_json = file_encryption_key.and_then(|v| serde_json::to_string(v).ok());
+        let headers_json = serde_json::to_string(fetch.file_request_headers).ok();
+        let oauth_json = serde_json::to_string(fetch.oauth_metadata_urls).ok();
+        let encryption_json = fetch
+            .file_encryption_key
+            .and_then(|v| serde_json::to_string(v).ok());
+        let import_json = serde_json::to_string(fetch.import_directives).ok();
+        let metadata_json = serde_json::to_string(fetch.metadata).ok();
         conn.execute(
             "UPDATE bulk_manifests
              SET fhir_base_url = ?1, output_format = ?2, file_request_headers = ?3,
-                 oauth_metadata_urls = ?4, file_encryption_key = ?5
-             WHERE tenant_id = ?6 AND submitter = ?7 AND submission_id = ?8 AND manifest_id = ?9",
+                 oauth_metadata_urls = ?4, file_encryption_key = ?5,
+                 import_directives = ?6, submission_metadata = ?7
+             WHERE tenant_id = ?8 AND submitter = ?9 AND submission_id = ?10
+               AND manifest_id = ?11",
             params![
-                fhir_base_url,
-                output_format,
+                fetch.fhir_base_url,
+                fetch.output_format,
                 headers_json,
                 oauth_json,
                 encryption_json,
+                import_json,
+                metadata_json,
                 tenant.tenant_id().as_str(),
                 id.submitter,
                 id.submission_id,
