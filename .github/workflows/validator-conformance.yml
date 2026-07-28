@@ -86,20 +86,30 @@ jobs:
       # executed tests is asserted rather than assumed.
       - name: Ignored pack-smoke tests
         run: |
-          set -euo pipefail
+          # No `set -e`: the exit code is read from PIPESTATUS so that the
+          # zero-tests-collected diagnostic below is always reached. Counting
+          # uses awk -- the runners have no `bc`.
+          set -uo pipefail
           cargo test -p helios-fhir-validator --all-features --test pack_smoke \
             -- --ignored --nocapture 2>&1 | tee pack-smoke.log
-          passed=$(grep -oP 'test result: ok\. \K[0-9]+' pack-smoke.log | paste -sd+ - | bc)
-          echo "ignored pack-smoke tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 1 ]; then
+          status=${PIPESTATUS[0]}
+          passed=$(awk '/^test result:/ { for (i = 2; i <= NF; i++) if ($i == "passed;") total += $(i - 1) } END { print total + 0 }' pack-smoke.log)
+          echo "ignored pack-smoke tests passed: $passed"
+          if [ "$passed" -lt 1 ]; then
             echo "::error::[NO-TESTS-RAN] The ignored pack-smoke filter collected 0 tests. cargo test exits 0 in that case, so this step would otherwise pass without asserting anything."
             exit 1
           fi
+          exit "$status"
 
       # Writes target/spec-examples/<version>.actual.json whether it passes or
       # fails; the upload below is what you copy a new baseline from.
+      #
+      # `always()`: the pack smoke and the corpus sweep are independent
+      # signals. A failure in one must not skip the other and throw away the
+      # build -- the job still fails, but both results get reported.
       - name: Official FHIR example corpus sweep
         id: corpus
+        if: always()
         run: |
           cargo test -p helios-fhir-validator --all-features --test spec_examples \
             -- --ignored --nocapture
