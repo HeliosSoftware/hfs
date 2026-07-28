@@ -375,8 +375,8 @@ test.describe("query builder", () => {
     await expect(text).toContainText("birthdate is on or after “1980-01-01”");
     await expect(text).toContainText("general-practitioner’s name is “Ann”");
     await expect(text).toContainText("related Observation whose code is “1234-5”");
-    await expect(text).toContainText("also returning the general-practitioner of each Patient (repeatedly)");
-    await expect(text).toContainText("showing 20 per page");
+    await expect(text).toContainText("Also returning the general-practitioner of each Patient (repeatedly)");
+    await expect(text).toContainText("Showing 20 per page");
 
     // The narration follows edits made through the rows.
     const row = queries.builder.conditionRows.first();
