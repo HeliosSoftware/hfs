@@ -1,0 +1,11 @@
+{
+  "description": "Baseline for the official FHIR example corpus sweep in crates/fhir-validator/tests/spec_examples.rs. Every entry is a published spec example that the structural validator reports issues on -- i.e. a suspected false positive in the engine, not a defect in the example. Entries may only be removed (by fixing the engine), never added without review. Regenerate with the copy of this file the test writes to target/spec-examples/<version>.actual.json.",
+  "version": "1.0.0",
+  "corpus": "crates/fhir/tests/data/json/R5",
+  "fhirVersion": "R5",
+  "resourcesValidated": 2824,
+  "nonResourceFiles": [
+    "examples.json.zip"
+  ],
+  "knownFailures": []
+}
