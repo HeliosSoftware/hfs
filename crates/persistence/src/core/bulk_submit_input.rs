@@ -63,11 +63,16 @@ pub trait FileTokenProvider: Send + Sync {
 pub trait SubmitInputFetcher: Send + Sync {
     /// Fetches and parses the Bulk Export Manifest at `url`, applying the
     /// provider-supplied request headers and (when required) an acquired token.
+    ///
+    /// `encryption_key` carries the `fileEncryptionKey` descriptor: the submit
+    /// spec has the Data Provider encrypt the manifest as well as the files it
+    /// lists, so implementations decrypt the response before parsing it.
     async fn fetch_manifest(
         &self,
         url: &str,
         request_headers: &[(String, String)],
         oauth_metadata_urls: &[String],
+        encryption_key: Option<&Value>,
     ) -> StorageResult<RemoteManifest>;
 
     /// Opens a streaming, line-buffered reader over the NDJSON file at `url`.
@@ -75,7 +80,7 @@ pub trait SubmitInputFetcher: Send + Sync {
     /// Implementations apply `request_headers`, request `gzip` via `Accept-Encoding`
     /// and transparently decompress, and — when `requires_access_token` is true —
     /// attach a read-scoped bearer token. `encryption_key` carries the
-    /// `fileEncryptionKey` descriptor for JWE-encrypted files (Phase 5).
+    /// `fileEncryptionKey` descriptor for JWE-encrypted files.
     async fn open_file_stream(
         &self,
         url: &str,
