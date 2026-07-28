@@ -37,7 +37,7 @@ export class SearchBuilder {
   get sections(): Locator {
     return this.page.locator("#builder-sections");
   }
-  addButton(kind: "condition" | "include" | "control" | "has"): Locator {
+  addButton(kind: "condition" | "include" | "control" | "has" | "include-fwd" | "include-rev"): Locator {
     return this.page.locator(`[data-add='${kind}']`);
   }
   get conditionRows(): Locator {
