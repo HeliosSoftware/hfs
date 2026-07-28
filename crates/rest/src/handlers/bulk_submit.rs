@@ -25,6 +25,7 @@ use helios_persistence::core::{
 };
 use serde_json::{Value, json};
 
+use super::bulk_common::{first_value, parse_query_pairs};
 use crate::config::BulkSubmitConfig;
 use crate::error::{RestError, RestResult};
 use crate::extractors::{PeerIp, TenantExtractor};
@@ -33,6 +34,9 @@ use crate::state::AppState;
 
 /// The SMART operation scope authorizing every `$bulk-submit` surface.
 const SUBMIT_SCOPE: &str = "bulk-submit";
+
+/// Query parameter selecting a status-manifest page (1-based).
+const PAGE_PARAM: &str = "page";
 
 /// The code system for the `submissionStatus` Coding (per the IG).
 const SUBMISSION_STATUS_SYSTEM: &str = "http://hl7.org/fhir/event-status";
@@ -637,7 +641,26 @@ fn parse_status_request(body: &Value) -> RestResult<(String, String)> {
     ))
 }
 
+/// Parses the 1-based `?page=N` status-manifest page selector; absent → page 1.
+fn parse_page_param(query: Option<&str>) -> RestResult<usize> {
+    let pairs = parse_query_pairs(query);
+    match first_value(&pairs, PAGE_PARAM) {
+        None => Ok(1),
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| bad_request(format!("invalid page '{raw}' (expected an integer >= 1)"))),
+    }
+}
+
 /// `GET /bulk-submit-status/{poll_token}` — poll / fetch the status manifest.
+///
+/// The manifest's `output` / `outcome` / `deleted` entries are paginated at
+/// `manifest_page_size` entries per page; when more remain, the response carries a
+/// `link[]` entry with `relation: next` pointing at `?page=N+1` on this same URL
+/// (per <https://build.fhir.org/ig/HL7/bulk-data/en/submit.html>). Every other
+/// manifest field repeats identically on each page, as the spec requires.
 pub async fn bulk_submit_poll_handler<S>(
     State(state): State<AppState<S>>,
     Path(token): Path<String>,
@@ -683,6 +706,7 @@ where
     }
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
+    let page = parse_page_param(request.uri().query())?;
 
     let summary = jobs
         .get_submission(ctx, sub_id)
@@ -729,15 +753,39 @@ where
     let ttl = Duration::from_secs(cfg.file_url_ttl_secs);
     let base = state.base_url().trim_end_matches('/');
 
+    // Slice the artifact rows into the requested page. Backends return them in a
+    // stable order (`ORDER BY id`) and rows are append-only until the whole
+    // submission is deleted, so a given page is the same set across polls.
+    let page_size = cfg.manifest_page_size as usize;
+    let total_pages = if page_size == 0 {
+        1
+    } else {
+        files.len().div_ceil(page_size).max(1)
+    };
+    if page > total_pages {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-status".to_string(),
+            id: format!("{token}?{PAGE_PARAM}={page}"),
+        });
+    }
+    let page_files = if page_size == 0 {
+        &files[..]
+    } else {
+        let start = (page - 1) * page_size;
+        &files[start..(start + page_size).min(files.len())]
+    };
+
     let mut output_arr = Vec::new();
     let mut outcome_arr = Vec::new();
     let mut deleted_arr = Vec::new();
     // `requiresAccessToken` describes whether retrieving *any* file requires a
     // token. Seed from the configured posture, then OR in each file — never let a
     // single open file clear a token requirement set by another file or the config.
+    // The posture an output store returns is store-wide, not per-artifact, so this
+    // stays identical on every page even though each page sees a different slice.
     let mut requires_token = cfg.requires_access_token == "true";
 
-    for f in &files {
+    for f in page_files {
         let resource_type = f
             .resource_type
             .clone()
@@ -806,6 +854,15 @@ where
         }
     }
 
+    // A single `next` link chains to the following page; the last page has none.
+    let mut link_arr = Vec::new();
+    if page < total_pages {
+        link_arr.push(json!({
+            "relation": "next",
+            "url": format!("{base}/bulk-submit-status/{token}?{PAGE_PARAM}={}", page + 1),
+        }));
+    }
+
     let manifest = json!({
         "submissionId": sub_id.submission_id,
         "transactionTime": transaction_time.to_rfc3339(),
@@ -814,9 +871,7 @@ where
         "output": output_arr,
         "outcome": outcome_arr,
         "deleted": deleted_arr,
-        // `link` is part of the status-manifest schema; HFS returns a single,
-        // non-paginated manifest, so it is always empty.
-        "link": [],
+        "link": link_arr,
     });
     let body = serde_json::to_vec(&manifest).map_err(|e| RestError::InternalError {
         message: e.to_string(),
@@ -1296,5 +1351,22 @@ mod tests {
         // Mismatched subject without wildcard → not owned.
         let p = principal_with("system/bulk-submit", "someone-else");
         assert!(!owns_submission(Some(&p), Some("owner")));
+    }
+
+    #[test]
+    fn test_parse_page_param() {
+        // Absent / empty query → first page.
+        assert_eq!(parse_page_param(None).unwrap(), 1);
+        assert_eq!(parse_page_param(Some("")).unwrap(), 1);
+        // Explicit page, alone or alongside other params.
+        assert_eq!(parse_page_param(Some("page=3")).unwrap(), 3);
+        assert_eq!(parse_page_param(Some("foo=bar&page=2")).unwrap(), 2);
+        // Non-numeric, zero, and negative pages are rejected.
+        for q in ["page=abc", "page=0", "page=-1", "page="] {
+            assert!(
+                matches!(parse_page_param(Some(q)), Err(RestError::BadRequest { .. })),
+                "expected 400 for query '{q}'"
+            );
+        }
     }
 }

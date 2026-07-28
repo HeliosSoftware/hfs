@@ -83,6 +83,43 @@ fn mock_fetcher() -> Arc<MockFetcher> {
     })
 }
 
+/// A fetcher whose manifest yields three status artifacts — one `output` receipt,
+/// one aggregated `outcome` (the second line's type does not match the declared
+/// type), and one `deleted` receipt — so the status manifest has enough entries to
+/// paginate across all three arrays.
+fn multi_artifact_fetcher() -> Arc<MockFetcher> {
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "https://provider/patients.ndjson".to_string(),
+        concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"pg-p1\"}\n",
+            "{\"resourceType\":\"Observation\",\"id\":\"pg-o1\",\"status\":\"final\"}\n",
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    files.insert(
+        "https://provider/deleted.ndjson".to_string(),
+        b"{\"resourceType\":\"Patient\",\"id\":\"pg-p1\"}\n".to_vec(),
+    );
+    Arc::new(MockFetcher {
+        files,
+        manifest: RemoteManifest {
+            requires_access_token: false,
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: "https://provider/patients.ndjson".to_string(),
+                count: Some(2),
+            }],
+            deleted: vec![RemoteFile {
+                resource_type: None,
+                url: "https://provider/deleted.ndjson".to_string(),
+                count: Some(1),
+            }],
+        },
+    })
+}
+
 async fn create_submit_server() -> (
     TestServer,
     Arc<SqliteBackend>,
@@ -90,10 +127,11 @@ async fn create_submit_server() -> (
     Arc<LocalFsOutputStore>,
     tempfile::TempDir,
 ) {
-    create_submit_server_with(BulkSubmitConfig::default()).await
+    create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await
 }
 
 async fn create_submit_server_with(
+    fetcher: Arc<MockFetcher>,
     bulk_submit: BulkSubmitConfig,
 ) -> (
     TestServer,
@@ -121,7 +159,6 @@ async fn create_submit_server_with(
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
-    let fetcher = mock_fetcher();
 
     let config = ServerConfig {
         multitenancy: MultitenancyConfig {
@@ -268,6 +305,156 @@ async fn test_strict_handling_rejects_unknown_directives() {
         .json(&body)
         .await;
     assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+}
+
+/// Runs kick-off → status kick-off → worker drain and returns the poll path.
+async fn run_to_completion(
+    server: &TestServer,
+    backend: &Arc<SqliteBackend>,
+    fetcher: &Arc<MockFetcher>,
+    output: &Arc<LocalFsOutputStore>,
+) -> String {
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let status = server
+        .post("/$bulk-submit-status")
+        .json(&status_body())
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    let poll_path = status
+        .headers()
+        .get("content-location")
+        .expect("Content-Location")
+        .to_str()
+        .unwrap()
+        .trim_start_matches("http://localhost:8080")
+        .to_string();
+    drain_submit(backend, fetcher, output).await;
+    poll_path
+}
+
+/// Spec (submit.html): when the status manifest is returned incrementally, `link`
+/// carries a single `relation: next` entry pointing at the following manifest page,
+/// and every other field repeats identically across pages.
+#[tokio::test]
+async fn test_status_manifest_paginates_with_next_links() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with(
+        multi_artifact_fetcher(),
+        BulkSubmitConfig {
+            manifest_page_size: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let poll_path = run_to_completion(&server, &backend, &fetcher, &output).await;
+
+    // Walk the `next` chain, collecting every advertised artifact URL.
+    let mut pages: Vec<Value> = Vec::new();
+    let mut next = Some(poll_path.clone());
+    while let Some(path) = next {
+        let resp = server.get(&path).await;
+        assert_eq!(resp.status_code(), StatusCode::OK, "page {path}");
+        let manifest: Value = resp.json();
+        let links = manifest["link"].as_array().expect("link array").clone();
+        assert!(links.len() <= 1, "at most one next link: {links:?}");
+        next = links.first().map(|l| {
+            assert_eq!(l["relation"], "next");
+            l["url"]
+                .as_str()
+                .expect("link url")
+                .trim_start_matches("http://localhost:8080")
+                .to_string()
+        });
+        pages.push(manifest);
+    }
+
+    // Three artifacts (output + outcome + deleted) → three single-entry pages.
+    assert_eq!(pages.len(), 3, "expected 3 pages, got {}", pages.len());
+    let mut totals = (0, 0, 0);
+    for page in &pages {
+        let (o, c, d) = (
+            page["output"].as_array().unwrap().len(),
+            page["outcome"].as_array().unwrap().len(),
+            page["deleted"].as_array().unwrap().len(),
+        );
+        assert_eq!(o + c + d, 1, "each page holds one entry: {page}");
+        totals = (totals.0 + o, totals.1 + c, totals.2 + d);
+    }
+    // Paging spans all three arrays without dropping or duplicating an entry.
+    assert_eq!(
+        totals,
+        (1, 1, 1),
+        "output/outcome/deleted entries across the chain"
+    );
+    // Non-paged fields repeat identically (spec SHALL).
+    for page in &pages[1..] {
+        for field in [
+            "submissionId",
+            "transactionTime",
+            "requiresAccessToken",
+            "outputFormat",
+        ] {
+            assert_eq!(page[field], pages[0][field], "field {field} must repeat");
+        }
+    }
+    // The last page has no `next`.
+    assert!(pages[2]["link"].as_array().unwrap().is_empty());
+
+    // A page past the end is 404; a malformed page is 400.
+    assert_eq!(
+        server
+            .get(&format!("{poll_path}?page=4"))
+            .await
+            .status_code(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .get(&format!("{poll_path}?page=0"))
+            .await
+            .status_code(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        server
+            .get(&format!("{poll_path}?page=abc"))
+            .await
+            .status_code(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// With `manifest_page_size = 0` pagination is off: one manifest, empty `link`.
+#[tokio::test]
+async fn test_pagination_disabled_returns_single_manifest() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server_with(
+        multi_artifact_fetcher(),
+        BulkSubmitConfig {
+            manifest_page_size: 0,
+            ..Default::default()
+        },
+    )
+    .await;
+    let poll_path = run_to_completion(&server, &backend, &fetcher, &output).await;
+
+    let manifest: Value = server.get(&poll_path).await.json();
+    assert_eq!(manifest["output"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["outcome"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["deleted"].as_array().unwrap().len(), 1);
+    assert!(manifest["link"].as_array().unwrap().is_empty());
+    assert_eq!(
+        server
+            .get(&format!("{poll_path}?page=2"))
+            .await
+            .status_code(),
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]
@@ -472,10 +659,13 @@ async fn test_full_lifecycle_ingests_and_polls() {
 
 #[tokio::test]
 async fn test_in_progress_poll_advertises_the_configured_retry_after() {
-    let (server, ..) = create_submit_server_with(BulkSubmitConfig {
-        retry_after_secs: 7,
-        ..BulkSubmitConfig::default()
-    })
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            retry_after_secs: 7,
+            ..BulkSubmitConfig::default()
+        },
+    )
     .await;
     let poll_path = start_and_get_poll_path(&server).await;
 
@@ -493,11 +683,14 @@ async fn test_in_progress_poll_advertises_the_configured_retry_after() {
 async fn test_poll_beyond_the_rate_limit_returns_429_with_retry_after() {
     // Spec (build.fhir.org submit.html): Data Consumers SHOULD rate-limit the
     // status endpoint and return Retry-After so clients back off.
-    let (server, ..) = create_submit_server_with(BulkSubmitConfig {
-        poll_rate_limit: 2,
-        poll_rate_window_secs: 60,
-        ..BulkSubmitConfig::default()
-    })
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            poll_rate_limit: 2,
+            poll_rate_window_secs: 60,
+            ..BulkSubmitConfig::default()
+        },
+    )
     .await;
     let poll_path = start_and_get_poll_path(&server).await;
 
@@ -531,10 +724,13 @@ async fn test_poll_beyond_the_rate_limit_returns_429_with_retry_after() {
 
 #[tokio::test]
 async fn test_poll_rate_limit_of_zero_disables_throttling() {
-    let (server, ..) = create_submit_server_with(BulkSubmitConfig {
-        poll_rate_limit: 0,
-        ..BulkSubmitConfig::default()
-    })
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            poll_rate_limit: 0,
+            ..BulkSubmitConfig::default()
+        },
+    )
     .await;
     let poll_path = start_and_get_poll_path(&server).await;
 
