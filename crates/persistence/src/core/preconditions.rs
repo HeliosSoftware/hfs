@@ -721,4 +721,55 @@ mod tests {
             412
         );
     }
+
+    // ── Entity-tag construction and rendering ────────────────────────────────
+
+    /// `Display` is the wire format — it is what an `ETag` response header and a
+    /// generated `If-Match` are rendered from — so the `W/` prefix and the
+    /// quoting have to be exact, not merely round-trippable.
+    #[test]
+    fn entity_tag_renders_the_wire_format() {
+        assert_eq!(EntityTag::new_strong("3").to_string(), "\"3\"");
+        assert_eq!(EntityTag::new_weak("3").to_string(), "W/\"3\"");
+    }
+
+    /// Rendering and parsing must be inverses. A drift here (a missing `W/`, an
+    /// extra layer of quotes) would not fail any single-sided test but would make
+    /// every server-generated tag unmatchable by the client that echoes it back.
+    #[test]
+    fn entity_tag_display_round_trips_through_parse() {
+        for tag in [EntityTag::new_strong("3"), EntityTag::new_weak("42")] {
+            let rendered = tag.to_string();
+            assert_eq!(
+                EntityTagPrecondition::parse([rendered.as_str()]).unwrap(),
+                EntityTagPrecondition::Tags(vec![tag.clone()]),
+                "{rendered} must parse back to the tag it was rendered from"
+            );
+        }
+    }
+
+    /// The two constructors differ only in weakness, and weakness is part of
+    /// identity — `new_strong` and `new_weak` must not be interchangeable.
+    #[test]
+    fn new_strong_and_new_weak_differ_only_in_weakness() {
+        let strong = EntityTag::new_strong("7");
+        let weak = EntityTag::new_weak("7");
+
+        assert!(!strong.weak);
+        assert!(weak.weak);
+        assert_eq!(strong.value, weak.value);
+        assert_ne!(strong, weak);
+    }
+
+    /// An unescaped `"` inside the opaque tag makes the element unparseable.
+    ///
+    /// It must be reported as malformed — and so fail closed — rather than being
+    /// silently truncated at the stray quote, which would let `"a"b"` match the
+    /// stored version `a`.
+    #[test]
+    fn unescaped_quote_inside_tag_is_malformed() {
+        let err = EntityTagPrecondition::parse([r#""a"b""#]).unwrap_err();
+        assert_eq!(err.reason, "entity-tag contains an unescaped double quote");
+        assert_eq!(err.raw, r#""a"b""#);
+    }
 }

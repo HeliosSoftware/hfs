@@ -368,4 +368,42 @@ mod tests {
         let with_conditions = ConditionalHeaders::from_headers(&headers);
         assert!(with_conditions.has_conditions());
     }
+
+    /// `has_if_match` is the sole input to the `HFS_REQUIRE_IF_MATCH` gate in
+    /// the update handler, so its "was a precondition supplied?" answer decides
+    /// between two *different* rejections: `428` (you must send one) and `412`
+    /// (the one you sent does not hold).
+    ///
+    /// The malformed case is the one that matters. Reporting it as *not*
+    /// supplied would answer `428 Precondition Required` to a client that did
+    /// send an `If-Match` — telling it to retry with the header it already sent.
+    /// It must count as supplied and then fail on its own merits.
+    #[test]
+    fn has_if_match_distinguishes_absent_from_supplied() {
+        assert!(
+            !ConditionalHeaders::default().has_if_match(),
+            "no header at all is not a supplied precondition"
+        );
+
+        let mut valid = HeaderMap::new();
+        valid.insert(header::IF_MATCH, HeaderValue::from_static("W/\"1\""));
+        assert!(ConditionalHeaders::from_headers(&valid).has_if_match());
+
+        // `*` is a precondition too, not a wildcard opt-out.
+        let mut star = HeaderMap::new();
+        star.insert(header::IF_MATCH, HeaderValue::from_static("*"));
+        assert!(ConditionalHeaders::from_headers(&star).has_if_match());
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert(header::IF_MATCH, HeaderValue::from_static("garbage"));
+        let parsed = ConditionalHeaders::from_headers(&malformed);
+        assert!(
+            parsed.has_if_match(),
+            "a malformed value was still supplied by the client"
+        );
+        assert!(
+            parsed.if_match_tags().is_err(),
+            "and it must still be rejected on its own merits"
+        );
+    }
 }

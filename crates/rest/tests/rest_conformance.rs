@@ -797,6 +797,44 @@ mod conditional_update {
         response.assert_status(StatusCode::PRECONDITION_FAILED);
     }
 
+    /// A PATCH whose `If-Match` cannot be parsed must fail closed with 412 and
+    /// leave the resource untouched.
+    ///
+    /// This is the fail-open half of issue #311 on the PATCH path: an
+    /// unparseable value used to be indistinguishable from an absent one, so a
+    /// client that asked for optimistic locking and got the syntax wrong had its
+    /// write applied unconditionally. The stored-state assertion is the point —
+    /// a 412 alone would also be consistent with the patch landing first.
+    #[tokio::test]
+    async fn test_patch_malformed_if_match_fails_closed() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let patch = json!([
+            {"op": "replace", "path": "/name/0/family", "value": "Patched"}
+        ]);
+
+        let response = server
+            .patch("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .content_type("application/json-patch+json")
+            .add_header(IF_MATCH, HeaderValue::from_static("garbage"))
+            .bytes(serde_json::to_vec(&patch).unwrap().into())
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+
+        let read = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: serde_json::Value = read.json();
+        assert_eq!(
+            body["name"][0]["family"], "Smith",
+            "a malformed precondition must not become an unconditional patch"
+        );
+    }
+
     /// Reads the current `ETag` for a resource.
     async fn current_etag(server: &TestServer, path: &str) -> String {
         let response = server
