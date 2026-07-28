@@ -7,5 +7,9589 @@
   "nonResourceFiles": [
     "examples.json.zip"
   ],
-  "knownFailures": []
+  "knownFailures": [
+    {
+      "file": "activitydefinition.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "actordefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "actualgroup.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "administrableproductdefinition.profile.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "adverseevent.profile.json",
+      "issues": 12,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "allergyintolerance.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "annotation.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "artifactassessment.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "auditevent.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "batch-bundle.profile.json",
+      "issues": 233,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "biologicallyderivedproduct.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bmi.profile.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bodyheight.profile.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bodystructure.profile.json",
+      "issues": 17,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bodytemp.profile.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bodyweight.profile.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bp.profile.json",
+      "issues": 109,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "canonicalresource.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "capabilitystatement.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "careteam.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "catalog.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cdshooksguidanceresponse.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cdshooksrequestorchestration.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cdshooksserviceplandefinition.profile.json",
+      "issues": 12,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "chargeitem.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "chargeitemdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cholesterol.profile.json",
+      "issues": 12,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "citation.profile.json",
+      "issues": 16,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "claim.profile.json",
+      "issues": 16,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "claimresponse.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "clinicalimpression.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "clinicalusedefinition.profile.json",
+      "issues": 7,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-account-aggregate.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-account-balance-term.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-account-billing-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-account-relationship.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-account-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-cardinality-behavior.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-condition-kind.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-grouping-behavior.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-participant-function.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-participant-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-precheck-behavior.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-reason-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-relationship-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-required-behavior.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-action-selection-behavior.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-additional-binding-purpose.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-administrable-dose-form.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-administration-subpotent-reason.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-adverse-event-actuality.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-allergy-intolerance-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-allergy-intolerance-criticality.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-allergy-intolerance-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-animal-tissue-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-appointmentstatus.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-artifact-contribution-instance-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-artifact-contribution-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-artifact-url-classifier.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-artifactassessment-disposition.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-artifactassessment-information-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-artifactassessment-workflow-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-assert-direction-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-assert-manual-completion-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-assert-operator-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-assert-response-code-types.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-asset-availability.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-audit-event-action.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-audit-event-severity.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-biologicallyderived-product-property-type-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-biologicallyderived-product-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-biologicallyderived-productcodes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-biologicallyderivedproductdispense-match-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-biologicallyderivedproductdispense-origin-relationship.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-biologicallyderivedproductdispense-performer-function.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-biologicallyderivedproductdispense-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-bundle-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-capability-statement-kind.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-care-team-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-catalogType.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-cdshooks-indicator.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-certainty-rating.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-certainty-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-characteristic-combination.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-characteristic-offset.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-chargeitem-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-citation-artifact-classifier.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-citation-classification-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-citation-status-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-citation-summary-style.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-cited-artifact-abstract-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-cited-artifact-classification-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-cited-artifact-part-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-cited-artifact-status-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-cited-medium.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-claim-decision-reason.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-claim-decision.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-claim-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-claim-use.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-clinical-use-definition-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-clinical-use-definition-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-code-search-support.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-codesystem-content-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-codesystem-hierarchy-meaning.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-color-names.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-color-rgb.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-combined-dose-form.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-compartment-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-composition-attestation-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-composition-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-concept-property-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-concept-subsumption-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-conceptmap-attribute-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-conceptmap-property-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-conceptmap-unmapped-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-condition-precondition-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-condition-questionnaire-purpose.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-conditional-delete-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-conditional-read-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-conformance-expectation.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-consent-data-meaning.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-consent-provision-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-consent-state-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-actionstatus.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-assetcontext.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-assetscope.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-assetsubtype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-assettype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-decision-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-definition-subtype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-definition-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-expiration-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-legalstate.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-party-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-publicationstatus.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-scope.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-security-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-security-classification.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-security-control.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contract-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contributor-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contributor-summary-source.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contributor-summary-style.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-contributor-summary-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-coverage-kind.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-datestype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-days-of-week.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-definition-method.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-detectedissue-severity.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-detectedissue-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-action.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-availability-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-correctiveactionscope.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-nametype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-operation-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-productidentifierinudi.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-specification-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-device-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-deviceassociation-operationstatus.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-deviceassociation-status-reason.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-deviceassociation-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-devicedefinition-regulatory-identifier-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-devicedefinition-relationtype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-devicedispense-status-reason.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-devicedispense-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-deviceusage-adherence-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-deviceusage-adherence-reason.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-deviceusage-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-diagnostic-report-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-document-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-document-relationship-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-eligibility-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-eligibilityrequest-purpose.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-eligibilityresponse-purpose.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-diagnosis-use.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-location-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-reason-use.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-endpoint-environment.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-endpoint-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-enrollment-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-episode-of-care-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-event-capability-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-evidence-classifier-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-evidence-report-section.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-evidence-report-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-evidence-variable-event.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-examplescenario-actor-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-explanationofbenefit-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-extension-context-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-fhir-types.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-fhirpath-types.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-filter-operator.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-flag-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-fm-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-focus-characteristic-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-formularyitem-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-genomicstudy-changetype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-genomicstudy-dataformat.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-genomicstudy-methodtype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-genomicstudy-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-genomicstudy-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-goal-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-graph-compartment-rule.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-graph-compartment-use.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-group-membership-basis.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-group-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-guidance-module-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-guidance-response-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-guide-page-generation.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-guide-parameter-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-history-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-http-operations.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-http-verb.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-iana-link-relations.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-icd-10-procedures.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-identity-assuranceLevel.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-imagingselection-2dgraphictype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-imagingselection-3dgraphictype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-imagingselection-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-imagingstudy-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-ingredient-function.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-ingredient-manufacturer-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-ingredient-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-interaction-incidence.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-interaction-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-inventoryitem-nametype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-inventoryitem-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-inventoryreport-counttype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-inventoryreport-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-invoice-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-issue-severity.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-issue-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-item-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-knowledge-representation-level.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-legal-status-of-supply.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-link-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-linkage-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-list-item-flag.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-list-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-list-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-location-characteristic.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-location-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-location-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-manufactured-dose-form.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-map-group-type-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-map-input-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-map-model-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-map-source-list-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-map-target-list-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-map-transform.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-measure-aggregate-method.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-measure-definition-example.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-measure-group-example.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-measure-report-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-measure-report-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-measure-stratifier-example.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-measure-supplemental-data-example.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-measurereport-stratifier-value-example.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medication-admin-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medication-cost-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medication-dose-aid.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medication-ingredientstrength.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medication-intended-performer-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medication-statement-adherence.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medication-statement-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medication-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicationdispense-admin-location.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicationdispense-status-reason.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicationdispense-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicationknowledge-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicationrequest-intent.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicationrequest-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-additional-monitoring.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-confidentiality.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-contact-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-cross-reference-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-domain.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-name-part-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-name-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-package-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-pediatric-use.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-special-measures.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-medicinal-product-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-message-significance-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-message-transport.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-messageheader-response-request.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-metric-calibration-state.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-metric-calibration-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-metric-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-metric-operational-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-namingsystem-identifier-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-namingsystem-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-nutritionproduct-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-observation-range-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-observation-referencerange-normalvalue.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-observation-statistics.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-observation-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-observation-triggeredbytype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-operation-kind.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-operation-parameter-scope.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-operation-parameter-use.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-organization-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-orientation-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-package-material.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-package-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-packaging-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-participationstatus.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-payment-issuertype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-payment-kind.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-payment-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-permission-rule-combining.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-permission-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-permitted-data-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-price-component-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-product-category.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-product-intended-use.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-provenance-entity-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-published-in-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-questionnaire-answer-constraint.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-questionnaire-answers-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-questionnaire-disabled-display.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-questionnaire-enable-behavior.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-questionnaire-enable-operator.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-reaction-event-severity.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-reason-medication-not-given-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-reference-handling-policy.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-regulated-authorization-basis.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-regulated-authorization-case-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-regulated-authorization-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-related-artifact-type-expanded.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-relationship.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-report-action-result-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-report-participant-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-report-relation-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-report-result-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-report-status-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-arm-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-classifiers.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-focus-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-objective-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-party-organization-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-party-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-phase.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-prim-purp-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-reason-stopped.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-research-study-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-resource-validation-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-response-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-restful-capability-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-restful-security-service.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-search-comparator.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-search-entry-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-search-modifier-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-search-processingmode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-sequence-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-service-mode.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-servicerequest-orderdetail-parameter-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-slotstatus.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-spdx-license.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-specimen-combined.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-specimen-contained-preference.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-specimen-role.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-specimen-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-statistic-model-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-strand-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-structure-definition-kind.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-study-design.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-submit-data-update-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-subscription-notification-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-subscription-payload-content.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-subscription-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-subscriptiontopic-cr-behavior.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-amount-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-form.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-grade.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-name-authority.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-name-domain.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-name-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-optical-activity.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-relationship-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-representation-format.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-representation-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-source-material-genus.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-source-material-part.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-source-material-species.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-source-material-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-stereochemistry.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-structure-technique.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-weight-method.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-substance-weight-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-supplydelivery-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-supplydelivery-supplyitemtype.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-supplyrequest-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-target-species.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-task-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-task-intent.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-task-status-reason.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-task-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-testscript-scope-conformance-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-testscript-scope-phase-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-therapy-relationship-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-title-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-transport-code.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-transport-intent.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-transport-status-reason.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-transport-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-type-derivation-rule.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-udi-entry-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-undesirable-effect-frequency.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-unit-of-presentation.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-usage-context-agreement-scope.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-variable-handling.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-verificationresult-status.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-version-algorithm.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-versioning-policy.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-virtual-service-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-vision-base-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-vision-eye-codes.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-warning-type.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem-week-of-month.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "codesystem.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "communication.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "communicationrequest.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "compartmentdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "computableplandefinition.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "computablevalueset.profile.json",
+      "issues": 13,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "conceptmap.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "condition.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "conditiondefinition.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "contract.profile.json",
+      "issues": 18,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "coverage.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "coverageeligibilityrequest.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "coverageeligibilityresponse.profile.json",
+      "issues": 11,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cqllibrary.profile.json",
+      "issues": 38,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "dataelements.json",
+      "issues": 18,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "datarequirement.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "definition.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "detectedissue.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "device.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "devicedefinition.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "devicemetricobservation.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "devicerequest.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "deviceusage.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "diagnosticreport.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "documentreference.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "dosage.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "ebmrecommendation.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "elementdefinition-de.profile.json",
+      "issues": 13,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "elementdefinition.profile.json",
+      "issues": 12,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "elmlibrary.profile.json",
+      "issues": 57,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "event.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "eventdefinition.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "evidence.profile.json",
+      "issues": 7,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "evidencereport.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "evidencevariable.profile.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "examplescenario-example-laborder.json",
+      "issues": 21,
+      "kinds": [
+        "not-array"
+      ]
+    },
+    {
+      "file": "examplescenario-example.json",
+      "issues": 4,
+      "kinds": [
+        "not-array"
+      ]
+    },
+    {
+      "file": "examplescenario.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "executablevalueset.profile.json",
+      "issues": 15,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "explanationofbenefit.profile.json",
+      "issues": 26,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "familymemberhistory-genetic.profile.json",
+      "issues": 15,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "familymemberhistory.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "fhirpathlibrary.profile.json",
+      "issues": 39,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "fivews.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "genomicstudy.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "goal.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "graphdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "group.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "groupdefinition.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "guidanceresponse.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "hdlcholesterol.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "headcircum.profile.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "heartrate.profile.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "history-bundle.profile.json",
+      "issues": 189,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "immunization.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "immunizationrecommendation.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "implementationguide.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "ingredient.profile.json",
+      "issues": 7,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "inventoryitem.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "invoice.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "ldlcholesterol.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "library.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "lipidprofile.profile.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "logiclibrary.profile.json",
+      "issues": 24,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "manufactureditemdefinition.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "measure.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "measurereport.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medication.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationadministration.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationknowledge.profile.json",
+      "issues": 35,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationrequest.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationstatement.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicinalproductdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "messagedefinition.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "messageheader.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "metadataresource.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "modelinfolibrary.profile.json",
+      "issues": 43,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "moduledefinitionlibrary.profile.json",
+      "issues": 28,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "molecularsequence.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "namingsystem.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "nutritionintake.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "nutritionorder.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "nutritionproduct.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure-cancel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure-dar.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bmi.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-height.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-length.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-temperature.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-head-circumference.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-heart-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-respiratory-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-satO2.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-vitals-panel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "observationdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "operationdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "oxygensat.profile.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "packagedproductdefinition.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "parameters.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "patient.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "paymentreconciliation.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "person.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "plandefinition.profile.json",
+      "issues": 16,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "practitioner.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "procedure.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "productshelflife.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "profiles-others.json",
+      "issues": 1770,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "profiles-resources.json",
+      "issues": 623,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "profiles-types.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "provenance-relevant-history.profile.json",
+      "issues": 13,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "provenance.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "publishableactivitydefinition.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "publishablecodesystem.profile.json",
+      "issues": 7,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "publishableconceptmap.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "publishablelibrary.profile.json",
+      "issues": 7,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "publishablemeasure.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "publishablenamingsystem.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "publishableplandefinition.profile.json",
+      "issues": 11,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "publishablevalueset.profile.json",
+      "issues": 17,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "questionnaire.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "questionnaireresponse-example-f201-lifelines.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "questionnaireresponse.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "regulatedauthorization.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "request.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "requestorchestration.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "requirements.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "resprate.profile.json",
+      "issues": 36,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "riskassessment.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "search-set-bundle.profile.json",
+      "issues": 75,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "searchparameter.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "servicerequest.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareable.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareableactivitydefinition.profile.json",
+      "issues": 12,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablecodesystem.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareableconceptmap.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablelibrary.profile.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablemeasure.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablenamingsystem.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareableplandefinition.profile.json",
+      "issues": 15,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareabletestscript.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablevalueset.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "specimen.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "specimendefinition.profile.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "structuredefinition-example-composition.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "structuredefinition-example-section-library.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "structuredefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "structuremap.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "subscription-notification-bundle.profile.json",
+      "issues": 73,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "subscriptiontopic.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "substance.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "substancedefinition.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "substancepolymer.profile.json",
+      "issues": 12,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "substancereferenceinformation.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "substancesourcematerial.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "supplydelivery.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "supplyrequest.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "task.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "terminologycapabilities.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "testplan.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "testreport.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "testscript.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "timing.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "transaction-bundle.profile.json",
+      "issues": 233,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "transport.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "triggerdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "triglyceride.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "usagecontext.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "valueset-FHIR-version.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-account-aggregate.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-account-balance-term.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-account-billing-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-account-relationship.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-account-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-account-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-cardinality-behavior.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-condition-kind.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-grouping-behavior.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-participant-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-participant-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-precheck-behavior.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-reason-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-relationship-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-required-behavior.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-selection-behavior.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-action-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-additional-binding-purpose.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-additional-instruction-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-address-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-address-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adjudication-error.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adjudication-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adjudication.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-administrable-dose-form.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-administration-method-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-administration-subpotent-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-administrative-gender.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-actuality.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-causality-assess.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-causality-method.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-contributing-factor.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-mitigating-action.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-participant-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-preventive-action.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-seriousness.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-supporting-info.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-adverse-event-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-age-units.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-all-languages.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-all-resource-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-allergen-class.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-allergy-intolerance-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-allergy-intolerance-criticality.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-allergy-intolerance-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-allergyintolerance-clinical.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-allergyintolerance-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-allergyintolerance-verification.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-animal-tissue-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-appointment-cancellation-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-appointment-recurrrence-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-appointmentresponse-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-appointmentstatus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-approach-site-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-artifact-contribution-instance-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-artifact-contribution-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-artifact-url-classifier.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-artifactassessment-disposition.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-artifactassessment-information-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-artifactassessment-workflow-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-assert-direction-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-assert-manual-completion-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-assert-operator-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-assert-response-code-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-asset-availability.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-attribute-estimate-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-audit-event-action.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-audit-event-outcome-detail.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-audit-event-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-audit-event-severity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-audit-event-sub-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-audit-event-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-basic-resource-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-benefit-network.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-benefit-term.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-benefit-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-benefit-unit.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-binding-strength.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-biologicallyderived-product-property-type-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-biologicallyderived-product-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-biologicallyderived-productcodes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-biologicallyderivedproductdispense-match-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-biologicallyderivedproductdispense-origin-relationship.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-biologicallyderivedproductdispense-performer-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-biologicallyderivedproductdispense-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-body-site.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-bodystructure-bodylandmarkorientation-clockface-position.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-bodystructure-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-bodystructure-relative-location.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-bundle-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-c80-facilitycodes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-c80-practice-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-capability-format-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-capability-statement-kind.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-care-plan-activity-performed.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-care-plan-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-care-plan-intent.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-care-team-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-care-team-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-catalogType.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-cdshooks-indicator.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-certainty-rating.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-certainty-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-characteristic-combination.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-characteristic-offset.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-chargeitem-billingcodes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-chargeitem-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-citation-artifact-classifier.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-citation-classification-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-citation-status-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-citation-summary-style.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-cited-artifact-abstract-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-cited-artifact-classification-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-cited-artifact-part-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-cited-artifact-status-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-cited-medium.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-careteamrole.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-decision-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-decision.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-exception.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-informationcategory.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-modifiers.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-subtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-claim-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-clinical-findings.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-clinical-use-definition-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-clinical-use-definition-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-clinicalimpression-change-pattern.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-clinicalimpression-prognosis.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-clinicalimpression-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-code-search-support.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-codesystem-content-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-codesystem-hierarchy-meaning.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-color-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-combined-dose-form.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-common-tags.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-communication-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-communication-not-done-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-communication-request-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-communication-topic.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-compartment-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-composite-measure-scoring.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-composition-attestation-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-composition-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-concept-map-relationship.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-concept-property-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-concept-subsumption-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-conceptmap-attribute-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-conceptmap-property-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-conceptmap-unmapped-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-concrete-fhir-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-clinical.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-precondition-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-questionnaire-purpose.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-severity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-stage-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-stage.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-condition-ver-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-conditional-delete-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-conditional-read-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-conformance-expectation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-action.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-content-class.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-content-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-data-meaning.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-policy.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-provision-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-state-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consent-verification.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-consistency-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-constraint-severity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contact-point-system.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contact-point-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-container-cap.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-container-material.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-action.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-actionstatus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-actorrole.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-assetcontext.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-assetscope.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-assetsubtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-assettype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-content-derivative.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-decision-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-definition-subtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-definition-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-expiration-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-legalstate.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-party-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-publicationstatus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-scope.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-security-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-security-classification.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-security-control.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-signer-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-subtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-term-subtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-term-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contract-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contributor-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contributor-summary-source.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contributor-summary-style.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contributor-summary-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-contributor-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-country.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-coverage-class.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-coverage-copay-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-coverage-financial-exception.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-coverage-kind.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-coverage-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-coverageeligibilityresponse-ex-auth-support.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-currencies.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-data-absent-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-data-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-datestype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-days-of-week.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-definition-method.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-definition-resource-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-definition-topic.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-definition-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-designation-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-detectedissue-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-detectedissue-mitigation-action.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-detectedissue-severity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-detectedissue-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-action.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-availability-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-correctiveactionscope.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-nametype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-operation-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-productidentifierinudi.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-property-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-safety.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-specification-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-specification-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-device-versiontype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-deviceassociation-operationstatus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-deviceassociation-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-deviceassociation-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-devicedefinition-regulatory-identifier-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-devicedefinition-relationtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-devicedispense-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-devicedispense-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-devicemetric-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-deviceusage-adherence-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-deviceusage-adherence-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-deviceusage-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-diagnosis-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-diagnostic-report-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-diagnostic-service-sections.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-diet-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-discriminator-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-disease-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-disease-symptom-procedure.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-distance-units.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-doc-section-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-doc-typecodes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-document-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-document-reference-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-document-relationship-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-duration-units.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-edible-substance-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-elementdefinition-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-eligibility-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-eligibilityrequest-purpose.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-eligibilityresponse-purpose.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-admit-source.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-diagnosis-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-diet.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-discharge-disposition.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-location-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-participant-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-reason-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-special-arrangements.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-special-courtesy.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-subject-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-encounter-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-endpoint-connection-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-endpoint-environment.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-endpoint-payload-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-endpoint-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-enrollment-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-enteral-route.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-entformula-additive.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-entformula-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-episode-of-care-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-episodeofcare-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-event-capability-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-event-resource-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-event-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-event-timing.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-evidence-classifier-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-evidence-report-section.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-evidence-report-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-evidence-variable-event.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ex-benefitcategory.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ex-diagnosis-on-admission.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ex-diagnosisrelatedgroup.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ex-diagnosistype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ex-paymenttype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ex-procedure-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ex-program-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ex-revenue-center.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-examplescenario-actor-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-examplescenario-instance-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-explanationofbenefit-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-expression-language.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-extension-context-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-fhir-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-fhirpath-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-filter-operator.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-flag-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-flag-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-flag-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-fm-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-focus-characteristic-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-food-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-forms.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-formularyitem-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-fundsreserve.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-genomicstudy-changetype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-genomicstudy-dataformat.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-genomicstudy-methodtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-genomicstudy-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-genomicstudy-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-goal-achievement.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-goal-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-goal-priority.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-goal-start-event.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-goal-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-graph-compartment-rule.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-graph-compartment-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-group-membership-basis.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-group-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-guidance-module-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-guidance-response-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-guide-page-generation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-guide-parameter-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-handling-condition.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-history-absent-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-history-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-http-operations.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-http-verb.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-iana-link-relations.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-icd-10-procedures.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-icd-10.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-identifier-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-identifier-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-identity-assuranceLevel.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-imagingselection-2dgraphictype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-imagingselection-3dgraphictype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-imagingselection-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-imagingstudy-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-evaluation-dose-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-evaluation-dose-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-evaluation-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-funding-source.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-origin.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-program-eligibility.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-recommendation-date-criterion.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-recommendation-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-recommendation-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-route.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-site.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-subpotent-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-target-disease.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-immunization-vaccine-funding-program.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ingredient-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ingredient-manufacturer-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ingredient-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-insuranceplan-applicability.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-insuranceplan-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-interactant.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-interaction-effect.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-interaction-incidence.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-interaction-management.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-interaction-trigger.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-interaction-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-inventoryitem-nametype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-inventoryitem-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-inventoryreport-counttype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-inventoryreport-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-invoice-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-issue-severity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-issue-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-item-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-jurisdiction.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-knowledge-representation-level.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-languages.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-legal-status-of-supply.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-library-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-link-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-linkage-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-lipid-ldl-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-list-empty-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-list-example-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-list-item-flag.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-list-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-list-order.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-list-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-location-characteristic.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-location-form.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-location-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-location-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-manifestation-or-symptom.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-manufactured-dose-form.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-map-group-type-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-map-input-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-map-model-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-map-source-list-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-map-target-list-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-map-transform.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-marital-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-aggregate-method.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-data-usage.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-definition-example.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-group-example.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-improvement-notation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-population.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-report-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-report-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-scoring-unit.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-stratifier-example.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-supplemental-data-example.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measure-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measurement-property.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-measurereport-stratifier-value-example.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-med-admin-perform-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-admin-location.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-admin-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-as-needed-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-cost-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-dose-aid.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-form-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-ingredientstrength.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-intended-performer-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-statement-adherence.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-statement-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medication-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationdispense-admin-location.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationdispense-performer-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationdispense-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationdispense-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationknowledge-characteristic.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationknowledge-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationrequest-admin-location.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationrequest-course-of-therapy.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationrequest-intent.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationrequest-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicationrequest-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-additional-monitoring.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-classification.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-confidentiality.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-contact-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-cross-reference-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-domain.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-name-part-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-name-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-package-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-pediatric-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-special-measures.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-medicinal-product-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-message-events.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-message-reason-encounter.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-message-significance-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-message-transport.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-messageheader-response-request.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-metric-calibration-state.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-metric-calibration-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-metric-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-metric-operational-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-mimetypes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-missing-tooth-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-modified-foodtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-name-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-namingsystem-identifier-system-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-namingsystem-identifier-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-namingsystem-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-narrative-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-not-consumed-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-note-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-nutrient-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-nutrition-product-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-nutrition-product-nutrient.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-nutritionproduct-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-object-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-interpretation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-methods.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-range-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-referencerange-normalvalue.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-statistics.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-triggeredbytype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-observation-vitalsignresult.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-operation-kind.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-operation-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-operation-parameter-scope.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-operation-parameter-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-organization-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-organization-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-orientation-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-package-material.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-package-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-packaging-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-participant-resource-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-participant-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-participation-role-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-participationstatus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-patient-contactrelationship.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-payeetype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-payment-adjustment-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-payment-issuertype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-payment-kind.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-payment-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-payment-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-payment-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-performer-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-performer-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-permission-rule-combining.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-permission-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-permitted-data-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-plan-definition-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-practitioner-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-prepare-patient-prior-specimen-collection.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-price-component-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-procedure-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-procedure-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-procedure-followup.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-procedure-not-performed-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-procedure-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-procedure-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-process-priority.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-product-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-product-characteristic-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-product-intended-use.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-product-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-program.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-property-representation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-provenance-activity-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-provenance-entity-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-provenance-history-agent-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-provenance-history-record-activity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-provider-qualification.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-provider-taxonomy.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-publication-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-published-in-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-quantity-comparator.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-questionnaire-answer-constraint.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-questionnaire-answers-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-questionnaire-answers.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-questionnaire-disabled-display.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-questionnaire-enable-behavior.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-questionnaire-enable-operator.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-questionnaire-questions.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-reaction-event-severity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-reason-medication-given-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-reason-medication-not-given-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-reason-medication-status-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-reference-handling-policy.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-reference-version-rules.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-referenced-item-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-referencerange-appliesto.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-referencerange-meaning.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-regulated-authorization-basis.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-regulated-authorization-case-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-regulated-authorization-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-rejection-criteria.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-related-artifact-type-all.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-related-artifact-type-expanded.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-related-artifact-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-related-claim-relationship.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-relatedperson-relationshiptype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-relationship.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-remittance-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-report-action-result-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-report-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-report-participant-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-report-relation-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-report-result-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-report-status-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-request-intent.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-request-priority.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-request-resource-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-request-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-arm-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-classifiers.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-focus-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-objective-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-party-organization-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-party-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-phase.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-prim-purp-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-reason-stopped.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-study-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-subject-milestone.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-subject-state-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-research-subject-state.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-resource-aggregation-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-resource-slicing-rules.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-resource-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-resource-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-resource-validation-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-response-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-restful-capability-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-restful-security-service.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-risk-probability.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-route-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-search-comparator.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-search-entry-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-search-modifier-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-search-param-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-search-processingmode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-security-label-data-examples.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-security-label-event-examples.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-security-label-examples.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-security-labels.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-security-role-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-security-source-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-sequence-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-series-performer-function.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-service-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-service-mode.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-service-place.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-service-provision-conditions.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-service-referral-method.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-service-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-service-uscls.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-servicerequest-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-servicerequest-orderdetail-parameter-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-signature-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-slotstatus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-sort-direction.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-spdx-license.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-specimen-collection-method.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-specimen-collection.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-specimen-combined.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-specimen-contained-preference.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-specimen-container-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-specimen-processing-method.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-specimen-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-specimen-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-statistic-model-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-statistic-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-strand-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-structure-definition-kind.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-study-design.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-submit-data-update-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-subscriber-relationship.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-subscription-channel-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-subscription-error.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-subscription-notification-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-subscription-payload-content.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-subscription-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-subscription-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-subscriptiontopic-cr-behavior.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-amount-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-category.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-form.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-grade.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-name-authority.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-name-domain.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-name-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-optical-activity.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-relationship-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-representation-format.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-representation-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-source-material-genus.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-source-material-part.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-source-material-species.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-source-material-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-stereochemistry.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-structure-technique.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-weight-method.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-substance-weight-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-supplement-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-supply-item.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-supplydelivery-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-supplydelivery-supplyitemtype.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-supplyrequest-kind.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-supplyrequest-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-supplyrequest-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-surface.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-system-restful-interaction.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-target-species.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-task-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-task-intent.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-task-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-task-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-testscript-operation-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-testscript-profile-destination-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-testscript-profile-origin-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-testscript-scope-conformance-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-testscript-scope-phase-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-texture-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-therapy-relationship-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-therapy.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-timezones.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-timing-abbreviation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-title-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-tooth.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-transport-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-transport-intent.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-transport-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-transport-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-trigger-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-type-derivation-rule.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-type-restful-interaction.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ucum-bodylength.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ucum-bodytemp.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ucum-bodyweight.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ucum-units.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-ucum-vitals-common.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-udi-entry-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-undesirable-effect-classification.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-undesirable-effect-frequency.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-undesirable-effect-symptom.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-unit-of-presentation.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-units-of-time.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-usage-context-agreement-scope.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-use-context.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-vaccine-code.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-value-filter-comparator.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-variable-handling.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-variable-role.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-can-push-updates.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-communication-method.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-failure-action.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-need.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-primary-source-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-push-type-available.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-validation-process.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-validation-status.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-verificationresult-validation-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-version-algorithm.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-version-independent-all-resource-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-version-independent-resource-types.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-versioning-policy.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-virtual-service-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-vision-base-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-vision-eye-codes.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-vision-product.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-warning-type.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset-week-of-month.json",
+      "issues": 2,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "valueset.profile.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "virtualservicedetail.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "vitalsigns.profile.json",
+      "issues": 24,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "vitalspanel.profile.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    }
+  ]
 }

@@ -160,8 +160,44 @@ fn output_path(version_dir: &str) -> PathBuf {
         .join(format!("{}.actual.json", version_dir.to_lowercase()))
 }
 
+/// Per-kind sample issues, printed after a sweep and deliberately *not*
+/// stored in the baseline.
+///
+/// The baseline records error kinds, not messages, so it stays stable when
+/// message wording changes. But a kind alone ("primitive-value", 5,688
+/// times) does not tell you what is actually wrong. These samples do, at
+/// zero churn cost: they live in the CI log next to the counts.
+type Samples = BTreeMap<String, (usize, Vec<String>)>;
+
+/// Sample issues retained per error kind.
+const SAMPLES_PER_KIND: usize = 8;
+
+fn record_sample(samples: &mut Samples, kind: &str, file: &str, path: &str, message: &str) {
+    let entry = samples
+        .entry(kind.to_string())
+        .or_insert_with(|| (0, Vec::new()));
+    entry.0 += 1;
+    if entry.1.len() < SAMPLES_PER_KIND {
+        entry.1.push(format!("{file} :: {path} -- {message}"));
+    }
+}
+
+fn print_samples(version_dir: &str, samples: &Samples) {
+    if samples.is_empty() {
+        return;
+    }
+    println!("\n{version_dir}: issue kinds, with samples");
+    for (kind, (total, examples)) in samples {
+        println!("  {kind} ({total} total)");
+        for example in examples {
+            println!("      {example}");
+        }
+    }
+    println!();
+}
+
 /// Validate every example in one corpus directory.
-fn sweep(version: FhirVersion, version_dir: &str) -> Manifest {
+fn sweep(version: FhirVersion, version_dir: &str) -> (Manifest, Samples) {
     let dir = corpus_dir(version_dir);
     assert!(
         dir.is_dir(),
@@ -195,6 +231,7 @@ fn sweep(version: FhirVersion, version_dir: &str) -> Manifest {
     let mut non_resource_files = Vec::new();
     let mut known_failures = Vec::new();
     let mut resources_validated = 0usize;
+    let mut samples: Samples = BTreeMap::new();
 
     for path in &files {
         let name = file_name(path);
@@ -228,11 +265,13 @@ fn sweep(version: FhirVersion, version_dir: &str) -> Manifest {
             .errors
             .iter()
             .map(|e| {
-                serde_json::to_value(e.kind)
+                let kind = serde_json::to_value(e.kind)
                     .expect("ErrorKind serializes")
                     .as_str()
                     .expect("ErrorKind is a string")
-                    .to_string()
+                    .to_string();
+                record_sample(&mut samples, &kind, &name, &e.path, &e.message);
+                kind
             })
             .collect();
         kinds.sort();
@@ -246,7 +285,7 @@ fn sweep(version: FhirVersion, version_dir: &str) -> Manifest {
         });
     }
 
-    Manifest {
+    let manifest = Manifest {
         description: MANIFEST_DESCRIPTION.to_string(),
         version: "1.0.0".to_string(),
         corpus: format!("crates/fhir/tests/data/json/{version_dir}"),
@@ -254,7 +293,8 @@ fn sweep(version: FhirVersion, version_dir: &str) -> Manifest {
         resources_validated,
         non_resource_files,
         known_failures,
-    }
+    };
+    (manifest, samples)
 }
 
 fn file_name(path: &Path) -> String {
@@ -270,7 +310,8 @@ fn file_name(path: &Path) -> String {
 
 /// Sweep one version and adjudicate it against the checked-in baseline.
 fn run_version(version: FhirVersion, version_dir: &str) {
-    let actual = sweep(version, version_dir);
+    let (actual, samples) = sweep(version, version_dir);
+    print_samples(version_dir, &samples);
 
     // Always publish the regenerated manifest, pass or fail -- it is both the
     // CI artifact and the copy-over source for accepting a change.

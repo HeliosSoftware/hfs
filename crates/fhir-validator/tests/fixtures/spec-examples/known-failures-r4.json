@@ -7,5 +7,1546 @@
   "nonResourceFiles": [
     "package-min-ver.json"
   ],
-  "knownFailures": []
+  "knownFailures": [
+    {
+      "file": "account-questionnaire.json",
+      "issues": 32,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "activitydefinition-questionnaire.json",
+      "issues": 71,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "actualgroup-questionnaire.json",
+      "issues": 34,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "adverseevent-questionnaire.json",
+      "issues": 41,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "allergyintolerance-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "appointment-questionnaire.json",
+      "issues": 39,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "appointmentresponse-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "auditevent-questionnaire.json",
+      "issues": 66,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "basic-questionnaire.json",
+      "issues": 14,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "binary-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "biologicallyderivedproduct-questionnaire.json",
+      "issues": 46,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "bmi-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "bodyheight-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "bodystructure-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "bodytemp-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "bodyweight-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "bp-questionnaire.json",
+      "issues": 78,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "bundle-questionnaire.json",
+      "issues": 50,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "capabilitystatement-questionnaire.json",
+      "issues": 142,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "careplan-questionnaire.json",
+      "issues": 60,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "careteam-questionnaire.json",
+      "issues": 29,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "catalog-questionnaire.json",
+      "issues": 59,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "catalogentry-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "cdshooksguidanceresponse-questionnaire.json",
+      "issues": 25,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "cdshooksrequestgroup-questionnaire.json",
+      "issues": 62,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "cdshooksserviceplandefinition-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "chargeitem-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "chargeitemdefinition-questionnaire.json",
+      "issues": 54,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "cholesterol-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "claim-questionnaire.json",
+      "issues": 154,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "claimresponse-questionnaire.json",
+      "issues": 146,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "clinicaldocument-questionnaire.json",
+      "issues": 59,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "clinicalimpression-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contract-legalstate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-contract-publicationstatus.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-contract-status.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-author.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-effective.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-end.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-keyword.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-workflow.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationrequest-status.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-program.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-questionnaire.json",
+      "issues": 74,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "communication-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "communicationrequest-questionnaire.json",
+      "issues": 35,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "compartmentdefinition-questionnaire.json",
+      "issues": 32,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "composition-questionnaire.json",
+      "issues": 59,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "computableplandefinition-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "conceptmap-questionnaire.json",
+      "issues": 70,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "condition-questionnaire.json",
+      "issues": 38,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "consent-questionnaire.json",
+      "issues": 58,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "contract-questionnaire.json",
+      "issues": 185,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "coverage-questionnaire.json",
+      "issues": 46,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "coverageeligibilityrequest-questionnaire.json",
+      "issues": 54,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "coverageeligibilityresponse-questionnaire.json",
+      "issues": 59,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "cqf-questionnaire-questionnaire.json",
+      "issues": 72,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "cqllibrary-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "detectedissue-questionnaire.json",
+      "issues": 32,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "device-questionnaire.json",
+      "issues": 67,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "devicedefinition-questionnaire.json",
+      "issues": 65,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "devicemetric-questionnaire.json",
+      "issues": 26,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "devicemetricobservation-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "devicerequest-questionnaire.json",
+      "issues": 38,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "deviceusestatement-questionnaire.json",
+      "issues": 22,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "diagnosticreport-example-gingival-mass.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "diagnosticreport-genetics-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "diagnosticreport-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "documentmanifest-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "documentreference-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "effectevidencesynthesis-questionnaire.json",
+      "issues": 86,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "elementdefinition-de-questionnaire.json",
+      "issues": 512,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "encounter-questionnaire.json",
+      "issues": 76,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "endpoint-questionnaire.json",
+      "issues": 20,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "enrollmentrequest-questionnaire.json",
+      "issues": 16,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "enrollmentresponse-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "episodeofcare-questionnaire.json",
+      "issues": 32,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "eventdefinition-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "evidence-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "evidencevariable-questionnaire.json",
+      "issues": 97,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "examplescenario-example.json",
+      "issues": 4,
+      "kinds": [
+        "not-array"
+      ]
+    },
+    {
+      "file": "examplescenario-questionnaire.json",
+      "issues": 88,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "explanationofbenefit-questionnaire.json",
+      "issues": 261,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "familymemberhistory-genetic-questionnaire.json",
+      "issues": 35,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "familymemberhistory-questionnaire.json",
+      "issues": 35,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "flag-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "goal-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "graphdefinition-questionnaire.json",
+      "issues": 51,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "group-questionnaire.json",
+      "issues": 34,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "groupdefinition-questionnaire.json",
+      "issues": 34,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "guidanceresponse-questionnaire.json",
+      "issues": 24,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "hdlcholesterol-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "headcircum-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "healthcareservice-questionnaire.json",
+      "issues": 51,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "heartrate-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "hlaresult-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "imagingstudy-questionnaire.json",
+      "issues": 57,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "immunization-questionnaire.json",
+      "issues": 64,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "immunizationrecommendation-questionnaire.json",
+      "issues": 34,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "implementationguide-questionnaire.json",
+      "issues": 107,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "insuranceplan-questionnaire.json",
+      "issues": 81,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "invoice-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "json-edge-cases.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "ldlcholesterol-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "library-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "linkage-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "lipidprofile-questionnaire.json",
+      "issues": 37,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "list-questionnaire.json",
+      "issues": 30,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "location-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "measure-questionnaire.json",
+      "issues": 89,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "measurereport-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "media-questionnaire.json",
+      "issues": 31,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medication-questionnaire.json",
+      "issues": 29,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicationadministration-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicationdispense-questionnaire.json",
+      "issues": 46,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicationknowledge-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicationrequest-questionnaire.json",
+      "issues": 63,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicationstatement-questionnaire.json",
+      "issues": 28,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproduct-questionnaire.json",
+      "issues": 65,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductauthorization-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductcontraindication-questionnaire.json",
+      "issues": 21,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductindication-questionnaire.json",
+      "issues": 23,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductingredient-questionnaire.json",
+      "issues": 45,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductinteraction-questionnaire.json",
+      "issues": 20,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductmanufactured-questionnaire.json",
+      "issues": 16,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductpackaged-questionnaire.json",
+      "issues": 38,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductpharmaceutical-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "medicinalproductundesirableeffect-questionnaire.json",
+      "issues": 14,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "messagedefinition-questionnaire.json",
+      "issues": 49,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "messageheader-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "molecularsequence-questionnaire.json",
+      "issues": 101,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "namingsystem-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "nutritionorder-questionnaire.json",
+      "issues": 73,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure-cancel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure-dar.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bmi.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-height.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-length.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-temperature.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-head-circumference.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-heart-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-respiratory-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-satO2.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-vitals-panel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-genetics-questionnaire.json",
+      "issues": 54,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "observation-questionnaire.json",
+      "issues": 54,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "observationdefinition-questionnaire.json",
+      "issues": 41,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "operationdefinition-questionnaire.json",
+      "issues": 70,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "operationoutcome-questionnaire.json",
+      "issues": 20,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "organization-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "organizationaffiliation-questionnaire.json",
+      "issues": 21,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "oxygensat-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "parameters-questionnaire.json",
+      "issues": 120,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "patient-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "paymentnotice-questionnaire.json",
+      "issues": 21,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "paymentreconciliation-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "person-questionnaire.json",
+      "issues": 25,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "picoelement-questionnaire.json",
+      "issues": 97,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "plandefinition-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "practitioner-questionnaire.json",
+      "issues": 26,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "practitionerrole-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "procedure-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "provenance-questionnaire.json",
+      "issues": 35,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "provenance-relevant-history-questionnaire.json",
+      "issues": 44,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "questionnaire-cqf-example.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "questionnaire-questionnaire.json",
+      "issues": 72,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "questionnaireresponse-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "relatedperson-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "requestgroup-questionnaire.json",
+      "issues": 62,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "researchdefinition-questionnaire.json",
+      "issues": 46,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "researchelementdefinition-questionnaire.json",
+      "issues": 97,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "researchstudy-questionnaire.json",
+      "issues": 45,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "researchsubject-questionnaire.json",
+      "issues": 18,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "resprate-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "riskassessment-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "riskevidencesynthesis-questionnaire.json",
+      "issues": 78,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "schedule-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "searchparameter-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "servicerequest-genetics-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "servicerequest-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "shareableactivitydefinition-questionnaire.json",
+      "issues": 71,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "shareablecodesystem-questionnaire.json",
+      "issues": 74,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "shareablelibrary-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "shareablemeasure-questionnaire.json",
+      "issues": 89,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "shareableplandefinition-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "shareablevalueset-questionnaire.json",
+      "issues": 96,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "slot-questionnaire.json",
+      "issues": 20,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "specimen-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "specimendefinition-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "structuredefinition-questionnaire.json",
+      "issues": 58,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "structuremap-questionnaire.json",
+      "issues": 202,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "subscription-questionnaire.json",
+      "issues": 23,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "substance-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "substancenucleicacid-questionnaire.json",
+      "issues": 38,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "substancepolymer-questionnaire.json",
+      "issues": 53,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "substanceprotein-questionnaire.json",
+      "issues": 24,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "substancereferenceinformation-questionnaire.json",
+      "issues": 44,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "substancesourcematerial-questionnaire.json",
+      "issues": 63,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "substancespecification-questionnaire.json",
+      "issues": 115,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "supplydelivery-questionnaire.json",
+      "issues": 25,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "supplyrequest-questionnaire.json",
+      "issues": 29,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "synthesis-questionnaire.json",
+      "issues": 41,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "task-questionnaire.json",
+      "issues": 266,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "terminologycapabilities-questionnaire.json",
+      "issues": 92,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "testreport-questionnaire.json",
+      "issues": 70,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "testscript-questionnaire.json",
+      "issues": 170,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "triglyceride-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "v2-tables.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-author.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-effective.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-end.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-keyword.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-workflow.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-questionnaire.json",
+      "issues": 96,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valuesets.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "verificationresult-questionnaire.json",
+      "issues": 50,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "visionprescription-questionnaire.json",
+      "issues": 39,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "vitalsigns-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "vitalspanel-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ]
+    }
+  ]
 }

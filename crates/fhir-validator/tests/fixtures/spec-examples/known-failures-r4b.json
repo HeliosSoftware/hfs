@@ -7,5 +7,5190 @@
   "nonResourceFiles": [
     "examples.json.zip"
   ],
-  "knownFailures": []
+  "knownFailures": [
+    {
+      "file": "activitydefinition.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "actualgroup.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "administrableproductdefinition.profile.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "allergyintolerance.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "annotation.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "auditevent.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "biologicallyderivedproduct.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bmi.profile.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bodyheight.profile.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bodytemp.profile.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bodyweight.profile.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "bp.profile.json",
+      "issues": 105,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "careplan.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "catalog.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cdshooksguidanceresponse.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cdshooksrequestgroup.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cdshooksserviceplandefinition.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "chargeitem.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "chargeitemdefinition.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cholesterol.profile.json",
+      "issues": 11,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "citation.profile.json",
+      "issues": 49,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "claim.profile.json",
+      "issues": 14,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "claimresponse.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "clinicaldocument.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "clinicalimpression.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "clinicalusedefinition.profile.json",
+      "issues": 7,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-adjudication-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-adjudication.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-allergyintolerance-clinical.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-allergyintolerance-verification.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-animal-genderstatus.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-animal-species.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-appointment-cancellation-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-audit-event-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-audit-source-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-basic-resource-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-benefit-network.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-benefit-term.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-benefit-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-benefit-unit.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-catalogType.json",
+      "issues": 4,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-claim-careteamrole.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-claim-exception.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-claim-informationcategory.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-claim-modifiers.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-claim-subtype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-claim-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-clinical-use-definition-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-concept-subsumption-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-condition-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-condition-clinical.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-consent-action.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-consent-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-consent-policy.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-consent-scope.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contactentity-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contract-action.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contract-actorrole.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contract-legalstate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-contract-publicationstatus.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-contract-signer-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contract-status.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-contract-subtype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contract-term-subtype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contract-term-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-contract-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-definition-use.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-device-action.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-admit-source.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-diet.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-discharge-disposition.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-participant-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-special-arrangements.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-encounter-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-endpoint-connection-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-endpoint-payload-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-entformula-additive.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-episodeofcare-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-ex-benefitcategory.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-ex-diagnosis-on-admission.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-ex-diagnosisrelatedgroup.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-ex-diagnosistype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-ex-paymenttype.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-ex-procedure-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-ex-program-code.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-ex-revenue-center.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-author.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-effective.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-end.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-keyword.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-workflow.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-feeding-device.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-fhirpath-types.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-flag-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-flag-priority.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-fm-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-gender-identity.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-goal-achievement.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-goal-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-goal-priority.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-icd-10-procedures.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-immunization-evaluation-dose-status-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-immunization-evaluation-dose-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-immunization-funding-source.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-immunization-origin.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-immunization-program-eligibility.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-immunization-recommendation-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-immunization-subpotent-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-insuranceplan-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-language-preference-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-list-empty-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-list-example-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-list-item-flag.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-list-order.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-location-physical-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-med-admin-perform-function.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-media-modality.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medication-admin-category.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medication-admin-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medication-statement-category.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medication-statement-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medication-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationdispense-category.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationdispense-performer-function.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationdispense-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationdispense-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationknowledge-characteristic.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationknowledge-package-type.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationknowledge-status.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationrequest-category.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationrequest-course-of-therapy.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationrequest-intent.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationrequest-status-reason.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-medicationrequest-status.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value",
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-message-reason-encounter.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-missing-tooth-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-observation-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-observation-statistics.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-organization-role.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-organization-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-payment-adjustment-reason.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-payment-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-payment-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-procedure-progress-status-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-process-priority.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-product-intended-use.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-program.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value",
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-provenance-agent-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-provenance-participant-role.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-provider-qualification.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-questionnaire-display-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-questionnaire-item-control.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-reason-medication-given-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-reason-medication-not-given-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-referencerange-meaning.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-regulated-authorization-basis.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-regulated-authorization-case-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-regulated-authorization-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-related-claim-relationship.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-resource-security-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-resource-validation-mode.json",
+      "issues": 2,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-risk-probability.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-secondary-finding.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-service-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-service-place.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-service-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-service-uscls.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-standards-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-statistic-type.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-subscription-search-modifier.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value",
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-grade.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-name-authority.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-name-domain.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-name-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-representation-format.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-representation-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-source-material-genus.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-source-material-part.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-source-material-species.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-source-material-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-structure-technique.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-weight-method.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-substance-weight-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-supplydelivery-type.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-supplyrequest-kind.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-surface.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-target-species.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "codesystem-task-code.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-testscript-operation-codes.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-testscript-profile-destination-types.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-testscript-profile-origin-types.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-tooth.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem-vision-product.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "codesystem.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "communication.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "communicationrequest.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "composition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "computableplandefinition.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "conceptmap.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "condition.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "consent.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "contract.profile.json",
+      "issues": 18,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "coverage.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "coverageeligibilityrequest.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "coverageeligibilityresponse.profile.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cqf-questionnaire.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "cqllibrary.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "dataelements.json",
+      "issues": 17,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "datarequirement.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "definition.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "detectedissue.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "devicedefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "devicemetricobservation.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "devicerequest.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "deviceusestatement.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "diagnosticreport-example-gingival-mass.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "diagnosticreport-genetics.profile.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "diagnosticreport.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "dosage.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "elementdefinition-de.profile.json",
+      "issues": 13,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "elementdefinition.profile.json",
+      "issues": 12,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "event.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "eventdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "evidence.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "evidencereport.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "evidencevariable.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "examplescenario-example.json",
+      "issues": 4,
+      "kinds": [
+        "not-array"
+      ]
+    },
+    {
+      "file": "explanationofbenefit.profile.json",
+      "issues": 22,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-11179-objectclass.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-11179-objectclassproperty.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-11179-permitted-value-conceptmap.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-11179-permitted-value-valueset.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-allergyintolerance-asserteddate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-allergyintolerance-certainty.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-allergyintolerance-duration.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-allergyintolerance-reasonrefuted.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-allergyintolerance-resolutionage.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-allergyintolerance-substanceexposurerisk.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-auditevent-accession.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-auditevent-anonymized.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-auditevent-encrypted.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-auditevent-instance.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-auditevent-mpps.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-auditevent-numberofinstances.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-auditevent-participantobjectcontainsstudy.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-auditevent-sopclass.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-bodysite.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-capabilities.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-capabilitystatement-expectation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-capabilitystatement-prohibited.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-capabilitystatement-search-parameter-combination.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-capabilitystatement-supported-system.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-capabilitystatement-websocket.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-careplan-activity-title.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-alternate.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-author.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-concept-comments.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-conceptorder.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-effectivedate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-expirationdate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-history.json",
+      "issues": 56,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-keyword.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-label.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-map.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-othername.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-replacedby.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-sourcereference.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-trusted-expansion.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-usage.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-warning.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-codesystem-workflowstatus.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-coding-sctdescid.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-communication-media.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-communicationrequest-initiatinglocation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-composition-clinicaldocument-otherconfidentiality.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-composition-clinicaldocument-versionnumber.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-composition-section-subject.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-concept-bidirectional.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-condition-asserteddate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-condition-dueto.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-condition-occurredfollowing.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-condition-outcome.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-condition-related.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-condition-ruledout.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-consent-location.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-consent-notificationendpoint.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-consent-transcriber.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-consent-witness.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-contactpoint-area.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-contactpoint-country.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-contactpoint-extension.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-contactpoint-local.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-calculatedvalue.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-cdshooksendpoint.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-certainty.json",
+      "issues": 47,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-citation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-contactaddress.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-contactreference.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-contributiontime.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-encounterclass.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-encountertype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-expression.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-initialvalue.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-initiatingorganization.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-initiatingperson.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-library.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-measureinfo.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-qualityofevidence.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-receivingorganization.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-receivingperson.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-recipientlanguage.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-recipienttype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-relativedatetime.json",
+      "issues": 38,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-strengthofrecommendation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-systemuserlanguage.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-systemusertaskcontext.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqf-systemusertype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-cqm-validityperiod.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-data-absent-reason.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-definitions.json",
+      "issues": 1696,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-designnote.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-device-implantstatus.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-devicerequest-patientinstruction.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-addendumof.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-extends.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-geneticsanalysis.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-geneticsassessedcondition.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-geneticsfamilymemberhistory.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-geneticsreferences.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-locationperformed.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-replaces.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-risk.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-diagnosticreport-summaryof.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-display.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-allowedunits.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-bestpractice-explanation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-bestpractice.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-bindingname.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-equivalence.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-identifier.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-inheritedextensiblevalueset.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-iscommonbinding.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-maxvalueset.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-minvalueset.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-namespace.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-profile-element.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-question.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-selector.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-elementdefinition-translatable.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-encounter-associatedencounter.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-encounter-modeofarrival.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-encounter-reasoncancelled.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-entryformat.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-event-basedon.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-event-eventhistory.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-event-location.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-event-partof.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-event-performerfunction.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-event-statusreason.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-family-member-history-genetics-observation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-family-member-history-genetics-parent.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-family-member-history-genetics-sibling.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-familymemberhistory-abatement.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-familymemberhistory-patient-record.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-familymemberhistory-severity.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-familymemberhistory-type.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-flag-detail.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-flag-priority.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-geolocation.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-goal-acceptance.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-goal-reasonrejected.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-goal-relationship.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-hla-genotyping-results-allele-database.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-hla-genotyping-results-glstring.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-hla-genotyping-results-haploid.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-hla-genotyping-results-method.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-http-response-header.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-humanname-assembly-order.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-humanname-fathers-family.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-humanname-mothers-family.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-humanname-own-name.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-humanname-own-prefix.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-humanname-partner-name.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-humanname-partner-prefix.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-identifier-validdate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-ad-use.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-additionallocator.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-buildingnumbersuffix.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-careof.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-censustract.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-delimiter.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-deliveryaddressline.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-deliveryinstallationarea.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-deliveryinstallationqualifier.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-deliveryinstallationtype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-deliverymode.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-deliverymodeidentifier.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-direction.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-housenumber.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-housenumbernumeric.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-postbox.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-precinct.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-streetaddressline.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-streetname.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-streetnamebase.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-streetnametype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-unitid.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-adxp-unittype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-en-qualifier.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-en-representation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-en-use.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-nullflavor.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-pq-translation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-preferred.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-sc-coding.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-tel-address.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-uncertainty.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-iso21090-uncertaintytype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-language.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-list-changebase.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-location-boundary-geojson.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-location-distance.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-match-grade.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-maxdecimalplaces.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-maxsize.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-maxvalue.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-messageheader-response-request.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-mimetype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-minlength.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-minvalue.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-narrativelink.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-no-binding.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-nutritionorder-adaptivefeedingdevice.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-oauth-uris.json",
+      "issues": 38,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-bodyposition.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-delta.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-devicecode.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-focuscode.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-gatewaydevice.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsallele.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsaminoacidchange.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsancestry.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticscopynumberevent.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsdnaregionname.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsgene.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsgenomicsourceclass.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsinterpretation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsphaseset.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-geneticsvariant.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-precondition.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-reagent.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-replaces.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-secondaryfinding.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-sequelto.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-specimencode.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-observation-timeoffset.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-openehr-administration.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-openehr-careplan.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-openehr-exposuredate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-openehr-exposuredescription.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-openehr-exposureduration.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-openehr-location.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-openehr-management.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-openehr-test.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-operationdefinition-allowed-type.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-operationdefinition-profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-operationoutcome-authority.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-operationoutcome-detectedissue.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-operationoutcome-issue-source.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-ordinalvalue.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-organization-period.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-organization-preferredcontact.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-organizationaffiliation-primaryind.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-originaltext.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-parameters-fullurl.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-adoptioninfo.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-animal.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-birthplace.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-birthtime.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-cadavericdonor.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-citizenship.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-congregation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-disability.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-genderidentity.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-importance.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-interpreterrequired.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-mothersmaidenname.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-nationality.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-preferencetype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-proficiency.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-relatedperson.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-patient-religion.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-practitioner-animalspecies.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-practitionerrole-primaryind.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-procedure-approachbodystructure.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-procedure-causedby.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-procedure-directedby.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-procedure-incisiondatetime.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-procedure-method.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-procedure-progressstatus.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-procedure-schedule.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-procedure-targetbodystructure.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-quantity-precision.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-basetype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-choiceorientation.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-constraint.json",
+      "issues": 56,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-displaycategory.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-fhirtype.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-hidden.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-itemcontrol.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-maxoccurs.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-minoccurs.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-optionexclusive.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-optionprefix.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-referencefilter.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-referenceprofile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-referenceresource.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-signaturerequired.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-sliderstepvalue.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-supportlink.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-unit.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-unitoption.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-unitvalueset.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaire-usagemode.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaireresponse-author.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaireresponse-completionmode.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaireresponse-reason.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaireresponse-reviewer.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-questionnaireresponse-signature.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-regex.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-relative-date.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-rendered-value.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-rendering-markdown.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-rendering-style.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-rendering-stylesensitive.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-rendering-xhtml.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-replaces.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-request-donotperform.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-request-insurance.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-request-performerorder.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-request-relevanthistory.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-request-replaces.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-request-statusreason.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-resource-approvaldate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-resource-effectiveperiod.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-resource-lastreviewdate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-resource-pertainstogoal.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-servicerequest-geneticsitem.json",
+      "issues": 38,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-servicerequest-precondition.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-servicerequest-questionnairerequest.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-specimen-collectionpriority.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-specimen-isdryweight.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-specimen-processingtime.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-specimen-sequencenumber.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-specimen-specialhandling.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-ancestor.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-applicable-version.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-category.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-codegen-super.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-dependencies.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-display-hint.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-explicit-type-name.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-fhir-type.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-fmm-no-warnings.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-fmm.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-hierarchy.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-normative-version.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-security-category.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-standards-status.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-summary.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-table-name.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-template-status.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-wg.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-structuredefinition-xml-no-order.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-task-candidatelist.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-task-replaces.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-timing-dayofmonth.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-timing-daysofcycle.json",
+      "issues": 11,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-timing-exact.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-translation.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-tz-code.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-tz-offset.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-usagecontext-group.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-activitystatusdate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-author.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-authoritativesource.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-casesensitive.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-concept-comments.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-concept-definition.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-conceptorder.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-deprecated.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-effectivedate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-expand-group.json",
+      "issues": 29,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-expand-rules.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-expansionsource.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-expirationdate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-expression.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-extensible.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-keyword.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-label.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-map.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-othername.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-parametersource.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-reference.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-rules-text.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-sourcereference.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-special-status.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-steward.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-supplement.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-system.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-systemname.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-systemref.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-toocostly.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-trusted-expansion.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-unclosed.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-usage.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-warning.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-valueset-workflowstatus.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-variable.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-workflow-episodeofcare.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-workflow-instantiatescanonical.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-workflow-instantiatesuri.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-workflow-reasoncode.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-workflow-reasonreference.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-workflow-relatedartifact.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-workflow-researchstudy.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension-workflow-supportinginfo.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "extension.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "familymemberhistory-genetic.profile.json",
+      "issues": 30,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "familymemberhistory.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "fivews.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "goal.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "group.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "groupdefinition.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "guidanceresponse.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "hdlcholesterol.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "headcircum.profile.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "heartrate.profile.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "hlaresult.profile.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "immunization.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "immunizationevaluation.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "immunizationrecommendation.profile.json",
+      "issues": 10,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "implementationguide.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "ingredient.profile.json",
+      "issues": 7,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "invoice.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "json-edge-cases.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "ldlcholesterol.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "library.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "lipidprofile.profile.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "manufactureditemdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "measure.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "measurereport.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "media.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medication.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationadministration.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationdispense.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationknowledge.profile.json",
+      "issues": 16,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationrequest.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicationstatement.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "medicinalproductdefinition.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "messagedefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "messageheader.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "nutritionorder.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "nutritionproduct.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure-cancel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure-dar.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bloodpressure.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-bmi.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-height.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-length.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-body-temperature.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-head-circumference.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-heart-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-respiratory-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-satO2.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-example-vitals-panel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ]
+    },
+    {
+      "file": "observation-genetics.profile.json",
+      "issues": 23,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "observation.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "oxygensat.profile.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "packagedproductdefinition.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "parameters.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "patient.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "plandefinition.profile.json",
+      "issues": 12,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "population.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "procedure.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "profiles-others.json",
+      "issues": 611,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "profiles-resources.json",
+      "issues": 478,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "profiles-types.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "provenance-relevant-history.profile.json",
+      "issues": 13,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "provenance.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "questionnaire-cqf-example.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ]
+    },
+    {
+      "file": "questionnaire.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "questionnaireresponse-extensions-QuestionnaireResponse-item-subject.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "questionnaireresponse.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "regulatedauthorization.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "request.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "requestgroup.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "researchdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "researchelementdefinition.profile.json",
+      "issues": 20,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "resprate.profile.json",
+      "issues": 34,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "riskassessment.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "servicerequest-genetics.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "servicerequest.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareableactivitydefinition.profile.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablecodesystem.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablelibrary.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablemeasure.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "shareablevalueset.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "specimen.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "specimendefinition.profile.json",
+      "issues": 5,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "structuredefinition-example-composition.json",
+      "issues": 3,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "structuredefinition-example-section-library.json",
+      "issues": 9,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "structuremap.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "subscriptiontopic.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "substance.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "substancedefinition.profile.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "supplydelivery.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "supplyrequest.profile.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "task.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "terminologycapabilities.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "testscript.profile.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "timing.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "triggerdefinition.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "triglyceride.profile.json",
+      "issues": 4,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "usagecontext.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "valueset-catalogType.json",
+      "issues": 3,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-concept-subsumption-outcome.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-author.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-effective.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-end.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-keyword.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-extensions-ValueSet-workflow.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-observation-statistics.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-resource-security-category.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-resource-validation-mode.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset-standards-status.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ]
+    },
+    {
+      "file": "valueset.profile.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "valuesets.json",
+      "issues": 14,
+      "kinds": [
+        "primitive-value",
+        "required"
+      ]
+    },
+    {
+      "file": "vitalsigns.profile.json",
+      "issues": 22,
+      "kinds": [
+        "primitive-value"
+      ]
+    },
+    {
+      "file": "vitalspanel.profile.json",
+      "issues": 27,
+      "kinds": [
+        "primitive-value"
+      ]
+    }
+  ]
 }
