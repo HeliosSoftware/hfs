@@ -34,7 +34,11 @@
 use serde_json::json;
 
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider, ResourceStorage};
+// `ResourceStorage` is deliberately not imported: every scenario is generic over
+// `B: BundleProvider`, and method resolution on a type *parameter* searches the
+// bound's supertraits, so `read`/`exists`/`delete`/`create_or_update` are already
+// in scope. Importing it would be an unused import (`-D warnings`).
+use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
 use helios_persistence::tenant::TenantContext;
 
 /// A PUT entry carrying an `ifMatch` precondition.
