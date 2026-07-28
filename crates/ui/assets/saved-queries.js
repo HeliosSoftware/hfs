@@ -162,6 +162,42 @@
   var PREFIX_RE = /^(eq|ne|gt|ge|lt|le|sa|eb|ap)(?=[\d])/;
   var catalogType = null;
 
+  /* Per-type parameter metadata from the catalog fragment's data attributes:
+   * type -> { code: { type: "reference"|..., targets: ["Patient", ...] } }.
+   * Feeds the chaining controls; promise-cached so each type is fetched once. */
+  var PARAM_META = {};
+  var paramMetaPromises = {};
+  function parseCatalog(html) {
+    var tpl = document.createElement("template");
+    tpl.innerHTML = html;
+    var meta = {};
+    tpl.content.querySelectorAll("option").forEach(function (opt) {
+      meta[opt.value] = {
+        type: opt.dataset.type || "",
+        targets: (opt.dataset.targets || "").split(",").filter(Boolean),
+      };
+    });
+    return { meta: meta, datalist: tpl.content.querySelector("datalist") };
+  }
+  function fetchParams(type) {
+    if (!type) return Promise.resolve({});
+    if (paramMetaPromises[type]) return paramMetaPromises[type];
+    paramMetaPromises[type] = fetch(
+      "/ui/queries/params?type=" + encodeURIComponent(type),
+      { credentials: "same-origin" },
+    )
+      .then(function (response) {
+        return response.ok ? response.text() : null;
+      })
+      .then(function (html) {
+        if (!html) return {};
+        var parsed = parseCatalog(html);
+        PARAM_META[type] = parsed.meta;
+        return parsed.meta;
+      });
+    return paramMetaPromises[type];
+  }
+
   /* Swaps the parameter datalist for the current resource type. The
    * fragment is server-rendered from the SearchParameter registry. */
   function loadCatalog(type) {
@@ -175,11 +211,11 @@
       })
       .then(function (html) {
         if (!html) return;
-        var tpl = document.createElement("template");
-        tpl.innerHTML = html;
-        var next = tpl.content.querySelector("datalist");
+        var parsed = parseCatalog(html);
+        PARAM_META[type] = parsed.meta;
         var current = document.getElementById("param-options");
-        if (next && current) current.replaceWith(next);
+        if (parsed.datalist && current) current.replaceWith(parsed.datalist);
+        refreshChainAffordances();
       });
   }
 
@@ -196,16 +232,63 @@
         } catch (e) {
           /* keep the raw value */
         }
-        var colon = rawKey.indexOf(":");
-        return {
-          key: colon < 0 ? rawKey : rawKey.slice(0, colon),
-          modifier: colon < 0 ? "" : rawKey.slice(colon + 1),
-          value: value,
-        };
+        return parseKey(rawKey, value);
       });
   }
 
+  /* Parses one query key into a row part. Chained keys get their own kinds;
+   * anything deeper than one hop (or a nested _has) stays a raw condition so
+   * the URL keeps working even where the builder has no dedicated controls. */
+  function parseKey(rawKey, value) {
+    if (rawKey.indexOf("_has:") === 0) {
+      /* _has:Type:ref-param:leaf[:modifier] — reverse chain, one level. */
+      var segs = rawKey.split(":");
+      var nested = segs.length > 3 && segs[3] === "_has";
+      if (segs.length >= 4 && segs.length <= 5 && !nested && segs[3].indexOf(".") < 0) {
+        return {
+          kind: "has",
+          hasType: segs[1],
+          refParam: segs[2],
+          key: segs[3],
+          modifier: segs[4] || "",
+          value: value,
+        };
+      }
+      return { kind: "condition", key: rawKey, modifier: "", value: value };
+    }
+    var dot = rawKey.indexOf(".");
+    if (dot > 0) {
+      /* ref[:Type].ref[:Type]…​.leaf[:modifier] — forward chain, any depth.
+       * Every segment but the last is a reference hop with an optional type
+       * qualifier; the modifier belongs to the leaf. */
+      var segs = rawKey.split(".");
+      var hops = segs.slice(0, -1).map(function (seg) {
+        var c = seg.indexOf(":");
+        return {
+          ref: c < 0 ? seg : seg.slice(0, c),
+          type: c < 0 ? "" : seg.slice(c + 1),
+        };
+      });
+      var last = segs[segs.length - 1];
+      var lastColon = last.indexOf(":");
+      return {
+        kind: "chain",
+        hops: hops,
+        key: lastColon < 0 ? last : last.slice(0, lastColon),
+        modifier: lastColon < 0 ? "" : last.slice(lastColon + 1),
+        value: value,
+      };
+    }
+    var colon = rawKey.indexOf(":");
+    return {
+      key: colon < 0 ? rawKey : rawKey.slice(0, colon),
+      modifier: colon < 0 ? "" : rawKey.slice(colon + 1),
+      value: value,
+    };
+  }
+
   function bucketFor(part) {
+    if (part.kind === "chain" || part.kind === "has") return "condition";
     if (CONTROL_KEYS.indexOf(part.key) >= 0) return "control";
     if (INCLUDE_KEYS.indexOf(part.key) >= 0) return "include";
     return "condition";
@@ -219,7 +302,332 @@
     select.appendChild(el);
   }
 
+  /* ---- chaining rows (#394) -------------------------------------------- */
+
+  var chainListSeq = 0;
+
+  function pill(text) {
+    var el = document.createElement("span");
+    el.className = "builder-pill";
+    el.textContent = text;
+    return el;
+  }
+  function chainLabel(text) {
+    var el = document.createElement("span");
+    el.className = "builder-row__chainlabel";
+    el.textContent = text;
+    return el;
+  }
+  /* A free-text input backed by a per-row datalist we can refill. */
+  function listedInput(row, placeholder, initial) {
+    var input = document.createElement("input");
+    var list = document.createElement("datalist");
+    list.id = "chain-list-" + ++chainListSeq;
+    input.setAttribute("list", list.id);
+    input.placeholder = placeholder;
+    input.spellcheck = false;
+    input.value = initial || "";
+    row.appendChild(list);
+    return { input: input, list: list };
+  }
+  function fillList(list, codes) {
+    list.textContent = "";
+    codes.forEach(function (code) {
+      var opt = document.createElement("option");
+      opt.value = code;
+      list.appendChild(opt);
+    });
+  }
+
+  /* Modifier select + value input + remove button, shared by every row kind. */
+  function appendTail(row, part) {
+    var value = part.value;
+    var selectedMod = part.modifier;
+    var prefix = PREFIX_RE.exec(value);
+    if (!selectedMod && prefix) {
+      selectedMod = prefix[1];
+      value = value.slice(2);
+    }
+    var modifier = document.createElement("select");
+    modifier.className = "builder-row__modifier";
+    option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
+    COLON_MODIFIERS.forEach(function (m) {
+      option(modifier, m, ":" + m, selectedMod === m);
+    });
+    PREFIXES.forEach(function (p) {
+      option(modifier, p, p, selectedMod === p);
+    });
+    row.appendChild(modifier);
+
+    var valueInput = document.createElement("input");
+    valueInput.className = "builder-row__value";
+    valueInput.value = value;
+    valueInput.placeholder = sections.dataset.msgValue;
+    valueInput.spellcheck = false;
+    row.appendChild(valueInput);
+
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "builder-row__remove";
+    remove.dataset.removeRow = "true";
+    remove.setAttribute("aria-label", sections.dataset.msgRemove);
+    remove.textContent = "×";
+    row.appendChild(remove);
+  }
+
+  /* Forward chain: one hop segment per reference —
+   * `ref › [type]` … then the leaf param, operator, and value. Serializes to
+   * `ref.leaf=`, `ref:Type.leaf=`, or deeper (`ref.ref2.leaf=`), matching the
+   * numbered-levels panel in the design; the drill-deeper affordance appends
+   * a hop when the leaf itself is a reference. */
+  function chainRow(part) {
+    var row = document.createElement("div");
+    row.className = "builder-row builder-row--chain";
+    var hops = (part.hops || []).map(function (h) {
+      return { ref: h.ref, type: h.type };
+    });
+
+    var hopsHost = document.createElement("span");
+    hopsHost.className = "builder-row__hops";
+    row.appendChild(hopsHost);
+
+    var leaf = listedInput(row, sections.dataset.msgParam, part.key);
+    leaf.input.className = "builder-row__cparam";
+    row.appendChild(leaf.input);
+
+    var deeper = document.createElement("button");
+    deeper.type = "button";
+    deeper.className = "builder-row__drill";
+    deeper.dataset.chainDeeper = "true";
+    deeper.title = sections.dataset.msgChainInto;
+    deeper.textContent = "›";
+    deeper.hidden = true;
+    row.appendChild(deeper);
+
+    appendTail(row, part);
+
+    var base = sections.dataset.type || "";
+
+    /* Candidate resource types feeding hop k: the selected type of the
+     * previous hop, else all of its registry targets (base type at k=0). */
+    function parentTypes(k, done) {
+      if (k === 0) return done([base]);
+      var prev = hops[k - 1];
+      if (prev.type) return done([prev.type]);
+      parentTypes(k - 1, function (grand) {
+        var pending = grand.length;
+        var out = [];
+        if (!pending) return done([]);
+        grand.forEach(function (g) {
+          fetchParams(g).then(function (meta) {
+            (((meta[prev.ref] || {}).targets) || []).forEach(function (t) {
+              if (out.indexOf(t) < 0) out.push(t);
+            });
+            if (--pending === 0) done(out);
+          });
+        });
+      });
+    }
+
+    function segRefill(k) {
+      var seg = hopsHost.children[k];
+      if (!seg) return;
+      var refInput = seg.querySelector(".builder-row__chainref");
+      var typeSel = seg.querySelector(".builder-row__ctype");
+      parentTypes(k, function (parents) {
+        /* Ref-param suggestions: reference params across the parents. */
+        var list = seg.querySelector("datalist");
+        var pending = parents.length;
+        var codes = [];
+        if (!pending) return;
+        parents.forEach(function (p) {
+          fetchParams(p).then(function (meta) {
+            Object.keys(meta).forEach(function (code) {
+              if (meta[code].type === "reference" && codes.indexOf(code) < 0) {
+                codes.push(code);
+              }
+            });
+            if (--pending === 0) fillList(list, codes.sort());
+          });
+        });
+        /* Target-type options for this hop's qualifier. */
+        var chosen = hops[k].type;
+        var tPending = parents.length;
+        var targets = [];
+        parents.forEach(function (p) {
+          fetchParams(p).then(function (meta) {
+            (((meta[refInput.value.trim()] || {}).targets) || []).forEach(function (t) {
+              if (targets.indexOf(t) < 0) targets.push(t);
+            });
+            if (--tPending === 0) {
+              typeSel.textContent = "";
+              option(typeSel, "", sections.dataset.msgAnyTarget, chosen === "");
+              targets.forEach(function (t) {
+                option(typeSel, t, t, chosen === t);
+              });
+              if (chosen && targets.indexOf(chosen) < 0) {
+                option(typeSel, chosen, chosen, true);
+              }
+            }
+          });
+        });
+      });
+    }
+
+    function leafTypes(done) {
+      parentTypes(hops.length, done);
+    }
+
+    function refillLeaf() {
+      leafTypes(function (types) {
+        var pending = types.length;
+        var codes = [];
+        var anyRef = false;
+        if (!pending) return;
+        types.forEach(function (t) {
+          fetchParams(t).then(function (meta) {
+            Object.keys(meta).forEach(function (code) {
+              if (codes.indexOf(code) < 0) codes.push(code);
+            });
+            var m = meta[leaf.input.value.trim()];
+            if (m && m.type === "reference") anyRef = true;
+            if (--pending === 0) {
+              fillList(leaf.list, codes.sort());
+              deeper.hidden = !anyRef;
+            }
+          });
+        });
+      });
+    }
+
+    function addSegment(k) {
+      var seg = document.createElement("span");
+      seg.className = "builder-row__hopseg";
+
+      var ref = listedInput(seg, sections.dataset.msgParam, hops[k].ref);
+      ref.input.className = "builder-row__key builder-row__chainref";
+      if (k === 0) ref.input.setAttribute("list", "param-options");
+      seg.appendChild(ref.input);
+
+      seg.appendChild(chainLabel("›"));
+
+      var typeSel = document.createElement("select");
+      typeSel.className = "builder-row__ctype";
+      seg.appendChild(typeSel);
+
+      ref.input.addEventListener("input", function () {
+        hops[k].ref = ref.input.value.trim();
+        segRefill(k);
+        refillLeaf();
+      });
+      typeSel.addEventListener("change", function () {
+        hops[k].type = typeSel.value;
+        for (var j = k + 1; j < hops.length; j++) segRefill(j);
+        refillLeaf();
+        updateUrl();
+      });
+
+      hopsHost.appendChild(seg);
+      segRefill(k);
+    }
+
+    hops.forEach(function (_, k) {
+      addSegment(k);
+    });
+    refillLeaf();
+
+    leaf.input.addEventListener("input", refillLeaf);
+    deeper.addEventListener("click", function () {
+      var refName = leaf.input.value.trim();
+      if (!refName) return;
+      hops.push({ ref: refName, type: "" });
+      leaf.input.value = "";
+      addSegment(hops.length - 1);
+      refillLeaf();
+      leaf.input.focus();
+      updateUrl();
+    });
+
+    /* updateUrl reads the hops through the row's DOM state. */
+    row.chainHops = hops;
+
+    return row;
+  }
+
+  /* Reverse chain: has-a-related [Type] via [ref-param] where-its [param].
+   * Serializes to `_has:Type:ref:param=` (one level). */
+  function hasRow(part) {
+    var row = document.createElement("div");
+    row.className = "builder-row builder-row--has";
+
+    row.appendChild(pill(sections.dataset.msgHasPill));
+
+    var type = listedInput(row, sections.dataset.msgHasType, part.hasType);
+    type.input.className = "builder-row__htype";
+    type.input.setAttribute("list", "resource-type-options");
+    row.appendChild(type.input);
+
+    row.appendChild(chainLabel(sections.dataset.msgHasVia));
+
+    var ref = listedInput(row, sections.dataset.msgParam, part.refParam);
+    ref.input.className = "builder-row__href";
+    row.appendChild(ref.input);
+
+    row.appendChild(chainLabel(sections.dataset.msgHasWhere));
+
+    var leaf = listedInput(row, sections.dataset.msgParam, part.key);
+    leaf.input.className = "builder-row__cparam";
+    row.appendChild(leaf.input);
+
+    appendTail(row, part);
+
+    var base = sections.dataset.type || "";
+    function refillParams() {
+      var t = type.input.value.trim();
+      if (!t) return;
+      fetchParams(t).then(function (meta) {
+        var codes = Object.keys(meta).sort();
+        /* The link must be a reference param that can point at the base
+         * type; params with no declared targets stay offered. */
+        fillList(
+          ref.list,
+          codes.filter(function (code) {
+            var m = meta[code];
+            if (m.type !== "reference") return false;
+            return m.targets.length === 0 || m.targets.indexOf(base) >= 0;
+          }),
+        );
+        fillList(leaf.list, codes);
+      });
+    }
+    type.input.addEventListener("input", refillParams);
+    refillParams();
+
+    return row;
+  }
+
+  /* Shows the drill-into affordance on condition rows whose parameter is a
+   * reference, per the registry metadata for the current base type. */
+  function refreshChainAffordances() {
+    if (!sections) return;
+    var meta = PARAM_META[sections.dataset.type || ""] || {};
+    sections
+      .querySelectorAll("#builder-conditions .builder-row")
+      .forEach(function (row) {
+        if (row.classList.contains("builder-row--chain")) return;
+        if (row.classList.contains("builder-row--has")) return;
+        var key = row.querySelector(".builder-row__key");
+        var drill = row.querySelector("[data-chain-from]");
+        if (!key || !drill) return;
+        var m = meta[key.value.trim()];
+        drill.hidden = !(m && m.type === "reference");
+      });
+  }
+
   function builderRow(kind, part) {
+    if (kind === "condition" && part.kind === "chain") return chainRow(part);
+    if (kind === "condition" && part.kind === "has") return hasRow(part);
+
     var row = document.createElement("div");
     row.className = "builder-row";
 
@@ -240,6 +648,19 @@
     key.className = "builder-row__key";
     row.appendChild(key);
 
+    if (kind === "condition") {
+      /* Reference params can drill into their target (#394); hidden until
+       * the registry metadata confirms the param is a reference. */
+      var drill = document.createElement("button");
+      drill.type = "button";
+      drill.className = "builder-row__drill";
+      drill.dataset.chainFrom = "true";
+      drill.title = sections.dataset.msgChainInto;
+      drill.textContent = "›";
+      drill.hidden = true;
+      row.appendChild(drill);
+    }
+
     /* Comparator prefixes render in the modifier select but are rejoined
      * onto the value; colon modifiers are rejoined onto the key. */
     var value = part.value;
@@ -253,7 +674,7 @@
     if (kind !== "control") {
       var modifier = document.createElement("select");
       modifier.className = "builder-row__modifier";
-      option(modifier, "", "—", !selectedMod);
+      option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
       if (kind === "include") {
         option(modifier, "iterate", ":iterate", selectedMod === "iterate");
       } else {
@@ -304,9 +725,16 @@
     });
   }
 
+  /* The last URL the rows themselves produced. A native `change` can fire on
+   * the URL input after `updateUrl` rewrote it programmatically (the browser's
+   * dirty-value flag survives), and rebuilding the rows mid-interaction would
+   * yank focus and drop in-flight edits — so re-parsing skips its own echo. */
+  var lastSerialized = null;
+
   /* URL → rows. */
   function renderBuilder() {
     if (!sections || !urlInput) return;
+    if (urlInput.value === lastSerialized) return;
     var parsed = parseSearchUrl(urlInput.value);
     if (!parsed) {
       sections.hidden = true;
@@ -326,6 +754,7 @@
       var kind = bucketFor(part);
       hosts[kind].appendChild(builderRow(kind, part));
     });
+    refreshChainAffordances();
   }
 
   /* Rows → URL. */
@@ -334,7 +763,28 @@
     var type = sections.dataset.type || "";
     var parts = [];
     sections.querySelectorAll(".builder-row").forEach(function (row) {
-      var key = row.querySelector(".builder-row__key").value.trim();
+      var key;
+      if (row.classList.contains("builder-row--chain")) {
+        var segs = row.querySelectorAll(".builder-row__hopseg");
+        var leaf = row.querySelector(".builder-row__cparam").value.trim();
+        if (!segs.length || !leaf) return;
+        var pieces = [];
+        for (var si = 0; si < segs.length; si++) {
+          var ref = segs[si].querySelector(".builder-row__chainref").value.trim();
+          if (!ref) return;
+          var ctype = segs[si].querySelector(".builder-row__ctype").value;
+          pieces.push(ref + (ctype ? ":" + ctype : ""));
+        }
+        key = pieces.join(".") + "." + leaf;
+      } else if (row.classList.contains("builder-row--has")) {
+        var htype = row.querySelector(".builder-row__htype").value.trim();
+        var href = row.querySelector(".builder-row__href").value.trim();
+        var hleaf = row.querySelector(".builder-row__cparam").value.trim();
+        if (!htype || !href || !hleaf) return;
+        key = "_has:" + htype + ":" + href + ":" + hleaf;
+      } else {
+        key = row.querySelector(".builder-row__key").value.trim();
+      }
       if (!key) return;
       var modifierEl = row.querySelector(".builder-row__modifier");
       var mod = modifierEl ? modifierEl.value : "";
@@ -345,21 +795,57 @@
     });
     urlInput.value =
       "GET /" + type + (parts.length ? "?" + parts.join("&") : "");
+    lastSerialized = urlInput.value;
   }
 
   if (sections && urlInput) {
     urlInput.addEventListener("change", renderBuilder);
     sections.addEventListener("input", function (event) {
-      if (event.target.closest(".builder-row")) updateUrl();
+      if (event.target.closest(".builder-row")) {
+        updateUrl();
+        if (event.target.classList.contains("builder-row__key")) {
+          refreshChainAffordances();
+        }
+      }
     });
     sections.addEventListener("click", function (event) {
       var remove = event.target.closest("[data-remove-row]");
+      var drillFrom = event.target.closest("[data-chain-from]");
       var add = event.target.closest("[data-add]");
       if (remove) {
         remove.closest(".builder-row").remove();
         updateUrl();
+      } else if (drillFrom) {
+        /* Convert the condition row into a forward-chain row for its
+         * reference param, keeping the value the user already typed. */
+        var from = drillFrom.closest(".builder-row");
+        var refParam = from.querySelector(".builder-row__key").value.trim();
+        var kept = from.querySelector(".builder-row__value").value.trim();
+        var chain = chainRow({
+          kind: "chain",
+          hops: [{ ref: refParam, type: "" }],
+          key: "",
+          modifier: "",
+          value: kept,
+        });
+        from.replaceWith(chain);
+        chain.querySelector(".builder-row__cparam").focus();
+        updateUrl();
       } else if (add) {
         var kind = add.dataset.add;
+        if (kind === "has") {
+          var has = hasRow({
+            kind: "has",
+            hasType: "",
+            refParam: "",
+            key: "",
+            modifier: "",
+            value: "",
+          });
+          builderHosts().condition.appendChild(has);
+          has.querySelector(".builder-row__htype").focus();
+          return;
+        }
         var part = {
           key: kind === "include" ? "_include" : kind === "control" ? "_count" : "",
           modifier: "",

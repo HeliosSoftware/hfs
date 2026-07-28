@@ -2510,6 +2510,83 @@ button.pill {
   align-self: flex-start;
 }
 
+/* Chaining rows (#394): forward chains and _has carry extra controls, so
+ * they wrap; the shared input skin comes from the selectors above. */
+.builder-row--chain,
+.builder-row--has {
+  flex-wrap: wrap;
+}
+
+.builder-row__ctype,
+.builder-row__cparam,
+.builder-row__chainref,
+.builder-row__htype,
+.builder-row__href {
+  height: 32px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  outline: none;
+  width: 150px;
+}
+
+.builder-row__ctype {
+  width: 130px;
+  font-family: inherit;
+  color: var(--muted);
+}
+
+.builder-row__ctype:focus,
+.builder-row__cparam:focus,
+.builder-row__chainref:focus,
+.builder-row__htype:focus,
+.builder-row__href:focus {
+  border-color: var(--accent);
+}
+
+.builder-row__chainlabel {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.builder-pill {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.builder-row__drill {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--surface-border);
+  border-radius: 7px;
+  background: none;
+  color: var(--accent);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.builder-row__drill:hover {
+  background: var(--accent-soft);
+}
+
 /* In-page results card */
 
 .query-results {

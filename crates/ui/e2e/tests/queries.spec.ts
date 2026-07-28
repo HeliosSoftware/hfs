@@ -84,6 +84,136 @@ test.describe("query builder", () => {
     await expect(queries.builder.conditionRows).toHaveCount(1);
   });
 
+  /* ---- chaining (#394) ------------------------------------------------- */
+
+  test("a chained query hydrates into a forward-chain row and round-trips", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?general-practitioner.name=Smith");
+    await expect(queries.builder.chainRows).toHaveCount(1);
+    const row = queries.builder.chainRows.first();
+    await expect(row.locator(".builder-row__chainref")).toHaveValue("general-practitioner");
+    await expect(row.locator(".builder-row__cparam")).toHaveValue("name");
+    await expect(row.locator(".builder-row__value")).toHaveValue("Smith");
+
+    // Editing the value re-serializes the same chained key.
+    await row.locator(".builder-row__value").fill("Jones");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?general-practitioner.name=Jones",
+    );
+  });
+
+  test("an explicitly typed chain keeps its :Type qualifier", async ({ queries }) => {
+    await queries.builder.setUrl("Observation?subject:Patient.name:contains=ann");
+    const row = queries.builder.chainRows.first();
+    await expect(row.locator(".builder-row__chainref")).toHaveValue("subject");
+    await expect(row.locator(".builder-row__cparam")).toHaveValue("name");
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("contains");
+    // The registry feeds Patient into the target-type select.
+    await expect
+      .poll(async () => row.locator(".builder-row__ctype").inputValue())
+      .toBe("Patient");
+
+    await row.locator(".builder-row__value").fill("bob");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Observation?subject:Patient.name:contains=bob",
+    );
+  });
+
+  test("drilling into a reference param converts the row to a chain", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?general-practitioner=123");
+    const row = queries.builder.conditionRows.first();
+    // The affordance appears once the registry metadata loads.
+    const drill = queries.builder.drillButton(row);
+    await expect(drill).toBeVisible();
+    await drill.click();
+
+    await expect(queries.builder.chainRows).toHaveCount(1);
+    const chain = queries.builder.chainRows.first();
+    await chain.locator(".builder-row__cparam").fill("name");
+    await chain.locator(".builder-row__value").fill("Smith");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?general-practitioner.name=Smith",
+    );
+    // The target-type select offers this param's registry targets.
+    await expect
+      .poll(async () => chain.locator(".builder-row__ctype option").count())
+      .toBeGreaterThan(1);
+  });
+
+  test("a _has query hydrates into a reverse-chain row and round-trips", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?_has:Observation:patient:code=1234-5");
+    await expect(queries.builder.hasRows).toHaveCount(1);
+    const row = queries.builder.hasRows.first();
+    await expect(row.locator(".builder-row__htype")).toHaveValue("Observation");
+    await expect(row.locator(".builder-row__href")).toHaveValue("patient");
+    await expect(row.locator(".builder-row__cparam")).toHaveValue("code");
+    await expect(row.locator(".builder-row__value")).toHaveValue("1234-5");
+
+    await row.locator(".builder-row__value").fill("8480-6");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:code=8480-6",
+    );
+  });
+
+  test("the links-here button builds a _has filter from scratch", async ({ queries }) => {
+    await queries.builder.setUrl("Patient");
+    await queries.builder.addButton("has").click();
+    const row = queries.builder.hasRows.first();
+    await row.locator(".builder-row__htype").fill("Observation");
+    await row.locator(".builder-row__href").fill("patient");
+    await row.locator(".builder-row__cparam").fill("code");
+    await row.locator(".builder-row__value").fill("1234-5");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_has:Observation:patient:code=1234-5",
+    );
+  });
+
+  test("a multi-level chain hydrates into hop segments and round-trips", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?general-practitioner.organization.name=Acme");
+    await expect(queries.builder.chainRows).toHaveCount(1);
+    const row = queries.builder.chainRows.first();
+    const hops = row.locator(".builder-row__hopseg");
+    await expect(hops).toHaveCount(2);
+    await expect(hops.nth(0).locator(".builder-row__chainref")).toHaveValue(
+      "general-practitioner",
+    );
+    await expect(hops.nth(1).locator(".builder-row__chainref")).toHaveValue("organization");
+    await expect(row.locator(".builder-row__cparam")).toHaveValue("name");
+
+    await row.locator(".builder-row__value").fill("Beta");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?general-practitioner.organization.name=Beta",
+    );
+  });
+
+  test("drilling deeper appends a hop when the leaf is a reference", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?general-practitioner.name=x");
+    const row = queries.builder.chainRows.first();
+    const leaf = row.locator(".builder-row__cparam");
+    await leaf.fill("organization");
+    // organization is a reference param on the target types, so the
+    // drill-deeper affordance appears.
+    const deeper = row.locator("[data-chain-deeper]");
+    await expect(deeper).toBeVisible();
+    await deeper.click();
+
+    await expect(row.locator(".builder-row__hopseg")).toHaveCount(2);
+    await leaf.fill("name");
+    await row.locator(".builder-row__value").fill("Acme");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?general-practitioner.organization.name=Acme",
+    );
+  });
+
   test("picking a type swaps in that type's parameter datalist", async ({ queries }) => {
     await queries.railItem("Patient").click();
     // /ui/queries/params fills #param-options for the picked type.
