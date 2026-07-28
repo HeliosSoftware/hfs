@@ -9,6 +9,7 @@
 //! Implements the FHIR Bulk Data Access **Submit** operation:
 //! <https://build.fhir.org/ig/HL7/bulk-data/en/submit.html>.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use axum::{
@@ -24,8 +25,10 @@ use helios_persistence::core::{
 };
 use serde_json::{Value, json};
 
+use crate::config::BulkSubmitConfig;
 use crate::error::{RestError, RestResult};
-use crate::extractors::TenantExtractor;
+use crate::extractors::{PeerIp, TenantExtractor};
+use crate::rate_limit::RateLimiter;
 use crate::state::AppState;
 
 /// The SMART operation scope authorizing every `$bulk-submit` surface.
@@ -65,6 +68,59 @@ fn owns_submission(principal: Option<&Principal>, owner_subject: Option<&str>) -
         None => true,
         Some(p) => owner_subject == Some(p.subject.as_str()) || p.scopes.has_system_wildcard(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Status-poll rate limiting
+// ---------------------------------------------------------------------------
+
+/// Buckets for the status-poll surface. Private to this module, so a hammering
+/// poller cannot spend another surface's budget.
+static POLL_LIMITER: RateLimiter = RateLimiter::new();
+
+/// Who a poll is billed to: the poll token scopes the bucket to one submission,
+/// and the principal (else the peer address) separates clients sharing it. A
+/// deployment with neither auth nor a recorded peer shares one bucket per
+/// token — the restrictive reading, since polling is what we are limiting.
+fn poll_rate_limit_key(token: &str, principal: Option<&Principal>, peer: Option<IpAddr>) -> String {
+    match principal {
+        Some(p) => format!("{token}|sub:{}", p.subject),
+        None => match peer {
+            Some(ip) => format!("{token}|ip:{ip}"),
+            None => format!("{token}|anon"),
+        },
+    }
+}
+
+/// Enforces the per-client status-poll rate limit.
+///
+/// The Submit spec has Data Consumers rate-limit the status endpoint and tell a
+/// throttled client when to come back, so the `429` carries the delta-seconds
+/// until the window rolls forward (issue #399). `poll_rate_limit = 0` disables
+/// the limiter outright.
+fn check_poll_rate_limit(
+    cfg: &BulkSubmitConfig,
+    token: &str,
+    principal: Option<&Principal>,
+    peer: Option<IpAddr>,
+) -> RestResult<()> {
+    if cfg.poll_rate_limit == 0 {
+        return Ok(());
+    }
+    let key = poll_rate_limit_key(token, principal, peer);
+    POLL_LIMITER
+        .check_window(
+            &key,
+            cfg.poll_rate_limit,
+            Duration::from_secs(cfg.poll_rate_window_secs),
+        )
+        .map_err(|limited| RestError::TooManyRequests {
+            message: format!(
+                "too many status polls (max {} per {}s); honour the Retry-After header",
+                cfg.poll_rate_limit, cfg.poll_rate_window_secs
+            ),
+            retry_after_secs: Some(limited.retry_after_secs),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +399,10 @@ where
                     "too many concurrent submissions for this tenant (max {})",
                     cfg.max_concurrent_per_tenant
                 ),
+                // A slot frees when an in-flight submission finishes, which no
+                // one can time; the advertised poll cadence is the best hint
+                // available and keeps retries off a tight loop.
+                retry_after_secs: Some(cfg.retry_after_secs),
             });
         }
         let requires_token = cfg.requires_access_token != "false";
@@ -543,6 +603,7 @@ pub async fn bulk_submit_poll_handler<S>(
     State(state): State<AppState<S>>,
     Path(token): Path<String>,
     _tenant: TenantExtractor,
+    PeerIp(peer): PeerIp,
     request: Request,
 ) -> RestResult<Response>
 where
@@ -562,6 +623,10 @@ where
         .clone();
     let principal = request.extensions().get::<Principal>().cloned();
     check_submit_scope(principal.as_ref())?;
+
+    // Throttle before any job-store work: a client ignoring the advertised
+    // Retry-After should cost a cheap 429, not a round trip per poll.
+    check_poll_rate_limit(cfg, &token, principal.as_ref(), peer)?;
 
     let target = jobs
         .resolve_poll_token(&token)
