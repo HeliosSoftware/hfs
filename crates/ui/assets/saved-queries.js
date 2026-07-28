@@ -762,6 +762,90 @@
     return row;
   }
 
+  /* Related-data rows (#396): structured `_include` / `_revinclude` —
+   * `Source : ref-param [: target]` plus an Iterate toggle, serializing to
+   * `_include=Src:param[:Target]` (`:iterate` rides the key). A wildcard or
+   * unparseable value falls back to the plain include row. */
+  function includeRow(part) {
+    var reverse = part.key === "_revinclude";
+    var bits = (part.value || "").split(":");
+    var row = document.createElement("div");
+    row.className = "builder-row builder-row--include";
+    row.dataset.includeKey = part.key;
+
+    row.appendChild(pill(reverse ? "_revinclude" : "_includes"));
+
+    var base = sections.dataset.type || "";
+    var type = listedInput(row, sections.dataset.msgHasType, bits[0] || (reverse ? "" : base));
+    type.input.className = "builder-row__itype";
+    type.input.setAttribute("list", "resource-type-options");
+    row.appendChild(type.input);
+
+    row.appendChild(chainLabel(":"));
+
+    var ref = listedInput(row, sections.dataset.msgParam, bits[1] || "");
+    ref.input.className = "builder-row__iparam";
+    row.appendChild(ref.input);
+
+    var target = null;
+    if (!reverse) {
+      row.appendChild(chainLabel(":"));
+      target = document.createElement("select");
+      target.className = "builder-row__itarget";
+      row.appendChild(target);
+    }
+
+    var iterate = document.createElement("button");
+    iterate.type = "button";
+    iterate.className = "builder-row__iterate";
+    iterate.dataset.toggleIterate = "true";
+    iterate.textContent = "↘ " + sections.dataset.msgIterate;
+    iterate.setAttribute("aria-pressed", part.modifier === "iterate" ? "true" : "false");
+    row.appendChild(iterate);
+
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "builder-row__remove";
+    remove.dataset.removeRow = "true";
+    remove.setAttribute("aria-label", sections.dataset.msgRemove);
+    remove.textContent = "×";
+    row.appendChild(remove);
+
+    function refill() {
+      var t = type.input.value.trim();
+      if (!t) return;
+      fetchParams(t).then(function (meta) {
+        var codes = Object.keys(meta)
+          .filter(function (code) {
+            var m = meta[code];
+            if (m.type !== "reference") return false;
+            /* A reverse include must be able to point back at the base. */
+            if (!reverse) return true;
+            return m.targets.length === 0 || m.targets.indexOf(base) >= 0;
+          })
+          .sort();
+        fillList(ref.list, codes);
+        if (target) {
+          var chosen = bits[2] || "";
+          var targets = ((meta[ref.input.value.trim()] || {}).targets || []).slice();
+          target.textContent = "";
+          option(target, "", sections.dataset.msgAnyTarget, chosen === "");
+          targets.forEach(function (t2) {
+            option(target, t2, t2, chosen === t2);
+          });
+          if (chosen && targets.indexOf(chosen) < 0) {
+            option(target, chosen, chosen, true);
+          }
+        }
+      });
+    }
+    type.input.addEventListener("input", refill);
+    ref.input.addEventListener("input", refill);
+    refill();
+
+    return row;
+  }
+
   /* Shows the drill-into affordance on condition rows whose parameter is a
    * reference, per the registry metadata for the current base type. */
   function refreshChainAffordances() {
@@ -784,6 +868,9 @@
   function builderRow(kind, part) {
     if (kind === "condition" && part.kind === "chain") return chainRow(part);
     if (kind === "condition" && part.kind === "has") return hasRow(part);
+    if (kind === "include" && (!part.value || part.value.indexOf(":") > 0)) {
+      return includeRow(part);
+    }
 
     var row = document.createElement("div");
     row.className = "builder-row";
@@ -952,6 +1039,17 @@
           pieces.push(ref + (ctype ? ":" + ctype : ""));
         }
         key = pieces.join(".") + "." + leaf;
+      } else if (row.classList.contains("builder-row--include")) {
+        var itype = row.querySelector(".builder-row__itype").value.trim();
+        var iparam = row.querySelector(".builder-row__iparam").value.trim();
+        if (!itype || !iparam) return;
+        var itargetEl = row.querySelector(".builder-row__itarget");
+        var itarget = itargetEl ? itargetEl.value : "";
+        var iter = row.querySelector("[data-toggle-iterate]");
+        key = row.dataset.includeKey;
+        if (iter && iter.getAttribute("aria-pressed") === "true") key += ":iterate";
+        parts.push(key + "=" + itype + ":" + iparam + (itarget ? ":" + itarget : ""));
+        return;
       } else if (row.classList.contains("builder-row--has")) {
         var htype = row.querySelector(".builder-row__htype").value.trim();
         var href = row.querySelector(".builder-row__href").value.trim();
@@ -995,7 +1093,14 @@
     sections.addEventListener("click", function (event) {
       var remove = event.target.closest("[data-remove-row]");
       var drillFrom = event.target.closest("[data-chain-from]");
+      var toggleIterate = event.target.closest("[data-toggle-iterate]");
       var toggleMods = event.target.closest("[data-toggle-mods]");
+      if (toggleIterate) {
+        var on = toggleIterate.getAttribute("aria-pressed") === "true";
+        toggleIterate.setAttribute("aria-pressed", on ? "false" : "true");
+        updateUrl();
+        return;
+      }
       var modChip = event.target.closest("[data-mod-chip]");
       var addOr = event.target.closest("[data-add-or]");
       if (toggleMods) {
@@ -1057,6 +1162,16 @@
         updateUrl();
       } else if (add) {
         var kind = add.dataset.add;
+        if (kind === "include-fwd" || kind === "include-rev") {
+          var inc = includeRow({
+            key: kind === "include-rev" ? "_revinclude" : "_include",
+            modifier: "",
+            value: "",
+          });
+          builderHosts().include.appendChild(inc);
+          inc.querySelector(kind === "include-rev" ? ".builder-row__itype" : ".builder-row__iparam").focus();
+          return;
+        }
         if (kind === "has") {
           var has = hasRow({
             kind: "has",
