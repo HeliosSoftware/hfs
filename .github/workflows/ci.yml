@@ -17,11 +17,7 @@ env:
 jobs:
   test-rust:
     name: Test Rust
-    # TEMPORARY (verification): normally `[self-hosted]`. Pinned to the Windows
-    # agent to confirm the MinIO settings tests still pass with the checksum
-    # opt-out removed — i.e. with the SDK's default CRC32 path active on a CPU
-    # without SSE4.1/PCLMULQDQ. Revert once 5/5 is confirmed.
-    runs-on: [self-hosted, Windows]
+    runs-on: [self-hosted]
     # Bound the whole job so a genuine hang fails fast instead of parking a
     # runner for hours. A healthy run (full all-features build + tests) fits
     # comfortably under this.
