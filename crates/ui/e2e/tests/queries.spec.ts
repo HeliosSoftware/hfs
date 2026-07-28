@@ -253,6 +253,64 @@ test.describe("query builder", () => {
     );
   });
 
+  /* ---- modifier panel (#415) ------------------------------------------ */
+
+  test("the modifier select gates to the parameter type", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name=x");
+    const row = queries.builder.conditionRows.first();
+    // string param: :contains offered, date prefixes are not
+    await expect
+      .poll(async () => row.locator(".builder-row__modifier option").allTextContents())
+      .toContain(":contains");
+    const opts = await row.locator(".builder-row__modifier option").allTextContents();
+    expect(opts).not.toContain("ge");
+    expect(opts).not.toContain(":in");
+  });
+
+  test("the MODIFY panel explains chips and clicking one applies it", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?name=ann");
+    const row = queries.builder.conditionRows.first();
+    await row.locator("[data-toggle-mods]").click();
+    const panel = row.locator(".builder-row__modpanel");
+    await expect(panel).toBeVisible();
+    const chip = panel.locator("[data-mod-chip=contains]");
+    await expect(chip).toContainText(":contains");
+    await expect(chip).toContainText("anywhere");
+
+    await chip.click();
+    await expect(row.locator(".builder-row__modifier")).toHaveValue("contains");
+    await expect(queries.builder.url).toHaveValue("GET /Patient?name:contains=ann");
+  });
+
+  /* ---- results sort + typed columns (#416) ---------------------------- */
+
+  test("typed default columns render and the sort control re-runs the query", async ({
+    queries,
+    request,
+  }) => {
+    await createResource(request, "Patient", {
+      name: [{ family: "Sortable" }],
+      gender: "female",
+      birthDate: "1980-01-01",
+    });
+    await queries.goto();
+    await queries.builder.run("Patient?name=Sortable");
+    await queries.results.waitShown();
+
+    // Patient renders its typed default columns without any _elements.
+    const headers = queries.page.locator("#query-results-head th");
+    await expect(headers).toContainText(["id", "name", "gender", "birthDate"]);
+
+    const sort = queries.page.locator("#query-results-sort");
+    await sort.selectOption("-_lastUpdated");
+    await expect(queries.page.locator("#query-results-open")).toHaveAttribute(
+      "href",
+      "/Patient?name=Sortable&_sort=-_lastUpdated",
+    );
+  });
+
   test("picking a type swaps in that type's parameter datalist", async ({ queries }) => {
     await queries.railItem("Patient").click();
     // /ui/queries/params fills #param-options for the picked type.
