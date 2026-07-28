@@ -1018,6 +1018,7 @@
       hosts[kind].appendChild(builderRow(kind, part));
     });
     refreshChainAffordances();
+    updatePlain();
   }
 
   /* Rows → URL. */
@@ -1077,6 +1078,7 @@
     urlInput.value =
       "GET /" + type + (parts.length ? "?" + parts.join("&") : "");
     lastSerialized = urlInput.value;
+    updatePlain();
   }
 
   if (sections && urlInput) {
@@ -1273,6 +1275,117 @@
           item.dataset.railType.toLowerCase().indexOf(needle) < 0;
       });
     });
+  }
+
+
+  /* ---- "In plain English" (#395): a deterministic narration of the query,
+   * assembled from server-rendered i18n fragments. No LLM involved — this is
+   * the inverse companion of natural-language search. */
+  var plainHost = document.getElementById("query-plain");
+  var plainText = document.getElementById("query-plain-text");
+  var PLAIN = null;
+  (function () {
+    var blob = document.getElementById("plain-english-msgs");
+    if (blob) {
+      try {
+        PLAIN = JSON.parse(blob.textContent);
+      } catch (e) {
+        PLAIN = null;
+      }
+    }
+  })();
+
+  function tpl(text, args) {
+    return text.replace(/\{(\w+)\}/g, function (_, k) {
+      return args[k] != null ? args[k] : "";
+    });
+  }
+
+  function plainValue(part) {
+    var raw = part.value || "";
+    var mod = part.modifier || "";
+    var alternatives = raw.split(",").filter(Boolean).map(function (v) {
+      var p = PREFIX_RE.exec(v);
+      return p ? v.slice(2) : v;
+    });
+    var prefix = PREFIX_RE.exec(raw);
+    var verbKey = mod || (prefix ? prefix[1] : "");
+    var verb = PLAIN.verbs[verbKey] != null ? PLAIN.verbs[verbKey] : PLAIN.verbs[""];
+    var joined = alternatives
+      .map(function (v) {
+        return "\u201C" + v + "\u201D";
+      })
+      .join(" " + PLAIN.or + " ");
+    return { verb: verb, value: joined };
+  }
+
+  function updatePlain() {
+    if (!PLAIN || !plainHost || !urlInput) return;
+    var parsed = parseSearchUrl(urlInput.value);
+    if (!parsed) {
+      plainHost.hidden = true;
+      return;
+    }
+    var clauses = [];
+    var extras = [];
+    splitQuery(parsed.query).forEach(function (part) {
+      if (part.kind === "chain") {
+        var path = part.hops
+          .map(function (h) {
+            return h.ref + (h.type ? " (" + h.type + ")" : "");
+          })
+          .concat([part.key])
+          .join(PLAIN.arrow + " ");
+        var cv = plainValue(part);
+        clauses.push(tpl(PLAIN.clause, { path: path, verb: cv.verb, value: cv.value }));
+        return;
+      }
+      if (part.kind === "has") {
+        var hv = plainValue(part);
+        clauses.push(
+          tpl(PLAIN.has, { type: part.hasType, param: part.key, verb: hv.verb, value: hv.value }),
+        );
+        return;
+      }
+      if (part.key === "_include" || part.key === "_revinclude") {
+        var bits = (part.value || "").split(":");
+        var iter = part.modifier === "iterate" ? " " + PLAIN.iterate : "";
+        if (part.key === "_include") {
+          extras.push(
+            tpl(PLAIN.include, {
+              param: bits[1] || part.value,
+              type: bits[0] || parsed.type,
+              target: bits[2] ? " (" + bits[2] + ")" : "",
+            }) + iter,
+          );
+        } else {
+          extras.push(
+            tpl(PLAIN.revinclude, { type: bits[0] || "?", param: bits[1] || "?" }) + iter,
+          );
+        }
+        return;
+      }
+      if (part.key === "_count") {
+        extras.push(tpl(PLAIN.count, { n: part.value }));
+        return;
+      }
+      if (part.key === "_sort") {
+        extras.push(tpl(PLAIN.sort, { sort: part.value }));
+        return;
+      }
+      if (CONTROL_KEYS.indexOf(part.key) >= 0 || !part.key) return;
+      var v = plainValue(part);
+      clauses.push(tpl(PLAIN.clause, { path: part.key, verb: v.verb, value: v.value }));
+    });
+
+    var sentence = tpl(PLAIN.find, { type: parsed.type });
+    if (clauses.length) {
+      sentence += " \u2014 " + clauses.join(" " + PLAIN.and + " ");
+    }
+    if (extras.length) sentence += ". " + extras.join("; ");
+    sentence += ".";
+    plainText.textContent = sentence;
+    plainHost.hidden = false;
   }
 
   /* ---- Results: the FHIR search response, rendered in-page ------------- */

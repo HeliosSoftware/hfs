@@ -42,6 +42,47 @@
     <button class="btn btn--primary" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
   </div>
 
+  <p class="query-plain" id="query-plain" hidden>
+    <span class="query-plain__pill">{{ i18n.t("plain-pill") }}</span>
+    <span id="query-plain-text"></span>
+  </p>
+  <script type="application/json" id="plain-english-msgs">
+    {
+      "find": "{{ i18n.t("plain-find") }}",
+      "clause": "{{ i18n.t("plain-clause") }}",
+      "and": "{{ i18n.t("plain-and") }}",
+      "or": "{{ i18n.t("plain-or") }}",
+      "arrow": "{{ i18n.t("plain-arrow") }}",
+      "has": "{{ i18n.t("plain-has") }}",
+      "include": "{{ i18n.t("plain-include") }}",
+      "revinclude": "{{ i18n.t("plain-revinclude") }}",
+      "iterate": "{{ i18n.t("plain-iterate") }}",
+      "count": "{{ i18n.t("plain-count") }}",
+      "sort": "{{ i18n.t("plain-sort") }}",
+      "verbs": {
+        "": "{{ i18n.t("plain-verb-is") }}",
+        "contains": "{{ i18n.t("plain-verb-contains") }}",
+        "exact": "{{ i18n.t("plain-verb-exact") }}",
+        "missing": "{{ i18n.t("plain-verb-missing") }}",
+        "not": "{{ i18n.t("plain-verb-not") }}",
+        "text": "{{ i18n.t("plain-verb-text") }}",
+        "in": "{{ i18n.t("plain-verb-in") }}",
+        "not-in": "{{ i18n.t("plain-verb-not-in") }}",
+        "identifier": "{{ i18n.t("plain-verb-identifier") }}",
+        "of-type": "{{ i18n.t("plain-verb-of-type") }}",
+        "ge": "{{ i18n.t("plain-verb-ge") }}",
+        "le": "{{ i18n.t("plain-verb-le") }}",
+        "gt": "{{ i18n.t("plain-verb-gt") }}",
+        "lt": "{{ i18n.t("plain-verb-lt") }}",
+        "ne": "{{ i18n.t("plain-verb-ne") }}",
+        "eq": "{{ i18n.t("plain-verb-eq") }}",
+        "sa": "{{ i18n.t("plain-verb-sa") }}",
+        "eb": "{{ i18n.t("plain-verb-eb") }}",
+        "ap": "{{ i18n.t("plain-verb-ap") }}"
+      }
+    }
+  </script>
+
   <datalist id="param-options"></datalist>
   <datalist id="resource-type-options">
     {% for t in resource_types %}<option value="{{ t }}"></option>{% endfor %}

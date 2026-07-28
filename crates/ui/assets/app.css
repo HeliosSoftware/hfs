@@ -3900,3 +3900,26 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
   color: var(--muted);
   font-size: 12px;
 }
+
+/* In plain English (#395). */
+.query-plain {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.query-plain__pill {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}

@@ -358,6 +358,32 @@ test.describe("query builder", () => {
     );
   });
 
+  /* ---- in plain English (#395) ---------------------------------------- */
+
+  test("the plain-English line narrates conditions, chains, _has and includes", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl(
+      "Patient?name:contains=Smith,Jones&birthdate=ge1980-01-01" +
+        "&general-practitioner.name=Ann&_has:Observation:patient:code=1234-5" +
+        "&_include:iterate=Patient:general-practitioner&_count=20",
+    );
+    const text = queries.page.locator("#query-plain-text");
+    await expect(queries.page.locator("#query-plain")).toBeVisible();
+    await expect(text).toContainText("Find Patient records");
+    await expect(text).toContainText("name contains “Smith” or “Jones”");
+    await expect(text).toContainText("birthdate is on or after “1980-01-01”");
+    await expect(text).toContainText("general-practitioner’s name is “Ann”");
+    await expect(text).toContainText("related Observation whose code is “1234-5”");
+    await expect(text).toContainText("Also returning the general-practitioner of each Patient (repeatedly)");
+    await expect(text).toContainText("Showing 20 per page");
+
+    // The narration follows edits made through the rows.
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__value").first().fill("Lopez");
+    await expect(text).toContainText("name contains “Lopez” or “Jones”");
+  });
+
   test("picking a type swaps in that type's parameter datalist", async ({ queries }) => {
     await queries.railItem("Patient").click();
     // /ui/queries/params fills #param-options for the picked type.
