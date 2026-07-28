@@ -155,9 +155,20 @@ async fn control_plane_namespace_ids_are_reserved() {
     }
 }
 
-/// Hierarchical ids stay valid — `TenantId` treats `/` as the hierarchy
-/// separator and `SharedSchemaStrategy` accepts `acme/research`. Tightening the
-/// charset here would contradict a shipped feature.
+/// Hierarchical ids stay valid — `TenantId` models `/` as the hierarchy
+/// separator (`is_descendant_of`, `parent`, `ancestors`), so tightening the
+/// charset here would contradict a shipped feature of the domain type.
+///
+/// This used to cite `SharedSchemaStrategy` as the second justification; that
+/// type was unwired scaffolding and was removed in #370, so the domain model is
+/// now the whole reason. Note what the removed code got wrong, because any
+/// future per-tenant schema/bucket/database naming scheme must not repeat it:
+/// its tenant→identifier mapping was **not injective** — it folded `/` and `-`
+/// to `_` and lowercased, so `acme/research` and `acme_research` (and `Acme`
+/// and `acme`) collided onto one identifier. Two distinct tenants sharing one
+/// container is a cross-tenant data breach. Any such mapping must be injective
+/// (percent-encode, as `S3Keyspace::registry_object_id` does) and must not use
+/// `DefaultHasher`, whose output is not stable across Rust releases.
 #[tokio::test]
 async fn hierarchical_ids_are_still_accepted() {
     let server = create_test_server().await;

@@ -12,23 +12,24 @@
 //!
 //! # Design Philosophy
 //!
-//! The persistence layer enforces tenant isolation at the type level. Every storage
-//! operation requires a `TenantContext`, making it impossible to accidentally bypass
-//! tenant boundaries. This is a deliberate design choice - there is no escape hatch.
+//! The persistence layer scopes tenant data with a `TenantContext`: every
+//! tenant-scoped storage operation requires one as its first argument, so a
+//! tenant-scoped operation cannot be constructed without it. (A few operations
+//! are intentionally cross-tenant — the admin aggregate `count_by_tenant`, the
+//! tenant-registry calls — and take no context by design.)
 //!
 //! # Tenant Placement
 //!
 //! Every backend in this crate stores all tenants' records together in one
 //! set of tables, collections, or indices, separated by a `tenant_id`
-//! discriminator that every query filters on. Isolation is logical and
-//! enforced at the query level; no backend gives a tenant its own database
-//! schema or its own database. The sole exception is the S3 backend's
+//! discriminator that every query filters on — the shared-schema model chosen
+//! in design discussion
+//! [#28](https://github.com/HeliosSoftware/hfs/discussions/28). Isolation is
+//! logical and enforced at the query level; no backend gives a tenant its own
+//! database schema or its own database. The sole exception is the S3 backend's
 //! `S3TenancyMode::BucketPerTenant`, which maps each tenant to a dedicated
 //! bucket (S3's default `PrefixPerTenant` mode is shared storage). A backend
 //! reports its tenant placement through `Backend::capabilities()`.
-//!
-//! The `strategy` module's schema-per-tenant and database-per-tenant types
-//! are unused SQL/name generators — no backend calls them (see issue #370).
 //!
 //! Note that `TenancyModel` is a *different* axis: it selects whether a given
 //! resource *type* is tenant-scoped or shared across tenants, not where a
