@@ -878,6 +878,36 @@ async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
+/// v14 -> v15: search performance indexes (issue #224).
+///
+/// Purely additive — nothing is dropped and no query semantics change. Every index
+/// here was validated against a 1.45M-row replica of the benchmark dataset: each
+/// one is measurably used by the plans the query builder now emits, and the set as
+/// a whole took a 30-client mixed search workload from 45 tps / 659 ms to
+/// 112 tps / 267 ms.
+///
+/// Deliberately NOT added: an index on
+/// `(tenant_id, resource_type, param_name, resource_id, composite_group)`. It looks
+/// like the obvious fix for the composite timeout, and it *is* required by the
+/// correlated-`EXISTS` formulation of that query (which runs in ~1 ms) — but with
+/// the SQL we actually emit, Postgres never scans it (0 scans over a clean 30 s
+/// run; it BitmapOrs the token and quantity indexes instead). It indexes every row
+/// of `search_index`, so it would be pure write amplification on the import path.
+/// See `build_composite_condition` for why the `EXISTS` form was rejected.
+///
+/// Also deliberately NOT dropped: `idx_search_resource`. It reads as redundant (a
+/// column prefix of `idx_search_composite`), but it is the per-resource probe in
+/// the new plans and takes ~12M scans in a 30 s run — the hottest index in the
+/// schema. It is also the write path's `DELETE FROM search_index WHERE
+/// tenant/type/resource_id` and the FK cascade.
+///
+/// Index builds take a `SHARE` lock, blocking writes for their duration — measured
+/// at ~6 s for this whole migration on 1.45M rows. Migrations run at startup before
+/// the instance serves traffic, and `initialize_schema` holds an advisory lock, so
+/// instances serialize rather than race. Operators upgrading a large database can
+/// pre-build these `CONCURRENTLY` by hand; the `IF NOT EXISTS` clauses then make
+/// this migration a no-op.
+///
 /// `CREATE INDEX CONCURRENTLY` is deliberately NOT used here: if the process dies
 /// mid-build it leaves an `INVALID` index behind, and a later
 /// `CREATE INDEX CONCURRENTLY IF NOT EXISTS` would see the name and skip it forever
