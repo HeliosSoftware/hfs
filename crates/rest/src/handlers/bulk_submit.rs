@@ -9,6 +9,7 @@
 //! Implements the FHIR Bulk Data Access **Submit** operation:
 //! <https://build.fhir.org/ig/HL7/bulk-data/en/submit.html>.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use axum::{
@@ -19,17 +20,23 @@ use axum::{
 };
 use helios_auth::Principal;
 use helios_persistence::core::{
-    ExportPartKey, ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus,
-    submission_output_job_id,
+    ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams, ManifestStatus,
+    ResourceStorage, SubmissionId, SubmissionStatus, submission_output_job_id,
 };
 use serde_json::{Value, json};
 
+use super::bulk_common::{first_value, parse_query_pairs};
+use crate::config::BulkSubmitConfig;
 use crate::error::{RestError, RestResult};
-use crate::extractors::TenantExtractor;
+use crate::extractors::{PeerIp, TenantExtractor};
+use crate::rate_limit::RateLimiter;
 use crate::state::AppState;
 
 /// The SMART operation scope authorizing every `$bulk-submit` surface.
 const SUBMIT_SCOPE: &str = "bulk-submit";
+
+/// Query parameter selecting a status-manifest page (1-based).
+const PAGE_PARAM: &str = "page";
 
 /// The code system for the `submissionStatus` Coding (per the IG).
 const SUBMISSION_STATUS_SYSTEM: &str = "http://hl7.org/fhir/event-status";
@@ -65,6 +72,59 @@ fn owns_submission(principal: Option<&Principal>, owner_subject: Option<&str>) -
         None => true,
         Some(p) => owner_subject == Some(p.subject.as_str()) || p.scopes.has_system_wildcard(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Status-poll rate limiting
+// ---------------------------------------------------------------------------
+
+/// Buckets for the status-poll surface. Private to this module, so a hammering
+/// poller cannot spend another surface's budget.
+static POLL_LIMITER: RateLimiter = RateLimiter::new();
+
+/// Who a poll is billed to: the poll token scopes the bucket to one submission,
+/// and the principal (else the peer address) separates clients sharing it. A
+/// deployment with neither auth nor a recorded peer shares one bucket per
+/// token — the restrictive reading, since polling is what we are limiting.
+fn poll_rate_limit_key(token: &str, principal: Option<&Principal>, peer: Option<IpAddr>) -> String {
+    match principal {
+        Some(p) => format!("{token}|sub:{}", p.subject),
+        None => match peer {
+            Some(ip) => format!("{token}|ip:{ip}"),
+            None => format!("{token}|anon"),
+        },
+    }
+}
+
+/// Enforces the per-client status-poll rate limit.
+///
+/// The Submit spec has Data Consumers rate-limit the status endpoint and tell a
+/// throttled client when to come back, so the `429` carries the delta-seconds
+/// until the window rolls forward (issue #399). `poll_rate_limit = 0` disables
+/// the limiter outright.
+fn check_poll_rate_limit(
+    cfg: &BulkSubmitConfig,
+    token: &str,
+    principal: Option<&Principal>,
+    peer: Option<IpAddr>,
+) -> RestResult<()> {
+    if cfg.poll_rate_limit == 0 {
+        return Ok(());
+    }
+    let key = poll_rate_limit_key(token, principal, peer);
+    POLL_LIMITER
+        .check_window(
+            &key,
+            cfg.poll_rate_limit,
+            Duration::from_secs(cfg.poll_rate_window_secs),
+        )
+        .map_err(|limited| RestError::TooManyRequests {
+            message: format!(
+                "too many status polls (max {} per {}s); honour the Retry-After header",
+                cfg.poll_rate_limit, cfg.poll_rate_window_secs
+            ),
+            retry_after_secs: Some(limited.retry_after_secs),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +170,52 @@ fn part_scalar(param: &Value, child: &str) -> Option<String> {
                 .find(|c| c.get("name").and_then(|n| n.as_str()) == Some(child))
         })
         .and_then(scalar)
+}
+
+/// Reads an `import` / `metadata` parameter's `(parameterUrl, parameterValue)` pair.
+///
+/// Both child parts are 1..1 in the IG and `parameterUrl` SHALL be an absolute URL,
+/// so a malformed directive is a client error rather than something to drop silently.
+fn pre_coordinated_part(param: &Value, kind: &str) -> RestResult<(String, String)> {
+    let url = part_scalar(param, "parameterUrl")
+        .ok_or_else(|| bad_request(format!("`{kind}.parameterUrl` is required")))?;
+    if !url.contains("://") {
+        return Err(bad_request(format!(
+            "`{kind}.parameterUrl` must be an absolute URL, got '{url}'"
+        )));
+    }
+    let value = part_scalar(param, "parameterValue")
+        .ok_or_else(|| bad_request(format!("`{kind}.parameterValue` is required")))?;
+    Ok((url, value))
+}
+
+/// Validates the `import` directives HFS recognizes and reports the rest.
+///
+/// A recognized directive with an unusable value is always a `400`. Directives HFS
+/// does not recognize are rejected under `Prefer: handling=strict` and ignored
+/// (with a warning) otherwise. `metadata` parts carry no processing semantics — HFS
+/// retains every one of them verbatim, so none are rejected.
+fn validate_import_directives(directives: &[(String, String)], strict: bool) -> RestResult<()> {
+    for (url, value) in directives {
+        if url == IMPORT_MODE_PARAMETER_URL {
+            if ImportMode::parse(value).is_none() {
+                return Err(bad_request(format!(
+                    "unsupported import mode '{value}' for '{IMPORT_MODE_PARAMETER_URL}' \
+                     (expected replace|merge)"
+                )));
+            }
+        } else if strict {
+            return Err(bad_request(format!(
+                "unrecognized `import` directive '{url}' rejected under Prefer: handling=strict"
+            )));
+        } else {
+            tracing::warn!(
+                directive = %url,
+                "ignoring unrecognized `import` directive on $bulk-submit kickoff"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Parses a `$bulk-submit` `Parameters` body, enforcing the spec's validation SHALLs.
@@ -189,22 +295,10 @@ fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
             "fileEncryptionKey" => {
                 req.file_encryption_key = Some(p.clone());
             }
-            "import" => {
-                if let (Some(u), Some(v)) = (
-                    part_scalar(p, "parameterUrl"),
-                    part_scalar(p, "parameterValue"),
-                ) {
-                    req.import_directives.push((u, v));
-                }
-            }
-            "metadata" => {
-                if let (Some(u), Some(v)) = (
-                    part_scalar(p, "parameterUrl"),
-                    part_scalar(p, "parameterValue"),
-                ) {
-                    req.metadata.push((u, v));
-                }
-            }
+            "import" => req
+                .import_directives
+                .push(pre_coordinated_part(p, "import")?),
+            "metadata" => req.metadata.push(pre_coordinated_part(p, "metadata")?),
             _ => {}
         }
     }
@@ -306,13 +400,7 @@ where
         .map_err(|e| bad_request(format!("invalid Parameters JSON: {e}")))?;
     let req = parse_submit_request(&body)?;
 
-    // Under `Prefer: handling=strict`, reject pre-coordinated directives we do not
-    // recognize (we recognize none specifically); lenient/absent → ignore them.
-    if strict && (!req.import_directives.is_empty() || !req.metadata.is_empty()) {
-        return Err(bad_request(
-            "unrecognized `import`/`metadata` directives rejected under Prefer: handling=strict",
-        ));
-    }
+    validate_import_directives(&req.import_directives, strict)?;
 
     let sub_id = SubmissionId::new(req.submitter_key(), req.submission_id.clone());
     let ctx = tenant.context();
@@ -343,6 +431,10 @@ where
                     "too many concurrent submissions for this tenant (max {})",
                     cfg.max_concurrent_per_tenant
                 ),
+                // A slot frees when an in-flight submission finishes, which no
+                // one can time; the advertised poll cadence is the best hint
+                // available and keeps retries off a tight loop.
+                retry_after_secs: Some(cfg.retry_after_secs),
             });
         }
         let requires_token = cfg.requires_access_token != "false";
@@ -405,14 +497,25 @@ where
             ctx,
             &sub_id,
             &manifest.manifest_id,
-            req.fhir_base_url.as_deref(),
-            req.output_format.as_deref(),
-            &req.file_request_headers,
-            &req.oauth_metadata_urls,
-            req.file_encryption_key.as_ref(),
+            ManifestFetchParams {
+                fhir_base_url: req.fhir_base_url.as_deref(),
+                output_format: req.output_format.as_deref(),
+                file_request_headers: &req.file_request_headers,
+                oauth_metadata_urls: &req.oauth_metadata_urls,
+                file_encryption_key: req.file_encryption_key.as_ref(),
+                import_directives: &req.import_directives,
+                metadata: &req.metadata,
+            },
         )
         .await
         .map_err(RestError::from)?;
+    } else if !req.import_directives.is_empty() || !req.metadata.is_empty() {
+        // `import`/`metadata` are pre-coordinated with the data they describe; a
+        // status-only kickoff carries no manifest for them to attach to.
+        tracing::warn!(
+            submission = %sub_id,
+            "ignoring `import`/`metadata` directives on a kickoff without a manifestUrl"
+        );
     }
 
     // submissionStatus=stopped → abort (rolls back recorded changes).
@@ -538,11 +641,31 @@ fn parse_status_request(body: &Value) -> RestResult<(String, String)> {
     ))
 }
 
+/// Parses the 1-based `?page=N` status-manifest page selector; absent → page 1.
+fn parse_page_param(query: Option<&str>) -> RestResult<usize> {
+    let pairs = parse_query_pairs(query);
+    match first_value(&pairs, PAGE_PARAM) {
+        None => Ok(1),
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| bad_request(format!("invalid page '{raw}' (expected an integer >= 1)"))),
+    }
+}
+
 /// `GET /bulk-submit-status/{poll_token}` — poll / fetch the status manifest.
+///
+/// The manifest's `output` / `outcome` / `deleted` entries are paginated at
+/// `manifest_page_size` entries per page; when more remain, the response carries a
+/// `link[]` entry with `relation: next` pointing at `?page=N+1` on this same URL
+/// (per <https://build.fhir.org/ig/HL7/bulk-data/en/submit.html>). Every other
+/// manifest field repeats identically on each page, as the spec requires.
 pub async fn bulk_submit_poll_handler<S>(
     State(state): State<AppState<S>>,
     Path(token): Path<String>,
     _tenant: TenantExtractor,
+    PeerIp(peer): PeerIp,
     request: Request,
 ) -> RestResult<Response>
 where
@@ -563,6 +686,10 @@ where
     let principal = request.extensions().get::<Principal>().cloned();
     check_submit_scope(principal.as_ref())?;
 
+    // Throttle before any job-store work: a client ignoring the advertised
+    // Retry-After should cost a cheap 429, not a round trip per poll.
+    check_poll_rate_limit(cfg, &token, principal.as_ref(), peer)?;
+
     let target = jobs
         .resolve_poll_token(&token)
         .await
@@ -579,6 +706,7 @@ where
     }
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
+    let page = parse_page_param(request.uri().query())?;
 
     let summary = jobs
         .get_submission(ctx, sub_id)
@@ -625,15 +753,39 @@ where
     let ttl = Duration::from_secs(cfg.file_url_ttl_secs);
     let base = state.base_url().trim_end_matches('/');
 
+    // Slice the artifact rows into the requested page. Backends return them in a
+    // stable order (`ORDER BY id`) and rows are append-only until the whole
+    // submission is deleted, so a given page is the same set across polls.
+    let page_size = cfg.manifest_page_size as usize;
+    let total_pages = if page_size == 0 {
+        1
+    } else {
+        files.len().div_ceil(page_size).max(1)
+    };
+    if page > total_pages {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-status".to_string(),
+            id: format!("{token}?{PAGE_PARAM}={page}"),
+        });
+    }
+    let page_files = if page_size == 0 {
+        &files[..]
+    } else {
+        let start = (page - 1) * page_size;
+        &files[start..(start + page_size).min(files.len())]
+    };
+
     let mut output_arr = Vec::new();
     let mut outcome_arr = Vec::new();
     let mut deleted_arr = Vec::new();
     // `requiresAccessToken` describes whether retrieving *any* file requires a
     // token. Seed from the configured posture, then OR in each file — never let a
     // single open file clear a token requirement set by another file or the config.
+    // The posture an output store returns is store-wide, not per-artifact, so this
+    // stays identical on every page even though each page sees a different slice.
     let mut requires_token = cfg.requires_access_token == "true";
 
-    for f in &files {
+    for f in page_files {
         let resource_type = f
             .resource_type
             .clone()
@@ -702,6 +854,15 @@ where
         }
     }
 
+    // A single `next` link chains to the following page; the last page has none.
+    let mut link_arr = Vec::new();
+    if page < total_pages {
+        link_arr.push(json!({
+            "relation": "next",
+            "url": format!("{base}/bulk-submit-status/{token}?{PAGE_PARAM}={}", page + 1),
+        }));
+    }
+
     let manifest = json!({
         "submissionId": sub_id.submission_id,
         "transactionTime": transaction_time.to_rfc3339(),
@@ -710,9 +871,7 @@ where
         "output": output_arr,
         "outcome": outcome_arr,
         "deleted": deleted_arr,
-        // `link` is part of the status-manifest schema; HFS returns a single,
-        // non-paginated manifest, so it is always empty.
-        "link": [],
+        "link": link_arr,
     });
     let body = serde_json::to_vec(&manifest).map_err(|e| RestError::InternalError {
         message: e.to_string(),
@@ -984,7 +1143,7 @@ mod tests {
                 {"name": "headerValue", "valueString": "abc"}
             ]}),
             json!({"name": "import", "part": [
-                {"name": "parameterUrl", "valueUri": "https://helios.software/import-mode"},
+                {"name": "parameterUrl", "valueUri": IMPORT_MODE_PARAMETER_URL},
                 {"name": "parameterValue", "valueString": "replace"}
             ]}),
             json!({"name": "metadata", "part": [
@@ -1004,6 +1163,115 @@ mod tests {
         assert_eq!(req.import_directives.len(), 1);
         assert_eq!(req.import_directives[0].1, "replace");
         assert_eq!(req.metadata.len(), 1);
+    }
+
+    /// Builds a kickoff body carrying a single `import` or `metadata` directive.
+    fn body_with_directive(kind: &str, parts: Value) -> Value {
+        json!({"resourceType": "Parameters", "parameter": [
+            param("submitter", "valueIdentifier", json!({"value": "e"})),
+            param("submissionId", "valueString", json!("s")),
+            param("manifestUrl", "valueUrl", json!("https://p/m.json")),
+            param("fhirBaseUrl", "valueUrl", json!("https://p/fhir")),
+            json!({"name": kind, "part": parts}),
+        ]})
+    }
+
+    #[test]
+    fn test_directive_parts_are_required_and_absolute() {
+        for kind in ["import", "metadata"] {
+            // parameterValue missing (1..1 in the IG).
+            let body = body_with_directive(
+                kind,
+                json!([{"name": "parameterUrl", "valueUri": "https://ex/a"}]),
+            );
+            assert!(parse_submit_request(&body).is_err(), "{kind} without value");
+
+            // parameterUrl missing.
+            let body = body_with_directive(
+                kind,
+                json!([{"name": "parameterValue", "valueString": "v"}]),
+            );
+            assert!(parse_submit_request(&body).is_err(), "{kind} without url");
+
+            // parameterUrl SHALL be an absolute URL.
+            let body = body_with_directive(
+                kind,
+                json!([
+                    {"name": "parameterUrl", "valueUri": "not-absolute"},
+                    {"name": "parameterValue", "valueString": "v"}
+                ]),
+            );
+            assert!(parse_submit_request(&body).is_err(), "{kind} relative url");
+        }
+    }
+
+    #[test]
+    fn test_import_mode_directive_values() {
+        for mode in ["replace", "merge"] {
+            let body = body_with_directive(
+                "import",
+                json!([
+                    {"name": "parameterUrl", "valueUri": IMPORT_MODE_PARAMETER_URL},
+                    {"name": "parameterValue", "valueString": mode}
+                ]),
+            );
+            let req = parse_submit_request(&body).expect("recognized mode");
+            // A recognized directive is accepted under both handling postures.
+            assert!(validate_import_directives(&req.import_directives, true).is_ok());
+            assert!(validate_import_directives(&req.import_directives, false).is_ok());
+            assert_eq!(
+                ImportMode::from_directives(&req.import_directives),
+                ImportMode::parse(mode).unwrap()
+            );
+        }
+
+        // An unusable value for a directive we DO recognize is always a 400.
+        let body = body_with_directive(
+            "import",
+            json!([
+                {"name": "parameterUrl", "valueUri": IMPORT_MODE_PARAMETER_URL},
+                {"name": "parameterValue", "valueString": "upsert"}
+            ]),
+        );
+        let req = parse_submit_request(&body).expect("parses");
+        assert!(validate_import_directives(&req.import_directives, false).is_err());
+        assert!(validate_import_directives(&req.import_directives, true).is_err());
+    }
+
+    #[test]
+    fn test_unrecognized_import_directive_handling() {
+        let body = body_with_directive(
+            "import",
+            json!([
+                {"name": "parameterUrl", "valueUri": "https://ex/unknown-option"},
+                {"name": "parameterValue", "valueString": "on"}
+            ]),
+        );
+        let req = parse_submit_request(&body).expect("parses");
+        // Lenient (default): ignored, and the mode falls back to replace.
+        assert!(validate_import_directives(&req.import_directives, false).is_ok());
+        assert_eq!(
+            ImportMode::from_directives(&req.import_directives),
+            ImportMode::Replace
+        );
+        // Strict: rejected.
+        assert!(validate_import_directives(&req.import_directives, true).is_err());
+    }
+
+    #[test]
+    fn test_metadata_is_never_rejected_under_strict() {
+        // HFS retains every `metadata` part verbatim, so unknown URLs are not a
+        // reason to fail the kickoff even under `Prefer: handling=strict`.
+        let body = body_with_directive(
+            "metadata",
+            json!([
+                {"name": "parameterUrl", "valueUri": "https://ex/whatever"},
+                {"name": "parameterValue", "valueString": "v"}
+            ]),
+        );
+        let req = parse_submit_request(&body).expect("parses");
+        assert_eq!(req.metadata.len(), 1);
+        assert!(validate_import_directives(&req.import_directives, true).is_ok());
     }
 
     #[test]
@@ -1083,5 +1351,22 @@ mod tests {
         // Mismatched subject without wildcard → not owned.
         let p = principal_with("system/bulk-submit", "someone-else");
         assert!(!owns_submission(Some(&p), Some("owner")));
+    }
+
+    #[test]
+    fn test_parse_page_param() {
+        // Absent / empty query → first page.
+        assert_eq!(parse_page_param(None).unwrap(), 1);
+        assert_eq!(parse_page_param(Some("")).unwrap(), 1);
+        // Explicit page, alone or alongside other params.
+        assert_eq!(parse_page_param(Some("page=3")).unwrap(), 3);
+        assert_eq!(parse_page_param(Some("foo=bar&page=2")).unwrap(), 2);
+        // Non-numeric, zero, and negative pages are rejected.
+        for q in ["page=abc", "page=0", "page=-1", "page="] {
+            assert!(
+                matches!(parse_page_param(Some(q)), Err(RestError::BadRequest { .. })),
+                "expected 400 for query '{q}'"
+            );
+        }
     }
 }

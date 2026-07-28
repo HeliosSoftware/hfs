@@ -158,6 +158,7 @@ pub mod fhir_types;
 pub mod handlers;
 pub mod jwe;
 pub mod middleware;
+pub(crate) mod rate_limit;
 pub mod responses;
 pub mod routing;
 pub mod state;

@@ -1080,6 +1080,14 @@ fn add_bulk_submit_worker_schema(conn: &Connection) -> StorageResult<()> {
             "last_processed_line",
             "ALTER TABLE bulk_manifests ADD COLUMN last_processed_line INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "import_directives",
+            "ALTER TABLE bulk_manifests ADD COLUMN import_directives TEXT",
+        ),
+        (
+            "submission_metadata",
+            "ALTER TABLE bulk_manifests ADD COLUMN submission_metadata TEXT",
+        ),
     ];
     for (col, sql) in &manifest_adds {
         if !manifest_columns.iter().any(|c| c == col) {
@@ -1537,6 +1545,8 @@ mod tests {
             "oauth_metadata_urls",
             "file_encryption_key",
             "last_processed_line",
+            "import_directives",
+            "submission_metadata",
         ] {
             assert!(has_column("bulk_manifests", col), "missing {col}");
         }

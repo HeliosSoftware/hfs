@@ -554,6 +554,108 @@ impl NdjsonEntry {
     }
 }
 
+/// The `import` directive `parameterUrl` HFS recognizes, selecting how a submitted
+/// resource is applied when a resource with the same id already exists.
+///
+/// The Bulk Data Submit IG defines the `import` parameter as a container for
+/// *pre-coordinated* processing options and leaves the vocabulary to implementers
+/// ("a Data Consumer might allow the Data Provider to specify whether or not
+/// existing data should be replaced with the data in the submission"). This is the
+/// URL HFS publishes for that choice; its `parameterValue` is an [`ImportMode`].
+pub const IMPORT_MODE_PARAMETER_URL: &str = "https://helios.software/import-mode";
+
+/// How a submitted resource is applied when one with the same id already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportMode {
+    /// Last-write-wins: the submitted resource replaces the stored one wholesale.
+    ///
+    /// This is the default, and matches how `$bulk-submit` behaved before the
+    /// `import` directive was honored.
+    #[default]
+    Replace,
+    /// The submitted resource is merged onto the stored one with
+    /// [RFC 7396 JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7396)
+    /// semantics: elements absent from the submission are retained, elements
+    /// present overwrite, arrays are replaced wholesale, and a `null` member
+    /// removes the stored element. See [`merge_resource`].
+    Merge,
+}
+
+impl ImportMode {
+    /// The `parameterValue` string for this mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Merge => "merge",
+        }
+    }
+
+    /// Parses a `parameterValue`, returning `None` for unrecognized values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "replace" => Some(Self::Replace),
+            "merge" => Some(Self::Merge),
+            _ => None,
+        }
+    }
+
+    /// Resolves the mode from persisted `(parameterUrl, parameterValue)` pairs.
+    ///
+    /// Directives HFS does not recognize are ignored here — the kickoff handler is
+    /// what rejects them (under `Prefer: handling=strict`) or logs them. The last
+    /// recognized directive wins.
+    pub fn from_directives(directives: &[(String, String)]) -> Self {
+        directives
+            .iter()
+            .filter(|(url, _)| url == IMPORT_MODE_PARAMETER_URL)
+            .filter_map(|(_, value)| Self::parse(value))
+            .next_back()
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for ImportMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Merges a submitted resource onto a stored one per [`ImportMode::Merge`].
+///
+/// This is RFC 7396 JSON Merge Patch with one FHIR-specific guard: the stored
+/// resource's `id` is always preserved, so a submission cannot re-key a resource it
+/// is merging into. Note that arrays are replaced wholesale — merge patch has no
+/// element-wise array semantics, and FHIR repeating elements have no reliable
+/// identity to match on.
+pub fn merge_resource(stored: &Value, submitted: &Value) -> Value {
+    let mut merged = merge_patch(stored, submitted);
+    if let (Some(obj), Some(id)) = (merged.as_object_mut(), stored.get("id")) {
+        obj.insert("id".to_string(), id.clone());
+    }
+    merged
+}
+
+/// RFC 7396 `MergePatch(target, patch)`.
+fn merge_patch(target: &Value, patch: &Value) -> Value {
+    let Some(patch_obj) = patch.as_object() else {
+        return patch.clone();
+    };
+    let mut out = match target.as_object() {
+        Some(obj) => obj.clone(),
+        None => serde_json::Map::new(),
+    };
+    for (key, value) in patch_obj {
+        if value.is_null() {
+            out.remove(key);
+        } else {
+            let target_value = out.get(key).cloned().unwrap_or(Value::Null);
+            out.insert(key.clone(), merge_patch(&target_value, value));
+        }
+    }
+    Value::Object(out)
+}
+
 /// Options for bulk processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkProcessingOptions {
@@ -569,6 +671,9 @@ pub struct BulkProcessingOptions {
     /// Whether to allow updates to existing resources.
     #[serde(default = "default_allow_updates")]
     pub allow_updates: bool,
+    /// How a submitted resource is applied over an existing one with the same id.
+    #[serde(default)]
+    pub import_mode: ImportMode,
 }
 
 fn default_submit_batch_size() -> u32 {
@@ -597,6 +702,7 @@ impl BulkProcessingOptions {
             continue_on_error: default_continue_on_error(),
             max_errors: 0,
             allow_updates: default_allow_updates(),
+            import_mode: ImportMode::default(),
         }
     }
 
@@ -624,23 +730,36 @@ impl BulkProcessingOptions {
         self
     }
 
+    /// Sets how submitted resources are applied over existing ones.
+    pub fn with_import_mode(mut self, import_mode: ImportMode) -> Self {
+        self.import_mode = import_mode;
+        self
+    }
+
+    /// Resolves the content to write when a submitted resource lands on an existing
+    /// one, applying [`Self::import_mode`].
+    pub fn content_for_update(&self, stored: &Value, submitted: &Value) -> Value {
+        match self.import_mode {
+            ImportMode::Replace => submitted.clone(),
+            ImportMode::Merge => merge_resource(stored, submitted),
+        }
+    }
+
     /// Creates options for strict processing (no errors allowed).
     pub fn strict() -> Self {
         Self {
-            batch_size: default_submit_batch_size(),
             continue_on_error: false,
             max_errors: 1,
             allow_updates: true,
+            ..Self::new()
         }
     }
 
     /// Creates options for create-only processing.
     pub fn create_only() -> Self {
         Self {
-            batch_size: default_submit_batch_size(),
-            continue_on_error: true,
-            max_errors: 0,
             allow_updates: false,
+            ..Self::new()
         }
     }
 }
@@ -1292,5 +1411,117 @@ mod tests {
         let result = StreamProcessingResult::new().aborted("max errors exceeded");
         assert!(result.aborted);
         assert_eq!(result.abort_reason, Some("max errors exceeded".to_string()));
+    }
+
+    #[test]
+    fn test_import_mode_parse_and_default() {
+        assert_eq!(ImportMode::parse("replace"), Some(ImportMode::Replace));
+        assert_eq!(ImportMode::parse("merge"), Some(ImportMode::Merge));
+        assert_eq!(ImportMode::parse("Merge"), None);
+        assert_eq!(ImportMode::parse("upsert"), None);
+        // Absent directive → replace (the pre-existing behavior).
+        assert_eq!(ImportMode::default(), ImportMode::Replace);
+        assert_eq!(ImportMode::Merge.as_str(), "merge");
+    }
+
+    #[test]
+    fn test_import_mode_from_directives() {
+        let none: Vec<(String, String)> = vec![];
+        assert_eq!(ImportMode::from_directives(&none), ImportMode::Replace);
+
+        let merge = vec![(IMPORT_MODE_PARAMETER_URL.to_string(), "merge".to_string())];
+        assert_eq!(ImportMode::from_directives(&merge), ImportMode::Merge);
+
+        // Directives under other URLs never select a mode.
+        let other = vec![("https://example.org/other".to_string(), "merge".to_string())];
+        assert_eq!(ImportMode::from_directives(&other), ImportMode::Replace);
+
+        // Last recognized directive wins.
+        let both = vec![
+            (IMPORT_MODE_PARAMETER_URL.to_string(), "merge".to_string()),
+            (IMPORT_MODE_PARAMETER_URL.to_string(), "replace".to_string()),
+        ];
+        assert_eq!(ImportMode::from_directives(&both), ImportMode::Replace);
+    }
+
+    #[test]
+    fn test_merge_resource_retains_absent_elements() {
+        let stored = serde_json::json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "name": [{"family": "Original"}],
+            "gender": "female",
+            "active": true
+        });
+        let submitted = serde_json::json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "gender": "male"
+        });
+        let merged = merge_resource(&stored, &submitted);
+        // Submitted element overwrites...
+        assert_eq!(merged["gender"], serde_json::json!("male"));
+        // ...absent elements survive (this is the whole point of merge).
+        assert_eq!(merged["name"], serde_json::json!([{"family": "Original"}]));
+        assert_eq!(merged["active"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_merge_resource_replaces_arrays_and_deletes_nulls() {
+        let stored = serde_json::json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "name": [{"family": "A"}, {"family": "B"}],
+            "telecom": [{"system": "phone", "value": "555"}]
+        });
+        let submitted = serde_json::json!({
+            "resourceType": "Patient",
+            "name": [{"family": "C"}],
+            "telecom": null
+        });
+        let merged = merge_resource(&stored, &submitted);
+        // RFC 7396: arrays are replaced wholesale, never merged element-wise.
+        assert_eq!(merged["name"], serde_json::json!([{"family": "C"}]));
+        // RFC 7396: a null member removes the stored element.
+        assert!(merged.get("telecom").is_none());
+    }
+
+    #[test]
+    fn test_merge_resource_merges_nested_objects_and_keeps_stored_id() {
+        let stored = serde_json::json!({
+            "resourceType": "Observation",
+            "id": "o1",
+            "code": {"text": "BP", "coding": [{"code": "1234"}]},
+            "status": "final"
+        });
+        let submitted = serde_json::json!({
+            "resourceType": "Observation",
+            "id": "other",
+            "code": {"text": "Blood pressure"}
+        });
+        let merged = merge_resource(&stored, &submitted);
+        assert_eq!(merged["code"]["text"], serde_json::json!("Blood pressure"));
+        assert_eq!(
+            merged["code"]["coding"],
+            serde_json::json!([{"code": "1234"}])
+        );
+        assert_eq!(merged["status"], serde_json::json!("final"));
+        // A submission cannot re-key the resource it merges into.
+        assert_eq!(merged["id"], serde_json::json!("o1"));
+    }
+
+    #[test]
+    fn test_content_for_update_follows_import_mode() {
+        let stored = serde_json::json!({
+            "resourceType": "Patient", "id": "p1", "gender": "female", "active": true
+        });
+        let submitted = serde_json::json!({"resourceType": "Patient", "id": "p1"});
+
+        let replace = BulkProcessingOptions::new();
+        assert_eq!(replace.content_for_update(&stored, &submitted), submitted);
+
+        let merge = BulkProcessingOptions::new().with_import_mode(ImportMode::Merge);
+        let merged = merge.content_for_update(&stored, &submitted);
+        assert_eq!(merged["gender"], serde_json::json!("female"));
     }
 }

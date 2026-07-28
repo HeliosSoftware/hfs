@@ -13,7 +13,7 @@ HFS implements the FHIR Bulk Data Submit operation from the Argo25 branch as the
 |---|---|---|---|
 | kick-off | POST | `/$bulk-submit` | `200` sync accept; queues ingestion; `429` if blocking; `4XX` plus OperationOutcome on validation error |
 | status kick-off | POST | `/$bulk-submit-status` | `202` plus `Content-Location` poll URL |
-| poll or manifest | GET | `/bulk-submit-status/{poll_token}` | `202` in-progress with `X-Progress` and `Retry-After`; `200` plus status manifest when done; `404` after delete |
+| poll or manifest | GET | `/bulk-submit-status/{poll_token}` | `202` in-progress with `X-Progress` and `Retry-After`; `200` plus status manifest when done; `429` plus `Retry-After` when rate-limited; `404` after delete |
 | cancel | DELETE | `/bulk-submit-status/{poll_token}` | `202`; subsequent poll returns `404` |
 | HFS-served artifact | GET | `/bulk-submit-file/{poll_token}/{part}` | `200` `application/fhir+ndjson` |
 
@@ -33,9 +33,24 @@ The kick-off `Parameters` resource supports:
 - `fileRequestHeader`: part.
 - `oauthMetadataUrl`.
 - `fileEncryptionKey`: part.
-- `metadata` / `import`: parts.
+- `metadata` / `import`: parts (`parameterUrl` + `parameterValue`, both required; `parameterUrl` SHALL be absolute).
 
 At least one of `submissionStatus` or `manifestUrl` must be populated.
+
+## Pre-coordinated `import` / `metadata` Directives
+
+Both are persisted with the manifest they accompany and applied at ingestion. On a
+status-only kick-off (no `manifestUrl`) they have nothing to attach to and are ignored with a warning.
+
+| Directive | `parameterUrl` | Values | Effect |
+|---|---|---|---|
+| import mode | `https://helios.software/import-mode` | `replace` (default), `merge` | How a submitted resource is applied when one with the same id already exists |
+
+- `replace`: upsert-by-id, last-write-wins — the submitted resource replaces the stored one wholesale.
+- `merge`: RFC 7396 JSON Merge Patch of the submission onto the stored resource — elements absent from the submission are retained, present elements overwrite, arrays are replaced wholesale, and a `null` member removes the stored element. The stored `id` is always preserved.
+- A recognized directive with an unusable value (e.g. `import-mode=upsert`) is always `400`.
+- Unrecognized `import` `parameterUrl`s are `400` under `Prefer: handling=strict` and ignored with a warning otherwise.
+- `metadata` parts carry no processing semantics: HFS retains all of them verbatim on the manifest and logs them at ingestion, so none are rejected under strict handling. They are not echoed into the status manifest, whose schema defines no slot for them.
 
 ## Environment
 
@@ -55,10 +70,15 @@ At least one of `submissionStatus` or `manifestUrl` must be populated.
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention in seconds |
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact URL lifetime in seconds |
+| `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max entries per status-manifest page; `0` disables pagination |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | none | OAuth client_id for fetching protected provider files |
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | none | PEM key for `private_key_jwt` client assertion |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | `ES384` or `RS384` |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens; never `system/bulk-submit` |
+| `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` seconds advertised on an in-progress status poll |
+| `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls per client, per submission, per window; `0` disables |
+| `HFS_BULK_SUBMIT_POLL_RATE_WINDOW` | `60` | Sliding window for the poll rate limit, in seconds |
+| `HFS_BULK_SUBMIT_BLOCK_CONCURRENT_SUBMISSION` | `false` | Reject a new submission while one is in-progress; returns `429` |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | none | P-256/P-384 private key(s) for `ECDH-ES*` `fileEncryptionKey` unwrapping — PEM (PKCS#8/SEC1) or a JWK / JWK Set |
 
 Job state reuses the same backend as the FHIR resources. SQLite shares `./data/hfs.db`; PostgreSQL shares `HFS_DATABASE_URL`. Bulk submit is available on `sqlite`, `postgres`, and their `-elasticsearch` composites. Other backends return `501`. The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubmitProvider` ingestion engine) and `BulkSubmitRestWorker` (full `$bulk-submit` REST worker/job-store): SQLite and Postgres advertise both, while S3 advertises only `BulkSubmitIngest` and never owns REST-worker job state.
@@ -71,7 +91,8 @@ Job state reuses the same backend as the FHIR resources. SQLite shares `./data/h
 - `deleted` files, either transaction Bundles or resource refs, are applied as deletes.
 - Partial success remains `200` with a populated `error[]` array of OperationOutcome NDJSON.
 - Per-resource issues carry the `artifact-relatedArtifact` extension.
-- `import` directives use upsert-by-id with last-write-wins, matching `replace`. `merge` semantics are a documented follow-up.
+- Resources are ingested per the submission's import mode (`replace` by default); see the directives section above.
+- NDJSON files stream to the ingestion engine; JWE-encrypted files are the exception and are buffered whole, since the authentication tag trails the ciphertext.
 - JWE decryption for `fileEncryptionKey` is built unconditionally; the `bulk-submit-jwe` feature is a deprecated no-op.
 - Both the manifest and each output/deleted file are decrypted. A plaintext file is rejected when a key was supplied; a plaintext manifest is tolerated with a warning.
 - Supported `alg`: `dir`, `A128KW`/`A192KW`/`A256KW`, `A128GCMKW`/`A192GCMKW`/`A256GCMKW`, `ECDH-ES` and `ECDH-ES+A128KW`/`+A192KW`/`+A256KW`.
@@ -79,5 +100,10 @@ Job state reuses the same backend as the FHIR resources. SQLite shares `./data/h
 - `RSA-OAEP`/`RSA-OAEP-256` are deliberately rejected: the only pure-Rust RSA implementation carries RUSTSEC-2023-0071 (Marvin Attack timing sidechannel) with no fix. Use `ECDH-ES` for asymmetric CEK delivery. RSA private keys are rejected by the config loader too.
 - `RSA1_5` and `PBES2-*` are also rejected; every error names the algorithm and the reason.
 - `fileEncryptionKey.value` may be base64url key material, an `oct` JWK, or itself a JWE delivering the CEK. The last form needs `HFS_BULK_SUBMIT_DECRYPTION_KEY` (P-256/P-384 PEM or JWK/JWK Set) — as do `ECDH-ES*` files.
-- Status `link` and pagination: HFS returns a single, non-paginated status manifest; the `link` array is always present and empty.
+- Status `link` and pagination: the status manifest is paginated at `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE`
+  entries (`output` + `outcome` + `deleted` combined). When more remain, `link` carries a single
+  `{relation: next, url: .../bulk-submit-status/{token}?page=N}` entry; every other manifest field repeats
+  identically on each page. Fetch pages from the status URL with `?page=N` (1-based) — out of range is `404`,
+  malformed is `400`. Page size `0` disables pagination and yields one manifest with an empty `link`.
+- Status-poll pacing: the `202` advertises `HFS_BULK_SUBMIT_RETRY_AFTER`, and a client that polls past `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` within the window gets `429` plus a `Retry-After` pointing at the end of that window. Buckets are keyed by poll token plus principal, falling back to peer address; the check runs before any job-store work, so throttled polls stay cheap.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.

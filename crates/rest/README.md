@@ -211,12 +211,23 @@ them, and exposes results through a status manifest.
   status artifacts). See the [API Endpoints](#api-endpoints) table.
 - **Scope**: every surface requires the `system/bulk-submit` SMART scope when auth is
   enabled; status, cancel, and file surfaces also enforce submission ownership.
+- **Poll pacing**: an in-progress poll advertises `Retry-After`
+  (`HFS_BULK_SUBMIT_RETRY_AFTER`); a client that ignores it and hammers the poll URL
+  is throttled with `429` plus a `Retry-After` pointing at the end of the rate window
+  (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` / `_POLL_RATE_WINDOW`). Buckets are per client
+  (principal, else peer address) per poll token.
 - **Backends**: available on `sqlite`, `postgres`, and their `-elasticsearch`
   composites; other backends return `501`. Job state reuses the FHIR-resource
   backend — no separate job store to configure.
 - **Status manifest**: emits `output[]`, `outcome[]`, and `deleted[]` arrays (each
   entry carries `url`, `count`, and `fileSize`), plus `requiresAccessToken`,
-  `transactionTime`, and an always-present `link[]` (single, non-paginated).
+  `transactionTime`, and `link[]`.
+- **Status pagination**: entries are split across pages of
+  `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` (default `1000`); when more remain, `link[]`
+  carries one `{"relation": "next", "url": ".../bulk-submit-status/{token}?page=N"}`
+  entry and every other manifest field repeats identically on each page. Pages are
+  fetched from the same status URL with `?page=N` (1-based); an out-of-range page is
+  `404` and a malformed one `400`. Set the page size to `0` to disable pagination.
 
 Configured via `HFS_BULK_SUBMIT_*` environment variables:
 
@@ -230,6 +241,9 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact-URL lifetime, seconds. |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention after completion, seconds. |
 | `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll. |
+| `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max `output` + `outcome` + `deleted` entries per status-manifest page; further pages are chained by `link[]` `next`. `0` disables pagination. |
+| `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls allowed per client, per submission, per rate window. `0` disables poll rate limiting. |
+| `HFS_BULK_SUBMIT_POLL_RATE_WINDOW` | `60` | Sliding window for the poll rate limit, seconds. |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit-worker pool size. |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers. |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (kick-off returns `429` if exceeded). |
@@ -241,7 +255,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
-| `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | Private key(s) for asymmetric JWE key management — PEM (PKCS#8/PKCS#1/SEC1) or a JWK / JWK Set. |
+| `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when

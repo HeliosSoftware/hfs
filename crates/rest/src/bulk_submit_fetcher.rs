@@ -6,16 +6,23 @@
 //! provider-supplied request headers, `gzip`, and — when files require an access
 //! token — a read-scoped bearer obtained via an optional [`FileTokenProvider`].
 //!
+//! NDJSON bodies are streamed to the ingestion engine rather than buffered, so a
+//! manifest referencing multi-gigabyte files costs a fixed amount of memory per
+//! concurrent fetch. The one exception is `fileEncryptionKey` (JWE) files, whose
+//! format forces whole-body buffering — see [`HttpSubmitInputFetcher::open_file_stream`].
+//!
 //! When the submission carries a `fileEncryptionKey`, the manifest and every
 //! file are decrypted with the [`crate::jwe`] module (built unconditionally).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use helios_persistence::core::{FileTokenProvider, RemoteManifest, SubmitInputFetcher};
 use helios_persistence::error::{BackendError, StorageError, StorageResult};
 use serde_json::Value;
 use tokio::io::AsyncBufRead;
+use tokio_util::io::StreamReader;
 
 use crate::jwe::{self, DecryptionKeys, PrivateKey};
 
@@ -278,6 +285,9 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
             .map_err(|e| Self::err(format!("parsing manifest {url}: {e}")))
     }
 
+    /// Returns as soon as the response headers arrive; the body is read lazily
+    /// as the caller consumes lines. JWE-encrypted files are the exception and
+    /// are buffered whole (the authentication tag trails the ciphertext).
     async fn open_file_stream(
         &self,
         url: &str,
@@ -307,17 +317,31 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
                 resp.status()
             )));
         }
-        // Buffer the (gzip-decoded) body; NDJSON files in practice fit comfortably,
-        // and this avoids pulling in a stream→AsyncRead bridge dependency.
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Self::err(format!("reading file {url}: {e}")))?;
-        let bytes = self
-            .decrypt_file(bytes.to_vec(), keys.as_ref())
-            .map_err(|e| Self::err(format!("decrypting file {url}: {e}")))?;
-        Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-            bytes,
+        if let Some(keys) = &keys {
+            // A JWE is a single AEAD ciphertext whose authentication tag is the
+            // final segment: no plaintext may be released before the whole body
+            // has been read and the tag verified. Encrypted files are therefore
+            // necessarily buffered; unencrypted ones stream.
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| Self::err(format!("reading file {url}: {e}")))?;
+            let bytes = self
+                .decrypt_file(bytes.to_vec(), Some(keys))
+                .map_err(|e| Self::err(format!("decrypting file {url}: {e}")))?;
+            return Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+                bytes,
+            ))));
+        }
+        // Stream the (gzip-decoded) body straight through to the ingestion
+        // engine, so peak memory stays bounded by the buffer size rather than
+        // by the file size.
+        let owned_url = url.to_string();
+        let stream = resp
+            .bytes_stream()
+            .map_err(move |e| std::io::Error::other(format!("reading file {owned_url}: {e}")));
+        Ok(Box::new(tokio::io::BufReader::new(StreamReader::new(
+            stream,
         ))))
     }
 }
@@ -405,6 +429,84 @@ mod tests {
             .build_get("http://example.com/m.json", &headers, false, &[])
             .await;
         assert!(rb.is_ok());
+    }
+
+    /// Serves one chunked NDJSON response: the first line, then (only after
+    /// `release` fires) the second line and the terminating chunk. A buffering
+    /// fetcher cannot hand back a reader until the body completes, so it would
+    /// deadlock here — which the surrounding timeout turns into a failure.
+    async fn serve_two_chunks(release: tokio::sync::oneshot::Receiver<()>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request head so the client's write completes.
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/fhir+ndjson\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n";
+            sock.write_all(head).await.unwrap();
+
+            let line1 = "{\"resourceType\":\"Patient\",\"id\":\"1\"}\n";
+            sock.write_all(format!("{:x}\r\n{line1}\r\n", line1.len()).as_bytes())
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+
+            // Hold the body open until the test has consumed line 1.
+            let _ = release.await;
+
+            let line2 = "{\"resourceType\":\"Patient\",\"id\":\"2\"}\n";
+            sock.write_all(format!("{:x}\r\n{line2}\r\n", line2.len()).as_bytes())
+                .await
+                .unwrap();
+            sock.write_all(b"0\r\n\r\n").await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        format!("http://{addr}/file.ndjson")
+    }
+
+    #[tokio::test]
+    async fn test_open_file_stream_yields_lines_before_body_completes() {
+        use tokio::io::AsyncBufReadExt;
+
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let url = serve_two_chunks(wait).await;
+        let fetcher = fetcher();
+
+        let reader = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetcher.open_file_stream(&url, &[], false, &[], None),
+        )
+        .await
+        .expect("open_file_stream must not wait for the whole body")
+        .expect("fetch succeeds");
+
+        let mut lines = reader.lines();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("first line must arrive before the body completes")
+            .unwrap()
+            .unwrap();
+        assert!(first.contains("\"id\":\"1\""));
+
+        // Let the server finish; the rest of the stream must follow.
+        release.send(()).unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("second line arrives")
+            .unwrap()
+            .unwrap();
+        assert!(second.contains("\"id\":\"2\""));
+        assert!(lines.next_line().await.unwrap().is_none());
     }
 
     #[test]
