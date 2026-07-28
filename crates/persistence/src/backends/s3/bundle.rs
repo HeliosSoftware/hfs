@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
-    ResourceStorage, VersionedStorage,
+    ResourceStorage, VersionedStorage, bundle_if_match_gate,
 };
 use crate::error::{BackendError, ResourceError, StorageError, TransactionError, ValidationError};
 use crate::tenant::TenantContext;
@@ -262,8 +262,22 @@ impl S3Backend {
                     Err(err) => return Err(err),
                 };
 
+                // Evaluate `ifMatch` up front so an unsatisfiable precondition
+                // fails identically whether or not the resource exists. It is a
+                // list, satisfied when any listed tag matches (issue #311), and
+                // `*` requires a current representation — so with no existing
+                // resource a supplied `ifMatch` must fail rather than create.
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    current.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok((failure, None));
+                }
+
                 if let Some(existing) = current {
                     let updated = if let Some(if_match) = entry.if_match.as_deref() {
+                        // Re-check atomically against the object store; the gate
+                        // above only used the version we read a moment ago.
                         self.update_with_match(tenant, &resource_type, &id, if_match, resource)
                             .await?
                     } else {
@@ -301,6 +315,18 @@ impl S3Backend {
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
                 let snapshot = self.read(tenant, &resource_type, &id).await.ok().flatten();
+
+                // Gate before dispatching. `delete_with_match` reports a missing
+                // resource as `NotFound`, which the idempotent-delete arm below
+                // turns into a *success* — so without this, `ifMatch` against an
+                // already-absent resource silently reported "deleted" instead of
+                // failing the precondition.
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    snapshot.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok((failure, None));
+                }
 
                 let delete_result = if let Some(if_match) = entry.if_match.as_deref() {
                     self.delete_with_match(tenant, &resource_type, &id, if_match)
