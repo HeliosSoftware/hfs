@@ -19,7 +19,6 @@
 //! | `dir` | the shared key itself is the CEK |
 //! | `A128KW`, `A192KW`, `A256KW` | AES key wrap (RFC 3394) under the shared key |
 //! | `A128GCMKW`, `A192GCMKW`, `A256GCMKW` | AES-GCM key wrap under the shared key |
-//! | `RSA-OAEP`, `RSA-OAEP-256` | a configured RSA private key |
 //! | `ECDH-ES`, `ECDH-ES+A128KW`, `+A192KW`, `+A256KW` | a configured P-256/P-384 private key |
 //!
 //! | `enc` (content encryption) |
@@ -29,9 +28,19 @@
 //!
 //! `zip: "DEF"` payload compression is decompressed after decryption.
 //!
-//! Deliberately unsupported: `RSA1_5` (RFC 8017 §7.2 padding-oracle exposure;
-//! deprecated by RFC 8725 for JOSE) and `PBES2-*` (password-based — the submit
-//! flow has no shared password).
+//! # Deliberately unsupported
+//!
+//! - `RSA-OAEP` / `RSA-OAEP-256`. The only pure-Rust implementation is the `rsa`
+//!   crate, which carries [RUSTSEC-2023-0071] (Marvin Attack — key recovery
+//!   through a decryption timing sidechannel) with no fixed release. Rather than
+//!   take a knowingly vulnerable RSA implementation into a server that handles
+//!   PHI, the RSA arms are rejected; use the `ECDH-ES` family to deliver a
+//!   content-encryption key asymmetrically.
+//! - `RSA1_5`. RFC 8017 §7.2 padding-oracle exposure; deprecated for JOSE by
+//!   RFC 8725.
+//! - `PBES2-*`. Password-based — the submit flow has no shared password.
+//!
+//! [RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071
 
 use std::io::Read;
 
@@ -49,6 +58,13 @@ pub type JweError = String;
 
 type Result<T> = std::result::Result<T, JweError>;
 
+/// Why the RSA key-management arms are absent — reused by the `alg` rejection
+/// and by private-key loading so both point at the same reason.
+const RSA_UNSUPPORTED: &str = "RSA key management (RSA-OAEP / RSA-OAEP-256 / RSA1_5) is not \
+     supported: the only pure-Rust RSA implementation carries RUSTSEC-2023-0071 \
+     (Marvin Attack timing sidechannel) with no fixed release. Use the ECDH-ES \
+     family with a P-256 or P-384 key instead.";
+
 fn b64(part: &str) -> Result<Vec<u8>> {
     // Tolerate padded input: some producers emit standard base64url with `=`.
     let trimmed = part.trim_end_matches('=');
@@ -64,13 +80,6 @@ fn b64(part: &str) -> Result<Vec<u8>> {
 /// A private key usable for asymmetric JWE key management.
 #[derive(Clone)]
 pub enum PrivateKey {
-    /// RSA key for `RSA-OAEP` / `RSA-OAEP-256`.
-    Rsa {
-        /// JWK `kid`, when the key was supplied as a JWK.
-        kid: Option<String>,
-        /// The decoded private key.
-        key: rsa::RsaPrivateKey,
-    },
     /// NIST P-256 key for the `ECDH-ES` family.
     P256 {
         /// JWK `kid`, when the key was supplied as a JWK.
@@ -91,7 +100,6 @@ impl std::fmt::Debug for PrivateKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never render key material.
         let (kind, kid) = match self {
-            PrivateKey::Rsa { kid, .. } => ("RSA", kid),
             PrivateKey::P256 { kid, .. } => ("P-256", kid),
             PrivateKey::P384 { kid, .. } => ("P-384", kid),
         };
@@ -102,9 +110,7 @@ impl std::fmt::Debug for PrivateKey {
 impl PrivateKey {
     fn kid(&self) -> Option<&str> {
         match self {
-            PrivateKey::Rsa { kid, .. }
-            | PrivateKey::P256 { kid, .. }
-            | PrivateKey::P384 { kid, .. } => kid.as_deref(),
+            PrivateKey::P256 { kid, .. } | PrivateKey::P384 { kid, .. } => kid.as_deref(),
         }
     }
 }
@@ -116,7 +122,7 @@ impl PrivateKey {
 pub struct DecryptionKeys {
     /// Symmetric key material — the CEK for `dir`, or the KEK for `A*KW`.
     pub shared: Option<Vec<u8>>,
-    /// Private keys for `RSA-OAEP*` / `ECDH-ES*` recipients.
+    /// Private keys for `ECDH-ES*` recipients.
     pub private: Vec<PrivateKey>,
 }
 
@@ -183,12 +189,13 @@ impl DecryptionKeys {
 // Private-key loading
 // ---------------------------------------------------------------------------
 
-/// Parses one or more private keys from PEM (PKCS#8, PKCS#1, or SEC1) or from a
+/// Parses one or more EC private keys from PEM (PKCS#8 or SEC1) or from a
 /// JWK / JWK Set document.
 ///
 /// A PEM bundle may hold several keys; every `-----BEGIN … PRIVATE KEY-----`
-/// block is parsed. Keys whose type is not usable for JWE are an error rather
-/// than a silent skip, so a misconfigured deployment fails at startup.
+/// block is parsed. Keys whose type is not usable for JWE — including RSA keys,
+/// since the RSA arms are unsupported — are an error rather than a silent skip,
+/// so a misconfigured deployment fails at startup.
 pub fn load_private_keys(material: &str) -> Result<Vec<PrivateKey>> {
     let trimmed = material.trim();
     if trimmed.is_empty() {
@@ -214,8 +221,7 @@ pub fn load_private_keys(material: &str) -> Result<Vec<PrivateKey>> {
 }
 
 fn load_private_keys_pem(pem: &str) -> Result<Vec<PrivateKey>> {
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::DecodePrivateKey;
+    use p256::pkcs8::DecodePrivateKey;
 
     const END: &str = "-----END ";
 
@@ -237,11 +243,7 @@ fn load_private_keys_pem(pem: &str) -> Result<Vec<PrivateKey>> {
         rest = &after[block_end..];
 
         let key = if block.contains("BEGIN RSA PRIVATE KEY") {
-            PrivateKey::Rsa {
-                kid: None,
-                key: rsa::RsaPrivateKey::from_pkcs1_pem(block)
-                    .map_err(|e| format!("invalid PKCS#1 RSA private key: {e}"))?,
-            }
+            return Err(RSA_UNSUPPORTED.to_string());
         } else if block.contains("BEGIN EC PRIVATE KEY") {
             // SEC1 does not record the curve in the label; try both sizes.
             match p256::SecretKey::from_sec1_pem(block) {
@@ -254,18 +256,14 @@ fn load_private_keys_pem(pem: &str) -> Result<Vec<PrivateKey>> {
             }
         } else if block.contains("BEGIN PRIVATE KEY") {
             // PKCS#8 — the algorithm OID decides.
-            if let Ok(key) = rsa::RsaPrivateKey::from_pkcs8_pem(block) {
-                PrivateKey::Rsa { kid: None, key }
-            } else if let Ok(key) = p256::SecretKey::from_pkcs8_pem(block) {
+            if let Ok(key) = p256::SecretKey::from_pkcs8_pem(block) {
                 PrivateKey::P256 { kid: None, key }
             } else if let Ok(key) = p384::SecretKey::from_pkcs8_pem(block) {
                 PrivateKey::P384 { kid: None, key }
             } else {
-                return Err(
-                    "PKCS#8 private key is not RSA, P-256, or P-384 (the key types JWE \
-                     key management supports here)"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "PKCS#8 private key is not P-256 or P-384. {RSA_UNSUPPORTED}"
+                ));
             }
         } else {
             // A certificate or public key in the same bundle — not an error.
@@ -298,26 +296,7 @@ fn ec_jwk_str(jwk: &Value) -> String {
 fn private_key_from_jwk(jwk: &Value) -> Result<PrivateKey> {
     let kid = jwk.get("kid").and_then(|v| v.as_str()).map(str::to_string);
     match jwk.get("kty").and_then(|v| v.as_str()) {
-        Some("RSA") => {
-            use rsa::BigUint;
-            let field = |name: &str| -> Result<BigUint> {
-                let raw = jwk
-                    .get(name)
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| format!("RSA JWK is missing '{name}'"))?;
-                Ok(BigUint::from_bytes_be(&b64(raw)?))
-            };
-            let n = field("n")?;
-            let e = field("e")?;
-            let d = field("d")?;
-            // p/q are optional in RFC 7518 but required to build a usable key
-            // without factoring; both are present in every real-world JWK.
-            let p = field("p")?;
-            let q = field("q")?;
-            let key = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q])
-                .map_err(|e| format!("invalid RSA JWK: {e}"))?;
-            Ok(PrivateKey::Rsa { kid, key })
-        }
+        Some("RSA") => Err(RSA_UNSUPPORTED.to_string()),
         Some("EC") => {
             let jwk_str = ec_jwk_str(jwk);
             match jwk.get("crv").and_then(|v| v.as_str()) {
@@ -336,9 +315,7 @@ fn private_key_from_jwk(jwk: &Value) -> Result<PrivateKey> {
                 )),
             }
         }
-        other => Err(format!(
-            "unsupported JWK kty {other:?} (expected RSA or EC)"
-        )),
+        other => Err(format!("unsupported JWK kty {other:?} (expected EC)")),
     }
 }
 
@@ -647,42 +624,6 @@ fn derive_cek(
             aes_gcm_open(kek, &b64(iv)?, &sealed, &[])
                 .map_err(|_| format!("JWE {alg} key unwrap failed"))
         }
-        "RSA-OAEP" | "RSA-OAEP-256" => {
-            let kid = header.get("kid").and_then(|v| v.as_str());
-            let candidates = keys.candidates(kid);
-            if candidates.is_empty() {
-                return Err(format!(
-                    "JWE alg={alg} requires a configured RSA private key \
-                     (set HFS_BULK_SUBMIT_DECRYPTION_KEY)"
-                ));
-            }
-            let padding = || {
-                if alg == "RSA-OAEP" {
-                    rsa::Oaep::new::<sha1::Sha1>()
-                } else {
-                    rsa::Oaep::new::<sha2::Sha256>()
-                }
-            };
-            let mut saw_rsa = false;
-            for key in candidates {
-                if let PrivateKey::Rsa { key, .. } = key {
-                    saw_rsa = true;
-                    if let Ok(cek) = key.decrypt(padding(), encrypted_key) {
-                        return Ok(cek);
-                    }
-                }
-            }
-            if saw_rsa {
-                Err(format!(
-                    "JWE {alg} key unwrap failed with the configured RSA key(s)"
-                ))
-            } else {
-                Err(format!(
-                    "JWE alg={alg} requires a configured RSA private key \
-                     (the configured key(s) are not RSA)"
-                ))
-            }
-        }
         "ECDH-ES" | "ECDH-ES+A128KW" | "ECDH-ES+A192KW" | "ECDH-ES+A256KW" => {
             let z = ecdh_shared_secret(header, keys)?;
             let direct = alg == "ECDH-ES";
@@ -722,18 +663,18 @@ fn derive_cek(
                 aes_key_unwrap(kw, &derived, encrypted_key)
             }
         }
-        "RSA1_5" => Err(
+        "RSA-OAEP" | "RSA-OAEP-256" => Err(format!("JWE alg={alg} is rejected. {RSA_UNSUPPORTED}")),
+        "RSA1_5" => Err(format!(
             "JWE alg=RSA1_5 is rejected: RSAES-PKCS1-v1_5 is deprecated for JOSE \
-             (RFC 8725) because of its padding-oracle exposure"
-                .to_string(),
-        ),
+             (RFC 8725) because of its padding-oracle exposure. {RSA_UNSUPPORTED}"
+        )),
         other if other.starts_with("PBES2-") => Err(format!(
             "unsupported JWE alg '{other}': password-based key derivation has no \
              shared secret in the bulk-submit flow"
         )),
         other => Err(format!(
             "unsupported JWE alg '{other}' (expected dir|A128KW|A192KW|A256KW|\
-             A128GCMKW|A192GCMKW|A256GCMKW|RSA-OAEP|RSA-OAEP-256|ECDH-ES[+A128KW|+A192KW|+A256KW])"
+             A128GCMKW|A192GCMKW|A256GCMKW|ECDH-ES[+A128KW|+A192KW|+A256KW])"
         )),
     }
 }
@@ -784,7 +725,13 @@ fn ecdh_shared_secret(header: &Map<String, Value>, keys: &DecryptionKeys) -> Res
 }
 
 /// NIST SP 800-56A Concat KDF with SHA-256, as profiled by RFC 7518 §4.6.2.
-fn concat_kdf(z: &[u8], alg_id: &str, apu: &[u8], apv: &[u8], key_len: usize) -> Vec<u8> {
+pub(crate) fn concat_kdf(
+    z: &[u8],
+    alg_id: &str,
+    apu: &[u8],
+    apv: &[u8],
+    key_len: usize,
+) -> Vec<u8> {
     use sha2::{Digest, Sha256};
 
     fn len_prefixed(out: &mut Vec<u8>, data: &[u8]) {
@@ -1081,10 +1028,11 @@ mod tests {
         assert_eq!(out, b"Live long and prosper.");
     }
 
-    /// RFC 7516 Appendix A.1 — `RSA-OAEP` + `A256GCM`, exercising RSA JWK
-    /// loading and the RSA key-unwrap path against a known vector.
+    /// RFC 7516 Appendix A.1 — `RSA-OAEP` + `A256GCM`. Deliberately *not*
+    /// supported: both the RSA JWK and the JWE itself are rejected with an
+    /// error naming RUSTSEC-2023-0071, so the reason survives in the code.
     #[test]
-    fn rfc7516_a1_rsa_oaep_a256gcm() {
+    fn rfc7516_a1_rsa_oaep_is_rejected_with_the_advisory() {
         // A.1.3, with the RFC's display line breaks removed.
         let jwk = serde_json::json!({
             "kty": "RSA",
@@ -1094,7 +1042,8 @@ mod tests {
             "p": "1r52Xk46c-LsfB5P442p7atdPUrxQSy4mti_tZI3Mgf2EuFVbUoDBvaRQ-SWxkbkmoEzL7JXroSBjSrK3YIQgYdMgyAEPTPjXv_hI2_1eTSPVZfzL0lffNn03IXqWF5MDFuoUYE0hzb2vhrlN_rKrbfDIwUbTrjjgieRbwC6Cl0",
             "q": "wLb35x7hmQWZsWJmB_vle87ihgZ19S8lBEROLIsZG4ayZVe9Hi9gDVCOBmUDdaDYVTSNx_8Fyw1YYa9XGrGnDew00J28cRUoeBB_jKI1oma0Orv1T9aXIWxKwd4gvxFImOWr3QRL9KEBRzk2RatUBnmDZJTIAfwTs0g68UZHvtc",
         });
-        let keys = DecryptionKeys::private(load_private_keys(&jwk.to_string()).expect("A.1.3 JWK"));
+        let err = load_private_keys(&jwk.to_string()).unwrap_err();
+        assert!(err.contains("RUSTSEC-2023-0071"), "{err}");
 
         // A.1.7, with the RFC's display line breaks removed.
         let compact = "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ.\
@@ -1102,11 +1051,10 @@ mod tests {
                        48V1_ALb6US04U3b.\
                        5eym8TW_c8SuK0ltJ3rpYIzOeDQz7TALvtu6UG9oMo4vpzs9tX_EFShS8iB7j6jiSdiwkIr3ajwQzaBtQD_A.\
                        XFBoMYUZodetZdvTiFvSkQ";
-        let out = decrypt(compact.as_bytes(), &keys).expect("RFC 7516 A.1 vector");
-        assert_eq!(
-            out,
-            b"The true sign of intelligence is not knowledge but imagination."
-        );
+        let err = decrypt(compact.as_bytes(), &DecryptionKeys::default()).unwrap_err();
+        assert!(err.contains("RSA-OAEP"), "{err}");
+        assert!(err.contains("RUSTSEC-2023-0071"), "{err}");
+        assert!(err.contains("ECDH-ES"), "{err}");
     }
 
     #[test]
@@ -1275,41 +1223,18 @@ mod tests {
     }
 
     #[test]
-    fn rsa_oaep_round_trip() {
+    fn ecdh_es_without_a_configured_key_names_the_missing_configuration() {
         use rand::rngs::OsRng;
-        use rsa::{RsaPrivateKey, RsaPublicKey};
 
-        let mut rng = OsRng;
-        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let public = RsaPublicKey::from(&private);
-
-        let cek = vec![0xaau8; 32];
-        let encrypted_key = public
-            .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), &cek)
-            .unwrap();
-
-        let iv = [0xbbu8; 12];
-        let plaintext = b"rsa-oaep";
-        let header = r#"{"alg":"RSA-OAEP-256","enc":"A256GCM"}"#;
-        let aad = B64URL.encode(header);
-        let (ct, tag) = seal_gcm(&cek, &iv, aad.as_bytes(), plaintext);
-        let compact = format!(
-            "{}.{}.{}.{}.{}",
-            aad,
-            B64URL.encode(&encrypted_key),
-            B64URL.encode(iv),
-            B64URL.encode(&ct),
-            B64URL.encode(&tag)
+        let ephemeral = p256::SecretKey::random(&mut OsRng);
+        let epk: Value = serde_json::from_str(&ephemeral.public_key().to_jwk_string()).unwrap();
+        let header = serde_json::json!({"alg": "ECDH-ES", "enc": "A256GCM", "epk": epk});
+        let compact = dir_compact(
+            &serde_json::to_string(&header).unwrap(),
+            &[0u8; 12],
+            b"ct",
+            b"tag",
         );
-
-        let keys = DecryptionKeys::private(vec![PrivateKey::Rsa {
-            kid: None,
-            key: private,
-        }]);
-        let out = decrypt(compact.as_bytes(), &keys).unwrap();
-        assert_eq!(out, plaintext);
-
-        // Without a configured key the error names the missing configuration.
         let err = decrypt(compact.as_bytes(), &DecryptionKeys::default()).unwrap_err();
         assert!(err.contains("HFS_BULK_SUBMIT_DECRYPTION_KEY"), "{err}");
     }
@@ -1398,6 +1323,11 @@ mod tests {
     #[test]
     fn unsupported_algorithms_name_themselves() {
         for (header, needle) in [
+            (r#"{"alg":"RSA-OAEP","enc":"A256GCM"}"#, "RUSTSEC-2023-0071"),
+            (
+                r#"{"alg":"RSA-OAEP-256","enc":"A256GCM"}"#,
+                "RUSTSEC-2023-0071",
+            ),
             (r#"{"alg":"RSA1_5","enc":"A128CBC-HS256"}"#, "RSA1_5"),
             (
                 r#"{"alg":"PBES2-HS256+A128KW","enc":"A128GCM"}"#,
@@ -1437,28 +1367,36 @@ mod tests {
     }
 
     #[test]
-    fn load_private_keys_reads_pkcs8_rsa_and_ec_pem() {
+    fn load_private_keys_reads_pkcs8_ec_pem() {
+        use p256::pkcs8::{EncodePrivateKey, LineEnding};
         use rand::rngs::OsRng;
-        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 
-        let rsa_pem = rsa::RsaPrivateKey::new(&mut OsRng, 2048)
-            .unwrap()
+        let p256_pem = p256::SecretKey::random(&mut OsRng)
             .to_pkcs8_pem(LineEnding::LF)
             .unwrap()
             .to_string();
-        let keys = load_private_keys(&rsa_pem).unwrap();
-        assert!(matches!(keys.as_slice(), [PrivateKey::Rsa { .. }]));
-
-        let ec_pem = p256::SecretKey::random(&mut OsRng)
-            .to_pkcs8_pem(LineEnding::LF)
-            .unwrap()
-            .to_string();
-        let keys = load_private_keys(&ec_pem).unwrap();
+        let keys = load_private_keys(&p256_pem).unwrap();
         assert!(matches!(keys.as_slice(), [PrivateKey::P256 { .. }]));
 
+        let p384_pem = p384::SecretKey::random(&mut OsRng)
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let keys = load_private_keys(&p384_pem).unwrap();
+        assert!(matches!(keys.as_slice(), [PrivateKey::P384 { .. }]));
+
         // A bundle yields both keys.
-        let bundle = format!("{rsa_pem}{ec_pem}");
+        let bundle = format!("{p256_pem}{p384_pem}");
         assert_eq!(load_private_keys(&bundle).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn load_private_keys_rejects_rsa_pem_with_the_advisory() {
+        // A PKCS#1 RSA block is recognised and refused by label, so the failure
+        // explains itself rather than surfacing as a parse error.
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n";
+        let err = load_private_keys(pem).unwrap_err();
+        assert!(err.contains("RUSTSEC-2023-0071"), "{err}");
     }
 
     #[test]

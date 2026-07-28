@@ -256,19 +256,33 @@ manifest and every output/deleted file are decrypted by the
 
 | Layer | Supported |
 |-------|-----------|
-| `alg` | `dir`, `A128KW`/`A192KW`/`A256KW`, `A128GCMKW`/`A192GCMKW`/`A256GCMKW`, `RSA-OAEP`, `RSA-OAEP-256`, `ECDH-ES`, `ECDH-ES+A128KW`/`+A192KW`/`+A256KW` |
+| `alg` | `dir`, `A128KW`/`A192KW`/`A256KW`, `A128GCMKW`/`A192GCMKW`/`A256GCMKW`, `ECDH-ES`, `ECDH-ES+A128KW`/`+A192KW`/`+A256KW` |
 | `enc` | `A128GCM`/`A192GCM`/`A256GCM`, `A128CBC-HS256`/`A192CBC-HS384`/`A256CBC-HS512` |
 | Serialization | compact, flattened JSON, general JSON |
 | Compression | `zip: "DEF"` |
 
-`RSA1_5` (RFC 8725 deprecation) and `PBES2-*` (no shared password in this flow)
-are rejected with an error naming the algorithm, as is any other unknown `alg`
-or `enc`.
+Deliberately unsupported, each rejected with an error naming the reason:
+
+- **`RSA-OAEP` / `RSA-OAEP-256`.** The only pure-Rust RSA implementation (the
+  `rsa` crate) carries [RUSTSEC-2023-0071] — the Marvin Attack, key recovery
+  through a decryption timing sidechannel — with no fixed release. Rather than
+  take a knowingly vulnerable RSA implementation into a server that handles PHI,
+  the RSA arms are refused; use the `ECDH-ES` family to deliver a
+  content-encryption key asymmetrically. RSA private keys are likewise rejected
+  by `HFS_BULK_SUBMIT_DECRYPTION_KEY` rather than silently ignored.
+- **`RSA1_5`.** RFC 8017 §7.2 padding-oracle exposure; deprecated for JOSE by
+  RFC 8725.
+- **`PBES2-*`.** Password-based — the submit flow has no shared password.
+
+Any other unknown `alg` or `enc` is rejected with the offending value in the
+message.
+
+[RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071
 
 `fileEncryptionKey.value` is accepted as base64url key material, an `oct` JWK, or
 — matching the spec's "JSON Web Encryption structure to deliver a Content
 Encryption Key" — a JWE that wraps the CEK. That last form, and any file using
-`RSA-OAEP*`/`ECDH-ES*` directly, needs a local private key in
+`ECDH-ES*` directly, needs a local P-256/P-384 private key in
 `HFS_BULK_SUBMIT_DECRYPTION_KEY`; `dir` and the `A*KW` families work from the
 provider-supplied symmetric key alone and need no configuration.
 

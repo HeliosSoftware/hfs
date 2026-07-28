@@ -469,26 +469,28 @@ mod tests {
     fn test_unwraps_a_jwe_wrapped_content_encryption_key() {
         use rand::rngs::OsRng;
 
-        // The provider delivers the CEK as a JWE addressed to HFS's public key.
-        let private = rsa::RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        let public = rsa::RsaPublicKey::from(&private);
+        // The provider delivers the CEK as an ECDH-ES JWE addressed to HFS's
+        // public key, rather than putting the raw key in `value`.
+        let recipient = p256::SecretKey::random(&mut OsRng);
+        let ephemeral = p256::SecretKey::random(&mut OsRng);
+        let epk: Value = serde_json::from_str(&ephemeral.public_key().to_jwk_string()).unwrap();
+        let z = p256::ecdh::diffie_hellman(
+            ephemeral.to_nonzero_scalar(),
+            recipient.public_key().as_affine(),
+        );
+        let wrap_cek = crate::jwe::concat_kdf(z.raw_secret_bytes(), "A256GCM", b"", b"", 32);
+
         let cek = [17u8; 32];
-        let wrap_cek = [19u8; 32];
-        let encrypted_key = rsa::RsaPublicKey::encrypt(
-            &public,
-            &mut OsRng,
-            rsa::Oaep::new::<sha2::Sha256>(),
-            &wrap_cek,
-        )
-        .unwrap();
         let iv = [23u8; 12];
-        let header = br#"{"alg":"RSA-OAEP-256","enc":"A256GCM"}"#;
-        let header_b64 = B64URL.encode(header);
+        let header =
+            serde_json::json!({"alg": "ECDH-ES", "enc": "A256GCM", "epk": epk}).to_string();
+        let header_b64 = B64URL.encode(&header);
         let sealed = Aes256Gcm::new_from_slice(&wrap_cek)
             .unwrap()
             .encrypt(
                 Nonce::<U12>::from_slice(&iv),
                 Payload {
+                    // The wrapped payload is the file CEK, base64url-encoded.
                     msg: B64URL.encode(cek).as_bytes(),
                     aad: header_b64.as_bytes(),
                 },
@@ -496,9 +498,8 @@ mod tests {
             .unwrap();
         let (ct, tag) = sealed.split_at(sealed.len() - 16);
         let key_jwe = format!(
-            "{}.{}.{}.{}.{}",
+            "{}..{}.{}.{}",
             header_b64,
-            B64URL.encode(&encrypted_key),
             B64URL.encode(iv),
             B64URL.encode(ct),
             B64URL.encode(tag)
@@ -508,9 +509,9 @@ mod tests {
         let file = seal(&cek, plaintext);
         let enc_key = json!({"value": key_jwe});
 
-        let f = fetcher().with_decryption_keys(vec![PrivateKey::Rsa {
+        let f = fetcher().with_decryption_keys(vec![PrivateKey::P256 {
             kid: None,
-            key: private,
+            key: recipient,
         }]);
         let keys = f.resolve_keys(Some(&enc_key)).unwrap();
         let out = f.decrypt_file(file.into_bytes(), keys.as_ref()).unwrap();

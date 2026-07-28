@@ -1554,7 +1554,7 @@ async fn build_bulk_submit(
             _ => None,
         };
     // Private keys for JWE `fileEncryptionKey` material addressed to HFS
-    // asymmetrically (RSA-OAEP* / ECDH-ES*). `dir` and the A*KW families use the
+    // asymmetrically (ECDH-ES*, P-256/P-384). `dir` and the A*KW families use the
     // symmetric key the provider supplies and need no configuration.
     let decryption_keys = match cfg.decryption_key.as_deref() {
         Some(material) => helios_rest::jwe::load_private_keys(material)

@@ -634,11 +634,12 @@ pub struct BulkSubmitConfig {
     pub private_key: Option<String>,
     /// Signing algorithm for the client assertion (`ES384` or `RS384`).
     pub signing_alg: String,
-    /// Private key(s) HFS decrypts asymmetrically addressed JWEs with — PEM
-    /// (PKCS#8/PKCS#1/SEC1) or a JWK / JWK Set. Only needed when a Data Provider
-    /// delivers the `fileEncryptionKey` content-encryption key wrapped to an HFS
-    /// public key (`RSA-OAEP*` / `ECDH-ES*`); `dir` and the `A*KW` families use
-    /// the symmetric key in `fileEncryptionKey.value` and need no configuration.
+    /// P-256/P-384 private key(s) HFS decrypts asymmetrically addressed JWEs
+    /// with — PEM (PKCS#8/SEC1) or a JWK / JWK Set. Only needed when a Data
+    /// Provider delivers the `fileEncryptionKey` content-encryption key wrapped
+    /// to an HFS public key (`ECDH-ES*`); `dir` and the `A*KW` families use the
+    /// symmetric key in `fileEncryptionKey.value` and need no configuration.
+    /// RSA keys are rejected — see [`crate::jwe`] for why.
     pub decryption_key: Option<String>,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,

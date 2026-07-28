@@ -114,9 +114,7 @@ aes-gcm = "0.10"                                         # A*GCM content encrypt
 aes-kw = "0.2"                                           # A*KW key wrap (RFC 3394)
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 hmac = "0.12"                                            # A*CBC-HS* authentication tag
-sha1 = "0.10"                                            # RSA-OAEP (SHA-1 variant)
-sha2 = "0.10"                                            # RSA-OAEP-256, Concat KDF, A*CBC-HS*
-rsa = "0.9"                                              # RSA-OAEP / RSA-OAEP-256
+sha2 = "0.10"                                            # Concat KDF, A*CBC-HS*
 p256 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-ES (P-256)
 p384 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-ES (P-384)
 flate2 = "1"                                             # JWE `zip: "DEF"` payloads
