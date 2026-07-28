@@ -182,22 +182,24 @@ jobs:
         env:
           RUN_MINIO_S3_TESTS: "1"
           EXPECTED_MINIO_SETTINGS_TESTS: "5"
-          # The single self-hosted Windows runner is a virtualized guest whose
-          # CPU does not advertise SSE4.1 + PCLMULQDQ. The AWS S3 SDK's default
-          # integrity protection computes a CRC32 on every upload via the
-          # `crc-fast` crate (aws-sdk-s3 -> aws-smithy-checksums -> crc-fast),
-          # and crc-fast 1.6.0 has no software fallback on x86_64 — it panics
-          # ("x86 features missing (SSE4.1 && PCLMULQDQ)"), failing all four
-          # tests before they can verify anything. Opt out of the default
-          # checksum calc/validation so the SDK never enters that code path.
-          # This step verifies the If-Match / If-None-Match precondition
-          # contract, not checksums, so no coverage is lost; the Linux leg above
-          # still exercises the default checksum path. Both the test's SDK
-          # client and the S3 backend build config via
-          # `aws_config::defaults(BehaviorVersion::latest())`, which reads these
-          # env vars, so setting them here is sufficient.
-          AWS_REQUEST_CHECKSUM_CALCULATION: "WHEN_REQUIRED"
-          AWS_RESPONSE_CHECKSUM_VALIDATION: "WHEN_REQUIRED"
+          # This step used to set AWS_REQUEST_CHECKSUM_CALCULATION and
+          # AWS_RESPONSE_CHECKSUM_VALIDATION to "WHEN_REQUIRED". That was not a
+          # preference — it was a workaround for crc-fast 1.6.0, which gates its
+          # software fallback behind `#[cfg(target_arch = "x86")]` and so panics
+          # ("x86 features missing (SSE4.1 && PCLMULQDQ)") on this virtualized
+          # x86_64 guest, whose CPU advertises neither. The AWS S3 SDK reaches it
+          # on every upload via aws-sdk-s3 -> aws-smithy-checksums -> crc-fast.
+          #
+          # Opting out dodged the panic but also disabled the SDK's default
+          # integrity protection, so this leg tested a different SDK
+          # configuration than the Linux leg above — and the checksum path, the
+          # part that was actually broken, was the one thing Windows never
+          # exercised. crc-fast 1.9.0 (via aws-sdk-s3 1.122.0) has a working
+          # software fallback, so the panic is gone and both legs can run the
+          # same defaults.
+          #
+          # Do not re-add the opt-out to silence a checksum panic; that would
+          # mean the SDK has been downgraded below crc-fast 1.7.1.
         # `runs-on: [self-hosted]` is unpinned, so this job can land on a Windows
         # runner, where `run:` defaults to PowerShell and cannot parse this bash
         # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
