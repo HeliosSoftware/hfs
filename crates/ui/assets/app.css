@@ -3810,3 +3810,29 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
 .builder-row__modchip[aria-pressed="true"] strong {
   color: var(--accent);
 }
+
+/* Results sort (#416). */
+.query-results__sort {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.query-results__sort select {
+  height: 30px;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 12.5px;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  outline: none;
+}
