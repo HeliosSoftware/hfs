@@ -61,11 +61,19 @@ impl FhirVersionExtractor {
 
     /// Returns the FHIR version to use for storage.
     ///
-    /// Uses the Content-Type version if specified, otherwise falls back
-    /// to the default FHIR version.
-    pub fn storage_version(&self) -> FhirVersion {
-        self.content_version
-            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled)
+    /// Uses the Content-Type version if specified, otherwise falls back to
+    /// the supplied default — callers pass the server's configured default
+    /// (`ServerConfig::default_fhir_version`), not the compile-time one.
+    pub fn storage_version_or(&self, default: FhirVersion) -> FhirVersion {
+        self.content_version.unwrap_or(default)
+    }
+
+    /// Returns the FHIR version a read should be rendered as.
+    ///
+    /// Uses the Accept version if specified, otherwise falls back to the
+    /// supplied default — same contract as [`Self::storage_version_or`].
+    pub fn accept_version_or(&self, default: FhirVersion) -> FhirVersion {
+        self.accept_version.unwrap_or(default)
     }
 }
 
@@ -129,6 +137,9 @@ mod tests {
             content_version: None,
             accept_version: None,
         };
-        assert_eq!(extractor.storage_version(), FhirVersion::default());
+        assert_eq!(
+            extractor.storage_version_or(FhirVersion::default()),
+            FhirVersion::default()
+        );
     }
 }

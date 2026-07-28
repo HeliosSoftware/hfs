@@ -96,10 +96,6 @@ helios-persistence/
 │   │   ├── writer.rs       # Search index writer
 │   │   ├── reindex.rs      # Reindexing operations
 │   │   └── errors.rs       # Search-specific error types
-│   ├── strategy/        # Tenancy isolation strategies
-│   │   ├── shared_schema.rs       # tenant_id column + optional RLS
-│   │   ├── schema_per_tenant.rs   # PostgreSQL search_path isolation
-│   │   └── database_per_tenant.rs # Complete database isolation
 │   ├── backends/        # Backend implementations
 │   │   ├── sqlite/      # Reference implementation (complete)
 │   │   │   ├── backend.rs      # SqliteBackend with connection pooling
@@ -230,7 +226,7 @@ Backend (connection management, capabilities)
 ## Features
 
 - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-- **Multitenancy**: Three isolation strategies with type-level enforcement
+- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode)
 - **Full FHIR Search**: All parameter types, modifiers, chaining, \_include/\_revinclude
 - **Versioning**: Complete resource history with optimistic locking
 - **Transactions**: ACID transactions with FHIR bundle support
@@ -238,15 +234,40 @@ Backend (connection management, capabilities)
 
 ## Multitenancy
 
-All storage operations require a `TenantContext`, ensuring tenant isolation at the type level. There is no way to bypass this requirement—the compiler enforces it.
+Every tenant-scoped storage operation requires a `TenantContext` as its first argument, so the compiler guarantees tenant scope is *available* at the call site (a few operations are intentionally cross-tenant — `count_by_tenant`, the tenant-registry calls — and take none). This is a guarantee about call sites, not about the SQL each backend emits: the `tenant_id` predicate is hand-written per query, and the control on it is review. A database-enforced layer (PostgreSQL RLS) is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
-### Tenancy Strategies
+### Tenant Isolation
 
-| Strategy                | Isolation                         | Use Case                                     |
-| ----------------------- | --------------------------------- | -------------------------------------------- |
-| **Shared Schema**       | `tenant_id` column + optional RLS | Multi-tenant SaaS with shared infrastructure |
-| **Schema-per-Tenant**   | PostgreSQL schemas                | Logical isolation with shared database       |
-| **Database-per-Tenant** | Separate databases                | Complete isolation for compliance            |
+There is one isolation model — **shared schema with a `tenant_id`
+discriminator** — chosen deliberately in [discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28).
+All tenants' records live in one set of tables, collections, or indices;
+isolation is logical and enforced at the query level. No backend gives a tenant
+its own database schema, its own database, or a Row-Level Security policy. Each
+backend applies the discriminator in its own idiom:
+
+| Backend           | How the discriminator is applied                                          |
+| ----------------- | ------------------------------------------------------------------------- |
+| **SQLite**        | `tenant_id` column; composite indexes lead with `tenant_id`               |
+| **PostgreSQL**    | `tenant_id` column; `PRIMARY KEY (tenant_id, resource_type, id)`          |
+| **MongoDB**       | `tenant_id` field on every document                                       |
+| **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
+| **S3**            | Tenant-scoped key prefix, or a dedicated bucket per tenant (see below)    |
+
+The S3 backend is the one place HFS offers a genuine per-tenant *physical*
+boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
+bucket, with its own IAM/policy surface (tenants absent from the bucket map
+fall back to the shared system bucket). Every other backend is shared-schema.
+Note that Elasticsearch gives each tenant its own index, but within a single
+cluster and credential, so that is a naming boundary rather than a physical
+one — the term filter is what actually isolates.
+
+Schema-per-tenant and database-per-tenant are **not** offered for the SQL
+backends, so neither can be cited to satisfy an isolation, compliance, or
+data-residency requirement. Unwired SQL generators for them were removed in
+[#370](https://github.com/HeliosSoftware/hfs/issues/370), after the capability
+advertisements that referenced them were corrected in
+[#369](https://github.com/HeliosSoftware/hfs/issues/369). A backend reports
+what it actually does through `Backend::capabilities()`.
 
 ### Hierarchical Tenants
 
@@ -319,7 +340,8 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 
 > **Note:** Documentation links reference [build.fhir.org](https://build.fhir.org), which contains the current FHIR development version. Some features marked as planned are new and may be labeled "Trial Use" in the specification.
 
-**Legend:** ✓ Implemented | ◐ Partial | ○ Planned | ✗ Not planned | † Requires external service
+**Legend:** ✓ Implemented | ◐ Partial | ○ Planned | ✗ Not planned | † Requires external service | ‡ Mode-dependent — see multitenancy notes | — Backend not present in this tree
+
 | Feature                                                                     | SQLite | PostgreSQL | MongoDB | Cassandra | Neo4j | Elasticsearch | S3  |
 | --------------------------------------------------------------------------- | ------ | ---------- | ------- | --------- | ----- | ------------- | --- |
 | **Core Operations**                                                         |
@@ -336,10 +358,10 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Delete History](https://build.fhir.org/http.html#delete)                   | ✓      | ✓          | ○       | ✗         | ○     | ✗             | ✗   |
 | Per-User Settings (`/_user/settings`)                                       | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ✓   |
 | **Multitenancy**                                                            |
-| Shared Schema                                                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ✓   |
-| Schema-per-Tenant                                                           | ✗      | ○          | ○       | ✗         | ✗     | ✗             | ✗   |
-| Database-per-Tenant                                                         | ✓      | ○          | ○       | ○         | ○     | ○             | ✓   |
-| Row-Level Security                                                          | ✗      | ○          | ✗       | ✗         | ✗     | ✗             | ✗   |
+| Shared Schema                                                               | ✓      | ✓          | ✓       | —         | —     | ✓             | ‡✓  |
+| Schema-per-Tenant                                                           | ✗      | ✗          | ✗       | —         | —     | ✗             | ✗   |
+| Database-per-Tenant                                                         | ✗      | ✗          | ○       | —         | —     | ○             | ‡✓  |
+| Row-Level Security                                                          | ✗      | ○          | ✗       | —         | —     | ✗             | ✗   |
 | **[Search Parameters](https://build.fhir.org/search.html#ptypes)**          |
 | [String](https://build.fhir.org/search.html#string)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | [Token](https://build.fhir.org/search.html#token)                           | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ✗   |
@@ -376,8 +398,8 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | Multiple fields                                                             | ✓      | ✓          | ◐       | ✗         | ○     | ✓             | ✗   |
 | **[Bulk Operations](https://hl7.org/fhir/uv/bulkdata/)**                    |
 | [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ◐   |
-| [Bulk Submit ingest](https://hackmd.io/@argonaut/rJoqHZrPle)                | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
-| [Bulk Submit REST worker](https://hackmd.io/@argonaut/rJoqHZrPle)           | ✓      | ✓          | ✗       | ✗         | ✗     | ✗             | ✗   |
+| [Bulk Submit ingest](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)                | ✓      | ✓          | ○       | ○         | ○     | ○             | ✓   |
+| [Bulk Submit REST worker](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)           | ✓      | ✓          | ✗       | ✗         | ✗     | ✗             | ✗   |
 
 **Notes on partial cells:**
 
@@ -398,12 +420,13 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 - **`:in` / `:not-in`** — handled at the REST layer: `:in` is expanded against a terminology
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.
-- **Chained / `_has`** — SQLite and PostgreSQL resolve chains natively in-backend (✓). For every
-  other backend (◐), the REST layer resolves chained and reverse-chained parameters via
-  application-side joins (`search::resolve_chains`): each hop is one plain `search()` against the
-  backend, and the result is folded into an `_id` filter. So `GET /Observation?subject.name=Smith`
-  and `?_has:Observation:subject:code=…` work end-to-end on every searchable backend, including
-  Elasticsearch and MongoDB.
+- **Chained / `_has`** — chained and reverse-chained parameters are resolved by the persistence
+  layer's backend-agnostic resolver (`search::resolve_chains`), not natively in any backend: each
+  hop is one plain `search()` against the backend, and the result is folded into an `_id` filter
+  that the backend's ordinary `search()` executes. Because the rewrite happens above the backend,
+  `GET /Observation?subject.name=Smith` and `?_has:Observation:subject:code=…` work end-to-end on
+  every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. (The native
+  `ChainedSearchProvider` trait is not wired into request handling.)
 - **Composite** — SQLite, PostgreSQL, and Elasticsearch evaluate composite component values
   (token, string, number, quantity, date) end-to-end (✓): the REST layer resolves component types
   from the registry and the extractor indexes each composite instance as a `composite_group`.
@@ -412,6 +435,14 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   query. See `docs/search-spec-assessment.md`.
 
 The S3 backend is intentionally storage-focused (CRUD/version/history and `BulkSubmitProvider` ingestion) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. `$bulk-submit` REST worker/job state also belongs to SQLite or PostgreSQL; S3 supports only the synchronous ingest provider. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
+
+**Multitenancy notes.** The four Multitenancy rows describe *where a tenant's records physically live*, not how strongly the boundary is enforced; a deployment sits in exactly one of the first three.
+
+- **‡ S3 tenancy is a property of the deployment, not the backend type.** A `PrefixPerTenant` instance (one shared bucket, tenant-scoped key prefixes) is *Shared Schema*; a `BucketPerTenant` instance (a dedicated bucket per tenant) is *Database-per-Tenant*. An instance declares exactly one — see `S3Backend::declared_capabilities_for`.
+- **○ means no backend implements it today.** Unwired SQL generators for these topologies (shared-schema + RLS, schema-per-tenant `search_path`, database-per-tenant pools) once lived in `src/strategy/`; they were removed in issue #370. Do not read a `○` cell as a deployable isolation guarantee.
+- **✗ for PostgreSQL is a decision, not a gap.** Design discussion #28 chose shared-schema for PostgreSQL and declined the per-schema and per-database topologies; advertising them anyway was the defect issue #369 corrected.
+- **— Cassandra and Neo4j have no backend in this tree** (`src/backends/mod.rs`), so they have no tenant placement to report.
+- **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
 ### Primary/Secondary Role Matrix
 
@@ -502,14 +533,14 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### PostgreSQL
 
-Full-featured relational backend for production deployments with JSONB storage, full-text search, and advanced multi-tenant isolation strategies.
+Full-featured relational backend for production deployments with JSONB storage and full-text search.
 
 - Full CRUD operations with ACID transactions
 - Full-text search via PostgreSQL's tsvector/tsquery
 - All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
 - Chained parameters and reverse chaining (`_has`)
 - `_include` and `_revinclude` resolution
-- Multi-tenant support (shared schema, schema-per-tenant, database-per-tenant)
+- Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
 **Prerequisites:** A running PostgreSQL instance (14+).
 
@@ -538,7 +569,7 @@ PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarant
 - Full-text search with relevance scoring (`_text`, `_content`) via Elasticsearch
 - All FHIR search parameter types (string, token, date, number, quantity, reference, URI, composite)
 - Advanced text search with stemming, boolean operators, and proximity matching (`:text-advanced`)
-- Multi-tenant support (shared schema, schema-per-tenant, database-per-tenant)
+- Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
 **Prerequisites:** Running PostgreSQL (14+) and Elasticsearch 8.x instances.
 
@@ -1006,11 +1037,15 @@ cargo test -p helios-persistence --test s3_tests --features s3
 - [x] Transaction traits (ACID, bundles)
 - [x] Capabilities trait (CapabilityStatement generation)
 
-### Phase 3: Tenancy Strategies ✓
+### Phase 3: Tenant Isolation
 
-- [x] Shared schema strategy with RLS support
-- [x] Schema-per-tenant strategy with PostgreSQL search_path
-- [x] Database-per-tenant strategy with pool management
+- [x] Shared-schema isolation via a `tenant_id` discriminator, with a mandatory
+      `TenantContext` on every tenant-scoped `ResourceStorage` operation
+- [x] Per-tenant physical isolation for S3 (`S3TenancyMode::BucketPerTenant`)
+- [ ] Row-Level Security as a PostgreSQL database-enforced layer — not
+      implemented; tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381)
+- Schema-per-tenant and database-per-tenant for SQL backends: **not planned**
+  (design discussion #28). Unwired SQL generators removed in #370.
 
 ### Phase 4: SQLite Backend ✓
 

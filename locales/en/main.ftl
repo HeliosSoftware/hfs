@@ -310,6 +310,32 @@ queries-add-condition = Add condition
 queries-includes = Includes
 queries-result-controls = Result controls
 queries-remove = Remove
+queries-match-is = is
+queries-or = + or
+queries-sort-label = Sort
+queries-sort-default = Default
+queries-sort-recent = Most recent
+queries-sort-oldest = Oldest
+queries-sort-id = ID
+queries-modify-heading = Modifiers
+queries-mod-exact = whole value incl. case & accents
+queries-mod-contains = match anywhere in the text
+queries-mod-missing = field is present / absent
+queries-mod-text = advanced text handling
+queries-mod-not = none of the values match
+queries-mod-above = this or an ancestor
+queries-mod-below = this or a descendant
+queries-mod-in = member of the value set
+queries-mod-not-in = not a member of the value set
+queries-mod-identifier = match the reference by identifier
+queries-mod-of-type = match identifier type, system and value
+queries-chain-into = Filter by a property of the referenced resource
+queries-chain-any-target = any
+queries-has-pill = has a related
+queries-has-type-placeholder = resource type
+queries-has-via = linked via
+queries-has-where = where its
+queries-add-has = ⧉ Filter a resource that links here
 queries-param-placeholder = parameter
 queries-value-placeholder = value
 queries-results = Results
@@ -395,3 +421,19 @@ editor-expand-all = Expand all
 editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
+
+## Resources workspace (#282)
+
+resources-heading = Resources
+resources-lede = Browse, search, create, and edit FHIR resources. Search in natural language or build the query by hand, then open any result to edit it.
+resources-create = Create new
+resources-save-blocked = Fix the validation issues before saving.
+resources-save-invalid = The JSON is not valid — fix it before saving.
+resources-edit-title = Edit resource
+resources-tab-edit = Edit
+resources-tab-history = History
+resources-types-heading = Resource types
+
+queries-saved-group = Saved
+
+nav-collapse = Collapse menu

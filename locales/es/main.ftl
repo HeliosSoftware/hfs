@@ -306,6 +306,32 @@ queries-add-condition = Añadir condición
 queries-includes = Includes
 queries-result-controls = Controles de resultado
 queries-remove = Quitar
+queries-match-is = es
+queries-or = + o
+queries-sort-label = Orden
+queries-sort-default = Predeterminado
+queries-sort-recent = Más recientes
+queries-sort-oldest = Más antiguos
+queries-sort-id = ID
+queries-modify-heading = Modificadores
+queries-mod-exact = valor completo, incl. mayúsculas y acentos
+queries-mod-contains = coincide en cualquier parte del texto
+queries-mod-missing = el campo está presente / ausente
+queries-mod-text = tratamiento avanzado de texto
+queries-mod-not = ningún valor coincide
+queries-mod-above = este o un ancestro
+queries-mod-below = este o un descendiente
+queries-mod-in = miembro del value set
+queries-mod-not-in = no es miembro del value set
+queries-mod-identifier = compara la referencia por identificador
+queries-mod-of-type = compara tipo, sistema y valor del identificador
+queries-chain-into = Filtrar por una propiedad del recurso referenciado
+queries-chain-any-target = cualquiera
+queries-has-pill = tiene un recurso relacionado
+queries-has-type-placeholder = tipo de recurso
+queries-has-via = enlazado vía
+queries-has-where = donde su
+queries-add-has = ⧉ Filtrar un recurso que enlaza aquí
 queries-param-placeholder = parámetro
 queries-value-placeholder = valor
 queries-results = Resultados
@@ -391,3 +417,20 @@ editor-expand-all = Expandir todo
 editor-edit-raw = Editar crudo
 editor-versions = Versiones
 editor-versions-none = Sin versiones anteriores.
+## Historial y versiones (#236)
+
+## Espacio de recursos (#282)
+
+resources-heading = Recursos
+resources-lede = Explora, busca, crea y edita recursos FHIR. Busca en lenguaje natural o arma la consulta a mano, y abre cualquier resultado para editarlo.
+resources-create = Crear nuevo
+resources-save-blocked = Corrige los problemas de validación antes de guardar.
+resources-save-invalid = El JSON no es válido — corrígelo antes de guardar.
+resources-edit-title = Editar recurso
+resources-tab-edit = Editar
+resources-tab-history = Historial
+resources-types-heading = Tipos de recurso
+
+queries-saved-group = Guardadas
+
+nav-collapse = Colapsar menú

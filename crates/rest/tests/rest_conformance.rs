@@ -190,6 +190,70 @@ mod status_codes {
         response.assert_status(StatusCode::NO_CONTENT);
     }
 
+    /// A deleted resource is brought back to life by a subsequent update
+    /// (<https://hl7.org/fhir/http.html#delete>), so `PUT` onto a deleted id
+    /// must restore it rather than fail with 410 Gone.
+    #[tokio::test]
+    async fn test_update_after_delete_restores_resource() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        server
+            .delete("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        // Read of the deleted resource is 410 Gone
+        server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .assert_status(StatusCode::GONE);
+
+        let restored = json!({
+            "resourceType": "Patient",
+            "id": "patient-1",
+            "name": [{"family": "Restored"}]
+        });
+
+        let response = server
+            .put("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&restored)
+            .await;
+
+        response.assert_status(StatusCode::CREATED);
+
+        // The resource is readable again with the new content
+        let read = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        read.assert_status_ok();
+        let body: Value = read.json();
+        assert_eq!(body["name"][0]["family"], "Restored");
+
+        // The restore continues the version chain rather than resetting to "1":
+        // v1 create, v2 delete, v3 restore.
+        let etag = read
+            .headers()
+            .get("etag")
+            .expect("restored resource should have an ETag")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            etag, "W/\"3\"",
+            "restored resource should continue the version chain"
+        );
+    }
+
     #[tokio::test]
     async fn test_read_not_found_returns_404() {
         let (server, _backend) = create_test_server().await;

@@ -64,13 +64,12 @@ where
                 },
             ));
         }
-        let chain = reconstruct_chain_string(param);
         let value = param
             .values
             .first()
             .map(|v| v.value.clone())
             .unwrap_or_default();
-        let ids = resolve_forward_chain(storage, tenant, &base_type, &chain, &value).await?;
+        let ids = resolve_forward_chain(storage, tenant, &base_type, param, &value).await?;
         id_sets.push(ids.into_iter().collect());
     }
 
@@ -117,16 +116,6 @@ where
     Ok(rewritten)
 }
 
-/// Reconstructs the dotted chain string (`subject.organization.name`) from a
-/// parameter's structured chain links.
-fn reconstruct_chain_string(param: &SearchParameter) -> String {
-    let mut parts = vec![param.name.clone()];
-    for link in &param.chain {
-        parts.push(link.target_param.clone());
-    }
-    parts.join(".")
-}
-
 /// Intersects a list of id sets (`AND` across chains). An empty input means no
 /// chains contributed, which should not happen here, but yields an empty set.
 fn intersect(mut sets: Vec<HashSet<String>>) -> HashSet<String> {
@@ -143,109 +132,127 @@ fn intersect(mut sets: Vec<HashSet<String>>) -> HashSet<String> {
 
 /// Resolves a forward chain (e.g. `subject.organization.name=Hospital`) to a
 /// set of `base_type` resource ids, walking from the deepest target back out.
+///
+/// Target types per hop come from an explicit `:Type` qualifier when the
+/// request carried one, else from the registry's declared targets — all of
+/// them: FHIR's untyped chain searches every target type, so a multi-target
+/// reference like `Patient.general-practitioner` fans out to Practitioner,
+/// Organization, and PractitionerRole rather than guessing one. The name
+/// heuristic remains only for parameters the registry does not know.
 async fn resolve_forward_chain<S>(
     storage: &S,
     tenant: &TenantContext,
     base_type: &str,
-    chain: &str,
+    param: &SearchParameter,
     value: &str,
 ) -> StorageResult<Vec<String>>
 where
     S: SearchProvider + ?Sized,
 {
-    let parts: Vec<&str> = chain.split('.').collect();
-    if parts.len() < 2 {
+    let hops = &param.chain;
+    if hops.is_empty() {
         return Ok(Vec::new());
     }
+    let terminal_param = &hops[hops.len() - 1].target_param;
 
-    // Per-link target types, resolved from the registry (single-target params)
-    // with a heuristic fallback for ambiguous references.
-    let target_types: Vec<String> = {
+    // Candidate parent/target types per hop, and the terminal param's type.
+    let (parent_types_per_hop, terminal_types, terminal_type) = {
         let reg = storage.search_param_registry(tenant);
         let registry = reg.read();
-        let mut types = Vec::with_capacity(parts.len() - 1);
-        let mut current = base_type.to_string();
-        for ref_param in parts.iter().take(parts.len() - 1) {
-            let next = registry
-                .get_param(&current, ref_param)
-                .and_then(|def| {
-                    def.target.as_ref().and_then(|t| {
-                        if t.len() == 1 {
-                            Some(t[0].clone())
-                        } else {
-                            None
+
+        let mut parents: Vec<Vec<String>> = Vec::with_capacity(hops.len());
+        let mut current: Vec<String> = vec![base_type.to_string()];
+        for hop in hops {
+            parents.push(current.clone());
+            current = match &hop.target_type {
+                Some(t) => vec![t.clone()],
+                None => {
+                    let mut targets: Vec<String> = Vec::new();
+                    for parent in &current {
+                        if let Some(def) = registry.get_param(parent, &hop.reference_param) {
+                            for t in def.target.as_deref().unwrap_or_default() {
+                                if !targets.contains(t) {
+                                    targets.push(t.clone());
+                                }
+                            }
                         }
-                    })
-                })
-                .unwrap_or_else(|| infer_target_type(ref_param));
-            types.push(next.clone());
-            current = next;
+                    }
+                    if targets.is_empty() {
+                        vec![infer_target_type(&hop.reference_param)]
+                    } else {
+                        targets
+                    }
+                }
+            };
         }
-        types
-    };
 
-    // Deepest hop: search the terminal target type for the terminal param.
-    let terminal_param = parts[parts.len() - 1];
-    let deepest_type = target_types.last().map(String::as_str).unwrap_or(base_type);
-    let terminal_type = {
-        let reg = storage.search_param_registry(tenant);
-        let registry = reg.read();
-        resolve_param_type(
+        // Only search terminal types that define the terminal param — the
+        // others cannot match. Keep the unfiltered set if that empties the
+        // list (an unregistered custom param still gets a permissive try).
+        let defined: Vec<String> = current
+            .iter()
+            .filter(|t| registry.get_param(t, terminal_param).is_some())
+            .cloned()
+            .collect();
+        let terminal_types = if defined.is_empty() { current } else { defined };
+        let terminal_type = resolve_param_type(
             &registry,
-            deepest_type,
+            &terminal_types[0],
             terminal_param,
             &[SearchValue::eq(value)],
-        )
+        );
+        (parents, terminal_types, terminal_type)
     };
-    let terminal_query = SearchQuery::new(deepest_type).with_parameter(SearchParameter {
-        name: terminal_param.to_string(),
-        param_type: terminal_type,
-        modifier: None,
-        values: vec![SearchValue::eq(value)],
-        chain: vec![],
-        components: vec![],
-    });
-    let result = storage.search(tenant, &terminal_query).await?;
-    let mut current_refs: Vec<String> = result
-        .resources
-        .items
-        .into_iter()
-        .map(|r| format!("{}/{}", r.resource_type(), r.id()))
-        .collect();
+
+    // Deepest hop: search each candidate terminal type, union the refs.
+    let mut current_refs: Vec<String> = Vec::new();
+    for terminal_target in &terminal_types {
+        let terminal_query = SearchQuery::new(terminal_target).with_parameter(SearchParameter {
+            name: terminal_param.clone(),
+            param_type: terminal_type,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        });
+        let result = storage.search(tenant, &terminal_query).await?;
+        current_refs.extend(
+            result
+                .resources
+                .items
+                .into_iter()
+                .map(|r| format!("{}/{}", r.resource_type(), r.id())),
+        );
+    }
     if current_refs.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Walk back out: for each reference hop, find parents pointing at the refs.
-    for i in (0..parts.len() - 1).rev() {
-        let ref_param = parts[i];
-        let parent_type = if i == 0 {
-            base_type
-        } else {
-            &target_types[i - 1]
-        };
+    // Walk back out: for each reference hop, find parents pointing at the
+    // refs, across every candidate parent type.
+    for i in (0..hops.len()).rev() {
+        let ref_param = &hops[i].reference_param;
         let values: Vec<SearchValue> = current_refs.iter().map(SearchValue::eq).collect();
-        let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
-            name: ref_param.to_string(),
-            param_type: SearchParamType::Reference,
-            modifier: None,
-            values,
-            chain: vec![],
-            components: vec![],
-        });
-        let r = storage.search(tenant, &query).await?;
-        current_refs = r
-            .resources
-            .items
-            .into_iter()
-            .map(|res| {
+        let mut next_refs: Vec<String> = Vec::new();
+        for parent_type in &parent_types_per_hop[i] {
+            let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
+                name: ref_param.clone(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                values: values.clone(),
+                chain: vec![],
+                components: vec![],
+            });
+            let r = storage.search(tenant, &query).await?;
+            next_refs.extend(r.resources.items.into_iter().map(|res| {
                 if i == 0 {
                     res.id().to_string()
                 } else {
                     format!("{}/{}", res.resource_type(), res.id())
                 }
-            })
-            .collect();
+            }));
+        }
+        current_refs = next_refs;
         if current_refs.is_empty() {
             return Ok(Vec::new());
         }

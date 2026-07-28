@@ -8,21 +8,24 @@ use serde_json::json;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    Pagination, SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+    SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
 };
+
+use helios_fhir::FhirVersion;
 
 #[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::SqliteBackend;
 
 #[cfg(feature = "sqlite")]
 fn create_sqlite_backend() -> SqliteBackend {
-    let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
-    backend.init_schema().expect("Failed to initialize schema");
-    backend
+    super::make_sqlite_backend()
 }
 
 fn create_tenant() -> TenantContext {
-    TenantContext::new(TenantId::new("test-tenant"), TenantPermissions::full_access())
+    TenantContext::new(
+        TenantId::new("test-tenant"),
+        TenantPermissions::full_access(),
+    )
 }
 
 #[cfg(feature = "sqlite")]
@@ -64,7 +67,10 @@ async fn seed_observations(backend: &SqliteBackend, tenant: &TenantContext) {
     ];
 
     for obs in observations {
-        backend.create(tenant, "Observation", obs).await.unwrap();
+        backend
+            .create(tenant, "Observation", obs, FhirVersion::default())
+            .await
+            .unwrap();
     }
 }
 
@@ -80,18 +86,18 @@ async fn test_quantity_search_value_only() {
         name: "value-quantity".to_string(),
         param_type: SearchParamType::Quantity,
         modifier: None,
-        values: vec![SearchValue::quantity(SearchPrefix::Eq, 70.0, None, None)],
+        values: vec![SearchValue::new(SearchPrefix::Eq, "70")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find observation with value 70
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         if let Some(value) = resource.content()["valueQuantity"]["value"].as_f64() {
             assert!((value - 70.0).abs() < 0.1);
         }
@@ -110,18 +116,16 @@ async fn test_quantity_search_value_and_unit() {
         name: "value-quantity".to_string(),
         param_type: SearchParamType::Quantity,
         modifier: None,
-        values: vec![SearchValue::quantity(
+        values: vec![SearchValue::new(
             SearchPrefix::Eq,
-            70.0,
-            Some("http://unitsofmeasure.org"),
-            Some("kg"),
+            "70|http://unitsofmeasure.org|kg",
         )],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
@@ -141,18 +145,18 @@ async fn test_quantity_search_gt() {
         name: "value-quantity".to_string(),
         param_type: SearchParamType::Quantity,
         modifier: None,
-        values: vec![SearchValue::quantity(SearchPrefix::Gt, 100.0, None, None)],
+        values: vec![SearchValue::new(SearchPrefix::Gt, "100")],
         chain: vec![],
         components: vec![],
     });
 
     let result = backend
-        .search(&tenant, &query, Pagination::new(100))
+        .search(&tenant, &query.with_count(100))
         .await
         .unwrap();
 
     // Should find observations with value > 100 (154 lb, 175 cm)
-    for resource in &result.resources {
+    for resource in &result.resources.items {
         if let Some(value) = resource.content()["valueQuantity"]["value"].as_f64() {
             assert!(value > 100.0);
         }

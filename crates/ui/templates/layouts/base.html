@@ -14,7 +14,7 @@
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
   <aside class="sidebar" id="sidebar">
     <div class="brand">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
@@ -75,34 +75,16 @@
         <span class="icon">{% include "icons/home.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-home") }}</span>
       </a>
-      <a class="nav-item" href="/ui/queries"{% if active_page == "queries" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-saved-queries") }}">
-        <span class="icon">{% include "icons/bookmark.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-saved-queries") }}</span>
-      </a>
       <!--
-        Search is a real page only when natural-language search is enabled
-        (#255). With HFS_NL_SEARCH_ENABLED=false the route is not mounted and
-        the entry stays as it was: a coming-soon placeholder that says nothing
-        about the feature.
+        Resources (#282): the primary read/write workspace, and the one entry
+        for it. Searching, editing, and version history all live inside
+        Resources — on the page and in its edit modal — so they have no separate
+        nav entries. Their routes stay reachable by URL (/ui/search, /ui/editor,
+        /ui/history, /ui/queries); they are just not in the menu.
       -->
-      {% if nl_enabled %}
-      <a class="nav-item" href="/ui/search"{% if active_page == "search" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-search") }}">
-        <span class="icon">{% include "icons/search.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-search") }}</span>
-      </a>
-      {% else %}
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-search") }}">
-        <span class="icon">{% include "icons/search.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-search") }}</span>
-      </span>
-      {% endif %}
-      <a class="nav-item" href="/ui/editor"{% if active_page == "editor" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resource-editor") }}">
-        <span class="icon">{% include "icons/pencil.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-resource-editor") }}</span>
-      </a>
-      <a class="nav-item" href="/ui/history" title="{{ i18n.t("nav-history-versions") }}">
-        <span class="icon">{% include "icons/history.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-history-versions") }}</span>
+      <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resources") }}">
+        <span class="icon">{% include "icons/layers.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-resources") }}</span>
       </a>
       <a class="nav-item" href="/ui/compartments"{% if active_page == "compartments" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-compartments") }}">
         <span class="icon">{% include "icons/compartments.svg" %}</span>
@@ -132,9 +114,9 @@
         <span class="icon">{% include "icons/shield.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-capability-conformance") }}</span>
       </span>
-      <a class="nav-item" href="/ui/search-parameters"{% if active_page == "search-parameters" %} aria-current="page"{% endif %}>
+      <a class="nav-item" href="/ui/search-parameters"{% if active_page == "search-parameters" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-search-parameters") }}">
         <span class="icon">{% include "icons/search.svg" %}</span>
-        {{ i18n.t("nav-search-parameters") }}
+        <span class="nav-item__label">{{ i18n.t("nav-search-parameters") }}</span>
       </a>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-admin-ops") }}">
         <span class="icon">{% include "icons/sliders.svg" %}</span>
@@ -185,6 +167,13 @@
       </details>
     </div>
   </aside>
+
+  <!--
+    Optional secondary panel, flush against the sidebar and styled as part of
+    the menu (Brett's Resources frame): the Resources page fills it with the
+    resource-type list. Absent on every other page.
+  -->
+  {% block nav_panel %}{% endblock %}
 
   <div class="pane">
     <header class="topbar">

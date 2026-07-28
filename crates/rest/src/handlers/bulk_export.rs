@@ -411,7 +411,7 @@ where
         &tenant,
         principal.as_ref(),
         level,
-        version.storage_version(),
+        version.storage_version_or(state.config().default_fhir_version),
         &method,
         &headers,
         raw_query.as_deref(),

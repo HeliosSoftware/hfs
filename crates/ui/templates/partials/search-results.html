@@ -11,6 +11,15 @@
   <div class="query-results__head">
     <h2 class="query-group__type">{{ i18n.t("queries-results") }}</h2>
     <span class="query-results__meta" id="query-results-meta"></span>
+    <label class="query-results__sort">
+      <span>{{ i18n.t("queries-sort-label") }}</span>
+      <select id="query-results-sort">
+        <option value="">{{ i18n.t("queries-sort-default") }}</option>
+        <option value="-_lastUpdated">{{ i18n.t("queries-sort-recent") }}</option>
+        <option value="_lastUpdated">{{ i18n.t("queries-sort-oldest") }}</option>
+        <option value="_id">{{ i18n.t("queries-sort-id") }}</option>
+      </select>
+    </label>
     <a class="btn query-results__open" id="query-results-open" target="_blank" rel="noopener">{{ i18n.t("queries-open-tab") }}</a>
   </div>
   <div class="table-wrap">

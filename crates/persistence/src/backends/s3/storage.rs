@@ -18,7 +18,7 @@ use crate::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, StorageResult,
 };
 use crate::search::reindex::{ReindexSource, ResourcePage};
-use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+use crate::tenant::{Operation, TenantContext, TenantId, TenantPermissions};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, Pagination, PaginationMode, ResourceMethod,
     StoredResource,
@@ -409,6 +409,91 @@ impl S3Backend {
         resource
     }
 
+    /// Brings a soft-deleted resource back to life with new content.
+    ///
+    /// FHIR permits a deleted resource to be restored by a subsequent update
+    /// ([http.html#delete](https://hl7.org/fhir/http.html#delete)), so a `PUT`
+    /// onto a deleted id must succeed instead of failing with `Gone`. The
+    /// restored resource continues the existing version chain (the deletion
+    /// record keeps its version, the restore gets the next one) and keeps the
+    /// FHIR version the resource was originally stored under.
+    ///
+    /// Returns `NotFound` if no deleted object is present — the caller has
+    /// already established one exists, so that only happens under a concurrent
+    /// write.
+    async fn restore_deleted(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+    ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let location = self.tenant_location(tenant)?;
+        let current_key = location.keyspace.current_resource_key(resource_type, id);
+
+        let Some(actual) = self
+            .load_current_with_meta(tenant, resource_type, id)
+            .await?
+        else {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        };
+
+        if !actual.resource.is_deleted() {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
+
+        let deleted_version = actual.resource.version_id().to_string();
+        let new_content = self.ensure_resource_shape(resource_type, id, resource);
+        // `new_version` clears `deleted_at` — the exact inverse of the
+        // `mark_deleted` performed by `delete` — while keeping the original
+        // creation time and FHIR version and taking the next version number.
+        let restored = actual
+            .resource
+            .new_version(new_content, ResourceMethod::Put);
+
+        let payload = self.serialize_json(&restored)?;
+        match self
+            .put_json_object(
+                &location.bucket,
+                &current_key,
+                &payload,
+                actual.etag.as_deref(),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.put_history_and_indexes(&location, &restored, HistoryMethod::Put)
+                    .await?;
+                Ok(restored)
+            }
+            Err(StorageError::Backend(BackendError::QueryError { .. })) => {
+                let latest = self
+                    .load_current_with_meta(tenant, resource_type, id)
+                    .await?
+                    .map(|v| v.resource.version_id().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version: deleted_version,
+                        actual_version: latest,
+                    },
+                ))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Restores a resource snapshot as the latest version.
     ///
     /// If a current version exists (including tombstones), this writes a new
@@ -504,6 +589,8 @@ impl ResourceStorage for S3Backend {
         resource: Value,
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource> {
+        tenant.check_permission(Operation::Create, resource_type)?;
+
         let location = self.tenant_location(tenant)?;
 
         let id = resource
@@ -580,6 +667,15 @@ impl ResourceStorage for S3Backend {
                     .await?;
                 Ok((created, true))
             }
+            // A deleted resource is brought back to life by a subsequent update
+            // (FHIR http.html#delete), continuing the existing version chain
+            // rather than being rejected with `Gone`.
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {
+                let restored = self
+                    .restore_deleted(tenant, resource_type, id, resource)
+                    .await?;
+                Ok((restored, true))
+            }
             Err(err) => Err(err),
         }
     }
@@ -614,8 +710,10 @@ impl ResourceStorage for S3Backend {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        let location = self.tenant_location(tenant)?;
         let resource_type = current.resource_type();
+        tenant.check_permission(Operation::Update, resource_type)?;
+
+        let location = self.tenant_location(tenant)?;
         let id = current.id();
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
@@ -693,6 +791,8 @@ impl ResourceStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
+        tenant.check_permission(Operation::Delete, resource_type)?;
+
         let location = self.tenant_location(tenant)?;
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 

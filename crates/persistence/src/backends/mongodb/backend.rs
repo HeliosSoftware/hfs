@@ -185,6 +185,45 @@ impl MongoBackend {
     pub(crate) const SEARCH_INDEX_COLLECTION: &'static str = "search_index";
     pub(crate) const TENANTS_COLLECTION: &'static str = "tenants";
 
+    /// The capabilities this backend declares.
+    ///
+    /// Invariant across every valid configuration, so it is exposed as a
+    /// constructor-free associated function. Both [`Backend::supports`] and
+    /// [`Backend::capabilities`] delegate here so the two answers cannot drift
+    /// apart.
+    ///
+    /// # Tenancy
+    ///
+    /// `SharedSchema` only: all tenants share one set of collections, separated
+    /// by a `tenant_id` discriminator that every query filters on. There is no
+    /// per-tenant database or collection namespace, so it declares neither
+    /// `SchemaPerTenant` nor `DatabasePerTenant`.
+    pub fn declared_capabilities() -> Vec<BackendCapability> {
+        vec![
+            BackendCapability::Crud,
+            BackendCapability::Versioning,
+            BackendCapability::InstanceHistory,
+            BackendCapability::TypeHistory,
+            BackendCapability::SystemHistory,
+            BackendCapability::BasicSearch,
+            BackendCapability::DateSearch,
+            BackendCapability::QuantitySearch,
+            BackendCapability::ReferenceSearch,
+            BackendCapability::ChainedSearch,
+            BackendCapability::ReverseChaining,
+            BackendCapability::Include,
+            BackendCapability::Revinclude,
+            BackendCapability::Sorting,
+            BackendCapability::OffsetPagination,
+            BackendCapability::CursorPagination,
+            BackendCapability::Transactions,
+            BackendCapability::OptimisticLocking,
+            BackendCapability::BulkExport,
+            BackendCapability::InDbSofRunner,
+            BackendCapability::SharedSchema,
+        ]
+    }
+
     /// Creates a new MongoDB backend from the provided configuration.
     pub fn new(config: MongoBackendConfig) -> StorageResult<Self> {
         Self::validate_connection_string(&config.connection_string)?;
@@ -546,42 +585,11 @@ impl Backend for MongoBackend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        matches!(
-            capability,
-            BackendCapability::Crud
-                | BackendCapability::Versioning
-                | BackendCapability::InstanceHistory
-                | BackendCapability::TypeHistory
-                | BackendCapability::SystemHistory
-                | BackendCapability::BasicSearch
-                | BackendCapability::DateSearch
-                | BackendCapability::ReferenceSearch
-                | BackendCapability::Sorting
-                | BackendCapability::OffsetPagination
-                | BackendCapability::CursorPagination
-                | BackendCapability::Transactions
-                | BackendCapability::OptimisticLocking
-                | BackendCapability::SharedSchema
-        )
+        Self::declared_capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        vec![
-            BackendCapability::Crud,
-            BackendCapability::Versioning,
-            BackendCapability::InstanceHistory,
-            BackendCapability::TypeHistory,
-            BackendCapability::SystemHistory,
-            BackendCapability::BasicSearch,
-            BackendCapability::DateSearch,
-            BackendCapability::ReferenceSearch,
-            BackendCapability::Sorting,
-            BackendCapability::OffsetPagination,
-            BackendCapability::CursorPagination,
-            BackendCapability::Transactions,
-            BackendCapability::OptimisticLocking,
-            BackendCapability::SharedSchema,
-        ]
+        Self::declared_capabilities()
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {

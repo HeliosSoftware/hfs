@@ -51,11 +51,12 @@ pub(crate) struct TenantLocation {
 }
 
 impl S3Backend {
-    /// Returns the backend-level capability declarations for S3.
+    /// The capabilities S3 declares regardless of how tenants are placed.
     ///
-    /// Kept independent of client construction so reporting/tests do not need
-    /// AWS SDK initialization.
-    pub fn declared_capabilities() -> Vec<BackendCapability> {
+    /// Deliberately excludes every tenant-placement variant — those depend on
+    /// the configured [`S3TenancyMode`] and are added by
+    /// [`declared_capabilities_for`](Self::declared_capabilities_for).
+    fn base_capabilities() -> Vec<BackendCapability> {
         vec![
             BackendCapability::Crud,
             BackendCapability::Versioning,
@@ -66,9 +67,41 @@ impl S3Backend {
             BackendCapability::CursorPagination,
             BackendCapability::BulkExport,
             BackendCapability::BulkSubmitIngest,
-            BackendCapability::SharedSchema,
-            BackendCapability::DatabasePerTenant,
         ]
+    }
+
+    /// The capabilities an S3 backend configured with `mode` declares.
+    ///
+    /// Kept independent of client construction so reporting and tests do not
+    /// need AWS SDK initialization — the reason the previous no-argument
+    /// `declared_capabilities()` existed. It takes the mode because, unlike
+    /// every other backend in this crate, S3's tenant-placement topology is a
+    /// property of the *instance*, not of the backend type:
+    ///
+    /// | Mode | Placement | Declares |
+    /// |---|---|---|
+    /// | [`S3TenancyMode::PrefixPerTenant`] | one shared bucket, tenant-scoped key prefixes | `SharedSchema` |
+    /// | [`S3TenancyMode::BucketPerTenant`] | a dedicated bucket per tenant | `DatabasePerTenant` |
+    ///
+    /// Exactly one tenancy variant is declared, per the mutual-exclusivity rule
+    /// on [`BackendCapability`]. `BucketPerTenant` does **not** additionally
+    /// declare `SharedSchema` when `default_system_bucket` is set: whether
+    /// cross-tenant state is storable is a different axis, answered by
+    /// [`supports_user_settings`](Self::supports_user_settings) and
+    /// `ResourceStorage::supports_tenant_registry`.
+    ///
+    /// The `match` is exhaustive without a wildcard arm on purpose, so adding a
+    /// third `S3TenancyMode` is a compile error here rather than a silently
+    /// stale claim.
+    pub fn declared_capabilities_for(mode: &S3TenancyMode) -> Vec<BackendCapability> {
+        let tenancy = match mode {
+            S3TenancyMode::PrefixPerTenant { .. } => BackendCapability::SharedSchema,
+            S3TenancyMode::BucketPerTenant { .. } => BackendCapability::DatabasePerTenant,
+        };
+
+        let mut capabilities = Self::base_capabilities();
+        capabilities.push(tenancy);
+        capabilities
     }
 
     /// Creates a new S3 backend using AWS standard credential provider chain.
@@ -339,11 +372,11 @@ impl Backend for S3Backend {
     }
 
     fn supports(&self, capability: BackendCapability) -> bool {
-        Self::declared_capabilities().contains(&capability)
+        self.capabilities().contains(&capability)
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        Self::declared_capabilities()
+        Self::declared_capabilities_for(&self.config.tenancy_mode)
     }
 
     async fn acquire(&self) -> Result<Self::Connection, BackendError> {

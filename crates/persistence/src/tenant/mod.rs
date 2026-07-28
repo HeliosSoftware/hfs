@@ -8,21 +8,32 @@
 //! - [`TenantId`] - Opaque tenant identifier with hierarchical namespace support
 //! - [`TenantContext`] - Validated context required for all storage operations
 //! - [`TenantPermissions`] - Defines what operations a tenant can perform
-//! - [`TenancyModel`] - Determines how resources are isolated between tenants
+//! - [`TenancyModel`] - Whether a resource type is tenant-scoped or shared across tenants
 //!
 //! # Design Philosophy
 //!
-//! The persistence layer enforces tenant isolation at the type level. Every storage
-//! operation requires a `TenantContext`, making it impossible to accidentally bypass
-//! tenant boundaries. This is a deliberate design choice - there is no escape hatch.
+//! The persistence layer scopes tenant data with a `TenantContext`: every
+//! tenant-scoped storage operation requires one as its first argument, so a
+//! tenant-scoped operation cannot be constructed without it. (A few operations
+//! are intentionally cross-tenant — the admin aggregate `count_by_tenant`, the
+//! tenant-registry calls — and take no context by design.)
 //!
-//! # Tenancy Models
+//! # Tenant Placement
 //!
-//! Three isolation strategies are supported:
+//! Every backend in this crate stores all tenants' records together in one
+//! set of tables, collections, or indices, separated by a `tenant_id`
+//! discriminator that every query filters on — the shared-schema model chosen
+//! in design discussion
+//! [#28](https://github.com/HeliosSoftware/hfs/discussions/28). Isolation is
+//! logical and enforced at the query level; no backend gives a tenant its own
+//! database schema or its own database. The sole exception is the S3 backend's
+//! `S3TenancyMode::BucketPerTenant`, which maps each tenant to a dedicated
+//! bucket (S3's default `PrefixPerTenant` mode is shared storage). A backend
+//! reports its tenant placement through `Backend::capabilities()`.
 //!
-//! 1. **Shared Schema** - All tenants in one database with tenant_id column
-//! 2. **Schema-per-Tenant** - Separate database schema for each tenant
-//! 3. **Database-per-Tenant** - Separate database for each tenant
+//! Note that `TenancyModel` is a *different* axis: it selects whether a given
+//! resource *type* is tenant-scoped or shared across tenants, not where a
+//! tenant's records physically live.
 //!
 //! # Examples
 //!

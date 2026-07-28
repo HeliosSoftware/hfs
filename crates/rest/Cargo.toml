@@ -55,6 +55,9 @@ helios-observability = { path = "../observability", version = "0.2.1" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# `io` provides StreamReader, bridging the reqwest byte stream for bulk-submit
+# NDJSON files into the AsyncBufRead the ingestion engine consumes.
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 
 # Web framework

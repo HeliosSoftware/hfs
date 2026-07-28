@@ -552,9 +552,18 @@ impl QueryBuilder {
             // Build the FTS match query
             // Use the column prefix to search only the specified column
             let param_num = param_offset + i + 1;
+            // `tenant_id = ?1` is not optional. Without it this sub-select
+            // matches *every* tenant's `resource_fts` rows and yields a bare
+            // `resource_id` set, which the outer query then intersects with this
+            // tenant's resources: tenant A's Patient/123 comes back because
+            // tenant B's Patient/123 contained the search term. That is a
+            // cross-tenant match oracle, and it is exactly the discriminator
+            // that `BackendCapability::SharedSchema` promises every query
+            // carries. `?1` is the tenant in every param layout this builder
+            // produces (see `with_param_offset`), so reusing it adds no binding.
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "resource_id IN (SELECT resource_id FROM resource_fts WHERE {} MATCH ?{})",
+                    "resource_id IN (SELECT resource_id FROM resource_fts WHERE tenant_id = ?1 AND {} MATCH ?{})",
                     column, param_num
                 ),
                 vec![SqlParam::string(&search_term)],

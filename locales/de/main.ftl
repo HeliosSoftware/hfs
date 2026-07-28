@@ -306,6 +306,32 @@ queries-add-condition = Bedingung hinzufügen
 queries-includes = Includes
 queries-result-controls = Ergebnis-Steuerung
 queries-remove = Entfernen
+queries-match-is = ist
+queries-or = + oder
+queries-sort-label = Sortierung
+queries-sort-default = Standard
+queries-sort-recent = Neueste zuerst
+queries-sort-oldest = Älteste zuerst
+queries-sort-id = ID
+queries-modify-heading = Modifikatoren
+queries-mod-exact = ganzer Wert inkl. Groß-/Kleinschreibung & Akzente
+queries-mod-contains = Treffer irgendwo im Text
+queries-mod-missing = Feld ist vorhanden / fehlt
+queries-mod-text = erweiterte Textbehandlung
+queries-mod-not = keiner der Werte trifft zu
+queries-mod-above = dieser oder ein Vorfahr
+queries-mod-below = dieser oder ein Nachfahre
+queries-mod-in = Mitglied des Value Sets
+queries-mod-not-in = kein Mitglied des Value Sets
+queries-mod-identifier = Referenz nach Identifier abgleichen
+queries-mod-of-type = Identifier-Typ, -System und -Wert abgleichen
+queries-chain-into = Nach einer Eigenschaft der referenzierten Ressource filtern
+queries-chain-any-target = beliebig
+queries-has-pill = hat eine verknüpfte
+queries-has-type-placeholder = Ressourcentyp
+queries-has-via = verknüpft über
+queries-has-where = wobei ihr
+queries-add-has = ⧉ Eine hierher verweisende Ressource filtern
 queries-param-placeholder = Parameter
 queries-value-placeholder = Wert
 queries-results = Ergebnisse
@@ -391,3 +417,20 @@ editor-expand-all = Alle ausklappen
 editor-edit-raw = Rohtext bearbeiten
 editor-versions = Versionen
 editor-versions-none = Keine früheren Versionen.
+## Verlauf & Versionen (#236)
+
+## Ressourcen-Arbeitsbereich (#282)
+
+resources-heading = Ressourcen
+resources-lede = FHIR-Ressourcen durchsuchen, suchen, erstellen und bearbeiten. In natürlicher Sprache suchen oder die Abfrage selbst bauen, dann ein Ergebnis zum Bearbeiten öffnen.
+resources-create = Neu erstellen
+resources-save-blocked = Beheben Sie die Validierungsprobleme vor dem Speichern.
+resources-save-invalid = Das JSON ist ungültig — beheben Sie es vor dem Speichern.
+resources-edit-title = Ressource bearbeiten
+resources-tab-edit = Bearbeiten
+resources-tab-history = Verlauf
+resources-types-heading = Ressourcentypen
+
+queries-saved-group = Gespeichert
+
+nav-collapse = Menü einklappen
