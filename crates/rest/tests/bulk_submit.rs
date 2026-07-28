@@ -271,6 +271,114 @@ async fn test_strict_handling_rejects_unknown_directives() {
 }
 
 #[tokio::test]
+async fn test_strict_handling_accepts_recognized_import_mode() {
+    // Only *unrecognized* directives are rejected under strict handling — the
+    // import mode HFS publishes is honored regardless of posture.
+    let (server, ..) = create_submit_server().await;
+    let mut body = kickoff_body();
+    body["parameter"].as_array_mut().unwrap().push(json!({
+        "name": "import",
+        "part": [
+            {"name": "parameterUrl", "valueUri": "https://helios.software/import-mode"},
+            {"name": "parameterValue", "valueString": "merge"}
+        ]
+    }));
+    let resp = server
+        .post("/$bulk-submit")
+        .add_header("Prefer", "handling=strict")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_unsupported_import_mode_value_rejected() {
+    // A directive we recognize with a value we cannot honor is a 400 even under
+    // lenient handling — silently ingesting under the wrong mode would corrupt data.
+    let (server, ..) = create_submit_server().await;
+    let mut body = kickoff_body();
+    body["parameter"].as_array_mut().unwrap().push(json!({
+        "name": "import",
+        "part": [
+            {"name": "parameterUrl", "valueUri": "https://helios.software/import-mode"},
+            {"name": "parameterValue", "valueString": "upsert"}
+        ]
+    }));
+    let resp = server.post("/$bulk-submit").json(&body).await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+}
+
+/// Kicks off a submission over a pre-existing `sub-p1` and returns its stored
+/// content after ingestion, so `replace` and `merge` can be compared end-to-end.
+async fn ingest_with_import_mode(mode: Option<&str>) -> Value {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server().await;
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    // Already stored: a Patient with a `gender` the submission never mentions.
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "sub-p1",
+                "gender": "female",
+                "name": [{"family": "Stale"}]
+            }),
+            helios_fhir::FhirVersion::default_enabled(),
+        )
+        .await
+        .expect("seed patient");
+
+    let mut body = kickoff_body();
+    if let Some(mode) = mode {
+        body["parameter"].as_array_mut().unwrap().push(json!({
+            "name": "import",
+            "part": [
+                {"name": "parameterUrl", "valueUri": "https://helios.software/import-mode"},
+                {"name": "parameterValue", "valueString": mode}
+            ]
+        }));
+    }
+    assert_eq!(
+        server.post("/$bulk-submit").json(&body).await.status_code(),
+        StatusCode::OK
+    );
+    drain_submit(&backend, &fetcher, &output).await;
+
+    backend
+        .read(&tenant, "Patient", "sub-p1")
+        .await
+        .unwrap()
+        .expect("patient still stored")
+        .content()
+        .clone()
+}
+
+#[tokio::test]
+async fn test_import_mode_merge_applied_to_ingestion() {
+    let stored = ingest_with_import_mode(Some("merge")).await;
+    // Submitted element wins...
+    assert_eq!(stored["name"], json!([{"family": "A"}]));
+    // ...and the element the submission omitted survives.
+    assert_eq!(stored["gender"], json!("female"));
+}
+
+#[tokio::test]
+async fn test_import_mode_replace_applied_to_ingestion() {
+    for mode in [Some("replace"), None] {
+        let stored = ingest_with_import_mode(mode).await;
+        assert_eq!(stored["name"], json!([{"family": "A"}]));
+        assert!(
+            stored.get("gender").is_none(),
+            "replace must not retain unsubmitted elements, got {stored}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_full_lifecycle_ingests_and_polls() {
     let (server, backend, fetcher, output, _tmp) = create_submit_server().await;
 

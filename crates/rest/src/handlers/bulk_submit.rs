@@ -20,8 +20,8 @@ use axum::{
 };
 use helios_auth::Principal;
 use helios_persistence::core::{
-    ExportPartKey, ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus,
-    submission_output_job_id,
+    ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams, ManifestStatus,
+    ResourceStorage, SubmissionId, SubmissionStatus, submission_output_job_id,
 };
 use serde_json::{Value, json};
 
@@ -168,6 +168,52 @@ fn part_scalar(param: &Value, child: &str) -> Option<String> {
         .and_then(scalar)
 }
 
+/// Reads an `import` / `metadata` parameter's `(parameterUrl, parameterValue)` pair.
+///
+/// Both child parts are 1..1 in the IG and `parameterUrl` SHALL be an absolute URL,
+/// so a malformed directive is a client error rather than something to drop silently.
+fn pre_coordinated_part(param: &Value, kind: &str) -> RestResult<(String, String)> {
+    let url = part_scalar(param, "parameterUrl")
+        .ok_or_else(|| bad_request(format!("`{kind}.parameterUrl` is required")))?;
+    if !url.contains("://") {
+        return Err(bad_request(format!(
+            "`{kind}.parameterUrl` must be an absolute URL, got '{url}'"
+        )));
+    }
+    let value = part_scalar(param, "parameterValue")
+        .ok_or_else(|| bad_request(format!("`{kind}.parameterValue` is required")))?;
+    Ok((url, value))
+}
+
+/// Validates the `import` directives HFS recognizes and reports the rest.
+///
+/// A recognized directive with an unusable value is always a `400`. Directives HFS
+/// does not recognize are rejected under `Prefer: handling=strict` and ignored
+/// (with a warning) otherwise. `metadata` parts carry no processing semantics — HFS
+/// retains every one of them verbatim, so none are rejected.
+fn validate_import_directives(directives: &[(String, String)], strict: bool) -> RestResult<()> {
+    for (url, value) in directives {
+        if url == IMPORT_MODE_PARAMETER_URL {
+            if ImportMode::parse(value).is_none() {
+                return Err(bad_request(format!(
+                    "unsupported import mode '{value}' for '{IMPORT_MODE_PARAMETER_URL}' \
+                     (expected replace|merge)"
+                )));
+            }
+        } else if strict {
+            return Err(bad_request(format!(
+                "unrecognized `import` directive '{url}' rejected under Prefer: handling=strict"
+            )));
+        } else {
+            tracing::warn!(
+                directive = %url,
+                "ignoring unrecognized `import` directive on $bulk-submit kickoff"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Parses a `$bulk-submit` `Parameters` body, enforcing the spec's validation SHALLs.
 fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
     let params = body
@@ -245,22 +291,10 @@ fn parse_submit_request(body: &Value) -> RestResult<SubmitRequest> {
             "fileEncryptionKey" => {
                 req.file_encryption_key = Some(p.clone());
             }
-            "import" => {
-                if let (Some(u), Some(v)) = (
-                    part_scalar(p, "parameterUrl"),
-                    part_scalar(p, "parameterValue"),
-                ) {
-                    req.import_directives.push((u, v));
-                }
-            }
-            "metadata" => {
-                if let (Some(u), Some(v)) = (
-                    part_scalar(p, "parameterUrl"),
-                    part_scalar(p, "parameterValue"),
-                ) {
-                    req.metadata.push((u, v));
-                }
-            }
+            "import" => req
+                .import_directives
+                .push(pre_coordinated_part(p, "import")?),
+            "metadata" => req.metadata.push(pre_coordinated_part(p, "metadata")?),
             _ => {}
         }
     }
@@ -362,13 +396,7 @@ where
         .map_err(|e| bad_request(format!("invalid Parameters JSON: {e}")))?;
     let req = parse_submit_request(&body)?;
 
-    // Under `Prefer: handling=strict`, reject pre-coordinated directives we do not
-    // recognize (we recognize none specifically); lenient/absent → ignore them.
-    if strict && (!req.import_directives.is_empty() || !req.metadata.is_empty()) {
-        return Err(bad_request(
-            "unrecognized `import`/`metadata` directives rejected under Prefer: handling=strict",
-        ));
-    }
+    validate_import_directives(&req.import_directives, strict)?;
 
     let sub_id = SubmissionId::new(req.submitter_key(), req.submission_id.clone());
     let ctx = tenant.context();
@@ -465,14 +493,25 @@ where
             ctx,
             &sub_id,
             &manifest.manifest_id,
-            req.fhir_base_url.as_deref(),
-            req.output_format.as_deref(),
-            &req.file_request_headers,
-            &req.oauth_metadata_urls,
-            req.file_encryption_key.as_ref(),
+            ManifestFetchParams {
+                fhir_base_url: req.fhir_base_url.as_deref(),
+                output_format: req.output_format.as_deref(),
+                file_request_headers: &req.file_request_headers,
+                oauth_metadata_urls: &req.oauth_metadata_urls,
+                file_encryption_key: req.file_encryption_key.as_ref(),
+                import_directives: &req.import_directives,
+                metadata: &req.metadata,
+            },
         )
         .await
         .map_err(RestError::from)?;
+    } else if !req.import_directives.is_empty() || !req.metadata.is_empty() {
+        // `import`/`metadata` are pre-coordinated with the data they describe; a
+        // status-only kickoff carries no manifest for them to attach to.
+        tracing::warn!(
+            submission = %sub_id,
+            "ignoring `import`/`metadata` directives on a kickoff without a manifestUrl"
+        );
     }
 
     // submissionStatus=stopped → abort (rolls back recorded changes).
@@ -1049,7 +1088,7 @@ mod tests {
                 {"name": "headerValue", "valueString": "abc"}
             ]}),
             json!({"name": "import", "part": [
-                {"name": "parameterUrl", "valueUri": "https://helios.software/import-mode"},
+                {"name": "parameterUrl", "valueUri": IMPORT_MODE_PARAMETER_URL},
                 {"name": "parameterValue", "valueString": "replace"}
             ]}),
             json!({"name": "metadata", "part": [
@@ -1069,6 +1108,115 @@ mod tests {
         assert_eq!(req.import_directives.len(), 1);
         assert_eq!(req.import_directives[0].1, "replace");
         assert_eq!(req.metadata.len(), 1);
+    }
+
+    /// Builds a kickoff body carrying a single `import` or `metadata` directive.
+    fn body_with_directive(kind: &str, parts: Value) -> Value {
+        json!({"resourceType": "Parameters", "parameter": [
+            param("submitter", "valueIdentifier", json!({"value": "e"})),
+            param("submissionId", "valueString", json!("s")),
+            param("manifestUrl", "valueUrl", json!("https://p/m.json")),
+            param("fhirBaseUrl", "valueUrl", json!("https://p/fhir")),
+            json!({"name": kind, "part": parts}),
+        ]})
+    }
+
+    #[test]
+    fn test_directive_parts_are_required_and_absolute() {
+        for kind in ["import", "metadata"] {
+            // parameterValue missing (1..1 in the IG).
+            let body = body_with_directive(
+                kind,
+                json!([{"name": "parameterUrl", "valueUri": "https://ex/a"}]),
+            );
+            assert!(parse_submit_request(&body).is_err(), "{kind} without value");
+
+            // parameterUrl missing.
+            let body = body_with_directive(
+                kind,
+                json!([{"name": "parameterValue", "valueString": "v"}]),
+            );
+            assert!(parse_submit_request(&body).is_err(), "{kind} without url");
+
+            // parameterUrl SHALL be an absolute URL.
+            let body = body_with_directive(
+                kind,
+                json!([
+                    {"name": "parameterUrl", "valueUri": "not-absolute"},
+                    {"name": "parameterValue", "valueString": "v"}
+                ]),
+            );
+            assert!(parse_submit_request(&body).is_err(), "{kind} relative url");
+        }
+    }
+
+    #[test]
+    fn test_import_mode_directive_values() {
+        for mode in ["replace", "merge"] {
+            let body = body_with_directive(
+                "import",
+                json!([
+                    {"name": "parameterUrl", "valueUri": IMPORT_MODE_PARAMETER_URL},
+                    {"name": "parameterValue", "valueString": mode}
+                ]),
+            );
+            let req = parse_submit_request(&body).expect("recognized mode");
+            // A recognized directive is accepted under both handling postures.
+            assert!(validate_import_directives(&req.import_directives, true).is_ok());
+            assert!(validate_import_directives(&req.import_directives, false).is_ok());
+            assert_eq!(
+                ImportMode::from_directives(&req.import_directives),
+                ImportMode::parse(mode).unwrap()
+            );
+        }
+
+        // An unusable value for a directive we DO recognize is always a 400.
+        let body = body_with_directive(
+            "import",
+            json!([
+                {"name": "parameterUrl", "valueUri": IMPORT_MODE_PARAMETER_URL},
+                {"name": "parameterValue", "valueString": "upsert"}
+            ]),
+        );
+        let req = parse_submit_request(&body).expect("parses");
+        assert!(validate_import_directives(&req.import_directives, false).is_err());
+        assert!(validate_import_directives(&req.import_directives, true).is_err());
+    }
+
+    #[test]
+    fn test_unrecognized_import_directive_handling() {
+        let body = body_with_directive(
+            "import",
+            json!([
+                {"name": "parameterUrl", "valueUri": "https://ex/unknown-option"},
+                {"name": "parameterValue", "valueString": "on"}
+            ]),
+        );
+        let req = parse_submit_request(&body).expect("parses");
+        // Lenient (default): ignored, and the mode falls back to replace.
+        assert!(validate_import_directives(&req.import_directives, false).is_ok());
+        assert_eq!(
+            ImportMode::from_directives(&req.import_directives),
+            ImportMode::Replace
+        );
+        // Strict: rejected.
+        assert!(validate_import_directives(&req.import_directives, true).is_err());
+    }
+
+    #[test]
+    fn test_metadata_is_never_rejected_under_strict() {
+        // HFS retains every `metadata` part verbatim, so unknown URLs are not a
+        // reason to fail the kickoff even under `Prefer: handling=strict`.
+        let body = body_with_directive(
+            "metadata",
+            json!([
+                {"name": "parameterUrl", "valueUri": "https://ex/whatever"},
+                {"name": "parameterValue", "valueString": "v"}
+            ]),
+        );
+        let req = parse_submit_request(&body).expect("parses");
+        assert_eq!(req.metadata.len(), 1);
+        assert!(validate_import_directives(&req.import_directives, true).is_ok());
     }
 
     #[test]
