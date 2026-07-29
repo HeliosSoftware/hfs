@@ -248,7 +248,15 @@ sp-note-shadowed = Verdeckt durch { $url } auf (base, code): eine Quelle mit hö
 sp-note-empty-expression = Leerer Ausdruck: der Extractor indexiert keine Zeilen, jede Suche über diesen Parameter liefert stillschweigend nichts.
 sp-note-no-target = Referenzparameter ohne Zieltypen: verkettete Suche kann den referenzierten Typ nicht auflösen.
 sp-note-choice-type = Choice-Typ-Ausdruck: der Extractor schreibt ofType(T) / as T vor der Auswertung gegen das gespeicherte JSON auf das konkrete Element um (z. B. valueQuantity).
-sp-writes-pending = Anlegen, Überschreiben und Löschen von Tenant-Parametern kommt, sobald Suchparameter in der Datenbank gespeichert werden (#235).
+sp-new = Neuer Suchparameter
+sp-edit = Bearbeiten
+sp-delete = Löschen
+sp-delete-confirm = Diesen gespeicherten Suchparameter löschen? Suchen, die ihn verwenden, finden nach der Aktualisierung der Registry keine Treffer mehr.
+cmp-new = Neue Compartment-Definition
+cmp-edit = Bearbeiten
+cmp-delete = Löschen
+cmp-delete-confirm = Diese Compartment-Definition löschen? Ihre Compartment-Routen funktionieren dann nicht mehr.
+crud-delete-failed = Löschen fehlgeschlagen
 
 ## Compartment-Ansicht & Tester (#237)
 

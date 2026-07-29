@@ -25,6 +25,10 @@ use crate::conformance::ConformanceSource;
 /// source of truth) and deserialized here.
 #[derive(Deserialize, Clone)]
 pub(crate) struct CompartmentDef {
+    /// The stored resource id — what Edit deep-links and Delete address.
+    /// Empty when the server returned the definition without one.
+    #[serde(default)]
+    pub id: String,
     pub url: String,
     #[serde(default)]
     pub version: String,
@@ -105,6 +109,16 @@ impl CompartmentCatalog {
             .entry(key)
             .or_insert_with(|| built.clone())
             .clone()
+    }
+
+    /// Drops the cached definitions for a tenant + version so the next request
+    /// re-fetches. The page calls this on `?refresh=1`, which the CRUD flows
+    /// append after a write lands through the FHIR API (#237).
+    pub fn invalidate(&self, tenant: &str, version: FhirVersion) {
+        self.cache
+            .lock()
+            .expect("compartment lock")
+            .remove(&(tenant.to_string(), version));
     }
 
     /// Every resource type of the version, from the first CompartmentDefinition
@@ -564,6 +578,14 @@ mod tests {
                     resource.code
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn defs_keep_the_resource_id_for_the_editor_links() {
+        for def in &r4_defs() {
+            assert!(!def.id.is_empty(), "id missing on {}", def.url);
         }
     }
 

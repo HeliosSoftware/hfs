@@ -248,7 +248,15 @@ sp-note-shadowed = Eclipsado por { $url } en (base, code): un origen de mayor pr
 sp-note-empty-expression = Expresión vacía: el extractor no indexa ninguna fila, así que toda búsqueda con este parámetro devuelve vacío en silencio.
 sp-note-no-target = Parámetro de referencia sin tipos destino: la búsqueda encadenada no puede resolver el tipo referenciado.
 sp-note-choice-type = Expresión de tipo choice: el extractor reescribe ofType(T) / as T al elemento concreto (por ejemplo valueQuantity) antes de evaluar contra el JSON almacenado.
-sp-writes-pending = Crear, anular y borrar parámetros por tenant llegará cuando los parámetros de búsqueda se guarden en la base de datos (#235).
+sp-new = Nuevo parámetro de búsqueda
+sp-edit = Editar
+sp-delete = Eliminar
+sp-delete-confirm = ¿Eliminar este parámetro de búsqueda almacenado? Las búsquedas que lo usan dejarán de coincidir cuando el registro se actualice.
+cmp-new = Nueva definición de compartimento
+cmp-edit = Editar
+cmp-delete = Eliminar
+cmp-delete-confirm = ¿Eliminar esta definición de compartimento? Sus rutas de compartimento dejarán de resolverse.
+crud-delete-failed = Error al eliminar
 
 ## Visor y probador de compartments (#237)
 

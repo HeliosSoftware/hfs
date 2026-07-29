@@ -3923,3 +3923,24 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
   letter-spacing: 0.05em;
   white-space: nowrap;
 }
+
+/* Conformance CRUD (#237, #238): New in the page head, Edit/Delete in the
+   detail panels. */
+.page-head__actions {
+  margin-top: 10px;
+}
+
+.detail__actions {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.btn--danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn--danger:hover {
+  background: var(--danger-soft);
+}

@@ -252,7 +252,15 @@ sp-note-shadowed = Shadowed by { $url } on (base, code): a higher-precedence sou
 sp-note-empty-expression = Empty expression: the extractor indexes zero rows, so every search on this parameter silently returns empty.
 sp-note-no-target = Reference parameter with no target types: chained search cannot resolve the referenced type.
 sp-note-choice-type = Choice-type expression: the extractor rewrites ofType(T) / as T to the concrete element (for example valueQuantity) before evaluating against raw stored JSON.
-sp-writes-pending = Creating, overriding, and deleting tenant parameters lands once search parameters are stored in the database (#235).
+sp-new = New search parameter
+sp-edit = Edit
+sp-delete = Delete
+sp-delete-confirm = Delete this stored search parameter? Searches that use it stop matching once the registry refreshes.
+cmp-new = New compartment definition
+cmp-edit = Edit
+cmp-delete = Delete
+cmp-delete-confirm = Delete this compartment definition? Its compartment routes stop resolving.
+crud-delete-failed = Delete failed
 
 ## Compartment viewer & tester (#237)
 
