@@ -13,7 +13,9 @@ use crate::core::history::{
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
     SystemHistoryProvider, TypeHistoryProvider,
 };
-use crate::core::{PurgableStorage, ResourceStorage, VersionedStorage, normalize_etag};
+use crate::core::{
+    PurgableStorage, ResourceStorage, VersionedStorage, if_match_field_satisfied, normalize_etag,
+};
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, StorageResult,
 };
@@ -1185,14 +1187,15 @@ impl VersionedStorage for S3Backend {
             }));
         }
 
-        let expected = normalize_etag(expected_version);
+        // `expected_version` is the client's `If-Match` field value, which is a
+        // LIST and is satisfied when any listed tag matches (issue #311).
         let actual_version = actual.resource.version_id();
-        if expected != actual_version {
+        if !if_match_field_satisfied(expected_version, actual_version) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
                     actual_version: actual_version.to_string(),
                 },
             ));
@@ -1218,14 +1221,15 @@ impl VersionedStorage for S3Backend {
             }));
         };
 
-        let expected = normalize_etag(expected_version);
+        // `expected_version` is the client's `If-Match` field value, which is a
+        // LIST and is satisfied when any listed tag matches (issue #311).
         let actual_version = actual.resource.version_id();
-        if expected != actual_version {
+        if !if_match_field_satisfied(expected_version, actual_version) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
                     actual_version: actual_version.to_string(),
                 },
             ));

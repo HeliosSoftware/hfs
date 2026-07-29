@@ -95,14 +95,25 @@ where
             id: id.clone(),
         })?;
 
-    // Check If-Match precondition
-    if let Some(if_match) = conditional.if_match() {
-        let current_etag = format!("W/\"{}\"", existing.version_id());
-        if if_match != current_etag && if_match != "*" {
-            return Err(RestError::PreconditionFailed {
-                message: format!("ETag mismatch: expected {}, got {}", if_match, current_etag),
-            });
-        }
+    // Check the If-Match precondition (RFC 9110 §13.1.1).
+    //
+    // List-aware: satisfied when ANY supplied entity-tag matches. A malformed
+    // value fails the precondition rather than being ignored. The resource is
+    // known to exist here (the read above 404s otherwise), so `*` always
+    // matches. See `helios_persistence::core::preconditions`.
+    let if_match = conditional
+        .if_match_tags()
+        .map_err(|e| RestError::PreconditionFailed {
+            message: format!("Malformed If-Match header: {e}"),
+        })?;
+
+    if !if_match.if_match_satisfied(Some(existing.version_id())) {
+        return Err(RestError::PreconditionFailed {
+            message: format!(
+                "If-Match precondition failed: no supplied entity-tag matches the current version W/\"{}\"",
+                existing.version_id()
+            ),
+        });
     }
 
     // Apply the patch
