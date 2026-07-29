@@ -88,6 +88,14 @@
           <span class="editor-row__type">{{ row.type_label }}</span>
           {% endif %}
 
+          {% if !row.slice.is_empty() %}
+          <span class="editor-row__slice">{{ row.slice }}</span>
+          {% endif %}
+
+          {% if !row.slice.is_empty() %}
+          <span class="editor-row__slice">{{ row.slice }}</span>
+          {% endif %}
+
           {% if row.must_support %}
           <span class="editor-row__ms" title="{{ i18n.t("editor-must-support-hint") }}">{{ i18n.t("editor-must-support-badge") }}</span>
           {% endif %}
@@ -110,9 +118,18 @@
           </span>
           {% endif %}
 
+          {% if !row.binding_strength.is_empty() %}
+          <span class="editor-row__bind" title="{{ i18n.t("editor-binding-hint") }}">{{ row.binding_strength }}</span>
+          {% endif %}
+
+          {% if !row.binding_strength.is_empty() %}
+          <span class="editor-row__bind" title="{{ i18n.t("editor-binding-hint") }}">{{ row.binding_strength }}</span>
+          {% endif %}
+
           {% if row.is_primitive %}
           <input class="editor-row__input" type="text" value="{{ row.value }}"
                  data-set="{{ row.path }}"
+                 {% if !row.binding_url.is_empty() %}data-vs-url="{{ row.binding_url }}"{% endif %}
                  {% if let Some(vs) = row.binding %}list="vs-{{ vs }}" placeholder="{{ vs }}"{% endif %}>
           {% endif %}
 
@@ -146,9 +163,9 @@
                 </select>
               </div>
               {% else %}
-              <button type="button" class="editor-add__item{% if option.must_support %} editor-add__item--ms{% endif %}" data-add-name="{{ option.name }}"
-                      data-add="{{ row.path }}" data-name="{{ option.name }}"{% if !option.short.is_empty() %} title="{{ option.short }}"{% endif %}>
-                <span class="editor-add__name">{{ option.name }}{% if option.required %} <em>*</em>{% endif %}{% if option.must_support %} <span class="editor-add__ms">{{ i18n.t("editor-must-support-badge") }}</span>{% endif %}</span>
+              <button type="button" class="editor-add__item{% if option.must_support %} editor-add__item--ms{% endif %}" data-add-name="{{ option.name }}{% if !option.slice.is_empty() %} {{ option.slice }}{% endif %}"
+                      data-add="{{ row.path }}" data-name="{{ option.name }}"{% if !option.slice.is_empty() %} data-slice="{{ option.slice }}"{% endif %}{% if !option.short.is_empty() %} title="{{ option.short }}"{% endif %}>
+                <span class="editor-add__name">{{ option.name }}{% if !option.slice.is_empty() %} <span class="editor-add__slicename">· {{ option.slice }}</span>{% endif %}{% if option.required %} <em>*</em>{% endif %}{% if option.must_support %} <span class="editor-add__ms">{{ i18n.t("editor-must-support-badge") }}</span>{% endif %}</span>
                 <span class="editor-add__type">{{ option.type_label }}</span>
                 {% if !option.short.is_empty() %}
                 <span class="editor-add__short">{{ option.short }}</span>

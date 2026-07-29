@@ -40,6 +40,7 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
             std::path::Path::new("../../data"),
         )),
         helios_fhir::FhirVersion::R4,
+        None,
     )
 }
 
@@ -152,6 +153,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
+        None,
     )
     .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
     .await

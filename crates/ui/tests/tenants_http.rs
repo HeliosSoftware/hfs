@@ -37,6 +37,7 @@ fn app(store: &Arc<dyn ResourceStorage>) -> Router {
         "default".to_string(),
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
+        None,
     )
 }
 
@@ -175,6 +176,7 @@ async fn page_reports_registry_unavailable_without_a_store() {
         "default".to_string(),
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
+        None,
     )
     .oneshot(Request::get("/ui/tenants").body(Body::empty()).unwrap())
     .await
@@ -254,6 +256,7 @@ async fn version_choice_persists_to_user_settings_and_redirects_back() {
         "default".to_string(),
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
+        None,
     );
 
     // Selecting a version persists it and bounces back to the referring page.
@@ -317,6 +320,7 @@ async fn tenant_choice_persists_and_the_selector_follows_it() {
             "default".to_string(),
             Arc::new(helios_ui::StaticConformanceSource::empty()),
             FhirVersion::R4,
+            None,
         )
     };
 

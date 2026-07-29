@@ -120,6 +120,9 @@ struct WebState {
     /// The server's default tenant id — the fallback when no stored choice
     /// exists (#344).
     default_tenant: String,
+    /// Terminology server base URL (`HFS_TERMINOLOGY_SERVER`), when one is
+    /// configured — powers the editor's live `$expand` pickers (#365).
+    terminology: Option<String>,
     /// Per-user settings, for the persisted FHIR-version choice (#343). `None`
     /// when the backend has no settings store; the selector then applies
     /// per-page only.
@@ -542,6 +545,7 @@ pub fn mount(
     self_base_url: String,
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
@@ -557,6 +561,7 @@ pub fn mount(
         default_tenant,
         source,
         fhir_version,
+        terminology,
     )
 }
 
@@ -576,6 +581,7 @@ pub fn mount_with_conformance_source(
     default_tenant: String,
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
 ) -> Router {
     let nl_enabled = nl.enabled;
 
@@ -599,6 +605,7 @@ pub fn mount_with_conformance_source(
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
         .route("/ui/editor", get(editor::page))
+        .route("/ui/editor/expand", get(editor::expand))
         .route(
             "/ui/editor/render",
             axum::routing::post(editor::render_body),
@@ -633,6 +640,7 @@ pub fn mount_with_conformance_source(
         data_dir,
         fhir_version,
         default_tenant,
+        terminology,
     };
 
     router

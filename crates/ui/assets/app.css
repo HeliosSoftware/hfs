@@ -3864,3 +3864,27 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
   color: var(--muted);
   font-size: 11px;
 }
+
+/* Slice + binding chips (#365). */
+.editor-row__slice {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.editor-row__bind {
+  padding: 1px 5px;
+  border: 1px dashed var(--surface-border);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.03em;
+}
+
+.editor-add__slicename {
+  color: var(--accent);
+  font-weight: 500;
+}

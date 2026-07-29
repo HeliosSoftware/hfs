@@ -211,12 +211,22 @@ pub(super) fn validate_slices(
 /// today; a missing `match` (constraining slice) matches nothing, and a
 /// `match` with no `value` matches everything (lodash `_.isMatch` semantics
 /// for an empty source).
-fn slice_matches(slice: &Slice, item: &Value) -> bool {
-    let Some(match_) = &slice.match_ else {
-        return false;
-    };
-    match match_.value.as_ref() {
-        Some(pattern) => is_partial_match(item, pattern),
-        None => true,
+pub(crate) fn slice_matches(slice: &Slice, item: &Value) -> bool {
+    if let Some(match_) = &slice.match_ {
+        return match match_.value.as_ref() {
+            Some(pattern) => is_partial_match(item, pattern),
+            None => true,
+        };
     }
+    // The converter carries a pattern/value discriminator as the slice
+    // schema's pattern (or fixed) keyword rather than an explicit match.
+    if let Some(schema) = &slice.schema {
+        if let Some(pattern) = &schema.pattern {
+            return is_partial_match(item, pattern);
+        }
+        if let Some(fixed) = &schema.fixed {
+            return is_partial_match(item, fixed);
+        }
+    }
+    false
 }
