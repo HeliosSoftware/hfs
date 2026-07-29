@@ -944,6 +944,24 @@ mod postgres_integration {
                  (HTTP 504), got {other:?} — this is the #353 regression"
             ),
         }
+
+        // Call sites that add no context of their own convert with a bare `?`,
+        // which goes through `impl From<tokio_postgres::Error> for StorageError`
+        // rather than the classifier directly. That path must classify
+        // identically, or the fix would hold only for the sites that happen to
+        // pass a context string.
+        let err = client
+            .query("SELECT pg_sleep(5)", &[])
+            .await
+            .expect_err("pg_sleep(5) must be cancelled by a 250ms statement_timeout");
+        let converted: StorageError = err.into();
+        assert!(
+            matches!(
+                converted,
+                StorageError::Backend(BackendError::Timeout { .. })
+            ),
+            "the `?` conversion must classify too, got {converted:?}"
+        );
     }
 
     // ========================================================================

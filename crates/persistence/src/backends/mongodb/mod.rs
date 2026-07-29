@@ -23,22 +23,3 @@ mod storage;
 mod user_settings;
 
 pub use backend::{MongoBackend, MongoBackendConfig};
-
-/// Converts a MongoDB driver error into a [`StorageError`], classified by
-/// server error code, with `context` describing what the caller was doing.
-///
-/// The MongoDB counterpart to `postgres::query_error`. See
-/// [`crate::error::classify_mongodb_error`] for the mapping: a server-side
-/// deadline (`MaxTimeMSExpired` / `ExceededTimeLimit`) becomes a `Timeout`
-/// (504), a transport/topology failure becomes `Unavailable` (503 +
-/// `Retry-After`), and everything else stays `Internal` (500) with
-/// byte-identical text to the `internal_error(format!(…))` it replaces
-/// (issue #353).
-///
-/// Taking `mongodb::error::Error` by type means a site whose closure yields
-/// some other error fails to compile rather than being silently mis-converted.
-///
-/// [`StorageError`]: crate::error::StorageError
-pub(crate) fn query_error(context: &str, err: mongodb::error::Error) -> crate::error::StorageError {
-    crate::error::StorageError::Backend(crate::error::classify_mongodb_error(context, err))
-}

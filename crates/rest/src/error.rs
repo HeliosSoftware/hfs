@@ -1413,9 +1413,20 @@ mod tests {
                       statement timeout"
                 .to_string(),
         };
-        let (status, code, _) = RestError::from(err).client_response();
+        let rest_err = RestError::from(err);
+        let (status, code, _) = rest_err.client_response();
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(code, "timeout");
+
+        // `Display` is what reaches the operator's logs and any `{err}` in a
+        // caller's own message, so it must keep the backend detail the client
+        // response strips.
+        let displayed = rest_err.to_string();
+        assert!(
+            displayed.starts_with("Backend timeout: "),
+            "unexpected Display form: {displayed}"
+        );
+        assert!(displayed.contains("canceling statement due to statement timeout"));
     }
 
     /// The client-facing text must not carry driver internals, the backend
