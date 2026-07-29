@@ -25,7 +25,7 @@ use crate::types::{
     SearchQuery, SearchValue, StoredResource, strip_reference_version,
 };
 
-use super::MongoBackend;
+use super::{MongoBackend, query_error};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -74,11 +74,11 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
     while cursor
         .advance()
         .await
-        .map_err(|e| internal_error(format!("Failed to advance MongoDB cursor: {}", e)))?
+        .map_err(|e| query_error("Failed to advance MongoDB cursor", e))?
     {
-        let doc = cursor.deserialize_current().map_err(|e| {
-            internal_error(format!("Failed to deserialize MongoDB document: {}", e))
-        })?;
+        let doc = cursor
+            .deserialize_current()
+            .map_err(|e| query_error("Failed to deserialize MongoDB document", e))?;
         docs.push(doc);
     }
     Ok(docs)
@@ -198,7 +198,7 @@ impl SearchProvider for MongoBackend {
         let docs = collect_documents(
             find_action
                 .await
-                .map_err(|e| internal_error(format!("Failed to execute MongoDB search: {}", e)))?,
+                .map_err(|e| query_error("Failed to execute MongoDB search", e))?,
         )
         .await?;
 
@@ -319,7 +319,7 @@ impl SearchProvider for MongoBackend {
         resources
             .count_documents(filter)
             .await
-            .map_err(|e| internal_error(format!("Failed to count MongoDB search results: {}", e)))
+            .map_err(|e| query_error("Failed to count MongoDB search results", e))
     }
 
     fn search_param_registry(
@@ -584,7 +584,7 @@ impl MongoBackend {
         let cursor = search_index
             .aggregate(pipeline)
             .await
-            .map_err(|e| internal_error(format!("Failed to aggregate contained search: {}", e)))?;
+            .map_err(|e| query_error("Failed to aggregate contained search", e))?;
         let docs = collect_documents(cursor).await?;
 
         let mut out = Vec::new();
@@ -656,7 +656,7 @@ impl MongoBackend {
             let ids = search_index
                 .distinct("resource_id", filter)
                 .await
-                .map_err(|e| internal_error(format!("Failed to query search_index: {}", e)))?
+                .map_err(|e| query_error("Failed to query search_index", e))?
                 .into_iter()
                 .filter_map(|value| value.as_str().map(ToString::to_string))
                 .collect::<HashSet<_>>();
@@ -738,7 +738,7 @@ impl MongoBackend {
         let ids = search_index
             .distinct("resource_id", filter)
             .await
-            .map_err(|e| internal_error(format!("Failed to query search_index: {}", e)))?
+            .map_err(|e| query_error("Failed to query search_index", e))?
             .into_iter()
             .filter_map(|value| value.as_str().map(ToString::to_string))
             .collect::<HashSet<_>>();
@@ -1500,7 +1500,7 @@ impl MongoBackend {
                 "is_deleted": false,
             })
             .await
-            .map_err(|e| internal_error(format!("Failed to fetch included resource: {}", e)))?;
+            .map_err(|e| query_error("Failed to fetch included resource", e))?;
 
         match doc {
             Some(doc) => Ok(Some(self.document_to_stored_resource(
@@ -1613,12 +1613,7 @@ impl RevincludeProvider for MongoBackend {
             let matching_ids: Vec<String> = search_index
                 .distinct("resource_id", index_filter)
                 .await
-                .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to query search_index for revinclude: {}",
-                        e
-                    ))
-                })?
+                .map_err(|e| query_error("Failed to query search_index for revinclude", e))?
                 .into_iter()
                 .filter_map(|value| value.as_str().map(ToString::to_string))
                 .collect();
@@ -1635,11 +1630,13 @@ impl RevincludeProvider for MongoBackend {
                 "id": { "$in": Bson::Array(id_bson) },
             };
 
-            let docs =
-                collect_documents(resources_collection.find(resource_filter).await.map_err(
-                    |e| internal_error(format!("Failed to fetch revinclude resources: {}", e)),
-                )?)
-                .await?;
+            let docs = collect_documents(
+                resources_collection
+                    .find(resource_filter)
+                    .await
+                    .map_err(|e| query_error("Failed to fetch revinclude resources", e))?,
+            )
+            .await?;
 
             for doc in docs {
                 let stored =

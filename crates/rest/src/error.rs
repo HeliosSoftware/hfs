@@ -19,8 +19,21 @@
 //! | UnsupportedResourceType | 400 | not-supported |
 //! | AccessDenied | 403 | forbidden |
 //! | BackendError::{Unavailable, ConnectionFailed, PoolExhausted} | 503 | transient |
+//! | BackendError::Timeout | 504 | timeout |
 //! | BackendError::UnsupportedCapability | 501 | not-supported |
 //! | BackendError::{Migration, Internal, Query, Serialization} | 500 | exception |
+//!
+//! `503` and `504` are both transient, but they say different things and are
+//! read differently by the infrastructure in front of the server:
+//!
+//! - **503** — *this instance* cannot serve right now (backend down, pool
+//!   exhausted, lock contention). Carries `Retry-After`; a load balancer taking
+//!   the instance out of rotation is the correct response.
+//! - **504** — the instance is fine; one *statement* exceeded a server-side
+//!   time limit and the backend cancelled it (PostgreSQL `statement_timeout`,
+//!   MongoDB `maxTimeMS`). No `Retry-After`: the query is usually
+//!   deterministically too slow, so a prompt retry only adds load. Ejecting the
+//!   instance would be wrong. See issue #353.
 //!
 //! [`RestError::NotSupported`] (400 + `not-supported`) is reserved for
 //! spec-defined parameters/features that the server explicitly refuses;
@@ -176,6 +189,27 @@ pub enum RestError {
         message: String,
     },
 
+    /// A backend cancelled the operation at a server-side time limit
+    /// (HTTP 504) — e.g. PostgreSQL `statement_timeout` (issue #353).
+    ///
+    /// Deliberately **not** 503. A 503 asserts that *this instance* cannot
+    /// serve requests, which load balancers and service meshes routinely read
+    /// as "eject this backend from rotation". A statement timeout says nothing
+    /// about instance health — one expensive query was stopped — so ejecting
+    /// the instance would be wrong and, under the load that provoked the
+    /// timeout, actively harmful.
+    ///
+    /// Also deliberately **not** accompanied by `Retry-After`. A cancelled
+    /// query is usually deterministically too slow for the configured budget,
+    /// so inviting a prompt retry just multiplies load on an already-strained
+    /// database. The 503 family keeps its `Retry-After`, where a retry
+    /// genuinely helps.
+    GatewayTimeout {
+        /// Error message. Internal only — sanitized before it reaches the
+        /// client (see [`RestError::client_response`]).
+        message: String,
+    },
+
     /// Not implemented (HTTP 501).
     NotImplemented {
         /// Description of what's not implemented.
@@ -282,6 +316,9 @@ impl fmt::Display for RestError {
             }
             RestError::ServiceUnavailable { message } => {
                 write!(f, "Service unavailable: {}", message)
+            }
+            RestError::GatewayTimeout { message } => {
+                write!(f, "Backend timeout: {}", message)
             }
             RestError::NotImplemented { feature } => {
                 write!(f, "Not implemented: {}", feature)
@@ -397,6 +434,30 @@ impl RestError {
                 "transient",
                 message.clone(),
             ),
+            RestError::GatewayTimeout { message } => {
+                // Keep the operator's diagnosis intact server-side — the
+                // SQLSTATE, the context string, and the driver text are all in
+                // `message`, and they are what tells an operator *which*
+                // statement blew the budget and whether to raise
+                // `HFS_PG_STATEMENT_TIMEOUT_MS` or fix the query.
+                tracing::warn!(
+                    error.detail = %message,
+                    "backend cancelled a statement at its server-side time limit"
+                );
+                // The client gets none of that. Naming the backend product or
+                // an `HFS_*` environment variable here would fingerprint the
+                // deployment while being useless to the recipient — a client
+                // cannot set a server env var. Tell them the one thing they
+                // *can* act on: make the query cheaper.
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "The request exceeded the server's time limit for a single operation. \
+                     Narrow the request — add or tighten search parameters, reduce _count, \
+                     or request a smaller date range — and try again."
+                        .to_string(),
+                )
+            }
             RestError::NotImplemented { feature } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
@@ -744,8 +805,15 @@ impl From<TransactionError> for RestError {
             TransactionError::BundleError { index, message } => RestError::BadRequest {
                 message: format!("Bundle entry {}: {}", index, message),
             },
-            TransactionError::Timeout { .. }
-            | TransactionError::RolledBack { .. }
+            // A transaction that ran out of time is the same condition as a
+            // cancelled statement, one level up: the backend is healthy and
+            // stopped work that exceeded its budget. It answered 500 until
+            // #353, which is the identical mis-classification this issue fixes
+            // for `BackendError::Timeout`.
+            TransactionError::Timeout { .. } => RestError::GatewayTimeout {
+                message: err.to_string(),
+            },
+            TransactionError::RolledBack { .. }
             | TransactionError::InvalidTransaction
             | TransactionError::NestedNotSupported
             | TransactionError::UnsupportedIsolationLevel { .. } => RestError::InternalError {
@@ -777,6 +845,14 @@ impl From<BackendError> for RestError {
             BackendError::PoolExhausted { backend_name } => RestError::ServiceUnavailable {
                 message: format!("connection pool exhausted for {backend_name}"),
             },
+
+            // A server-side statement deadline elapsed (e.g. PostgreSQL
+            // `statement_timeout` → SQLSTATE 57014). The backend is healthy and
+            // deliberately stopped one over-long statement, so this is neither
+            // a server defect (500) nor an instance-level outage (503) — see
+            // `RestError::GatewayTimeout` for why the distinction matters to
+            // load balancers. Issue #353.
+            BackendError::Timeout { message, .. } => RestError::GatewayTimeout { message },
 
             // Genuine server-side faults: retrying will not help, so keep them
             // 500. Their raw detail is sanitized and logged by
@@ -1311,11 +1387,96 @@ mod tests {
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
+            (
+                BackendError::Timeout {
+                    backend_name: "postgres".to_string(),
+                    message: "canceling statement due to statement timeout".to_string(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
         ];
         for (err, expected) in cases {
             let (status, _, _) = RestError::from(err).client_response();
             assert_eq!(status, expected);
         }
+    }
+
+    // ── BackendError::Timeout → 504 (issue #353) ───────────────────────────
+
+    /// A statement cancelled at a server-side deadline is a `504` with the FHIR
+    /// `timeout` issue code — not the `500`/`exception` it produced before.
+    #[test]
+    fn test_backend_timeout_maps_to_504_timeout() {
+        let err = BackendError::Timeout {
+            backend_name: "postgres".to_string(),
+            message: "Failed to execute search: db error: ERROR: canceling statement due to \
+                      statement timeout"
+                .to_string(),
+        };
+        let (status, code, _) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "timeout");
+    }
+
+    /// The client-facing text must not carry driver internals, the backend
+    /// product name, or an `HFS_*` variable name — it should say only what the
+    /// caller can act on. The operator's copy goes to the log instead.
+    #[test]
+    fn test_backend_timeout_message_is_sanitized() {
+        let err = BackendError::Timeout {
+            backend_name: "postgres".to_string(),
+            message: "Failed to execute search: db error: ERROR: canceling statement due to \
+                      statement timeout; SELECT id FROM resources WHERE tenant_id = $1"
+                .to_string(),
+        };
+        let (_, _, message) = RestError::from(err).client_response();
+        for leak in [
+            "canceling statement",
+            "db error",
+            "SELECT",
+            "resources",
+            "postgres",
+            "statement_timeout",
+            "HFS_PG_STATEMENT_TIMEOUT_MS",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "504 diagnostic leaked {leak:?}: {message}"
+            );
+        }
+        // It must still be actionable rather than merely opaque.
+        assert!(message.contains("time limit"));
+        assert!(message.contains("Narrow the request"));
+    }
+
+    /// A transaction that exceeded its budget is the same condition one level
+    /// up, and answered 500 until #353.
+    #[test]
+    fn test_transaction_timeout_maps_to_504() {
+        let err = TransactionError::Timeout { timeout_ms: 30_000 };
+        let (status, code, _) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "timeout");
+    }
+
+    /// The 504 deliberately carries no `Retry-After`: a cancelled query is
+    /// usually deterministically too slow, so inviting a prompt retry just
+    /// multiplies load on a strained database. `Retry-After` stays on the 503
+    /// family, where a retry genuinely helps.
+    #[tokio::test]
+    async fn test_gateway_timeout_has_no_retry_after() {
+        let response = RestError::GatewayTimeout {
+            message: "statement cancelled".to_string(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "504 must not advise a retry deadline"
+        );
     }
 
     #[tokio::test]

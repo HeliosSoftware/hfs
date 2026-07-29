@@ -24,9 +24,9 @@ use crate::types::{
     ReverseChainedParameter, SearchQuery, StoredResource,
 };
 
-use super::PostgresBackend;
 use super::search::chain_builder::ChainQueryBuilder;
 use super::search::query_builder::{PostgresQueryBuilder, SortValueKind, SqlParam};
+use super::{PostgresBackend, query_error};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -200,7 +200,7 @@ impl SearchProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to execute search: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute search", e))?;
 
         // Parse rows, capturing the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
@@ -339,7 +339,7 @@ impl SearchProvider for PostgresBackend {
         let row = client
             .query_one(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))?;
+            .map_err(|e| query_error("Failed to count resources", e))?;
 
         let count: i64 = row.get(0);
         Ok(count as u64)
@@ -402,7 +402,7 @@ impl MultiTypeSearchProvider for PostgresBackend {
         let rows = client
             .query(&sql, &[&tenant_id])
             .await
-            .map_err(|e| internal_error(format!("Failed to execute multi-type search: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute multi-type search", e))?;
 
         let mut resources = Vec::new();
         for row in &rows {
@@ -567,9 +567,10 @@ impl RevincludeProvider for PostgresBackend {
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
 
-            let rows = client.query(&sql, &param_refs).await.map_err(|e| {
-                internal_error(format!("Failed to execute revinclude query: {}", e))
-            })?;
+            let rows = client
+                .query(&sql, &param_refs)
+                .await
+                .map_err(|e| query_error("Failed to execute revinclude query", e))?;
 
             for row in &rows {
                 let id: String = row.get(0);
@@ -662,7 +663,7 @@ impl ChainedSearchProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to execute chain query: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute chain query", e))?;
 
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
@@ -710,7 +711,7 @@ impl ChainedSearchProvider for PostgresBackend {
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to execute reverse chain query: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute reverse chain query", e))?;
 
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
@@ -746,7 +747,7 @@ impl TextSearchProvider for PostgresBackend {
         let rows = client
             .query(&sql, &[&tenant_id, &resource_type, &text])
             .await
-            .map_err(|e| internal_error(format!("Failed to execute text search: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute text search", e))?;
 
         let mut resources = Vec::new();
         for row in &rows {
@@ -821,7 +822,7 @@ impl TextSearchProvider for PostgresBackend {
         let rows = client
             .query(&sql, &[&tenant_id, &resource_type, &content])
             .await
-            .map_err(|e| internal_error(format!("Failed to execute content search: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute content search", e))?;
 
         let mut resources = Vec::new();
         for row in &rows {
@@ -948,9 +949,7 @@ impl PostgresBackend {
                     let rows = client
                         .query(&fragment.sql, &param_refs)
                         .await
-                        .map_err(|e| {
-                            internal_error(format!("Failed to execute contained query: {e}"))
-                        })?;
+                        .map_err(|e| query_error("Failed to execute contained query", e))?;
                     rows.iter()
                         .map(|row| {
                             (
@@ -1168,7 +1167,7 @@ impl PostgresBackend {
                 &[&tenant_id, &resource_type, &id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to fetch resource: {}", e)))?;
+            .map_err(|e| query_error("Failed to fetch resource", e))?;
 
         if rows.is_empty() {
             return Ok(None);

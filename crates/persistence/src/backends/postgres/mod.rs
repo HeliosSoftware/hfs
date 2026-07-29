@@ -83,3 +83,29 @@ mod transaction;
 mod user_settings;
 
 pub use backend::{PostgresBackend, PostgresConfig};
+
+/// Converts a `tokio_postgres` error into a [`StorageError`], classified by
+/// SQLSTATE, with `context` describing what the caller was doing.
+///
+/// This is the driver-facing counterpart to each module's `internal_error`
+/// helper. Prefer it at every site that maps a `tokio_postgres::Error`:
+/// `internal_error(format!("…: {e}"))` stringifies the error and throws away
+/// `err.code()`, which is the only thing that can tell a statement cancellation
+/// (`57014`) apart from a genuine defect (issue #353).
+///
+/// ```ignore
+/// // before — SQLSTATE lost, always a 500
+/// .map_err(|e| internal_error(format!("Failed to execute search: {e}")))?
+/// // after  — 57014 becomes a 504, everything else is unchanged
+/// .map_err(|e| query_error("Failed to execute search", e))?
+/// ```
+///
+/// The fallback is deliberately byte-identical to `internal_error`'s output for
+/// the same context, so converting a call site cannot change behaviour for any
+/// error that is not explicitly classified. Because it takes a
+/// `tokio_postgres::Error` by type, a site whose closure yields some other error
+/// (serde, chrono, a parse) fails to compile rather than being silently
+/// mis-converted.
+pub(crate) fn query_error(context: &str, err: tokio_postgres::Error) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::classify_postgres_error(context, err))
+}

@@ -78,3 +78,21 @@ mod transaction;
 mod user_settings;
 
 pub use backend::{SqliteBackend, SqliteBackendConfig};
+
+/// Converts a `rusqlite` error into a [`StorageError`], classified by
+/// `ErrorCode`, with `context` describing what the caller was doing.
+///
+/// The SQLite counterpart to `postgres::query_error`. See
+/// [`crate::error::classify_sqlite_error`] for the mapping: an interrupted
+/// statement becomes a `Timeout` (504), a `busy_timeout` expiry becomes
+/// `Unavailable` (503 + `Retry-After`), and everything else stays `Internal`
+/// (500) with byte-identical text to the `internal_error(format!(…))` it
+/// replaces (issue #353).
+///
+/// Taking `rusqlite::Error` by type means a site whose closure yields some
+/// other error fails to compile rather than being silently mis-converted.
+///
+/// [`StorageError`]: crate::error::StorageError
+pub(crate) fn query_error(context: &str, err: rusqlite::Error) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(crate::error::classify_sqlite_error(context, err))
+}

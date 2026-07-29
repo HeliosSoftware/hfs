@@ -25,8 +25,8 @@ use crate::types::{
     ReverseChainedParameter, SearchQuery, SearchValue, StoredResource,
 };
 
-use super::SqliteBackend;
 use super::search::{QueryBuilder, SortValueKind, SqlParam};
+use super::{SqliteBackend, query_error};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -216,7 +216,7 @@ impl SearchProvider for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare search query: {}", e)))?;
+            .map_err(|e| query_error("Failed to prepare search query", e))?;
 
         // Bind params: tenant, type, then (cursor) sort value + id, then filter params.
         let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -256,9 +256,9 @@ impl SearchProvider for SqliteBackend {
                 };
                 Ok((id, version_id, data, last_updated, fhir_version, sort_key))
             })
-            .map_err(|e| internal_error(format!("Failed to execute search: {}", e)))?
+            .map_err(|e| query_error("Failed to execute search", e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| internal_error(format!("Failed to read row: {}", e)))?;
+            .map_err(|e| query_error("Failed to read row", e))?;
 
         // Parse rows, carrying the sort key for cursor construction.
         let mut parsed: Vec<(StoredResource, Option<CursorValue>)> = Vec::new();
@@ -389,7 +389,7 @@ impl SearchProvider for SqliteBackend {
 
         let count: i64 = conn
             .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
-            .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))?;
+            .map_err(|e| query_error("Failed to count resources", e))?;
 
         Ok(count as u64)
     }
@@ -453,7 +453,7 @@ impl MultiTypeSearchProvider for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare multi-type search: {}", e)))?;
+            .map_err(|e| query_error("Failed to prepare multi-type search", e))?;
 
         let rows = stmt
             .query_map(params![tenant_id], |row| {
@@ -472,12 +472,12 @@ impl MultiTypeSearchProvider for SqliteBackend {
                     fhir_version,
                 ))
             })
-            .map_err(|e| internal_error(format!("Failed to execute multi-type search: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute multi-type search", e))?;
 
         let mut resources = Vec::new();
         for row in rows {
             let (resource_type, id, version_id, data, last_updated_str, fhir_version_str) =
-                row.map_err(|e| internal_error(format!("Failed to read row: {}", e)))?;
+                row.map_err(|e| query_error("Failed to read row", e))?;
 
             let json_data: serde_json::Value = serde_json::from_slice(&data)
                 .map_err(|e| internal_error(format!("Failed to deserialize resource: {}", e)))?;
@@ -640,9 +640,9 @@ impl RevincludeProvider for SqliteBackend {
                     .join(" OR ")
             );
 
-            let mut stmt = conn.prepare(&sql).map_err(|e| {
-                internal_error(format!("Failed to prepare revinclude query: {}", e))
-            })?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| query_error("Failed to prepare revinclude query", e))?;
 
             // Build params: tenant_id, source_type, then all the patterns
             let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -664,13 +664,11 @@ impl RevincludeProvider for SqliteBackend {
                     let fhir_version: String = row.get(4)?;
                     Ok((id, version_id, data, last_updated, fhir_version))
                 })
-                .map_err(|e| {
-                    internal_error(format!("Failed to execute revinclude query: {}", e))
-                })?;
+                .map_err(|e| query_error("Failed to execute revinclude query", e))?;
 
             for row in rows {
                 let (id, version_id, data, last_updated_str, fhir_version_str) =
-                    row.map_err(|e| internal_error(format!("Failed to read row: {}", e)))?;
+                    row.map_err(|e| query_error("Failed to read row", e))?;
 
                 // Skip if we've already included this resource
                 let resource_key = format!("{}/{}", revinclude.source_type, id);
@@ -766,7 +764,7 @@ impl ChainedSearchProvider for SqliteBackend {
         // Bind parameters: tenant_id, resource_type, then fragment params
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare chain query: {}", e)))?;
+            .map_err(|e| query_error("Failed to prepare chain query", e))?;
 
         // Build parameter vector for rusqlite
         let mut bound_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -786,11 +784,11 @@ impl ChainedSearchProvider for SqliteBackend {
 
         let rows = stmt
             .query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))
-            .map_err(|e| internal_error(format!("Failed to execute chain query: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute chain query", e))?;
 
         let mut ids = Vec::new();
         for row in rows {
-            ids.push(row.map_err(|e| internal_error(format!("Failed to read row: {}", e)))?);
+            ids.push(row.map_err(|e| query_error("Failed to read row", e))?);
         }
 
         Ok(ids)
@@ -832,7 +830,7 @@ impl ChainedSearchProvider for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare reverse chain query: {}", e)))?;
+            .map_err(|e| query_error("Failed to prepare reverse chain query", e))?;
 
         // Build parameter vector for rusqlite
         let mut bound_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -852,11 +850,11 @@ impl ChainedSearchProvider for SqliteBackend {
 
         let rows = stmt
             .query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))
-            .map_err(|e| internal_error(format!("Failed to execute reverse chain query: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute reverse chain query", e))?;
 
         let mut ids = Vec::new();
         for row in rows {
-            ids.push(row.map_err(|e| internal_error(format!("Failed to read row: {}", e)))?);
+            ids.push(row.map_err(|e| query_error("Failed to read row", e))?);
         }
 
         Ok(ids)
@@ -925,9 +923,9 @@ impl SqliteBackend {
         let matches: Vec<(String, String, Option<String>)> = match builder.build_contained(query) {
             Some(fragment) => {
                 let conn = self.get_connection()?;
-                let mut stmt = conn.prepare(&fragment.sql).map_err(|e| {
-                    internal_error(format!("Failed to prepare contained query: {e}"))
-                })?;
+                let mut stmt = conn
+                    .prepare(&fragment.sql)
+                    .map_err(|e| query_error("Failed to prepare contained query", e))?;
                 let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
                     Box::new(tenant_id.to_string()),
                     Box::new(contained_type.to_string()),
@@ -949,9 +947,9 @@ impl SqliteBackend {
                         row.get::<_, Option<String>>(2)?,
                     ))
                 })
-                .map_err(|e| internal_error(format!("Failed to execute contained query: {e}")))?
+                .map_err(|e| query_error("Failed to execute contained query", e))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| internal_error(format!("Failed to read contained row: {e}")))?
+                .map_err(|e| query_error("Failed to read contained row", e))?
             }
             None => Vec::new(),
         };
@@ -1219,17 +1217,17 @@ impl SqliteBackend {
 
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare find query: {}", e)))?;
+            .map_err(|e| query_error("Failed to prepare find query", e))?;
 
         let rows = stmt
             .query_map(params![tenant_id, resource_type, param_name], |row| {
                 row.get::<_, String>(0)
             })
-            .map_err(|e| internal_error(format!("Failed to execute find query: {}", e)))?;
+            .map_err(|e| query_error("Failed to execute find query", e))?;
 
         let mut ids = Vec::new();
         for row in rows {
-            ids.push(row.map_err(|e| internal_error(format!("Failed to read row: {}", e)))?);
+            ids.push(row.map_err(|e| query_error("Failed to read row", e))?);
         }
 
         Ok(ids)
@@ -1248,7 +1246,7 @@ impl SqliteBackend {
                 "SELECT id, version_id, data, last_updated, fhir_version FROM resources
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare query: {}", e)))?;
+            .map_err(|e| query_error("Failed to prepare query", e))?;
 
         let rows = stmt
             .query_map(params![tenant_id, resource_type], |row| {
@@ -1259,12 +1257,12 @@ impl SqliteBackend {
                 let fhir_version: String = row.get(4)?;
                 Ok((id, version_id, data, last_updated, fhir_version))
             })
-            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+            .map_err(|e| query_error("Failed to query resources", e))?;
 
         let mut resources = Vec::new();
         for row in rows {
             let (id, version_id, data, last_updated_str, fhir_version_str) =
-                row.map_err(|e| internal_error(format!("Failed to read row: {}", e)))?;
+                row.map_err(|e| query_error("Failed to read row", e))?;
 
             let json_data: serde_json::Value = serde_json::from_slice(&data)
                 .map_err(|e| internal_error(format!("Failed to deserialize: {}", e)))?;
