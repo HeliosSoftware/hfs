@@ -106,6 +106,20 @@ body {
   line-height: 1.2;
 }
 
+/* The fixed sidebar sits outside the grid flow, so the flow columns need
+   explicit placement — otherwise the pane auto-fills the rail column. */
+.pane {
+  grid-column: 2;
+}
+
+body.has-nav-panel .nav-panel {
+  grid-column: 2;
+}
+
+body.has-nav-panel .pane {
+  grid-column: 3;
+}
+
 svg {
   display: block;
 }
@@ -3590,6 +3604,7 @@ body.has-nav-panel {
 
 @media (max-width: 1100px) {
   body.has-nav-panel { grid-template-columns: 76px 1fr; }
+  body.has-nav-panel .pane { grid-column: 2; }
   .nav-panel { display: none; }
 }
 

@@ -16,9 +16,11 @@ test("the sidebar rests as a rail and expands on hover", async ({ page, chrome }
   await expect.poll(async () => (await chrome.sidebar.boundingBox())?.width).toBeGreaterThan(250);
   await expect(chrome.navLink("/ui/resources").locator(".nav-item__label")).toBeVisible();
 
-  // Content does not reflow: the main column starts at the rail edge.
-  const main = await page.locator("main, .content").first().boundingBox();
-  expect(main && main.x).toBeLessThan(100);
+  // Content does not reflow: the main column starts at the rail edge and
+  // stays there while the sidebar overlays it.
+  const main = await page.locator(".pane").boundingBox();
+  expect(main && main.x).toBeGreaterThan(60);
+  expect(main && main.x).toBeLessThan(120);
 
   // Leave: collapses back.
   await page.mouse.move(800, 400);
