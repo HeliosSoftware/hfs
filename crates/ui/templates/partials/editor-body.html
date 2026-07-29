@@ -134,11 +134,6 @@
           <span class="editor-row__deferred" title="{{ i18n.t("editor-deferred-hint") }}">{{ i18n.t("editor-deferred-badge") }}</span>
           {% endif %}
 
-          {% if !row.binding_strength.is_empty() %}
-          <span class="editor-row__bind" title="{{ i18n.t("editor-binding-hint") }}">{{ row.binding_strength }}</span>
-          <span class="editor-row__deferred" title="{{ i18n.t("editor-deferred-hint") }}">{{ i18n.t("editor-deferred-badge") }}</span>
-          {% endif %}
-
           {% if row.is_primitive %}
           <input class="editor-row__input" type="text" value="{{ row.value }}"
                  data-set="{{ row.path }}"
