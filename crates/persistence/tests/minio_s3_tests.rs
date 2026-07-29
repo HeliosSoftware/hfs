@@ -1177,7 +1177,7 @@ async fn test_minio_purge_tenant_settings_edits_objects_in_place() {
 
     let changed = harness.backend.purge_tenant_settings("acme").await.unwrap();
     assert!(
-        changed >= 1,
+        changed > 0,
         "the settings object should have been rewritten"
     );
 

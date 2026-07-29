@@ -265,10 +265,7 @@ pub fn normalize_legacy(document: &mut Value, writing_tenant: &str) -> bool {
     let stored = as_object(document);
     let mut globals = Map::new();
     let mut moved = Map::new();
-    let mut by_tenant = stored
-        .get(BY_TENANT_KEY)
-        .map(|value| as_object(value))
-        .unwrap_or_default();
+    let mut by_tenant = stored.get(BY_TENANT_KEY).map(as_object).unwrap_or_default();
 
     for (key, value) in stored {
         if key == BY_TENANT_KEY {
@@ -312,7 +309,7 @@ pub fn stored_for_put(current: &Value, incoming: Value, tenant: &str) -> Value {
 
     let mut by_tenant = as_object(&base)
         .get(BY_TENANT_KEY)
-        .map(|value| as_object(value))
+        .map(as_object)
         .unwrap_or_default();
 
     let mut globals = Map::new();

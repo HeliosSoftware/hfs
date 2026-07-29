@@ -754,6 +754,59 @@ async fn put_in_one_tenant_does_not_erase_another_tenants_queries() {
     );
 }
 
+/// The other half of `PUT`-replaces-the-projection: the user-global keys are
+/// part of that view, so a `PUT` that omits one deletes it — from *every*
+/// tenant, since those keys are shared.
+///
+/// This is ordinary `PUT` semantics and is unchanged by tenant scoping (a `PUT`
+/// without `theme` always dropped it). It is pinned here because the scoping
+/// makes it newly surprising — "I only wrote my tenant's queries" — and because
+/// the fix is not to make `PUT` a merge: clients that want to touch one key use
+/// `PATCH`, which is what every shipped client does.
+#[tokio::test]
+async fn put_replaces_the_user_global_keys_too() {
+    let (server, _backend) = server_with_backend();
+
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"theme": "dark"}))
+        .await;
+
+    // A PUT from another tenant that does not echo `theme` back drops it.
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .json(&json!({"savedQueries": {"Patient": {"b": {}}}}))
+        .await;
+    let acme = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(acme.json::<Value>(), json!({}), "PUT replaces the globals");
+
+    // Echoing it back keeps it, and a PATCH never touches it.
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .json(&json!({"theme": "dark", "savedQueries": {"Patient": {"b": {}}}}))
+        .await;
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"savedQueries": {"Patient": {"a": {}}}}))
+        .await;
+    let acme = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(acme.json::<Value>()["theme"], "dark");
+    assert_eq!(
+        acme.json::<Value>()["savedQueries"]["Patient"],
+        json!({"a": {}})
+    );
+}
+
 /// Merge-patch semantics survive the rewrite: a `null` still deletes exactly one
 /// sibling entry, in this tenant only.
 #[tokio::test]
@@ -805,8 +858,12 @@ async fn purging_a_tenant_erases_its_saved_queries_from_user_settings() {
 
     let (server, backend) = server_with_backend();
 
+    // Written the way the web UI actually writes: a merge patch per change
+    // (`saved-queries.js`, `theme.js` and `nav.js` all PATCH). A `PUT` here would
+    // additionally exercise the replace-the-globals semantics covered by
+    // `put_replaces_the_user_global_keys_too`, which is not what this is about.
     server
-        .put("/_user/settings")
+        .patch("/_user/settings")
         .add_header(TENANT, HeaderValue::from_static("acme"))
         .json(&json!({
             "theme": "dark",
@@ -814,7 +871,7 @@ async fn purging_a_tenant_erases_its_saved_queries_from_user_settings() {
         }))
         .await;
     server
-        .put("/_user/settings")
+        .patch("/_user/settings")
         .add_header(TENANT, HeaderValue::from_static("beta"))
         .json(&json!({"savedQueries": {"Patient": {"q": {"query": "name=jones"}}}}))
         .await;
