@@ -37,7 +37,7 @@ for (const { href, url } of NAV) {
     await chrome.sidebar.hover();
     await expect
       .poll(async () => (await chrome.sidebar.boundingBox())?.width)
-      .toBeGreaterThan(250);
+      .toBeGreaterThan(290);
     const link = chrome.navLink(href);
     await expect(link).toBeVisible();
     await link.click();
