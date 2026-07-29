@@ -1142,6 +1142,101 @@ async fn test_minio_settings_delete_is_idempotent() {
     assert!(!harness.backend.delete_settings(&user).await.unwrap());
 }
 
+/// Issue #313: a tenant purge must reach the PHI-derived query strings a client
+/// stores in the settings document — objects that sit *outside* every tenant
+/// prefix and that `purge_tenant_data`'s prefix sweep therefore cannot touch.
+///
+/// This is the S3-specific risk the mock cannot prove: the sweep rewrites each
+/// object with a real conditional `PutObject`, so if the service ignored
+/// `If-Match` the purge could silently clobber a concurrent settings write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_purge_tenant_settings_edits_objects_in_place() {
+    if skip_if_disabled("test_minio_purge_tenant_settings_edits_objects_in_place") {
+        return;
+    }
+
+    let harness = make_prefix_backend("settings-tenant-purge").await;
+    let user = unique_user_key("tenant-purge");
+
+    harness
+        .backend
+        .put_settings(
+            &user,
+            json!({
+                "theme": "dark",
+                "byTenant": {
+                    "acme": {"savedQueries": {"Patient": {"q": {"query": "name=smith"}}}},
+                    "beta": {"savedQueries": {"Patient": {"q": {"query": "name=jones"}}}}
+                }
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    let before = harness.backend.get_settings(&user).await.unwrap().unwrap();
+
+    let changed = harness.backend.purge_tenant_settings("acme").await.unwrap();
+    assert!(
+        changed >= 1,
+        "the settings object should have been rewritten"
+    );
+
+    let after = harness.backend.get_settings(&user).await.unwrap().unwrap();
+    // The object survives — it holds another tenant's content and the user's
+    // global preferences — but acme's subtree is gone from it.
+    assert_eq!(after.document["theme"], "dark");
+    assert!(after.document["byTenant"].get("acme").is_none());
+    assert_eq!(
+        after.document["byTenant"]["beta"]["savedQueries"]["Patient"]["q"]["query"],
+        "name=jones"
+    );
+    assert!(
+        !serde_json::to_string(&after.document)
+            .unwrap()
+            .contains("smith"),
+        "purged content must not survive in the stored object"
+    );
+    // The version bumped, so a client holding the pre-purge ETag cannot write
+    // the purged content back.
+    assert_eq!(after.version, before.version + 1);
+    assert!(
+        harness
+            .backend
+            .put_settings(&user, json!({"x": 1}), Some(before.version))
+            .await
+            .is_err()
+    );
+}
+
+/// A tenant with nothing stored costs a listing and no writes, leaving every
+/// document at its original version (so no client ETag is needlessly broken).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_purge_tenant_settings_is_a_no_op_when_nothing_matches() {
+    if skip_if_disabled("test_minio_purge_tenant_settings_is_a_no_op_when_nothing_matches") {
+        return;
+    }
+
+    let harness = make_prefix_backend("settings-tenant-purge-noop").await;
+    let user = unique_user_key("tenant-purge-noop");
+
+    harness
+        .backend
+        .put_settings(&user, json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    let before = harness.backend.get_settings(&user).await.unwrap().unwrap();
+
+    harness
+        .backend
+        .purge_tenant_settings("absent")
+        .await
+        .unwrap();
+
+    let after = harness.backend.get_settings(&user).await.unwrap().unwrap();
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.document, json!({"theme": "dark"}));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // #284: a missing bucket must never read as an empty store on the real client.
 //

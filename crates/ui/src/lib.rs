@@ -132,6 +132,15 @@ struct WebState {
 /// authenticated principal, `l2:` when auth is disabled (`/ui` also sits
 /// outside the auth layer today; #320 tracks the authenticated modes). Keep in
 /// step with `crates/rest/src/extractors/user.rs`.
+///
+/// These two go through [`SettingsStore`] **directly**, not through
+/// `/_user/settings`, so they bypass the per-tenant scoping that handler applies
+/// (issue #313). That is correct precisely because both are in
+/// [`GLOBAL_SETTINGS_KEYS`](helios_persistence::core::GLOBAL_SETTINGS_KEYS) —
+/// they are user-global preferences, and `tenantId` in particular has to be
+/// readable *before* a tenant is known. Anything added here that is **not** in
+/// that list must go through the handler instead, or it will be written outside
+/// a tenant purge's reach.
 const SETTINGS_VERSION_KEY: &str = "fhirVersion";
 const SETTINGS_TENANT_KEY: &str = "tenantId";
 const LOCAL_USER_KEY: &str = "l2:";
