@@ -409,10 +409,34 @@
         })
         .then(function (result) {
           if (!result.ok) {
-            // The server refused it. Show its OperationOutcome, not our guess.
-            var issue = result.payload && result.payload.issue && result.payload.issue[0];
+            // The server refused it. Show its OperationOutcome, not our guess —
+            // and anchor each issue to its row exactly like live errors (#366):
+            // OperationOutcome.expression carries the same dotted paths.
+            var issues = (result.payload && result.payload.issue) || [];
+            var anchored = 0;
+            issues.forEach(function (issue) {
+              var text =
+                issue.diagnostics || (issue.details && issue.details.text) || "";
+              var expr =
+                (issue.expression && issue.expression[0]) ||
+                (issue.location && issue.location[0]) ||
+                "";
+              var path = expr.indexOf(".") > 0 ? expr.slice(expr.indexOf(".") + 1) : "";
+              var row = path
+                ? document.querySelector('[data-path="' + path + '"]')
+                : null;
+              if (row) {
+                var p = document.createElement("p");
+                p.className = "editor-row__error";
+                p.textContent = text;
+                row.appendChild(p);
+                row.classList.add("editor-row--error");
+                anchored++;
+              }
+            });
+            var first = issues[0];
             say(
-              (issue && (issue.diagnostics || (issue.details && issue.details.text))) ||
+              (first && (first.diagnostics || (first.details && first.details.text))) ||
                 "",
               "error"
             );
