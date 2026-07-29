@@ -119,6 +119,45 @@ async fn patch_null_deletes_a_key() {
     assert_eq!(get.json::<Value>(), json!({"theme": "dark"}));
 }
 
+/// #442: `GET` serves the empty document as a real representation (`{}` with
+/// `ETag: "0"`), so the validator it hands out must round-trip — a fresh
+/// user's read-then-conditional-write deadlocked on 412 forever otherwise.
+#[tokio::test]
+async fn if_match_zero_writes_the_first_version() {
+    let server = create_test_server();
+
+    let fresh = server.get("/_user/settings").await;
+    assert_eq!(fresh.header("etag"), HeaderValue::from_static("\"0\""));
+
+    let created = server
+        .patch("/_user/settings")
+        .add_header(IF_MATCH, HeaderValue::from_static("\"0\""))
+        .json(&json!({"recentSearches": [{"query": "/Patient?name=x"}]}))
+        .await;
+    created.assert_status_ok();
+    assert_eq!(created.header("etag"), HeaderValue::from_static("\"1\""));
+
+    // And once a version exists, "0" is genuinely stale again.
+    let stale = server
+        .patch("/_user/settings")
+        .add_header(IF_MATCH, HeaderValue::from_static("\"0\""))
+        .json(&json!({"a": 1}))
+        .await;
+    assert_eq!(stale.status_code(), StatusCode::PRECONDITION_FAILED);
+}
+
+/// `If-Match: *` still requires an actually stored document.
+#[tokio::test]
+async fn if_match_star_still_requires_an_existing_document() {
+    let server = create_test_server();
+    let conflict = server
+        .patch("/_user/settings")
+        .add_header(IF_MATCH, HeaderValue::from_static("*"))
+        .json(&json!({"a": 1}))
+        .await;
+    assert_eq!(conflict.status_code(), StatusCode::PRECONDITION_FAILED);
+}
+
 #[tokio::test]
 async fn stale_if_match_is_rejected_with_412() {
     let server = create_test_server();
