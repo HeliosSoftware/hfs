@@ -81,14 +81,14 @@ nav-resource-editor = Editor de recursos
 nav-history-versions = Historial y versiones
 nav-compartments = Compartimentos
 nav-batch-transaction = Lote / Transacción
-nav-bulk-export = Exportación masiva
+nav-import = Importar
+nav-export = Exportar
 nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
 nav-admin-ops = Administración / Operaciones
 nav-subscriptions = Suscripciones
 nav-tenants = Tenants
-nav-toggle = Contraer o expandir la navegación
 
 ## Mantenimiento de tenants (/ui/tenants)
 

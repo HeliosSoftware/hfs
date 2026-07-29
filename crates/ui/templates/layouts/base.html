@@ -7,10 +7,9 @@
   <link rel="stylesheet" href="/ui/assets/app.css">
   <!-- The effective tenant for browser-issued FHIR calls (#344). -->
   <meta name="hfs-tenant" content="{{ status.tenant_id() }}">
-  <!-- No `defer`: these attributes must land on <html> before first paint,
-       or the stored theme / collapsed-nav flashes its default first. -->
+  <!-- No `defer`: the theme attribute must land on <html> before first paint,
+       or the stored theme flashes its default first. -->
   <script src="/ui/assets/theme.js"></script>
-  <script src="/ui/assets/nav.js"></script>
   <!-- Vendored, pinned htmx (no runtime CDN). Served from the embedded asset store. -->
   <script src="/ui/assets/htmx.min.js" defer></script>
 </head>
@@ -22,22 +21,6 @@
         <span class="brand__name">{{ i18n.t("app-title") }}</span>
         <span class="brand__version">hfs v{{ status.version }}</span>
       </div>
-      <!--
-        Collapse / expand toggle. A real button (keyboard-operable); nav.js flips
-        the `data-nav` state on <html>, persists it, and keeps aria-expanded in
-        sync. aria-controls points at the sidebar it collapses.
-      -->
-      <button
-        type="button"
-        class="nav-toggle"
-        data-toggle-nav
-        aria-controls="sidebar"
-        aria-expanded="true"
-        aria-label="{{ i18n.t("nav-toggle") }}"
-        title="{{ i18n.t("nav-toggle") }}"
-      >
-        <span class="icon">{% include "icons/panel-left.svg" %}</span>
-      </button>
     </div>
 
     <!--
@@ -96,9 +79,13 @@
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
       </span>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-bulk-export") }}">
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-import") }}">
+        <span class="icon">{% include "icons/import.svg" %}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-import") }}</span>
+      </span>
+      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-export") }}">
         <span class="icon">{% include "icons/export.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-bulk-export") }}</span>
+        <span class="nav-item__label">{{ i18n.t("nav-export") }}</span>
       </span>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-sql-on-fhir") }}">
         <span class="icon">{% include "icons/grid.svg" %}</span>

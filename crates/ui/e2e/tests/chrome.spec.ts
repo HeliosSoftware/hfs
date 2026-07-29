@@ -1,49 +1,46 @@
 import { test, expect } from "../pages/fixtures";
 
-// The persistent chrome: the collapsible nav. Like the theme, it caches in
-// localStorage and roams via a /_user/settings merge-patch — behavior only the
-// browser can observe.
+// The persistent chrome: the sidebar rail (#438). There is no toggle and no
+// persisted state anymore — the sidebar rests as an icon rail and expands as
+// an overlay while hovered or keyboard-focused.
 
-test("the nav toggle collapses and expands, syncing aria and the cache", async ({
-  page,
-  chrome,
-}) => {
+test("the sidebar rests as a rail and expands on hover", async ({ page, chrome }) => {
   await page.goto("/ui", { waitUntil: "networkidle" });
-  // Default is expanded.
-  await expect(page.locator("html")).toHaveAttribute("data-nav", "expanded");
-  await expect(chrome.navToggle).toHaveAttribute("aria-expanded", "true");
 
-  const patch = page.waitForRequest(
-    (r) => r.url().endsWith("/_user/settings") && r.method() === "PATCH",
-  );
-  await chrome.navToggle.click();
+  // Resting: rail width, labels visually hidden (still in the a11y tree).
+  await page.mouse.move(800, 400);
+  await expect.poll(async () => (await chrome.sidebar.boundingBox())?.width).toBeLessThan(100);
 
-  await expect(page.locator("html")).toHaveAttribute("data-nav", "collapsed");
-  await expect(chrome.navToggle).toHaveAttribute("aria-expanded", "false");
-  const req = await patch;
-  expect(JSON.parse(req.postData() ?? "{}")).toEqual({ nav: "collapsed" });
-  expect(await page.evaluate(() => localStorage.getItem("hfs-nav"))).toBe("collapsed");
+  // Hover: expands past the rail and the labels become visible.
+  await chrome.sidebar.hover();
+  await expect.poll(async () => (await chrome.sidebar.boundingBox())?.width).toBeGreaterThan(250);
+  await expect(chrome.navLink("/ui/resources").locator(".nav-item__label")).toBeVisible();
 
-  // Toggling back expands again.
-  await chrome.navToggle.click();
-  await expect(page.locator("html")).toHaveAttribute("data-nav", "expanded");
+  // Content does not reflow: the main column starts at the rail edge.
+  const main = await page.locator("main, .content").first().boundingBox();
+  expect(main && main.x).toBeLessThan(100);
+
+  // Leave: collapses back.
+  await page.mouse.move(800, 400);
+  await expect.poll(async () => (await chrome.sidebar.boundingBox())?.width).toBeLessThan(100);
 });
 
-test("a returning user's collapsed choice is applied before paint", async ({ page }) => {
-  // Isolate the cache path: the settings doc is shared across tests (no auth →
-  // one anonymous user), so pin the server response to empty and let the
-  // localStorage cache be the sole source, the way a first-visit-elsewhere
-  // returning user has it.
-  await page.route("**/_user/settings", (route) =>
-    route.request().method() === "GET"
-      ? route.fulfill({ contentType: "application/json", body: "{}" })
-      : route.fulfill({ status: 200, body: "{}" }),
-  );
-  await page.addInitScript(() => {
-    try {
-      localStorage.setItem("hfs-nav", "collapsed");
-    } catch {}
-  });
-  await page.goto("/ui", { waitUntil: "domcontentloaded" });
-  await expect(page.locator("html")).toHaveAttribute("data-nav", "collapsed");
+test("keyboard focus inside the sidebar also expands it", async ({ page, chrome }) => {
+  await page.goto("/ui", { waitUntil: "networkidle" });
+  await page.mouse.move(800, 400);
+  await chrome.navLink("/ui/resources").focus();
+  await expect.poll(async () => (await chrome.sidebar.boundingBox())?.width).toBeGreaterThan(250);
+});
+
+test("there is no expand/collapse toggle", async ({ page }) => {
+  await page.goto("/ui", { waitUntil: "networkidle" });
+  await expect(page.locator("[data-toggle-nav]")).toHaveCount(0);
+});
+
+test("the Batch & Data section lists Import and Export", async ({ page, chrome }) => {
+  await page.goto("/ui", { waitUntil: "networkidle" });
+  await chrome.sidebar.hover();
+  await expect(chrome.soonItem("Import")).toBeVisible();
+  await expect(chrome.soonItem("Export")).toBeVisible();
+  await expect(chrome.soonItem("SQL-on-FHIR")).toBeVisible();
 });
