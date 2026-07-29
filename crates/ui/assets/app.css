@@ -3922,6 +3922,8 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
   text-transform: uppercase;
   letter-spacing: 0.05em;
   white-space: nowrap;
+}
+
 /* mustSupport emphasis + human labels (#364). */
 .editor-row--must-support > .editor-row__head .editor-row__label {
   font-weight: 600;
