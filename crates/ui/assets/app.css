@@ -3836,3 +3836,31 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
   border-radius: 8px;
   outline: none;
 }
+
+/* mustSupport emphasis + human labels (#364). */
+.editor-row--must-support > .editor-row__head .editor-row__label {
+  font-weight: 600;
+}
+
+.editor-row__name {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.editor-row__ms,
+.editor-add__ms {
+  padding: 1px 5px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  color: var(--accent);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+
+.editor-add__short {
+  display: block;
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 11px;
+}

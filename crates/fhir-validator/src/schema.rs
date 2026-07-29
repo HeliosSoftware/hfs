@@ -152,6 +152,11 @@ pub struct FhirSchema {
     /// Mirrors `ElementDefinition.isSummary`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<bool>,
+    /// Mirrors `ElementDefinition.short` — the human label consumers render
+    /// instead of the raw element name. The longer `definition` text is
+    /// deliberately not carried (pack size); `short` is the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short: Option<String>,
 
     // ------------------------------------------------------------------
     // Helios extension
