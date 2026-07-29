@@ -743,6 +743,34 @@ mod tests {
         .with_source(source)
     }
 
+    #[tokio::test]
+    async fn invalidate_drops_the_cached_snapshot() {
+        let source = crate::conformance::StaticConformanceSource::empty().with(
+            "SearchParameter",
+            FhirVersion::default(),
+            vec![serde_json::json!({
+                "resourceType": "SearchParameter",
+                "id": "sp-1",
+                "url": "http://example.org/SearchParameter/color",
+                "name": "color",
+                "code": "color",
+                "status": "active",
+                "type": "token",
+                "base": ["Patient"],
+                "expression": "Patient.extension.value"
+            })],
+        );
+        let catalog = SpCatalog::new(Arc::new(source));
+        let first = catalog.snapshot("t1", FhirVersion::default()).await;
+        let cached = catalog.snapshot("t1", FhirVersion::default()).await;
+        assert!(Arc::ptr_eq(&first, &cached), "second read serves the cache");
+
+        catalog.invalidate("t1", FhirVersion::default());
+        let fresh = catalog.snapshot("t1", FhirVersion::default()).await;
+        assert!(!Arc::ptr_eq(&first, &fresh), "invalidate forces a re-fetch");
+        assert_eq!(fresh.params.len(), 1);
+    }
+
     #[test]
     fn snapshot_keeps_resource_ids_for_the_editor_links() {
         let resources = vec![serde_json::json!({

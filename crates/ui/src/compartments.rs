@@ -581,6 +581,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn invalidate_drops_the_cached_definitions() {
+        let source = crate::conformance::StaticConformanceSource::empty().with(
+            "CompartmentDefinition",
+            FhirVersion::default(),
+            vec![serde_json::json!({
+                "resourceType": "CompartmentDefinition",
+                "id": "cd-1",
+                "url": "http://example.org/CompartmentDefinition/patient",
+                "status": "active",
+                "code": "Patient",
+                "search": true,
+                "resource": []
+            })],
+        );
+        let catalog = CompartmentCatalog::new(std::sync::Arc::new(source));
+        let first = catalog.definitions("t1", FhirVersion::default()).await;
+        let cached = catalog.definitions("t1", FhirVersion::default()).await;
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &cached),
+            "second read serves the cache"
+        );
+
+        catalog.invalidate("t1", FhirVersion::default());
+        let fresh = catalog.definitions("t1", FhirVersion::default()).await;
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &fresh),
+            "invalidate forces a re-fetch"
+        );
+        assert_eq!(fresh[0].id, "cd-1");
+    }
+
     #[cfg(feature = "R4")]
     #[test]
     fn defs_keep_the_resource_id_for_the_editor_links() {
