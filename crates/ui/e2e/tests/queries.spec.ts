@@ -311,6 +311,79 @@ test.describe("query builder", () => {
     );
   });
 
+  /* ---- related data (#396) -------------------------------------------- */
+
+  test("_include and _revinclude hydrate as structured related-data rows", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl(
+      "Patient?_include=Patient:general-practitioner&_revinclude:iterate=Observation:patient",
+    );
+    const rows = queries.page.locator("#builder-includes .builder-row--include");
+    await expect(rows).toHaveCount(2);
+
+    const inc = rows.nth(0);
+    await expect(inc.locator(".builder-row__itype")).toHaveValue("Patient");
+    await expect(inc.locator(".builder-row__iparam")).toHaveValue("general-practitioner");
+
+    const rev = rows.nth(1);
+    await expect(rev.locator(".builder-row__itype")).toHaveValue("Observation");
+    await expect(rev.locator(".builder-row__iparam")).toHaveValue("patient");
+    await expect(rev.locator("[data-toggle-iterate]")).toHaveAttribute("aria-pressed", "true");
+
+    // Round-trip: toggling iterate off on the revinclude re-serializes.
+    await rev.locator("[data-toggle-iterate]").click();
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_include=Patient:general-practitioner&_revinclude=Observation:patient",
+    );
+  });
+
+  test("the related-data buttons build includes from scratch", async ({ queries }) => {
+    await queries.builder.setUrl("Patient");
+    await queries.builder.addButton("include-rev").click();
+    const row = queries.page.locator("#builder-includes .builder-row--include").first();
+    await row.locator(".builder-row__itype").fill("Observation");
+    await row.locator(".builder-row__iparam").fill("subject");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_revinclude=Observation:subject",
+    );
+
+    await queries.builder.addButton("include-fwd").click();
+    const inc = queries.page.locator("#builder-includes .builder-row--include").nth(1);
+    // The source type defaults to the base type.
+    await expect(inc.locator(".builder-row__itype")).toHaveValue("Patient");
+    await inc.locator(".builder-row__iparam").fill("general-practitioner");
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?_revinclude=Observation:subject&_include=Patient:general-practitioner",
+    );
+  });
+
+  /* ---- in plain English (#395) ---------------------------------------- */
+
+  test("the plain-English line narrates conditions, chains, _has and includes", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl(
+      "Patient?name:contains=Smith,Jones&birthdate=ge1980-01-01" +
+        "&general-practitioner.name=Ann&_has:Observation:patient:code=1234-5" +
+        "&_include:iterate=Patient:general-practitioner&_count=20",
+    );
+    const text = queries.page.locator("#query-plain-text");
+    await expect(queries.page.locator("#query-plain")).toBeVisible();
+    await expect(text).toContainText("Find Patient records");
+    await expect(text).toContainText("name contains “Smith” or “Jones”");
+    await expect(text).toContainText("birthdate is on or after “1980-01-01”");
+    await expect(text).toContainText("general-practitioner’s name is “Ann”");
+    await expect(text).toContainText("related Observation whose code is “1234-5”");
+    await expect(text).toContainText("Also returning the general-practitioner of each Patient (repeatedly)");
+    await expect(text).toContainText("Showing 20 per page");
+
+    // The narration follows edits made through the rows.
+    const row = queries.builder.conditionRows.first();
+    await row.locator(".builder-row__value").first().fill("Lopez");
+    await expect(text).toContainText("name contains “Lopez” or “Jones”");
+  });
+
   test("picking a type swaps in that type's parameter datalist", async ({ queries }) => {
     await queries.railItem("Patient").click();
     // /ui/queries/params fills #param-options for the picked type.
