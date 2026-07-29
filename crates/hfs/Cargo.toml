@@ -40,7 +40,7 @@ s3 = ["helios-rest/s3"]
 # Subscriptions
 subscriptions = ["helios-rest/subscriptions", "dep:helios-subscriptions"]
 
-# Bulk-submit JWE file decryption (dir + A128/A256GCM)
+# Deprecated no-op — bulk-submit JWE decryption is now always built.
 bulk-submit-jwe = ["helios-rest/bulk-submit-jwe"]
 
 # Cloud audit backends

@@ -10,6 +10,9 @@
 //! manifest referencing multi-gigabyte files costs a fixed amount of memory per
 //! concurrent fetch. The one exception is `fileEncryptionKey` (JWE) files, whose
 //! format forces whole-body buffering — see [`HttpSubmitInputFetcher::open_file_stream`].
+//!
+//! When the submission carries a `fileEncryptionKey`, the manifest and every
+//! file are decrypted with the [`crate::jwe`] module (built unconditionally).
 
 use std::sync::Arc;
 
@@ -21,6 +24,12 @@ use serde_json::Value;
 use tokio::io::AsyncBufRead;
 use tokio_util::io::StreamReader;
 
+use crate::jwe::{self, DecryptionKeys, PrivateKey};
+
+/// The default `fileEncryptionKey.coding` code (submit spec: "If omitted,
+/// defaults to a system of `…/file-encryption-type` and code of `jwe`").
+const FILE_ENCRYPTION_TYPE_JWE: &str = "jwe";
+
 /// Fetches submit input over HTTP(S) using `reqwest`.
 pub struct HttpSubmitInputFetcher {
     client: reqwest::Client,
@@ -28,6 +37,9 @@ pub struct HttpSubmitInputFetcher {
     token_provider: Option<Arc<dyn FileTokenProvider>>,
     /// Read scope requested for the outbound file-retrieval token (e.g. `system/*.rs`).
     outbound_scope: String,
+    /// Local private keys used when `fileEncryptionKey.value` (or a file's JWE)
+    /// addresses HFS asymmetrically — `RSA-OAEP*` / `ECDH-ES*`.
+    decryption_keys: Vec<PrivateKey>,
 }
 
 impl HttpSubmitInputFetcher {
@@ -37,7 +49,15 @@ impl HttpSubmitInputFetcher {
             client: reqwest::Client::new(),
             token_provider,
             outbound_scope,
+            decryption_keys: Vec::new(),
         }
+    }
+
+    /// Adds the private keys used to unwrap asymmetrically addressed JWEs
+    /// (`HFS_BULK_SUBMIT_DECRYPTION_KEY`).
+    pub fn with_decryption_keys(mut self, keys: Vec<PrivateKey>) -> Self {
+        self.decryption_keys = keys;
+        self
     }
 
     fn err(msg: impl Into<String>) -> StorageError {
@@ -82,116 +102,134 @@ impl HttpSubmitInputFetcher {
         Ok(rb)
     }
 
-    /// Decrypts `bytes` when a `fileEncryptionKey` is present.
+    /// Reads a named sub-part of the `fileEncryptionKey` parameter.
     ///
-    /// Without the `bulk-submit-jwe` feature this errors (documented
-    /// non-conformance). With the feature it decrypts a `dir` + A128/A256GCM
-    /// compact JWE, treating `fileEncryptionKey.value` as the base64url symmetric
-    /// content-encryption key.
-    fn maybe_decrypt(bytes: Vec<u8>, encryption_key: Option<&Value>) -> StorageResult<Vec<u8>> {
+    /// Accepts both the spec shape (`part[]` with `name`/`value[x]`) and the
+    /// flattened shape some producers emit (`{"value": "…"}`).
+    fn key_part<'a>(key: &'a Value, name: &str) -> Option<&'a Value> {
+        key.get("part")
+            .and_then(|p| p.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|c| c.get("name").and_then(|n| n.as_str()) == Some(name))
+            })
+            .and_then(|c| {
+                c.get("valueString")
+                    .or_else(|| c.get("valueCoding"))
+                    .or_else(|| c.get("valueCode"))
+            })
+            .or_else(|| key.get(name))
+    }
+
+    /// Turns the `fileEncryptionKey` descriptor into a usable key set, or
+    /// `Ok(None)` when the submission is unencrypted.
+    fn resolve_keys(
+        &self,
+        encryption_key: Option<&Value>,
+    ) -> StorageResult<Option<DecryptionKeys>> {
         let Some(key) = encryption_key else {
+            return Ok(None);
+        };
+
+        // `coding` defaults to `jwe`; anything else is a scheme we do not know.
+        let code = Self::key_part(key, "coding").and_then(|c| {
+            c.get("code")
+                .and_then(|v| v.as_str())
+                .or_else(|| c.as_str())
+                .map(str::to_string)
+        });
+        if let Some(code) = &code {
+            if code != FILE_ENCRYPTION_TYPE_JWE {
+                return Err(Self::err(format!(
+                    "unsupported fileEncryptionKey.coding.code '{code}' (only \
+                     '{FILE_ENCRYPTION_TYPE_JWE}' is defined)"
+                )));
+            }
+        }
+
+        let value = Self::key_part(key, "value")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Self::err("fileEncryptionKey.value is required"))?;
+
+        let private = self.decryption_keys.clone();
+        // The spec calls `value` "the JSON Web Encryption structure to deliver a
+        // Content Encryption Key". When it *is* a JWE, unwrap it with a locally
+        // configured private key; otherwise it carries the CEK directly.
+        let cek = if jwe::looks_like_jwe(value.as_bytes()) {
+            let payload = jwe::decrypt(value.as_bytes(), &DecryptionKeys::private(private.clone()))
+                .map_err(|e| Self::err(format!("unwrapping fileEncryptionKey.value: {e}")))?;
+            interpret_cek(&payload).ok_or_else(|| {
+                Self::err("fileEncryptionKey.value unwrapped to unusable key material")
+            })?
+        } else {
+            interpret_cek(value.as_bytes()).ok_or_else(|| {
+                Self::err(
+                    "fileEncryptionKey.value is neither a JWE, an `oct` JWK, nor \
+                     base64url-encoded key material",
+                )
+            })?
+        };
+
+        Ok(Some(DecryptionKeys {
+            shared: Some(cek),
+            private,
+        }))
+    }
+
+    /// Decrypts a downloaded file when the submission is encrypted.
+    ///
+    /// A `fileEncryptionKey` means the provider SHALL have encrypted the file,
+    /// so a non-JWE payload is an error rather than a silent plaintext accept.
+    fn decrypt_file(
+        &self,
+        bytes: Vec<u8>,
+        keys: Option<&DecryptionKeys>,
+    ) -> StorageResult<Vec<u8>> {
+        let Some(keys) = keys else {
             return Ok(bytes);
         };
-        #[cfg(not(feature = "bulk-submit-jwe"))]
-        {
-            let _ = key;
-            Err(Self::err(
-                "fileEncryptionKey (JWE) is not supported in this build \
-                 (enable the `bulk-submit-jwe` feature)",
-            ))
+        if !jwe::looks_like_jwe(&bytes) {
+            return Err(Self::err(
+                "fileEncryptionKey was supplied but the file is not a JWE",
+            ));
         }
-        #[cfg(feature = "bulk-submit-jwe")]
-        {
-            let value = key
-                .get("value")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    // value may also be supplied as a nested part: { name: "value", valueString }
-                    key.get("part")
-                        .and_then(|p| p.as_array())
-                        .and_then(|arr| {
-                            arr.iter()
-                                .find(|c| c.get("name").and_then(|n| n.as_str()) == Some("value"))
-                        })
-                        .and_then(|c| c.get("valueString").and_then(|v| v.as_str()))
-                })
-                .ok_or_else(|| Self::err("fileEncryptionKey.value is required"))?;
-            jwe::decrypt_dir_gcm(&bytes, value).map_err(Self::err)
-        }
+        jwe::decrypt(&bytes, keys).map_err(Self::err)
     }
 }
 
-#[cfg(feature = "bulk-submit-jwe")]
-mod jwe {
-    //! Minimal `dir` + AxxxGCM compact-JWE decryption (pure Rust, no OpenSSL).
+/// Interprets raw key material as an AES key.
+///
+/// Accepts an `oct` JWK, a base64url-encoded key, or (for a CEK recovered from
+/// a JWE payload) raw bytes of a valid AES/AES-CBC-HMAC key length.
+fn interpret_cek(bytes: &[u8]) -> Option<Vec<u8>> {
+    const KEY_LENGTHS: [usize; 5] = [16, 24, 32, 48, 64];
 
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
-    use base64::Engine;
-
-    fn b64(part: &str) -> Result<Vec<u8>, String> {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(part)
-            .map_err(|e| format!("base64url decode failed: {e}"))
-    }
-
-    /// Decrypts a compact JWE (`hdr.ek.iv.ct.tag`) created with `alg=dir` and
-    /// `enc=A128GCM|A256GCM`, using `key_b64url` as the symmetric key.
-    pub fn decrypt_dir_gcm(jwe_bytes: &[u8], key_b64url: &str) -> Result<Vec<u8>, String> {
-        let compact = std::str::from_utf8(jwe_bytes)
-            .map_err(|_| "JWE is not valid UTF-8".to_string())?
-            .trim();
-        let parts: Vec<&str> = compact.split('.').collect();
-        if parts.len() != 5 {
-            return Err("compact JWE must have 5 segments".to_string());
-        }
-        let header_b64 = parts[0];
-        let header_json = b64(header_b64)?;
-        let header: serde_json::Value =
-            serde_json::from_slice(&header_json).map_err(|e| format!("invalid JWE header: {e}"))?;
-        if header.get("alg").and_then(|v| v.as_str()) != Some("dir") {
-            return Err("only alg=dir is supported".to_string());
-        }
-        let enc = header
-            .get("enc")
-            .and_then(|v| v.as_str())
-            .unwrap_or("A256GCM");
-        if !parts[1].is_empty() {
-            return Err("alg=dir must not carry an encrypted key".to_string());
-        }
-        let iv = b64(parts[2])?;
-        let ct = b64(parts[3])?;
-        let tag = b64(parts[4])?;
-        let key = b64(key_b64url)?;
-        // AEAD ciphertext = ciphertext || tag; AAD = ASCII(base64url(header)).
-        let mut ciphertext = ct;
-        ciphertext.extend_from_slice(&tag);
-        let nonce = Nonce::from_slice(&iv);
-        let aad = header_b64.as_bytes();
-        let payload = Payload {
-            msg: &ciphertext,
-            aad,
-        };
-        match enc {
-            "A256GCM" => {
-                let cipher = Aes256Gcm::new_from_slice(&key)
-                    .map_err(|e| format!("invalid A256GCM key: {e}"))?;
-                cipher
-                    .decrypt(nonce, payload)
-                    .map_err(|_| "JWE decryption failed (A256GCM)".to_string())
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let text = text.trim();
+        if text.starts_with('{') {
+            // An `oct` JWK: {"kty":"oct","k":"<base64url>"}.
+            if let Ok(jwk) = serde_json::from_str::<Value>(text) {
+                if let Some(k) = jwk.get("k").and_then(|v| v.as_str()) {
+                    return base64::Engine::decode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        k.trim_end_matches('='),
+                    )
+                    .ok();
+                }
             }
-            "A128GCM" => {
-                let cipher = Aes128Gcm::new_from_slice(&key)
-                    .map_err(|e| format!("invalid A128GCM key: {e}"))?;
-                cipher
-                    .decrypt(nonce, payload)
-                    .map_err(|_| "JWE decryption failed (A128GCM)".to_string())
+            return None;
+        }
+        if let Ok(decoded) = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            text.trim_end_matches('='),
+        ) {
+            if KEY_LENGTHS.contains(&decoded.len()) {
+                return Some(decoded);
             }
-            other => Err(format!(
-                "unsupported JWE enc '{other}' (expected A128GCM|A256GCM)"
-            )),
         }
     }
+    // Raw bytes — only plausible for a CEK recovered from a JWE payload.
+    KEY_LENGTHS.contains(&bytes.len()).then(|| bytes.to_vec())
 }
 
 #[async_trait]
@@ -201,6 +239,7 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         url: &str,
         request_headers: &[(String, String)],
         oauth_metadata_urls: &[String],
+        encryption_key: Option<&Value>,
     ) -> StorageResult<RemoteManifest> {
         // The manifest itself may be protected; attempt with a token when one is
         // configured, falling back to anonymous when not.
@@ -221,7 +260,27 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| Self::err(format!("reading manifest {url}: {e}")))?;
+            .map_err(|e| Self::err(format!("reading manifest {url}: {e}")))?
+            .to_vec();
+
+        // The spec has the provider encrypt the manifest as well as the files.
+        // Manifests carry URLs rather than PHI and several providers leave them
+        // in the clear, so a plaintext manifest is accepted with a warning while
+        // a plaintext *file* is rejected outright.
+        let keys = self.resolve_keys(encryption_key)?;
+        let bytes = match &keys {
+            Some(keys) if jwe::looks_like_jwe(&bytes) => jwe::decrypt(&bytes, keys)
+                .map_err(|e| Self::err(format!("decrypting manifest {url}: {e}")))?,
+            Some(_) => {
+                tracing::warn!(
+                    manifest_url = url,
+                    "fileEncryptionKey was supplied but the manifest is not encrypted"
+                );
+                bytes
+            }
+            None => bytes,
+        };
+
         serde_json::from_slice::<RemoteManifest>(&bytes)
             .map_err(|e| Self::err(format!("parsing manifest {url}: {e}")))
     }
@@ -237,6 +296,9 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
         oauth_metadata_urls: &[String],
         encryption_key: Option<&Value>,
     ) -> StorageResult<Box<dyn AsyncBufRead + Send + Unpin>> {
+        // Resolve the key before the fetch so a misconfigured submission fails
+        // without pulling the file body.
+        let keys = self.resolve_keys(encryption_key)?;
         let rb = self
             .build_get(
                 url,
@@ -255,16 +317,18 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
                 resp.status()
             )));
         }
-        if encryption_key.is_some() {
-            // A compact JWE is a single AEAD ciphertext whose authentication tag
-            // is the final segment: no plaintext may be released before the whole
-            // body has been read and the tag verified. Encrypted files are
-            // therefore necessarily buffered; unencrypted ones stream.
+        if let Some(keys) = &keys {
+            // A JWE is a single AEAD ciphertext whose authentication tag is the
+            // final segment: no plaintext may be released before the whole body
+            // has been read and the tag verified. Encrypted files are therefore
+            // necessarily buffered; unencrypted ones stream.
             let bytes = resp
                 .bytes()
                 .await
                 .map_err(|e| Self::err(format!("reading file {url}: {e}")))?;
-            let bytes = Self::maybe_decrypt(bytes.to_vec(), encryption_key)?;
+            let bytes = self
+                .decrypt_file(bytes.to_vec(), Some(keys))
+                .map_err(|e| Self::err(format!("decrypting file {url}: {e}")))?;
             return Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
                 bytes,
             ))));
@@ -285,11 +349,47 @@ impl SubmitInputFetcher for HttpSubmitInputFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::aead::consts::U12;
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use base64::Engine;
     use serde_json::json;
 
+    const B64URL: base64::engine::general_purpose::GeneralPurpose =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    fn fetcher() -> HttpSubmitInputFetcher {
+        HttpSubmitInputFetcher::new(None, "system/*.rs".to_string())
+    }
+
+    /// Builds a `dir` + A256GCM compact JWE over `plaintext`.
+    fn seal(key: &[u8; 32], plaintext: &[u8]) -> String {
+        let iv = [3u8; 12];
+        let header = br#"{"alg":"dir","enc":"A256GCM"}"#;
+        let header_b64 = B64URL.encode(header);
+        let sealed = Aes256Gcm::new_from_slice(key)
+            .unwrap()
+            .encrypt(
+                Nonce::<U12>::from_slice(&iv),
+                Payload {
+                    msg: plaintext,
+                    aad: header_b64.as_bytes(),
+                },
+            )
+            .unwrap();
+        let (ct, tag) = sealed.split_at(sealed.len() - 16);
+        format!(
+            "{}..{}.{}.{}",
+            header_b64,
+            B64URL.encode(iv),
+            B64URL.encode(ct),
+            B64URL.encode(tag)
+        )
+    }
+
     #[test]
-    fn test_maybe_decrypt_passthrough_when_unencrypted() {
-        let out = HttpSubmitInputFetcher::maybe_decrypt(b"hello".to_vec(), None).unwrap();
+    fn test_decrypt_file_passthrough_when_unencrypted() {
+        let out = fetcher().decrypt_file(b"hello".to_vec(), None).unwrap();
         assert_eq!(out, b"hello");
     }
 
@@ -301,8 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_get_no_token_succeeds() {
-        let fetcher = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string());
-        let rb = fetcher
+        let rb = fetcher()
             .build_get("http://example.com/m.json", &[], false, &[])
             .await;
         assert!(rb.is_ok());
@@ -310,8 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_get_requires_token_without_provider_errors() {
-        let fetcher = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string());
-        let result = fetcher
+        let result = fetcher()
             .build_get(
                 "http://example.com/file.ndjson",
                 &[],
@@ -326,9 +424,8 @@ mod tests {
     #[tokio::test]
     async fn test_build_get_applies_provider_headers() {
         // Provider headers are applied even on the anonymous path.
-        let fetcher = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string());
         let headers = vec![("X-Custom".to_string(), "value".to_string())];
-        let rb = fetcher
+        let rb = fetcher()
             .build_get("http://example.com/m.json", &headers, false, &[])
             .await;
         assert!(rb.is_ok());
@@ -383,7 +480,7 @@ mod tests {
 
         let (release, wait) = tokio::sync::oneshot::channel();
         let url = serve_two_chunks(wait).await;
-        let fetcher = HttpSubmitInputFetcher::new(None, "system/*.rs".to_string());
+        let fetcher = fetcher();
 
         let reader = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -412,59 +509,172 @@ mod tests {
         assert!(lines.next_line().await.unwrap().is_none());
     }
 
-    #[cfg(not(feature = "bulk-submit-jwe"))]
     #[test]
-    fn test_maybe_decrypt_rejected_without_feature() {
-        let key = json!({"coding": {"code": "jwe"}, "value": "x"});
-        assert!(HttpSubmitInputFetcher::maybe_decrypt(b"data".to_vec(), Some(&key)).is_err());
+    fn test_decrypts_file_with_flattened_key_value() {
+        let key = [7u8; 32];
+        let plaintext = b"{\"resourceType\":\"Patient\",\"id\":\"x\"}\n";
+        let compact = seal(&key, plaintext);
+        let enc_key = json!({"coding": {"code": "jwe"}, "value": B64URL.encode(key)});
+
+        let f = fetcher();
+        let keys = f.resolve_keys(Some(&enc_key)).unwrap();
+        let out = f
+            .decrypt_file(compact.clone().into_bytes(), keys.as_ref())
+            .unwrap();
+        assert_eq!(out, plaintext);
+
+        // A wrong key fails the authentication tag.
+        let wrong = json!({"value": B64URL.encode([9u8; 32])});
+        let wrong_keys = f.resolve_keys(Some(&wrong)).unwrap();
+        assert!(
+            f.decrypt_file(compact.into_bytes(), wrong_keys.as_ref())
+                .is_err()
+        );
     }
 
-    #[cfg(feature = "bulk-submit-jwe")]
     #[test]
-    fn test_jwe_dir_a256gcm_round_trip() {
-        use aes_gcm::aead::{Aead, KeyInit, Payload};
-        use aes_gcm::{Aes256Gcm, Nonce};
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    fn test_decrypts_file_with_spec_shaped_parts() {
+        // The spec shape: fileEncryptionKey is a part with `coding`/`value` parts.
+        let key = [11u8; 32];
+        let plaintext = b"line\n";
+        let compact = seal(&key, plaintext);
+        let enc_key = json!({
+            "name": "fileEncryptionKey",
+            "part": [
+                {"name": "coding", "valueCoding": {
+                    "system": "http://hl7.org/fhir/uv/bulkdata/ValueSet/file-encryption-type",
+                    "code": "jwe"
+                }},
+                {"name": "value", "valueString": B64URL.encode(key)},
+            ]
+        });
+        let f = fetcher();
+        let keys = f.resolve_keys(Some(&enc_key)).unwrap();
+        let out = f.decrypt_file(compact.into_bytes(), keys.as_ref()).unwrap();
+        assert_eq!(out, plaintext);
+    }
 
-        let key = [7u8; 32];
-        let iv = [3u8; 12];
-        let plaintext = b"{\"resourceType\":\"Patient\",\"id\":\"x\"}\n";
-        let header_json = br#"{"alg":"dir","enc":"A256GCM"}"#;
-        let header_b64 = b64.encode(header_json);
+    #[test]
+    fn test_accepts_an_oct_jwk_as_the_key_value() {
+        let key = [13u8; 32];
+        let plaintext = b"jwk\n";
+        let compact = seal(&key, plaintext);
+        let jwk = json!({"kty": "oct", "k": B64URL.encode(key)}).to_string();
+        let enc_key = json!({"value": jwk});
+        let f = fetcher();
+        let keys = f.resolve_keys(Some(&enc_key)).unwrap();
+        let out = f.decrypt_file(compact.into_bytes(), keys.as_ref()).unwrap();
+        assert_eq!(out, plaintext);
+    }
 
-        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let ct_and_tag = cipher
+    #[test]
+    fn test_unwraps_a_jwe_wrapped_content_encryption_key() {
+        use rand::rngs::OsRng;
+
+        // The provider delivers the CEK as an ECDH-ES JWE addressed to HFS's
+        // public key, rather than putting the raw key in `value`.
+        let recipient = p256::SecretKey::random(&mut OsRng);
+        let ephemeral = p256::SecretKey::random(&mut OsRng);
+        let epk: Value = serde_json::from_str(&ephemeral.public_key().to_jwk_string()).unwrap();
+        let z = p256::ecdh::diffie_hellman(
+            ephemeral.to_nonzero_scalar(),
+            recipient.public_key().as_affine(),
+        );
+        let wrap_cek = crate::jwe::concat_kdf(z.raw_secret_bytes(), "A256GCM", b"", b"", 32);
+
+        let cek = [17u8; 32];
+        let iv = [23u8; 12];
+        let header =
+            serde_json::json!({"alg": "ECDH-ES", "enc": "A256GCM", "epk": epk}).to_string();
+        let header_b64 = B64URL.encode(&header);
+        let sealed = Aes256Gcm::new_from_slice(&wrap_cek)
+            .unwrap()
             .encrypt(
-                Nonce::from_slice(&iv),
+                Nonce::<U12>::from_slice(&iv),
                 Payload {
-                    msg: plaintext,
+                    // The wrapped payload is the file CEK, base64url-encoded.
+                    msg: B64URL.encode(cek).as_bytes(),
                     aad: header_b64.as_bytes(),
                 },
             )
             .unwrap();
-        let (ct, tag) = ct_and_tag.split_at(ct_and_tag.len() - 16);
-        let compact = format!(
+        let (ct, tag) = sealed.split_at(sealed.len() - 16);
+        let key_jwe = format!(
             "{}..{}.{}.{}",
             header_b64,
-            b64.encode(iv),
-            b64.encode(ct),
-            b64.encode(tag)
+            B64URL.encode(iv),
+            B64URL.encode(ct),
+            B64URL.encode(tag)
         );
 
-        let out =
-            super::jwe::decrypt_dir_gcm(compact.as_bytes(), &b64.encode(key)).expect("decrypt");
+        let plaintext = b"wrapped\n";
+        let file = seal(&cek, plaintext);
+        let enc_key = json!({"value": key_jwe});
+
+        let f = fetcher().with_decryption_keys(vec![PrivateKey::P256 {
+            kid: None,
+            key: recipient,
+        }]);
+        let keys = f.resolve_keys(Some(&enc_key)).unwrap();
+        let out = f.decrypt_file(file.into_bytes(), keys.as_ref()).unwrap();
         assert_eq!(out, plaintext);
 
-        // Through the public surface (key as fileEncryptionKey.value).
-        let enc_key = json!({"coding": {"code": "jwe"}, "value": b64.encode(key)});
-        let out2 =
-            HttpSubmitInputFetcher::maybe_decrypt(compact.clone().into_bytes(), Some(&enc_key))
-                .unwrap();
-        assert_eq!(out2, plaintext);
+        // Without the private key the failure names the missing configuration.
+        let err = fetcher().resolve_keys(Some(&enc_key)).unwrap_err();
+        assert!(
+            err.to_string().contains("HFS_BULK_SUBMIT_DECRYPTION_KEY"),
+            "{err}"
+        );
+    }
 
-        // Wrong key → decryption fails (authentication-tag mismatch).
-        let wrong = json!({"coding": {"code": "jwe"}, "value": b64.encode([9u8; 32])});
-        assert!(HttpSubmitInputFetcher::maybe_decrypt(compact.into_bytes(), Some(&wrong)).is_err());
+    #[test]
+    fn test_rejects_unknown_encryption_coding() {
+        let enc_key = json!({"coding": {"code": "pgp"}, "value": "AAAA"});
+        let err = fetcher().resolve_keys(Some(&enc_key)).unwrap_err();
+        assert!(err.to_string().contains("'pgp'"), "{err}");
+    }
+
+    #[test]
+    fn test_rejects_missing_key_value() {
+        let enc_key = json!({"coding": {"code": "jwe"}});
+        let err = fetcher().resolve_keys(Some(&enc_key)).unwrap_err();
+        assert!(err.to_string().contains("value is required"), "{err}");
+    }
+
+    #[test]
+    fn test_rejects_unusable_key_value() {
+        let enc_key = json!({"value": "not-a-key"});
+        let err = fetcher().resolve_keys(Some(&enc_key)).unwrap_err();
+        assert!(err.to_string().contains("base64url"), "{err}");
+    }
+
+    #[test]
+    fn test_rejects_a_plaintext_file_when_a_key_was_supplied() {
+        let enc_key = json!({"value": B64URL.encode([5u8; 32])});
+        let f = fetcher();
+        let keys = f.resolve_keys(Some(&enc_key)).unwrap();
+        let err = f
+            .decrypt_file(b"{\"resourceType\":\"Patient\"}\n".to_vec(), keys.as_ref())
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a JWE"), "{err}");
+    }
+
+    #[test]
+    fn test_interpret_cek_forms() {
+        // base64url of a 32-byte key
+        assert_eq!(
+            interpret_cek(B64URL.encode([1u8; 32]).as_bytes())
+                .unwrap()
+                .len(),
+            32
+        );
+        // oct JWK
+        let jwk = json!({"kty": "oct", "k": B64URL.encode([2u8; 16])}).to_string();
+        assert_eq!(interpret_cek(jwk.as_bytes()).unwrap().len(), 16);
+        // raw bytes at a valid AES length
+        assert_eq!(interpret_cek(&[3u8; 64]).unwrap().len(), 64);
+        // nothing usable
+        assert!(interpret_cek(b"nope").is_none());
+        assert!(interpret_cek(&[4u8; 17]).is_none());
     }
 }
