@@ -9,6 +9,10 @@ pub mod retry;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use helios_persistence::core::ResourceStorage;
+use helios_persistence::error::StorageError;
+use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::email::EmailChannel;
@@ -45,6 +49,15 @@ pub struct SubscriptionEngine {
     messaging_channel: Option<Arc<MessagingChannel>>,
     config: SubscriptionConfig,
     base_url: String,
+    /// Storage handle used to write a server-driven status transition back into
+    /// the stored `Subscription` resource. `None` leaves every transition
+    /// in-memory only, which is the pre-#357 behaviour.
+    status_store: Option<Arc<dyn ResourceStorage>>,
+    /// Bounds how many status write-backs may be in flight at once, so a
+    /// transition storm (every subscription tripping at the same instant during
+    /// a subscriber outage) cannot drain the primary backend's connection pool
+    /// and take reads down with it.
+    status_write_slots: Arc<Semaphore>,
 }
 
 fn calculate_handshake_retry_delay(
@@ -103,6 +116,8 @@ impl SubscriptionEngine {
             )
         });
 
+        let status_write_slots = Arc::new(Semaphore::new(config.status_write_concurrency.max(1)));
+
         Self {
             topic_registry,
             topic_resource_index: DashMap::new(),
@@ -116,7 +131,36 @@ impl SubscriptionEngine {
             messaging_channel,
             config,
             base_url,
+            status_store: None,
+            status_write_slots,
         }
+    }
+
+    /// Attaches the storage handle that server-driven status transitions are
+    /// written back to (issue #357).
+    ///
+    /// Without this the engine's decisions — `requested` → `active` after a
+    /// successful handshake, `→ error`, `→ off` once the delivery circuit
+    /// breaker trips — live only in the in-memory manager. They are then lost on
+    /// restart, and `GET /Subscription/{id}` contradicts
+    /// `GET /Subscription/{id}/$status` for the lifetime of the resource.
+    ///
+    /// This deliberately takes the plain [`ResourceStorage`] every backend
+    /// already implements rather than a new per-backend store, so the fix
+    /// applies uniformly to SQLite, PostgreSQL, MongoDB, S3, and the composite
+    /// deployments with no schema change and no migration.
+    ///
+    /// On a composite deployment pass the **composite**, not the primary, so the
+    /// rewritten resource also reaches the search index — otherwise
+    /// `GET /Subscription?status=active` keeps answering from stale documents.
+    pub fn with_status_store(mut self, storage: Arc<dyn ResourceStorage>) -> Self {
+        self.status_store = Some(storage);
+        self
+    }
+
+    /// Whether server-driven status transitions are written back to storage.
+    pub fn persists_status(&self) -> bool {
+        self.status_store.is_some() && self.config.persist_status
     }
 
     /// Returns a reference to the topic registry.
@@ -544,9 +588,8 @@ impl SubscriptionEngine {
                     error = %e,
                     "Failed to build handshake"
                 );
-                let _ =
-                    self.manager
-                        .update_status(tenant_id, sub_id, SubscriptionStatusCode::Error);
+                self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                    .await;
                 return;
             }
         };
@@ -596,11 +639,8 @@ impl SubscriptionEngine {
                             endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                             "Email channel requested but no SMTP settings configured"
                         );
-                        let _ = self.manager.update_status(
-                            tenant_id,
-                            sub_id,
-                            SubscriptionStatusCode::Error,
-                        );
+                        self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                            .await;
                         return;
                     }
                 },
@@ -613,11 +653,8 @@ impl SubscriptionEngine {
                             endpoint = subscription.channel.endpoint.as_deref().unwrap_or(""),
                             "Messaging channel requested but messaging settings not configured"
                         );
-                        let _ = self.manager.update_status(
-                            tenant_id,
-                            sub_id,
-                            SubscriptionStatusCode::Error,
-                        );
+                        self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                            .await;
                         return;
                     }
                 },
@@ -643,11 +680,8 @@ impl SubscriptionEngine {
                         attempt,
                         "Handshake successful, activating subscription"
                     );
-                    let _ = self.manager.update_status(
-                        tenant_id,
-                        sub_id,
-                        SubscriptionStatusCode::Active,
-                    );
+                    self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Active)
+                        .await;
                     return;
                 }
                 Ok(DispatchResult::PermanentError(msg)) => {
@@ -660,11 +694,8 @@ impl SubscriptionEngine {
                         error = %msg,
                         "Handshake failed with permanent error"
                     );
-                    let _ = self.manager.update_status(
-                        tenant_id,
-                        sub_id,
-                        SubscriptionStatusCode::Error,
-                    );
+                    self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                        .await;
                     return;
                 }
                 Ok(DispatchResult::RetryableError(msg)) => {
@@ -678,11 +709,8 @@ impl SubscriptionEngine {
                             error = %msg,
                             "Handshake retries exhausted"
                         );
-                        let _ = self.manager.update_status(
-                            tenant_id,
-                            sub_id,
-                            SubscriptionStatusCode::Error,
-                        );
+                        self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                            .await;
                         return;
                     }
 
@@ -711,11 +739,8 @@ impl SubscriptionEngine {
                         error = %e,
                         "Handshake error"
                     );
-                    let _ = self.manager.update_status(
-                        tenant_id,
-                        sub_id,
-                        SubscriptionStatusCode::Error,
-                    );
+                    self.transition_status(tenant_id, sub_id, SubscriptionStatusCode::Error)
+                        .await;
                     return;
                 }
             }
@@ -802,7 +827,7 @@ impl SubscriptionEngine {
                         error = %msg,
                         "Permanent delivery error"
                     );
-                    self.handle_delivery_failure(tenant_id, sub_id);
+                    self.handle_delivery_failure(tenant_id, sub_id).await;
                     return;
                 }
                 Ok(DispatchResult::RetryableError(msg)) => {
@@ -819,7 +844,7 @@ impl SubscriptionEngine {
                             error = %msg,
                             "Max retries exhausted"
                         );
-                        self.handle_delivery_failure(tenant_id, sub_id);
+                        self.handle_delivery_failure(tenant_id, sub_id).await;
                         return;
                     }
 
@@ -846,36 +871,217 @@ impl SubscriptionEngine {
                         error = %e,
                         "Dispatch error"
                     );
-                    self.handle_delivery_failure(tenant_id, sub_id);
+                    self.handle_delivery_failure(tenant_id, sub_id).await;
                     return;
                 }
             }
         }
     }
 
+    /// The single choke point for every server-driven status transition.
+    ///
+    /// Applies the transition to the in-memory manager and, only when the
+    /// manager accepted it as a genuine state change, writes the new status back
+    /// into the stored `Subscription` resource.
+    ///
+    /// Gating the write on the manager's `Ok` is what keeps the write volume
+    /// bounded. [`SubscriptionManager::update_status`] rejects same-state
+    /// transitions and transitions out of a terminal state, so when a subscriber
+    /// outage parks hundreds of concurrent dispatch tasks that all observe
+    /// `consecutive_failures >= off_threshold`, exactly one of them gets `Ok`
+    /// and therefore exactly one issues a write. Over a subscription's whole
+    /// lifetime that is at most three writes (`→ active`, `→ error`, `→ off`).
+    ///
+    /// Returns whether the in-memory transition was applied. Persistence failure
+    /// does **not** change that answer: see [`Self::write_status_back`].
+    async fn transition_status(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        new_status: SubscriptionStatusCode,
+    ) -> bool {
+        if self
+            .manager
+            .update_status(tenant_id, subscription_id, new_status)
+            .is_err()
+        {
+            return false;
+        }
+        self.write_status_back(tenant_id, subscription_id, new_status)
+            .await;
+        true
+    }
+
+    /// Writes a server-driven status transition into the stored `Subscription`.
+    ///
+    /// Fails **open**, always. The in-memory transition has already been applied
+    /// by [`Self::transition_status`] and is what this process acts on, so a
+    /// storage error must never undo it: refusing to mark a subscription `off`
+    /// because the database is briefly unavailable would put the server straight
+    /// back to hammering the endpoint the circuit breaker just gave up on. The
+    /// cost of failing open is that this one transition does not survive a
+    /// restart — exactly the pre-#357 behaviour, and no worse.
+    ///
+    /// A concurrent client write wins. `ResourceStorage::update` takes the
+    /// version that was read and every backend rejects a stale one, so a racing
+    /// `PUT /Subscription/{id}` surfaces here as a version conflict, which is
+    /// **dropped rather than retried**: the client's copy is the newer intent,
+    /// and its write re-registers the subscription anyway.
+    async fn write_status_back(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        new_status: SubscriptionStatusCode,
+    ) {
+        if !self.config.persist_status {
+            return;
+        }
+        let Some(storage) = self.status_store.as_ref() else {
+            return;
+        };
+
+        // A transition storm must not drain the backend's connection pool.
+        // `acquire_owned` is not used: the permit lives only for this call.
+        let Ok(_permit) = self.status_write_slots.acquire().await else {
+            return; // Semaphore closed — engine shutting down.
+        };
+
+        let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
+        let timeout = self.config.status_write_timeout;
+
+        let result = tokio::time::timeout(
+            timeout,
+            persist_status(storage.as_ref(), &tenant, subscription_id, new_status),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(PersistOutcome::Written)) => debug!(
+                tenant_id,
+                subscription_id,
+                status = %new_status,
+                "Persisted subscription status transition"
+            ),
+            Ok(Ok(PersistOutcome::AlreadyCurrent)) => debug!(
+                tenant_id,
+                subscription_id,
+                status = %new_status,
+                "Stored subscription status already current; no write issued"
+            ),
+            Ok(Ok(PersistOutcome::Vanished)) => debug!(
+                tenant_id,
+                subscription_id, "Subscription resource is gone; nothing to persist status onto"
+            ),
+            Ok(Ok(PersistOutcome::RacedClientWrite)) => debug!(
+                tenant_id,
+                subscription_id,
+                status = %new_status,
+                "Concurrent client write won; dropping server status write-back"
+            ),
+            // The one line that tells an operator this server has silently
+            // reverted to losing its subscription decisions on restart.
+            Ok(Err(e)) => error!(
+                tenant_id,
+                subscription_id,
+                status = %new_status,
+                error = %e,
+                "Failed to persist subscription status transition; \
+                 this transition will not survive a restart"
+            ),
+            Err(_) => error!(
+                tenant_id,
+                subscription_id,
+                status = %new_status,
+                timeout_ms = timeout.as_millis() as u64,
+                "Timed out persisting subscription status transition; \
+                 this transition will not survive a restart"
+            ),
+        }
+    }
+
     /// Handle a delivery failure: increment failure count and potentially
     /// transition status to error or off.
-    fn handle_delivery_failure(&self, tenant_id: &str, subscription_id: &str) {
-        if let Some(failure_count) = self.manager.record_failure(tenant_id, subscription_id) {
-            if failure_count >= self.config.off_threshold {
-                warn!(
-                    subscription_id,
-                    failures = failure_count,
-                    "Turning off subscription after repeated failures"
-                );
-                let _ = self.manager.update_status(
-                    tenant_id,
-                    subscription_id,
-                    SubscriptionStatusCode::Off,
-                );
-            } else if failure_count >= self.config.error_threshold {
-                let _ = self.manager.update_status(
-                    tenant_id,
-                    subscription_id,
-                    SubscriptionStatusCode::Error,
-                );
-            }
+    async fn handle_delivery_failure(&self, tenant_id: &str, subscription_id: &str) {
+        let Some(failure_count) = self.manager.record_failure(tenant_id, subscription_id) else {
+            return;
+        };
+        if failure_count >= self.config.off_threshold {
+            warn!(
+                tenant_id,
+                subscription_id,
+                failures = failure_count,
+                threshold = self.config.off_threshold,
+                "Turning off subscription after repeated failures"
+            );
+            self.transition_status(tenant_id, subscription_id, SubscriptionStatusCode::Off)
+                .await;
+        } else if failure_count >= self.config.error_threshold {
+            self.transition_status(tenant_id, subscription_id, SubscriptionStatusCode::Error)
+                .await;
         }
+    }
+}
+
+/// What [`persist_status`] did, so the caller can log it at the right level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistOutcome {
+    /// The stored resource was rewritten with the new status.
+    Written,
+    /// The stored resource already carried this status — no write issued.
+    ///
+    /// This is the common case on the first boot after upgrading: rehydration
+    /// re-activates every subscription that reads back `requested`, and without
+    /// this check each success would rewrite a resource that write-back had
+    /// already corrected on a previous run.
+    AlreadyCurrent,
+    /// The resource no longer exists (deleted between the transition and the
+    /// write). Not an error.
+    Vanished,
+    /// A concurrent client write bumped the version first. Dropped, not retried.
+    RacedClientWrite,
+}
+
+/// Reads the stored `Subscription`, replaces its `status`, and writes it back.
+///
+/// Only the `status` field is touched: the resource is read, mutated in place,
+/// and handed back to `update`, so a field this engine knows nothing about
+/// cannot be dropped on the way through. In particular the version-shape markers
+/// (`topic`/`channelType` vs `criteria`/`channel`) survive untouched, which
+/// matters because startup rehydration infers the FHIR version from exactly
+/// those keys (`crate::rehydrate::infer_fhir_version`).
+async fn persist_status(
+    storage: &dyn ResourceStorage,
+    tenant: &TenantContext,
+    subscription_id: &str,
+    new_status: SubscriptionStatusCode,
+) -> Result<PersistOutcome, StorageError> {
+    let current = match storage.read(tenant, "Subscription", subscription_id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(PersistOutcome::Vanished),
+        // A deleted subscription is `Gone`, not an error worth shouting about.
+        Err(StorageError::Resource(_)) => return Ok(PersistOutcome::Vanished),
+        Err(e) => return Err(e),
+    };
+
+    if current.content().get("status").and_then(|v| v.as_str()) == Some(new_status.as_fhir_str()) {
+        return Ok(PersistOutcome::AlreadyCurrent);
+    }
+
+    let mut updated = current.content().clone();
+    let Some(object) = updated.as_object_mut() else {
+        // Not a JSON object — nothing sane to write back onto.
+        return Ok(PersistOutcome::Vanished);
+    };
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String(new_status.as_fhir_str().to_string()),
+    );
+
+    match storage.update(tenant, &current, updated).await {
+        Ok(_) => Ok(PersistOutcome::Written),
+        Err(StorageError::Concurrency(_)) => Ok(PersistOutcome::RacedClientWrite),
+        Err(StorageError::Resource(_)) => Ok(PersistOutcome::Vanished),
+        Err(e) => Err(e),
     }
 }
 

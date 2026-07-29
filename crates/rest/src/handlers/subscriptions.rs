@@ -39,17 +39,91 @@ where
             feature: "Subscriptions".to_string(),
         })?;
 
-    let sub = engine
-        .manager()
-        .get_subscription(tenant.tenant_id(), &id)
-        .ok_or(RestError::NotFound {
-            resource_type: "Subscription".to_string(),
-            id: id.clone(),
-        })?;
+    let snapshot = resolve_snapshot(&state, engine, tenant.tenant_id(), &id).await?;
 
-    let status_resource = build_subscription_status(&sub, &id, state.base_url());
+    let status_resource = build_subscription_status(&snapshot, &id, state.base_url());
 
     Ok((StatusCode::OK, Json(status_resource)).into_response())
+}
+
+/// The runtime facts `$status` / `$events` report, from whichever source can
+/// supply them.
+struct StatusSnapshot {
+    status: helios_subscriptions::manager::SubscriptionStatusCode,
+    topic_url: String,
+    events_since_start: u64,
+    fhir_version: helios_fhir::FhirVersion,
+}
+
+/// Resolves a subscription's runtime state, falling back to storage when the
+/// engine does not hold it.
+///
+/// The engine is authoritative when it has the subscription: that entry is what
+/// delivery decisions are actually made from, so reporting anything else would
+/// be a worse lie than a lag.
+///
+/// The fallback exists because the engine legitimately does not hold every
+/// stored subscription. Rehydration can fail for one tenant, an operator can
+/// disable it (`HFS_SUBSCRIPTION_REHYDRATE=false`), or a topic can fail to
+/// parse. Answering `404` in those cases while `GET /Subscription/{id}` answers
+/// `200` is a self-contradiction the client cannot act on — and the R5 Backport
+/// IG asks a server to keep responding to `$status` regardless. Falling back to
+/// the stored resource turns "I have lost track of this" into the honest
+/// "here is what the record says", with the event counter reported as `0`
+/// because this process genuinely has not delivered anything for it.
+async fn resolve_snapshot<S>(
+    state: &AppState<S>,
+    engine: &std::sync::Arc<helios_subscriptions::SubscriptionEngine>,
+    tenant_id: &str,
+    id: &str,
+) -> RestResult<StatusSnapshot>
+where
+    S: ResourceStorage + Send + Sync,
+{
+    if let Some(sub) = engine.manager().get_subscription(tenant_id, id) {
+        return Ok(StatusSnapshot {
+            status: sub.status,
+            topic_url: sub.topic_url,
+            events_since_start: sub.events_since_start,
+            fhir_version: sub.fhir_version,
+        });
+    }
+
+    let tenant_ctx = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new(tenant_id),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let stored = state
+        .storage()
+        .read(&tenant_ctx, "Subscription", id)
+        .await?
+        .ok_or_else(|| RestError::NotFound {
+            resource_type: "Subscription".to_string(),
+            id: id.to_string(),
+        })?;
+
+    let content = stored.content();
+    let status = content
+        .get("status")
+        .and_then(|v| v.as_str())
+        .and_then(helios_subscriptions::manager::SubscriptionStatusCode::from_fhir_str)
+        .unwrap_or(helios_subscriptions::manager::SubscriptionStatusCode::Requested);
+
+    // `topic` (R4B+) or `criteria` (R4 backport); mirrors the manager's own
+    // version-aware extraction closely enough for a status report.
+    let topic_url = content
+        .get("topic")
+        .and_then(|v| v.as_str())
+        .or_else(|| content.get("criteria").and_then(|v| v.as_str()))
+        .unwrap_or_default()
+        .to_string();
+
+    Ok(StatusSnapshot {
+        status,
+        topic_url,
+        events_since_start: 0,
+        fhir_version: stored.fhir_version(),
+    })
 }
 
 /// Handler for the `$events` operation on Subscription resources.
@@ -74,16 +148,12 @@ where
             feature: "Subscriptions".to_string(),
         })?;
 
-    let sub = engine
-        .manager()
-        .get_subscription(tenant.tenant_id(), &id)
-        .ok_or(RestError::NotFound {
-            resource_type: "Subscription".to_string(),
-            id: id.clone(),
-        })?;
+    // Same storage fallback as `$status`: both handlers had the identical miss,
+    // and fixing only one would look complete in review.
+    let snapshot = resolve_snapshot(&state, engine, tenant.tenant_id(), &id).await?;
 
     // Return a Bundle with a SubscriptionStatus indicating query-status
-    let bundle_type = sub.fhir_version.notification_bundle_type();
+    let bundle_type = snapshot.fhir_version.notification_bundle_type();
 
     let bundle = json!({
         "resourceType": "Bundle",
@@ -91,13 +161,13 @@ where
         "entry": [{
             "resource": {
                 "resourceType": "SubscriptionStatus",
-                "status": sub.status.as_fhir_str(),
+                "status": snapshot.status.as_fhir_str(),
                 "type": "query-status",
-                "eventsSinceSubscriptionStart": sub.events_since_start,
+                "eventsSinceSubscriptionStart": snapshot.events_since_start,
                 "subscription": {
                     "reference": format!("Subscription/{}", id)
                 },
-                "topic": sub.topic_url
+                "topic": snapshot.topic_url
             }
         }]
     });
@@ -182,11 +252,7 @@ where
 }
 
 /// Builds a SubscriptionStatus resource for the $status response.
-fn build_subscription_status(
-    sub: &helios_subscriptions::manager::ActiveSubscription,
-    id: &str,
-    base_url: &str,
-) -> serde_json::Value {
+fn build_subscription_status(sub: &StatusSnapshot, id: &str, base_url: &str) -> serde_json::Value {
     if uses_backport_ig(sub.fhir_version) {
         // R4 backport: return Parameters resource
         json!({
