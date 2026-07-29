@@ -443,13 +443,46 @@ impl ResourceStorage for SqliteBackend {
         let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
-        // Soft delete the resource
-        conn.execute(
-            "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
-             WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5",
-            params![deleted_at, new_version_str, tenant_id, resource_type, id],
-        )
-        .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+        // Soft delete the resource, guarded by the version we just read.
+        //
+        // The `version_id`/`is_deleted` predicates make this a compare-and-swap
+        // rather than a blind overwrite. Without them a concurrent writer that
+        // lands between the SELECT above and this UPDATE is silently clobbered,
+        // and worse: `new_version` was computed from the stale read, so the
+        // history INSERT below then collides with the row that writer already
+        // wrote and trips `PRIMARY KEY (tenant_id, resource_type, id,
+        // version_id)`. Because neither statement runs in a transaction, the
+        // UPDATE is already committed at that point — the caller gets a 500 and
+        // the current row now points at a version whose history entry holds
+        // someone else's content.
+        //
+        // MongoDB and S3 already guarded their equivalent writes (a
+        // `version_id` term in the update filter, and a conditional PUT
+        // respectively); this brings SQLite to parity. Losing the race is
+        // reported as `NotFound`, which is what a caller racing a concurrent
+        // delete would have seen anyway.
+        let updated = conn
+            .execute(
+                "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
+                 WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
+                   AND version_id = ?6 AND is_deleted = 0",
+                params![
+                    deleted_at,
+                    new_version_str,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    current_version
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+
+        if updated == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
 
         // Insert deletion record into history (preserve fhir_version)
         conn.execute(
