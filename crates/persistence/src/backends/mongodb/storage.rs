@@ -1507,6 +1507,7 @@ impl ResourceStorage for MongoBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let db = self.get_database().await?;
         let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
         // RFC 3339 string, matching the SQLite registry's `created_at` format so
@@ -1531,6 +1532,7 @@ impl ResourceStorage for MongoBackend {
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let db = self.get_database().await?;
         let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
         let result = tenants
@@ -1541,6 +1543,7 @@ impl ResourceStorage for MongoBackend {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let db = self.get_database().await?;
         // Count current-version docs first (soft-deleted included, mirroring the
         // SQLite purge) so we can report what was removed.

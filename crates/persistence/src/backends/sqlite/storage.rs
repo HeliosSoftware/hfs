@@ -834,6 +834,7 @@ impl ResourceStorage for SqliteBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let conn = self.get_connection()?;
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here
@@ -858,6 +859,7 @@ impl ResourceStorage for SqliteBackend {
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let conn = self.get_connection()?;
         let changed = conn
             .execute("DELETE FROM tenants WHERE id = ?1", params![id])
@@ -866,6 +868,7 @@ impl ResourceStorage for SqliteBackend {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let mut conn = self.get_connection()?;
         let tx = conn
             .transaction()

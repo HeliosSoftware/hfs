@@ -384,3 +384,71 @@ async fn tenant_choice_persists_and_the_selector_follows_it() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
+
+/// This route is destructive and — unlike `/admin/tenants` — is mounted outside
+/// the auth layer, so before #317 an unauthenticated
+/// `DELETE /ui/tenants/__system__?purge=true` wiped the AuditEvent trail and the
+/// shared terminology. It now refuses reserved ids.
+///
+/// This closes the reserved-id hole only; whether `/ui/*` should be
+/// authenticated at all is a separate, deliberately untouched question.
+#[tokio::test]
+async fn delete_refuses_the_reserved_system_tenant() {
+    let store = store();
+
+    // Seed the shared tenant the way the database audit sink does.
+    let system = TenantContext::system();
+    let created = store
+        .create(
+            &system,
+            "AuditEvent",
+            serde_json::json!({ "resourceType": "AuditEvent" }),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("seed system-tenant AuditEvent");
+
+    let res = app(&store)
+        .oneshot(
+            Request::delete("/ui/tenants/__system__?purge=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The page reports the refusal in its error banner rather than 500-ing.
+    let body = body_text(res).await;
+    assert!(
+        body.contains("form-error"),
+        "the refusal must surface as an error banner, got: {body}"
+    );
+
+    // The data consequence: nothing was purged.
+    let survivor = store
+        .read(&system, "AuditEvent", created.id())
+        .await
+        .expect("read must not error");
+    assert!(
+        survivor.is_some(),
+        "a refused purge must leave the audit trail intact"
+    );
+}
+
+/// The reservation is exact, so an ordinary `__`-prefixed tenant is still fully
+/// manageable from this page.
+#[tokio::test]
+async fn delete_still_accepts_underscore_prefixed_tenants() {
+    let store = store();
+    post_form(&store, "id=__legacy").await;
+
+    let res = app(&store)
+        .oneshot(
+            Request::delete("/ui/tenants/__legacy?purge=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
