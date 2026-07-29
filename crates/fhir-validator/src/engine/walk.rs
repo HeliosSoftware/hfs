@@ -727,6 +727,7 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         must_support,
         summary,
         short,
+        context,
         regex,
     );
     out

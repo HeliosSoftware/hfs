@@ -280,7 +280,7 @@
     var extension = event.target.closest("[data-extension]");
     if (extension) {
       var panel = extension.closest(".editor-add__ext");
-      var url = panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "";
+      var url = extension.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
       send("extension", { path: extension.dataset.extension, url: url });
       return;
     }
