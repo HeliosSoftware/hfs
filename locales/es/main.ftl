@@ -202,7 +202,7 @@ queries-unavailable = Las consultas guardadas no están disponibles: el backend 
 ## Visor de SearchParameters (#238)
 
 sp-heading = Parámetros de búsqueda
-sp-lede = Explora los parámetros con los que este servidor resuelve las búsquedas, filtrados por tipo de recurso base. Los parámetros de la especificación son de solo lectura; la edición por tenant llegará cuando los parámetros vivan en el almacenamiento.
+sp-lede = Explora los parámetros con los que este servidor resuelve las búsquedas, filtrados por tipo de recurso base. Los parámetros almacenados se pueden crear, editar y eliminar; el registro recoge los cambios por tenant.
 sp-version-label = Versión FHIR
 sp-spec-missing = No se encontró el bundle completo de la especificación (search-parameters-*.json) en el directorio de datos — solo se muestran los parámetros mínimos embebidos.
 sp-rail-label = Filtro de recursos
@@ -264,7 +264,7 @@ cmp-heading = Compartimentos
 cmp-lede = Las definiciones de compartment con las que este servidor enruta las peticiones /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"}, y un probador que responde: ¿está este tipo en este compartment, mediante qué parámetros, y qué búsqueda ejecuta el servidor?
 cmp-rail-label = Definiciones de compartment
 cmp-rail-heading = Compartimentos
-cmp-rail-note = Las definiciones base vienen con el servidor (generadas desde la especificación FHIR). Editarlas implica una capa de overrides por tenant — pregunta abierta en el issue.
+cmp-rail-note = Las definiciones son recursos almacenados, sembrados desde la especificación FHIR al arrancar. Las ediciones y eliminaciones aquí son por tenant.
 cmp-tabs-label = Secciones del compartment
 cmp-tab-definition = Definición
 cmp-tab-members = Miembros

@@ -206,7 +206,7 @@ queries-unavailable = Saved queries are unavailable: this server's storage backe
 ## SearchParameter viewer (#238)
 
 sp-heading = Search parameters
-sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Spec parameters are read-only; tenant-scoped editing arrives once search parameters live in storage.
+sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
 sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory — only the minimal embedded fallback parameters are shown.
 sp-rail-label = Resource filter
@@ -268,7 +268,7 @@ cmp-heading = Compartments
 cmp-lede = The compartment definitions this server routes /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"} requests with, and a tester that answers: is this type in this compartment, via which parameters, and what search does the server run?
 cmp-rail-label = Compartment definitions
 cmp-rail-heading = Compartments
-cmp-rail-note = Base definitions ship with the server (codegen'd from the FHIR spec). Editing them implies a tenant-scoped override layer — open question on the issue.
+cmp-rail-note = Definitions are stored resources, seeded from the FHIR spec at startup. Edits and deletions here are tenant-scoped.
 cmp-tabs-label = Compartment sections
 cmp-tab-definition = Definition
 cmp-tab-members = Members

@@ -202,7 +202,7 @@ queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-B
 ## SearchParameter-Ansicht (#238)
 
 sp-heading = Suchparameter
-sp-lede = Durchsuche die Parameter, mit denen dieser Server Suchen auflöst, gefiltert nach Basis-Ressourcentyp. Spezifikationsparameter sind schreibgeschützt; tenant-spezifisches Bearbeiten kommt, sobald Suchparameter im Storage liegen.
+sp-lede = Durchsuche die Parameter, mit denen dieser Server Suchen auflöst, gefiltert nach Basis-Ressourcentyp. Gespeicherte Parameter lassen sich anlegen, bearbeiten und löschen; die Registry übernimmt Änderungen pro Tenant.
 sp-version-label = FHIR-Version
 sp-spec-missing = Das vollständige Spezifikations-Bundle (search-parameters-*.json) wurde im Datenverzeichnis nicht gefunden — es werden nur die minimalen eingebetteten Fallback-Parameter angezeigt.
 sp-rail-label = Ressourcenfilter
@@ -264,7 +264,7 @@ cmp-heading = Compartments
 cmp-lede = Die Compartment-Definitionen, mit denen dieser Server /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"}-Anfragen routet, und ein Tester, der beantwortet: Ist dieser Typ in diesem Compartment, über welche Parameter, und welche Suche führt der Server aus?
 cmp-rail-label = Compartment-Definitionen
 cmp-rail-heading = Compartments
-cmp-rail-note = Die Basisdefinitionen werden mit dem Server ausgeliefert (aus der FHIR-Spezifikation generiert). Sie zu bearbeiten setzt eine tenant-spezifische Override-Schicht voraus — offene Frage im Issue.
+cmp-rail-note = Die Definitionen sind gespeicherte Ressourcen, beim Start aus der FHIR-Spezifikation angelegt. Bearbeiten und Löschen wirken hier pro Tenant.
 cmp-tabs-label = Compartment-Bereiche
 cmp-tab-definition = Definition
 cmp-tab-members = Mitglieder
