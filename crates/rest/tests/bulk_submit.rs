@@ -36,6 +36,7 @@ impl SubmitInputFetcher for MockFetcher {
         _url: &str,
         _headers: &[(String, String)],
         _oauth: &[String],
+        _encryption_key: Option<&Value>,
     ) -> StorageResult<RemoteManifest> {
         Ok(RemoteManifest {
             requires_access_token: self.manifest.requires_access_token,

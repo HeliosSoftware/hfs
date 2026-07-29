@@ -644,3 +644,41 @@ async fn test_bundle_tenant_isolation() {
             .unwrap()
     );
 }
+
+// ============================================================================
+// Issue #311 — `ifMatch` on bundle entries
+//
+// The scenarios themselves are backend-agnostic and live in
+// `super::if_match_suite`, so PostgreSQL runs the *same* assertions (see
+// `postgres_tests.rs`) instead of a retyped approximation. These wrappers give
+// each scenario its own SQLite backend and its own test name, so a failure
+// still names the exact behavior that broke.
+// ============================================================================
+
+/// Expands to a `#[tokio::test]` that runs one shared scenario on a fresh
+/// in-memory SQLite backend.
+macro_rules! sqlite_if_match_test {
+    ($name:ident) => {
+        #[cfg(feature = "sqlite")]
+        #[tokio::test]
+        async fn $name() {
+            let backend = create_sqlite_backend();
+            super::if_match_suite::$name(&backend, &create_tenant()).await;
+        }
+    };
+}
+
+sqlite_if_match_test!(batch_put_honors_stale_if_match);
+sqlite_if_match_test!(batch_put_accepts_matching_if_match);
+sqlite_if_match_test!(multi_valued_if_match_matches_any_member);
+sqlite_if_match_test!(multi_valued_if_match_fails_when_no_member_matches);
+sqlite_if_match_test!(strong_form_if_match_matches_weak_etag);
+sqlite_if_match_test!(if_match_on_absent_resource_fails_instead_of_creating);
+sqlite_if_match_test!(star_if_match_requires_an_existing_resource);
+sqlite_if_match_test!(malformed_if_match_fails_closed);
+sqlite_if_match_test!(batch_put_if_match_on_deleted_resource_fails);
+sqlite_if_match_test!(batch_delete_if_match_on_deleted_resource_fails);
+sqlite_if_match_test!(batch_delete_honors_stale_if_match);
+sqlite_if_match_test!(batch_delete_accepts_matching_if_match);
+sqlite_if_match_test!(transaction_delete_honors_stale_if_match);
+sqlite_if_match_test!(transaction_delete_accepts_matching_if_match);
