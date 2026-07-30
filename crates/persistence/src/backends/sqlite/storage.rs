@@ -921,8 +921,21 @@ impl ResourceStorage for SqliteBackend {
             tx.execute(sql, params![id])
                 .map_err(|e| internal_error(format!("purge delete: {e}")))?;
         }
+        // Per-user settings are keyed by user, not tenant, so they are not swept
+        // by the deletes above — but a client stores PHI-derived query strings in
+        // them, which belong to this tenant (issue #313). Same transaction: this
+        // connection already holds the write lock, and a second one would
+        // deadlock against it.
+        let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
         tx.commit()
             .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                documents = settings,
+                "purged tenant-scoped content from user settings documents"
+            );
+        }
         Ok(removed.max(0) as u64)
     }
 }
