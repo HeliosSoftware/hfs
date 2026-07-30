@@ -228,6 +228,83 @@ jobs:
           echo "Runner IP: $RUNNER_IP"
           echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
 
+      # ── Reclaim storage left behind by earlier runs, then prove we can ───
+      # The cleanup steps at the end of this job are `if: always()`, which does
+      # NOT run when the *runner itself* is shut down mid-job. When that happened
+      # on run 30550776427 the Postgres and tgz containers were orphaned holding
+      # a full Synthea import, the Docker host filled up, and every
+      # testcontainers-based job in the repo failed with `disk quota exceeded`
+      # for hours afterwards.
+      #
+      # A step at the end cannot defend against its own step never running, so
+      # the durable control is here, at the *start*: reap anything a previous run
+      # left behind before allocating anything new. This is the compensating
+      # control for that GitHub limitation, not a nicety.
+      - name: Reap stale benchmark containers and verify Docker host storage
+        run: |
+          set -uo pipefail
+          RUN_ID="${{ github.run_id }}"
+
+          # Reap by name prefix rather than by label, so containers created
+          # before labelling was added here are also caught.
+          #
+          # Two conditions, BOTH re-checked in the loop rather than trusting
+          # `--filter name=` to anchor: this deletes other people's containers if
+          # it is wrong, which would be far worse than the leak it fixes. The
+          # filter narrows the candidate set; the `case` statements decide.
+          #   1. the name must start with `hfs-bench-`  → only ours
+          #   2. the name must NOT contain this run id  → never a live sibling.
+          #      The matrix legs (sqlite, postgres) share a run id and run
+          #      concurrently, so this is what stops one leg killing the other.
+          echo "── Reaping hfs-bench-* containers from earlier runs ──"
+          REAPED=0
+          for id in $(docker ps -aq --filter "name=hfs-bench-" 2>/dev/null); do
+            name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||')
+            case "$name" in
+              hfs-bench-*) ;;                 # ours — keep checking
+              *) continue ;;                  # not ours — never touch
+            esac
+            case "$name" in
+              *"$RUN_ID"*) continue ;;        # this run's own — leave alone
+            esac
+            echo "  removing $name ($id)"
+            docker rm -f -v "$id" >/dev/null 2>&1 || true
+            REAPED=$((REAPED + 1))
+          done
+          echo "  reaped: $REAPED"
+
+          # `-v` above drops each container's anonymous volumes; named volumes
+          # from this workflow are labelled, so they can be pruned precisely
+          # without touching anything another workflow owns.
+          echo "── Pruning this workflow's dangling volumes ──"
+          docker volume prune -f --filter "label=hfs-bench=1" 2>/dev/null || true
+
+          echo "── Docker host usage ──"
+          docker system df 2>/dev/null || true
+
+          # Preflight. `docker system df` reports image/volume usage but not a
+          # filesystem *quota*, which is what actually bit us — the daemon failed
+          # at CreateContainer with "write .../meta.db: disk quota exceeded".
+          # The only reliable check is to ask the daemon to do the thing we need
+          # it to do: create a container and write to its layer.
+          #
+          # This detects an *exhausted* host, not a merely tight one: 256 MiB is
+          # a floor, and a host with 1 GB free would pass here and still fail
+          # during the import. That is a deliberate trade — the point is to turn
+          # the common case from "fails confusingly 20 minutes in, leaving more
+          # debris" into "fails in 10 seconds with the remedy printed".
+          echo "── Canary: create a container and write 256 MiB ──"
+          if ! docker run --rm --name "hfs-bench-canary-$RUN_ID" alpine:3 \
+                 sh -c 'dd if=/dev/zero of=/canary bs=1M count=256 2>&1 | tail -1'; then
+            echo "::error::Docker host cannot create a container or has no writable space."
+            echo "The benchmark writes several GB (Synthea corpus + Postgres data), so it"
+            echo "would fail slowly and leave more debris. Failing fast instead."
+            echo "Remedy on the Docker host: docker system prune -af --volumes"
+            docker system df 2>/dev/null || true
+            exit 1
+          fi
+          echo "Canary OK — host has writable space."
+
       # ── tgz bundle server ────────────────────────────────────────────────
       # The import suite pulls the Synthea `bulk_1k` corpus from this service
       # (`GET /reset`, `GET /<bundle>.json`). Built from the benchmark repo's
@@ -240,8 +317,13 @@ jobs:
           echo "TGZ_CONTAINER=$TGZ_CONTAINER" >> "$GITHUB_ENV"
 
           docker build -t "$TGZ_IMAGE" fhir-benchmark/infra/tgz
-          docker rm -f "$TGZ_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$TGZ_CONTAINER" -p 0:8080 "$TGZ_IMAGE" \
+          docker rm -f -v "$TGZ_CONTAINER" 2>/dev/null || true
+          # Labelled so the start-of-job reaper and volume prune can find this
+          # container precisely if a killed runner ever leaves it behind.
+          docker run -d --name "$TGZ_CONTAINER" \
+            --label hfs-bench=1 \
+            --label "hfs-bench-run=${{ github.run_id }}" \
+            -p 0:8080 "$TGZ_IMAGE" \
             "https://storage.googleapis.com/aidbox-public/synthea/performance/bulk_1k.tar.gz" >/dev/null
 
           echo "Waiting for tgz bundle server..."
@@ -273,24 +355,46 @@ jobs:
             echo "SQLite DB: $DB_PATH"
           else
             PG_CONTAINER="hfs-bench-pg-${{ github.run_id }}"
+            PG_VOLUME="hfs-bench-pgdata-${{ github.run_id }}"
             echo "PG_CONTAINER=$PG_CONTAINER" >> "$GITHUB_ENV"
+            echo "PG_VOLUME=$PG_VOLUME" >> "$GITHUB_ENV"
             echo "Container name: $PG_CONTAINER"
+            echo "Data volume:    $PG_VOLUME"
           fi
 
       - name: Start ephemeral Postgres
         if: matrix.backend == 'postgres'
         run: |
           set -euo pipefail
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -f -v "$PG_CONTAINER" 2>/dev/null || true
+          docker volume rm -f "$PG_VOLUME" 2>/dev/null || true
+          docker volume create --label hfs-bench=1 \
+            --label "hfs-bench-run=${{ github.run_id }}" "$PG_VOLUME" >/dev/null
+
           # Tuning approximates the benchmark's infra/postgres/postgres.conf.
           # shared_buffers/effective_cache_size are scaled DOWN from the
           # published values (10G/25G) to fit a typical self-hosted runner;
           # bump them (and the runner) to match the benchmark host for numbers
           # that are directly comparable to the public report. `--shm-size`
           # must exceed shared_buffers.
+          #
+          # The data directory is a **named volume**, not the container's
+          # writable layer. Importing the Synthea corpus writes several GB, and
+          # in the layer that lands in the daemon's own storage where nothing can
+          # reclaim it independently of the container — so an orphaned container
+          # pins the space indefinitely (run 30550776427). A named volume is
+          # addressable: the reaper at the top of this job can drop it by label
+          # even when the container that created it is long gone.
+          #
+          # Mounted at `/var/lib/postgresql` (the image's declared VOLUME root)
+          # rather than at `$PGDATA`, so this keeps working across postgres image
+          # versions that relocate PGDATA within that tree.
           docker run -d \
             --name "$PG_CONTAINER" \
+            --label hfs-bench=1 \
+            --label "hfs-bench-run=${{ github.run_id }}" \
             --shm-size=4g \
+            -v "$PG_VOLUME:/var/lib/postgresql" \
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_USER=postgres \
             -e POSTGRES_DB=postgres \
@@ -506,6 +610,32 @@ jobs:
               "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
           done
 
+      # ── Artifacts ────────────────────────────────────────────────────────
+      # Deliberately placed immediately after the suites and BEFORE the
+      # post-processing steps below. When run 30550776427's runner was killed
+      # during per-shape attribution, these steps — which sat after it — never
+      # ran, so the server log and raw results were lost precisely for the run
+      # that most needed diagnosing. Everything after this point is derived data
+      # that can be recomputed from these artifacts; the artifacts cannot be
+      # recovered from anything. Upload first, analyse second.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-benchmark-${{ matrix.backend }}-${{ github.run_id }}
+          path: bench-results/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-server-log-${{ matrix.backend }}-${{ github.run_id }}
+          path: /tmp/hfs-bench-${{ matrix.backend }}.log
+          retention-days: 7
+          if-no-files-found: ignore
+
       # ── Per-query-shape attribution ──────────────────────────────────────
       # Without this the search suite reports a single aggregate latency and we
       # cannot tell which of the ~21 query shapes is slow. Produces a table sorted
@@ -612,25 +742,6 @@ jobs:
           PYEOF
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── Artifacts ────────────────────────────────────────────────────────
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fhir-benchmark-${{ matrix.backend }}-${{ github.run_id }}
-          path: bench-results/
-          retention-days: 90
-          if-no-files-found: ignore
-
-      - name: Upload server log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fhir-bench-server-log-${{ matrix.backend }}-${{ github.run_id }}
-          path: /tmp/hfs-bench-${{ matrix.backend }}.log
-          retention-days: 7
-          if-no-files-found: ignore
-
       # ── Cleanup ──────────────────────────────────────────────────────────
       - name: Stop HFS server
         if: always()
@@ -644,12 +755,21 @@ jobs:
         if: always()
         run: |
           if [ -n "${TGZ_CONTAINER:-}" ]; then
-            docker rm -f "$TGZ_CONTAINER" 2>/dev/null || true
+            docker rm -f -v "$TGZ_CONTAINER" 2>/dev/null || true
           fi
 
+      # `-v` and the explicit `volume rm` matter: without them the Postgres data
+      # volume outlives the container and is never reclaimed. This is the happy
+      # path — the reaper at the top of the job is what covers the case where
+      # this step never runs at all (killed runner).
       - name: Stop ephemeral Postgres
         if: always() && matrix.backend == 'postgres'
         run: |
           if [ -n "${PG_CONTAINER:-}" ]; then
-            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+            docker rm -f -v "$PG_CONTAINER" 2>/dev/null || true
           fi
+          if [ -n "${PG_VOLUME:-}" ]; then
+            docker volume rm -f "$PG_VOLUME" 2>/dev/null || true
+          fi
+          echo "── Docker host usage after cleanup ──"
+          docker system df 2>/dev/null || true
