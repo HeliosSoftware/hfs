@@ -402,6 +402,7 @@ where
                 &manifest_url,
                 &view.file_request_headers,
                 &view.oauth_metadata_urls,
+                view.file_encryption_key.as_ref(),
             )
             .await
         {
@@ -921,6 +922,7 @@ mod tests {
             _url: &str,
             _headers: &[(String, String)],
             _oauth: &[String],
+            _encryption_key: Option<&Value>,
         ) -> StorageResult<RemoteManifest> {
             Ok(self.manifest.clone())
         }
@@ -1040,6 +1042,7 @@ mod tests {
             _url: &str,
             _h: &[(String, String)],
             _o: &[String],
+            _k: Option<&Value>,
         ) -> StorageResult<RemoteManifest> {
             Err(crate::error::StorageError::Backend(
                 crate::error::BackendError::Internal {

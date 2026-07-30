@@ -294,14 +294,33 @@ impl StoredResource {
         }
     }
 
-    /// Checks if the given ETag matches this resource's ETag.
+    /// Checks whether the given `If-Match` field value matches this resource.
     ///
-    /// Used for If-Match conditional updates.
+    /// Delegates to [`crate::core::preconditions`] so this shares one
+    /// implementation with the REST handlers and every backend's bundle
+    /// executor. It was previously a second, hand-rolled normalizer that only
+    /// ever compared the whole field value, so a comma-separated list — which is
+    /// what the header is defined as (RFC 9110 §13.1.1) — could never match
+    /// (issue #311). `helios-hts` calls this directly and gains list support
+    /// from the delegation.
+    ///
+    /// # Bare, unquoted tags
+    ///
+    /// A valid `entity-tag` is always quoted, so the shared parser rejects a
+    /// bare `1`. This method nevertheless still accepts one, via the fallback
+    /// below, because it is public API whose existing callers (notably
+    /// `helios-hts`) and tests depend on that leniency. Tightening it is a
+    /// separate, deliberate break and is deliberately NOT bundled into the
+    /// issue #311 fix. New code should not rely on it.
     pub fn matches_etag(&self, etag: &str) -> bool {
-        // Strip W/ prefix and quotes for comparison
-        let normalized_self = self.etag.trim_start_matches("W/").trim_matches('"');
-        let normalized_other = etag.trim_start_matches("W/").trim_matches('"');
-        normalized_self == normalized_other
+        use crate::core::preconditions::EntityTagPrecondition;
+
+        if let Ok(precondition) = EntityTagPrecondition::parse([etag]) {
+            return precondition.if_match_satisfied(Some(&self.version_id));
+        }
+
+        // Legacy fallback: compare a bare, unquoted token.
+        crate::core::versioned::normalize_etag(etag) == self.version_id
     }
 
     /// Returns the FHIR Meta element for this resource.

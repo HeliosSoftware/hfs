@@ -17,6 +17,16 @@ use helios_persistence::core::BackendKind;
 #[path = "common/cluster_harness.rs"]
 mod cluster_harness;
 
+/// The backend-agnostic `ifMatch` scenarios (issue #311), shared verbatim with
+/// the SQLite suite that owns the file.
+///
+/// Declared at the top level rather than inside `mod postgres_integration`
+/// because `#[path]` on a module nested in an *inline* module resolves relative
+/// to `tests/postgres_tests/postgres_integration/`, which does not exist. At the
+/// crate root it resolves relative to `tests/`, which does.
+#[path = "transactions/if_match_suite.rs"]
+mod if_match_suite;
+
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -7176,4 +7186,87 @@ mod postgres_integration {
             "merge must retain elements the submission omitted"
         );
     }
+
+    // ========================================================================
+    // Issue #311 — `ifMatch` on bundle entries, on a real PostgreSQL instance
+    //
+    // PostgreSQL carried both #311 defects (batch arm ignored `ifMatch`; the
+    // field was compared as one opaque string), and its batch and transaction
+    // arms are separate code paths from SQLite's. Running the *shared* suite
+    // here is what makes "the backends agree" a checked claim rather than an
+    // assumption — the assertions are literally the same function bodies.
+    //
+    // Each test gets its own tenant, since the whole binary shares one
+    // container database and the scenarios reuse fixed resource ids.
+    // ========================================================================
+
+    /// Expands to a `#[tokio::test]` running one shared scenario against the
+    /// shared PostgreSQL container under an isolated tenant.
+    macro_rules! pg_if_match_test {
+        ($test_name:ident, $scenario:ident) => {
+            #[tokio::test]
+            async fn $test_name() {
+                let backend = create_backend().await;
+                let tenant = create_tenant(concat!("if_match_", stringify!($scenario)));
+                super::if_match_suite::$scenario(&backend, &tenant).await;
+            }
+        };
+    }
+
+    pg_if_match_test!(
+        postgres_integration_batch_put_honors_stale_if_match,
+        batch_put_honors_stale_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_put_accepts_matching_if_match,
+        batch_put_accepts_matching_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_multi_valued_if_match_matches_any_member,
+        multi_valued_if_match_matches_any_member
+    );
+    pg_if_match_test!(
+        postgres_integration_multi_valued_if_match_fails_when_no_member_matches,
+        multi_valued_if_match_fails_when_no_member_matches
+    );
+    pg_if_match_test!(
+        postgres_integration_strong_form_if_match_matches_weak_etag,
+        strong_form_if_match_matches_weak_etag
+    );
+    pg_if_match_test!(
+        postgres_integration_if_match_on_absent_resource_fails_instead_of_creating,
+        if_match_on_absent_resource_fails_instead_of_creating
+    );
+    pg_if_match_test!(
+        postgres_integration_star_if_match_requires_an_existing_resource,
+        star_if_match_requires_an_existing_resource
+    );
+    pg_if_match_test!(
+        postgres_integration_malformed_if_match_fails_closed,
+        malformed_if_match_fails_closed
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_put_if_match_on_deleted_resource_fails,
+        batch_put_if_match_on_deleted_resource_fails
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_delete_if_match_on_deleted_resource_fails,
+        batch_delete_if_match_on_deleted_resource_fails
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_delete_honors_stale_if_match,
+        batch_delete_honors_stale_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_delete_accepts_matching_if_match,
+        batch_delete_accepts_matching_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_transaction_delete_honors_stale_if_match,
+        transaction_delete_honors_stale_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_transaction_delete_accepts_matching_if_match,
+        transaction_delete_accepts_matching_if_match
+    );
 }

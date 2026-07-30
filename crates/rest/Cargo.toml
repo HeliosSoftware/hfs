@@ -33,10 +33,10 @@ s3 = ["helios-persistence/s3", "dep:aws-sdk-s3", "dep:aws-config"]
 # Subscriptions
 subscriptions = ["dep:helios-subscriptions"]
 
-# Bulk-submit JWE file decryption (`fileEncryptionKey`). Enables decrypting
-# `dir` + A128GCM/A256GCM compact-JWE files; without it, encrypted submissions
-# record a `not-supported` manifest-level error (documented non-conformance).
-bulk-submit-jwe = ["dep:aes-gcm"]
+# Deprecated no-op, kept so existing build invocations keep working.
+# Bulk-submit JWE decryption of `fileEncryptionKey` manifests/files is now built
+# unconditionally — see the `jwe` module for the supported algorithms.
+bulk-submit-jwe = []
 
 # OpenTelemetry OTLP trace export (forwards to helios-observability)
 otel = ["helios-observability/otel"]
@@ -110,8 +110,17 @@ reqwest = { version = "0.12", features = ["json", "gzip"] }
 # JWT signing for the bulk-submit outbound SMART Backend Services client.
 jsonwebtoken = "9"
 
-# Pure-Rust AES-GCM for optional bulk-submit JWE file decryption (no OpenSSL).
-aes-gcm = { version = "0.10", optional = true }
+# Pure-Rust JOSE primitives for bulk-submit JWE decryption (`fileEncryptionKey`),
+# implemented in `src/jwe.rs`. RustCrypto throughout — no OpenSSL.
+aes = "0.8"                                              # A*CBC-HS* content encryption
+aes-gcm = "0.10"                                         # A*GCM content encryption + A*GCMKW
+aes-kw = "0.2"                                           # A*KW key wrap (RFC 3394)
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+hmac = "0.12"                                            # A*CBC-HS* authentication tag
+sha2 = "0.10"                                            # Concat KDF, A*CBC-HS*
+p256 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-ES (P-256)
+p384 = { version = "0.13", features = ["ecdh", "jwk", "pem", "pkcs8"] }  # ECDH-ES (P-384)
+flate2 = "1"                                             # JWE `zip: "DEF"` payloads
 
 [dev-dependencies]
 # HTTP testing
@@ -121,8 +130,8 @@ axum-test = "18.0"
 # in-process request log the handlers read for per-tenant traffic).
 helios-observability = { path = "../observability" }
 
-# gzip test payloads for HTTP compression tests
-flate2 = "1"
+# Key generation for the JWE round-trip tests
+rand = "0.8"
 
 # Temp files
 tempfile = "3"

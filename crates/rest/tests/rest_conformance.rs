@@ -583,6 +583,272 @@ mod conditional_update {
 
         response.assert_status_ok();
     }
+
+    // ---------------------------------------------------------------------
+    // Issue #311 — `If-Match` is a comma-separated list (RFC 9110 §13.1.1)
+    // ---------------------------------------------------------------------
+
+    /// The headline bug: a multi-valued `If-Match` is satisfied when ANY listed
+    /// tag matches. The whole field value used to be compared as one opaque
+    /// string, so this was a permanent 412 on a request that must succeed.
+    #[tokio::test]
+    async fn test_multi_valued_if_match_succeeds_on_any_member() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let etag = current_etag(&server, "/Patient/patient-1").await;
+
+        let updated = json!({
+            "resourceType": "Patient",
+            "id": "patient-1",
+            "name": [{"family": "UpdatedSmith"}]
+        });
+
+        // A stale tag first, then the current one — must still match.
+        let list = format!("W/\"99\", {etag}");
+        let response = server
+            .put("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .add_header(IF_MATCH, HeaderValue::from_str(&list).unwrap())
+            .json(&updated)
+            .await;
+
+        response.assert_status_ok();
+    }
+
+    /// A list in which nothing matches must still be refused.
+    #[tokio::test]
+    async fn test_multi_valued_if_match_fails_when_none_match() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let updated = json!({
+            "resourceType": "Patient",
+            "id": "patient-1",
+            "name": [{"family": "UpdatedSmith"}]
+        });
+
+        let response = server
+            .put("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .add_header(IF_MATCH, HeaderValue::from_static("W/\"98\", W/\"99\""))
+            .json(&updated)
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// A client echoing the strong form must match the weak ETag FHIR mandates.
+    #[tokio::test]
+    async fn test_strong_form_if_match_matches_weak_etag() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let etag = current_etag(&server, "/Patient/patient-1").await;
+        let strong = etag.trim_start_matches("W/").to_string();
+
+        let updated = json!({
+            "resourceType": "Patient",
+            "id": "patient-1",
+            "name": [{"family": "UpdatedSmith"}]
+        });
+
+        let response = server
+            .put("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .add_header(IF_MATCH, HeaderValue::from_str(&strong).unwrap())
+            .json(&updated)
+            .await;
+
+        response.assert_status_ok();
+    }
+
+    /// `If-Match: *` asserts a *current representation exists*, so on an absent
+    /// resource it is a failed precondition — it must NOT license an
+    /// update-as-create. This is a deliberate behavior change (RFC 9110
+    /// §13.1.1); previously the create proceeded.
+    #[tokio::test]
+    async fn test_if_match_star_on_absent_resource_is_412() {
+        let (server, _backend) = create_test_server().await;
+
+        let created = json!({
+            "resourceType": "Patient",
+            "id": "does-not-exist",
+            "name": [{"family": "New"}]
+        });
+
+        let response = server
+            .put("/Patient/does-not-exist")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .add_header(IF_MATCH, HeaderValue::from_static("*"))
+            .json(&created)
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// A malformed `If-Match` must fail the precondition rather than be
+    /// discarded — discarding it turns a guarded update into an unconditional
+    /// overwrite.
+    #[tokio::test]
+    async fn test_malformed_if_match_is_412_not_an_unconditional_write() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let updated = json!({
+            "resourceType": "Patient",
+            "id": "patient-1",
+            "name": [{"family": "Overwritten"}]
+        });
+
+        let response = server
+            .put("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            // Unquoted: not a valid entity-tag.
+            .add_header(IF_MATCH, HeaderValue::from_static("garbage"))
+            .json(&updated)
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+
+        // And the stale write must not have landed.
+        let read = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: serde_json::Value = read.json();
+        assert_eq!(body["name"][0]["family"], "Smith");
+    }
+
+    /// PATCH shares the same precondition path as PUT.
+    #[tokio::test]
+    async fn test_patch_honors_multi_valued_if_match() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let etag = current_etag(&server, "/Patient/patient-1").await;
+        let list = format!("W/\"99\", {etag}");
+
+        let patch = json!([
+            {"op": "replace", "path": "/name/0/family", "value": "Patched"}
+        ]);
+
+        // `.json()` would overwrite the content type with `application/json`,
+        // which the patch handler rejects with 415. `.bytes()` leaves it alone,
+        // so set it explicitly with `.content_type()`.
+        let response = server
+            .patch("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .content_type("application/json-patch+json")
+            .add_header(IF_MATCH, HeaderValue::from_str(&list).unwrap())
+            .bytes(serde_json::to_vec(&patch).unwrap().into())
+            .await;
+
+        response.assert_status_ok();
+
+        // The patch must actually have been applied — a 200 alone would also be
+        // consistent with the precondition being skipped entirely.
+        let read = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: serde_json::Value = read.json();
+        assert_eq!(body["name"][0]["family"], "Patched");
+    }
+
+    /// A PATCH whose `If-Match` list matches nothing must be refused.
+    #[tokio::test]
+    async fn test_patch_multi_valued_if_match_fails_when_none_match() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let patch = json!([
+            {"op": "replace", "path": "/name/0/family", "value": "Patched"}
+        ]);
+
+        let response = server
+            .patch("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .content_type("application/json-patch+json")
+            .add_header(IF_MATCH, HeaderValue::from_static("W/\"98\", W/\"99\""))
+            .bytes(serde_json::to_vec(&patch).unwrap().into())
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// A PATCH whose `If-Match` cannot be parsed must fail closed with 412 and
+    /// leave the resource untouched.
+    ///
+    /// This is the fail-open half of issue #311 on the PATCH path: an
+    /// unparseable value used to be indistinguishable from an absent one, so a
+    /// client that asked for optimistic locking and got the syntax wrong had its
+    /// write applied unconditionally. The stored-state assertion is the point —
+    /// a 412 alone would also be consistent with the patch landing first.
+    #[tokio::test]
+    async fn test_patch_malformed_if_match_fails_closed() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let patch = json!([
+            {"op": "replace", "path": "/name/0/family", "value": "Patched"}
+        ]);
+
+        let response = server
+            .patch("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .content_type("application/json-patch+json")
+            .add_header(IF_MATCH, HeaderValue::from_static("garbage"))
+            .bytes(serde_json::to_vec(&patch).unwrap().into())
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+
+        let read = server
+            .get("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: serde_json::Value = read.json();
+        assert_eq!(
+            body["name"][0]["family"], "Smith",
+            "a malformed precondition must not become an unconditional patch"
+        );
+    }
+
+    /// Reads the current `ETag` for a resource.
+    async fn current_etag(server: &TestServer, path: &str) -> String {
+        let response = server
+            .get(path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response
+            .headers()
+            .get("etag")
+            .expect("ETag header")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
 }
 
 // =============================================================================

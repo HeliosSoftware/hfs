@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 19;
+pub const SCHEMA_VERSION: i32 = 20;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -317,6 +317,7 @@ async fn migrate_schema(
             16 => migrate_v16_to_v17(client).await?,
             17 => migrate_v17_to_v18(client).await?,
             18 => migrate_v18_to_v19(client).await?,
+            19 => migrate_v19_to_v20(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -833,6 +834,54 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
+/// v15 -> v16: covering indexes on token and date + wider MCV + date multivariate
+/// stat (issue #281).
+///
+/// `idx_search_token_code` and `idx_search_date` are rebuilt with `INCLUDE (resource_id)`
+/// so the subquery probes are index-only. `value_token_code` statistics are widened to
+/// 4,000 and a matching multivariate stat is added for `value_date`, giving the planner
+/// the same cross-column correlation data for date that token received in v14->v15.
+async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let index_stmts = [
+        "DROP INDEX IF EXISTS idx_search_token_code",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code
+         ON search_index (tenant_id, resource_type, param_name, value_token_code, value_token_system)
+         INCLUDE (resource_id)
+         WHERE value_token_code IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_date",
+        "CREATE INDEX IF NOT EXISTS idx_search_date
+         ON search_index (tenant_id, resource_type, param_name, value_date)
+         INCLUDE (resource_id)
+         WHERE value_date IS NOT NULL",
+    ];
+
+    for sql in index_stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v15->v16 failed: {}", e)))?;
+    }
+
+    let stats_stmts = [
+        "ALTER TABLE search_index ALTER COLUMN value_token_code SET STATISTICS 4000",
+        "CREATE STATISTICS IF NOT EXISTS stx_search_type_param_date (mcv, dependencies)
+         ON resource_type, param_name, value_date FROM search_index",
+        "ANALYZE search_index",
+    ];
+
+    for sql in stats_stmts {
+        if let Err(e) = client.execute(sql, &[]).await {
+            tracing::warn!(
+                "Migration v15->v16: optional statistics step failed (plans may be \
+                 suboptimal, search remains correct): {}",
+                e
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// v14 -> v15: search performance indexes (issue #224).
 ///
 /// Purely additive — nothing is dropped and no query semantics change. Every index
@@ -1011,7 +1060,7 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v15 -> v16: Add the unified `cluster_jobs` table (design doc §4).
+/// v16 -> v17: Add the unified `cluster_jobs` table (design doc §4).
 ///
 /// One shared queue for every async job surface that was process-local
 /// (SoF `$export` #169, search reindex A2), discriminated by `kind`. Claiming
@@ -1019,7 +1068,7 @@ async fn migrate_v13_to_v14(client: &deadpool_postgres::Client) -> StorageResult
 /// (worker_id / lease_expiry / heartbeat_at / fencing_token columns and the
 /// `FOR UPDATE SKIP LOCKED` claim in `cluster_jobs.rs`); bulk export/submit
 /// deliberately stay on their own tables (resolved decision F3).
-async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "CREATE TABLE IF NOT EXISTS cluster_jobs (
@@ -1043,7 +1092,7 @@ async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v15->v16 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
 
     client
         .execute(
@@ -1066,14 +1115,14 @@ async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v16 -> v17: Add the `cluster_refresh_cache` table (design doc §5 C2).
+/// v17 -> v18: Add the `cluster_refresh_cache` table (design doc §5 C2).
 ///
 /// Shared store for cluster-coordinated single-flight document refreshes
 /// (`cluster_refresh_cache.rs`; today: IdP JWKS documents keyed by URL).
 /// Deliberately **no `tenant_id` column**: the cached documents are public
 /// upstream material shared by every tenant, so the wrong-tenant DoD row
 /// does not apply (methodology §6).
-async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "CREATE TABLE IF NOT EXISTS cluster_refresh_cache (
@@ -1085,12 +1134,12 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v16->v17 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v17->v18 failed: {}", e)))?;
 
     Ok(())
 }
 
-/// v17 -> v18: Subscriptions cluster delivery (design doc §Class B, #170).
+/// v18 -> v19: Subscriptions cluster delivery (design doc §Class B, #170).
 ///
 /// Four tables:
 /// - `subscription_state` — shared per-subscription counters/status (B4);
@@ -1103,7 +1152,7 @@ async fn migrate_v16_to_v17(client: &deadpool_postgres::Client) -> StorageResult
 ///   the cluster-jobs lease + fencing discipline plus a retry schedule (B5).
 /// - `subscription_ws_tokens` — single-use WebSocket binding tokens,
 ///   redeemed with `DELETE … RETURNING` (B2).
-async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "CREATE TABLE IF NOT EXISTS subscription_state (
@@ -1121,7 +1170,7 @@ async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| {
             pg_error(format!(
-                "Migration v17->v18 (subscription_state) failed: {}",
+                "Migration v18->v19 (subscription_state) failed: {}",
                 e
             ))
         })?;
@@ -1141,7 +1190,7 @@ async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| {
             pg_error(format!(
-                "Migration v17->v18 (subscription_notification_events) failed: {}",
+                "Migration v18->v19 (subscription_notification_events) failed: {}",
                 e
             ))
         })?;
@@ -1184,7 +1233,7 @@ async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| {
             pg_error(format!(
-                "Migration v17->v18 (subscription_delivery_outbox) failed: {}",
+                "Migration v18->v19 (subscription_delivery_outbox) failed: {}",
                 e
             ))
         })?;
@@ -1220,7 +1269,7 @@ async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| {
             pg_error(format!(
-                "Migration v17->v18 (subscription_ws_tokens) failed: {}",
+                "Migration v18->v19 (subscription_ws_tokens) failed: {}",
                 e
             ))
         })?;
@@ -1228,15 +1277,15 @@ async fn migrate_v17_to_v18(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v18 -> v19: durable composite secondary-backend sync outbox (design doc
+/// v19 -> v20: durable composite secondary-backend sync outbox (design doc
 /// §Class E, E1).
 ///
 /// One table, `composite_sync_outbox`, denormalized to one row per
 /// `(event, backend_id)` pair under the cluster-jobs lease + fencing
 /// discipline plus a retry schedule — the same shape as
-/// `subscription_delivery_outbox` (v17), adapted for a resource-sync
+/// `subscription_delivery_outbox` (v19), adapted for a resource-sync
 /// payload instead of a push-notification payload.
-async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v19_to_v20(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "CREATE TABLE IF NOT EXISTS composite_sync_outbox (
@@ -1264,7 +1313,7 @@ async fn migrate_v18_to_v19(client: &deadpool_postgres::Client) -> StorageResult
         .await
         .map_err(|e| {
             pg_error(format!(
-                "Migration v18->v19 (composite_sync_outbox) failed: {}",
+                "Migration v19->v20 (composite_sync_outbox) failed: {}",
                 e
             ))
         })?;

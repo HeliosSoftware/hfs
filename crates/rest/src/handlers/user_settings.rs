@@ -31,7 +31,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_persistence::core::{
-    ResourceStorage, SettingsStore, StoredUserSettings, apply_merge_patch,
+    EntityTagPrecondition, ResourceStorage, SettingsStore, StoredUserSettings, apply_merge_patch,
 };
 use helios_persistence::error::{ConcurrencyError, StorageError};
 use serde_json::Value;
@@ -79,9 +79,13 @@ where
 
     // Honor If-None-Match only when a document actually exists; an empty default
     // document (version 0) must never be reported as "not modified".
+    //
+    // List-aware and weak-comparison (RFC 9110 §13.1.2): 304 when ANY supplied
+    // tag matches. A malformed value cannot be satisfied, so it is treated as
+    // "no match" and the full document is returned — safe for a read.
     if version > 0
-        && let Some(inm) = conditional.if_none_match()
-        && (inm == current_etag || inm == "*")
+        && let Ok(inm) = conditional.if_none_match_tags()
+        && !inm.if_none_match_satisfied(Some(&version.to_string()))
     {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, current_etag)]).into_response());
     }
@@ -116,17 +120,13 @@ where
         .map(|stored| stored.version)
         .unwrap_or(0);
 
-    let if_match = match precondition {
-        IfMatch::Absent => None,
-        IfMatch::Version(expected) => Some(expected),
-        // `*` asserts the document exists, which the store cannot express as a
-        // version, so resolve it against the current one and pin the write to
-        // that — which also keeps the write conditional.
-        IfMatch::Any => {
-            check_if_match(precondition, current_version)?;
-            Some(current_version)
-        }
-    };
+    // Evaluate the precondition against the version we just read, then pin the
+    // write to that same version. The store cannot express `*` (or a multi-tag
+    // list) as a single version, so resolving it here and pinning to the
+    // observed version keeps the write conditional — the backend still rejects
+    // it atomically if another writer lands in between.
+    check_if_match(&precondition, current_version)?;
+    let if_match = precondition.is_present().then_some(current_version);
 
     let stored = store
         .put_settings(user.as_str(), document, if_match)
@@ -165,7 +165,7 @@ where
             Some(stored) => (stored.document, stored.version),
             None => (Value::Object(Default::default()), 0),
         };
-        check_if_match(precondition, version)?;
+        check_if_match(&precondition, version)?;
         let merged = apply_merge_patch(current, &merge_patch);
         validate_settings_document(&merged)?;
 
@@ -177,7 +177,7 @@ where
             // Only a caller who sent *no* precondition gets the conflict
             // absorbed. A caller who sent one — including `*` — asked to be
             // told about the race, so the failure must surface.
-            Err(e) if is_lock_failure(&e) && precondition == IfMatch::Absent && attempts < 2 => {
+            Err(e) if is_lock_failure(&e) && !precondition.is_present() && attempts < 2 => {
                 attempts += 1;
             }
             Err(e) => return Err(e.into()),
@@ -292,80 +292,58 @@ fn parse_object_body(body: &Bytes) -> RestResult<Value> {
     Ok(value)
 }
 
-/// A parsed `If-Match` precondition.
-///
-/// The header has four distinct input states and they must not be conflated —
-/// collapsing them onto `Option<i64>` is what let a malformed header silently
-/// become "no precondition", i.e. an unconditional overwrite (issue #270).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IfMatch {
-    /// No `If-Match` header: the write is unconditional.
-    Absent,
-    /// `If-Match: *` — succeed only if a document already exists.
-    Any,
-    /// A specific version must be current.
-    Version(i64),
-}
-
 /// Parses `If-Match` for `/_user/settings`.
+///
+/// Delegates to the shared, list-aware parser in
+/// [`helios_persistence::core::preconditions`] — this endpoint used to carry its
+/// own private tri-state enum, which handled only a *single* entity-tag and so
+/// rejected the comma-separated list the header is actually defined as
+/// (issue #311). The shared type subsumes it.
 ///
 /// Per [RFC 9110 §13.1.1] a precondition that cannot be satisfied means the
 /// method MUST NOT be performed. A syntactically invalid field value can never
-/// satisfy the strong comparison the section requires, so it is a failed
-/// precondition rather than a missing one — `412`, not "carry on". (`400` would
-/// be equally conformant for malformed syntax; `412` is chosen for consistency
-/// with every other precondition path in this crate.)
+/// be satisfied, so it is a failed precondition rather than a missing one —
+/// `412`, not "carry on". (`400` would be equally conformant for malformed
+/// syntax; `412` is kept for consistency with every other precondition path in
+/// this crate, and because #270 already settled the question here.)
 ///
-/// Both the strong form `"{n}"` and the legacy weak form `W/"{n}"` are accepted.
-/// This endpoint now emits strong ETags (see [`etag`]), but a client deployed
-/// against an earlier build may still echo back a weak one, so rejecting `W/`
-/// outright would break it for no benefit.
+/// Both the strong form `"{n}"` and the legacy weak form `W/"{n}"` are accepted;
+/// the shared comparison ignores the weakness flag. This endpoint emits strong
+/// ETags (see [`etag`]), but a client deployed against an earlier build may
+/// still echo back a weak one, so rejecting `W/` outright would break it for no
+/// benefit.
 ///
 /// [RFC 9110 §13.1.1]: https://www.rfc-editor.org/rfc/rfc9110#section-13.1.1
-fn parse_if_match(conditional: &ConditionalHeaders) -> RestResult<IfMatch> {
-    let Some(raw) = conditional.if_match() else {
-        return Ok(IfMatch::Absent);
-    };
-    let raw = raw.trim();
-    if raw == "*" {
-        return Ok(IfMatch::Any);
-    }
-
-    let unquoted = raw
-        .strip_prefix("W/")
-        .unwrap_or(raw)
-        .trim()
-        .trim_matches('"');
-
-    unquoted
-        .parse::<i64>()
-        .map(IfMatch::Version)
-        .map_err(|_| RestError::PreconditionFailed {
+fn parse_if_match(conditional: &ConditionalHeaders) -> RestResult<EntityTagPrecondition> {
+    conditional
+        .if_match_tags()
+        .cloned()
+        .map_err(|e| RestError::PreconditionFailed {
             message: format!(
-                "Malformed If-Match value {raw:?}; expected an entity-tag such as \"3\", or *"
+                "Malformed If-Match value: {e}; expected an entity-tag such as \"3\", or *"
             ),
         })
 }
 
 /// Checks a parsed precondition against the currently stored `version`, where
 /// version `0` means "no document exists yet".
-fn check_if_match(precondition: IfMatch, version: i64) -> RestResult<()> {
-    let failed = match precondition {
-        IfMatch::Absent => None,
-        // `*` is *not* "no precondition": it asserts the resource exists.
-        IfMatch::Any if version == 0 => {
-            Some("If-Match: * requires an existing settings document".to_string())
-        }
-        IfMatch::Any => None,
-        IfMatch::Version(expected) if expected != version => Some(format!(
-            "Expected settings version {expected}, but found {version}"
-        )),
-        IfMatch::Version(_) => None,
-    };
-    match failed {
-        Some(message) => Err(RestError::PreconditionFailed { message }),
-        None => Ok(()),
+///
+/// Version `0` is mapped to "no current representation" so the shared evaluator
+/// gives the semantics this endpoint already had: `*` requires an existing
+/// document, and a concrete tag never matches a document that does not exist.
+fn check_if_match(precondition: &EntityTagPrecondition, version: i64) -> RestResult<()> {
+    let current = (version > 0).then(|| version.to_string());
+    if precondition.if_match_satisfied(current.as_deref()) {
+        return Ok(());
     }
+
+    let message = match current {
+        Some(current) => {
+            format!("If-Match precondition failed: current settings version is {current}")
+        }
+        None => "If-Match precondition failed: no settings document exists yet".to_string(),
+    };
+    Err(RestError::PreconditionFailed { message })
 }
 
 /// Reads the caller's settings document, adopting a pre-#270 one on a miss.
@@ -520,26 +498,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_if_match_accepts_strong_weak_and_bare_tags() {
-        // Strong is the form this endpoint now emits.
-        assert_eq!(
-            parse_if_match(&with_if_match("\"7\"")).unwrap(),
-            IfMatch::Version(7)
-        );
+    fn parse_if_match_accepts_strong_and_weak_tags() {
+        // Strong is the form this endpoint emits (and the form the web UI echoes
+        // back, since it copies the ETag response header verbatim).
+        let strong = parse_if_match(&with_if_match("\"7\"")).unwrap();
+        assert!(check_if_match(&strong, 7).is_ok());
+        assert!(check_if_match(&strong, 8).is_err());
+
         // Weak is still accepted, for clients built against earlier releases.
+        let weak = parse_if_match(&with_if_match("W/\"5\"")).unwrap();
+        assert!(check_if_match(&weak, 5).is_ok());
+
         assert_eq!(
-            parse_if_match(&with_if_match("W/\"5\"")).unwrap(),
-            IfMatch::Version(5)
+            parse_if_match(&with_if_match("*")).unwrap(),
+            EntityTagPrecondition::Any
         );
-        assert_eq!(
-            parse_if_match(&with_if_match("9")).unwrap(),
-            IfMatch::Version(9)
-        );
-        assert_eq!(parse_if_match(&with_if_match("*")).unwrap(), IfMatch::Any);
         assert_eq!(
             parse_if_match(&ConditionalHeaders::from_headers(&HeaderMap::new())).unwrap(),
-            IfMatch::Absent
+            EntityTagPrecondition::Absent
         );
+    }
+
+    /// A bare, unquoted value is not a valid `entity-tag` (RFC 9110 §8.8.3
+    /// requires the opaque tag to be quoted). It used to be accepted here only
+    /// as an artifact of `trim_matches('"')`; nothing sends it — the web UI
+    /// echoes the quoted ETag verbatim — so it now fails the precondition
+    /// rather than being silently reinterpreted.
+    #[test]
+    fn parse_if_match_rejects_bare_unquoted_tag() {
+        assert!(parse_if_match(&with_if_match("9")).is_err());
+    }
+
+    /// Issue #311: the header is a list, and this endpoint's old private parser
+    /// could only ever see one tag.
+    #[test]
+    fn parse_if_match_accepts_a_list_and_matches_any_member() {
+        let p = parse_if_match(&with_if_match("\"3\", \"4\"")).unwrap();
+        assert!(check_if_match(&p, 3).is_ok());
+        assert!(check_if_match(&p, 4).is_ok());
+        assert!(check_if_match(&p, 5).is_err());
     }
 
     /// A malformed `If-Match` must fail the precondition, not be discarded.
@@ -547,9 +544,12 @@ mod tests {
     /// Previously this returned `None` — "no precondition" — silently turning a
     /// request that asked to be conditional into an unconditional
     /// last-writer-wins overwrite (issue #270).
+    ///
+    /// Note `"1", "2"` is deliberately NOT in this list any more: it is a
+    /// well-formed two-element list, and rejecting it was issue #311.
     #[test]
     fn parse_if_match_rejects_a_malformed_value() {
-        for raw in ["garbage", "\"\"", "W/\"\"", "\"1\", \"2\"", "1.5", "-"] {
+        for raw in ["garbage", "1.5", "-", "3", "W/3", "\"unterminated"] {
             let err = parse_if_match(&with_if_match(raw)).unwrap_err();
             assert!(
                 matches!(err, RestError::PreconditionFailed { .. }),
@@ -558,26 +558,37 @@ mod tests {
         }
     }
 
+    /// An empty opaque tag (`""`) is syntactically valid but can never equal a
+    /// settings version, so it parses cleanly and then fails the *check* — still
+    /// a 412, just at the correct stage.
+    #[test]
+    fn empty_opaque_tag_parses_but_never_matches() {
+        let p = parse_if_match(&with_if_match("\"\"")).unwrap();
+        assert!(check_if_match(&p, 1).is_err());
+        assert!(check_if_match(&p, 0).is_err());
+    }
+
     /// `If-Match: *` means "the document must already exist" (RFC 9110
     /// §13.1.1), *not* "no precondition" — so it must fail against version 0.
     #[test]
     fn wildcard_requires_an_existing_document() {
-        assert!(check_if_match(IfMatch::Any, 0).is_err());
-        assert!(check_if_match(IfMatch::Any, 1).is_ok());
+        assert!(check_if_match(&EntityTagPrecondition::Any, 0).is_err());
+        assert!(check_if_match(&EntityTagPrecondition::Any, 1).is_ok());
     }
 
     #[test]
     fn version_precondition_matches_exactly() {
-        assert!(check_if_match(IfMatch::Version(3), 3).is_ok());
-        assert!(check_if_match(IfMatch::Version(3), 4).is_err());
+        let v3 = parse_if_match(&with_if_match("\"3\"")).unwrap();
+        assert!(check_if_match(&v3, 3).is_ok());
+        assert!(check_if_match(&v3, 4).is_err());
         // Version 0 = no document; a caller asserting v3 must be told.
-        assert!(check_if_match(IfMatch::Version(3), 0).is_err());
+        assert!(check_if_match(&v3, 0).is_err());
     }
 
     #[test]
     fn absent_precondition_never_fails() {
-        assert!(check_if_match(IfMatch::Absent, 0).is_ok());
-        assert!(check_if_match(IfMatch::Absent, 42).is_ok());
+        assert!(check_if_match(&EntityTagPrecondition::Absent, 0).is_ok());
+        assert!(check_if_match(&EntityTagPrecondition::Absent, 42).is_ok());
     }
 
     /// `If-Match` requires strong comparison, so this endpoint emits a strong

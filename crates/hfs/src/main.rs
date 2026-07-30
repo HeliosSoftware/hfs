@@ -1780,11 +1780,20 @@ async fn build_bulk_submit(
             }
             _ => None,
         };
+    // Private keys for JWE `fileEncryptionKey` material addressed to HFS
+    // asymmetrically (ECDH-ES*, P-256/P-384). `dir` and the A*KW families use the
+    // symmetric key the provider supplies and need no configuration.
+    let decryption_keys = match cfg.decryption_key.as_deref() {
+        Some(material) => helios_rest::jwe::load_private_keys(material)
+            .map_err(|e| anyhow::anyhow!("HFS_BULK_SUBMIT_DECRYPTION_KEY is invalid: {e}"))?,
+        None => Vec::new(),
+    };
     let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(
         helios_rest::bulk_submit_fetcher::HttpSubmitInputFetcher::new(
             token_provider,
             cfg.outbound_scope.clone(),
-        ),
+        )
+        .with_decryption_keys(decryption_keys),
     );
 
     spawn_submit_workers(jobs.clone(), fetcher.clone(), output.clone(), &cfg);

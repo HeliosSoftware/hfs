@@ -102,6 +102,7 @@ pub mod cluster_refresh_cache;
 pub mod composite_sync_outbox;
 pub mod event_fanout;
 pub mod history;
+pub mod preconditions;
 pub mod search;
 pub mod sof_runner;
 pub mod storage;
@@ -158,6 +159,10 @@ pub use event_fanout::{EventFanout, FanoutEnvelope, FanoutKind, LifecycleOp};
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+};
+pub use preconditions::{
+    EntityTag, EntityTagPrecondition, MalformedPrecondition, bundle_if_match_gate,
+    if_match_field_satisfied, precondition_failed_entry,
 };
 pub use search::{
     ChainedSearchProvider, FullSearchProvider, IncludeProvider, MultiTypeSearchProvider,

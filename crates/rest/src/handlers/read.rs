@@ -90,17 +90,30 @@ where
                 }
             }
 
-            // Check conditional headers (If-None-Match)
-            if let Some(etag) = conditional.if_none_match() {
-                let resource_etag = format!("W/\"{}\"", stored.version_id());
-                if etag == resource_etag || etag == "*" {
-                    debug!(etag = %resource_etag, "Returning 304 Not Modified");
-                    return Ok(StatusCode::NOT_MODIFIED.into_response());
-                }
+            // Check conditional headers (If-None-Match), then If-Modified-Since.
+            //
+            // RFC 9110 §13.2.2 fixes the evaluation order and makes
+            // If-Modified-Since conditional on If-None-Match being *absent*:
+            // when the client sent an entity-tag, the tag is authoritative and a
+            // date must not be consulted. Evaluating both independently let a
+            // stale-but-old resource return 304 even though the ETag had just
+            // said it changed.
+            //
+            // If-None-Match is a list and uses weak comparison; `*` matches when
+            // any current representation exists. A malformed value cannot be
+            // satisfied, so it is treated as "does not match" — for a safe
+            // method that simply means the full representation is returned.
+            let if_none_match = conditional.if_none_match_tags().ok();
+            let inm_present = if_none_match.is_some_and(|p| p.is_present());
+
+            if let Some(precondition) = if_none_match
+                && !precondition.if_none_match_satisfied(Some(stored.version_id()))
+            {
+                debug!(version_id = %stored.version_id(), "Returning 304 Not Modified");
+                return Ok(StatusCode::NOT_MODIFIED.into_response());
             }
 
-            // Check If-Modified-Since
-            if let Some(since) = conditional.if_modified_since() {
+            if !inm_present && let Some(since) = conditional.if_modified_since() {
                 let last_modified = stored.last_modified();
                 if last_modified <= since {
                     debug!("Resource not modified since {}", since);
@@ -234,17 +247,30 @@ where
                 }
             }
 
-            // Check conditional headers (If-None-Match)
-            if let Some(etag) = conditional.if_none_match() {
-                let resource_etag = format!("W/\"{}\"", stored.version_id());
-                if etag == resource_etag || etag == "*" {
-                    debug!(etag = %resource_etag, "Returning 304 Not Modified");
-                    return Ok(StatusCode::NOT_MODIFIED.into_response());
-                }
+            // Check conditional headers (If-None-Match), then If-Modified-Since.
+            //
+            // RFC 9110 §13.2.2 fixes the evaluation order and makes
+            // If-Modified-Since conditional on If-None-Match being *absent*:
+            // when the client sent an entity-tag, the tag is authoritative and a
+            // date must not be consulted. Evaluating both independently let a
+            // stale-but-old resource return 304 even though the ETag had just
+            // said it changed.
+            //
+            // If-None-Match is a list and uses weak comparison; `*` matches when
+            // any current representation exists. A malformed value cannot be
+            // satisfied, so it is treated as "does not match" — for a safe
+            // method that simply means the full representation is returned.
+            let if_none_match = conditional.if_none_match_tags().ok();
+            let inm_present = if_none_match.is_some_and(|p| p.is_present());
+
+            if let Some(precondition) = if_none_match
+                && !precondition.if_none_match_satisfied(Some(stored.version_id()))
+            {
+                debug!(version_id = %stored.version_id(), "Returning 304 Not Modified");
+                return Ok(StatusCode::NOT_MODIFIED.into_response());
             }
 
-            // Check If-Modified-Since
-            if let Some(since) = conditional.if_modified_since() {
+            if !inm_present && let Some(since) = conditional.if_modified_since() {
                 let last_modified = stored.last_modified();
                 if last_modified <= since {
                     debug!("Resource not modified since {}", since);
