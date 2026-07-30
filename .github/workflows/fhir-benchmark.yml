@@ -248,15 +248,34 @@ jobs:
           # Reap by name prefix rather than by label, so containers created
           # before labelling was added here are also caught.
           #
-          # Two conditions, BOTH re-checked in the loop rather than trusting
+          # THREE conditions, all re-checked in the loop rather than trusting
           # `--filter name=` to anchor: this deletes other people's containers if
           # it is wrong, which would be far worse than the leak it fixes. The
-          # filter narrows the candidate set; the `case` statements decide.
-          #   1. the name must start with `hfs-bench-`  → only ours
-          #   2. the name must NOT contain this run id  → never a live sibling.
-          #      The matrix legs (sqlite, postgres) share a run id and run
-          #      concurrently, so this is what stops one leg killing the other.
-          echo "── Reaping hfs-bench-* containers from earlier runs ──"
+          # filter narrows the candidate set; the checks below decide.
+          #
+          #   1. name starts with `hfs-bench-`   → only ever our own containers
+          #   2. name does NOT contain this run id → never a live sibling. The
+          #      matrix legs (sqlite, postgres) share a run id and run
+          #      concurrently, so this stops one leg killing the other.
+          #   3. older than MAX_AGE_MIN          → never a *different* run that
+          #      is still going.
+          #
+          # (3) is not redundant with (2). The `concurrency` group at the top of
+          # this file only cancels in-progress runs on the SAME ref, so a
+          # dispatch on `main` and a dispatch on a PR branch run side by side
+          # with different run ids — and without an age guard each would reap the
+          # other's containers mid-benchmark. Same idiom as ci.yml's
+          # "Sweep orphaned testcontainers from dead runs".
+          #
+          # 120 minutes is comfortably longer than a full leg (the import suite
+          # alone runs ~22 min, plus corpus download and the other suites), so a
+          # legitimately-running benchmark is never in range. Debris older than
+          # that is unambiguously dead. The canary below is what protects us in
+          # the window where an orphan is younger than the guard but still
+          # holding the host's space.
+          MAX_AGE_MIN=120
+          echo "── Reaping hfs-bench-* containers older than ${MAX_AGE_MIN}m ──"
+          NOW=$(date +%s)
           REAPED=0
           for id in $(docker ps -aq --filter "name=hfs-bench-" 2>/dev/null); do
             name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's|^/||')
@@ -267,7 +286,14 @@ jobs:
             case "$name" in
               *"$RUN_ID"*) continue ;;        # this run's own — leave alone
             esac
-            echo "  removing $name ($id)"
+            created=$(docker inspect -f '{{.Created}}' "$id" 2>/dev/null) || continue
+            created_s=$(date -d "$created" +%s 2>/dev/null) || continue
+            age_min=$(( (NOW - created_s) / 60 ))
+            if [ "$age_min" -lt "$MAX_AGE_MIN" ]; then
+              echo "  keeping $name (age ${age_min}m — may be a concurrent run)"
+              continue
+            fi
+            echo "  removing $name ($id, age ${age_min}m)"
             docker rm -f -v "$id" >/dev/null 2>&1 || true
             REAPED=$((REAPED + 1))
           done
