@@ -139,7 +139,7 @@ jobs:
       - name: Start PostgreSQL
         run: |
           PG_CONTAINER="pg-cluster-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -168,7 +168,7 @@ jobs:
         run: |
           mkdir -p "$RESULTS_DIR"
           NGINX_CONTAINER="nginx-cluster-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$NGINX_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$NGINX_CONTAINER" 2>/dev/null || true
 
           # Upstreams are the two hfs processes on the runner. X-Hfs-Upstream
           # lets the smoke script prove round-robin. The Upgrade/Connection
@@ -429,7 +429,7 @@ jobs:
         if: env.NIGHTLY == 'true'
         run: |
           ES_CONTAINER="es-cluster-smoke-e1-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
             -e "discovery.type=single-node" \
             -e "xpack.security.enabled=false" \
@@ -583,11 +583,11 @@ jobs:
         if: always()
         run: |
           if [ -n "${PG_CONTAINER:-}" ]; then
-            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           fi
           if [ -n "${NGINX_CONTAINER:-}" ]; then
-            docker rm -f "$NGINX_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$NGINX_CONTAINER" 2>/dev/null || true
           fi
           if [ -n "${ES_CONTAINER:-}" ]; then
-            docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           fi

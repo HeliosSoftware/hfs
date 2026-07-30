@@ -73,5 +73,11 @@ jobs:
           # Same rationale as ci.yml: the shared container is parked in a
           # static OnceCell and never dropped; the github.run_id label is the
           # only cleanup path.
+          #
+          # `-v` for the same reason as ci.yml: the redis image declares
+          # VOLUME /data, so every testcontainer here leaves an anonymous
+          # volume behind that plain `docker rm -f` never reclaims. This
+          # workflow arrived with #269, after the repo-wide `-v` sweep, so it
+          # has to opt in explicitly.
           docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" \
-            | xargs -r docker rm -f || true
+            | xargs -r docker rm -fv || true

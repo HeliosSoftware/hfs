@@ -704,7 +704,7 @@ jobs:
             age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
             if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
               echo "Reaping orphan $id (age ${age_min}m)"
-              docker rm -f "$id" || true
+              docker rm -fv "$id" || true
               reaped=$((reaped + 1))
             fi
           done
