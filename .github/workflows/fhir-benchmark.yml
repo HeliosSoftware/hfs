@@ -294,7 +294,7 @@ jobs:
               continue
             fi
             echo "  removing $name ($id, age ${age_min}m)"
-            docker rm -f -v "$id" >/dev/null 2>&1 || true
+            docker rm -fv "$id" >/dev/null 2>&1 || true
             REAPED=$((REAPED + 1))
           done
           echo "  reaped: $REAPED"
@@ -343,7 +343,7 @@ jobs:
           echo "TGZ_CONTAINER=$TGZ_CONTAINER" >> "$GITHUB_ENV"
 
           docker build -t "$TGZ_IMAGE" fhir-benchmark/infra/tgz
-          docker rm -f -v "$TGZ_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
           # Labelled so the start-of-job reaper and volume prune can find this
           # container precisely if a killed runner ever leaves it behind.
           docker run -d --name "$TGZ_CONTAINER" \
@@ -392,7 +392,7 @@ jobs:
         if: matrix.backend == 'postgres'
         run: |
           set -euo pipefail
-          docker rm -f -v "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker volume rm -f "$PG_VOLUME" 2>/dev/null || true
           docker volume create --label hfs-bench=1 \
             --label "hfs-bench-run=${{ github.run_id }}" "$PG_VOLUME" >/dev/null
@@ -781,7 +781,7 @@ jobs:
         if: always()
         run: |
           if [ -n "${TGZ_CONTAINER:-}" ]; then
-            docker rm -f -v "$TGZ_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
           fi
 
       # `-v` and the explicit `volume rm` matter: without them the Postgres data
@@ -792,7 +792,7 @@ jobs:
         if: always() && matrix.backend == 'postgres'
         run: |
           if [ -n "${PG_CONTAINER:-}" ]; then
-            docker rm -f -v "$PG_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           fi
           if [ -n "${PG_VOLUME:-}" ]; then
             docker volume rm -f "$PG_VOLUME" 2>/dev/null || true

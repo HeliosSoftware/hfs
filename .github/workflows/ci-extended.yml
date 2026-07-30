@@ -50,7 +50,7 @@ jobs:
     steps:
       - name: Remove testcontainers from this run
         run: |
-          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -f || true
+          docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" | xargs -r docker rm -fv || true
 
       - name: Sweep orphaned testcontainers from dead runs
         run: |
@@ -64,7 +64,7 @@ jobs:
             age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
             if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
               echo "Reaping orphan $id (age ${age_min}m)"
-              docker rm -f "$id" || true
+              docker rm -fv "$id" || true
               reaped=$((reaped + 1))
             fi
           done
