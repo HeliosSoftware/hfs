@@ -42,6 +42,58 @@ fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
 
+/// Whether the optional `resource_fts` FTS5 virtual table exists on this
+/// database.
+///
+/// FTS5 is an optional SQLite compile-time feature. `create_fts_table`
+/// (`schema.rs`) succeeds silently when it is absent, so `resource_fts` may
+/// legitimately not exist — and a database created by an FTS5-less build keeps
+/// no table even once reopened by an FTS5-capable one, because the `v2 -> v3`
+/// migration is already recorded as done.
+///
+/// Callers therefore probe before touching the table, and treat "table absent"
+/// (a determinate fact: there is nothing indexed, so nothing to erase) very
+/// differently from "the statement failed" (an unknown, which must never be
+/// swallowed on a purge path — see the `DELETE FROM resource_fts` call sites).
+///
+/// Cheap: `sqlite_master` is answered from the connection's in-memory schema
+/// cache and does not touch disk.
+pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<bool> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
+        [],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
+}
+
+/// Runs a `DELETE FROM resource_fts …` on a purge path, skipping it when FTS5
+/// is unavailable and propagating any other failure.
+///
+/// The error handling is the point. Elsewhere in this backend an FTS delete is
+/// best-effort (`let _ = …`), which is tolerable on an index-maintenance path
+/// where the worst case is a stale entry. On a *purge* path it is not: a
+/// swallowed failure means the API answers `200` — "the record is gone" — while
+/// the resource's full text is still on disk. That is a false erasure
+/// attestation, and it is the same class of defect issue #386 reports, just
+/// reached by a different route. So: probe, then be strict.
+fn purge_fts_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> StorageResult<()> {
+    if !fts_table_exists(conn)? {
+        return Ok(());
+    }
+    conn.execute(sql, params)
+        .map_err(|e| internal_error(format!("purge fts delete: {e}")))?;
+    Ok(())
+}
+
 /// Extracts the `value[x]` payload from a FHIRPath Patch `Parameters.part`
 /// entry whose `name` is `"value"`. Returns the value of the first key
 /// matching `value[A-Z]…` (e.g. `valueString`, `valueQuantity`,
@@ -867,8 +919,14 @@ impl ResourceStorage for SqliteBackend {
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
         let mut conn = self.get_connection()?;
+        // IMMEDIATE, not the DEFERRED default: this transaction reads (the count
+        // below) before it writes. Under WAL a deferred transaction takes a read
+        // snapshot on that first read and then fails the read-to-write upgrade
+        // with SQLITE_BUSY_SNAPSHOT if another connection committed in between —
+        // and the busy handler is *not* invoked for that code, so the configured
+        // busy_timeout does not cover it. Taking the write lock up front does.
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| internal_error(format!("purge begin: {e}")))?;
         // Count current-version rows first so we can report what was removed.
         let removed: i64 = tx
@@ -880,6 +938,8 @@ impl ResourceStorage for SqliteBackend {
             .map_err(|e| internal_error(format!("purge count: {e}")))?;
         // search_index has ON DELETE CASCADE from resources, but delete it
         // explicitly too in case foreign keys are not enforced on this handle.
+        // (That explicit delete is also what fires the `search_index_fts`
+        // triggers, though a cascade fires them too.)
         for sql in [
             "DELETE FROM search_index WHERE tenant_id = ?1",
             "DELETE FROM resource_history WHERE tenant_id = ?1",
@@ -888,6 +948,22 @@ impl ResourceStorage for SqliteBackend {
             tx.execute(sql, params![id])
                 .map_err(|e| internal_error(format!("purge delete: {e}")))?;
         }
+        // `resource_fts` is an FTS5 *virtual* table: it can carry no foreign key,
+        // so the cascade above never reaches it and it must be deleted explicitly
+        // (issue #386). Left behind, the purged resource's narrative and its
+        // entire serialized body stay in the database, and are resurrected as a
+        // match oracle the moment a resource reuses the same logical id.
+        //
+        // Deliberately NOT gated on `is_search_offloaded()`: that flag is a
+        // write-path optimisation ("don't maintain an index nobody reads"),
+        // whereas this is an erasure guarantee. A deployment that indexed
+        // locally and later moved search to Elasticsearch still has rows here,
+        // and a purge is precisely when they must go.
+        purge_fts_rows(
+            &tx,
+            "DELETE FROM resource_fts WHERE tenant_id = ?1",
+            params![id],
+        )?;
         tx.commit()
             .map_err(|e| internal_error(format!("purge commit: {e}")))?;
         Ok(removed.max(0) as u64)
@@ -1071,16 +1147,7 @@ impl SqliteBackend {
     ) -> StorageResult<()> {
         use super::search::fts::extract_searchable_content;
 
-        // Check if FTS table exists (created in schema v3)
-        let fts_exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !fts_exists {
+        if !fts_table_exists(conn)? {
             // FTS5 not available - skip silently
             return Ok(());
         }
@@ -2311,11 +2378,23 @@ impl PurgableStorage for SqliteBackend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
+        // One transaction for the whole purge. Previously these were four
+        // independent autocommit statements, so a failure (or a crash) partway
+        // through left the resource deleted but its full text still in
+        // `resource_fts` — the exact orphan state this method now exists to
+        // prevent — and the caller could not tell a partial purge from a failed
+        // one, because a retry hits the not-found guard below and reports
+        // `NotFound` while the residue remains. IMMEDIATE for the same
+        // read-then-write / WAL reason as `purge_tenant_data`.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("purge begin: {e}")))?;
+
         // Check if resource exists (in any state)
-        let exists: bool = conn
+        let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
                 params![tenant_id, resource_type, id],
@@ -2325,7 +2404,7 @@ impl PurgableStorage for SqliteBackend {
 
         if !exists {
             // Also check history in case it was already purged from main table
-            let history_exists: bool = conn
+            let history_exists: bool = tx
                 .query_row(
                     "SELECT 1 FROM resource_history WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
                     params![tenant_id, resource_type, id],
@@ -2342,35 +2421,51 @@ impl PurgableStorage for SqliteBackend {
         }
 
         // Delete from resources table
-        conn.execute(
+        tx.execute(
             "DELETE FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             params![tenant_id, resource_type, id],
         )
         .map_err(|e| internal_error(format!("Failed to purge resource: {}", e)))?;
 
         // Delete from history table
-        conn.execute(
+        tx.execute(
             "DELETE FROM resource_history WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             params![tenant_id, resource_type, id],
         )
         .map_err(|e| internal_error(format!("Failed to purge resource history: {}", e)))?;
 
         // Delete from search index
-        conn.execute(
+        tx.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
             params![tenant_id, resource_type, id],
         )
         .map_err(|e| internal_error(format!("Failed to purge search index: {}", e)))?;
 
+        // Delete the full-text rows: no cascade reaches an FTS5 virtual table.
+        // See `purge_tenant_data` for why this is strict and ungated.
+        purge_fts_rows(
+            &tx,
+            "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+            params![tenant_id, resource_type, id],
+        )?;
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+
         Ok(())
     }
 
     async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
+        // Single transaction — see `purge` for the rationale.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("purge_all begin: {e}")))?;
+
         // Count how many we're about to delete
-        let count: i64 = conn
+        let count: i64 = tx
             .query_row(
                 "SELECT COUNT(DISTINCT id) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2",
                 params![tenant_id, resource_type],
@@ -2379,25 +2474,36 @@ impl PurgableStorage for SqliteBackend {
             .unwrap_or(0);
 
         // Delete from resources table
-        conn.execute(
+        tx.execute(
             "DELETE FROM resources WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
         .map_err(|e| internal_error(format!("Failed to purge resources: {}", e)))?;
 
         // Delete from history table
-        conn.execute(
+        tx.execute(
             "DELETE FROM resource_history WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
         .map_err(|e| internal_error(format!("Failed to purge resource history: {}", e)))?;
 
         // Delete from search index
-        conn.execute(
+        tx.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
         .map_err(|e| internal_error(format!("Failed to purge search index: {}", e)))?;
+
+        // Delete the full-text rows: no cascade reaches an FTS5 virtual table.
+        // See `purge_tenant_data` for why this is strict and ungated.
+        purge_fts_rows(
+            &tx,
+            "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2",
+            params![tenant_id, resource_type],
+        )?;
+
+        tx.commit()
+            .map_err(|e| internal_error(format!("purge_all commit: {e}")))?;
 
         Ok(count as u64)
     }
@@ -3653,6 +3759,29 @@ impl ReindexTarget for SqliteBackend {
             content,
         )?;
 
+        // Rebuild the full-text row as well. Without this, `$reindex` was a
+        // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
+        // each resource's search entries via `delete_search_entries` ->
+        // `delete_search_index`, which does drop the FTS row, and nothing here
+        // put it back. That happened on every reindex, with or without
+        // `clear_existing`, so the documented recovery operation silently
+        // disabled full-text search until each resource was next written.
+        //
+        // Not counted in `count`: that value is the number of `search_index`
+        // entries, which `$reindex-status` reports, and an FTS row is not one.
+        //
+        // Safe against duplicates because `run_reindex` always calls
+        // `delete_search_entries` for the resource immediately before this, and
+        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
+        // If that ordering ever changes, this must become delete-then-insert.
+        self.index_fts_content(
+            &conn,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            resource_id,
+            content,
+        )?;
+
         Ok(count)
     }
 
@@ -3666,6 +3795,19 @@ impl ReindexTarget for SqliteBackend {
                 params![tenant_id],
             )
             .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
+
+        // Clear the full-text rows too, matching PostgreSQL. This is only sound
+        // because `write_search_entries` above now repopulates them; adding this
+        // delete on its own would have made `$reindex --clear-existing` wipe
+        // `_text`/`_content` permanently.
+        //
+        // The returned count deliberately stays the `search_index` total —
+        // callers and tests treat it as the number of index entries cleared.
+        purge_fts_rows(
+            &conn,
+            "DELETE FROM resource_fts WHERE tenant_id = ?1",
+            params![tenant_id],
+        )?;
 
         Ok(deleted as u64)
     }

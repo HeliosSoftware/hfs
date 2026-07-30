@@ -3286,6 +3286,19 @@ impl ReindexTarget for PostgresBackend {
             .index_contained_resources(&client, tenant_id, resource_type, resource_id, content)
             .await?;
 
+        // Rebuild the full-text row as well. `run_reindex` deletes each
+        // resource's search entries first (`delete_search_entries` ->
+        // `delete_search_index`), and that drops the `resource_fts` row; without
+        // this call nothing put it back, so `$reindex` silently disabled
+        // `_text`/`_content` on every reindex, with or without `clear_existing`.
+        // Same defect as the SQLite side — this is not PostgreSQL-specific.
+        //
+        // Not counted in `count`, which reports `search_index` entries only.
+        // `index_fts_content` is DELETE-then-INSERT here, so it is idempotent
+        // regardless of what ran before it.
+        self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
+            .await?;
+
         Ok(count)
     }
 
