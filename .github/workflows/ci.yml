@@ -318,8 +318,16 @@ jobs:
           # The test helpers stamp `github.run_id`, which is exactly what makes
           # them reapable. No age guard: these are *this* run's containers, and
           # by construction they are only minutes old.
+          #
+          # `-v` is load-bearing. The postgres/elasticsearch/mongo images all
+          # declare VOLUME in their Dockerfiles, so every testcontainer gets an
+          # anonymous volume — and plain `docker rm -f` leaves it behind
+          # forever. That is what filled the shared host's 200G ZFS quota until
+          # containerd could not even write meta.db and *every* container start
+          # failed with "disk quota exceeded". `-v` removes only anonymous
+          # volumes; named volumes are never touched.
           docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" \
-            | xargs -r docker rm -f || true
+            | xargs -r docker rm -fv || true
 
       - name: Sweep orphaned testcontainers from dead runs
         run: |
@@ -335,7 +343,7 @@ jobs:
             age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
             if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
               echo "Reaping orphan $id (age ${age_min}m)"
-              docker rm -f "$id" || true
+              docker rm -fv "$id" || true
               reaped=$((reaped + 1))
             fi
           done

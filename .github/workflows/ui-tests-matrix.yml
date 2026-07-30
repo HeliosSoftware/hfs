@@ -127,7 +127,7 @@ jobs:
         if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
         run: |
           ES_CONTAINER="es-ui-matrix-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
             -e "discovery.type=single-node" \
             -e "xpack.security.enabled=false" \
@@ -158,7 +158,7 @@ jobs:
         if: matrix.backend == 'postgres'
         run: |
           PG_CONTAINER="pg-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -189,7 +189,7 @@ jobs:
         if: matrix.backend == 'mongodb'
         run: |
           MONGO_CONTAINER="mongo-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
@@ -352,7 +352,7 @@ jobs:
           set -euo pipefail
           BASE="http://$RUNNER_IP:$HFS_PORT"
           echo "Driving browser against $BASE"
-          docker rm -f "$PW_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PW_CONTAINER" 2>/dev/null || true
           # 2g shm: Chromium needs more than docker's 64m default.
           docker run -d --name "$PW_CONTAINER" --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
           docker cp crates/ui/e2e "$PW_CONTAINER":/work/e2e
@@ -377,7 +377,7 @@ jobs:
         if: always()
         run: |
           echo "Removing Playwright container..."
-          docker rm -f "$PW_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PW_CONTAINER" 2>/dev/null || true
 
           echo "Stopping HFS..."
           if [ -f /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid ]; then
@@ -395,6 +395,6 @@ jobs:
           fi
 
           echo "Stopping backend containers..."
-          docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
-          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
-          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${ES_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${MONGO_CONTAINER:-none}" 2>/dev/null || true
