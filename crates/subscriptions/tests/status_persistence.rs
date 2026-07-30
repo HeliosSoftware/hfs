@@ -197,6 +197,47 @@ async fn seed(backend: &SqliteBackend, resource_type: &str, resource: Value) {
         .expect("seed resource");
 }
 
+/// Registers the topic in the engine's in-memory registry.
+///
+/// `SubscriptionManager::register` rejects a subscription whose topic is not
+/// already registered (`TopicNotFound`), and the registry is populated only by
+/// resource events or by `rehydrate`. Writing the topic to storage is therefore
+/// not enough — these tests drive the engine the way the REST write handlers do,
+/// so they must fire the topic's own event first.
+async fn register_topic(engine: &SubscriptionEngine) {
+    engine
+        .on_resource_event(ResourceEvent {
+            tenant_id: TenantId::new(TENANT_ID),
+            fhir_version: current_fhir_version(),
+            resource_type: topic_resource_type().to_string(),
+            resource_id: "topic-1".to_string(),
+            version_id: "1".to_string(),
+            event_type: ResourceEventType::Create,
+            resource: Some(topic_resource()),
+            previous_resource: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await;
+    assert!(
+        engine.topic_registry().get_topic(TOPIC_URL).is_some(),
+        "test setup: the topic must be registered before any subscription is"
+    );
+}
+
+/// Asserts the subscription actually made it into the engine.
+///
+/// Without this, a setup failure (a `TopicNotFound` from an unregistered topic,
+/// say) leaves the stored status at `requested` — which is exactly what several
+/// of these tests assert as their *negative* case, so they would pass
+/// vacuously.
+fn assert_registered(engine: &SubscriptionEngine, id: &str) -> SubscriptionStatusCode {
+    engine
+        .manager()
+        .get_subscription(TENANT_ID, id)
+        .unwrap_or_else(|| panic!("test setup: subscription {id} was never registered"))
+        .status
+}
+
 /// Reads `Subscription.status` straight out of storage — the value a plain
 /// `GET /Subscription/{id}` would return.
 async fn stored_status(backend: &SqliteBackend, id: &str) -> String {
@@ -268,6 +309,7 @@ async fn successful_handshake_persists_active() {
     assert_eq!(stored_status(&backend, "sub-1").await, "requested");
 
     let engine = engine_with_writeback(Arc::clone(&backend));
+    register_topic(&engine).await;
     engine
         .on_resource_event(subscription_written_event(resource, "sub-1"))
         .await;
@@ -300,6 +342,7 @@ async fn delivery_failure_persists_error() {
 
     // error on the 1st failure; `off` far away so this test isolates `error`.
     let engine = engine_with_thresholds(Arc::clone(&backend), 1, 99);
+    register_topic(&engine).await;
     engine
         .on_resource_event(subscription_written_event(resource, "sub-1"))
         .await;
@@ -337,6 +380,7 @@ async fn delivery_circuit_breaker_persists_off() {
     // `handle_delivery_failure` tests `off` first, so both at 1 sends the very
     // first failure straight to `off`.
     let engine = engine_with_thresholds(Arc::clone(&backend), 1, 1);
+    register_topic(&engine).await;
     engine
         .on_resource_event(subscription_written_event(resource, "sub-1"))
         .await;
@@ -378,6 +422,7 @@ async fn write_back_preserves_every_other_field() {
     seed(&backend, "Subscription", resource.clone()).await;
 
     let engine = engine_with_writeback(Arc::clone(&backend));
+    register_topic(&engine).await;
     engine
         .on_resource_event(subscription_written_event(resource.clone(), "sub-1"))
         .await;
@@ -424,9 +469,19 @@ async fn no_write_when_stored_status_already_matches() {
     seed(&backend, "Subscription", resource.clone()).await;
 
     let engine = engine_with_writeback(Arc::clone(&backend));
+    register_topic(&engine).await;
     engine
         .on_resource_event(subscription_written_event(resource, "sub-1"))
         .await;
+
+    // Anti-vacuity: the first activation must genuinely have written, or the
+    // version comparison below compares two untouched versions and passes for
+    // the wrong reason.
+    assert_eq!(
+        assert_registered(&engine, "sub-1"),
+        SubscriptionStatusCode::Active
+    );
+    assert_eq!(stored_status(&backend, "sub-1").await, "active");
     let version_after_activation = stored_version(&backend, "sub-1").await;
 
     // Re-register from the now-`active` stored resource and re-run activation:
@@ -436,6 +491,10 @@ async fn no_write_when_stored_status_already_matches() {
         .on_resource_event(subscription_written_event(active_resource, "sub-1"))
         .await;
 
+    assert_eq!(
+        assert_registered(&engine, "sub-1"),
+        SubscriptionStatusCode::Active
+    );
     assert_eq!(
         stored_version(&backend, "sub-1").await,
         version_after_activation,
@@ -468,6 +527,7 @@ async fn without_a_status_store_storage_is_untouched() {
         },
         "http://localhost:8080".to_string(),
     );
+    register_topic(&engine).await;
     engine
         .on_resource_event(subscription_written_event(resource, "sub-1"))
         .await;
@@ -513,6 +573,7 @@ async fn persist_status_false_suppresses_write_back() {
         "http://localhost:8080".to_string(),
     )
     .with_status_store(Arc::clone(&backend) as Arc<dyn ResourceStorage>);
+    register_topic(&engine).await;
 
     assert!(!engine.persists_status());
 
@@ -520,6 +581,12 @@ async fn persist_status_false_suppresses_write_back() {
         .on_resource_event(subscription_written_event(resource, "sub-1"))
         .await;
 
+    // Anti-vacuity: the transition itself must have happened, so the assertion
+    // below proves the write was *suppressed* rather than never attempted.
+    assert_eq!(
+        assert_registered(&engine, "sub-1"),
+        SubscriptionStatusCode::Active
+    );
     assert_eq!(
         stored_status(&backend, "sub-1").await,
         "requested",
@@ -544,6 +611,7 @@ async fn write_back_on_a_deleted_subscription_is_a_no_op() {
     seed(&backend, "Subscription", resource.clone()).await;
 
     let engine = engine_with_writeback(Arc::clone(&backend));
+    register_topic(&engine).await;
 
     // Register without activating, then delete the resource out from under it.
     engine
@@ -559,6 +627,13 @@ async fn write_back_on_a_deleted_subscription_is_a_no_op() {
     engine
         .on_resource_event(subscription_written_event(resource, "sub-1"))
         .await;
+
+    // Anti-vacuity: the in-memory transition must have happened, so write-back
+    // really was attempted against a resource that had vanished.
+    assert_eq!(
+        assert_registered(&engine, "sub-1"),
+        SubscriptionStatusCode::Active
+    );
 
     let read_back = backend
         .read(&tenant_context(TENANT_ID), "Subscription", "sub-1")
