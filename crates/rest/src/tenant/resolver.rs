@@ -5,7 +5,7 @@
 
 use axum::http::request::Parts;
 use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
-use helios_persistence::tenant::{MAX_TENANT_ID_LEN, TenantId, TenantIdError};
+use helios_persistence::tenant::{TenantId, TenantIdError};
 use tracing::{debug, warn};
 
 use crate::config::{MultitenancyConfig, TenantRoutingMode};
@@ -405,6 +405,7 @@ fn is_fhir_resource_type(type_name: &str, fhir_version: &FhirVersion) -> bool {
 mod tests {
     use super::*;
     use axum::http::{HeaderValue, Request, Uri};
+    use helios_persistence::tenant::MAX_TENANT_ID_LEN;
 
     fn make_parts(path: &str, tenant_header: Option<&str>) -> Parts {
         let mut builder = Request::builder().uri(Uri::try_from(path).unwrap());
