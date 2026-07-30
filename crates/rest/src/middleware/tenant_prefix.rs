@@ -76,8 +76,14 @@ fn is_fhir_resource_type(type_name: &str, fhir_version: &FhirVersion) -> bool {
 /// this accepted a segment the resolver rejected, authorization and data access
 /// would disagree about which tenant the request is for.
 ///
-/// A URL prefix is a single path segment, so a hierarchical id never reaches
-/// here — `parse` will simply see the first segment.
+/// The delegation is total: whatever `parse` accepts, this accepts. In
+/// particular it does **not** additionally reject `/`, even though a tenant
+/// prefix is by definition a single path segment. That is deliberate — the only
+/// caller, [`extract_tenant_from_path`], passes `path.split('/').next()`, so a
+/// string containing `/` never reaches here. Adding a local `/` check would look
+/// like a guard while guarding nothing reachable, and would reintroduce exactly
+/// what issue #385 removed: a second, subtly different charset alongside the
+/// canonical one.
 fn is_valid_tenant_id(s: &str) -> bool {
     TenantId::parse(s).is_ok()
 }
@@ -294,12 +300,38 @@ mod tests {
         // A tenant provisioned as `tenant.example` was previously unroutable.
         assert!(is_valid_tenant_id("tenant.example"));
         assert!(!is_valid_tenant_id("")); // empty
-        assert!(!is_valid_tenant_id("tenant/path")); // never one URL segment
         assert!(!is_valid_tenant_id(&"a".repeat(100))); // too long
         assert!(!is_valid_tenant_id("tenant corp")); // whitespace
         // Reserved control-plane segments are not tenants (issue #385).
         assert!(!is_valid_tenant_id("resources"));
         assert!(!is_valid_tenant_id("__system__"));
+
+        // A hierarchical id *is* valid — this is a total delegation to
+        // `TenantId::parse`, not a stricter single-segment check. The earlier
+        // version of this test asserted the opposite and failed, which is the
+        // useful thing it did: the constraint that a tenant prefix is one
+        // segment lives in the caller (`path.split('/').next()`), not here.
+        // `hierarchical_id_is_accepted_here_but_unreachable_from_a_url` shows
+        // why that is safe.
+        assert!(is_valid_tenant_id("tenant/path"));
+    }
+
+    /// A `/` never reaches [`is_valid_tenant_id`] from a real request, so its
+    /// accepting one costs nothing — and a URL still cannot address a
+    /// hierarchical tenant, because only the first segment is taken.
+    #[test]
+    fn hierarchical_id_is_accepted_here_but_unreachable_from_a_url() {
+        let version = default_version();
+
+        // Accepted in isolation…
+        assert!(is_valid_tenant_id("acme/research"));
+
+        // …but the URL form yields the first segment only, so `acme/research`
+        // is addressable by header or JWT claim and never by URL prefix.
+        let (tenant, remaining) =
+            extract_tenant_from_path("/acme/research/Patient", &version).unwrap();
+        assert_eq!(tenant, "acme");
+        assert_eq!(remaining, "/research/Patient");
     }
 
     /// `authz_middleware` and the tenant resolver must classify a path segment
@@ -313,6 +345,10 @@ mod tests {
             "tenant.example",
             "my_tenant",
             "tenant-1",
+            // Included so the delegation stays *total*: a future local `/`
+            // check here would diverge from the canonical validator and fail
+            // this test, which is the point.
+            "acme/research",
             "",
             "resources",
             "__system__",
