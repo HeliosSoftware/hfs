@@ -122,6 +122,16 @@ fn validate_tenant_id(id: &str) -> RestResult<()> {
 /// from stored data (`registered: false`, `created_at: null`) so nothing with
 /// data is hidden. Each row carries the current non-deleted `resources` count.
 /// The internal system tenant is never listed.
+///
+/// Each row also carries `canonical` — whether the id satisfies
+/// [`TenantId::parse`]. It is `true` for everything this API can create, so the
+/// field only ever matters for ids that predate the canonical validator (issue
+/// #385): those were stored under a wider (or absent) charset and are no longer
+/// reachable through any ingress. This is how an operator finds them. Rows with
+/// `canonical: false` and a non-zero `resources` count are the ones needing
+/// attention — the data is still there, but requests naming that tenant are now
+/// rejected. `DELETE /admin/tenants/{id}` still accepts them, deliberately, so
+/// they can be cleaned up.
 pub async fn list_tenants_handler<S>(State(state): State<AppState<S>>) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
@@ -137,6 +147,11 @@ where
         .into_iter()
         .collect();
 
+    // `new` (unchecked) then `is_canonical`, not `parse().is_ok()`, to say
+    // plainly what this is: reporting on a value that is already stored, never
+    // admitting one.
+    let is_canonical = |id: &str| helios_persistence::tenant::TenantId::new(id).is_canonical();
+
     let mut seen = std::collections::HashSet::new();
     let mut tenants = Vec::new();
     for rec in &registered {
@@ -146,6 +161,7 @@ where
             "display_name": rec.display_name,
             "created_at": rec.created_at,
             "registered": true,
+            "canonical": is_canonical(&rec.id),
             "resources": counts.get(&rec.id).copied().unwrap_or(0),
         }));
     }
@@ -162,12 +178,20 @@ where
             "display_name": null,
             "created_at": null,
             "registered": false,
+            "canonical": is_canonical(id),
             "resources": n,
         }));
     }
 
+    let non_canonical = tenants
+        .iter()
+        .filter(|t| t["canonical"] == json!(false))
+        .count();
     let body = json!({
         "tenant_count": tenants.len(),
+        // Surfaced at the top level so an operator does not have to scan the
+        // rows to learn whether the upgrade stranded anything.
+        "non_canonical_count": non_canonical,
         "tenants": tenants,
     });
     Ok((StatusCode::OK, Json(body)).into_response())

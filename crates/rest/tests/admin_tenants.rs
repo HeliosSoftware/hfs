@@ -111,6 +111,39 @@ async fn create_then_list_round_trips() {
     assert_eq!(acme["resources"], 0);
 }
 
+/// The listing reports whether each id satisfies the canonical validator, so an
+/// operator can find tenants stranded by the tightening in issue #385.
+///
+/// Only the `true` side is reachable here, and that is the point: since this
+/// change, neither the admin API nor `ResourceStorage::register_tenant` will
+/// mint a non-canonical id, and a resource cannot be written under one either
+/// (the tenant header is validated). A `canonical: false` row can therefore only
+/// come from data that predates the validator — which a fresh test database has
+/// none of. The `false` side is covered where it can be constructed, against the
+/// unchecked constructor: `TenantId::is_canonical`'s unit tests in
+/// `helios-persistence`.
+#[tokio::test]
+async fn listing_reports_canonicality_so_legacy_ids_can_be_found() {
+    let server = create_test_server().await;
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme/research" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_for(&server, "beta", "Patient").await;
+
+    let list = server.get("/admin/tenants").await.json::<Value>();
+
+    // Registered and data-discovered rows both carry the flag.
+    assert_eq!(
+        find(&list, "acme/research").expect("acme")["canonical"],
+        true
+    );
+    assert_eq!(find(&list, "beta").expect("beta")["canonical"], true);
+    // And the summary an operator actually reads.
+    assert_eq!(list["non_canonical_count"], 0);
+}
+
 #[tokio::test]
 async fn duplicate_create_conflicts() {
     let server = create_test_server().await;
