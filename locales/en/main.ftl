@@ -260,6 +260,7 @@ cmp-heading = Compartments
 cmp-lede = The compartment definitions this server routes /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"} requests with, and a tester that answers: is this type in this compartment, via which parameters, and what search does the server run?
 cmp-rail-label = Compartment definitions
 cmp-rail-heading = Compartments
+cmp-degraded = Compartment definitions could not be loaded from this server right now — the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
 cmp-rail-note = Base definitions ship with the server (codegen'd from the FHIR spec). Editing them implies a tenant-scoped override layer — open question on the issue.
 cmp-tabs-label = Compartment sections
 cmp-tab-definition = Definition

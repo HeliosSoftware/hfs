@@ -256,6 +256,7 @@ cmp-heading = Compartimentos
 cmp-lede = Las definiciones de compartment con las que este servidor enruta las peticiones /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"}, y un probador que responde: ¿está este tipo en este compartment, mediante qué parámetros, y qué búsqueda ejecuta el servidor?
 cmp-rail-label = Definiciones de compartment
 cmp-rail-heading = Compartimentos
+cmp-degraded = Las definiciones de compartimento no se pudieron cargar de este servidor en este momento — la auto-llamada a /CompartmentDefinition falló (con autenticación habilitada esto suele significar que el token de servicio saliente falta o es inválido). La página reintenta en la siguiente petición.
 cmp-rail-note = Las definiciones base vienen con el servidor (generadas desde la especificación FHIR). Editarlas implica una capa de overrides por tenant — pregunta abierta en el issue.
 cmp-tabs-label = Secciones del compartment
 cmp-tab-definition = Definición
