@@ -5,7 +5,8 @@
 
 use axum::http::request::Parts;
 use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
-use helios_persistence::tenant::TenantId;
+use helios_persistence::tenant::{MAX_TENANT_ID_LEN, TenantId, TenantIdError};
+use tracing::{debug, warn};
 
 use crate::config::{MultitenancyConfig, TenantRoutingMode};
 use crate::middleware::tenant::X_TENANT_ID;
@@ -31,6 +32,10 @@ const RESERVED_SYSTEM_PATHS: &[&str] = &[
     // named `console` and strict-validation never mis-resolves the console path
     // to a `console` tenant under URL-path routing.
     "console",
+    // SMART discovery. Same rationale as `console`, and newly load-bearing since
+    // issue #385 widened the tenant charset to include `.` — see the twin list
+    // in `middleware::tenant_prefix`.
+    ".well-known",
 ];
 
 /// Result of resolving a tenant from a request.
@@ -64,11 +69,53 @@ impl ResolvedTenant {
 /// Trait for extracting tenant information from a specific source.
 pub trait TenantSourceExtractor: Send + Sync {
     /// Attempts to extract a tenant ID from the request.
-    fn extract(&self, parts: &Parts, config: &MultitenancyConfig) -> Option<TenantId>;
+    ///
+    /// The three-way return is the whole point, and the distinction is easy to
+    /// collapse by accident:
+    ///
+    /// - `Ok(Some(id))` — this source asserted a tenant and it is valid.
+    /// - `Ok(None)` — this source asserted **nothing**. Fall through to the next
+    ///   source, and ultimately to the default tenant.
+    /// - `Err(_)` — this source asserted a tenant and it is **invalid**. The
+    ///   request must be rejected, not silently redirected somewhere else.
+    ///
+    /// Before issue #385 there was no `Err` arm: an invalid `X-Tenant-ID` was
+    /// filtered to `None`, which fell through to the default tenant, so a client
+    /// typo silently read and wrote *another tenant's* data under a `200`.
+    ///
+    /// [`UrlPathTenantExtractor`] is the deliberate exception — for it, "not a
+    /// valid tenant id" genuinely means "not a tenant prefix" (`/Patient/123`),
+    /// so it returns `Ok(None)` and never `Err`.
+    fn extract(
+        &self,
+        parts: &Parts,
+        config: &MultitenancyConfig,
+    ) -> Result<Option<TenantId>, TenantSourceError>;
 
     /// Returns the source type this extractor handles.
     fn source_type(&self) -> TenantSource;
 }
+
+/// A tenant id asserted by a request source that failed canonical validation.
+///
+/// Carries the source so the caller can pick the right status: a bad header is
+/// the client's fault (`400`), a bad JWT claim is an unusable authorization
+/// context (`403`).
+#[derive(Debug, Clone)]
+pub struct TenantSourceError {
+    /// Which source carried the invalid id.
+    pub source: TenantSource,
+    /// Why it was rejected.
+    pub error: TenantIdError,
+}
+
+impl std::fmt::Display for TenantSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for TenantSourceError {}
 
 /// Extracts tenant from URL path prefix.
 ///
@@ -78,12 +125,22 @@ pub trait TenantSourceExtractor: Send + Sync {
 pub struct UrlPathTenantExtractor;
 
 impl TenantSourceExtractor for UrlPathTenantExtractor {
-    fn extract(&self, parts: &Parts, _config: &MultitenancyConfig) -> Option<TenantId> {
-        // First, check if middleware already extracted the tenant
+    /// Never returns `Err`: a first path segment that is not a valid tenant id
+    /// is not a *malformed tenant*, it is an ordinary untenanted path
+    /// (`/Patient/123`). Turning that into an error would 400 every non-tenanted
+    /// request. See [`TenantSourceExtractor::extract`].
+    fn extract(
+        &self,
+        parts: &Parts,
+        _config: &MultitenancyConfig,
+    ) -> Result<Option<TenantId>, TenantSourceError> {
+        // First, check if middleware already extracted the tenant. The
+        // middleware applies the same canonical check before storing it, so this
+        // is trusted reconstruction.
         if let Some(ExtractedTenantFromUrl(tenant)) =
             parts.extensions.get::<ExtractedTenantFromUrl>()
         {
-            return Some(TenantId::new(tenant));
+            return Ok(Some(TenantId::new(tenant)));
         }
 
         // Fall back to checking the original path (if stored) or current path
@@ -97,21 +154,22 @@ impl TenantSourceExtractor for UrlPathTenantExtractor {
         let path = path.strip_prefix('/').unwrap_or(path);
 
         // Get the first segment (before the next slash or end of path)
-        let tenant = path.split('/').next()?;
+        let Some(tenant) = path.split('/').next() else {
+            return Ok(None);
+        };
 
         // Skip reserved paths that are not tenant identifiers
         // Use the default FHIR version for resource type checking
         let fhir_version = FhirVersion::default_enabled();
         if is_reserved_path(tenant, &fhir_version) {
-            return None;
+            return Ok(None);
         }
 
-        // Validate tenant ID format (non-empty, reasonable characters)
-        if tenant.is_empty() || !is_valid_tenant_id(tenant) {
-            return None;
-        }
-
-        Some(TenantId::new(tenant))
+        // A URL prefix is a single path segment by construction, so a
+        // hierarchical id can never appear here — `acme/research` arrives as the
+        // segment `acme` followed by a path. Hierarchical tenants are therefore
+        // addressable by header and JWT claim, but not by URL-prefix routing.
+        Ok(TenantId::parse(tenant).ok())
     }
 
     fn source_type(&self) -> TenantSource {
@@ -124,13 +182,41 @@ impl TenantSourceExtractor for UrlPathTenantExtractor {
 pub struct HeaderTenantExtractor;
 
 impl TenantSourceExtractor for HeaderTenantExtractor {
-    fn extract(&self, parts: &Parts, _config: &MultitenancyConfig) -> Option<TenantId> {
-        parts
+    /// A present-but-invalid header is an error, not an absent tenant.
+    ///
+    /// This used to `filter` an invalid value away to `None`, which made the
+    /// resolver fall through to the **default tenant** — so `X-Tenant-ID:
+    /// acme.corp` (a `.`, which the old header charset rejected) silently read
+    /// and wrote the default tenant's data and returned `200`. That is a
+    /// cross-tenant read/write triggered by a typo. It is now a `400`.
+    ///
+    /// An absent header, and a header whose bytes are not valid UTF-8 or ASCII
+    /// (`to_str()` fails), remain `Ok(None)`: neither asserts a tenant.
+    fn extract(
+        &self,
+        parts: &Parts,
+        _config: &MultitenancyConfig,
+    ) -> Result<Option<TenantId>, TenantSourceError> {
+        let Some(raw) = parts
             .headers
             .get(&X_TENANT_ID)
             .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty() && is_valid_tenant_id(s))
-            .map(TenantId::new)
+        else {
+            return Ok(None);
+        };
+        // An empty header is treated as "not sent" rather than rejected, which
+        // is what it meant before and what a client emitting an unset variable
+        // produces.
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        TenantId::parse(raw).map(Some).map_err(|error| {
+            debug!(error = %error, "Rejecting invalid X-Tenant-ID header");
+            TenantSourceError {
+                source: TenantSource::Header,
+                error,
+            }
+        })
     }
 
     fn source_type(&self) -> TenantSource {
@@ -147,12 +233,33 @@ impl TenantSourceExtractor for HeaderTenantExtractor {
 pub struct JwtTenantExtractor;
 
 impl TenantSourceExtractor for JwtTenantExtractor {
-    fn extract(&self, parts: &Parts, _config: &MultitenancyConfig) -> Option<TenantId> {
-        parts
+    /// The claim is **authoritative** — [`crate::extractors::TenantExtractor`]
+    /// prefers it over header and URL — and it used to be validated by nothing
+    /// at all, making it the one path that could put an arbitrary string into a
+    /// storage key. It is now held to the same charset as every other source.
+    ///
+    /// An empty claim stays `Ok(None)`: the extractor already treats "empty" as
+    /// "no claim" and has a dedicated fail-loud path for it.
+    fn extract(
+        &self,
+        parts: &Parts,
+        _config: &MultitenancyConfig,
+    ) -> Result<Option<TenantId>, TenantSourceError> {
+        let Some(raw) = parts
             .extensions
             .get::<helios_auth::Principal>()
             .and_then(|p| p.tenant_id())
-            .map(TenantId::new)
+            .filter(|t| !t.is_empty())
+        else {
+            return Ok(None);
+        };
+        TenantId::parse(raw).map(Some).map_err(|error| {
+            warn!(error = %error, "Rejecting invalid tenant claim in validated token");
+            TenantSourceError {
+                source: TenantSource::JwtClaim,
+                error,
+            }
+        })
     }
 
     fn source_type(&self) -> TenantSource {
@@ -205,36 +312,47 @@ impl TenantResolver {
 
     /// Resolves the tenant from the request.
     ///
-    /// Returns a [`ResolvedTenant`] with the tenant ID and source information.
+    /// Returns a [`ResolvedTenant`] with the tenant ID and source information,
+    /// or [`TenantSourceError`] when a source **asserted** a tenant id that fails
+    /// canonical validation.
+    ///
+    /// An invalid assertion aborts resolution rather than being skipped. Skipping
+    /// it would hand the request to the next source — in practice the default
+    /// tenant — which is exactly the silent cross-tenant fallback issue #385
+    /// exists to remove. The first invalid source wins, in priority order, so the
+    /// reported reason is the one the caller most likely meant.
     pub fn resolve(
         &self,
         parts: &Parts,
         config: &MultitenancyConfig,
         default_tenant: &str,
-    ) -> ResolvedTenant {
+    ) -> Result<ResolvedTenant, TenantSourceError> {
         let mut all_sources = Vec::new();
 
         // Try each extractor in priority order
         for extractor in &self.extractors {
-            if let Some(tenant_id) = extractor.extract(parts, config) {
+            if let Some(tenant_id) = extractor.extract(parts, config)? {
                 all_sources.push((extractor.source_type(), tenant_id));
             }
         }
 
         // Select the highest priority source that provided a tenant
         if let Some((source, tenant_id)) = all_sources.first().cloned() {
-            ResolvedTenant {
+            Ok(ResolvedTenant {
                 tenant_id,
                 source,
                 all_sources,
-            }
+            })
         } else {
-            // Fall back to default tenant
-            ResolvedTenant {
+            // Fall back to default tenant. Constructed unchecked: it is operator
+            // configuration, not request input, and is validated once at startup
+            // (see `ServerConfig::validate_default_tenant`) so a misconfiguration
+            // is a boot failure rather than a per-request rejection.
+            Ok(ResolvedTenant {
                 tenant_id: TenantId::new(default_tenant),
                 source: TenantSource::Default,
                 all_sources,
-            }
+            })
         }
     }
 }
@@ -279,15 +397,9 @@ fn is_fhir_resource_type(type_name: &str, fhir_version: &FhirVersion) -> bool {
     }
 }
 
-/// Validates that a string is a valid tenant ID.
-fn is_valid_tenant_id(s: &str) -> bool {
-    // Tenant IDs should be alphanumeric with hyphens and underscores
-    // and have a reasonable length
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
+// The local `is_valid_tenant_id` that used to live here is gone: it was one of
+// three divergent charsets (issue #385). Validation is now `TenantId::parse`,
+// the single canonical definition in `helios-persistence`.
 
 #[cfg(test)]
 mod tests {
@@ -305,6 +417,19 @@ mod tests {
         request.into_parts().0
     }
 
+    /// `Ok(Some(id))` unwrapped, for the many assertions that only care about
+    /// the resolved value.
+    fn extracted(
+        extractor: &dyn TenantSourceExtractor,
+        parts: &Parts,
+        config: &MultitenancyConfig,
+    ) -> Option<String> {
+        extractor
+            .extract(parts, config)
+            .expect("extractor must not reject")
+            .map(|t| t.as_str().to_string())
+    }
+
     #[test]
     fn test_url_path_extractor() {
         let extractor = UrlPathTenantExtractor;
@@ -312,20 +437,38 @@ mod tests {
 
         // Valid tenant in URL
         let parts = make_parts("/acme/Patient/123", None);
-        assert_eq!(
-            extractor
-                .extract(&parts, &config)
-                .map(|t| t.as_str().to_string()),
-            Some("acme".to_string())
-        );
+        assert_eq!(extracted(&extractor, &parts, &config), Some("acme".into()));
 
         // Reserved path (should not extract)
         let parts = make_parts("/Patient/123", None);
-        assert_eq!(extractor.extract(&parts, &config), None);
+        assert_eq!(extracted(&extractor, &parts, &config), None);
 
         // System endpoint (should not extract)
         let parts = make_parts("/metadata", None);
-        assert_eq!(extractor.extract(&parts, &config), None);
+        assert_eq!(extracted(&extractor, &parts, &config), None);
+    }
+
+    /// The URL extractor must never return `Err`, or every untenanted request
+    /// would 400. A first segment that is not a valid tenant id simply is not a
+    /// tenant prefix.
+    #[test]
+    fn url_path_extractor_never_errors_on_a_non_tenant_segment() {
+        let extractor = UrlPathTenantExtractor;
+        let config = MultitenancyConfig::default();
+
+        for path in [
+            "/Patient/123",
+            "/metadata",
+            "/resources/x",  // reserved segment
+            "/__system__/x", // reserved sentinel
+            "/a%20b/Patient",
+        ] {
+            let parts = make_parts(path, None);
+            assert!(
+                extractor.extract(&parts, &config).is_ok(),
+                "{path} must fall through, not reject"
+            );
+        }
     }
 
     #[test]
@@ -335,20 +478,93 @@ mod tests {
 
         // Valid header
         let parts = make_parts("/Patient/123", Some("acme"));
-        assert_eq!(
-            extractor
-                .extract(&parts, &config)
-                .map(|t| t.as_str().to_string()),
-            Some("acme".to_string())
-        );
+        assert_eq!(extracted(&extractor, &parts, &config), Some("acme".into()));
 
         // Missing header
         let parts = make_parts("/Patient/123", None);
-        assert_eq!(extractor.extract(&parts, &config), None);
+        assert_eq!(extracted(&extractor, &parts, &config), None);
 
-        // Empty header
+        // Empty header — "not sent", not "malformed".
         let parts = make_parts("/Patient/123", Some(""));
-        assert_eq!(extractor.extract(&parts, &config), None);
+        assert_eq!(extracted(&extractor, &parts, &config), None);
+    }
+
+    /// Regression for the silent cross-tenant fallback (issue #385).
+    ///
+    /// A present-but-invalid `X-Tenant-ID` used to be filtered away to `None`,
+    /// so the resolver fell through to the **default tenant** and the request
+    /// was served — a `200` against someone else's data because of a typo.
+    #[test]
+    fn invalid_header_is_rejected_not_silently_defaulted() {
+        let extractor = HeaderTenantExtractor;
+        let config = MultitenancyConfig::default();
+
+        let too_long = "a".repeat(MAX_TENANT_ID_LEN + 1);
+        for bad in [
+            "acme corp",
+            "acme/",
+            "__system__",
+            "resources",
+            too_long.as_str(),
+        ] {
+            let parts = make_parts("/Patient/123", Some(bad));
+            let err = extractor
+                .extract(&parts, &config)
+                .expect_err(&format!("{bad:?} must be rejected"));
+            assert_eq!(err.source, TenantSource::Header);
+        }
+    }
+
+    /// The whole-resolver view of the same regression: the invalid header must
+    /// abort resolution rather than let the default tenant win.
+    #[test]
+    fn resolver_rejects_invalid_header_instead_of_falling_back_to_default() {
+        let config = MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        };
+        let resolver = TenantResolver::new(&config);
+
+        let parts = make_parts("/Patient/123", Some("acme corp"));
+        let err = resolver
+            .resolve(&parts, &config, "default")
+            .expect_err("an invalid asserted tenant must not resolve to the default");
+        assert_eq!(err.source, TenantSource::Header);
+    }
+
+    /// `.` was accepted by the admin API but by neither routing validator, so a
+    /// tenant provisioned as `tenant.example` was registered and unreachable.
+    /// The canonical charset is the union, which closes that gap.
+    #[test]
+    fn header_accepts_dotted_ids_the_admin_api_could_already_provision() {
+        let extractor = HeaderTenantExtractor;
+        let config = MultitenancyConfig::default();
+
+        let parts = make_parts("/Patient/123", Some("tenant.example"));
+        assert_eq!(
+            extracted(&extractor, &parts, &config),
+            Some("tenant.example".into())
+        );
+    }
+
+    /// Hierarchical ids reach storage by header (and JWT claim), never by URL
+    /// prefix — a URL prefix is one path segment by construction.
+    #[test]
+    fn hierarchical_ids_route_by_header_but_not_by_url_prefix() {
+        let config = MultitenancyConfig::default();
+
+        let parts = make_parts("/Patient/123", Some("acme/research"));
+        assert_eq!(
+            extracted(&HeaderTenantExtractor, &parts, &config),
+            Some("acme/research".into())
+        );
+
+        // The URL form yields the first segment only.
+        let parts = make_parts("/acme/research/Patient", None);
+        assert_eq!(
+            extracted(&UrlPathTenantExtractor, &parts, &config),
+            Some("acme".into())
+        );
     }
 
     #[test]
@@ -361,13 +577,13 @@ mod tests {
 
         // Header provided
         let parts = make_parts("/Patient/123", Some("acme"));
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver.resolve(&parts, &config, "default").expect("valid");
         assert_eq!(resolved.tenant_id_str(), "acme");
         assert_eq!(resolved.source, TenantSource::Header);
 
         // No header - falls back to default
         let parts = make_parts("/Patient/123", None);
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver.resolve(&parts, &config, "default").expect("valid");
         assert_eq!(resolved.tenant_id_str(), "default");
         assert_eq!(resolved.source, TenantSource::Default);
     }
@@ -382,13 +598,13 @@ mod tests {
 
         // Tenant in URL
         let parts = make_parts("/acme/Patient/123", None);
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver.resolve(&parts, &config, "default").expect("valid");
         assert_eq!(resolved.tenant_id_str(), "acme");
         assert_eq!(resolved.source, TenantSource::UrlPath);
 
         // No tenant in URL (reserved path) - falls back to default
         let parts = make_parts("/Patient/123", None);
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver.resolve(&parts, &config, "default").expect("valid");
         assert_eq!(resolved.tenant_id_str(), "default");
         assert_eq!(resolved.source, TenantSource::Default);
     }
@@ -403,14 +619,14 @@ mod tests {
 
         // Both URL and header - URL wins
         let parts = make_parts("/acme/Patient/123", Some("other"));
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver.resolve(&parts, &config, "default").expect("valid");
         assert_eq!(resolved.tenant_id_str(), "acme");
         assert_eq!(resolved.source, TenantSource::UrlPath);
         assert_eq!(resolved.all_sources.len(), 2);
 
         // Only header (reserved URL path)
         let parts = make_parts("/Patient/123", Some("acme"));
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver.resolve(&parts, &config, "default").expect("valid");
         assert_eq!(resolved.tenant_id_str(), "acme");
         assert_eq!(resolved.source, TenantSource::Header);
     }
@@ -459,15 +675,42 @@ mod tests {
         assert!(!is_reserved_path("my_tenant", &version));
     }
 
+    /// Replaces `test_is_valid_tenant_id`, which exercised this module's private
+    /// copy of the charset. That copy is gone (issue #385) — validation is
+    /// `TenantId::parse` — so the property worth pinning here is that the
+    /// *header source* accepts exactly what the canonical validator accepts.
+    ///
+    /// Two of the old assertions were inverted by this change, deliberately:
+    /// `tenant.com` and any dotted id are now **valid** (the admin API could
+    /// always provision one, so rejecting it here made such a tenant
+    /// unroutable). `tenant/path` stays invalid *for this source* only because a
+    /// header carrying it is valid — see
+    /// `hierarchical_ids_route_by_header_but_not_by_url_prefix` — while a URL
+    /// prefix is a single segment and can never carry it.
     #[test]
-    fn test_is_valid_tenant_id() {
-        assert!(is_valid_tenant_id("acme"));
-        assert!(is_valid_tenant_id("tenant-123"));
-        assert!(is_valid_tenant_id("my_tenant"));
-        assert!(is_valid_tenant_id("ABC123"));
-        assert!(!is_valid_tenant_id("")); // empty
-        assert!(!is_valid_tenant_id("tenant.com")); // dot
-        assert!(!is_valid_tenant_id("tenant/path")); // slash
-        assert!(!is_valid_tenant_id(&"a".repeat(100))); // too long
+    fn header_source_accepts_exactly_the_canonical_charset() {
+        let extractor = HeaderTenantExtractor;
+        let config = MultitenancyConfig::default();
+        let too_long = "a".repeat(MAX_TENANT_ID_LEN + 1);
+
+        for candidate in [
+            "acme",
+            "tenant-123",
+            "my_tenant",
+            "ABC123",
+            "tenant.com",
+            "acme/research",
+            "resources",
+            "__system__",
+            "tenant path",
+            too_long.as_str(),
+        ] {
+            let parts = make_parts("/Patient/123", Some(candidate));
+            assert_eq!(
+                extractor.extract(&parts, &config).is_ok(),
+                TenantId::parse(candidate).is_ok(),
+                "{candidate:?} classified differently from the canonical validator"
+            );
+        }
     }
 }

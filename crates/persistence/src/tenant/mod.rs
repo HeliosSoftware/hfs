@@ -35,6 +35,33 @@
 //! resource *type* is tenant-scoped or shared across tenants, not where a
 //! tenant's records physically live.
 //!
+//! # The tenant-id contract
+//!
+//! [`TenantId::parse`] is the single canonical validator. Every id that enters
+//! the server from outside — `X-Tenant-ID`, a URL path prefix, a JWT tenant
+//! claim, an admin-API provisioning body — goes through it, and
+//! [`ResourceStorage::register_tenant`](crate::core::ResourceStorage::register_tenant)
+//! re-checks it as a backstop so no future ingress can mint an id that skipped
+//! validation.
+//!
+//! **What a backend may rely on.** A tenant id reaching storage is 1..=64 bytes
+//! of ASCII letters, digits, `-`, `_`, `.`, and `/`; `/` neither leads, trails,
+//! nor repeats; and no segment is a reserved control-plane namespace (see
+//! [`RESERVED_TENANT_SEGMENTS`]). Case is significant.
+//!
+//! **What a backend may *not* assume.** That the id is safe to fold, truncate,
+//! or otherwise map lossily into its own keyspace. The contract guarantees a
+//! bounded, printable charset — it does not guarantee that the charset is legal
+//! everywhere. A backend whose keyspace is narrower than this (Elasticsearch
+//! index names must be lowercase; S3 prefixes give `/` structural meaning) still
+//! owes an **injective** encoding of its own. The precondition exists so that
+//! encoding has a bounded input to handle, not so it can be skipped: two
+//! distinct ids must always address distinct storage.
+//!
+//! Ids stored before this validator existed are unaffected — they round-trip
+//! through the unchecked [`TenantId::new`]. [`TenantId::is_canonical`] identifies
+//! them.
+//!
 //! # Examples
 //!
 //! ## Creating a Tenant Context
@@ -90,7 +117,7 @@ mod permissions;
 mod tenancy;
 
 pub use context::{TenantContext, TenantContextBuilder};
-pub use id::{SYSTEM_TENANT, TenantId};
+pub use id::{MAX_TENANT_ID_LEN, RESERVED_TENANT_SEGMENTS, SYSTEM_TENANT, TenantId, TenantIdError};
 pub use permissions::{
     CompartmentRestriction, Operation, TenantPermissions, TenantPermissionsBuilder,
 };

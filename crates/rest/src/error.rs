@@ -677,6 +677,11 @@ impl From<TenantError> for RestError {
             TenantError::InvalidTenant { .. } => RestError::BadRequest {
                 message: err.to_string(),
             },
+            // The caller supplied an id that is not a valid tenant id — a
+            // malformed request, not a permissions problem.
+            TenantError::NonCanonicalTenantId { .. } => RestError::BadRequest {
+                message: err.to_string(),
+            },
             TenantError::TenantSuspended { .. } => RestError::Forbidden {
                 message: err.to_string(),
             },

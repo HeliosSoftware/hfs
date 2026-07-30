@@ -5,6 +5,7 @@
 
 use axum::{extract::Request, http::Uri, middleware::Next, response::Response};
 use helios_fhir::{FhirResourceTypeProvider, FhirVersion};
+use helios_persistence::tenant::TenantId;
 
 /// Non-resource reserved paths (FHIR system endpoints, API prefixes).
 /// Resource types are checked dynamically via helios-fhir's FhirResourceTypeProvider.
@@ -23,6 +24,12 @@ const RESERVED_SYSTEM_PATHS: &[&str] = &[
     // can never be named `console` under URL-path routing, keeping the console
     // paths unambiguous with the authz console guard (see `middleware::auth`).
     "console",
+    // SMART discovery (`/.well-known/smart-configuration`). Reserved since issue
+    // #385: the canonical charset permits `.`, which the old private validator
+    // here rejected, so `.well-known` would otherwise parse as a tenant and this
+    // middleware would rewrite the path to `/smart-configuration` — a 404 for
+    // SMART discovery under `url_path`/`both` routing.
+    ".well-known",
 ];
 
 /// Checks if a path segment is a reserved path (not a tenant identifier).
@@ -59,12 +66,20 @@ fn is_fhir_resource_type(type_name: &str, fhir_version: &FhirVersion) -> bool {
     }
 }
 
-/// Validates that a string could be a tenant ID.
+/// Validates that a path segment could be a tenant ID.
+///
+/// Delegates to [`TenantId::parse`], the canonical validator (issue #385). This
+/// used to be a private copy of the charset, one of three that disagreed; the
+/// copy in `tenant::resolver` is gone for the same reason. Keeping the two in
+/// agreement is load-bearing: `authz_middleware` calls
+/// [`extract_tenant_from_path`] to decide which path it is authorizing, so if
+/// this accepted a segment the resolver rejected, authorization and data access
+/// would disagree about which tenant the request is for.
+///
+/// A URL prefix is a single path segment, so a hierarchical id never reaches
+/// here — `parse` will simply see the first segment.
 fn is_valid_tenant_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    TenantId::parse(s).is_ok()
 }
 
 /// Extracts tenant from URL path if present.
@@ -218,6 +233,27 @@ mod tests {
         assert!(extract_tenant_from_path("/console/metrics/uptime", &version).is_none());
     }
 
+    /// Regression for a break this change would otherwise have introduced.
+    ///
+    /// The canonical charset (issue #385) permits `.`, which this module's old
+    /// private validator rejected. Without reserving `.well-known`,
+    /// `/.well-known/smart-configuration` would parse `.well-known` as a tenant
+    /// and rewrite the path to `/smart-configuration`, which matches no route —
+    /// turning SMART discovery into a 404 under `url_path`/`both` routing.
+    #[test]
+    fn smart_discovery_is_not_parsed_as_a_tenant_prefix() {
+        let version = default_version();
+        assert!(extract_tenant_from_path("/.well-known/smart-configuration", &version).is_none());
+        assert!(is_reserved_path(".well-known", &version));
+
+        // A dotted id that is *not* a reserved route still routes as a tenant —
+        // the point of widening the charset.
+        let (tenant, remaining) =
+            extract_tenant_from_path("/tenant.example/Patient", &version).unwrap();
+        assert_eq!(tenant, "tenant.example");
+        assert_eq!(remaining, "/Patient");
+    }
+
     #[test]
     fn test_is_reserved_path() {
         let version = default_version();
@@ -253,10 +289,42 @@ mod tests {
         assert!(is_valid_tenant_id("tenant-123"));
         assert!(is_valid_tenant_id("my_tenant"));
         assert!(is_valid_tenant_id("ABC123"));
+        // `.` is now accepted: the canonical charset is the union of what the
+        // three old validators accepted, and the admin API always allowed it.
+        // A tenant provisioned as `tenant.example` was previously unroutable.
+        assert!(is_valid_tenant_id("tenant.example"));
         assert!(!is_valid_tenant_id("")); // empty
-        assert!(!is_valid_tenant_id("tenant.com")); // dot
-        assert!(!is_valid_tenant_id("tenant/path")); // slash
+        assert!(!is_valid_tenant_id("tenant/path")); // never one URL segment
         assert!(!is_valid_tenant_id(&"a".repeat(100))); // too long
+        assert!(!is_valid_tenant_id("tenant corp")); // whitespace
+        // Reserved control-plane segments are not tenants (issue #385).
+        assert!(!is_valid_tenant_id("resources"));
+        assert!(!is_valid_tenant_id("__system__"));
+    }
+
+    /// `authz_middleware` and the tenant resolver must classify a path segment
+    /// identically, or the request would be authorized as one tenant and served
+    /// as another. Both now call `TenantId::parse`; this pins that they agree.
+    #[test]
+    fn tenant_prefix_and_canonical_validator_agree() {
+        for candidate in [
+            "acme",
+            "ACME",
+            "tenant.example",
+            "my_tenant",
+            "tenant-1",
+            "",
+            "resources",
+            "__system__",
+            "tenant corp",
+            "tenant%2F",
+        ] {
+            assert_eq!(
+                is_valid_tenant_id(candidate),
+                TenantId::parse(candidate).is_ok(),
+                "{candidate:?} classified differently from the canonical validator"
+            );
+        }
     }
 
     #[test]

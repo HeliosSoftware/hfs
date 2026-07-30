@@ -834,6 +834,12 @@ impl ResourceStorage for SqliteBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        // Backstop for the canonical tenant-id contract (issue #385). SQLite
+        // keys tenants by an exact-match `tenant_id` column, so it has no
+        // collision of its own to defend against — this guards the *registry*
+        // from minting an id the other backends could not keep distinct, and
+        // keeps the precondition uniform across every implementation.
+        self.ensure_canonical_tenant_id(id)?;
         let conn = self.get_connection()?;
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here

@@ -28,7 +28,7 @@ use axum::{
 };
 use helios_audit::{AuditAction, AuditEventBuilder};
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::tenant::SYSTEM_TENANT;
+use helios_persistence::tenant::{SYSTEM_TENANT, TenantId};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
@@ -36,15 +36,9 @@ use tracing::debug;
 use crate::error::{RestError, RestResult};
 use crate::state::AppState;
 
-/// Maximum accepted tenant-id length. Generous, but bounds the value that flows
-/// into schema names / storage keys.
-const MAX_TENANT_ID_LEN: usize = 128;
-
-/// Tenant ids that name a control-plane namespace in a storage backend's
-/// keyspace. Currently the S3 sibling prefixes of `tenants/` (see
-/// `S3Keyspace`); `__system__` is checked separately as the shared-tenant
-/// sentinel.
-const RESERVED_TENANT_IDS: &[&str] = &["tenants", "resources", "history", "bulk"];
+// The tenant-id length cap and reserved-name list that used to live here are
+// now `helios_persistence::tenant::{MAX_TENANT_ID_LEN, RESERVED_TENANT_SEGMENTS}`,
+// applied by `TenantId::parse` — see `validate_tenant_id` below (issue #385).
 
 /// Request body for `POST /admin/tenants`.
 #[derive(Debug, Deserialize)]
@@ -93,51 +87,31 @@ async fn seed_new_tenant<S: ResourceStorage>(
     .await;
 }
 
-/// Validates a tenant id: non-empty, within length, no whitespace, a
-/// conservative identifier charset, and never the internal system sentinel.
+/// Validates a tenant id against the canonical definition.
+///
+/// This used to be a third, independent charset — wider than the two the REST
+/// routing surfaces enforced (it permitted `.` and `/`) and with a different
+/// length cap. Provisioning a tenant it accepted but routing did not produced a
+/// registered tenant nobody could address. Validation now lives in one place
+/// ([`TenantId::parse`], issue #385) and this handler only translates the
+/// rejection into a `400`.
+///
+/// Two rules the old local version had are now *stronger*, not merely moved:
+///
+/// - The reserved-name check compares each `/`-separated **segment**, not the
+///   whole id. `acme/resources` used to pass, and on S3 its objects land inside
+///   the `acme/resources/` prefix that tenant `acme` lists and
+///   `purge_tenant_data("acme")` deletes.
+/// - The length cap is 64, not 128. An id in 65..=128 bytes was already
+///   unroutable through both header and URL routing (each capped at 64), so it
+///   was reachable only through the JWT claim — the ingress that validated
+///   nothing.
 fn validate_tenant_id(id: &str) -> RestResult<()> {
-    if id.is_empty() {
-        return Err(RestError::BadRequest {
-            message: "tenant id must not be empty".to_string(),
-        });
-    }
-    if id.len() > MAX_TENANT_ID_LEN {
-        return Err(RestError::BadRequest {
-            message: format!("tenant id exceeds {MAX_TENANT_ID_LEN} characters"),
-        });
-    }
-    if id == SYSTEM_TENANT {
-        return Err(RestError::BadRequest {
-            message: "'__system__' is reserved for internal shared resources".to_string(),
-        });
-    }
-    // Names that collide with a control-plane namespace in the S3 keyspace.
-    //
-    // Defense in depth and a UX guardrail only — it is *not* what makes the
-    // keyspace safe. The S3 backend is safe structurally (registry records are
-    // direct `{id}.json` children of `tenants/`, tenant data is always nested
-    // deeper), because this check is reachable from the admin API alone: the JWT
-    // tenant extractor validates nothing. See `S3Keyspace::tenant_registry_prefix`
-    // and issue #271 — do not conclude from this list that the reader-side filter
-    // is redundant.
-    if RESERVED_TENANT_IDS.contains(&id) {
-        return Err(RestError::BadRequest {
-            message: format!("'{id}' is reserved for internal use"),
-        });
-    }
-    // Allow the characters that are safe across routing (header / URL prefix /
-    // JWT claim) and storage keys: alphanumerics plus `-`, `_`, `.`, and `/`
-    // (the hierarchy separator). Reject everything else, including whitespace.
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-    {
-        return Err(RestError::BadRequest {
-            message: "tenant id may contain only letters, digits, '-', '_', '.', and '/'"
-                .to_string(),
-        });
-    }
-    Ok(())
+    TenantId::parse(id)
+        .map(|_| ())
+        .map_err(|e| RestError::BadRequest {
+            message: e.to_string(),
+        })
 }
 
 /// `GET /admin/tenants`

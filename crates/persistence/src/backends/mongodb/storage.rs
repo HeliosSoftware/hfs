@@ -1507,6 +1507,11 @@ impl ResourceStorage for MongoBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        // Backstop for the canonical tenant-id contract (issue #385). MongoDB
+        // matches `tenant_id` as an exact BSON string under the default
+        // (case-sensitive) collation, so it has no derivation to protect — this
+        // keeps the precondition uniform across every implementation.
+        self.ensure_canonical_tenant_id(id)?;
         let db = self.get_database().await?;
         let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
         // RFC 3339 string, matching the SQLite registry's `created_at` format so

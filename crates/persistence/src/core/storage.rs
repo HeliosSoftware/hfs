@@ -778,9 +778,36 @@ pub trait ResourceStorage: Send + Sync {
         Ok(None)
     }
 
+    /// Rejects a tenant id that does not satisfy the canonical definition.
+    ///
+    /// Every implementation of [`register_tenant`](Self::register_tenant) calls
+    /// this first. It is a **backstop**, not the primary control: ids are
+    /// validated at each REST ingress (header, URL prefix, JWT claim, admin
+    /// body). Its job is to make the storage-layer precondition documented in
+    /// [`crate::tenant`] true by construction, so a future ingress — or an
+    /// embedder using this crate directly — cannot mint a tenant that skipped
+    /// validation. Issue #385.
+    ///
+    /// Deliberately **not** applied to `deregister_tenant`, `purge_tenant_data`,
+    /// or any read path. Those are how an operator cleans up a non-canonical
+    /// tenant that predates this validator; rejecting there would make bad data
+    /// permanently undeletable. Only the mint point is guarded.
+    fn ensure_canonical_tenant_id(&self, id: &str) -> StorageResult<()> {
+        crate::tenant::TenantId::parse(id).map(|_| ()).map_err(|e| {
+            StorageError::Tenant(crate::error::TenantError::NonCanonicalTenantId {
+                tenant_id: id.to_string(),
+                reason: e,
+            })
+        })
+    }
+
     /// Registers (provisions) a new tenant, stamping `created_at` with the
     /// current time. Returns [`StorageError`] if the tenant is already
     /// registered. Default: unsupported-capability error.
+    ///
+    /// Implementations must call
+    /// [`ensure_canonical_tenant_id`](Self::ensure_canonical_tenant_id) before
+    /// writing anything.
     async fn register_tenant(
         &self,
         _id: &str,
