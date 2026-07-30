@@ -230,3 +230,85 @@ fn carries_informational_mirrors_and_short_labels() {
     assert_eq!(note["short"], json!("Free-text remark"));
     assert_eq!(note["mustSupport"], Value::Null);
 }
+
+// ── issue #424: Element.id-derived ids are `string`, not `id` ──────────────
+//
+// The FHIRPath `System.String` code carries a `structuredefinition-fhir-type`
+// extension that HL7 populates inconsistently (R4B stamps `id` on every `.id`,
+// R5 on `ElementDefinition.id`). Taken literally, the `id` regex
+// `[A-Za-z0-9\-\.]{1,64}` rejects element ids with `[x]`, `:`, or > 64 chars —
+// i.e. StructureDefinitions the spec itself publishes. The converter now keys
+// the value-domain type on the base element: `Element.id` → `string`, while
+// `Resource.id` and `Extension.url` keep honoring the extension.
+
+const FHIR_TYPE_EXT: &str = "http://hl7.org/fhir/StructureDefinition/structuredefinition-fhir-type";
+const SYSTEM_STRING: &str = "http://hl7.org/fhirpath/System.String";
+
+/// Converts a one-field complex-type SD and returns that field's schema `type`.
+/// The field derives from `base_path` and its single `type[]` carries `code`
+/// plus a `structuredefinition-fhir-type` extension of `ext_value`.
+fn field_type(field: &str, base_path: &str, code: &str, ext_value: &str) -> Value {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/T",
+        "name": "T", "kind": "complex-type", "derivation": "specialization", "type": "T",
+        "snapshot": { "element": [
+            { "path": "T", "min": 0, "max": "*" },
+            {
+                "path": format!("T.{field}"),
+                "min": 0, "max": "1",
+                "base": { "path": base_path, "min": 0, "max": "1" },
+                "type": [{
+                    "extension": [{ "url": FHIR_TYPE_EXT, "valueUrl": ext_value }],
+                    "code": code
+                }]
+            }
+        ]}
+    });
+    let conversion = convert(&sd).expect("conversion");
+    serde_json::to_value(&conversion.schema).unwrap()["elements"][field]["type"].clone()
+}
+
+#[test]
+fn element_id_is_string_despite_id_type_extension() {
+    // The bug: R4B/R5 stamp `valueUrl: "id"` on Element.id. Must resolve to
+    // `string` so the restrictive `id` regex is never applied to element ids.
+    assert_eq!(
+        field_type("id", "Element.id", SYSTEM_STRING, "id"),
+        json!("string")
+    );
+}
+
+#[test]
+fn resource_id_keeps_id_type() {
+    // Resource ids are the genuine constrained `id` token; the fix must NOT
+    // relax them. A `Resource.id`-based field keeps honoring the extension.
+    assert_eq!(
+        field_type("id", "Resource.id", SYSTEM_STRING, "id"),
+        json!("id")
+    );
+}
+
+#[test]
+fn extension_url_keeps_uri_type() {
+    // Extension.url is `uri` in every version's fhir.schema.json; the fix must
+    // not demote it to `string`.
+    assert_eq!(
+        field_type("url", "Extension.url", SYSTEM_STRING, "uri"),
+        json!("uri")
+    );
+}
+
+#[test]
+fn element_id_override_is_independent_of_the_extension_value() {
+    // Whatever the (inconsistent) extension claims, an Element.id-derived field
+    // is `string`: `id` (the R4B/R5 bug) and `string` (R4/R6) both land there.
+    assert_eq!(
+        field_type("id", "Element.id", SYSTEM_STRING, "string"),
+        json!("string")
+    );
+    assert_eq!(
+        field_type("id", "Element.id", SYSTEM_STRING, "id"),
+        json!("string")
+    );
+}
