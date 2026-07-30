@@ -946,6 +946,11 @@ impl SubscriptionEngine {
             return; // Semaphore closed — engine shutting down.
         };
 
+        // A server-authored context: this runs on a background task with no
+        // request behind it, so there is no caller context to inherit. Same
+        // construction startup rehydration uses (`crate::rehydrate`). The tenant
+        // id comes from the subscription's own registration, never from a
+        // client-supplied header, so this cannot widen tenant reach.
         let tenant = TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access());
         let timeout = self.config.status_write_timeout;
 

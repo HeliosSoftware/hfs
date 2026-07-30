@@ -39,7 +39,7 @@ where
             feature: "Subscriptions".to_string(),
         })?;
 
-    let snapshot = resolve_snapshot(&state, engine, tenant.tenant_id(), &id).await?;
+    let snapshot = resolve_snapshot(&state, engine, &tenant, &id).await?;
 
     let status_resource = build_subscription_status(&snapshot, &id, state.base_url());
 
@@ -71,16 +71,20 @@ struct StatusSnapshot {
 /// the stored resource turns "I have lost track of this" into the honest
 /// "here is what the record says", with the event counter reported as `0`
 /// because this process genuinely has not delivered anything for it.
+///
+/// The storage read uses the request's own resolved [`TenantExtractor`] context,
+/// never a fabricated full-access one: this is a request path, so the tenant and
+/// its permissions must be the ones the request actually resolved to.
 async fn resolve_snapshot<S>(
     state: &AppState<S>,
     engine: &std::sync::Arc<helios_subscriptions::SubscriptionEngine>,
-    tenant_id: &str,
+    tenant: &TenantExtractor,
     id: &str,
 ) -> RestResult<StatusSnapshot>
 where
     S: ResourceStorage + Send + Sync,
 {
-    if let Some(sub) = engine.manager().get_subscription(tenant_id, id) {
+    if let Some(sub) = engine.manager().get_subscription(tenant.tenant_id(), id) {
         return Ok(StatusSnapshot {
             status: sub.status,
             topic_url: sub.topic_url,
@@ -89,20 +93,33 @@ where
         });
     }
 
-    let tenant_ctx = helios_persistence::tenant::TenantContext::new(
-        helios_persistence::tenant::TenantId::new(tenant_id),
-        helios_persistence::tenant::TenantPermissions::full_access(),
-    );
     let stored = state
         .storage()
-        .read(&tenant_ctx, "Subscription", id)
+        .read(tenant.context(), "Subscription", id)
         .await?
         .ok_or_else(|| RestError::NotFound {
             resource_type: "Subscription".to_string(),
             id: id.to_string(),
         })?;
 
-    let content = stored.content();
+    Ok(snapshot_from_stored(
+        stored.content(),
+        stored.fhir_version(),
+    ))
+}
+
+/// Derives a [`StatusSnapshot`] from a stored `Subscription`'s content.
+///
+/// Split out from [`resolve_snapshot`] so the parsing — the only part with real
+/// branching — is unit-testable without standing up an app and an engine.
+///
+/// `events_since_start` is reported as `0` rather than guessed: this process has
+/// genuinely delivered nothing for a subscription it is not holding, and the
+/// counter is not persisted (see the PR for #357).
+fn snapshot_from_stored(
+    content: &serde_json::Value,
+    fhir_version: helios_fhir::FhirVersion,
+) -> StatusSnapshot {
     let status = content
         .get("status")
         .and_then(|v| v.as_str())
@@ -118,12 +135,12 @@ where
         .unwrap_or_default()
         .to_string();
 
-    Ok(StatusSnapshot {
+    StatusSnapshot {
         status,
         topic_url,
         events_since_start: 0,
-        fhir_version: stored.fhir_version(),
-    })
+        fhir_version,
+    }
 }
 
 /// Handler for the `$events` operation on Subscription resources.
@@ -150,7 +167,7 @@ where
 
     // Same storage fallback as `$status`: both handlers had the identical miss,
     // and fixing only one would look complete in review.
-    let snapshot = resolve_snapshot(&state, engine, tenant.tenant_id(), &id).await?;
+    let snapshot = resolve_snapshot(&state, engine, &tenant, &id).await?;
 
     // Return a Bundle with a SubscriptionStatus indicating query-status
     let bundle_type = snapshot.fhir_version.notification_bundle_type();
@@ -301,4 +318,76 @@ fn build_subscription_status(sub: &StatusSnapshot, id: &str, base_url: &str) -> 
 /// (R4), false for versions with native subscription support (R4B, R5, R6).
 fn uses_backport_ig(version: helios_fhir::FhirVersion) -> bool {
     version.as_str() == "R4"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_fhir::FhirVersion;
+    use helios_subscriptions::manager::SubscriptionStatusCode;
+    use serde_json::json;
+
+    /// The `$status` / `$events` storage fallback (#357): when the engine does
+    /// not hold a subscription, its stored status is reported rather than `404`.
+    #[test]
+    fn snapshot_reads_status_and_native_topic() {
+        let snapshot = snapshot_from_stored(
+            &json!({
+                "resourceType": "Subscription",
+                "status": "off",
+                "topic": "http://example.org/topic/x",
+                "channelType": { "code": "rest-hook" }
+            }),
+            FhirVersion::default(),
+        );
+        assert_eq!(snapshot.status, SubscriptionStatusCode::Off);
+        assert_eq!(snapshot.topic_url, "http://example.org/topic/x");
+        assert_eq!(snapshot.events_since_start, 0);
+    }
+
+    /// R4 backport carries the topic in `criteria`, not `topic`.
+    #[test]
+    fn snapshot_reads_r4_backport_criteria_topic() {
+        let snapshot = snapshot_from_stored(
+            &json!({
+                "resourceType": "Subscription",
+                "status": "error",
+                "criteria": "http://example.org/topic/y",
+                "channel": { "type": "rest-hook" }
+            }),
+            FhirVersion::default(),
+        );
+        assert_eq!(snapshot.status, SubscriptionStatusCode::Error);
+        assert_eq!(snapshot.topic_url, "http://example.org/topic/y");
+    }
+
+    /// `entered-in-error` must survive the fallback as itself, not decay to
+    /// `requested` — the same trap the manager had before #357.
+    #[test]
+    fn snapshot_preserves_entered_in_error() {
+        let snapshot = snapshot_from_stored(
+            &json!({ "resourceType": "Subscription", "status": "entered-in-error" }),
+            FhirVersion::default(),
+        );
+        assert_eq!(snapshot.status, SubscriptionStatusCode::EnteredInError);
+    }
+
+    /// An absent or unrecognised status falls back to `requested`, and a missing
+    /// topic yields an empty string rather than panicking.
+    #[test]
+    fn snapshot_tolerates_missing_and_unknown_fields() {
+        let snapshot = snapshot_from_stored(
+            &json!({ "resourceType": "Subscription", "status": "not-a-code" }),
+            FhirVersion::default(),
+        );
+        assert_eq!(snapshot.status, SubscriptionStatusCode::Requested);
+        assert_eq!(snapshot.topic_url, "");
+
+        let bare = snapshot_from_stored(
+            &json!({ "resourceType": "Subscription" }),
+            FhirVersion::default(),
+        );
+        assert_eq!(bare.status, SubscriptionStatusCode::Requested);
+        assert_eq!(bare.topic_url, "");
+    }
 }

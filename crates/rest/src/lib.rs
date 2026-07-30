@@ -811,7 +811,6 @@ where
                 ),
                 ..default_sub_config
             };
-            let persist_status = sub_config.persist_status;
             // Outbound auth provider was built above (static bearer when
             // HFS_OUTBOUND_BEARER_TOKEN is set, otherwise no-op).
             let engine = helios_subscriptions::SubscriptionEngine::with_outbound_auth(
@@ -832,13 +831,15 @@ where
                 engine
                     .with_status_store(Arc::clone(&storage_arc)
                         as Arc<dyn helios_persistence::core::ResourceStorage>);
-            if persist_status {
+            // Reported from the engine rather than the config flag, so the line
+            // reflects what is actually wired: it reads OFF if either the flag is
+            // false or no store was attached.
+            if engine.persists_status() {
                 info!("Subscriptions engine ENABLED (status write-back ON)");
             } else {
                 info!(
-                    "Subscriptions engine ENABLED (status write-back OFF: \
-                     HFS_SUBSCRIPTION_PERSIST_STATUS=false; transitions will not \
-                     survive a restart)"
+                    "Subscriptions engine ENABLED (status write-back OFF; \
+                     transitions will not survive a restart)"
                 );
             }
             let engine = Arc::new(engine);
