@@ -166,13 +166,11 @@ fn expected_absent(ctx: Ctx) -> BTreeSet<String> {
         // stricter than the format's tri-state, so nothing is lost on packs we
         // generate ourselves.
         Ctx::Schema => &["scalar"],
-        // `order` is a live gap, not a deliberate omission: the converter
-        // hardcodes `order: None` (`converter/slicing.rs`), so the
-        // `ordered: true` enforcement loop in `engine/slicing.rs` never fires
-        // on a converted pack. `reslice` / `sliceIsConstraining` are unexercised
-        // — the core spec bundles contain no re-slicing; an IG corpus would be
-        // needed to cover them.
-        Ctx::Slice => &["order", "reslice", "sliceIsConstraining"],
+        // Unexercised rather than unimplemented: the core spec bundles contain
+        // no re-slicing, so an IG corpus would be needed to cover these.
+        // (`order` used to live here — the converter now emits it under
+        // `ordered: true`.)
+        Ctx::Slice => &["reslice", "sliceIsConstraining"],
         // Only reachable via a `resolve()`-style discriminator, which
         // `build_match` does not translate.
         Ctx::Match => &["resolve-ref"],

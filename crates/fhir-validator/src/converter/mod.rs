@@ -19,6 +19,7 @@
 //! | multi-type / `foo[x]` | `choices` declarer + one `choiceOf` branch per type |
 //! | `contentReference: "#A.b"` | `elementReference: ["A", "elements", "b"]` |
 //! | `slicing.discriminator` | `slicing.slices[].match` (pattern) — see `slicing` |
+//! | `slicing.ordered` | `slicing.ordered` + `slices[].order` (declaration ordinal) |
 //! | extension slice + type profile | parent `extensions` sugar |
 //! | `binding` | `{valueSet, strength}` carried for all strengths |
 //! | `constraint[]` | `constraints` map (`ele-1`/`ext-1` dropped off non-root elements — they are enforced once via the `Element`/`Extension` type schemas) |
