@@ -4,6 +4,74 @@ use crate::types::{DatePrecision, SearchPrefix, SearchValue};
 
 use super::super::query_builder::{SqlFragment, SqlParam};
 
+/// Builds a precision-aware date comparison against a `value_date`-style TEXT
+/// column, with one bind parameter (#456).
+///
+/// Stored values keep whatever precision the resource carried
+/// (`"1995-10-02"`, `"2016-01-23T13:07:42-04:00"`), while search bounds are
+/// full datetimes — and SQLite compares TEXT lexicographically, where
+/// `'1995-10-02' < '1995-10-02T00:00:00'`, so a day never fell inside its own
+/// range. Both sides therefore go through `datetime()`, which normalizes
+/// partial dates to `YYYY-MM-DD HH:MM:SS` and folds timezone offsets to UTC.
+/// The upper bound of a partial-precision value is derived in SQL with a
+/// modifier (`'+1 day'`), so a single parameter serves both ends of the range
+/// wherever the caller can only bind one.
+///
+/// `datetime()` truncates fractional seconds, so millisecond-precision values
+/// compare at second precision — a match too many beats never matching.
+///
+/// Returns the SQL and the value to bind for its (single) parameter.
+pub(crate) fn date_condition(
+    column: &str,
+    prefix: SearchPrefix,
+    value: &str,
+    param_num: usize,
+) -> (String, String) {
+    let precision = DatePrecision::from_date_string(value);
+
+    // The range start as a full datetime (always parseable by datetime()),
+    // and the SQL modifier that derives the range end for partial precisions.
+    let (start, bump) = match precision {
+        DatePrecision::Year => (format!("{}-01-01T00:00:00", &value[..4]), Some("+1 year")),
+        DatePrecision::Month => (format!("{}-01T00:00:00", &value[..7]), Some("+1 month")),
+        DatePrecision::Day => (format!("{value}T00:00:00"), Some("+1 day")),
+        _ => (value.to_string(), None),
+    };
+
+    let col = format!("datetime({column})");
+    let p = format!("datetime(?{param_num})");
+    let end = |m: &str| format!("datetime(?{param_num}, '{m}')");
+
+    let sql = match (prefix, bump) {
+        (SearchPrefix::Eq, Some(m)) => format!("({col} >= {p} AND {col} < {})", end(m)),
+        (SearchPrefix::Eq, None) => format!("{col} = {p}"),
+        (SearchPrefix::Ne, Some(m)) => format!("({col} < {p} OR {col} >= {})", end(m)),
+        (SearchPrefix::Ne, None) => format!("{col} != {p}"),
+        // gt / sa: strictly after the whole range.
+        (SearchPrefix::Gt | SearchPrefix::Sa, Some(m)) => format!("{col} >= {}", end(m)),
+        (SearchPrefix::Gt | SearchPrefix::Sa, None) => format!("{col} > {p}"),
+        // lt / eb: strictly before the whole range.
+        (SearchPrefix::Lt | SearchPrefix::Eb, _) => format!("{col} < {p}"),
+        (SearchPrefix::Ge, _) => format!("{col} >= {p}"),
+        (SearchPrefix::Le, Some(m)) => format!("{col} < {}", end(m)),
+        (SearchPrefix::Le, None) => format!("{col} <= {p}"),
+        (SearchPrefix::Ap, _) => {
+            let m = match precision {
+                DatePrecision::Year => "1 year",
+                DatePrecision::Month => "1 month",
+                DatePrecision::Day => "1 day",
+                DatePrecision::Hour => "1 hour",
+                DatePrecision::Minute => "10 minutes",
+                DatePrecision::Second | DatePrecision::Millisecond => "10 seconds",
+            };
+            format!(
+                "{col} BETWEEN datetime(?{param_num}, '-{m}') AND datetime(?{param_num}, '+{m}')"
+            )
+        }
+    };
+    (sql, start)
+}
+
 /// Handles date parameter SQL generation.
 pub struct DateHandler;
 
@@ -16,162 +84,8 @@ impl DateHandler {
     /// - "2024-01-15" matches the entire day
     pub fn build_sql(value: &SearchValue, param_offset: usize) -> SqlFragment {
         let param_num = param_offset + 1;
-        let date_value = &value.value;
-        let precision = DatePrecision::from_date_string(date_value);
-
-        // Precision range [start, end). Comparators match against its
-        // boundaries per the FHIR spec. When the value is full-precision the
-        // range is degenerate (start == end); fall back to scalar comparison
-        // so an exact instant still matches le/ge/eq.
-        let (start, end) = Self::get_precision_range(date_value, precision);
-
-        match value.prefix {
-            SearchPrefix::Eq => Self::build_equals(date_value, precision, param_num),
-            SearchPrefix::Ne => Self::build_not_equals(date_value, precision, param_num),
-            // gt / sa: strictly after the whole range → value_date >= end.
-            SearchPrefix::Gt | SearchPrefix::Sa if start != end => Self::cmp(">=", &end, param_num),
-            SearchPrefix::Gt | SearchPrefix::Sa => Self::cmp(">", date_value, param_num),
-            // lt / eb: strictly before the whole range → value_date < start.
-            SearchPrefix::Lt | SearchPrefix::Eb if start != end => {
-                Self::cmp("<", &start, param_num)
-            }
-            SearchPrefix::Lt | SearchPrefix::Eb => Self::cmp("<", date_value, param_num),
-            SearchPrefix::Ge if start != end => Self::cmp(">=", &start, param_num),
-            SearchPrefix::Ge => Self::cmp(">=", date_value, param_num),
-            SearchPrefix::Le if start != end => Self::cmp("<", &end, param_num),
-            SearchPrefix::Le => Self::cmp("<=", date_value, param_num),
-            SearchPrefix::Ap => Self::build_approximately(date_value, precision, param_num),
-        }
-    }
-
-    /// Builds a single-boundary date comparison `value_date {op} ?`.
-    fn cmp(op: &str, bound: &str, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_date {} ?{}", op, param_num),
-            vec![SqlParam::string(bound)],
-        )
-    }
-
-    /// Equality - matches any date within the precision range.
-    fn build_equals(date: &str, precision: DatePrecision, param_num: usize) -> SqlFragment {
-        let (start, end) = Self::get_precision_range(date, precision);
-
-        SqlFragment::with_params(
-            format!(
-                "value_date >= ?{} AND value_date < ?{}",
-                param_num,
-                param_num + 1
-            ),
-            vec![SqlParam::string(start), SqlParam::string(end)],
-        )
-    }
-
-    /// Not equals - outside the precision range.
-    fn build_not_equals(date: &str, precision: DatePrecision, param_num: usize) -> SqlFragment {
-        let (start, end) = Self::get_precision_range(date, precision);
-
-        SqlFragment::with_params(
-            format!(
-                "(value_date < ?{} OR value_date >= ?{})",
-                param_num,
-                param_num + 1
-            ),
-            vec![SqlParam::string(start), SqlParam::string(end)],
-        )
-    }
-
-    /// Approximately equals - +/- based on precision.
-    fn build_approximately(date: &str, precision: DatePrecision, param_num: usize) -> SqlFragment {
-        // SQLite datetime functions for range calculation
-        let modifier = match precision {
-            DatePrecision::Year => "1 year",
-            DatePrecision::Month => "1 month",
-            DatePrecision::Day => "1 day",
-            DatePrecision::Hour => "1 hour",
-            DatePrecision::Minute => "10 minutes",
-            DatePrecision::Second | DatePrecision::Millisecond => "10 seconds",
-        };
-
-        SqlFragment::with_params(
-            format!(
-                "value_date BETWEEN datetime(?{}, '-{}') AND datetime(?{}, '+{}')",
-                param_num, modifier, param_num, modifier
-            ),
-            vec![SqlParam::string(date)],
-        )
-    }
-
-    /// Gets the start and end of the range for a date at a given precision.
-    fn get_precision_range(date: &str, precision: DatePrecision) -> (String, String) {
-        match precision {
-            DatePrecision::Year => {
-                let year = &date[..4];
-                (
-                    format!("{}-01-01T00:00:00", year),
-                    format!("{}-01-01T00:00:00", year.parse::<i32>().unwrap_or(0) + 1),
-                )
-            }
-            DatePrecision::Month => {
-                let (year, month) = (&date[..4], &date[5..7]);
-                let year_num: i32 = year.parse().unwrap_or(0);
-                let month_num: i32 = month.parse().unwrap_or(1);
-
-                let (next_year, next_month) = if month_num >= 12 {
-                    (year_num + 1, 1)
-                } else {
-                    (year_num, month_num + 1)
-                };
-
-                (
-                    format!("{}-{:02}-01T00:00:00", year, month_num),
-                    format!("{}-{:02}-01T00:00:00", next_year, next_month),
-                )
-            }
-            DatePrecision::Day => (
-                format!("{}T00:00:00", date),
-                format!("{}T00:00:00", Self::add_day(date)),
-            ),
-            _ => {
-                // For finer precisions, use the exact value
-                (date.to_string(), date.to_string())
-            }
-        }
-    }
-
-    /// Adds one day to a date string.
-    fn add_day(date: &str) -> String {
-        // Simple date arithmetic - in production, use proper datetime library
-        let parts: Vec<&str> = date.split('-').collect();
-        if parts.len() >= 3 {
-            let year: i32 = parts[0].parse().unwrap_or(0);
-            let month: i32 = parts[1].parse().unwrap_or(1);
-            let day: i32 = parts[2].parse().unwrap_or(1);
-
-            let days_in_month = match month {
-                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                4 | 6 | 9 | 11 => 30,
-                2 => {
-                    if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-                        29
-                    } else {
-                        28
-                    }
-                }
-                _ => 30,
-            };
-
-            if day >= days_in_month {
-                if month >= 12 {
-                    format!("{}-01-01", year + 1)
-                } else {
-                    format!("{}-{:02}-01", year, month + 1)
-                }
-            } else {
-                format!("{}-{:02}-{:02}", year, month, day + 1)
-            }
-        } else {
-            date.to_string()
-        }
+        let (sql, bound) = date_condition("value_date", value.prefix, &value.value, param_num);
+        SqlFragment::with_params(sql, vec![SqlParam::string(bound)])
     }
 }
 
@@ -179,57 +93,75 @@ impl DateHandler {
 mod tests {
     use super::*;
 
+    fn sql_and_param(prefix: SearchPrefix, value: &str) -> (String, String) {
+        date_condition("value_date", prefix, value, 1)
+    }
+
     #[test]
-    fn test_date_eq_day() {
+    fn eq_day_is_a_normalized_half_open_range() {
+        let (sql, param) = sql_and_param(SearchPrefix::Eq, "1995-10-02");
+        assert_eq!(
+            sql,
+            "(datetime(value_date) >= datetime(?1) AND datetime(value_date) < datetime(?1, '+1 day'))"
+        );
+        assert_eq!(param, "1995-10-02T00:00:00");
+    }
+
+    #[test]
+    fn eq_full_precision_is_normalized_equality_not_an_empty_range() {
+        let (sql, param) = sql_and_param(SearchPrefix::Eq, "2016-01-23T13:07:42-04:00");
+        assert_eq!(sql, "datetime(value_date) = datetime(?1)");
+        assert_eq!(param, "2016-01-23T13:07:42-04:00");
+    }
+
+    #[test]
+    fn ge_includes_the_named_day_itself() {
+        let (sql, param) = sql_and_param(SearchPrefix::Ge, "1995-10-02");
+        assert_eq!(sql, "datetime(value_date) >= datetime(?1)");
+        assert_eq!(param, "1995-10-02T00:00:00");
+    }
+
+    #[test]
+    fn gt_starts_strictly_after_the_day() {
+        let (sql, _) = sql_and_param(SearchPrefix::Gt, "2024-01-15");
+        assert_eq!(sql, "datetime(value_date) >= datetime(?1, '+1 day')");
+    }
+
+    #[test]
+    fn lt_excludes_the_boundary_day() {
+        let (sql, param) = sql_and_param(SearchPrefix::Lt, "1996-01-01");
+        assert_eq!(sql, "datetime(value_date) < datetime(?1)");
+        assert_eq!(param, "1996-01-01T00:00:00");
+    }
+
+    #[test]
+    fn le_reaches_the_end_of_the_named_day() {
+        let (sql, _) = sql_and_param(SearchPrefix::Le, "2024-01-15");
+        assert_eq!(sql, "datetime(value_date) < datetime(?1, '+1 day')");
+    }
+
+    #[test]
+    fn year_and_month_bounds_are_datetime_parseable() {
+        let (_, year) = sql_and_param(SearchPrefix::Eq, "1995");
+        assert_eq!(year, "1995-01-01T00:00:00");
+        let (sql, month) = sql_and_param(SearchPrefix::Eq, "1995-10");
+        assert_eq!(month, "1995-10-01T00:00:00");
+        assert!(sql.contains("'+1 month'"));
+    }
+
+    #[test]
+    fn ap_scales_with_precision() {
+        let (sql, param) = sql_and_param(SearchPrefix::Ap, "2024-01-15");
+        assert!(sql.contains("BETWEEN datetime(?1, '-1 day') AND datetime(?1, '+1 day')"));
+        assert_eq!(param, "2024-01-15T00:00:00");
+    }
+
+    #[test]
+    fn build_sql_binds_exactly_one_parameter() {
+        // The multi-value caller advances the offset by one per value, so eq
+        // must not consume two slots.
         let value = SearchValue::new(SearchPrefix::Eq, "2024-01-15");
         let frag = DateHandler::build_sql(&value, 0);
-
-        assert!(frag.sql.contains(">="));
-        assert!(frag.sql.contains("<"));
-        assert_eq!(frag.params.len(), 2);
-    }
-
-    #[test]
-    fn test_date_gt() {
-        // gt on day-precision "2024-01-15" matches strictly after the day, i.e.
-        // value_date >= 2024-01-16T00:00:00.
-        let value = SearchValue::new(SearchPrefix::Gt, "2024-01-15");
-        let frag = DateHandler::build_sql(&value, 0);
-
-        assert!(frag.sql.contains(">= ?1"));
         assert_eq!(frag.params.len(), 1);
-        match &frag.params[0] {
-            SqlParam::String(s) => assert_eq!(s, "2024-01-16T00:00:00"),
-            _ => panic!("expected string bound"),
-        }
-    }
-
-    #[test]
-    fn test_date_le() {
-        // le on day-precision matches up to the end of the day → < next day.
-        let value = SearchValue::new(SearchPrefix::Le, "2024-01-15");
-        let frag = DateHandler::build_sql(&value, 0);
-
-        assert!(frag.sql.contains("< ?1"));
-        match &frag.params[0] {
-            SqlParam::String(s) => assert_eq!(s, "2024-01-16T00:00:00"),
-            _ => panic!("expected string bound"),
-        }
-    }
-
-    #[test]
-    fn test_date_ap() {
-        let value = SearchValue::new(SearchPrefix::Ap, "2024-01-15");
-        let frag = DateHandler::build_sql(&value, 0);
-
-        assert!(frag.sql.contains("BETWEEN"));
-        assert!(frag.sql.contains("datetime"));
-    }
-
-    #[test]
-    fn test_add_day() {
-        assert_eq!(DateHandler::add_day("2024-01-15"), "2024-01-16");
-        assert_eq!(DateHandler::add_day("2024-01-31"), "2024-02-01");
-        assert_eq!(DateHandler::add_day("2024-12-31"), "2025-01-01");
     }
 }

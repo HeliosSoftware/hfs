@@ -514,6 +514,30 @@ impl FilterSqlGenerator {
         // Infer the likely column based on parameter name patterns
         let column = self.infer_column(param);
 
+        // Dates need precision-aware, normalized comparison (#456); the
+        // generic text operators below mis-order mixed-precision values.
+        if column == "value_date" {
+            use crate::types::SearchPrefix;
+            let prefix = match op {
+                FilterOp::Eq => Some(SearchPrefix::Eq),
+                FilterOp::Ne => Some(SearchPrefix::Ne),
+                FilterOp::Gt => Some(SearchPrefix::Gt),
+                FilterOp::Sa => Some(SearchPrefix::Sa),
+                FilterOp::Lt => Some(SearchPrefix::Lt),
+                FilterOp::Eb => Some(SearchPrefix::Eb),
+                FilterOp::Ge => Some(SearchPrefix::Ge),
+                FilterOp::Le => Some(SearchPrefix::Le),
+                FilterOp::Ap => Some(SearchPrefix::Ap),
+                _ => None,
+            };
+            if let Some(prefix) = prefix {
+                let (sql, bound) = super::parameter_handlers::date::date_condition(
+                    column, prefix, value, param_num,
+                );
+                return (column, sql, bound);
+            }
+        }
+
         match op {
             FilterOp::Eq => (
                 column,

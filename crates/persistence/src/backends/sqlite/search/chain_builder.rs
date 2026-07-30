@@ -740,30 +740,13 @@ impl ChainQueryBuilder {
 
 /// Builds a date comparison condition.
 fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
-    use crate::types::SearchPrefix;
-
-    let (op, val) = match value.prefix {
-        SearchPrefix::Eq => ("=", &value.value),
-        SearchPrefix::Ne => ("!=", &value.value),
-        SearchPrefix::Gt => (">", &value.value),
-        SearchPrefix::Lt => ("<", &value.value),
-        SearchPrefix::Ge => (">=", &value.value),
-        SearchPrefix::Le => ("<=", &value.value),
-        SearchPrefix::Sa => (">", &value.value),
-        SearchPrefix::Eb => ("<", &value.value),
-        SearchPrefix::Ap => {
-            // Approximately equal: within a day for dates
-            return (
-                format!("DATE({}) = DATE(?{})", column, param_num),
-                SqlParam::String(value.value.clone()),
-            );
-        }
-    };
-
-    (
-        format!("{} {} ?{}", column, op, param_num),
-        SqlParam::String(val.clone()),
-    )
+    let (sql, bound) = super::parameter_handlers::date::date_condition(
+        column,
+        value.prefix,
+        &value.value,
+        param_num,
+    );
+    (sql, SqlParam::String(bound))
 }
 
 /// Builds a number comparison condition.

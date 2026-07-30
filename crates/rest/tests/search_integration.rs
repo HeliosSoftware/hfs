@@ -2577,3 +2577,115 @@ mod summary_count {
         assert!(body["total"].is_null(), "explicit _total=none wins: {body}");
     }
 }
+
+/// #456: date search must honor the value's precision at every boundary.
+/// Stored dates keep their source precision while bounds are full datetimes,
+/// and SQLite compares text — so a day never fell inside its own range, and a
+/// full-precision timestamp built the impossible range `>= X AND < X`.
+mod date_precision {
+    use super::*;
+
+    async fn seed(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        let patients = vec![
+            json!({"resourceType": "Patient", "id": "d-boundary", "birthDate": "1995-10-02"}),
+            json!({"resourceType": "Patient", "id": "d-new-year", "birthDate": "1996-01-01"}),
+            json!({"resourceType": "Patient", "id": "d-earlier", "birthDate": "1975-03-21"}),
+        ];
+        for p in patients {
+            backend
+                .create(&tenant, "Patient", p, FhirVersion::R4)
+                .await
+                .expect("seed patient");
+        }
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "d-obs",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "subject": {"reference": "Patient/d-boundary"},
+                    "effectiveDateTime": "2016-01-23T13:07:42-04:00"
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed observation");
+    }
+
+    async fn total(server: &TestServer, query: &str) -> u64 {
+        let response = server
+            .get(&format!("{query}&_total=accurate"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        response.json::<Value>()["total"].as_u64().expect("total")
+    }
+
+    #[tokio::test]
+    async fn day_precision_boundaries() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        // eq: the patient born that exact day is found.
+        assert_eq!(total(&server, "/Patient?birthdate=1995-10-02").await, 1);
+        // ge includes the named day itself.
+        assert_eq!(total(&server, "/Patient?birthdate=ge1995-10-02").await, 2);
+        // gt starts strictly after the day.
+        assert_eq!(total(&server, "/Patient?birthdate=gt1995-10-02").await, 1);
+        // le must NOT leak into the next day's midnight.
+        assert_eq!(total(&server, "/Patient?birthdate=le1995-12-31").await, 2);
+        // lt excludes the boundary day.
+        assert_eq!(total(&server, "/Patient?birthdate=lt1996-01-01").await, 2);
+        // A same-day sandwich pins exactly the one patient.
+        assert_eq!(
+            total(
+                &server,
+                "/Patient?birthdate=ge1995-10-02&birthdate=le1995-10-02"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn coarser_precisions_still_match() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        assert_eq!(total(&server, "/Patient?birthdate=1995-10").await, 1);
+        // The year range must not swallow 1996-01-01.
+        assert_eq!(total(&server, "/Patient?birthdate=1995").await, 1);
+    }
+
+    #[tokio::test]
+    async fn full_precision_timestamp_matches_itself() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        assert_eq!(
+            total(&server, "/Observation?date=2016-01-23T13:07:42-04:00").await,
+            1
+        );
+        // And the same instant expressed in UTC matches too: datetime()
+        // folds offsets before comparing.
+        assert_eq!(
+            total(&server, "/Observation?date=2016-01-23T17:07:42Z").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn chained_date_inherits_the_fix() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        assert_eq!(
+            total(&server, "/Observation?patient.birthdate=1995-10-02").await,
+            1
+        );
+    }
+}
