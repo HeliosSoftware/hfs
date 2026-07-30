@@ -43,6 +43,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      # GC *before* the matrix rather than after it. This suite pulls the
+      # multi-GB Playwright image on top of Elasticsearch, Postgres and Mongo,
+      # so it is the workflow most likely to be the one that finally tips the
+      # host over its quota — it needs the headroom up front, not afterwards.
+      # `build` runs once and gates the whole matrix, which makes it the right
+      # place: one sweep, before anything heavy is pulled.
+      - name: GC the Docker host
+        uses: ./.github/actions/docker-host-gc
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
