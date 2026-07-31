@@ -312,3 +312,36 @@ fn element_id_override_is_independent_of_the_extension_value() {
         json!("string")
     );
 }
+
+#[test]
+fn multiple_types_without_choice_take_the_first_and_warn() {
+    // A non-`[x]` element with more than one type is malformed but tolerated:
+    // the converter warns and uses the first type. This also exercises the
+    // `value_type_override` fall-through on the multi-type arm — the field is
+    // not `Element.id`-derived, so the override yields None and the first
+    // type's effective code (`string`) is used.
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/T",
+        "name": "T", "kind": "complex-type", "derivation": "specialization", "type": "T",
+        "snapshot": { "element": [
+            { "path": "T", "min": 0, "max": "*" },
+            {
+                "path": "T.weird",
+                "min": 0, "max": "1",
+                "type": [{ "code": "string" }, { "code": "integer" }]
+            }
+        ]}
+    });
+    let conversion = convert(&sd).expect("conversion");
+    let value = serde_json::to_value(&conversion.schema).unwrap();
+    assert_eq!(value["elements"]["weird"]["type"], json!("string"));
+    assert!(
+        conversion
+            .warnings
+            .iter()
+            .any(|w| w.contains("multiple types without [x]")),
+        "expected a multiple-types warning, got: {:?}",
+        conversion.warnings
+    );
+}
