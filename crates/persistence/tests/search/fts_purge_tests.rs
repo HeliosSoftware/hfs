@@ -232,7 +232,7 @@ async fn sqlite_purge_succeeds_when_fts_table_is_absent() {
         &backend,
         &tenant,
         "Patient",
-        suite::patient_with_narrative("p1", suite::PLANTED_TERM),
+        suite::patient_with_narrative("p1", &suite::planted_term(&tenant)),
         helios_fhir::FhirVersion::default(),
     )
     .await
@@ -282,7 +282,7 @@ async fn migration_sweeps_orphaned_fts_rows_from_existing_databases() {
             &backend,
             &tenant,
             "Patient",
-            suite::patient_with_narrative(id, suite::PLANTED_TERM),
+            suite::patient_with_narrative(id, &suite::planted_term(&tenant)),
             helios_fhir::FhirVersion::default(),
         )
         .await
@@ -374,7 +374,7 @@ async fn migration_preserves_fts_rows_for_soft_deleted_resources() {
         &backend,
         &tenant,
         "Patient",
-        suite::patient_with_narrative("p1", suite::PLANTED_TERM),
+        suite::patient_with_narrative("p1", &suite::planted_term(&tenant)),
         helios_fhir::FhirVersion::default(),
     )
     .await

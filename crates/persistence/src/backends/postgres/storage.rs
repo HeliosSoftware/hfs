@@ -3410,10 +3410,29 @@ impl SearchableContent {
 }
 
 /// Extracts searchable text content from a FHIR resource.
+///
+/// `full_content` backs `_content`, which FHIR defines as a search over *the
+/// entire content of the resource* — so it must be a superset of `_text`, the
+/// narrative-only search. `collect_strings` skips the `div` key deliberately, to
+/// keep raw XHTML markup (`div`, `p`, `xmlns`, attribute values) out of the
+/// index; that left the narrative missing from `_content` altogether, so a term
+/// that appeared only in `text.div` was findable through `_text` and invisible
+/// to `_content`. Appending the already-stripped narrative restores the
+/// superset relationship without indexing the markup, and matches SQLite, which
+/// has always had the narrative in `_content`. `data` stays excluded — base64
+/// attachment blobs are not text.
 fn extract_searchable_content(resource: &Value) -> SearchableContent {
+    let narrative = extract_narrative(resource);
+    let mut full_content = extract_all_strings(resource);
+    if !narrative.is_empty() {
+        if !full_content.is_empty() {
+            full_content.push(' ');
+        }
+        full_content.push_str(&narrative);
+    }
     SearchableContent {
-        narrative: extract_narrative(resource),
-        full_content: extract_all_strings(resource),
+        narrative,
+        full_content,
     }
 }
 
@@ -3475,5 +3494,87 @@ fn collect_strings(value: &Value, parts: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod fts_extraction_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn patient_with_narrative() -> Value {
+        json!({
+            "resourceType": "Patient",
+            "name": [{"family": "Purgetest"}],
+            "text": {
+                "status": "generated",
+                "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>Assessment: \
+                        Zebracrossingdiagnosis.</p></div>"
+            },
+            "photo": [{"contentType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUg=="}]
+        })
+    }
+
+    #[test]
+    fn content_includes_the_narrative() {
+        // Regression: `_content` is "the entire content of the resource", so a
+        // term that only appears in the narrative must be reachable through it.
+        // `collect_strings` skips the `div` key, which used to drop the
+        // narrative from `full_content` entirely — `_text` found the term,
+        // `_content` did not.
+        let content = extract_searchable_content(&patient_with_narrative());
+
+        assert!(
+            content.narrative.contains("Zebracrossingdiagnosis"),
+            "narrative: {}",
+            content.narrative
+        );
+        assert!(
+            content.full_content.contains("Zebracrossingdiagnosis"),
+            "_content must be a superset of _text: {}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains("Purgetest"),
+            "the non-narrative fields must still be there: {}",
+            content.full_content
+        );
+    }
+
+    #[test]
+    fn content_excludes_markup_and_binary_payloads() {
+        // The narrative goes in stripped, not raw: tag and attribute noise would
+        // make every resource match `xmlns` or `div`. Base64 attachment data
+        // stays out for the same reason plus index size.
+        let content = extract_searchable_content(&patient_with_narrative());
+
+        assert!(
+            !content.full_content.contains("xmlns"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("<p>"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("iVBORw0KGgo"),
+            "{}",
+            content.full_content
+        );
+    }
+
+    #[test]
+    fn narrative_only_resource_is_not_empty() {
+        // `index_fts_content` returns early on `is_empty()`; a resource whose
+        // only text is its narrative must still be indexed.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Binary",
+            "text": {"div": "<div><p>Solitary</p></div>"}
+        }));
+
+        assert!(!content.is_empty());
+        assert!(content.full_content.contains("Solitary"));
     }
 }

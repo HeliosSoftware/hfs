@@ -39,6 +39,16 @@
 //! The PostgreSQL suite runs every scenario against one long-lived container
 //! database, so scenarios must not collide. Each takes its own
 //! [`TenantContext`]; callers must pass a **distinct tenant per scenario**.
+//!
+//! A distinct tenant is not enough on its own, because [`FtsProbe::
+//! fts_rows_containing`] is deliberately *not* tenant-scoped — that is the whole
+//! point of it. Scenarios run concurrently under `cargo test`, and several end
+//! with a live indexed row on purpose (the reindex scenarios, the bystander
+//! tenant), so a term shared across scenarios makes the unqualified count
+//! non-zero for reasons that have nothing to do with the purge under test.
+//! [`planted_term`] therefore derives the token from the tenant id: the probe
+//! stays global — it still catches a surviving row under *any* tenant, type or
+//! id — while only ever counting rows this scenario planted.
 
 #![allow(dead_code)]
 
@@ -49,13 +59,45 @@ use helios_persistence::core::{PurgableStorage, ResourceStorage, SearchProvider}
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
-/// A rare token planted in narrative text. Long and unambiguous so a match can
-/// only come from the resource this suite created, never from seeded
+/// Stem of the token planted in narrative text. Rare and unambiguous, so a
+/// match can only come from a resource this suite created, never from seeded
 /// conformance data or another test's fixtures.
-pub const PLANTED_TERM: &str = "Zebracrossingdiagnosis";
+const PLANTED_STEM: &str = "Zebracrossingdiagnosis";
 
-/// A second planted token, for the resource that must survive.
-pub const BYSTANDER_TERM: &str = "Quokkaflavoured";
+/// Stem of the second planted token, for the resource that must survive.
+const BYSTANDER_STEM: &str = "Quokkaflavoured";
+
+/// The token this scenario plants, unique to `tenant`.
+///
+/// See the module docs: the residency probe counts rows across *all* tenants, so
+/// the token — not the tenant predicate — is what keeps concurrent scenarios on
+/// a shared database from reading as each other's leaks.
+pub fn planted_term(tenant: &TenantContext) -> String {
+    scoped_term(PLANTED_STEM, tenant)
+}
+
+/// The bystander token for `tenant`, unique on the same basis as
+/// [`planted_term`].
+pub fn bystander_term(tenant: &TenantContext) -> String {
+    scoped_term(BYSTANDER_STEM, tenant)
+}
+
+/// Appends the tenant id to `stem` as a single indexable word.
+///
+/// Non-alphanumerics are dropped rather than kept: both engines' tokenizers
+/// split on `-` and `_`, which would turn one rare token into several common
+/// ones and break the exact-match assertions. What remains is one long word that
+/// FTS5 and `to_tsvector('english', …)` both keep intact, and that a `LIKE
+/// '%…%'` residency probe matches literally.
+fn scoped_term(stem: &str, tenant: &TenantContext) -> String {
+    let suffix: String = tenant
+        .tenant_id()
+        .as_str()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    format!("{stem}{suffix}")
+}
 
 /// Reads physical `resource_fts` rows, bypassing every query path.
 ///
@@ -158,19 +200,20 @@ where
         .collect()
 }
 
-/// Seeds one Patient carrying `PLANTED_TERM` and asserts the full-text pipeline
-/// actually indexed it. Every scenario starts here; if this fails, nothing
-/// after it would have meant anything.
+/// Seeds one Patient carrying this tenant's [`planted_term`] and asserts the
+/// full-text pipeline actually indexed it. Every scenario starts here; if this
+/// fails, nothing after it would have meant anything.
 async fn seed_and_control<B, P>(backend: &B, probe: &P, tenant: &TenantContext, id: &str)
 where
     B: ResourceStorage + SearchProvider,
     P: FtsProbe,
 {
+    let term = planted_term(tenant);
     backend
         .create(
             tenant,
             "Patient",
-            patient_with_narrative(id, PLANTED_TERM),
+            patient_with_narrative(id, &term),
             FhirVersion::default(),
         )
         .await
@@ -183,7 +226,7 @@ where
          before the purge, or every assertion below is vacuous"
     );
     assert_eq!(
-        text_hits(backend, tenant, PLANTED_TERM).await,
+        text_hits(backend, tenant, &term).await,
         vec![id.to_string()],
         "POSITIVE CONTROL: _text must find the seeded narrative before the purge"
     );
@@ -214,7 +257,7 @@ where
          reported the resource was removed"
     );
     assert_eq!(
-        probe.fts_rows_containing(PLANTED_TERM).await,
+        probe.fts_rows_containing(&planted_term(tenant)).await,
         0,
         "no resource_fts row anywhere may still contain the purged text"
     );
@@ -238,7 +281,7 @@ where
         0,
         "purge_all must delete the type's resource_fts rows"
     );
-    assert_eq!(probe.fts_rows_containing(PLANTED_TERM).await, 0);
+    assert_eq!(probe.fts_rows_containing(&planted_term(tenant)).await, 0);
 }
 
 /// Tenant purge removes every one of the tenant's full-text rows, across types.
@@ -251,6 +294,7 @@ pub async fn purge_tenant_data_removes_fts_rows<B, P>(
     P: FtsProbe,
 {
     seed_and_control(backend, probe, tenant, "p1").await;
+    let term = planted_term(tenant);
 
     backend
         .create(
@@ -264,7 +308,7 @@ pub async fn purge_tenant_data_removes_fts_rows<B, P>(
                 "text": {
                     "status": "generated",
                     "div": format!(
-                        "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>{PLANTED_TERM}</p></div>"
+                        "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>{term}</p></div>"
                     )
                 }
             }),
@@ -290,7 +334,7 @@ pub async fn purge_tenant_data_removes_fts_rows<B, P>(
         "purge_tenant_data must delete every one of the tenant's resource_fts \
          rows, across all resource types"
     );
-    assert_eq!(probe.fts_rows_containing(PLANTED_TERM).await, 0);
+    assert_eq!(probe.fts_rows_containing(&term).await, 0);
 }
 
 /// The purge must not be over-broad: another tenant's rows survive untouched.
@@ -313,7 +357,7 @@ pub async fn purge_tenant_data_leaves_other_tenants_intact<B, P>(
         .create(
             bystander,
             "Patient",
-            patient_with_narrative("p1", BYSTANDER_TERM),
+            patient_with_narrative("p1", &bystander_term(bystander)),
             FhirVersion::default(),
         )
         .await
@@ -340,7 +384,7 @@ pub async fn purge_tenant_data_leaves_other_tenants_intact<B, P>(
         "purging one tenant must not touch another tenant's resource_fts rows"
     );
     assert_eq!(
-        text_hits(backend, bystander, BYSTANDER_TERM).await,
+        text_hits(backend, bystander, &bystander_term(bystander)).await,
         vec!["p1".to_string()],
         "the bystander tenant's full-text search must still work after the purge"
     );
@@ -385,7 +429,7 @@ pub async fn reuse_after_purge_does_not_resurrect_narrative<B, P>(
         .expect("re-create should succeed");
 
     assert_eq!(
-        text_hits(backend, tenant, PLANTED_TERM).await,
+        text_hits(backend, tenant, &planted_term(tenant)).await,
         Vec::<String>::new(),
         "the purged resource's narrative must not be matchable through a \
          re-created resource that merely reuses its id"
@@ -427,13 +471,13 @@ pub async fn tenant_reuse_does_not_resurrect_narrative<B, P>(
         .expect("re-create under the reused tenant id should succeed");
 
     assert_eq!(
-        text_hits(backend, tenant, PLANTED_TERM).await,
+        text_hits(backend, tenant, &planted_term(tenant)).await,
         Vec::<String>::new(),
         "a re-created tenant must not be able to surface the previous tenant's \
          purged content"
     );
     assert_eq!(
-        content_hits(backend, tenant, PLANTED_TERM).await,
+        content_hits(backend, tenant, &planted_term(tenant)).await,
         Vec::<String>::new(),
         "_content must be clean too, not only _text"
     );
@@ -457,7 +501,7 @@ pub async fn repeated_purge_and_recreate_does_not_grow_fts<B, P>(
             .create(
                 tenant,
                 "Patient",
-                patient_with_narrative("p1", PLANTED_TERM),
+                patient_with_narrative("p1", &planted_term(tenant)),
                 FhirVersion::default(),
             )
             .await
@@ -551,12 +595,12 @@ pub async fn reindex_preserves_full_text_search<B, P>(
          resource_fts row, not drop it"
     );
     assert_eq!(
-        text_hits(backend, tenant, PLANTED_TERM).await,
+        text_hits(backend, tenant, &planted_term(tenant)).await,
         vec!["p1".to_string()],
         "_text must still work after $reindex (clear_existing={clear_existing})"
     );
     assert_eq!(
-        content_hits(backend, tenant, PLANTED_TERM).await,
+        content_hits(backend, tenant, &planted_term(tenant)).await,
         vec!["p1".to_string()],
         "_content must still work after $reindex (clear_existing={clear_existing})"
     );
@@ -592,7 +636,7 @@ pub async fn repeated_reindex_does_not_duplicate_fts_rows<B, P>(
     }
 
     assert_eq!(
-        text_hits(backend, tenant, PLANTED_TERM).await,
+        text_hits(backend, tenant, &planted_term(tenant)).await,
         vec!["p1".to_string()],
         "_text must still return exactly one hit after repeated reindexing"
     );
