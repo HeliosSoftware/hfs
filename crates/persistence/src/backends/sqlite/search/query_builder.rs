@@ -414,11 +414,21 @@ impl QueryBuilder {
             combined = combined.or(cond);
         }
 
-        // Wrap in subquery to ensure proper AND/OR semantics
+        // Wrap in subquery to ensure proper AND/OR semantics. `:not` negates
+        // HERE, at the resource level, not inside the row predicate (#473):
+        // FHIR's :not means "no value of the parameter matches", so a
+        // multi-valued resource must not slip through via its other rows, and
+        // resources with no rows for the parameter count as matches — both of
+        // which NOT IN gives and a row-level NOT cannot.
+        let membership = if matches!(param.modifier, Some(SearchModifier::Not)) {
+            "NOT IN"
+        } else {
+            "IN"
+        };
         Some(SqlFragment::with_params(
             format!(
-                "resource_id IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
-                param.name, combined.sql
+                "resource_id {} (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
+                membership, param.name, combined.sql
             ),
             combined.params,
         ))
