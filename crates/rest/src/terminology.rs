@@ -87,12 +87,24 @@ impl TerminologyServiceClient {
     /// Creates a new client targeting the given base URL.
     ///
     /// Trailing slashes in `base_url` are trimmed automatically.
-    /// A 10-second timeout is applied to all requests.
+    /// A 10-second timeout is applied to all requests, with a short connect
+    /// timeout so an unreachable server fails fast — the `:in` fail-open
+    /// semantics depend on it.
+    ///
+    /// The client bypasses any proxy environment: the terminology server is a
+    /// configured internal endpoint, and routing it through an egress proxy
+    /// turns "connection refused in milliseconds" into a multi-minute hang on
+    /// runners whose `no_proxy` uses CIDR ranges reqwest cannot parse. The
+    /// previous silent `unwrap_or_default()` fallback could also discard the
+    /// timeouts entirely; a client build failure is a startup-visible
+    /// misconfiguration, not something to paper over.
     pub fn new(base_url: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(2))
+            .no_proxy()
             .build()
-            .unwrap_or_default();
+            .expect("terminology HTTP client");
 
         Self {
             client,
