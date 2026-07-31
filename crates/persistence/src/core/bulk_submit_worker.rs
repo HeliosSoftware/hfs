@@ -468,6 +468,9 @@ where
                 }
             };
 
+            // Per-file options: the file url is part of every entry result's
+            // identity, since line numbers restart in each file (#457).
+            let file_opts = opts.clone().with_file_url(&file.url);
             match self
                 .jobs
                 .process_ndjson_stream(
@@ -476,7 +479,7 @@ where
                     &lease.manifest_id,
                     &resource_type,
                     stream,
-                    &opts,
+                    &file_opts,
                 )
                 .await
             {

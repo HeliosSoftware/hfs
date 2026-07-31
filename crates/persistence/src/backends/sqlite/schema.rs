@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -295,6 +295,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             11 => migrate_v11_to_v12(conn)?,
             12 => migrate_v12_to_v13(conn)?,
             13 => migrate_v13_to_v14(conn)?,
+            14 => migrate_v14_to_v15(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -747,13 +748,14 @@ fn migrate_v5_to_v6(conn: &Connection) -> StorageResult<()> {
             submitter TEXT NOT NULL,
             submission_id TEXT NOT NULL,
             manifest_id TEXT NOT NULL,
+            file_url TEXT NOT NULL DEFAULT '',
             line_number INTEGER NOT NULL,
             resource_type TEXT NOT NULL,
             resource_id TEXT,
             created INTEGER,
             outcome TEXT NOT NULL,
             operation_outcome BLOB,
-            PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, line_number),
+            PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, file_url, line_number),
             FOREIGN KEY (tenant_id, submitter, submission_id, manifest_id)
                 REFERENCES bulk_manifests(tenant_id, submitter, submission_id, manifest_id) ON DELETE CASCADE
         )",
@@ -1256,6 +1258,41 @@ fn migrate_v12_to_v13(conn: &Connection) -> StorageResult<()> {
 /// `resources`; the registry adds the metadata that data alone cannot provide.
 fn migrate_v13_to_v14(conn: &Connection) -> StorageResult<()> {
     ensure_tenants_table(conn)
+}
+
+/// v14 -> v15 migration: `bulk_entry_results` gains `file_url` in its primary
+/// key (#457). Line numbers restart in every manifest output file, so without
+/// the file in the key every file after the first collided on its first entry.
+/// SQLite cannot alter a primary key, so the table is rebuilt; pre-migration
+/// rows keep an empty file_url.
+fn migrate_v14_to_v15(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE bulk_entry_results_v15 (
+            tenant_id TEXT NOT NULL,
+            submitter TEXT NOT NULL,
+            submission_id TEXT NOT NULL,
+            manifest_id TEXT NOT NULL,
+            file_url TEXT NOT NULL DEFAULT '',
+            line_number INTEGER NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT,
+            created INTEGER,
+            outcome TEXT NOT NULL,
+            operation_outcome BLOB,
+            PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, file_url, line_number),
+            FOREIGN KEY (tenant_id, submitter, submission_id, manifest_id)
+                REFERENCES bulk_manifests(tenant_id, submitter, submission_id, manifest_id) ON DELETE CASCADE
+        );
+        INSERT INTO bulk_entry_results_v15
+            (tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, resource_id, created, outcome, operation_outcome)
+        SELECT tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, resource_id, created, outcome, operation_outcome
+        FROM bulk_entry_results;
+        DROP TABLE bulk_entry_results;
+        ALTER TABLE bulk_entry_results_v15 RENAME TO bulk_entry_results;
+        CREATE INDEX IF NOT EXISTS idx_bulk_entry_results_outcome
+            ON bulk_entry_results(tenant_id, submitter, submission_id, manifest_id, outcome);",
+    )
+    .map_err(|e| migration_err(format!("migrate bulk_entry_results to v15: {e}")))
 }
 
 fn migration_err(message: String) -> crate::error::StorageError {
