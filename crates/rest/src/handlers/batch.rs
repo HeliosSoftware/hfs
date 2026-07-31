@@ -260,7 +260,7 @@ where
     // fail the bundle (#459). They used to be stored verbatim — unsearchable
     // and unresolvable. References to entries created by this same bundle use
     // `fullUrl`s, which the storage layer resolves during processing.
-    resolve_conditional_references(&state, &tenant, &mut indexed_entries).await?;
+    resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
 
     // Write-path validation: transactions are atomic, so any invalid write
     // entry rejects the whole bundle before anything executes.
