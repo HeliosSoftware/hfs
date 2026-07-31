@@ -92,10 +92,10 @@
       </a>
 
       <div class="nav__section">{{ i18n.t("nav-section-batch-data") }}</div>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-batch-transaction") }}">
+      <a class="nav-item" href="/ui/batch"{% if active_page == "batch" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-batch-transaction") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-batch-transaction") }}</span>
-      </span>
+      </a>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-bulk-export") }}">
         <span class="icon">{% include "icons/export.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-bulk-export") }}</span>

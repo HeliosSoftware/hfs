@@ -1,0 +1,94 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("batch-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title" id="batch-title">{{ i18n.t("batch-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("batch-lede") }}</p>
+</section>
+
+<!--
+  One page, three client-driven stages (Brett's Batch/Transaction frames):
+  upload → preflight → response. The server renders the shell; batch.js parses
+  the picked file, renders the execution plan, POSTs the bundle to the FHIR
+  root, and renders the outcome. Localized strings ride on data-msg-*.
+-->
+<div id="batch"
+     data-msg-invalid-json="{{ i18n.t("batch-invalid-json") }}"
+     data-msg-not-a-bundle="{{ i18n.t("batch-not-a-bundle") }}"
+     data-msg-bad-type="{{ i18n.t("batch-bad-type") }}"
+     data-msg-no-body="{{ i18n.t("batch-no-body") }}"
+     data-msg-entries="{{ i18n.t("batch-entries") }}"
+     data-msg-semantics-batch="{{ i18n.t("batch-semantics-batch") }}"
+     data-msg-semantics-transaction="{{ i18n.t("batch-semantics-transaction") }}"
+     data-msg-created="{{ i18n.t("batch-sum-created") }}"
+     data-msg-updated="{{ i18n.t("batch-sum-updated") }}"
+     data-msg-other="{{ i18n.t("batch-sum-other") }}"
+     data-msg-failed="{{ i18n.t("batch-sum-failed") }}"
+     data-msg-request-failed="{{ i18n.t("batch-request-failed") }}">
+
+  <!-- ============ Stage 1: upload ============ -->
+  <section class="card" id="batch-upload">
+    <div class="card-head">
+      <h3><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("batch-upload") }}</h3>
+    </div>
+    <button type="button" class="batch-drop" id="batch-drop">
+      <strong>{{ i18n.t("batch-drop-hint") }}</strong>
+      <span>{{ i18n.t("batch-drop-browse") }}</span>
+    </button>
+    <input type="file" id="batch-file" accept=".json,application/json,application/fhir+json" hidden>
+    <p class="batch-error" id="batch-upload-error" role="alert" hidden></p>
+  </section>
+
+  <!-- ============ Stage 2: preflight ============ -->
+  <section id="batch-preflight" hidden>
+    <div class="request-strip">
+      <span class="request-strip__label">{{ i18n.t("batch-request") }}</span>
+      <code id="batch-request-line"></code>
+    </div>
+
+    <!-- The point of the preflight: say what is about to run, and how the
+         server will treat failures — all-or-nothing vs. entry-by-entry. -->
+    <p class="notice" id="batch-semantics"></p>
+
+    <div class="card">
+      <div class="batch-tabs" role="tablist">
+        <button type="button" class="batch-tab" id="batch-tab-actions" role="tab" aria-selected="true">{{ i18n.t("batch-tab-actions") }}</button>
+        <button type="button" class="batch-tab" id="batch-tab-json" role="tab" aria-selected="false">{{ i18n.t("batch-tab-json") }}</button>
+      </div>
+      <ol class="batch-rows" id="batch-rows"></ol>
+      <pre class="batch-json" id="batch-json" hidden></pre>
+    </div>
+
+    <div class="batch-footer">
+      <button type="button" class="btn" id="batch-cancel">{{ i18n.t("batch-cancel") }}</button>
+      <div class="batch-footer__right">
+        <button type="button" class="btn" id="batch-upload-another">{{ i18n.t("batch-upload-another") }}</button>
+        <button type="button" class="btn btn--primary" id="batch-execute">{{ i18n.t("batch-execute") }}</button>
+      </div>
+    </div>
+    <p class="batch-error" id="batch-execute-error" role="alert" hidden></p>
+  </section>
+
+  <!-- ============ Stage 3: response ============ -->
+  <section id="batch-response" hidden>
+    <div class="card">
+      <div class="card-head">
+        <h3>{{ i18n.t("batch-response-heading") }}</h3>
+        <span class="batch-badge" id="batch-overall"></span>
+      </div>
+      <!-- The aggregate Steve asked for: how many resources this run created,
+           updated, or failed — not just per-row badges. -->
+      <p class="batch-summary" id="batch-summary"></p>
+      <ol class="batch-rows" id="batch-outcomes"></ol>
+    </div>
+    <div class="batch-footer">
+      <button type="button" class="btn" id="batch-back">{{ i18n.t("batch-back") }}</button>
+      <button type="button" class="btn btn--primary" id="batch-execute-again">{{ i18n.t("batch-execute-again") }}</button>
+    </div>
+  </section>
+</div>
+
+<script src="/ui/assets/batch.js" defer></script>
+{% endblock %}

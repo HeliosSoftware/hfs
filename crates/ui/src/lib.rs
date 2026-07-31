@@ -456,6 +456,15 @@ struct SearchParametersPage {
     view: search_params::SpView,
 }
 
+/// Batch/Transaction workspace (#476): a static shell; batch.js does the rest.
+#[derive(Template)]
+#[template(path = "pages/batch.html")]
+struct BatchPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+}
+
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
 /// are codegen'd into the binary; a tenant-scoped override layer is open
 /// question 1 on the issue.
@@ -605,6 +614,8 @@ pub fn mount_with_conformance_source(
         .route("/ui/queries/params", get(query_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/compartments", get(compartments_page))
+        // Batch/Transaction workspace (#476): upload → preflight → response.
+        .route("/ui/batch", get(batch_page))
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
         .route("/ui/editor", get(editor::page))
@@ -1031,6 +1042,22 @@ struct CompartmentsQuery {
     id: String,
     #[serde(default)]
     target: String,
+}
+
+/// Batch/Transaction workspace page (#476). The shell is server-rendered;
+/// batch.js drives upload → preflight → execute → response entirely against
+/// the ordinary FHIR root, so this crate never touches storage.
+async fn batch_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    render(BatchPage {
+        status: current_status(state.version, rv.0, &rt),
+        i18n: I18n::new(locale),
+        active_page: "batch",
+    })
 }
 
 /// Compartment viewer & tester page.
