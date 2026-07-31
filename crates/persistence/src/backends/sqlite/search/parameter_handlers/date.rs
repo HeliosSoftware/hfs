@@ -165,3 +165,78 @@ mod tests {
         assert_eq!(frag.params.len(), 1);
     }
 }
+
+#[cfg(test)]
+mod prefix_coverage_tests {
+    use super::*;
+
+    fn sql(prefix: SearchPrefix, value: &str) -> String {
+        date_condition("value_date", prefix, value, 1).0
+    }
+
+    #[test]
+    fn ne_day_is_the_complement_of_the_range() {
+        assert_eq!(
+            sql(SearchPrefix::Ne, "1995-10-02"),
+            "(datetime(value_date) < datetime(?1) OR datetime(value_date) >= datetime(?1, '+1 day'))"
+        );
+    }
+
+    #[test]
+    fn ne_full_precision_is_normalized_inequality() {
+        assert_eq!(
+            sql(SearchPrefix::Ne, "2016-01-23T13:07:42-04:00"),
+            "datetime(value_date) != datetime(?1)"
+        );
+    }
+
+    #[test]
+    fn sa_and_eb_mirror_gt_and_lt() {
+        assert_eq!(
+            sql(SearchPrefix::Sa, "1995-10-02"),
+            "datetime(value_date) >= datetime(?1, '+1 day')"
+        );
+        assert_eq!(
+            sql(SearchPrefix::Eb, "1995-10-02"),
+            "datetime(value_date) < datetime(?1)"
+        );
+    }
+
+    #[test]
+    fn full_precision_single_bounds() {
+        let instant = "2016-01-23T13:07:42Z";
+        assert_eq!(
+            sql(SearchPrefix::Gt, instant),
+            "datetime(value_date) > datetime(?1)"
+        );
+        assert_eq!(
+            sql(SearchPrefix::Ge, instant),
+            "datetime(value_date) >= datetime(?1)"
+        );
+        assert_eq!(
+            sql(SearchPrefix::Lt, instant),
+            "datetime(value_date) < datetime(?1)"
+        );
+        assert_eq!(
+            sql(SearchPrefix::Le, instant),
+            "datetime(value_date) <= datetime(?1)"
+        );
+    }
+
+    #[test]
+    fn ap_at_finer_precisions_scales_its_window() {
+        assert!(sql(SearchPrefix::Ap, "2016-01-23T13:07:42Z").contains("'-10 seconds'"));
+        assert!(sql(SearchPrefix::Ap, "1995").contains("'-1 year'"));
+        assert!(sql(SearchPrefix::Ap, "1995-10").contains("'-1 month'"));
+    }
+
+    #[test]
+    fn aliased_columns_pass_through() {
+        let (sql, bound) = date_condition("t3.value_date", SearchPrefix::Eq, "1995-10-02", 4);
+        assert_eq!(
+            sql,
+            "(datetime(t3.value_date) >= datetime(?4) AND datetime(t3.value_date) < datetime(?4, '+1 day'))"
+        );
+        assert_eq!(bound, "1995-10-02T00:00:00");
+    }
+}

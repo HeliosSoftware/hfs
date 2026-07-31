@@ -959,3 +959,32 @@ mod tests {
         assert!(!outer.is_terminal());
     }
 }
+
+#[cfg(test)]
+mod date_condition_tests {
+    use super::*;
+    use crate::types::SearchPrefix;
+
+    /// #456: chained date terminals use the precision-aware normalized
+    /// comparison, not the raw text `=` this used to emit.
+    #[test]
+    fn chained_dates_are_precision_aware() {
+        let value = SearchValue::new(SearchPrefix::Eq, "1995-10-02");
+        let (sql, param) = build_date_condition("t2.value_date", &value, 7);
+        assert_eq!(
+            sql,
+            "(datetime(t2.value_date) >= datetime(?7) AND datetime(t2.value_date) < datetime(?7, '+1 day'))"
+        );
+        match param {
+            SqlParam::String(s) => assert_eq!(s, "1995-10-02T00:00:00"),
+            _ => panic!("expected string param"),
+        }
+    }
+
+    #[test]
+    fn chained_full_precision_is_equality() {
+        let value = SearchValue::new(SearchPrefix::Eq, "2016-01-23T13:07:42-04:00");
+        let (sql, _) = build_date_condition("t2.value_date", &value, 3);
+        assert_eq!(sql, "datetime(t2.value_date) = datetime(?3)");
+    }
+}

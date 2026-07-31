@@ -797,3 +797,47 @@ mod tests {
         assert_eq!(sql.params.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod date_filter_tests {
+    use super::*;
+
+    /// #456: `_filter` date comparisons use the precision-aware normalized
+    /// path, not raw text operators.
+    #[test]
+    fn filter_dates_use_normalized_precision_ranges() {
+        let expr = FilterParser::parse("birthdate eq 1995-10-02").unwrap();
+        let frag = FilterSqlGenerator::new(1).generate(&expr);
+        assert!(
+            frag.sql.contains("datetime(value_date) >= datetime(?2)"),
+            "{}",
+            frag.sql
+        );
+        assert!(frag.sql.contains("'+1 day'"), "{}", frag.sql);
+    }
+
+    #[test]
+    fn filter_date_bounds_honor_the_named_day() {
+        let ge = FilterSqlGenerator::new(1)
+            .generate(&FilterParser::parse("birthdate ge 1995-10-02").unwrap());
+        assert!(
+            ge.sql.contains("datetime(value_date) >= datetime(?2)"),
+            "{}",
+            ge.sql
+        );
+        let le = FilterSqlGenerator::new(1)
+            .generate(&FilterParser::parse("birthdate le 1995-10-02").unwrap());
+        assert!(le.sql.contains("'+1 day'"), "{}", le.sql);
+        let sa = FilterSqlGenerator::new(1)
+            .generate(&FilterParser::parse("birthdate sa 1995-10-02").unwrap());
+        assert!(sa.sql.contains("'+1 day'"), "{}", sa.sql);
+    }
+
+    /// Non-date columns keep the plain text operators.
+    #[test]
+    fn filter_strings_keep_text_operators() {
+        let frag =
+            FilterSqlGenerator::new(1).generate(&FilterParser::parse("name eq Smith").unwrap());
+        assert!(frag.sql.contains("value_string = ?2"), "{}", frag.sql);
+    }
+}
