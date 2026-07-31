@@ -1,7 +1,12 @@
-//! Whole-spec smoke tests over the embedded packs. `#[ignore]`d in normal
-//! runs (they parse full packs); run explicitly with
-//! `cargo test -p helios-fhir-validator -- --ignored`
-//! (add `--features R4B,R5,R6` for the other-version sweeps).
+//! Whole-spec smoke tests over the embedded packs.
+//!
+//! These parse full packs, but the whole file runs in well under a second even
+//! in a debug build, so they are *not* `#[ignore]`d: they run in the default
+//! `cargo test` (and therefore in CI and in the coverage job), where they are
+//! the only thing that exercises pack loading end to end. Enable `R4B`/`R5`/`R6`
+//! for the other-version sweeps. Only `structural_validation_latency_smoke`
+//! stays `#[ignore]`d — it asserts on wall-clock time, which is not a sound
+//! gate on a shared runner.
 
 #![cfg(feature = "R4")]
 
@@ -12,7 +17,6 @@ use serde_json::json;
 
 /// Every enabled version's pack loads and validates a minimal Patient.
 #[test]
-#[ignore = "whole-pack parse; run with -- --ignored"]
 fn all_enabled_packs_load_and_validate() {
     let versions = [
         FhirVersion::R4,
@@ -100,7 +104,6 @@ fn structural_validation_latency_smoke() {
 }
 
 #[test]
-#[ignore = "whole-pack parse; run with -- --ignored"]
 fn r4_pack_loads_and_resolves_core_schemas() {
     let registry = core_registry(FhirVersion::R4);
     for name in [
@@ -147,7 +150,6 @@ fn r4_pack_loads_and_resolves_core_schemas() {
 }
 
 #[test]
-#[ignore = "whole-pack parse; run with -- --ignored"]
 fn r4_pack_validates_known_good_and_bad_resources() {
     let registry = core_registry(FhirVersion::R4);
     let validator = Validator::new(registry);
@@ -247,11 +249,11 @@ fn r4_pack_validates_known_good_and_bad_resources() {
 /// profiles failed validation. R4 was always clean (typed `string`), so it
 /// serves as the control that the assertion is meaningful.
 ///
-/// Version-gated behind R4B/R5 features (that is where the bug lived) and
-/// `#[ignore]`d like the other whole-pack tests.
+/// Version-gated behind R4B/R5 (that is where the bug lived), so it runs in
+/// CI's `cargo test --workspace --all-features` but not in the coverage job,
+/// which builds default features (R4 only).
 #[cfg(any(feature = "R4B", feature = "R5"))]
 #[test]
-#[ignore = "whole-pack parse; run with -- --ignored --features R4B,R5"]
 fn structuredefinition_element_ids_with_choice_or_slice_are_not_rejected() {
     // A trimmed but structurally-valid StructureDefinition whose element ids
     // include a choice base (`Observation.value[x]`) and a named slice

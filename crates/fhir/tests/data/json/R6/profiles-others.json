@@ -2,7 +2,7 @@
   "resourceType": "Bundle",
   "id": "profiles-others",
   "meta": {
-    "lastUpdated": "2026-07-17T03:44:13.245+00:00",
+    "lastUpdated": "2026-07-21T14:21:49.952+00:00",
     "tag": [
       {
         "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
@@ -50167,7 +50167,7 @@
         "title": "History bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-07-17T03:44:13+00:00",
+        "date": "2026-07-21T14:21:49+00:00",
         "description": "This profile holds all the requirements and constraints related to a FHIR history bundle.",
         "fhirVersion": "6.0.0-ballot4",
         "mapping": [
@@ -58584,7 +58584,7 @@
         "title": "Search Set Bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-07-17T03:44:13+00:00",
+        "date": "2026-07-21T14:21:49+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -63222,7 +63222,7 @@
         "title": "Subscription Notification bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-07-17T03:44:13+00:00",
+        "date": "2026-07-21T14:21:49+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -67851,7 +67851,7 @@
         "title": "Batch bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-07-17T03:44:13+00:00",
+        "date": "2026-07-21T14:21:49+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -77578,7 +77578,7 @@
         "title": "Batch response bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-07-17T03:44:13+00:00",
+        "date": "2026-07-21T14:21:49+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -79679,7 +79679,7 @@
         "title": "Transaction bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-07-17T03:44:13+00:00",
+        "date": "2026-07-21T14:21:49+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -89406,7 +89406,7 @@
         "title": "Transaction response bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-07-17T03:44:13+00:00",
+        "date": "2026-07-21T14:21:49+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {
@@ -91507,7 +91507,7 @@
         "title": "Document bundle",
         "status": "active",
         "experimental": false,
-        "date": "2026-07-17T03:44:13+00:00",
+        "date": "2026-07-21T14:21:49+00:00",
         "publisher": "HL7 International / FHIR Infrastructure",
         "contact": [
           {

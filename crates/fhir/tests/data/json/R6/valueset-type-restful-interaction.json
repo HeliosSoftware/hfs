@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "type-restful-interaction",
   "meta": {
-    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
+    "lastUpdated": "2026-07-22T01:21:49.952+11:00"
   },
   "text": {
     "status": "extensions",
