@@ -141,6 +141,24 @@ impl MockS3Client {
         state.objects.keys().filter(|(b, _)| b == bucket).count()
     }
 
+    /// Every object key currently stored in `bucket`, sorted.
+    ///
+    /// Used to assert the *literal* key layout, which
+    /// `bucket_object_count` cannot express — the tenant-prefix fidelity tests
+    /// (issue #447) need to prove that a safe tenant id still lands on exactly
+    /// its pre-fix key, not merely that some object exists.
+    fn keys(&self, bucket: &str) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut keys: Vec<String> = state
+            .objects
+            .keys()
+            .filter(|(b, _)| b == bucket)
+            .map(|(_, k)| k.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Total number of `put_object` calls received so far.
     fn put_count(&self) -> u64 {
         self.state.lock().unwrap().put_count
@@ -1384,6 +1402,222 @@ async fn purge_tenant_data_sweeps_resources_and_history() {
 
     assert!(backend.read(&tb, "Patient", "p2").await.unwrap().is_some());
     assert_eq!(backend.count(&tb, None).await.unwrap(), 1);
+}
+
+// ============================================================================
+// Tenant prefix fidelity (issue #447)
+// ============================================================================
+//
+// `S3Keyspace::with_tenant_prefix` used `trim_matches('/')`, so `acme`, `/acme`,
+// `acme/` and `//acme` all resolved to the data prefix `acme` while the registry
+// (injective since #271) held them as four separate tenants. A second defect in
+// the same derivation let a tenant named `acme/resources` nest its entire
+// keyspace inside the prefix tenant `acme` sweeps and lists.
+//
+// `keyspace.rs` proves the properties over an adversarial corpus of ids. These
+// drive the consequences through the real storage API instead, because that is
+// what an operator experiences and what the issue reported: a purge that deletes
+// a different tenant than the one named, and a read that returns another
+// tenant's resources.
+
+/// Issue #447, consequence 1: `DELETE /admin/tenants/%2Facme?purge=true` used to
+/// delete tenant `acme`'s resources *and its version history*, while leaving
+/// `acme`'s registry record in place — a still-registered, still-listed tenant
+/// whose data was gone, reported to the caller as success.
+#[tokio::test]
+async fn purging_a_slash_padded_tenant_leaves_the_bare_tenant_intact() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let bare = tenant("acme");
+
+    let created = backend
+        .create(
+            &bare,
+            "Patient",
+            json!({"resourceType":"Patient","id":"p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .update(
+            &bare,
+            &created,
+            json!({"resourceType":"Patient","id":"p1","active":true}),
+        )
+        .await
+        .unwrap();
+
+    // Every id that used to collapse onto `acme`.
+    for padded in ["/acme", "acme/", "//acme", "/acme/"] {
+        let removed = backend.purge_tenant_data(padded).await.unwrap();
+        assert_eq!(removed, 0, "purging {padded:?} must not reach any resource");
+    }
+
+    assert!(
+        backend
+            .read(&bare, "Patient", "p1")
+            .await
+            .unwrap()
+            .is_some(),
+        "tenant `acme`'s current resource must survive"
+    );
+    assert!(
+        backend
+            .vread(&bare, "Patient", "p1", "1")
+            .await
+            .unwrap()
+            .is_some(),
+        "tenant `acme`'s version history must survive"
+    );
+    assert_eq!(backend.count(&bare, None).await.unwrap(), 1);
+}
+
+/// Issue #447: slash-padded ids are distinct tenants in the registry, so they
+/// must also be distinct in the data keyspace — writes under one must be
+/// invisible to the others.
+#[tokio::test]
+async fn slash_padded_tenants_do_not_share_resources() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    let ids = ["acme", "/acme", "acme/", "//acme"];
+    for (i, id) in ids.iter().enumerate() {
+        backend
+            .create(
+                &tenant(id),
+                "Patient",
+                json!({"resourceType":"Patient","id": format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for (i, id) in ids.iter().enumerate() {
+        let ctx = tenant(id);
+        assert_eq!(
+            backend.count(&ctx, None).await.unwrap(),
+            1,
+            "tenant {id:?} must see only its own resource"
+        );
+        assert!(
+            backend
+                .read(&ctx, "Patient", &format!("p{i}"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for (j, _) in ids.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            assert!(
+                backend
+                    .read(&ctx, "Patient", &format!("p{j}"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "tenant {id:?} must not see p{j}"
+            );
+        }
+    }
+}
+
+/// The second defect in the same derivation: a tenant whose id carries a
+/// keyspace namespace as a later segment used to store its objects *inside* the
+/// parent id's radius. `acme` sweeps `acme/resources/` on purge and enumerates
+/// it on list, which is exactly where `acme/resources` kept everything — a
+/// cross-tenant delete and a cross-tenant read.
+///
+/// Reachable through the admin API today: `RESERVED_TENANT_IDS` is compared
+/// against the whole id, so `acme/resources` provisions cleanly.
+#[tokio::test]
+async fn a_tenant_named_after_a_sweep_root_survives_its_parents_purge() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let parent = tenant("acme");
+
+    for nested_id in ["acme/resources", "acme/history", "acme/bulk"] {
+        let nested = tenant(nested_id);
+        backend
+            .create(
+                &nested,
+                "Patient",
+                json!({"resourceType":"Patient","id":"nested"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // The parent must not be able to see it...
+        assert_eq!(
+            backend.count(&parent, None).await.unwrap(),
+            0,
+            "tenant `acme` must not enumerate {nested_id:?}'s resources"
+        );
+        assert!(
+            backend
+                .read(&parent, "Patient", "nested")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // ...nor destroy it by purging itself.
+        backend.purge_tenant_data("acme").await.unwrap();
+        assert!(
+            backend
+                .read(&nested, "Patient", "nested")
+                .await
+                .unwrap()
+                .is_some(),
+            "purging `acme` must not delete {nested_id:?}'s data"
+        );
+
+        backend.purge_tenant_data(nested_id).await.unwrap();
+    }
+}
+
+/// Hierarchical and ordinary ids must keep their exact prefix, so upgrading
+/// relocates nothing that was already stored safely. Asserted through the API:
+/// a resource written before the fix is still readable after it.
+///
+/// `__system__` matters most — it holds the shared terminology resources, and
+/// silently orphaning those would be far worse than the defect being fixed.
+#[tokio::test]
+async fn safe_tenant_ids_still_resolve_to_their_original_prefix() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+
+    for id in ["default", "acme", "acme/research", "__system__"] {
+        let ctx = tenant(id);
+        backend
+            .create(
+                &ctx,
+                "Patient",
+                json!({"resourceType":"Patient","id":"p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(backend.read(&ctx, "Patient", "p1").await.unwrap().is_some());
+    }
+
+    // The object keys themselves are unchanged — this is what makes the upgrade
+    // a no-op for these tenants rather than a silent relocation.
+    let keys = mock.keys("test-bucket");
+    for expected in [
+        "default/resources/Patient/p1/current.json",
+        "acme/resources/Patient/p1/current.json",
+        "acme/research/resources/Patient/p1/current.json",
+        "__system__/resources/Patient/p1/current.json",
+    ] {
+        assert!(
+            keys.iter().any(|k| k == expected),
+            "expected unchanged key {expected:?}; got {keys:?}"
+        );
+    }
 }
 
 // ============================================================================

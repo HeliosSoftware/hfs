@@ -309,6 +309,14 @@ mod shared_mongo {
     }
 }
 
+/// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
+/// verbatim with the SQLite and PostgreSQL suites.
+///
+/// `#[path]`-included rather than placed in `tests/common/`, which no test
+/// target declares and cargo therefore never compiles (issue #306).
+#[path = "multitenancy/tenant_id_fidelity_suite.rs"]
+mod tenant_id_fidelity_suite;
+
 fn create_tenant(tenant_id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access())
 }
@@ -3617,4 +3625,45 @@ async fn mongodb_integration_purge_tenant_settings() {
     backend.purge_tenant_settings("a.b").await.unwrap();
     let dotted_doc = backend.get_settings(&dotted).await.unwrap().unwrap();
     assert_eq!(dotted_doc.document, json!({}));
+}
+
+// ============================================================================
+// Issue #447 — tenant-id fidelity
+// ============================================================================
+//
+// The #447 defect is S3's: it *derives* a key prefix from the tenant id, and
+// `trim_matches('/')` made that derivation many-to-one. MongoDB derives
+// nothing — documents carry a `tenant_id` field matched exactly, under the
+// default (case-sensitive) collation — so the scoping is the identity mapping
+// and the defect cannot occur here.
+//
+// That is a code reading, and a code reading is exactly what let the same
+// defect class sit undiscovered in the two backends that *do* derive (#384 on
+// Elasticsearch, #447 on S3). So it is checked against a real server, where
+// BSON matching and collation are the engine's behaviour rather than the Rust's.
+//
+// Each test gets its own database (`build_test_database_name`), so a fixed base
+// id is safe here.
+
+#[tokio::test]
+async fn mongodb_integration_distinct_tenant_ids_never_share_data() {
+    let Some(backend) = create_backend("tenant_fidelity").await else {
+        eprintln!(
+            "Skipping mongodb_integration_distinct_tenant_ids_never_share_data (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    tenant_id_fidelity_suite::distinct_tenant_ids_never_share_data(&backend, "acme").await;
+}
+
+#[tokio::test]
+async fn mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact() {
+    let Some(backend) = create_backend("tenant_fidelity_purge").await else {
+        eprintln!(
+            "Skipping mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    tenant_id_fidelity_suite::purging_one_tenant_leaves_the_look_alikes_intact(&backend, "acme")
+        .await;
 }
