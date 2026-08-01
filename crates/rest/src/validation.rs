@@ -21,14 +21,15 @@ use dashmap::DashMap;
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::fhirpath_effects::FhirPathConstraintEvaluator;
 use helios_fhir_validator::{
-    CodedValue, CompositeResolver, EffectHandlers, ErrorKind, SchemaRegistry, SchemaResolver,
-    Severity, TerminologyError, TerminologyProvider, UnknownProfilePolicy, ValidationError,
-    ValidationOptions, Validator, dotted_to_fhirpath,
+    CodedValue, CompositeResolver, EffectHandlers, ErrorKind, PackageCache, PackageRef,
+    SchemaRegistry, SchemaResolver, Severity, TerminologyError, TerminologyProvider,
+    UnknownProfilePolicy, ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
+    materialize_package_layers,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Per-tenant, per-version profile registries fed from stored
 /// StructureDefinitions.
@@ -63,6 +64,9 @@ pub struct ValidationService {
     /// Per-tenant profile overlays, fed from stored StructureDefinition
     /// writes. `None` disables the feature.
     tenant_profiles: Option<TenantProfileMap>,
+    /// Server-wide IG/NPM package registry layers (dependents before deps).
+    /// Empty when `HFS_FHIR_PACKAGES` is unset.
+    package_layers: Vec<Arc<SchemaRegistry>>,
 }
 
 impl Default for ValidationService {
@@ -76,6 +80,7 @@ impl Default for ValidationService {
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
             tenant_profiles: Some(DashMap::new()),
+            package_layers: Vec::new(),
         }
     }
 }
@@ -88,14 +93,17 @@ impl ValidationService {
         Self::default()
     }
 
-    /// Build a service from `HFS_VALIDATION_*` configuration.
+    /// Build a service from `HFS_VALIDATION_*` / `HFS_FHIR_*` configuration.
     /// `terminology_server` is `HFS_TERMINOLOGY_SERVER` (required for
     /// `terminology = remote`; the config validator enforces the pairing).
+    ///
+    /// Fails when `HFS_FHIR_PACKAGES` is set and package resolution or
+    /// materialization fails — never boots with a silently empty overlay.
     pub fn from_config(
         config: &ValidationConfig,
         terminology_server: Option<&str>,
         version: helios_fhir::FhirVersion,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let mode = match config.mode.as_str() {
             "log" => ValidationMode::Log,
             "enforce" => ValidationMode::Enforce,
@@ -121,7 +129,10 @@ impl ValidationService {
                 }
                 _ => None,
             };
-        Self {
+
+        let package_layers = load_package_layers(config)?;
+
+        Ok(Self {
             mode,
             constraint_evaluator: config.constraints.then(FhirPathConstraintEvaluator::new),
             terminology,
@@ -130,7 +141,8 @@ impl ValidationService {
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
-        }
+            package_layers,
+        })
     }
 
     /// Replace the terminology provider (bindings stay unchecked without one).
@@ -145,8 +157,9 @@ impl ValidationService {
     }
 
     /// Validate a resource against the core pack for `version` (overlaid
-    /// with the tenant's stored profiles) plus any extra profile canonicals.
-    /// Structural issues first, then constraint issues, then binding issues.
+    /// with package layers and the tenant's stored profiles) plus any extra
+    /// profile canonicals. Structural issues first, then constraint issues,
+    /// then binding issues.
     pub async fn validate_resource(
         &self,
         version: FhirVersion,
@@ -154,11 +167,7 @@ impl ValidationService {
         profiles: Vec<String>,
         tenant: Option<&str>,
     ) -> Vec<ValidationError> {
-        let core = helios_fhir_validator::packs::core_registry(version);
-        let resolver: Arc<dyn SchemaResolver> = match self.tenant_overlay(tenant, version) {
-            Some(overlay) => Arc::new(CompositeResolver::new(vec![overlay, core])),
-            None => core,
-        };
+        let resolver = self.resolver_for(version, tenant);
         let validator = Validator::new(resolver);
         let opts = ValidationOptions {
             profiles,
@@ -284,6 +293,67 @@ impl ValidationService {
         let registry = registries.get(&(tenant.to_string(), version))?.clone();
         Some(Arc::new(LockedRegistryResolver(registry)))
     }
+
+    /// `CompositeResolver` layers: tenant overlay, package layers (dependents
+    /// before deps), then the embedded core pack.
+    fn resolver_for(
+        &self,
+        version: FhirVersion,
+        tenant: Option<&str>,
+    ) -> Arc<dyn SchemaResolver> {
+        let core = helios_fhir_validator::packs::core_registry(version);
+        let mut layers: Vec<Arc<dyn SchemaResolver>> = Vec::new();
+        if let Some(overlay) = self.tenant_overlay(tenant, version) {
+            layers.push(overlay);
+        }
+        for pkg in &self.package_layers {
+            layers.push(Arc::clone(pkg) as Arc<dyn SchemaResolver>);
+        }
+        if layers.is_empty() {
+            return core;
+        }
+        layers.push(core);
+        Arc::new(CompositeResolver::new(layers))
+    }
+}
+
+fn load_package_layers(config: &ValidationConfig) -> Result<Vec<Arc<SchemaRegistry>>, String> {
+    if config.packages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cache_root = config.package_cache.as_deref().ok_or_else(|| {
+        "HFS_FHIR_PACKAGES is set but HFS_FHIR_PACKAGE_CACHE is unset".to_string()
+    })?;
+    let cache = PackageCache::new(cache_root);
+    let mut roots = Vec::with_capacity(config.packages.len());
+    for raw in &config.packages {
+        roots.push(
+            PackageRef::parse(raw).map_err(|e| format!("HFS_FHIR_PACKAGES entry '{raw}': {e}"))?,
+        );
+    }
+    let layers = materialize_package_layers(&cache, &roots)
+        .map_err(|e| format!("FHIR package materialization failed: {e}"))?;
+
+    let mut out = Vec::with_capacity(layers.len());
+    for (id, registry, report) in layers {
+        info!(
+            package = %id,
+            inserted = report.inserted,
+            skipped_abstract = report.skipped_abstract,
+            convert_errors = report.convert_errors.len(),
+            code_systems = report.code_systems_seen,
+            value_sets = report.value_sets_seen,
+            "loaded FHIR package schema layer"
+        );
+        for w in &report.warnings {
+            warn!(package = %id, "package materialization warning: {w}");
+        }
+        for e in &report.convert_errors {
+            warn!(package = %id, "package StructureDefinition convert error: {e}");
+        }
+        out.push(registry);
+    }
+    Ok(out)
 }
 
 /// Resolver adapter over a shared, mutable registry.

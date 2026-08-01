@@ -59,6 +59,9 @@ pub(super) struct Node {
     pub schema: FhirSchema,
     pub children: IndexMap<String, Node>,
     pub slices: IndexMap<String, SliceNode>,
+    /// `type[].profile` URLs from the ElementDefinition (used when emitting
+    /// `profile` slice matchers; not part of the finalized schema IR).
+    pub type_profiles: Vec<String>,
     /// Slicing declaration from the sliced element's own ED.
     pub discriminators: Vec<EdDiscriminator>,
     pub slicing_rules: Option<String>,
@@ -223,6 +226,9 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
         1 => {
             let t = &ed.types[0];
             element.schema.type_ = Some(t.effective_code());
+            if !t.profile.is_empty() {
+                element.type_profiles = t.profile.clone();
+            }
             if !t.target_profile.is_empty() {
                 element.schema.refers = Some(t.target_profile.clone());
             }
@@ -234,6 +240,9 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
                 ed.path
             ));
             element.schema.type_ = Some(ed.types[0].effective_code());
+            if !ed.types[0].profile.is_empty() {
+                element.type_profiles = ed.types[0].profile.clone();
+            }
         }
     }
     apply_value_keywords(&mut element.schema, ed, warnings);
@@ -338,9 +347,10 @@ fn apply_choice(parent: &mut Node, base_name: &str, ed: &Ed, warnings: &mut Vec<
 
 /// Recursively turn a tree node into a schema, pruning empty nodes.
 pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSchema> {
-    let Node {
+      let Node {
         element_name: _,
         mut schema,
+        type_profiles: _,
         children,
         slices,
         discriminators,

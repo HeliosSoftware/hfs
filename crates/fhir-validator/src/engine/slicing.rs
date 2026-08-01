@@ -19,11 +19,12 @@
 //! enforced (pinned by `tests/fixtures/extended/slicing_rules.json`), and a
 //! `max: 0` prohibited slice is enforced (the reference skips falsy bounds).
 //!
-//! Match types other than `pattern` (`type`, `profile`, `binding`,
-//! `resolve-ref`) are deliberately not evaluated yet — they arrive in a later
-//! phase alongside the converter's discriminator translation. A slice whose
-//! matcher we cannot evaluate matches nothing, and a slice with no `match`
-//! at all (a constraining slice) also matches nothing.
+//! Match types: `pattern` (partial deep equality), `type` (JSON/FHIR type
+//! codes), `profile` (meta.profile claim or resolvable schema type), and
+//! `binding` (coded value equals the match payload when it is a Coding /
+//! code string — ValueSet membership is deferred to the effects pass when
+//! the payload is a canonical ValueSet URL and no inline code is present).
+//! `resolve-ref` remains unevaluated. A slice with no `match` matches nothing.
 
 use super::errors::{self, ErrorKind};
 use super::walk::{SchemaSet, WalkCtx, add_schemas_to_set, is_partial_match, validate_node};
@@ -67,7 +68,7 @@ pub(super) fn validate_slices(
                 if name == DEFAULT_SLICE {
                     continue;
                 }
-                if slice_matches(slice, item) {
+                if slice_matches(ctx, slice, item) {
                     *counters.get_mut(name).expect("counter exists") += 1;
                     item_matches[index].push(name.clone());
                 }
@@ -207,16 +208,152 @@ pub(super) fn validate_slices(
     consumed
 }
 
-/// Does an item belong to a slice? Only `pattern` matching is evaluated
-/// today; a missing `match` (constraining slice) matches nothing, and a
-/// `match` with no `value` matches everything (lodash `_.isMatch` semantics
-/// for an empty source).
-fn slice_matches(slice: &Slice, item: &Value) -> bool {
+/// Does an item belong to a slice?
+///
+/// A missing `match` (constraining slice) matches nothing. A `match` with no
+/// `value` matches everything (lodash `_.isMatch` semantics for an empty
+/// source). `type_` defaults to `pattern` when absent.
+fn slice_matches(ctx: &WalkCtx<'_>, slice: &Slice, item: &Value) -> bool {
     let Some(match_) = &slice.match_ else {
         return false;
     };
-    match match_.value.as_ref() {
-        Some(pattern) => is_partial_match(item, pattern),
-        None => true,
+    let Some(value) = match_.value.as_ref() else {
+        return true;
+    };
+    match match_.type_.as_deref().unwrap_or("pattern") {
+        "pattern" => is_partial_match(item, value),
+        "type" => {
+            let Some(expected) = value.as_str() else {
+                return false;
+            };
+            json_fhir_types(item).iter().any(|t| t == expected)
+        }
+        "profile" => {
+            let Some(profile) = value.as_str() else {
+                return false;
+            };
+            profile_matches(ctx, item, profile)
+        }
+        "binding" => binding_matches(item, value),
+        _ => false,
+    }
+}
+
+/// Infer FHIR type codes from a JSON value (resourceType, primitives, Coding).
+fn json_fhir_types(item: &Value) -> Vec<String> {
+    match item {
+        Value::String(_) => vec![
+            "string".into(),
+            "uri".into(),
+            "url".into(),
+            "canonical".into(),
+            "code".into(),
+            "id".into(),
+            "markdown".into(),
+            "oid".into(),
+            "uuid".into(),
+            "base64Binary".into(),
+            "date".into(),
+            "dateTime".into(),
+            "instant".into(),
+            "time".into(),
+        ],
+        Value::Bool(_) => vec!["boolean".into()],
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                vec!["integer".into(), "positiveInt".into(), "unsignedInt".into(), "decimal".into()]
+            } else {
+                vec!["decimal".into()]
+            }
+        }
+        Value::Object(map) => {
+            if let Some(rt) = map.get("resourceType").and_then(Value::as_str) {
+                return vec![rt.to_string()];
+            }
+            if map.contains_key("system") && map.contains_key("code") {
+                return vec!["Coding".into()];
+            }
+            if map.contains_key("coding") || (map.contains_key("text") && map.len() <= 2) {
+                return vec!["CodeableConcept".into()];
+            }
+            if map.contains_key("reference") || map.contains_key("identifier") {
+                return vec!["Reference".into()];
+            }
+            if map.contains_key("value") && (map.contains_key("unit") || map.contains_key("system"))
+            {
+                return vec!["Quantity".into()];
+            }
+            if map.contains_key("url") {
+                return vec!["Extension".into()];
+            }
+            Vec::new()
+        }
+        Value::Array(_) | Value::Null => Vec::new(),
+    }
+}
+
+fn profile_matches(ctx: &WalkCtx<'_>, item: &Value, profile: &str) -> bool {
+    if let Some(profiles) = item
+        .get("meta")
+        .and_then(|m| m.get("profile"))
+        .and_then(Value::as_array)
+        && profiles.iter().any(|p| p.as_str() == Some(profile))
+    {
+        return true;
+    }
+    // Extension slices: match by url when the profile canonical is the
+    // extension URL (common IG pattern).
+    if let Some(url) = item.get("url").and_then(Value::as_str)
+        && url == profile
+    {
+        return true;
+    }
+    // Resolvable profile whose `type` matches the item's resourceType / JSON type.
+    if let Some(schema) = ctx.resolver.resolve(profile) {
+        if let Some(ty) = schema.type_.as_deref() {
+            if json_fhir_types(item).iter().any(|t| t == ty) {
+                return true;
+            }
+            if item.get("resourceType").and_then(Value::as_str) == Some(ty) {
+                return true;
+            }
+        }
+        if let Some(name) = schema.name.as_deref()
+            && item.get("resourceType").and_then(Value::as_str) == Some(name)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Binding discriminator: if `expected` is a string, accept when the item is
+/// that code, a Coding with that code, or a CodeableConcept containing it.
+/// Full ValueSet expansion is intentionally not done here.
+fn binding_matches(item: &Value, expected: &Value) -> bool {
+    let Some(needle) = expected.as_str() else {
+        return is_partial_match(item, expected);
+    };
+    // Canonical ValueSet URL — only match when the instance literally carries
+    // that URL (rare); otherwise leave unmatched (slice stays inactive for
+    // ValueSet-based binding discriminators without inline codes).
+    if needle.contains('/') {
+        return item.as_str() == Some(needle)
+            || item.get("system").and_then(Value::as_str) == Some(needle);
+    }
+    match item {
+        Value::String(s) => s == needle,
+        Value::Object(map) => {
+            if map.get("code").and_then(Value::as_str) == Some(needle) {
+                return true;
+            }
+            if let Some(coding) = map.get("coding").and_then(Value::as_array) {
+                return coding
+                    .iter()
+                    .any(|c| c.get("code").and_then(Value::as_str) == Some(needle));
+            }
+            false
+        }
+        _ => false,
     }
 }

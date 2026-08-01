@@ -43,10 +43,11 @@
 //!
 //! ## Current limitations (hardening backlog)
 //!
-//! - Slice matchers: only `pattern` matching is evaluated. `type`,
-//!   `profile`, `binding`, and `resolve-ref` matchers are parsed but inert
-//!   (such slices match nothing and never enforce a minimum; the converter
-//!   emits a warning when it cannot build a pattern match).
+//! - Slice matchers: `pattern`, `type`, `profile`, and `binding` are
+//!   evaluated. `resolve-ref` remains inert. Binding discriminators that
+//!   name a ValueSet canonical (rather than an inline code) do not expand
+//!   the ValueSet at mark time. The converter emits a warning when it
+//!   cannot translate a discriminator into a match.
 //! - `refers` (reference target types) is carried but not enforced.
 //! - `extensible`-strength bindings are never checked (only `required`,
 //!   per the FHIR Schema spec); a warning mode may come later.
@@ -65,6 +66,7 @@ pub mod converter;
 pub mod editor;
 pub mod effects;
 pub mod engine;
+pub mod packages;
 pub mod packs;
 pub mod resolver;
 pub mod schema;
@@ -84,6 +86,11 @@ pub use effects::{
 pub use engine::{
     ErrorKind, Severity, SyncOutcome, UnknownProfilePolicy, ValidationError, ValidationOptions,
     Validator, dotted_to_fhirpath,
+};
+pub use packages::{
+    MaterializeReport, PackageCache, PackageError, PackageId, PackageManifest, PackageRef,
+    ResolvedPackage, ScannedPackage, materialize_package, materialize_package_layers,
+    materialize_tgz, resolve_packages, scan_package_dir,
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};

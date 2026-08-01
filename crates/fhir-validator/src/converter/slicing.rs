@@ -2,12 +2,11 @@
 //!
 //! A `value`/`pattern` discriminator at path `P` becomes a partial-match
 //! pattern built from the `fixed[x]`/`pattern[x]` constant found at `P`
-//! inside the slice's subtree (`$this` meaning the item root). Discriminator
-//! types we cannot evaluate yet (`type`, `profile`, `exists`, and any path
-//! containing `resolve()` or `extension(...)`) produce a slice with **no
-//! match and no minimum**: it can never produce false cardinality errors,
-//! its constraints simply stay dormant until the matcher lands (Phase 7),
-//! and the generator surfaces a warning.
+//! inside the slice's subtree (`$this` meaning the item root).
+//!
+//! `type`, `profile`, and `binding` discriminators become typed [`Match`]
+//! values evaluated at runtime by the engine. Paths containing `resolve()`
+//! or `extension(...)` remain unsupported (slice kept without match/min).
 
 use super::EdDiscriminator;
 use super::tree::{SliceNode, finalize};
@@ -29,10 +28,10 @@ pub(super) fn build_slicing(
             node,
             min,
             max,
-            extension_profile: _,
+            extension_profile,
         } = slice_node;
 
-        let match_ = build_match(&node, discriminators);
+        let match_ = build_match(&node, discriminators, extension_profile.as_deref());
         if match_.is_none() {
             warnings.push(format!(
                 "slice '{name}': discriminator(s) {:?} not translatable to a match; \
@@ -71,21 +70,86 @@ pub(super) fn build_slicing(
     })
 }
 
-/// Build a pattern match from `value`/`pattern` discriminators, reading the
-/// constant at each discriminator path out of the slice subtree.
-fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> Option<Match> {
+/// Build a match from discriminators, reading constants / type / binding /
+/// profile metadata out of the slice subtree.
+fn build_match(
+    node: &super::tree::Node,
+    discriminators: &[EdDiscriminator],
+    extension_profile: Option<&str>,
+) -> Option<Match> {
     if discriminators.is_empty() {
         return None;
     }
 
+    if discriminators
+        .iter()
+        .any(|d| d.path.contains("resolve()") || d.path.contains("extension("))
+    {
+        return None;
+    }
+
+    let kinds: Vec<&str> = discriminators.iter().map(|d| d.type_.as_str()).collect();
+    let all_pattern = kinds
+        .iter()
+        .all(|k| matches!(*k, "value" | "pattern"));
+    if all_pattern {
+        return build_pattern_match(node, discriminators);
+    }
+
+    // Single non-pattern discriminator (homogeneous set of one kind).
+    if kinds.iter().all(|k| *k == "type") && discriminators.len() == 1 {
+        let disc = &discriminators[0];
+        let target = node_at(node, &disc.path)?;
+        let type_code = target.schema.type_.as_ref()?;
+        return Some(Match {
+            type_: Some("type".to_string()),
+            value: Some(Value::String(type_code.clone())),
+            resolve_ref: None,
+        });
+    }
+    if kinds.iter().all(|k| *k == "profile") && discriminators.len() == 1 {
+        let disc = &discriminators[0];
+        let target = node_at(node, &disc.path)?;
+        let profile = extension_profile
+            .map(str::to_string)
+            .or_else(|| target.type_profiles.first().cloned())
+            .or_else(|| target.schema.url.clone())
+            .or_else(|| {
+                target
+                    .schema
+                    .refers
+                    .as_ref()
+                    .and_then(|r| r.first().cloned())
+            })?;
+        return Some(Match {
+            type_: Some("profile".to_string()),
+            value: Some(Value::String(profile)),
+            resolve_ref: None,
+        });
+    }
+    if kinds.iter().all(|k| *k == "binding") && discriminators.len() == 1 {
+        let disc = &discriminators[0];
+        let target = node_at(node, &disc.path)?;
+        let vs = target.schema.binding.as_ref()?.value_set.clone();
+        return Some(Match {
+            type_: Some("binding".to_string()),
+            value: Some(Value::String(vs)),
+            resolve_ref: None,
+        });
+    }
+
+    None
+}
+
+fn build_pattern_match(
+    node: &super::tree::Node,
+    discriminators: &[EdDiscriminator],
+) -> Option<Match> {
     let mut this_constant: Option<Value> = None;
     let mut pattern = Map::new();
 
     for disc in discriminators {
         if !matches!(disc.type_.as_str(), "value" | "pattern") {
-            return None;
-        }
-        if disc.path.contains("resolve()") || disc.path.contains("extension(") {
             return None;
         }
         let constant = constant_at(node, &disc.path)?;
@@ -111,18 +175,21 @@ fn build_match(node: &super::tree::Node, discriminators: &[EdDiscriminator]) -> 
     })
 }
 
+fn node_at<'a>(node: &'a super::tree::Node, path: &str) -> Option<&'a super::tree::Node> {
+    if path == "$this" {
+        return Some(node);
+    }
+    let mut current = node;
+    for segment in path.split('.') {
+        current = current.children.get(segment)?;
+    }
+    Some(current)
+}
+
 /// The fixed/pattern constant at `path` within the slice subtree
 /// (`$this` → the subtree root itself).
 fn constant_at(node: &super::tree::Node, path: &str) -> Option<Value> {
-    let target = if path == "$this" {
-        node
-    } else {
-        let mut current = node;
-        for segment in path.split('.') {
-            current = current.children.get(segment)?;
-        }
-        current
-    };
+    let target = node_at(node, path)?;
     target
         .schema
         .fixed

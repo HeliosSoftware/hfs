@@ -35,6 +35,10 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 indexmap = { version = "2", features = ["serde"] }
 # Schema pack (de)compression.
 flate2 = "1"
+# FHIR NPM `.tgz` extract (package materialization).
+tar = "0.4"
+# Optional integrity sidecar for cached package tarballs.
+sha2 = "0.10"
 # Primitive value regexes (FHIR spec patterns carried in the packs).
 regex = "1"
 # Dyn-compatible async TerminologyProvider.
@@ -46,6 +50,7 @@ helios-fhirpath = { path = "../fhirpath", version = "0.2.1", optional = true, de
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
 
 [[bin]]
 name = "generate-schema-packs"

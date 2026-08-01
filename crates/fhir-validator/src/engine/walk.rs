@@ -81,7 +81,7 @@ impl SchemaSet {
 }
 
 pub(super) struct WalkCtx<'a> {
-    resolver: &'a dyn SchemaResolver,
+    pub(super) resolver: &'a dyn SchemaResolver,
     errors: Vec<ValidationError>,
     deferred: Vec<Deferred>,
     pub(super) path: PathTracker,
