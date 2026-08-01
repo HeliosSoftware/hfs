@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 description = "FHIR resource validator for HFS — FHIR Schema based structural and profile validation"
 homepage = "https://github.com/HeliosSoftware/hfs/tree/main/crates/fhir-validator"
+readme = "README.md"
 keywords = ["helios-software", "hl7", "fhir", "validation", "fhir-schema"]
 
 [features]
@@ -43,6 +44,7 @@ sha2 = "0.10"
 regex = "1"
 # Dyn-compatible async TerminologyProvider.
 async-trait = "0.1"
+thiserror = "2"
 clap = { version = "4", features = ["derive"], optional = true }
 helios-fhirpath = { path = "../fhirpath", version = "0.2.1", optional = true, default-features = false }
 
