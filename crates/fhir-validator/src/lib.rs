@@ -6,6 +6,27 @@
 //! StructureDefinitions, validated via **cooperative schema sets** rather
 //! than snapshot flattening.
 //!
+//! ## Overview
+//!
+//! | Concern | Module |
+//! |---------|--------|
+//! | StructureDefinition → schema | [`converter`] |
+//! | Structural walk (cardinality, slices, fixed/pattern, …) | [`engine`] |
+//! | FHIRPath constraints + terminology bindings | [`effects`], [`fhirpath_effects`] |
+//! | Embedded core packs (R4–R6) | [`packs`], [`terminology`] |
+//! | FHIR NPM / IG package overlays | [`packages`] |
+//! | QuestionnaireResponse vs Questionnaire | [`questionnaire`] |
+//! | Authoring projection (“what can I add?”) | [`editor`] |
+//!
+//! The engine walks raw `serde_json::Value` — deliberately, since the typed
+//! `helios-fhir` models deserialize leniently and cannot surface unknown
+//! elements. Structural validation is pure and synchronous; FHIRPath
+//! constraints and terminology bindings are collected as [`Deferred`]
+//! obligations for an async effects pass.
+//!
+//! Resolver layering (earlier wins): tenant stored StructureDefinitions →
+//! package layers (filtered by `fhirVersions`) → embedded core pack.
+//!
 //! ## Quick start
 //!
 //! ```
@@ -31,36 +52,34 @@
 //! assert!(outcome.errors.is_empty());
 //! ```
 //!
-//! The engine walks raw `serde_json::Value` — deliberately, since the typed
-//! `helios-fhir` models deserialize leniently and cannot surface unknown
-//! elements. Structural validation is pure and synchronous; FHIRPath
-//! constraints and terminology bindings are collected as [`Deferred`]
-//! obligations for an async effects pass.
-//!
 //! The behavioral contract is the vendored FHIR Schema conformance suite in
 //! `tests/fixtures/upstream/` (exact ordered error matching), plus Helios
-//! extended fixtures in `tests/fixtures/extended/`.
+//! extended fixtures in `tests/fixtures/extended/`. Package materialization
+//! is documented in [`docs/packages.md`](../docs/packages.md).
 //!
-//! ## Current limitations (hardening backlog)
+//! ## Current limitations
 //!
-//! - Slice matchers: `pattern`, `type`, `profile`, and `binding` are
-//!   evaluated. `resolve-ref` remains inert. Binding discriminators that
-//!   name a ValueSet canonical (rather than an inline code) do not expand
-//!   the ValueSet at mark time. The converter emits a warning when it
-//!   cannot translate a discriminator into a match.
-//! - `refers` (reference target types) is carried but not enforced.
-//! - `extensible`-strength bindings are never checked (only `required`,
-//!   per the FHIR Schema spec); a warning mode may come later.
+//! - Slice matchers: `pattern`, `type`, `profile`, `binding`, `exists`, and
+//!   `extension` (paths traversing `extension('url')`) are evaluated;
+//!   reslices (`parent/child`) are scoped to the parent match. Discriminator
+//!   paths using `resolve()` remain unsupported (need an instance graph), as
+//!   does `resolve-ref`. Binding discriminators that name a ValueSet
+//!   canonical do not expand it at mark time.
+//! - `refers` (reference target types) is enforced only when
+//!   [`ValidationOptions::enforce_refers`] is set (off by default for
+//!   conformance-suite parity). Profile-target resolution is not performed.
+//! - `extensible`-strength bindings emit warnings only when
+//!   [`EffectHandlers::check_extensible_bindings`] is set; `preferred` /
+//!   `example` are never checked.
 //! - Constraint evaluation resolves `%resource`/`%rootResource` to the root
 //!   resource and evaluates via `path.all(expr)`, so invariants relying on
 //!   nested-resource `%resource` semantics can misfire (helios-fhirpath
 //!   limitation; see `fhirpath_effects`).
-//! - Schema sets are assembled per node without cross-resource memoization;
-//!   structural validation of a typical Patient measures ~300µs in debug
-//!   builds (see `tests/pack_smoke.rs`), so this has not been worth it yet.
+//! - Non-goals: XHTML well-formedness, Bundle `fullUrl` uniqueness rules.
 //! - Core extension definitions (`extension-definitions.json`) are not in
 //!   the vendored spec bundles, so pack profiles whose `extensions` sugar
-//!   references core extension URLs report `unknown-schema` when exercised.
+//!   references core extension URLs report `unknown-schema` when exercised
+//!   without an IG package that provides them.
 
 pub mod converter;
 pub mod editor;
@@ -68,6 +87,7 @@ pub mod effects;
 pub mod engine;
 pub mod packages;
 pub mod packs;
+pub mod questionnaire;
 pub mod resolver;
 pub mod schema;
 pub mod terminology;
@@ -89,9 +109,11 @@ pub use engine::{
 };
 pub use packages::{
     MaterializeReport, PackageCache, PackageError, PackageId, PackageManifest, PackageRef,
-    ResolvedPackage, ScannedPackage, ensure_package_path, materialize_package,
-    materialize_package_layers, materialize_tgz, resolve_packages, scan_package_dir,
+    ResolvedPackage, ScannedPackage, ensure_package_path, manifest_supports_fhir_version,
+    materialize_package, materialize_package_layers, materialize_package_layers_by_version,
+    materialize_tgz, resolve_packages, scan_package_dir,
 };
+pub use questionnaire::validate_questionnaire_response;
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};
 pub use terminology::{CoreTerminology, core_terminology};
