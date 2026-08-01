@@ -1,6 +1,8 @@
 use crate::packages::cache::PackageCache;
 use crate::packages::error::PackageError;
 use crate::packages::manifest::{PackageId, PackageManifest, PackageRef};
+use crate::packages::version::manifest_supports_fhir_version;
+use helios_fhir::FhirVersion;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
@@ -16,9 +18,14 @@ pub struct ResolvedPackage {
 /// `cache` only (offline). Returns packages in **deps-first** topological
 /// order (dependencies before dependents). Callers that need overlay
 /// precedence (dependents win) should reverse this list.
+///
+/// When `fhir_version` is `Some`, every resolved package must declare a
+/// compatible `fhirVersions` entry (or omit the field). Incompatible packages
+/// yield [`PackageError::Resolve`].
 pub fn resolve_packages(
     cache: &PackageCache,
     roots: &[PackageRef],
+    fhir_version: Option<FhirVersion>,
 ) -> Result<Vec<ResolvedPackage>, PackageError> {
     if roots.is_empty() {
         return Ok(Vec::new());
@@ -33,6 +40,15 @@ pub fn resolve_packages(
         }
         let path = cache.get(&id)?;
         let manifest = PackageManifest::load(&path.join("package.json"))?;
+        if let Some(version) = fhir_version
+            && !manifest_supports_fhir_version(&manifest.fhir_versions, version)
+        {
+            return Err(PackageError::Resolve(format!(
+                "package {id} declares fhirVersions {:?} incompatible with {}",
+                manifest.fhir_versions,
+                version.full_version()
+            )));
+        }
         for dep in manifest.dependency_ids() {
             if !manifests.contains_key(&dep) {
                 pending.push(dep);

@@ -35,26 +35,29 @@ HTTP fetch). They are not package sources.
 
 ### Examples
 
-Publisher tarball on disk:
+Bundled test fixture (check out of tree):
 
 ```bash
 export HFS_FHIR_PACKAGE_CACHE=$PWD/fhir-package-cache
-export HFS_FHIR_PACKAGE_SOURCES=/Users/sandhu/AtriusIGDraft/output/atrius.fhir.r4.india.en.tgz
+export HFS_FHIR_PACKAGE_SOURCES=crates/fhir-validator/tests/fixtures/packages/sample.tgz
 export HFS_VALIDATION_MODE=enforce
-# HFS_FHIR_PACKAGES optional — defaults to atrius.fhir.r4.india.en@0.1.0 from the tarball
+# defaults to example.fhir.r4.sample@0.1.0 from the tarball
 ```
 
-Publisher `output/` (picks `package.tgz` if present):
+Publisher tarball or `output/` on disk:
 
 ```bash
-export HFS_FHIR_PACKAGE_SOURCES=/Users/sandhu/AtriusIGDraft/output
+export HFS_FHIR_PACKAGE_SOURCES=/path/to/ig/output/package.tgz
+# or: /path/to/ig/output   (picks package.tgz when unique)
 ```
 
 Published URL:
 
 ```bash
-export HFS_FHIR_PACKAGE_SOURCES=https://atrius.in/fhir/r4/atrius-in/package.tgz
+export HFS_FHIR_PACKAGE_SOURCES=https://example.org/fhir/r4/sample/package.tgz
 ```
+
+See `tests/fixtures/packages/README.md` for the sample IG contents and rebuild script.
 
 ## Resolver order
 

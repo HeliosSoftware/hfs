@@ -245,6 +245,7 @@ fn resolve_requires_deps_in_cache() {
     let missing = resolve_packages(
         &cache,
         &[PackageRef::parse("example.ig@1.0.0").unwrap()],
+        Some(FhirVersion::R4),
     );
     // dep was seeded — should succeed with dep then root
     let ok = missing.unwrap();
@@ -271,9 +272,39 @@ fn resolve_requires_deps_in_cache() {
     let err = resolve_packages(
         &cache2,
         &[PackageRef::parse("example.ig@1.0.0").unwrap()],
+        None,
     )
     .unwrap_err();
     assert!(err.to_string().contains("example.dep@1.0.0"), "{err}");
+}
+
+#[test]
+fn resolve_rejects_incompatible_fhir_versions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = PackageCache::new(tmp.path());
+    let tgz = tmp.path().join("r5-only.tgz");
+    write_tgz(
+        &tgz,
+        &[(
+            "package/package.json",
+            br#"{
+              "name": "example.r5.only",
+              "version": "1.0.0",
+              "fhirVersions": ["5.0.0"],
+              "dependencies": {}
+            }"#,
+        )],
+    );
+    cache.ensure_from_tgz(&tgz).unwrap();
+    let err = resolve_packages(
+        &cache,
+        &[PackageRef::parse("example.r5.only@1.0.0").unwrap()],
+        Some(FhirVersion::R4),
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("incompatible"), "{msg}");
+    assert!(msg.contains("5.0.0") || msg.contains("4.0.1"), "{msg}");
 }
 
 #[test]
@@ -294,6 +325,89 @@ fn materialize_skips_abstract_and_inserts_profile() {
     );
 }
 
+fn sample_tgz_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages/sample.tgz")
+}
+
+fn sample_dir_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages/sample")
+}
+
+#[test]
+fn bundled_sample_tgz_materializes_and_validates_extension_slices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = PackageCache::new(tmp.path());
+    let id = cache.ensure_from_path(&sample_tgz_path()).unwrap();
+    assert_eq!(id.to_string(), "example.fhir.r4.sample@0.1.0");
+
+    // Expanded sources must stay in sync with the committed tarball.
+    let dir_id = cache.ensure_from_path(&sample_dir_path()).unwrap();
+    assert_eq!(dir_id.to_string(), id.to_string());
+
+    let layers =
+        materialize_package_layers(&cache, std::slice::from_ref(&id), Some(FhirVersion::R4))
+            .unwrap();
+    assert_eq!(layers.len(), 1);
+    assert!(layers[0].2.inserted >= 3, "report: {:?}", layers[0].2);
+
+    let core = packs::core_registry(FhirVersion::R4);
+    let mut resolvers: Vec<Arc<dyn helios_fhir_validator::SchemaResolver>> = layers
+        .into_iter()
+        .map(|(_, reg, _)| reg as Arc<dyn helios_fhir_validator::SchemaResolver>)
+        .collect();
+    resolvers.push(core);
+    let validator = Validator::new(Arc::new(CompositeResolver::new(resolvers)));
+
+    let profile = "http://example.org/fhir/r4/sample/StructureDefinition/sample-patient";
+    let missing = json!({
+        "resourceType": "Patient",
+        "meta": { "profile": [profile] }
+    });
+    let outcome = validator.validate_sync(&missing, &ValidationOptions::default());
+    let text = serde_json::to_string(&outcome.errors).unwrap();
+    assert!(
+        text.contains("identifier")
+            || text.contains("name")
+            || text.contains("gender")
+            || text.contains("slice-cardinality")
+            || text.contains("facility"),
+        "expected sample-patient required/slice issues, got {text}"
+    );
+
+    let ok = json!({
+        "resourceType": "Patient",
+        "meta": { "profile": [profile] },
+        "identifier": [{
+            "system": "http://example.org/fhir/sid/mrn",
+            "value": "MRN-1"
+        }],
+        "name": [{ "family": "Doe" }],
+        "gender": "unknown",
+        "extension": [{
+            "url": "http://example.org/fhir/r4/sample/StructureDefinition/sample-facility-code",
+            "valueCode": "FAC-1"
+        }]
+    });
+    let outcome = validator.validate_sync(&ok, &ValidationOptions::default());
+    let profile_errors: Vec<_> = outcome
+        .errors
+        .iter()
+        .filter(|e| {
+            let m = e.message.to_lowercase();
+            m.contains("required")
+                || m.contains("slice")
+                || e.path.contains("identifier")
+                || e.path.contains("extension")
+                || e.path.contains("gender")
+                || e.path.contains("name")
+        })
+        .collect();
+    assert!(
+        profile_errors.is_empty(),
+        "valid sample patient should not fail profile constraints: {profile_errors:?}"
+    );
+}
+
 #[test]
 fn package_layers_overlay_core_for_meta_profile() {
     let tmp = tempfile::tempdir().unwrap();
@@ -302,6 +416,7 @@ fn package_layers_overlay_core_for_meta_profile() {
     let layers = materialize_package_layers(
         &cache,
         &[PackageRef::parse("example.ig@1.0.0").unwrap()],
+        Some(FhirVersion::R4),
     )
     .unwrap();
     // Overlay order: root then dep (dependents first).
