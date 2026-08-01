@@ -89,8 +89,8 @@ pub use engine::{
 };
 pub use packages::{
     MaterializeReport, PackageCache, PackageError, PackageId, PackageManifest, PackageRef,
-    ResolvedPackage, ScannedPackage, materialize_package, materialize_package_layers,
-    materialize_tgz, resolve_packages, scan_package_dir,
+    ResolvedPackage, ScannedPackage, ensure_package_path, materialize_package,
+    materialize_package_layers, materialize_tgz, resolve_packages, scan_package_dir,
 };
 pub use resolver::{CompositeResolver, SchemaRegistry, SchemaResolver};
 pub use schema::{Binding, Constraint, FhirSchema, Match, Slice, Slicing};

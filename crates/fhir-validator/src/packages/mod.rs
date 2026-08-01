@@ -18,10 +18,14 @@
 //! ```
 //!
 //! Packages are expanded with the FHIR NPM `package/` prefix stripped so
-//! `package.json` sits at the version directory root. Validation never
-//! fetches from the network; populate the cache with
-//! [`PackageCache::ensure_from_tgz`] or [`PackageCache::ensure_from_dir`]
-//! (or an external seed step) before resolving.
+//! `package.json` sits at the version directory root.
+//!
+//! Populate the cache from **any local source** via
+//! [`PackageCache::ensure_from_path`] (`.tgz`, expanded dir, or IG publisher
+//! `output/` which selects `package.tgz`). HTTP(S) seeding is handled by the
+//! HFS REST layer (`HFS_FHIR_PACKAGE_SOURCES`) so this crate stays
+//! filesystem-only at validate time. The cache's `.staging/` directory is
+//! only a temporary unpack workspace — not a package source.
 //!
 //! ## Abstract StructureDefinitions
 //!
@@ -48,6 +52,17 @@ pub use manifest::{PackageId, PackageManifest, PackageRef};
 pub use materialize::{MaterializeReport, materialize_package};
 pub use resolve::{ResolvedPackage, resolve_packages};
 pub use scan::{ScannedPackage, scan_package_dir};
+
+/// Install `path` into `cache` then return the package id.
+///
+/// See [`PackageCache::ensure_from_path`] for accepted layouts (`.tgz`,
+/// expanded package dir, IG publisher `output/`).
+pub fn ensure_package_path(
+    cache: &PackageCache,
+    path: &Path,
+) -> Result<PackageId, PackageError> {
+    cache.ensure_from_path(path)
+}
 
 use crate::resolver::SchemaRegistry;
 use std::path::Path;

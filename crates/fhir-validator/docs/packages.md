@@ -2,39 +2,66 @@
 
 Package overlays use the same `SchemaRegistry` + `CompositeResolver` path as
 core packs and tenant-uploaded StructureDefinitions (#232). This document
-covers **materialization proper**: cache layout, dependency resolution, and
-operator configuration.
+covers **materialization proper**: cache layout, sources, dependency
+resolution, and operator configuration.
 
-## Cache layout
+## Cache vs sources
 
-```text
-{HFS_FHIR_PACKAGE_CACHE}/{package-name}/{version}/
-  package.json
-  StructureDefinition-….json
-  …
-  .sha256          # optional integrity of the source .tgz
-```
+| Concept | Role |
+|---------|------|
+| **Cache** (`HFS_FHIR_PACKAGE_CACHE`) | Durable expanded packages: `{cache}/{name}/{version}/` |
+| **Sources** (`HFS_FHIR_PACKAGE_SOURCES`) | Where packages are **installed from** at boot (local or URL) |
+| **Roots** (`HFS_FHIR_PACKAGES`) | Which `name@version` layers to load; defaults to packages installed from sources |
 
-Populate with `PackageCache::ensure_from_tgz` / `ensure_from_dir`, or any
-external seed that expands a FHIR NPM `.tgz` (with the `package/` prefix
-stripped) into that directory. **Validation never fetches from the network.**
+`.staging/` and `.downloads/` under the cache root are **internal** (temp unpack /
+HTTP fetch). They are not package sources.
+
+## Accepted local sources (`PackageCache::ensure_from_path`)
+
+- FHIR NPM `.tgz` / `.tar.gz` file (any path, e.g. IG publisher
+  `output/atrius.fhir.r4.india.en.tgz` or `output/package.tgz`)
+- Expanded package directory with `package.json` or `package/package.json`
+- IG publisher **`output/`** directory: prefers `package.tgz`; if several
+  `*.tgz` exist, pass one file explicitly (do **not** treat the whole HTML
+  tree as a package)
 
 ## Configuration
 
 | Variable | Purpose |
 |----------|---------|
-| `HFS_FHIR_PACKAGE_CACHE` | Cache root |
-| `HFS_FHIR_PACKAGES` | Comma-separated `name@version` roots |
+| `HFS_FHIR_PACKAGE_CACHE` | Cache root (required when sources/packages are set) |
+| `HFS_FHIR_PACKAGE_SOURCES` | Comma-separated local paths and/or `http(s)://…/*.tgz` URLs |
+| `HFS_FHIR_PACKAGES` | Optional `name@version` roots; if omitted, uses ids from sources |
 
-If `HFS_FHIR_PACKAGES` is set, boot **fails** when resolution or
-materialization fails (no silent empty overlay).
+### Examples
+
+Publisher tarball on disk:
+
+```bash
+export HFS_FHIR_PACKAGE_CACHE=$PWD/fhir-package-cache
+export HFS_FHIR_PACKAGE_SOURCES=/Users/sandhu/AtriusIGDraft/output/atrius.fhir.r4.india.en.tgz
+export HFS_VALIDATION_MODE=enforce
+# HFS_FHIR_PACKAGES optional — defaults to atrius.fhir.r4.india.en@0.1.0 from the tarball
+```
+
+Publisher `output/` (picks `package.tgz` if present):
+
+```bash
+export HFS_FHIR_PACKAGE_SOURCES=/Users/sandhu/AtriusIGDraft/output
+```
+
+Published URL:
+
+```bash
+export HFS_FHIR_PACKAGE_SOURCES=https://atrius.in/fhir/r4/atrius-in/package.tgz
+```
 
 ## Resolver order
 
 `CompositeResolver` (earlier wins):
 
 1. Tenant stored-StructureDefinition overlay (optional)
-2. Package layers — configured roots / dependents before transitive deps
+2. Package layers — dependents before transitive deps
 3. Embedded core schema pack
 
 ## What is loaded
@@ -46,5 +73,5 @@ via HTS, not the schema registry.
 
 ## Library API
 
-See `helios_fhir_validator::packages`: `PackageCache`, `resolve_packages`,
-`materialize_package`, `materialize_package_layers`.
+See `helios_fhir_validator::packages`: `PackageCache`, `ensure_from_path`,
+`resolve_packages`, `materialize_package`, `materialize_package_layers`.

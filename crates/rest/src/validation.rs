@@ -21,12 +21,14 @@ use dashmap::DashMap;
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::fhirpath_effects::FhirPathConstraintEvaluator;
 use helios_fhir_validator::{
-    CodedValue, CompositeResolver, EffectHandlers, ErrorKind, PackageCache, PackageRef,
+    CodedValue, CompositeResolver, EffectHandlers, ErrorKind, PackageCache, PackageId, PackageRef,
     SchemaRegistry, SchemaResolver, Severity, TerminologyError, TerminologyProvider,
     UnknownProfilePolicy, ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
     materialize_package_layers,
 };
 use serde_json::{Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -318,19 +320,38 @@ impl ValidationService {
 }
 
 fn load_package_layers(config: &ValidationConfig) -> Result<Vec<Arc<SchemaRegistry>>, String> {
-    if config.packages.is_empty() {
+    if config.packages.is_empty() && config.package_sources.is_empty() {
         return Ok(Vec::new());
     }
     let cache_root = config.package_cache.as_deref().ok_or_else(|| {
-        "HFS_FHIR_PACKAGES is set but HFS_FHIR_PACKAGE_CACHE is unset".to_string()
+        "HFS_FHIR_PACKAGES / HFS_FHIR_PACKAGE_SOURCES require HFS_FHIR_PACKAGE_CACHE".to_string()
     })?;
     let cache = PackageCache::new(cache_root);
-    let mut roots = Vec::with_capacity(config.packages.len());
-    for raw in &config.packages {
-        roots.push(
-            PackageRef::parse(raw).map_err(|e| format!("HFS_FHIR_PACKAGES entry '{raw}': {e}"))?,
-        );
+
+    let mut sourced: Vec<PackageId> = Vec::new();
+    for raw in &config.package_sources {
+        let id = seed_package_source(&cache, raw)
+            .map_err(|e| format!("HFS_FHIR_PACKAGE_SOURCES entry '{raw}': {e}"))?;
+        info!(package = %id, source = %raw, "seeded FHIR package into cache");
+        sourced.push(id);
     }
+
+    let roots = if config.packages.is_empty() {
+        if sourced.is_empty() {
+            return Ok(Vec::new());
+        }
+        sourced
+    } else {
+        let mut roots = Vec::with_capacity(config.packages.len());
+        for raw in &config.packages {
+            roots.push(
+                PackageRef::parse(raw)
+                    .map_err(|e| format!("HFS_FHIR_PACKAGES entry '{raw}': {e}"))?,
+            );
+        }
+        roots
+    };
+
     let layers = materialize_package_layers(&cache, &roots)
         .map_err(|e| format!("FHIR package materialization failed: {e}"))?;
 
@@ -354,6 +375,54 @@ fn load_package_layers(config: &ValidationConfig) -> Result<Vec<Arc<SchemaRegist
         out.push(registry);
     }
     Ok(out)
+}
+
+/// Seed one source into the cache: local path (via `ensure_from_path`) or
+/// HTTP(S) `.tgz` URL (downloaded under `{cache}/.downloads/`).
+fn seed_package_source(cache: &PackageCache, raw: &str) -> Result<PackageId, String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let downloaded = download_package_tgz(cache.root(), trimmed)?;
+        return cache
+            .ensure_from_tgz(&downloaded)
+            .map_err(|e| e.to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    cache.ensure_from_path(&path).map_err(|e| e.to_string())
+}
+
+fn download_package_tgz(cache_root: &Path, url: &str) -> Result<PathBuf, String> {
+    let downloads = cache_root.join(".downloads");
+    fs::create_dir_all(&downloads)
+        .map_err(|e| format!("cannot create {}: {e}", downloads.display()))?;
+
+    let name = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("package.tgz");
+    let name = if name.ends_with(".tgz") || name.ends_with(".tar.gz") {
+        name.to_string()
+    } else {
+        format!("{name}.tgz")
+    };
+    let dest = downloads.join(&name);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("GET {url}: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let bytes = response
+        .bytes()
+        .map_err(|e| format!("read {url}: {e}"))?;
+    fs::write(&dest, &bytes).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    Ok(dest)
 }
 
 /// Resolver adapter over a shared, mutable registry.

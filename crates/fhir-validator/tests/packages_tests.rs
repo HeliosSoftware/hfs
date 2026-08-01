@@ -149,6 +149,69 @@ fn seed_dep_and_root(cache_root: &Path) -> PathBuf {
 }
 
 #[test]
+fn ensure_from_path_accepts_tgz_and_publisher_output_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = PackageCache::new(tmp.path().join("cache"));
+
+    let tgz = tmp.path().join("solo.tgz");
+    write_tgz(
+        &tgz,
+        &[(
+            "package/package.json",
+            br#"{"name":"path.pkg","version":"1.2.3","dependencies":{}}"#,
+        )],
+    );
+    assert_eq!(
+        cache.ensure_from_path(&tgz).unwrap().to_string(),
+        "path.pkg@1.2.3"
+    );
+
+    // Simulate IG publisher output/: HTML junk + package.tgz.
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).unwrap();
+    fs::write(output.join("index.html"), b"<html></html>").unwrap();
+    let package_tgz = output.join("package.tgz");
+    write_tgz(
+        &package_tgz,
+        &[(
+            "package/package.json",
+            br#"{"name":"ig.output","version":"0.1.0","dependencies":{}}"#,
+        )],
+    );
+    assert_eq!(
+        cache.ensure_from_path(&output).unwrap().to_string(),
+        "ig.output@0.1.0"
+    );
+}
+
+#[test]
+fn ensure_from_path_rejects_ambiguous_output_tarballs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = PackageCache::new(tmp.path().join("cache"));
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).unwrap();
+    write_tgz(
+        &output.join("a.tgz"),
+        &[(
+            "package/package.json",
+            br#"{"name":"a","version":"1.0.0","dependencies":{}}"#,
+        )],
+    );
+    write_tgz(
+        &output.join("b.tgz"),
+        &[(
+            "package/package.json",
+            br#"{"name":"b","version":"1.0.0","dependencies":{}}"#,
+        )],
+    );
+    let err = cache.ensure_from_path(&output).unwrap_err();
+    assert!(
+        err.to_string().contains("multiple package tarballs"),
+        "{err}"
+    );
+}
+
+#[test]
 fn cache_ensure_from_tgz_and_get() {
     let tmp = tempfile::tempdir().unwrap();
     let cache = PackageCache::new(tmp.path());

@@ -111,6 +111,90 @@ impl PackageCache {
         copy_dir_all(&package_root, &dest)?;
         Ok(id)
     }
+
+    /// Install a package from a local path into the cache.
+    ///
+    /// Accepts:
+    /// - a FHIR NPM `.tgz` / `.tar.gz` file
+    /// - an expanded package directory (`package.json`, or `package/package.json`)
+    /// - an IG **publisher `output/`** directory: prefers `package.tgz`, else a
+    ///   single `*.tgz`, else `package/` if present
+    ///
+    /// Note: `.staging/` under the cache root is only a temporary unpack area
+    /// used while installing a tarball — it is **not** a package source.
+    pub fn ensure_from_path(&self, path: &Path) -> Result<PackageId, PackageError> {
+        if path.is_file() {
+            if is_tarball(path) {
+                return self.ensure_from_tgz(path);
+            }
+            return Err(PackageError::Invalid(format!(
+                "not a FHIR package tarball: {} (expected .tgz / .tar.gz)",
+                path.display()
+            )));
+        }
+        if !path.is_dir() {
+            return Err(PackageError::Invalid(format!(
+                "package source not found: {}",
+                path.display()
+            )));
+        }
+
+        // Expanded package (NPM layout or flat).
+        if path.join("package.json").is_file()
+            || path.join("package").join("package.json").is_file()
+        {
+            return self.ensure_from_dir(path);
+        }
+
+        // IG publisher `output/`: prefer canonical package.tgz.
+        let package_tgz = path.join("package.tgz");
+        if package_tgz.is_file() {
+            return self.ensure_from_tgz(&package_tgz);
+        }
+
+        let mut tarballs = list_tarballs(path)?;
+        tarballs.sort();
+        match tarballs.as_slice() {
+            [only] => self.ensure_from_tgz(only),
+            [] => Err(PackageError::Invalid(format!(
+                "directory {} is not a FHIR package (no package.json / package/) \
+                 and contains no .tgz — for IG publisher output, pass \
+                 output/package.tgz or output/<name>.tgz, not the whole HTML tree",
+                path.display()
+            ))),
+            many => Err(PackageError::Invalid(format!(
+                "directory {} has multiple package tarballs ({}); pass one explicitly \
+                 (prefer package.tgz)",
+                path.display(),
+                many
+                    .iter()
+                    .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+}
+
+fn is_tarball(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name.ends_with(".tgz") || name.ends_with(".tar.gz")
+}
+
+fn list_tarballs(dir: &Path) -> Result<Vec<PathBuf>, PackageError> {
+    let mut out = Vec::new();
+    for ent in fs::read_dir(dir).map_err(|e| PackageError::io(dir, e))? {
+        let ent = ent.map_err(|e| PackageError::io(dir, e))?;
+        let p = ent.path();
+        if p.is_file() && is_tarball(&p) {
+            out.push(p);
+        }
+    }
+    Ok(out)
 }
 
 fn hash_file(path: &Path) -> Result<String, PackageError> {
