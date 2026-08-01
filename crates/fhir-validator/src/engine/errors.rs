@@ -49,6 +49,14 @@ pub enum ErrorKind {
     // ------------------------------------------------------------------
     /// A primitive value failed its type-class or regex check.
     PrimitiveValue,
+    /// String longer than `maxLength`.
+    MaxLength,
+    /// Value below `minValue`.
+    MinValue,
+    /// Value above `maxValue`.
+    MaxValue,
+    /// `Reference.reference` target type not in `refers`.
+    ReferenceTarget,
     /// An array item matched no slice under `rules: closed`, or an unmatched
     /// item preceded matched items under `rules: openAtEnd`.
     SliceUnmatched,
@@ -60,6 +68,8 @@ pub enum ErrorKind {
     /// A profile named in `meta.profile` or the caller's profile list could
     /// not be resolved.
     UnknownProfile,
+    /// QuestionnaireResponse failed Questionnaire-driven checks.
+    Questionnaire,
 }
 
 /// Issue severity. Internal only — deliberately not serialized, so the
@@ -242,6 +252,37 @@ pub(crate) fn msg_primitive_type(type_name: &str, json_type: &str) -> String {
 /// [helios] a primitive string value failed the type's regex.
 pub(crate) fn msg_primitive_regex(type_name: &str, value: &str) -> String {
     format!("value '{value}' is not a valid {type_name}")
+}
+
+/// [helios] `maxLength` exceeded.
+pub(crate) fn msg_max_length(max: u64, actual: usize) -> String {
+    format!("string length {actual} exceeds maxLength {max}")
+}
+
+/// [helios] value below `minValue`.
+pub(crate) fn msg_min_value(min: &Value, actual: &Value) -> String {
+    format!(
+        "value '{}' is less than minValue '{}'",
+        render_value(actual),
+        render_value(min)
+    )
+}
+
+/// [helios] value above `maxValue`.
+pub(crate) fn msg_max_value(max: &Value, actual: &Value) -> String {
+    format!(
+        "value '{}' is greater than maxValue '{}'",
+        render_value(actual),
+        render_value(max)
+    )
+}
+
+/// [helios] Reference target type not allowed by `refers`.
+pub(crate) fn msg_reference_target(actual: &str, allowed: &[String]) -> String {
+    format!(
+        "reference target type '{actual}' is not in refers [{}]",
+        allowed.join(", ")
+    )
 }
 
 /// [reference] `FHIRPath constraint {id} error: {human}` — the wording of

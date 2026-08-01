@@ -56,6 +56,9 @@ pub struct ValidationOptions {
     pub use_meta_profiles: bool,
     /// What to do when a profile reference cannot be resolved.
     pub unknown_profile: UnknownProfilePolicy,
+    /// When true, enforce `refers` (Reference target resource-type) checks.
+    /// Off by default to preserve upstream conformance-suite parity.
+    pub enforce_refers: bool,
 }
 
 impl Default for ValidationOptions {
@@ -64,6 +67,7 @@ impl Default for ValidationOptions {
             profiles: Vec::new(),
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::default(),
+            enforce_refers: false,
         }
     }
 }

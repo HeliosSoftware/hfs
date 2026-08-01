@@ -20,11 +20,15 @@
 //! `max: 0` prohibited slice is enforced (the reference skips falsy bounds).
 //!
 //! Match types: `pattern` (partial deep equality), `type` (JSON/FHIR type
-//! codes), `profile` (meta.profile claim or resolvable schema type), and
+//! codes), `profile` (meta.profile claim or resolvable schema type),
 //! `binding` (coded value equals the match payload when it is a Coding /
 //! code string — ValueSet membership is deferred to the effects pass when
-//! the payload is a canonical ValueSet URL and no inline code is present).
-//! `resolve-ref` remains unevaluated. A slice with no `match` matches nothing.
+//! the payload is a canonical ValueSet URL and no inline code is present),
+//! `exists` (presence/absence of each `{path, exists}` entry, with
+//! `{extension: url}` path steps and choice-key prefixes), and `extension`
+//! (a `{url, pattern | extension}` chain matched against extension arrays
+//! by containment). `resolve-ref` remains unevaluated. A slice with no
+//! `match` matches nothing.
 
 use super::errors::{self, ErrorKind};
 use super::walk::{SchemaSet, WalkCtx, add_schemas_to_set, is_partial_match, validate_node};
@@ -68,7 +72,7 @@ pub(super) fn validate_slices(
                 if name == DEFAULT_SLICE {
                     continue;
                 }
-                if slice_matches(ctx, slice, item) {
+                if slice_matches_with_reslice(ctx, &slicing, name, slice, item) {
                     *counters.get_mut(name).expect("counter exists") += 1;
                     item_matches[index].push(name.clone());
                 }
@@ -208,6 +212,37 @@ pub(super) fn validate_slices(
     consumed
 }
 
+/// Reslice-aware match: a child slice `parent/child` only matches when the
+/// parent slice also matches the item. Constraining slices without their own
+/// matcher inherit the same-named parent's matcher when present.
+fn slice_matches_with_reslice(
+    ctx: &WalkCtx<'_>,
+    slicing: &Slicing,
+    _name: &str,
+    slice: &Slice,
+    item: &Value,
+) -> bool {
+    if let Some(parent) = &slice.reslice {
+        let Some(parent_slice) = slicing.slices.get(parent) else {
+            return false;
+        };
+        if !slice_matches(ctx, parent_slice, item) {
+            return false;
+        }
+        // Child may add its own matcher on top of the parent.
+        if slice.match_.is_some() {
+            return slice_matches(ctx, slice, item);
+        }
+        return true;
+    }
+    if slice.match_.is_none() && slice.slice_is_constraining == Some(true) {
+        // Inherit matcher from a same-named non-constraining sibling/parent
+        // declaration if present in this layer (rare); otherwise match nothing.
+        return false;
+    }
+    slice_matches(ctx, slice, item)
+}
+
 /// Does an item belong to a slice?
 ///
 /// A missing `match` (constraining slice) matches nothing. A `match` with no
@@ -235,8 +270,86 @@ fn slice_matches(ctx: &WalkCtx<'_>, slice: &Slice, item: &Value) -> bool {
             profile_matches(ctx, item, profile)
         }
         "binding" => binding_matches(item, value),
+        "exists" => exists_matches(item, value),
+        "extension" => extension_matches(item, value),
         _ => false,
     }
+}
+
+/// `exists` matcher: every `{path, exists}` entry must hold on the item.
+fn exists_matches(item: &Value, spec: &Value) -> bool {
+    let Some(entries) = spec.as_array() else {
+        return false;
+    };
+    entries.iter().all(|entry| {
+        let expected = entry.get("exists").and_then(Value::as_bool).unwrap_or(true);
+        entry
+            .get("path")
+            .and_then(Value::as_array)
+            .is_some_and(|path| path_exists(item, path) == expected)
+    })
+}
+
+/// Walk one exists-path over instance JSON. Steps are element keys (with a
+/// choice-prefix fallback: `value` also reaches `valueQuantity`) or
+/// `{extension: url}` selections; arrays fan out existentially.
+fn path_exists(current: &Value, segs: &[Value]) -> bool {
+    let Some(seg) = segs.first() else {
+        return !current.is_null();
+    };
+    let rest = &segs[1..];
+    match current {
+        Value::Array(items) => items.iter().any(|item| path_exists(item, segs)),
+        Value::Object(map) => {
+            if let Some(key) = seg.as_str() {
+                if map.get(key).is_some_and(|v| path_exists(v, rest)) {
+                    return true;
+                }
+                map.iter().any(|(k, v)| {
+                    k.strip_prefix(key)
+                        .and_then(|s| s.chars().next())
+                        .is_some_and(char::is_uppercase)
+                        && path_exists(v, rest)
+                })
+            } else if let Some(url) = seg.get("extension").and_then(Value::as_str) {
+                map.get("extension")
+                    .and_then(Value::as_array)
+                    .is_some_and(|exts| {
+                        exts.iter().any(|e| {
+                            e.get("url").and_then(Value::as_str) == Some(url)
+                                && path_exists(e, rest)
+                        })
+                    })
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `extension` matcher: some element of the item's `extension` array has the
+/// matcher's `url` and satisfies its `pattern` (partial match) or its nested
+/// `extension` matcher (chained complex extensions).
+fn extension_matches(item: &Value, matcher: &Value) -> bool {
+    let Some(url) = matcher.get("url").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(exts) = item.get("extension").and_then(Value::as_array) else {
+        return false;
+    };
+    exts.iter().any(|e| {
+        if e.get("url").and_then(Value::as_str) != Some(url) {
+            return false;
+        }
+        if let Some(nested) = matcher.get("extension") {
+            return extension_matches(e, nested);
+        }
+        match matcher.get("pattern") {
+            Some(pattern) => is_partial_match(e, pattern),
+            None => true,
+        }
+    })
 }
 
 /// Infer FHIR type codes from a JSON value (resourceType, primitives, Coding).
@@ -261,7 +374,12 @@ fn json_fhir_types(item: &Value) -> Vec<String> {
         Value::Bool(_) => vec!["boolean".into()],
         Value::Number(n) => {
             if n.is_i64() || n.is_u64() {
-                vec!["integer".into(), "positiveInt".into(), "unsignedInt".into(), "decimal".into()]
+                vec![
+                    "integer".into(),
+                    "positiveInt".into(),
+                    "unsignedInt".into(),
+                    "decimal".into(),
+                ]
             } else {
                 vec!["decimal".into()]
             }

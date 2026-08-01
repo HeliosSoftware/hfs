@@ -1,0 +1,93 @@
+{
+  "resourceType": "StructureDefinition",
+  "id": "exists-extension-discriminators",
+  "url": "http://example.org/StructureDefinition/exists-extension-discriminators",
+  "name": "ExistsExtensionDiscriminators",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Observation",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+  "derivation": "constraint",
+  "differential": {
+    "element": [
+      { "id": "Observation", "path": "Observation" },
+      {
+        "id": "Observation.component",
+        "path": "Observation.component",
+        "slicing": {
+          "discriminator": [{ "type": "exists", "path": "value" }],
+          "rules": "open"
+        }
+      },
+      {
+        "id": "Observation.component:withValue",
+        "path": "Observation.component",
+        "sliceName": "withValue",
+        "min": 1,
+        "max": "*"
+      },
+      {
+        "id": "Observation.component:withValue.value[x]",
+        "path": "Observation.component.value[x]",
+        "min": 1,
+        "type": [{ "code": "Quantity" }]
+      },
+      {
+        "id": "Observation.component:noValue",
+        "path": "Observation.component",
+        "sliceName": "noValue",
+        "min": 0,
+        "max": "*"
+      },
+      {
+        "id": "Observation.component:noValue.value[x]",
+        "path": "Observation.component.value[x]",
+        "max": "0"
+      },
+      {
+        "id": "Observation.identifier",
+        "path": "Observation.identifier",
+        "slicing": {
+          "discriminator": [
+            { "type": "value", "path": "extension('http://example.org/ext-kind').value" }
+          ],
+          "rules": "open"
+        }
+      },
+      {
+        "id": "Observation.identifier:kindA",
+        "path": "Observation.identifier",
+        "sliceName": "kindA",
+        "min": 0,
+        "max": "1"
+      },
+      {
+        "id": "Observation.identifier:kindA.extension",
+        "path": "Observation.identifier.extension",
+        "slicing": {
+          "discriminator": [{ "type": "value", "path": "url" }],
+          "rules": "open"
+        }
+      },
+      {
+        "id": "Observation.identifier:kindA.extension:kind",
+        "path": "Observation.identifier.extension",
+        "sliceName": "kind",
+        "min": 1,
+        "max": "1"
+      },
+      {
+        "id": "Observation.identifier:kindA.extension:kind.url",
+        "path": "Observation.identifier.extension.url",
+        "fixedUri": "http://example.org/ext-kind"
+      },
+      {
+        "id": "Observation.identifier:kindA.extension:kind.value[x]",
+        "path": "Observation.identifier.extension.value[x]",
+        "type": [{ "code": "string" }],
+        "fixedString": "A"
+      }
+    ]
+  }
+}

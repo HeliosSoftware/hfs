@@ -5,10 +5,11 @@
 //! with exact deep equality on the serialized form, so every mapping rule is
 //! pinned: shape (base.max → array), min → parent required (choice base name
 //! for `foo[x]`), max 0 → parent excluded, choice expansion, discriminator →
-//! pattern match, extension slicing → extensions sugar, contentReference →
-//! elementReference, targetProfile → refers, binding/constraint carrying
-//! (ele-1/ext-1 dropped on non-root elements), and primitive regex
-//! extraction.
+//! pattern / type / profile / binding / exists / extension match, extension
+//! slicing → extensions sugar, contentReference → elementReference,
+//! targetProfile → refers,
+//! binding/constraint carrying (ele-1/ext-1 dropped on non-root elements),
+//! and primitive regex extraction.
 
 use helios_fhir_validator::converter::convert;
 use serde_json::{Value, json};
@@ -186,6 +187,204 @@ fn converts_primitive_with_regex() {
         "derivation": "specialization",
         "type": "string",
         "regex": "[ \\r\\n\\t\\S]+"
+    });
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn converts_type_and_profile_slice_discriminators() {
+    let actual = convert_to_value("slice-discriminators.json");
+    let expected = json!({
+        "url": "http://example.org/StructureDefinition/slice-discriminators",
+        "name": "SliceDiscriminators",
+        "base": "http://hl7.org/fhir/StructureDefinition/Bundle",
+        "kind": "resource",
+        "derivation": "constraint",
+        "type": "Bundle",
+        "elements": {
+            "entry": {
+                "slicing": {
+                    "slices": {
+                        "patient": {
+                            "match": { "type": "type", "value": "Patient" },
+                            "min": 1,
+                            "max": 1,
+                            "schema": {
+                                "elements": {
+                                    "resource": { "type": "Patient" }
+                                },
+                                "required": ["resource"]
+                            }
+                        },
+                        "observation": {
+                            "match": { "type": "type", "value": "Observation" },
+                            "min": 0,
+                            "max": 1,
+                            "schema": {
+                                "elements": {
+                                    "resource": { "type": "Observation" }
+                                }
+                            }
+                        }
+                    },
+                    "rules": "closed",
+                    "ordered": false
+                }
+            },
+            "identifier": {
+                "slicing": {
+                    "slices": {
+                        "org": {
+                            "match": {
+                                "type": "profile",
+                                "value": "http://example.org/StructureDefinition/org-ref"
+                            },
+                            "min": 0,
+                            "max": 1,
+                            "schema": {
+                                "elements": {
+                                    "assigner": {
+                                        "type": "Reference",
+                                        "refers": [
+                                            "http://example.org/StructureDefinition/org-ref"
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "rules": "open"
+                }
+            }
+        }
+    });
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn converts_exists_and_extension_path_discriminators() {
+    let actual = convert_to_value("exists-extension-discriminators.json");
+    let expected = json!({
+        "url": "http://example.org/StructureDefinition/exists-extension-discriminators",
+        "name": "ExistsExtensionDiscriminators",
+        "base": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "kind": "resource",
+        "derivation": "constraint",
+        "type": "Observation",
+        "elements": {
+            "component": {
+                "slicing": {
+                    "slices": {
+                        "withValue": {
+                            "match": {
+                                "type": "exists",
+                                "value": [{ "path": ["value"], "exists": true }]
+                            },
+                            "min": 1,
+                            "schema": {
+                                "required": ["value"],
+                                "elements": {
+                                    "value": { "choices": ["valueQuantity"] },
+                                    "valueQuantity": { "type": "Quantity", "choiceOf": "value" }
+                                }
+                            }
+                        },
+                        "noValue": {
+                            "match": {
+                                "type": "exists",
+                                "value": [{ "path": ["value"], "exists": false }]
+                            },
+                            "min": 0,
+                            "schema": { "excluded": ["value"] }
+                        }
+                    },
+                    "rules": "open"
+                }
+            },
+            "identifier": {
+                "slicing": {
+                    "slices": {
+                        "kindA": {
+                            "match": {
+                                "type": "extension",
+                                "value": {
+                                    "url": "http://example.org/ext-kind",
+                                    "pattern": { "valueString": "A" }
+                                }
+                            },
+                            "min": 0,
+                            "max": 1,
+                            "schema": {
+                                "elements": {
+                                    "extension": {
+                                        "slicing": {
+                                            "slices": {
+                                                "kind": {
+                                                    "match": {
+                                                        "type": "pattern",
+                                                        "value": { "url": "http://example.org/ext-kind" }
+                                                    },
+                                                    "min": 1,
+                                                    "max": 1,
+                                                    "schema": {
+                                                        "elements": {
+                                                            "url": { "fixed": "http://example.org/ext-kind" },
+                                                            "value": { "choices": ["valueString"] },
+                                                            "valueString": {
+                                                                "type": "string",
+                                                                "choiceOf": "value",
+                                                                "fixed": "A"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            "rules": "open"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "rules": "open"
+                }
+            }
+        }
+    });
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn converts_binding_slice_discriminator() {
+    let actual = convert_to_value("binding-slice.json");
+    let expected = json!({
+        "url": "http://example.org/StructureDefinition/binding-slice",
+        "name": "BindingSlice",
+        "base": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "kind": "resource",
+        "derivation": "constraint",
+        "type": "Observation",
+        "elements": {
+            "category": {
+                "array": true,
+                "slicing": {
+                    "slices": {
+                        "laboratory": {
+                            "match": { "type": "binding", "value": "laboratory" },
+                            "min": 1,
+                            "max": 1,
+                            "schema": {
+                                "binding": {
+                                    "valueSet": "laboratory",
+                                    "strength": "required"
+                                }
+                            }
+                        }
+                    },
+                    "rules": "open"
+                }
+            }
+        }
     });
     assert_eq!(actual, expected);
 }

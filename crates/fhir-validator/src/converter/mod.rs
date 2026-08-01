@@ -94,7 +94,12 @@ pub(crate) struct Ed {
     pub binding: Option<EdBinding>,
     #[serde(default)]
     pub constraint: Vec<EdConstraint>,
-    /// Everything else — scanned for `fixed[x]` / `pattern[x]`.
+    #[serde(rename = "maxLength")]
+    pub max_length: Option<u64>,
+    #[serde(rename = "sliceIsConstraining")]
+    pub slice_is_constraining: Option<bool>,
+    /// Everything else — scanned for `fixed[x]` / `pattern[x]` /
+    /// `minValue[x]` / `maxValue[x]`.
     #[serde(flatten)]
     pub rest: serde_json::Map<String, Value>,
 }

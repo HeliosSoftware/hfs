@@ -4,7 +4,8 @@
 //! These fixtures pin behavior the upstream conformance suite leaves
 //! unspecified: `excluded`, numeric array cardinality messages, fixed/pattern
 //! messages, slicing rules (closed/openAtEnd/ordered/@default, prohibited
-//! `max: 0` slices), primitive-extension sidecars (`_field`),
+//! `max: 0` slices), slice matchers (`type` / `profile` / `binding` and
+//! extension url/profile/sugar), primitive-extension sidecars (`_field`),
 //! `elementReference` recursion, and required-satisfied-by-choice-branch.
 //! Same fixture format and exact-match contract as the upstream suite.
 
@@ -37,6 +38,26 @@ fn extended_choice_required() {
 #[test]
 fn extended_slicing_rules() {
     run_extended("slicing_rules.json");
+}
+
+#[test]
+fn extended_slice_matchers() {
+    run_extended("slice_matchers.json");
+}
+
+#[test]
+fn extended_exists_extension_matchers() {
+    run_extended("exists_extension_matchers.json");
+}
+
+#[test]
+fn extended_value_keywords() {
+    run_extended("value_keywords.json");
+}
+
+#[test]
+fn extended_reslicing() {
+    run_extended("reslicing.json");
 }
 
 #[test]

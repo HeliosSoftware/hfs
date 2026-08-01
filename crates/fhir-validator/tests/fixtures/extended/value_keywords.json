@@ -1,0 +1,70 @@
+{
+  "desc": "maxLength / minValue / maxValue — Helios extended",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "integer": { "kind": "primitive-type" },
+    "date": { "kind": "primitive-type" },
+    "Resource": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "name": { "type": "string", "maxLength": 5 },
+        "count": { "type": "integer", "minValue": 1, "maxValue": 10 },
+        "start": { "type": "date", "minValue": "2020-01-01", "maxValue": "2020-12-31" }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "maxLength ok",
+      "data": { "resourceType": "Resource", "name": "abcde" }
+    },
+    {
+      "desc": "maxLength exceeded",
+      "data": { "resourceType": "Resource", "name": "abcdef" },
+      "errors": [
+        {
+          "type": "max-length",
+          "path": "Resource.name",
+          "message": "string length 6 exceeds maxLength 5"
+        }
+      ]
+    },
+    {
+      "desc": "minValue / maxValue ok",
+      "data": { "resourceType": "Resource", "count": 5 }
+    },
+    {
+      "desc": "minValue violated",
+      "data": { "resourceType": "Resource", "count": 0 },
+      "errors": [
+        {
+          "type": "min-value",
+          "path": "Resource.count",
+          "message": "value '0' is less than minValue '1'"
+        }
+      ]
+    },
+    {
+      "desc": "maxValue violated",
+      "data": { "resourceType": "Resource", "count": 11 },
+      "errors": [
+        {
+          "type": "max-value",
+          "path": "Resource.count",
+          "message": "value '11' is greater than maxValue '10'"
+        }
+      ]
+    },
+    {
+      "desc": "date minValue violated",
+      "data": { "resourceType": "Resource", "start": "2019-12-31" },
+      "errors": [
+        {
+          "type": "min-value",
+          "path": "Resource.start",
+          "message": "value '2019-12-31' is less than minValue '2020-01-01'"
+        }
+      ]
+    }
+  ]
+}

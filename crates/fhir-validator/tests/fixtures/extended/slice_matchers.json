@@ -1,0 +1,727 @@
+{
+  "desc": "slice matchers — Helios extended (type / profile / binding discriminators, extension url/profile matching, closed extension slices; pattern matchers are covered by upstream 5_slices + slicing_rules)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "code": { "kind": "primitive-type" },
+    "uri": { "kind": "primitive-type" },
+    "Extension": {
+      "elements": {
+        "url": { "type": "uri" },
+        "value": { "choices": ["valueString", "valueCode", "valueCoding"] },
+        "valueString": { "choiceOf": "value", "type": "string" },
+        "valueCode": { "choiceOf": "value", "type": "code" },
+        "valueCoding": { "choiceOf": "value", "type": "Coding" }
+      }
+    },
+    "Coding": {
+      "elements": {
+        "system": { "type": "uri" },
+        "code": { "type": "code" },
+        "display": { "type": "string" }
+      }
+    },
+    "Patient": {
+      "type": "Patient",
+      "name": "Patient",
+      "kind": "resource",
+      "elements": {
+        "resourceType": { "type": "string" },
+        "id": { "type": "string" }
+      }
+    },
+    "Observation": {
+      "type": "Observation",
+      "name": "Observation",
+      "kind": "resource",
+      "elements": {
+        "resourceType": { "type": "string" },
+        "id": { "type": "string" },
+        "status": { "type": "code" }
+      }
+    },
+    "http://example.org/StructureDefinition/ext-race": {
+      "kind": "extension",
+      "url": "http://example.org/StructureDefinition/ext-race",
+      "elements": {
+        "url": { "type": "uri" },
+        "value": { "choices": ["valueCode"] },
+        "valueCode": { "choiceOf": "value", "type": "code" }
+      }
+    },
+    "http://example.org/StructureDefinition/ext-religion": {
+      "kind": "extension",
+      "url": "http://example.org/StructureDefinition/ext-religion",
+      "elements": {
+        "url": { "type": "uri" },
+        "value": { "choices": ["valueString"] },
+        "valueString": { "choiceOf": "value", "type": "string" }
+      }
+    },
+
+    "TypeSliceProfile": {
+      "base": "BundleLike",
+      "elements": {
+        "entry": {
+          "slicing": {
+            "rules": "closed",
+            "slices": {
+              "patient": {
+                "match": { "type": "type", "value": "Patient" },
+                "min": 1,
+                "max": 1,
+                "schema": {
+                  "required": ["id"],
+                  "elements": { "id": { "type": "string" } }
+                }
+              },
+              "observation": {
+                "match": { "type": "type", "value": "Observation" },
+                "min": 0,
+                "max": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "BundleLike": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "entry": {
+          "array": true,
+          "elements": {
+            "resourceType": { "type": "string" },
+            "id": { "type": "string" },
+            "status": { "type": "code" }
+          }
+        }
+      }
+    },
+
+    "ProfileMetaSlice": {
+      "base": "ResourceWithContained",
+      "elements": {
+        "contained": {
+          "slicing": {
+            "slices": {
+              "typedPatient": {
+                "match": {
+                  "type": "profile",
+                  "value": "http://example.org/StructureDefinition/mini-patient"
+                },
+                "min": 1,
+                "max": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "ResourceWithContained": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "contained": {
+          "array": true,
+          "elements": {
+            "resourceType": { "type": "string" },
+            "id": { "type": "string" },
+            "status": { "type": "code" },
+            "meta": {
+              "elements": {
+                "profile": { "array": true }
+              }
+            }
+          }
+        }
+      }
+    },
+    "http://example.org/StructureDefinition/mini-patient": {
+      "url": "http://example.org/StructureDefinition/mini-patient",
+      "type": "Patient",
+      "name": "MiniPatient",
+      "kind": "resource"
+    },
+
+    "ExtensionProfileSlice": {
+      "base": "ResourceWithExt",
+      "elements": {
+        "extension": {
+          "slicing": {
+            "slices": {
+              "race": {
+                "match": {
+                  "type": "profile",
+                  "value": "http://example.org/StructureDefinition/ext-race"
+                },
+                "min": 1,
+                "max": 1,
+                "schema": {
+                  "required": ["valueCode"],
+                  "elements": {
+                    "valueCode": { "type": "code" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ResourceWithExt": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "extension": { "type": "Extension", "array": true }
+      }
+    },
+
+    "ExtensionSugarProfile": {
+      "base": "ResourceWithExt",
+      "extensions": {
+        "race": {
+          "url": "http://example.org/StructureDefinition/ext-race",
+          "min": 1,
+          "max": 1
+        },
+        "religion": {
+          "url": "http://example.org/StructureDefinition/ext-religion",
+          "min": 0,
+          "max": 1
+        }
+      }
+    },
+
+    "ClosedExtensionProfile": {
+      "base": "ResourceWithExt",
+      "elements": {
+        "extension": {
+          "slicing": {
+            "rules": "closed",
+            "slices": {
+              "race": {
+                "match": {
+                  "type": "pattern",
+                  "value": { "url": "http://example.org/StructureDefinition/ext-race" }
+                },
+                "min": 1,
+                "max": 1,
+                "schema": {
+                  "required": ["valueCode"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "BindingCodeSlice": {
+      "base": "ResourceWithScalarCodes",
+      "elements": {
+        "category": {
+          "slicing": {
+            "slices": {
+              "lab": {
+                "match": { "type": "binding", "value": "laboratory" },
+                "min": 1,
+                "max": 1
+              },
+              "vital": {
+                "match": { "type": "binding", "value": "vital-signs" },
+                "min": 0,
+                "max": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "ResourceWithScalarCodes": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "category": { "array": true }
+      }
+    },
+    "ResourceWithCodes": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "category": {
+          "array": true,
+          "elements": {
+            "system": { "type": "uri" },
+            "code": { "type": "code" },
+            "text": { "type": "string" },
+            "coding": {
+              "array": true,
+              "elements": {
+                "system": { "type": "uri" },
+                "code": { "type": "code" }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "BindingCodeObjectSlice": {
+      "base": "ResourceWithCodes",
+      "elements": {
+        "category": {
+          "slicing": {
+            "slices": {
+              "lab": {
+                "match": { "type": "binding", "value": "laboratory" },
+                "min": 1,
+                "max": 1
+              },
+              "vital": {
+                "match": { "type": "binding", "value": "vital-signs" },
+                "min": 0,
+                "max": 1
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "BindingValueSetSlice": {
+      "base": "ResourceWithScalarCodes",
+      "elements": {
+        "category": {
+          "slicing": {
+            "slices": {
+              "fromVs": {
+                "match": {
+                  "type": "binding",
+                  "value": "http://hl7.org/fhir/ValueSet/observation-category"
+                },
+                "min": 1
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "BindingValueSetObjectSlice": {
+      "base": "ResourceWithCodes",
+      "elements": {
+        "category": {
+          "slicing": {
+            "slices": {
+              "fromVs": {
+                "match": {
+                  "type": "binding",
+                  "value": "http://hl7.org/fhir/ValueSet/observation-category"
+                },
+                "min": 1
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "CodingTypeSlice": {
+      "base": "ResourceWithCodes",
+      "elements": {
+        "category": {
+          "slicing": {
+            "rules": "closed",
+            "slices": {
+              "coding": {
+                "match": { "type": "type", "value": "Coding" },
+                "min": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "type: Patient + Observation entries match",
+      "schemas": ["TypeSliceProfile"],
+      "data": {
+        "resourceType": "BundleLike",
+        "entry": [
+          { "resourceType": "Patient", "id": "p1" },
+          { "resourceType": "Observation", "id": "o1", "status": "final" }
+        ]
+      }
+    },
+    {
+      "desc": "type: missing required Patient slice",
+      "schemas": ["TypeSliceProfile"],
+      "data": {
+        "resourceType": "BundleLike",
+        "entry": [{ "resourceType": "Observation", "id": "o1" }]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "BundleLike.entry",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+    {
+      "desc": "type: Patient slice schema requires id",
+      "schemas": ["TypeSliceProfile"],
+      "data": {
+        "resourceType": "BundleLike",
+        "entry": [{ "resourceType": "Patient" }]
+      },
+      "errors": [
+        {
+          "type": "required",
+          "path": "BundleLike.entry.0.id",
+          "message": "id is required"
+        }
+      ]
+    },
+    {
+      "desc": "type: closed rejects non-Patient/Observation",
+      "schemas": ["TypeSliceProfile"],
+      "data": {
+        "resourceType": "BundleLike",
+        "entry": [
+          { "resourceType": "Patient", "id": "p1" },
+          { "resourceType": "Practitioner", "id": "x" }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-unmatched",
+          "path": "BundleLike.entry.1",
+          "message": "item does not match any slice in closed slicing"
+        }
+      ]
+    },
+    {
+      "desc": "type: Coding inferred from system+code",
+      "schemas": ["CodingTypeSlice"],
+      "data": {
+        "resourceType": "ResourceWithCodes",
+        "category": [{ "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "laboratory" }]
+      }
+    },
+    {
+      "desc": "type: plain object is not Coding under closed type slicing",
+      "schemas": ["CodingTypeSlice"],
+      "data": {
+        "resourceType": "ResourceWithCodes",
+        "category": [{ "text": "lab" }]
+      },
+      "errors": [
+        {
+          "type": "slice-unmatched",
+          "path": "ResourceWithCodes.category.0",
+          "message": "item does not match any slice in closed slicing"
+        },
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithCodes.category",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+
+    {
+      "desc": "profile: meta.profile claim matches",
+      "schemas": ["ProfileMetaSlice"],
+      "data": {
+        "resourceType": "ResourceWithContained",
+        "contained": [
+          {
+            "resourceType": "Patient",
+            "meta": {
+              "profile": ["http://example.org/StructureDefinition/mini-patient"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "desc": "profile: resolvable schema type matches resourceType",
+      "schemas": ["ProfileMetaSlice"],
+      "data": {
+        "resourceType": "ResourceWithContained",
+        "contained": [{ "resourceType": "Patient", "id": "p1" }]
+      }
+    },
+    {
+      "desc": "profile: Observation does not match Patient profile slice",
+      "schemas": ["ProfileMetaSlice"],
+      "data": {
+        "resourceType": "ResourceWithContained",
+        "contained": [{ "resourceType": "Observation", "status": "final" }]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithContained.contained",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+
+    {
+      "desc": "profile: extension url equals profile canonical",
+      "schemas": ["ExtensionProfileSlice"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-race",
+            "valueCode": "2028-9"
+          }
+        ]
+      }
+    },
+    {
+      "desc": "profile: wrong extension url does not satisfy required slice",
+      "schemas": ["ExtensionProfileSlice"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-religion",
+            "valueString": "none"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithExt.extension",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+    {
+      "desc": "profile: matched extension slice schema requires valueCode",
+      "schemas": ["ExtensionProfileSlice"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-race"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "required",
+          "path": "ResourceWithExt.extension.0.valueCode",
+          "message": "valueCode is required"
+        }
+      ]
+    },
+
+    {
+      "desc": "extensions sugar: required race present; optional religion allowed",
+      "schemas": ["ExtensionSugarProfile"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-race",
+            "valueCode": "2028-9"
+          },
+          {
+            "url": "http://example.org/StructureDefinition/ext-religion",
+            "valueString": "none"
+          },
+          {
+            "url": "http://example.org/other",
+            "valueString": "open slicing allows unknown"
+          }
+        ]
+      }
+    },
+    {
+      "desc": "extensions sugar: missing required race",
+      "schemas": ["ExtensionSugarProfile"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-religion",
+            "valueString": "none"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithExt.extension",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+    {
+      "desc": "extensions sugar: resolved extension schema rejects excluded choice",
+      "schemas": ["ExtensionSugarProfile"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-race",
+            "valueString": "wrong"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "choice-excluded",
+          "path": "ResourceWithExt.extension.0.valueString",
+          "message": "valueString is excluded choice"
+        }
+      ]
+    },
+    {
+      "desc": "extensions sugar: duplicate race exceeds max 1",
+      "schemas": ["ExtensionSugarProfile"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-race",
+            "valueCode": "a"
+          },
+          {
+            "url": "http://example.org/StructureDefinition/ext-race",
+            "valueCode": "b"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithExt.extension",
+          "message": "Slice defines the following max cardinality: '1', actual cardinality: '2'"
+        }
+      ]
+    },
+
+    {
+      "desc": "closed extension pattern: only declared url allowed",
+      "schemas": ["ClosedExtensionProfile"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-race",
+            "valueCode": "2028-9"
+          }
+        ]
+      }
+    },
+    {
+      "desc": "closed extension pattern: unknown url rejected",
+      "schemas": ["ClosedExtensionProfile"],
+      "data": {
+        "resourceType": "ResourceWithExt",
+        "extension": [
+          {
+            "url": "http://example.org/StructureDefinition/ext-race",
+            "valueCode": "2028-9"
+          },
+          {
+            "url": "http://example.org/other",
+            "valueString": "nope"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-unmatched",
+          "path": "ResourceWithExt.extension.1",
+          "message": "item does not match any slice in closed slicing"
+        }
+      ]
+    },
+
+    {
+      "desc": "binding: string code matches",
+      "schemas": ["BindingCodeSlice"],
+      "data": {
+        "resourceType": "ResourceWithScalarCodes",
+        "category": ["laboratory"]
+      }
+    },
+    {
+      "desc": "binding: Coding.code matches",
+      "schemas": ["BindingCodeObjectSlice"],
+      "data": {
+        "resourceType": "ResourceWithCodes",
+        "category": [
+          { "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "laboratory" },
+          { "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs" }
+        ]
+      }
+    },
+    {
+      "desc": "binding: CodeableConcept.coding[].code matches",
+      "schemas": ["BindingCodeObjectSlice"],
+      "data": {
+        "resourceType": "ResourceWithCodes",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "desc": "binding: wrong code does not satisfy required slice",
+      "schemas": ["BindingCodeSlice"],
+      "data": {
+        "resourceType": "ResourceWithScalarCodes",
+        "category": ["survey"]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithScalarCodes.category",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+    {
+      "desc": "binding: ValueSet URL does not match Coding from that set (no expansion here)",
+      "schemas": ["BindingValueSetObjectSlice"],
+      "data": {
+        "resourceType": "ResourceWithCodes",
+        "category": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+            "code": "laboratory"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithCodes.category",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+    {
+      "desc": "binding: ValueSet URL matches only when item literally carries that URL",
+      "schemas": ["BindingValueSetSlice"],
+      "data": {
+        "resourceType": "ResourceWithScalarCodes",
+        "category": ["http://hl7.org/fhir/ValueSet/observation-category"]
+      }
+    }
+  ]
+}
