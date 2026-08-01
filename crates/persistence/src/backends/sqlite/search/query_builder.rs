@@ -382,8 +382,18 @@ impl QueryBuilder {
         param: &SearchParameter,
         param_offset: usize,
     ) -> Option<SqlFragment> {
-        // Handle special parameters
-        if param.name.starts_with('_') {
+        // Handle special parameters. `_tag`/`_profile`/`_security`/`_source`
+        // are NOT special on the query side: the extractor indexes them from
+        // meta like any typed parameter (rows in search_index under their own
+        // param_name), so they take the regular token/uri path below. Routing
+        // them into the special handler silently dropped the condition and
+        // returned the unfiltered result set (#474).
+        if param.name.starts_with('_')
+            && !matches!(
+                param.name.as_str(),
+                "_tag" | "_profile" | "_security" | "_source"
+            )
+        {
             return self.build_special_parameter_condition(param, param_offset);
         }
 
