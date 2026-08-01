@@ -955,7 +955,11 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ENABLE_VERSIONING", default_value = "true")]
     pub enable_versioning: bool,
 
-    /// Require If-Match header for updates.
+    /// Require If-Match header for updates and deletes.
+    ///
+    /// Honored by `PUT` and by `DELETE` (issue #312 — before that, deletes were
+    /// exempt, so a deployment that had opted into mandatory preconditions still
+    /// got unconditional deletes). `PATCH` does not yet consult it.
     #[arg(long, env = "HFS_REQUIRE_IF_MATCH", default_value = "false")]
     pub require_if_match: bool,
 

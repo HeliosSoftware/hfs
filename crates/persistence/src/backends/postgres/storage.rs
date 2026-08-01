@@ -551,6 +551,16 @@ impl ResourceStorage for PostgresBackend {
 
             // Soft delete the resource, guarded by the version we just read
             // (CAS) so racing writers cannot both assign the same version.
+            //
+            // Without the `version_id`/`is_deleted` predicates a concurrent
+            // writer landing between the SELECT above and this UPDATE is
+            // silently clobbered, and `new_version` — computed from the stale
+            // read — makes the history INSERT below collide with the row that
+            // writer already wrote, tripping `PRIMARY KEY (tenant_id,
+            // resource_type, id, version_id)` (schema.rs). MongoDB and S3
+            // already guarded their equivalent writes (a `version_id` term in
+            // the update filter, and a conditional PUT respectively); this
+            // brings PostgreSQL to parity.
             let updated = txn
                 .execute(
                     "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
@@ -990,9 +1000,21 @@ impl ResourceStorage for PostgresBackend {
                 .await
                 .map_err(|e| internal_error(format!("purge delete: {e}")))?;
         }
+        // Per-user settings are keyed by user, not tenant, so they are not swept
+        // by the deletes above — but a client stores PHI-derived query strings in
+        // them, which belong to this tenant (issue #313). Same transaction, so an
+        // offboarding cannot half-apply.
+        let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;
         tx.commit()
             .await
             .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                documents = settings,
+                "purged tenant-scoped content from user settings documents"
+            );
+        }
         Ok(removed.max(0) as u64)
     }
 }

@@ -72,15 +72,24 @@
 
     <div class="editor-tree">
       {% for row in rows %}
-      <div class="editor-row{% if row.is_extension %} editor-row--extension{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
+      <div class="editor-row{% if row.is_extension %} editor-row--extension{% endif %}{% if row.must_support %} editor-row--must-support{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
            style="padding-left: {{ row.indent }}px"
            data-path="{{ row.path }}">
 
         <div class="editor-row__head">
+          {% if !row.short.is_empty() %}
+          <span class="editor-row__label" title="{{ row.label }}">{{ row.short }}</span>
+          <span class="editor-row__name">{{ row.label }}</span>
+          {% else %}
           <span class="editor-row__label">{{ row.label }}</span>
+          {% endif %}
 
           {% if !row.type_label.is_empty() %}
           <span class="editor-row__type">{{ row.type_label }}</span>
+          {% endif %}
+
+          {% if row.must_support %}
+          <span class="editor-row__ms" title="{{ i18n.t("editor-must-support-hint") }}">{{ i18n.t("editor-must-support-badge") }}</span>
           {% endif %}
 
           {% if row.is_modifier %}
@@ -137,10 +146,13 @@
                 </select>
               </div>
               {% else %}
-              <button type="button" class="editor-add__item" data-add-name="{{ option.name }}"
-                      data-add="{{ row.path }}" data-name="{{ option.name }}">
-                <span class="editor-add__name">{{ option.name }}{% if option.required %} <em>*</em>{% endif %}</span>
+              <button type="button" class="editor-add__item{% if option.must_support %} editor-add__item--ms{% endif %}" data-add-name="{{ option.name }}"
+                      data-add="{{ row.path }}" data-name="{{ option.name }}"{% if !option.short.is_empty() %} title="{{ option.short }}"{% endif %}>
+                <span class="editor-add__name">{{ option.name }}{% if option.required %} <em>*</em>{% endif %}{% if option.must_support %} <span class="editor-add__ms">{{ i18n.t("editor-must-support-badge") }}</span>{% endif %}</span>
                 <span class="editor-add__type">{{ option.type_label }}</span>
+                {% if !option.short.is_empty() %}
+                <span class="editor-add__short">{{ option.short }}</span>
+                {% endif %}
                 {% if option.kind == "another" %}
                 <span class="editor-add__again">{{ i18n.t("editor-add-another") }}</span>
                 {% endif %}

@@ -306,6 +306,14 @@ jobs:
       # killed mid-test.
       MAX_CONTAINER_AGE_MIN: 90
     steps:
+      # Only the composite action is needed here, not the tree — a cone-mode
+      # sparse checkout keeps this job as cheap as it was before it had any
+      # checkout at all.
+      - name: Check out the Docker host GC action
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/actions
+
       - name: Reap this run's testcontainers
         run: |
           # testcontainers-rs removes a container only from `Drop for
@@ -348,6 +356,14 @@ jobs:
             fi
           done
           echo "Swept ${reaped} orphaned testcontainer(s)."
+
+      # Last, so it runs after the reaps above have released this run's volumes.
+      # `ci.yml` fires on every push and PR, which makes this the sweep that
+      # actually keeps the shared host below its quota — the other workflows
+      # carry it too, but far less often.
+      - name: GC the Docker host
+        if: always()
+        uses: ./.github/actions/docker-host-gc
 
   test-python:
     name: Test Python

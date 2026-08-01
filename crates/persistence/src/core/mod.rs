@@ -186,6 +186,9 @@ pub use transaction::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     IsolationLevel, LockingStrategy, Transaction, TransactionOptions, TransactionProvider,
 };
-pub use user_settings::{SettingsStore, StoredUserSettings, apply_merge_patch};
+pub use user_settings::{
+    BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,
+    normalize_legacy, project_for_tenant, purge_tenant_subtree, scope_merge_patch, stored_for_put,
+};
 pub use versioned::{VersionConflictInfo, VersionedStorage, check_version_match, normalize_etag};
 pub use ws_binding_tokens::WsBindingTokenStore;
