@@ -166,8 +166,7 @@ impl PackageCache {
                 "directory {} has multiple package tarballs ({}); pass one explicitly \
                  (prefer package.tgz)",
                 path.display(),
-                many
-                    .iter()
+                many.iter()
                     .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
                     .collect::<Vec<_>>()
                     .join(", ")

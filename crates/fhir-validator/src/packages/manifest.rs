@@ -68,10 +68,7 @@ impl PackageManifest {
     pub fn load(path: &Path) -> Result<Self, PackageError> {
         let text = fs::read_to_string(path).map_err(|e| PackageError::io(path, e))?;
         let manifest: Self = serde_json::from_str(&text).map_err(|e| {
-            PackageError::Manifest(format!(
-                "failed to parse {}: {e}",
-                path.display()
-            ))
+            PackageError::Manifest(format!("failed to parse {}: {e}", path.display()))
         })?;
         if manifest.name.is_empty() || manifest.version.is_empty() {
             return Err(PackageError::Manifest(format!(

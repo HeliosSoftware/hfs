@@ -54,9 +54,7 @@ pub fn materialize_package(
                 }
             }
             Err(e) => {
-                report
-                    .convert_errors
-                    .push(format!("{}: {e}", sd_label(sd)));
+                report.convert_errors.push(format!("{}: {e}", sd_label(sd)));
             }
         }
     }
