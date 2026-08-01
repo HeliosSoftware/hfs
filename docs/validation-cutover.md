@@ -15,17 +15,17 @@ enforcement. The Atrius `fhir-validation` crate and `HFS_PROFILE_MANIFEST` /
 
 See [crates/fhir-validator/docs/packages.md](../crates/fhir-validator/docs/packages.md).
 
-### Atrius IG on disk (publisher)
+### Sample package (tests / smoke)
 
 ```bash
 export HFS_FHIR_PACKAGE_CACHE=$PWD/fhir-package-cache
-export HFS_FHIR_PACKAGE_SOURCES=/Users/sandhu/AtriusIGDraft/output/atrius.fhir.r4.india.en.tgz
-# or: .../output/package.tgz   or   .../output  (uses package.tgz when unique)
+export HFS_FHIR_PACKAGE_SOURCES=crates/fhir-validator/tests/fixtures/packages/sample.tgz
 export HFS_VALIDATION_MODE=enforce
 ```
 
-Do **not** expect the whole HTML `output/` tree to be scanned as a package unless
-it contains `package.tgz` (or a single `*.tgz`). Prefer the `.tgz` path.
+For a full IG publisher tree, prefer `output/package.tgz` (or a single `*.tgz`).
+Do **not** treat the whole HTML `output/` tree as a package unless it contains
+that tarball.
 
 ## Staging checklist
 

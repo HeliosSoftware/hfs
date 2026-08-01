@@ -24,14 +24,25 @@ use helios_fhir_validator::{
     CodedValue, CompositeResolver, EffectHandlers, ErrorKind, PackageCache, PackageId, PackageRef,
     SchemaRegistry, SchemaResolver, Severity, TerminologyError, TerminologyProvider,
     UnknownProfilePolicy, ValidationError, ValidationOptions, Validator, dotted_to_fhirpath,
-    materialize_package_layers,
+    materialize_package_layers_by_version, validate_questionnaire_response,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// How terminology bindings are checked.
+#[derive(Clone)]
+enum TerminologyMode {
+    Off,
+    /// Offline core ValueSets — selected per request FHIR version.
+    Embedded,
+    /// Remote `$validate-code` (version-agnostic).
+    Remote(Arc<dyn TerminologyProvider>),
+}
 
 /// Per-tenant, per-version profile registries fed from stored
 /// StructureDefinitions.
@@ -54,7 +65,7 @@ pub enum ValidationMode {
 pub struct ValidationService {
     mode: ValidationMode,
     constraint_evaluator: Option<FhirPathConstraintEvaluator>,
-    terminology: Option<Arc<dyn TerminologyProvider>>,
+    terminology: TerminologyMode,
     /// Constraint ids never evaluated (default: `dom-6`, the narrative
     /// warning that fires on almost every machine-generated resource).
     suppress_constraints: Vec<String>,
@@ -63,12 +74,24 @@ pub struct ValidationService {
     /// Validate against `meta.profile` claims.
     use_meta_profiles: bool,
     unknown_profile: UnknownProfilePolicy,
+    /// Opt-in warning enforcement for `extensible`-strength bindings.
+    extensible_bindings: bool,
+    /// Enforce `refers` target-type checks on Reference elements.
+    enforce_refers: bool,
     /// Per-tenant profile overlays, fed from stored StructureDefinition
     /// writes. `None` disables the feature.
     tenant_profiles: Option<TenantProfileMap>,
-    /// Server-wide IG/NPM package registry layers (dependents before deps).
-    /// Empty when `HFS_FHIR_PACKAGES` is unset.
-    package_layers: Vec<Arc<SchemaRegistry>>,
+    /// Server-wide IG/NPM package registry layers keyed by FHIR version
+    /// (dependents before deps). Empty when packages are unset.
+    package_layers: HashMap<FhirVersion, Vec<Arc<SchemaRegistry>>>,
+    /// Optional lookup for Questionnaire resources (QR validation).
+    questionnaire_lookup: Option<Arc<dyn QuestionnaireLookup>>,
+}
+
+/// Resolves a Questionnaire by canonical URL for QuestionnaireResponse checks.
+pub trait QuestionnaireLookup: Send + Sync {
+    /// Return the Questionnaire resource for `canonical`, if available.
+    fn get_questionnaire(&self, canonical: &str) -> Option<Value>;
 }
 
 impl Default for ValidationService {
@@ -76,13 +99,16 @@ impl Default for ValidationService {
         Self {
             mode: ValidationMode::Off,
             constraint_evaluator: Some(FhirPathConstraintEvaluator::new()),
-            terminology: None,
+            terminology: TerminologyMode::Off,
             suppress_constraints: vec!["dom-6".to_string()],
             terminology_fail_closed: false,
             use_meta_profiles: true,
             unknown_profile: UnknownProfilePolicy::Warn,
+            extensible_bindings: false,
+            enforce_refers: false,
             tenant_profiles: Some(DashMap::new()),
-            package_layers: Vec::new(),
+            package_layers: HashMap::new(),
+            questionnaire_lookup: None,
         }
     }
 }
@@ -116,23 +142,20 @@ impl ValidationService {
             "ignore" => UnknownProfilePolicy::Ignore,
             _ => UnknownProfilePolicy::Warn,
         };
-        let terminology: Option<Arc<dyn TerminologyProvider>> =
-            match (config.terminology.as_str(), terminology_server) {
-                ("remote", Some(base)) => Some(Arc::new(RemoteTerminologyProvider::new(
+        let terminology = match (config.terminology.as_str(), terminology_server) {
+            ("remote", Some(base)) => {
+                TerminologyMode::Remote(Arc::new(RemoteTerminologyProvider::new(
                     base.to_string(),
                     Duration::from_millis(config.terminology_timeout_ms),
-                ))),
-                // Offline required-binding checks against the FHIR core value
-                // sets embedded in helios-fhir-validator (no server needed).
-                ("embedded", _) => {
-                    let provider: Arc<dyn TerminologyProvider> =
-                        helios_fhir_validator::core_terminology(version);
-                    Some(provider)
-                }
-                _ => None,
-            };
+                )))
+            }
+            // Offline required-binding checks against the FHIR core value
+            // sets embedded in helios-fhir-validator (selected per request).
+            ("embedded", _) => TerminologyMode::Embedded,
+            _ => TerminologyMode::Off,
+        };
 
-        let package_layers = load_package_layers(config)?;
+        let package_layers = load_package_layers(config, version)?;
 
         Ok(Self {
             mode,
@@ -142,14 +165,23 @@ impl ValidationService {
             terminology_fail_closed: config.terminology_fail == "closed",
             use_meta_profiles: config.meta_profiles,
             unknown_profile,
+            extensible_bindings: false,
+            enforce_refers: false,
             tenant_profiles: config.stored_profiles.then(DashMap::new),
             package_layers,
+            questionnaire_lookup: None,
         })
     }
 
-    /// Replace the terminology provider (bindings stay unchecked without one).
+    /// Replace the terminology provider with a remote/custom one.
     pub fn with_terminology(mut self, provider: Arc<dyn TerminologyProvider>) -> Self {
-        self.terminology = Some(provider);
+        self.terminology = TerminologyMode::Remote(provider);
+        self
+    }
+
+    /// Install a Questionnaire lookup used for QuestionnaireResponse checks.
+    pub fn with_questionnaire_lookup(mut self, lookup: Arc<dyn QuestionnaireLookup>) -> Self {
+        self.questionnaire_lookup = Some(lookup);
         self
     }
 
@@ -170,24 +202,66 @@ impl ValidationService {
         tenant: Option<&str>,
     ) -> Vec<ValidationError> {
         let resolver = self.resolver_for(version, tenant);
-        let validator = Validator::new(resolver);
+        let validator = Validator::new(Arc::clone(&resolver));
         let opts = ValidationOptions {
             profiles,
             use_meta_profiles: self.use_meta_profiles,
             unknown_profile: self.unknown_profile,
+            enforce_refers: self.enforce_refers,
+        };
+        let embedded = match &self.terminology {
+            TerminologyMode::Embedded => Some(helios_fhir_validator::core_terminology(version)),
+            _ => None,
+        };
+        let terminology: Option<&dyn TerminologyProvider> = match (&self.terminology, &embedded) {
+            (TerminologyMode::Remote(provider), _) => Some(provider.as_ref()),
+            (TerminologyMode::Embedded, Some(provider)) => Some(provider.as_ref()),
+            _ => None,
         };
         let handlers = EffectHandlers {
             constraints: self
                 .constraint_evaluator
                 .as_ref()
                 .map(|e| e as &dyn helios_fhir_validator::ConstraintEvaluator),
-            terminology: self.terminology.as_deref(),
+            terminology,
             suppress_constraints: &self.suppress_constraints,
             terminology_fail_closed: self.terminology_fail_closed,
+            check_extensible_bindings: self.extensible_bindings,
         };
-        validator
+        let mut issues = validator
             .validate(resource, version, &opts, &handlers)
-            .await
+            .await;
+
+        if resource.get("resourceType").and_then(Value::as_str) == Some("QuestionnaireResponse") {
+            issues.extend(self.validate_qr(resource, terminology).await);
+        }
+        issues
+    }
+
+    async fn validate_qr(
+        &self,
+        qr: &Value,
+        terminology: Option<&dyn TerminologyProvider>,
+    ) -> Vec<ValidationError> {
+        let Some(canonical) = qr.get("questionnaire").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Some(lookup) = &self.questionnaire_lookup else {
+            return Vec::new();
+        };
+        let Some(questionnaire) = lookup.get_questionnaire(canonical) else {
+            return vec![
+                ValidationError::new(
+                    ErrorKind::UnknownSchema,
+                    "QuestionnaireResponse.questionnaire".into(),
+                    format!(
+                        "could not resolve Questionnaire '{canonical}' for response validation"
+                    ),
+                )
+                .with_severity(Severity::Warning),
+            ];
+        };
+        validate_questionnaire_response(qr, &questionnaire, terminology).await
     }
 
     /// Write-path gate. `Ok(())` = proceed with the write; `Err` = reject
@@ -296,20 +370,18 @@ impl ValidationService {
         Some(Arc::new(LockedRegistryResolver(registry)))
     }
 
-    /// `CompositeResolver` layers: tenant overlay, package layers (dependents
-    /// before deps), then the embedded core pack.
-    fn resolver_for(
-        &self,
-        version: FhirVersion,
-        tenant: Option<&str>,
-    ) -> Arc<dyn SchemaResolver> {
+    /// `CompositeResolver` layers: tenant overlay, package layers for
+    /// `version` (dependents before deps), then the embedded core pack.
+    fn resolver_for(&self, version: FhirVersion, tenant: Option<&str>) -> Arc<dyn SchemaResolver> {
         let core = helios_fhir_validator::packs::core_registry(version);
         let mut layers: Vec<Arc<dyn SchemaResolver>> = Vec::new();
         if let Some(overlay) = self.tenant_overlay(tenant, version) {
             layers.push(overlay);
         }
-        for pkg in &self.package_layers {
-            layers.push(Arc::clone(pkg) as Arc<dyn SchemaResolver>);
+        if let Some(pkgs) = self.package_layers.get(&version) {
+            for pkg in pkgs {
+                layers.push(Arc::clone(pkg) as Arc<dyn SchemaResolver>);
+            }
         }
         if layers.is_empty() {
             return core;
@@ -319,9 +391,25 @@ impl ValidationService {
     }
 }
 
-fn load_package_layers(config: &ValidationConfig) -> Result<Vec<Arc<SchemaRegistry>>, String> {
+fn enabled_fhir_versions() -> Vec<FhirVersion> {
+    let mut versions = Vec::new();
+    #[cfg(feature = "R4")]
+    versions.push(FhirVersion::R4);
+    #[cfg(feature = "R4B")]
+    versions.push(FhirVersion::R4B);
+    #[cfg(feature = "R5")]
+    versions.push(FhirVersion::R5);
+    #[cfg(feature = "R6")]
+    versions.push(FhirVersion::R6);
+    versions
+}
+
+fn load_package_layers(
+    config: &ValidationConfig,
+    default_version: FhirVersion,
+) -> Result<HashMap<FhirVersion, Vec<Arc<SchemaRegistry>>>, String> {
     if config.packages.is_empty() && config.package_sources.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HashMap::new());
     }
     let cache_root = config.package_cache.as_deref().ok_or_else(|| {
         "HFS_FHIR_PACKAGES / HFS_FHIR_PACKAGE_SOURCES require HFS_FHIR_PACKAGE_CACHE".to_string()
@@ -338,7 +426,7 @@ fn load_package_layers(config: &ValidationConfig) -> Result<Vec<Arc<SchemaRegist
 
     let roots = if config.packages.is_empty() {
         if sourced.is_empty() {
-            return Ok(Vec::new());
+            return Ok(HashMap::new());
         }
         sourced
     } else {
@@ -352,29 +440,19 @@ fn load_package_layers(config: &ValidationConfig) -> Result<Vec<Arc<SchemaRegist
         roots
     };
 
-    let layers = materialize_package_layers(&cache, &roots)
-        .map_err(|e| format!("FHIR package materialization failed: {e}"))?;
+    let versions = enabled_fhir_versions();
+    let by_version =
+        materialize_package_layers_by_version(&cache, &roots, default_version, &versions)
+            .map_err(|e| format!("FHIR package materialization failed: {e}"))?;
 
-    let mut out = Vec::with_capacity(layers.len());
-    for (id, registry, report) in layers {
+    for (version, layers) in &by_version {
         info!(
-            package = %id,
-            inserted = report.inserted,
-            skipped_abstract = report.skipped_abstract,
-            convert_errors = report.convert_errors.len(),
-            code_systems = report.code_systems_seen,
-            value_sets = report.value_sets_seen,
-            "loaded FHIR package schema layer"
+            fhir_version = %version.full_version(),
+            layer_count = layers.len(),
+            "loaded FHIR package schema layers"
         );
-        for w in &report.warnings {
-            warn!(package = %id, "package materialization warning: {w}");
-        }
-        for e in &report.convert_errors {
-            warn!(package = %id, "package StructureDefinition convert error: {e}");
-        }
-        out.push(registry);
     }
-    Ok(out)
+    Ok(by_version)
 }
 
 /// Seed one source into the cache: local path (via `ensure_from_path`) or
@@ -418,9 +496,7 @@ fn download_package_tgz(cache_root: &Path, url: &str) -> Result<PathBuf, String>
         .map_err(|e| format!("GET {url}: {e}"))?
         .error_for_status()
         .map_err(|e| format!("GET {url}: {e}"))?;
-    let bytes = response
-        .bytes()
-        .map_err(|e| format!("read {url}: {e}"))?;
+    let bytes = response.bytes().map_err(|e| format!("read {url}: {e}"))?;
     fs::write(&dest, &bytes).map_err(|e| format!("write {}: {e}", dest.display()))?;
     Ok(dest)
 }
@@ -546,14 +622,17 @@ impl TerminologyProvider for RemoteTerminologyProvider {
 pub fn to_outcome_issue(error: &ValidationError) -> Issue {
     let code = match error.kind {
         ErrorKind::Required => IssueType::Required,
-        ErrorKind::FixedValue | ErrorKind::PatternValue | ErrorKind::PrimitiveValue => {
-            IssueType::Value
-        }
+        ErrorKind::FixedValue
+        | ErrorKind::PatternValue
+        | ErrorKind::PrimitiveValue
+        | ErrorKind::MaxLength
+        | ErrorKind::MinValue
+        | ErrorKind::MaxValue => IssueType::Value,
         ErrorKind::FhirpathConstraint => IssueType::Invariant,
-        ErrorKind::TerminologyBinding => IssueType::CodeInvalid,
+        ErrorKind::TerminologyBinding | ErrorKind::Questionnaire => IssueType::CodeInvalid,
         ErrorKind::UnknownSchema | ErrorKind::UnknownProfile => IssueType::NotSupported,
         // Everything structural: unknown-element, shape, cardinality,
-        // slicing, choices, wrong container type.
+        // slicing, choices, wrong container type, reference targets.
         ErrorKind::UnknownElement
         | ErrorKind::NotArray
         | ErrorKind::NotSingular
@@ -565,7 +644,8 @@ pub fn to_outcome_issue(error: &ValidationError) -> Issue {
         | ErrorKind::SliceUnmatched
         | ErrorKind::SliceOrder
         | ErrorKind::Choice
-        | ErrorKind::ChoiceExcluded => IssueType::Structure,
+        | ErrorKind::ChoiceExcluded
+        | ErrorKind::ReferenceTarget => IssueType::Structure,
     };
     let severity = match error.severity {
         Severity::Error => IssueSeverity::Error,
