@@ -349,7 +349,34 @@ fn answer_as_coded(answer: &Value) -> Option<CodedValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::TerminologyError;
     use serde_json::json;
+
+    /// Accepts exactly one code, whatever the ValueSet.
+    struct StubTerminology {
+        allowed: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl TerminologyProvider for StubTerminology {
+        async fn validate_code(
+            &self,
+            _value_set: &str,
+            coded: &CodedValue,
+        ) -> Result<bool, TerminologyError> {
+            let code = match coded {
+                CodedValue::Code(c) => Some(c.as_str()),
+                CodedValue::Coding(v) => v.get("code").and_then(Value::as_str),
+                CodedValue::CodeableConcept(v) => v
+                    .get("coding")
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| c.get("code"))
+                    .and_then(Value::as_str),
+            };
+            Ok(code == Some(self.allowed))
+        }
+    }
 
     #[tokio::test]
     async fn missing_required_item() {
@@ -414,5 +441,182 @@ mod tests {
             errors.iter().any(|e| e.message.contains("not defined")),
             "{errors:?}"
         );
+    }
+
+    fn smoker_questionnaire(enable_behavior: Option<&str>) -> Value {
+        let mut packs = json!({
+            "linkId": "packs",
+            "type": "integer",
+            "required": true,
+            "enableWhen": [
+                { "question": "smoker", "operator": "=", "answerBoolean": true }
+            ]
+        });
+        if let Some(behavior) = enable_behavior {
+            packs["enableBehavior"] = json!(behavior);
+            packs["enableWhen"] = json!([
+                { "question": "smoker", "operator": "=", "answerBoolean": true },
+                { "question": "vaper", "operator": "=", "answerBoolean": true }
+            ]);
+        }
+        json!({
+            "resourceType": "Questionnaire",
+            "status": "active",
+            "item": [
+                { "linkId": "smoker", "type": "boolean" },
+                { "linkId": "vaper", "type": "boolean" },
+                packs
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn enable_when_gates_required_item() {
+        let q = smoker_questionnaire(None);
+
+        // Condition unmet: the disabled required item may be absent.
+        let qr = json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "item": [{ "linkId": "smoker", "answer": [{ "valueBoolean": false }] }]
+        });
+        let errors = validate_questionnaire_response(&qr, &q, None).await;
+        assert!(errors.is_empty(), "{errors:?}");
+
+        // Condition met: the item becomes required.
+        let qr = json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "item": [{ "linkId": "smoker", "answer": [{ "valueBoolean": true }] }]
+        });
+        let errors = validate_questionnaire_response(&qr, &q, None).await;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("required Questionnaire item 'packs'")),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answers_on_disabled_item_warn() {
+        let q = smoker_questionnaire(None);
+        let qr = json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "item": [
+                { "linkId": "smoker", "answer": [{ "valueBoolean": false }] },
+                { "linkId": "packs", "answer": [{ "valueInteger": 2 }] }
+            ]
+        });
+        let errors = validate_questionnaire_response(&qr, &q, None).await;
+        let warning = errors
+            .iter()
+            .find(|e| e.message.contains("enableWhen is not satisfied"))
+            .unwrap_or_else(|| panic!("expected disabled-item warning, got {errors:?}"));
+        assert_eq!(warning.severity, Severity::Warning);
+    }
+
+    #[tokio::test]
+    async fn enable_behavior_any_enables_on_one_condition() {
+        let q = smoker_questionnaire(Some("any"));
+        // Only the second condition (vaper) holds; behavior `any` still
+        // enables the item, so its absence is a required-item error.
+        let qr = json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "item": [
+                { "linkId": "smoker", "answer": [{ "valueBoolean": false }] },
+                { "linkId": "vaper", "answer": [{ "valueBoolean": true }] }
+            ]
+        });
+        let errors = validate_questionnaire_response(&qr, &q, None).await;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("required Questionnaire item 'packs'")),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_option_membership() {
+        let q = json!({
+            "resourceType": "Questionnaire",
+            "status": "active",
+            "item": [{
+                "linkId": "color",
+                "type": "string",
+                "answerOption": [
+                    { "valueString": "red" },
+                    { "valueString": "blue" }
+                ]
+            }]
+        });
+        let qr_ok = json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "item": [{ "linkId": "color", "answer": [{ "valueString": "red" }] }]
+        });
+        let errors = validate_questionnaire_response(&qr_ok, &q, None).await;
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let qr_bad = json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "item": [{ "linkId": "color", "answer": [{ "valueString": "green" }] }]
+        });
+        let errors = validate_questionnaire_response(&qr_bad, &q, None).await;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("answerOption")),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_value_set_membership() {
+        let q = json!({
+            "resourceType": "Questionnaire",
+            "status": "active",
+            "item": [{
+                "linkId": "dx",
+                "type": "coding",
+                "answerValueSet": "http://example.org/ValueSet/dx-codes"
+            }]
+        });
+        let provider = StubTerminology { allowed: "ok" };
+
+        let qr_ok = json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "item": [{
+                "linkId": "dx",
+                "answer": [{ "valueCoding": { "system": "http://example.org/cs", "code": "ok" } }]
+            }]
+        });
+        let errors = validate_questionnaire_response(&qr_ok, &q, Some(&provider)).await;
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let qr_bad = json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "item": [{
+                "linkId": "dx",
+                "answer": [{ "valueCoding": { "system": "http://example.org/cs", "code": "bad" } }]
+            }]
+        });
+        let errors = validate_questionnaire_response(&qr_bad, &q, Some(&provider)).await;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("not in answerValueSet")),
+            "{errors:?}"
+        );
+
+        // Without a provider the check is skipped, not failed.
+        let errors = validate_questionnaire_response(&qr_bad, &q, None).await;
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }
