@@ -19,6 +19,35 @@
 //! conditional fetches. The weak form is still *accepted* on `If-Match` for
 //! clients built against earlier releases.
 //!
+//! # Tenant scoping (issue #313)
+//!
+//! The document is keyed by *user*, but most of what a client puts in it is
+//! derived from one *tenant's* data — a saved query such as
+//! `Patient?name=smith&birthdate=1970-01-01` is a PHI-bearing string. Keyed by
+//! user alone, those strings were unreachable by `purge_tenant_data`, so tenant
+//! offboarding and right-to-erasure could not complete.
+//!
+//! These handlers therefore **project on read and scope on write**, against the
+//! request's [`TenantExtractor`]:
+//!
+//! - `GET` returns the user-global keys plus *this tenant's* scoped keys, flat.
+//! - `PUT` replaces the globals and this tenant's subtree, leaving every other
+//!   tenant's subtree untouched — it replaces what the caller could *see*.
+//! - `PATCH` has its scoped members rewritten to apply to this tenant's subtree,
+//!   which preserves merge-patch semantics exactly, `null` deletes included.
+//!
+//! **The wire format is unchanged.** Clients — including ones this project does
+//! not ship — see the same flat document they always did; only the stored layout
+//! gained a [`BY_TENANT_KEY`] map. That is deliberate: it makes the guarantee
+//! server-side rather than something every client has to be upgraded to honour,
+//! and it means an old client cannot write PHI to an unpurgeable location. The
+//! one visible consequence is that saved queries and recent searches now change
+//! when the user switches tenants, which is the intended semantics.
+//!
+//! Which keys are global is decided by
+//! [`GLOBAL_SETTINGS_KEYS`](helios_persistence::core::GLOBAL_SETTINGS_KEYS); see
+//! that constant for why it is a denylist.
+//!
 //! [RFC 7386]: https://www.rfc-editor.org/rfc/rfc7386
 
 use std::sync::Arc;
@@ -31,13 +60,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_persistence::core::{
-    EntityTagPrecondition, ResourceStorage, SettingsStore, StoredUserSettings, apply_merge_patch,
+    BY_TENANT_KEY, EntityTagPrecondition, ResourceStorage, SettingsStore, StoredUserSettings,
+    apply_merge_patch, normalize_legacy, project_for_tenant, scope_merge_patch, stored_for_put,
 };
 use helios_persistence::error::{ConcurrencyError, StorageError};
 use serde_json::Value;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::UserKey;
+use crate::extractors::{TenantExtractor, UserKey};
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::state::AppState;
 
@@ -62,9 +92,19 @@ const MAX_SAVED_QUERIES_PER_TYPE: usize = 100;
 ///
 /// Returns the caller's settings document, or an empty object (`{}`, version 0)
 /// when none has been stored yet, so the UI always receives a usable document.
+///
+/// The document is *projected* for the request's tenant: user-global keys plus
+/// this tenant's scoped keys, flat, with the stored [`BY_TENANT_KEY`] map never
+/// on the wire. Exactly one tenant subtree is ever projected, so a caller cannot
+/// observe another tenant's saved queries.
+///
+/// The projection is a pure read — a document written before scoping existed is
+/// shown as-is and normalized on the first *write*, so `GET` stays
+/// side-effect-free.
 pub async fn get_user_settings<S>(
     State(state): State<AppState<S>>,
     user: UserKey,
+    tenant: TenantExtractor,
     conditional: ConditionalHeaders,
 ) -> RestResult<Response>
 where
@@ -72,7 +112,10 @@ where
 {
     let store = settings_store(&state)?;
     let (document, version) = match load_settings(store, &user).await? {
-        Some(stored) => (stored.document, stored.version),
+        Some(stored) => (
+            project_for_tenant(&stored.document, tenant.tenant_id()),
+            stored.version,
+        ),
         None => (Value::Object(Default::default()), 0),
     };
     let current_etag = etag(version);
@@ -98,9 +141,15 @@ where
 /// Replaces the caller's entire settings document with the request body, which
 /// must be a JSON object. An optional `If-Match` header makes the write
 /// conditional on the current version.
+///
+/// "Entire" means what the caller can *see* — the projection for this tenant —
+/// so the user-global keys and this tenant's scoped subtree are replaced while
+/// every other tenant's subtree survives. A wholesale replace of the *stored*
+/// document would destroy content the caller was never shown.
 pub async fn put_user_settings<S>(
     State(state): State<AppState<S>>,
     user: UserKey,
+    tenant: TenantExtractor,
     conditional: ConditionalHeaders,
     body: Bytes,
 ) -> RestResult<Response>
@@ -108,17 +157,16 @@ where
     S: ResourceStorage + Send + Sync,
 {
     let store = settings_store(&state)?;
-    let document = parse_object_body(&body)?;
-    validate_settings_document(&document)?;
+    let incoming = parse_object_body(&body)?;
     // Parse before touching storage so a malformed precondition fails fast.
     let precondition = parse_if_match(&conditional)?;
 
     // Adopt any pre-#270 document first, so a wholesale replace does not leave
     // the legacy copy stranded and unreachable.
-    let current_version = load_settings(store, &user)
-        .await?
-        .map(|stored| stored.version)
-        .unwrap_or(0);
+    let (current, current_version) = match load_settings(store, &user).await? {
+        Some(stored) => (stored.document, stored.version),
+        None => (Value::Object(Default::default()), 0),
+    };
 
     // Evaluate the precondition against the version we just read, then pin the
     // write to that same version. The store cannot express `*` (or a multi-tag
@@ -128,10 +176,15 @@ where
     check_if_match(&precondition, current_version)?;
     let if_match = precondition.is_present().then_some(current_version);
 
+    // The bounds apply to what is *stored*: with several tenants the stored
+    // document is the thing that grows, and it is the row every read pays for.
+    let document = stored_for_put(&current, incoming, tenant.tenant_id());
+    validate_settings_document(&document)?;
+
     let stored = store
         .put_settings(user.as_str(), document, if_match)
         .await?;
-    Ok(settings_response(stored))
+    Ok(settings_response(&stored, tenant.tenant_id()))
 }
 
 /// Handler for `PATCH /_user/settings`.
@@ -140,10 +193,16 @@ where
 /// caller's settings document — ideal for toggling a single key such as the
 /// theme. An optional `If-Match` header makes the write conditional.
 ///
+/// The patch applies to the *projection*: its tenant-scoped members are rewritten
+/// to target this tenant's subtree, which preserves merge-patch semantics exactly
+/// — a `null` member still deletes precisely the entry it names, just at a nested
+/// path.
+///
 /// [RFC 7386]: https://www.rfc-editor.org/rfc/rfc7386
 pub async fn patch_user_settings<S>(
     State(state): State<AppState<S>>,
     user: UserKey,
+    tenant: TenantExtractor,
     conditional: ConditionalHeaders,
     body: Bytes,
 ) -> RestResult<Response>
@@ -153,27 +212,36 @@ where
     let store = settings_store(&state)?;
     let merge_patch = parse_object_body(&body)?;
     let precondition = parse_if_match(&conditional)?;
+    let scoped_patch = scope_merge_patch(merge_patch, tenant.tenant_id());
 
-    // The bounds below apply to the *post-merge* document, which only the
-    // backend sees. Compute the merge here against the version we read, pin the
-    // write to that version so what was validated is exactly what lands, and —
-    // only when the caller sent no precondition of their own — absorb a benign
-    // concurrent-writer race with a couple of retries.
+    // The bounds below apply to the *post-merge stored* document. Compute the
+    // merge here against the version we read and write that exact document back
+    // pinned to the same version, so what was validated is what lands — the
+    // merge can no longer be handed to `patch_settings`, because a legacy
+    // document also has to be normalized first and a merge patch cannot express
+    // "move these keys". Pinning makes this equivalent: the backend still
+    // rejects the write atomically if another writer landed in between. Only
+    // when the caller sent no precondition of their own is a benign
+    // concurrent-writer race absorbed with a couple of retries.
     let mut attempts = 0;
     loop {
-        let (current, version) = match load_settings(store, &user).await? {
+        let (mut current, version) = match load_settings(store, &user).await? {
             Some(stored) => (stored.document, stored.version),
             None => (Value::Object(Default::default()), 0),
         };
         check_if_match(&precondition, version)?;
-        let merged = apply_merge_patch(current, &merge_patch);
+
+        // File any pre-scoping keys under their attributed tenant before merging,
+        // so this write does not leave them stranded outside the purge's reach.
+        normalize_legacy(&mut current, tenant.tenant_id());
+        let merged = apply_merge_patch(current, &scoped_patch);
         validate_settings_document(&merged)?;
 
         match store
-            .patch_settings(user.as_str(), merge_patch.clone(), Some(version))
+            .put_settings(user.as_str(), merged, Some(version))
             .await
         {
-            Ok(stored) => return Ok(settings_response(stored)),
+            Ok(stored) => return Ok(settings_response(&stored, tenant.tenant_id())),
             // Only a caller who sent *no* precondition gets the conflict
             // absorbed. A caller who sent one — including `*` — asked to be
             // told about the race, so the failure must surface.
@@ -199,6 +267,12 @@ fn is_lock_failure(error: &StorageError) -> bool {
 /// [`savedQueries` convention](helios_persistence::core::user_settings) is
 /// present — that it is an object keyed by resource type, each holding an
 /// object of at most [`MAX_SAVED_QUERIES_PER_TYPE`] entries keyed by query id.
+///
+/// Runs against the **stored** document, not the projection. With several
+/// tenants the stored document is what actually grows, and it is the row every
+/// read pays for; validating only the caller's slice would let a user exceed the
+/// cap one tenant at a time. For the same reason the per-type entry limit is
+/// checked inside every tenant subtree, not just at the top level.
 fn validate_settings_document(document: &Value) -> RestResult<()> {
     let size = serde_json::to_vec(document).map(|v| v.len()).unwrap_or(0);
     if size > MAX_SETTINGS_DOCUMENT_BYTES {
@@ -209,26 +283,43 @@ fn validate_settings_document(document: &Value) -> RestResult<()> {
         });
     }
 
-    let Some(saved_queries) = document.get("savedQueries") else {
+    // Top-level: a document written before tenant scoping existed.
+    validate_saved_queries(document, None)?;
+    // Per tenant: the normalized location.
+    if let Some(by_tenant) = document.get(BY_TENANT_KEY).and_then(Value::as_object) {
+        for (tenant, subtree) in by_tenant {
+            validate_saved_queries(subtree, Some(tenant))?;
+        }
+    }
+    Ok(())
+}
+
+/// Checks the `savedQueries` convention within one scope (the document root, or
+/// one tenant's subtree). `tenant` only labels the error message.
+fn validate_saved_queries(scope: &Value, tenant: Option<&str>) -> RestResult<()> {
+    let Some(saved_queries) = scope.get("savedQueries") else {
         return Ok(());
     };
+    // The client never sees the tenant subtree, so an error naming one would be
+    // confusing; report the key as the caller wrote it.
+    let at = tenant.map(|t| format!(" (tenant {t})")).unwrap_or_default();
     let Some(by_type) = saved_queries.as_object() else {
         return Err(RestError::UnprocessableEntity {
-            message: "savedQueries must be an object keyed by FHIR resource type".to_string(),
+            message: format!("savedQueries must be an object keyed by FHIR resource type{at}"),
         });
     };
     for (resource_type, entries) in by_type {
         let Some(entries) = entries.as_object() else {
             return Err(RestError::UnprocessableEntity {
                 message: format!(
-                    "savedQueries.{resource_type} must be an object keyed by query id"
+                    "savedQueries.{resource_type} must be an object keyed by query id{at}"
                 ),
             });
         };
         if entries.len() > MAX_SAVED_QUERIES_PER_TYPE {
             return Err(RestError::UnprocessableEntity {
                 message: format!(
-                    "savedQueries.{resource_type} has {} entries; the limit is {}",
+                    "savedQueries.{resource_type} has {} entries; the limit is {}{at}",
                     entries.len(),
                     MAX_SAVED_QUERIES_PER_TYPE
                 ),
@@ -287,6 +378,19 @@ fn parse_object_body(body: &Bytes) -> RestResult<Value> {
     if !value.is_object() {
         return Err(RestError::BadRequest {
             message: "Settings document must be a JSON object".to_string(),
+        });
+    }
+    // `byTenant` is the server's own storage layout, never part of the wire
+    // format. Accepting it would let a caller scoped to one tenant plant content
+    // under another tenant's subtree — or read it back on the next GET — which is
+    // exactly the cross-scope access this scoping exists to prevent. Rejecting is
+    // also honest: silently dropping the key would make the write look applied.
+    if value.get(BY_TENANT_KEY).is_some() {
+        return Err(RestError::UnprocessableEntity {
+            message: format!(
+                "'{BY_TENANT_KEY}' is reserved: settings are scoped to the request's tenant \
+                 automatically and it cannot be set directly"
+            ),
         });
     }
     Ok(value)
@@ -404,11 +508,12 @@ async fn adopt_legacy_document(
     Ok(Some(adopted))
 }
 
-/// Builds the success response for a write: the stored document plus its ETag.
-fn settings_response(stored: StoredUserSettings) -> Response {
+/// Builds the success response for a write: the document as the caller sees it
+/// (projected for `tenant`), plus its ETag.
+fn settings_response(stored: &StoredUserSettings, tenant: &str) -> Response {
     (
         [(header::ETAG, etag(stored.version))],
-        Json(stored.document),
+        Json(project_for_tenant(&stored.document, tenant)),
     )
         .into_response()
 }
@@ -441,6 +546,7 @@ fn etag(version: i64) -> String {
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+    use helios_persistence::core::GLOBAL_SETTINGS_KEYS;
 
     #[test]
     fn parse_object_body_rejects_empty() {
@@ -489,6 +595,101 @@ mod tests {
     fn parse_object_body_accepts_object() {
         let value = parse_object_body(&Bytes::from_static(b"{\"theme\":\"dark\"}")).unwrap();
         assert!(value.is_object());
+    }
+
+    /// The storage layout is not part of the wire format. Accepting it would let
+    /// a caller in one tenant write into (and then read back) another tenant's
+    /// subtree — see `parse_object_body`.
+    #[test]
+    fn parse_object_body_rejects_the_reserved_by_tenant_key() {
+        let body = br#"{"byTenant":{"victim":{"savedQueries":{"Patient":{"x":{}}}}}}"#;
+        let err = parse_object_body(&Bytes::from_static(body)).unwrap_err();
+        match err {
+            RestError::UnprocessableEntity { message } => {
+                assert!(
+                    message.contains("reserved"),
+                    "unexpected message: {message}"
+                )
+            }
+            other => panic!("expected 422 for the reserved key, got {other:?}"),
+        }
+        // Including when it is the null of a merge patch.
+        assert!(parse_object_body(&Bytes::from_static(br#"{"byTenant":null}"#)).is_err());
+    }
+
+    // ── Tenant-scoped validation bounds (issue #313) ────────────────────────
+
+    /// The per-type entry cap must hold inside every tenant subtree, not just at
+    /// the top level — otherwise a user exceeds it one tenant at a time.
+    #[test]
+    fn validation_bounds_saved_queries_within_each_tenant_subtree() {
+        let mut entries = serde_json::Map::new();
+        for i in 0..=MAX_SAVED_QUERIES_PER_TYPE {
+            entries.insert(format!("q{i}"), serde_json::json!({}));
+        }
+        let document = serde_json::json!({
+            "byTenant": {"acme": {"savedQueries": {"Patient": entries}}}
+        });
+        let err = validate_settings_document(&document).unwrap_err();
+        match err {
+            RestError::UnprocessableEntity { message } => {
+                assert!(message.contains("the limit is"), "unexpected: {message}");
+                assert!(
+                    message.contains("acme"),
+                    "should name the tenant: {message}"
+                );
+            }
+            other => panic!("expected 422, got {other:?}"),
+        }
+    }
+
+    /// The legacy top-level location is still bounded, so a pre-#313 document
+    /// cannot be grown past the cap either.
+    #[test]
+    fn validation_still_bounds_legacy_top_level_saved_queries() {
+        let document = serde_json::json!({"savedQueries": "not-an-object"});
+        assert!(matches!(
+            validate_settings_document(&document).unwrap_err(),
+            RestError::UnprocessableEntity { .. }
+        ));
+    }
+
+    /// A well-formed multi-tenant document passes.
+    #[test]
+    fn validation_accepts_a_scoped_document() {
+        let document = serde_json::json!({
+            "theme": "dark",
+            "byTenant": {
+                "acme": {"savedQueries": {"Patient": {"q1": {"query": "name=smith"}}}},
+                "beta": {"savedQueries": {"Observation": {"q2": {"query": "code=1234"}}}}
+            }
+        });
+        assert!(validate_settings_document(&document).is_ok());
+    }
+
+    /// The size cap is measured on the stored document, so a large *other*
+    /// tenant's subtree still counts against a small write.
+    #[test]
+    fn validation_measures_the_stored_document_not_the_projection() {
+        let bloat = "x".repeat(MAX_SETTINGS_DOCUMENT_BYTES);
+        let document = serde_json::json!({
+            "byTenant": {"other": {"junk": bloat}, "acme": {"savedQueries": {}}}
+        });
+        assert!(matches!(
+            validate_settings_document(&document).unwrap_err(),
+            RestError::PayloadTooLarge { .. }
+        ));
+    }
+
+    /// Guards the constant the whole design turns on: these four keys, and only
+    /// these, escape a tenant purge. Anything added here must provably not carry
+    /// content derived from a tenant's records.
+    #[test]
+    fn the_global_key_set_is_the_reviewed_one() {
+        assert_eq!(
+            GLOBAL_SETTINGS_KEYS,
+            &["theme", "nav", "fhirVersion", "tenantId"]
+        );
     }
 
     fn with_if_match(raw: &str) -> ConditionalHeaders {

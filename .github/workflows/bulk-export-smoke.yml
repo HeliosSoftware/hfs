@@ -136,7 +136,7 @@ jobs:
         if: contains(matrix.backend, 'elasticsearch')
         run: |
           ES_CONTAINER="es-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
-          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
             -e "discovery.type=single-node" \
             -e "xpack.security.enabled=false" \
@@ -162,7 +162,7 @@ jobs:
         if: contains(matrix.backend, 'postgres')
         run: |
           PG_CONTAINER="pg-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -191,7 +191,7 @@ jobs:
         if: contains(matrix.backend, 'mongodb')
         run: |
           MONGO_CONTAINER="mongo-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
-          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> "$GITHUB_ENV"
 
@@ -217,7 +217,7 @@ jobs:
         if: startsWith(matrix.backend, 's3')
         run: |
           MINIO_CONTAINER="minio-bulk-export-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fhir_version }}-${{ matrix.backend }}-${{ matrix.output }}"
-          docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$MINIO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MINIO_CONTAINER" -p 0:9000 -p 0:9001 \
             -e MINIO_ROOT_USER=hfs-minio \
             -e MINIO_ROOT_PASSWORD=hfs-minio-secret \
@@ -499,14 +499,14 @@ jobs:
         if: always()
         run: |
           if [ -n "${ES_CONTAINER:-}" ]; then
-            docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           fi
           if [ -n "${PG_CONTAINER:-}" ]; then
-            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           fi
           if [ -n "${MONGO_CONTAINER:-}" ]; then
-            docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
           fi
           if [ -n "${MINIO_CONTAINER:-}" ]; then
-            docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$MINIO_CONTAINER" 2>/dev/null || true
           fi

@@ -428,6 +428,8 @@ editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formu
 editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
 
 editor-add = Element hinzufügen
+editor-must-support-badge = MS
+editor-must-support-hint = Must-support: Konsumenten dieses Profils müssen dieses Element verarbeiten können
 editor-add-filter = Elemente filtern
 editor-add-another = weiteres hinzufügen
 editor-pick-type = Typ wählen…

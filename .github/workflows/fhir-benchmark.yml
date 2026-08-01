@@ -240,7 +240,7 @@ jobs:
           echo "TGZ_CONTAINER=$TGZ_CONTAINER" >> "$GITHUB_ENV"
 
           docker build -t "$TGZ_IMAGE" fhir-benchmark/infra/tgz
-          docker rm -f "$TGZ_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
           docker run -d --name "$TGZ_CONTAINER" -p 0:8080 "$TGZ_IMAGE" \
             "https://storage.googleapis.com/aidbox-public/synthea/performance/bulk_1k.tar.gz" >/dev/null
 
@@ -281,7 +281,7 @@ jobs:
         if: matrix.backend == 'postgres'
         run: |
           set -euo pipefail
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           # Tuning approximates the benchmark's infra/postgres/postgres.conf.
           # shared_buffers/effective_cache_size are scaled DOWN from the
           # published values (10G/25G) to fit a typical self-hosted runner;
@@ -644,12 +644,12 @@ jobs:
         if: always()
         run: |
           if [ -n "${TGZ_CONTAINER:-}" ]; then
-            docker rm -f "$TGZ_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$TGZ_CONTAINER" 2>/dev/null || true
           fi
 
       - name: Stop ephemeral Postgres
         if: always() && matrix.backend == 'postgres'
         run: |
           if [ -n "${PG_CONTAINER:-}" ]; then
-            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           fi
