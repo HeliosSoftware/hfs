@@ -422,6 +422,18 @@ where
             .map_err(RestError::from)?;
     }
 
+    // submissionStatus=completed → mark the submission terminal. Per the spec this
+    // means "no additional requests are expected for this submitter+submissionId",
+    // not "stop processing" — manifests registered by this or an earlier request
+    // still drain, and workers keep claiming them (see `claim_next_manifest`, which
+    // admits `complete` submissions for exactly this reason). Subsequent kick-offs
+    // are rejected by the terminal-status check above.
+    if req.submission_status == "completed" {
+        jobs.complete_submission(ctx, &sub_id)
+            .await
+            .map_err(RestError::from)?;
+    }
+
     let oo = json!({
         "resourceType": "OperationOutcome",
         "issue": [{

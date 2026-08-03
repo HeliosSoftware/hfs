@@ -1268,8 +1268,11 @@ impl SubmitClaimStrategy for SqliteBackend {
                  JOIN bulk_submissions s
                    ON s.tenant_id = m.tenant_id AND s.submitter = m.submitter
                       AND s.submission_id = m.submission_id
+                 -- `complete` is admitted alongside `in-progress`: it means the
+                 -- submitter will send no further manifests, not that already
+                 -- registered ones should be dropped. `aborted` stays excluded.
                  WHERE m.manifest_url IS NOT NULL
-                   AND s.status = 'in-progress'
+                   AND s.status IN ('in-progress', 'complete')
                    AND (m.status = 'pending'
                         OR (m.status = 'processing'
                             AND (m.lease_expiry IS NULL OR m.lease_expiry < ?1)))

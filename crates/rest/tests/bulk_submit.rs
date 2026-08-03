@@ -14,8 +14,8 @@ use axum_test::TestServer;
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{
-    BulkSubmitJobStore, DefaultSubmitWorker, ExportOutputStore, RemoteFile, RemoteManifest,
-    ResourceStorage, SubmitClaimStrategy, SubmitInputFetcher, WorkerId,
+    BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, ExportOutputStore, RemoteFile,
+    RemoteManifest, ResourceStorage, SubmitClaimStrategy, SubmitInputFetcher, WorkerId,
 };
 use helios_persistence::error::StorageResult;
 use helios_rest::ServerConfig;
@@ -173,6 +173,135 @@ fn status_body() -> Value {
             {"name": "submissionId", "valueString": "it-1"}
         ]
     })
+}
+
+/// Builds a kick-off carrying `manifestUrl` plus a terminal `submissionStatus`,
+/// the one-shot shape `bulk-submit-smoke.yml` uses.
+fn kickoff_body_with_status(submission_id: &str, code: &str) -> Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
+            {"name": "submissionId", "valueString": submission_id},
+            {"name": "manifestUrl", "valueUrl": "https://provider/manifest.json"},
+            {"name": "fhirBaseUrl", "valueUrl": "https://provider/fhir"},
+            {"name": "submissionStatus", "valueCoding": {
+                "system": "http://hl7.org/fhir/event-status", "code": code}}
+        ]
+    })
+}
+
+/// `submissionStatus=completed` SHALL make the submission terminal.
+///
+/// Regression: the kick-off handler branched only on `stopped`, so `completed`
+/// returned 200 while leaving the row `in-progress` forever. Each such
+/// submission then held a slot against `max_concurrent_per_tenant` (default 4),
+/// after which every further kick-off returned 429.
+#[tokio::test]
+async fn test_completed_status_finalizes_submission() {
+    let (server, backend, ..) = create_submit_server().await;
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("done-1", "completed"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let sub_id = helios_persistence::core::SubmissionId::new("http://ehr|ehr-1", "done-1");
+    let summary = backend
+        .get_submission(&tenant, &sub_id)
+        .await
+        .expect("get_submission")
+        .expect("submission exists");
+    assert_eq!(
+        summary.status,
+        helios_persistence::core::SubmissionStatus::Complete,
+        "completed kick-off must finalize the submission, got {}",
+        summary.status
+    );
+
+    // And being terminal, it must reject further kick-offs.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("done-1", "completed"))
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
+}
+
+/// A completed submission's already-registered manifests SHALL still be ingested.
+///
+/// `completed` means "no further manifests are coming", not "stop processing".
+/// The worker's claim query gates on submission status, so this pins that a
+/// finalized submission is still drained — the one-shot shape CI relies on.
+#[tokio::test]
+async fn test_completed_submission_still_ingests_manifests() {
+    let (server, backend, fetcher, output, _tmp) = create_submit_server().await;
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("done-2", "completed"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    drain_submit(&backend, &fetcher, &output).await;
+
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    for id in ["sub-p1", "sub-p2"] {
+        assert!(
+            backend
+                .read(&tenant, "Patient", id)
+                .await
+                .unwrap()
+                .is_some(),
+            "Patient/{id} must be ingested even though the submission is complete"
+        );
+    }
+}
+
+/// `submissionStatus=stopped` aborts rather than completes.
+#[tokio::test]
+async fn test_stopped_status_aborts_submission() {
+    let (server, backend, ..) = create_submit_server().await;
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("stop-1", "stopped"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let sub_id = helios_persistence::core::SubmissionId::new("http://ehr|ehr-1", "stop-1");
+    let summary = backend
+        .get_submission(&tenant, &sub_id)
+        .await
+        .expect("get_submission")
+        .expect("submission exists");
+    assert_eq!(
+        summary.status,
+        helios_persistence::core::SubmissionStatus::Aborted
+    );
 }
 
 #[tokio::test]
