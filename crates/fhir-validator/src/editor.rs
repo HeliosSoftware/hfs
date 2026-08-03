@@ -731,10 +731,17 @@ pub fn add_slice_element(
 ) -> Option<Path> {
     let added = add_element(resolver, root_type, document, path, name)?;
     let parent_schema = schema_at(resolver, root_type, path);
-    let seed = parent_schema
+    // Look the sliced element up through the same base/type merge that
+    // `schema_at` and `addable` use: a differential profile may inherit the
+    // sliced element rather than restating it, and the un-merged element map
+    // would miss it — offering the slice in `addable` but seeding nothing.
+    let element = parent_schema.as_ref().and_then(|schema| {
+        merged_elements(resolver, schema, &mut HashSet::new())
+            .get(name)
+            .cloned()
+    });
+    let seed = element
         .as_ref()
-        .and_then(|schema| schema.elements.as_ref())
-        .and_then(|elements| elements.get(name))
         .and_then(|element| element.slicing.as_ref())
         .and_then(|slicing| slicing.slices.get(slice_name))
         .and_then(|slice| {
@@ -1173,5 +1180,72 @@ mod slice_tests {
             &doc["identifier"][0],
         );
         assert_eq!(label.as_deref(), Some("mrn"));
+    }
+
+    /// A sparse derived profile inherits the sliced element from its base
+    /// instead of restating it. The slice lookup must go through the same
+    /// base-chain merge as `addable`, or the add-choice is offered but the
+    /// added item is seeded blank.
+    #[test]
+    fn slice_add_seeds_through_an_inherited_element() {
+        let base = json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/Sliced",
+            "name": "Sliced",
+            "kind": "resource",
+            "derivation": "specialization",
+            "type": "Sliced",
+            "snapshot": { "element": [
+                { "path": "Sliced", "min": 0, "max": "*" },
+                {
+                    "path": "Sliced.identifier",
+                    "min": 0, "max": "*",
+                    "type": [{ "code": "Identifier" }],
+                    "slicing": {
+                        "discriminator": [{ "type": "pattern", "path": "system" }],
+                        "rules": "open"
+                    }
+                },
+                {
+                    "path": "Sliced.identifier",
+                    "sliceName": "mrn",
+                    "min": 1, "max": "1",
+                    "type": [{ "code": "Identifier" }],
+                    "patternIdentifier": { "system": "http://example.org/mrn" }
+                }
+            ]}
+        });
+        let derived = json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/SlicedProfile",
+            "name": "SlicedProfile",
+            "kind": "resource",
+            "derivation": "constraint",
+            "type": "Sliced",
+            "baseDefinition": "http://example.org/StructureDefinition/Sliced",
+            "snapshot": { "element": [
+                { "path": "Sliced", "min": 0, "max": "*" }
+            ]}
+        });
+        let mut registry = crate::SchemaRegistry::new();
+        registry.insert(convert(&base).expect("base conversion").schema);
+        registry.insert(convert(&derived).expect("derived conversion").schema);
+        let registry = Arc::new(registry);
+
+        let mut doc = json!({ "resourceType": "SlicedProfile" });
+        add_slice_element(
+            registry.as_ref(),
+            "SlicedProfile",
+            &mut doc,
+            &[],
+            "identifier",
+            "mrn",
+        )
+        .expect("added");
+        assert_eq!(
+            doc["identifier"][0]["system"],
+            json!("http://example.org/mrn"),
+            "the inherited slice must still seed its pattern: {doc}"
+        );
     }
 }

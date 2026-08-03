@@ -126,6 +126,7 @@
    * datalist. 204 (no server configured) leaves the plain input alone. */
   var expandTimer = null;
   var expandSeq = 0;
+  var liveListSeq = 0;
   editorBody.addEventListener("input", function (event) {
     var input = event.target.closest("[data-vs-url]");
     if (!input) return;
@@ -144,7 +145,7 @@
           if (!data || seq !== expandSeq) return;
           var listId = input.getAttribute("list");
           if (!listId) {
-            listId = "vs-live-" + Math.abs(input.dataset.set.length + seq);
+            listId = "vs-live-" + (++liveListSeq);
             input.setAttribute("list", listId);
           }
           var list = document.getElementById(listId);
