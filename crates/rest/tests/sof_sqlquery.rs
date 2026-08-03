@@ -953,4 +953,101 @@ mod sof_sqlquery_tests {
             .expect("supportsCanonicalReference present");
         assert_eq!(canonical["valueBoolean"], json!(true));
     }
+
+    // =========================================================================
+    // #335 — inline `view.viewResource` on `$sqlquery-run`
+    // =========================================================================
+
+    /// A `$sqlquery-run` with an inline `queryResource` whose `depends-on`
+    /// ViewDefinition is supplied via `view.viewResource` in the same body
+    /// succeeds without the ViewDefinition being stored on the server.
+    #[tokio::test]
+    async fn inline_view_resource_satisfies_depends_on_without_storage() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        seed_patient(&backend, "p2", "Jones", false).await;
+
+        let vd_url = "http://example.org/sof/ViewDefinition/patient-flat-inline";
+        let vd = json!({
+            "resourceType": "ViewDefinition",
+            "url": vd_url,
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"path": "id", "name": "patient_id", "type": "string"},
+                {"path": "name.family", "name": "family", "type": "string"}
+            ]}]
+        });
+
+        let lib = library_with_canonical_vd(
+            "SELECT patient_id, family FROM t ORDER BY patient_id",
+            vd_url,
+            "t",
+            vec![],
+        );
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "queryResource", "resource": lib},
+                {"name": "view", "part": [
+                    {"name": "viewResource", "resource": vd}
+                ]}
+            ]
+        });
+
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(2));
+        let ids: Vec<&str> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["patient_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"p1") && ids.contains(&"p2"));
+    }
+
+    /// When a `view.viewResource` URL matches a `depends-on` canonical, the
+    /// inline VD is used and storage is never consulted for that dependency.
+    /// A dependency whose URL does NOT appear in any supplied `view` still
+    /// falls back to storage and returns 404 when absent.
+    #[tokio::test]
+    async fn depends_on_not_in_inline_views_falls_back_to_storage_404() {
+        let (server, _) = create_test_server().await;
+
+        let vd_url = "http://example.org/sof/ViewDefinition/not-stored";
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", vd_url, "t", vec![]);
+
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "queryResource", "resource": lib}
+            ]
+        });
+
+        let response = server
+            .post("/$sqlquery-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
 }

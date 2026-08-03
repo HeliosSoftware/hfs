@@ -67,6 +67,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use super::references::resolve_resource_canonical_or_relative;
+use super::view_sources::extract_table_source_views;
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
 use crate::state::AppState;
@@ -131,6 +132,7 @@ where
     S: SearchProvider + Send + Sync + 'static,
 {
     let params = extract_sqlquery_params_from_json(&body);
+    let inline_views = extract_table_source_views(&body)?;
 
     // Spec Common Operation Behavior axis 2 (representation): the FHIR XML
     // envelope form is not supported → 406, never raw bytes under a FHIR
@@ -214,7 +216,13 @@ where
     let mut schemas_in_order: Vec<(String, TableSchema)> = Vec::new();
     for dep in &library.depends_on {
         let label = dep.label.clone();
-        let vd_json = resolve_canonical_view_definition(&state, tenant.context(), &dep.url).await?;
+        let vd_json = match inline_views
+            .iter()
+            .find(|vd| vd.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
+        {
+            Some(vd) => vd.clone(),
+            None => resolve_canonical_view_definition(&state, tenant.context(), &dep.url).await?,
+        };
         let schema = TableSchema::from_view_definition(&vd_json);
         engine
             .create_table(&label, &schema)

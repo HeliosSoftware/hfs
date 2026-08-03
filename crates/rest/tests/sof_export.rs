@@ -2446,4 +2446,36 @@ mod sof_export_tests {
             resp.text()
         );
     }
+
+    #[tokio::test]
+    async fn test_sqlquery_export_view_reference_rejected_with_400() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "query", "part": [
+                    {"name": "queryReference",
+                     "valueReference": {"reference": "Library/any"}}
+                ]},
+                {"name": "view", "part": [
+                    {"name": "viewReference",
+                     "valueReference": {"reference": "ViewDefinition/patient-flat"}}
+                ]}
+            ]
+        });
+        let resp = server
+            .post("/$sqlquery-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "view.viewReference must be rejected: {}",
+            resp.text()
+        );
+        let out: Value = resp.json();
+        assert_eq!(out["resourceType"].as_str(), Some("OperationOutcome"));
+    }
 }

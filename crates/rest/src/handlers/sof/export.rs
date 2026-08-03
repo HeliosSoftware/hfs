@@ -61,6 +61,7 @@ use serde_json::{Value, json};
 
 use super::references::resolve_resource_canonical_or_relative;
 use super::sqlquery::{sqlquery_err_to_rest, validate_select_only};
+use super::view_sources::extract_table_source_views;
 use crate::error::RestError;
 use crate::export::controller::{
     ExportTask, ExportWork, JobStatus, NamedSqlQuery, NamedView, SqlExportLimits, SqlTableSource,
@@ -321,7 +322,7 @@ where
         });
     }
 
-    let table_sources = extract_table_source_views(&state, &tenant, &body).await?;
+    let table_sources = extract_table_source_views(&body)?;
     let queries = extract_sql_queries_from_body(&state, &tenant, &body, &table_sources).await?;
     if queries.is_empty() {
         return Ok(missing_query_response());
@@ -391,84 +392,6 @@ fn missing_query_response() -> Response {
         .into_response()
 }
 
-/// A ViewDefinition table source supplied via a body `view` parameter:
-/// optional friendly name plus the resolved ViewDefinition JSON. These are
-/// materialized as tables for the SQL to query against — they do not produce
-/// their own `output` entries.
-struct SuppliedTableView {
-    name: Option<String>,
-    view: Value,
-}
-
-/// Extracts and resolves the body's `view` table-source parameters.
-async fn extract_table_source_views<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    body: &Value,
-) -> Result<Vec<SuppliedTableView>, RestError>
-where
-    S: ResourceStorage + SearchProvider + Send + Sync + 'static,
-{
-    let entries = body
-        .get("parameter")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let mut out: Vec<SuppliedTableView> = Vec::new();
-    for p in &entries {
-        if p.get("name").and_then(|n| n.as_str()) != Some("view") {
-            continue;
-        }
-        let parts = p.get("part").and_then(|v| v.as_array());
-        let mut name: Option<String> = None;
-        let mut inline: Option<Value> = None;
-        let mut reference: Option<String> = None;
-        if let Some(arr) = parts {
-            for part in arr {
-                match part.get("name").and_then(|v| v.as_str()) {
-                    Some("name") => {
-                        name = part
-                            .get("valueString")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some("viewResource") => inline = part.get("resource").cloned(),
-                    Some("viewReference") => {
-                        reference = part
-                            .get("valueReference")
-                            .and_then(|r| r.get("reference"))
-                            .and_then(|v| v.as_str())
-                            .or_else(|| part.get("valueString").and_then(|v| v.as_str()))
-                            .map(|s| s.to_string());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let view = match (inline, reference) {
-            (Some(v), _) => v,
-            (None, Some(r)) => {
-                resolve_resource_canonical_or_relative(
-                    state,
-                    tenant.context(),
-                    "ViewDefinition",
-                    &r,
-                )
-                .await?
-            }
-            (None, None) => {
-                return Err(RestError::BadRequest {
-                    message: "each `view` parameter must supply `viewResource` or `viewReference`"
-                        .to_string(),
-                });
-            }
-        };
-        out.push(SuppliedTableView { name, view });
-    }
-    Ok(out)
-}
-
 /// Extracts the body's `query` parameters, resolving Libraries and their
 /// `depends-on` ViewDefinitions and binding `Library.parameter` values, so
 /// the background job has everything it needs without storage access.
@@ -476,7 +399,7 @@ async fn extract_sql_queries_from_body<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     body: &Value,
-    table_sources: &[SuppliedTableView],
+    table_sources: &[Value],
 ) -> Result<Vec<NamedSqlQuery>, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
@@ -567,7 +490,7 @@ async fn prepare_named_sqlquery<S>(
     name_hint: Option<String>,
     library_json: &Value,
     supplied_params: Option<&Value>,
-    table_sources: &[SuppliedTableView],
+    table_sources: &[Value],
 ) -> Result<NamedSqlQuery, RestError>
 where
     S: ResourceStorage + SearchProvider + Send + Sync + 'static,
@@ -590,16 +513,11 @@ where
 
     let mut tables: Vec<SqlTableSource> = Vec::with_capacity(library.depends_on.len());
     for dep in &library.depends_on {
-        let supplied = table_sources
+        let view = match table_sources
             .iter()
-            .find(|t| t.view.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
-            .or_else(|| {
-                table_sources
-                    .iter()
-                    .find(|t| t.name.as_deref() == Some(dep.label.as_str()))
-            });
-        let view = match supplied {
-            Some(t) => t.view.clone(),
+            .find(|vd| vd.get("url").and_then(|u| u.as_str()) == Some(dep.url.as_str()))
+        {
+            Some(vd) => vd.clone(),
             None => {
                 resolve_resource_canonical_or_relative(
                     state,

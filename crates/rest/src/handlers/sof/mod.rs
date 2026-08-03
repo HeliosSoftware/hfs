@@ -5,6 +5,7 @@ pub mod export;
 pub(crate) mod references;
 pub mod run;
 pub mod sqlquery;
+pub(crate) mod view_sources;
 
 pub use capability::sof_capabilities_handler;
 pub use export::{
