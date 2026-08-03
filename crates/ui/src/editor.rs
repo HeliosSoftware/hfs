@@ -75,6 +75,11 @@ pub struct Row {
     /// Precomputed: Askama has no closures.
     pub accepts_extension: bool,
     pub can_remove: bool,
+    /// `mustSupport` in the governing schema — emphasised in the form.
+    pub must_support: bool,
+    /// The `short` human label; the raw element name stays as the technical
+    /// hint next to it.
+    pub short: String,
 }
 
 /// An element offered under a node.
@@ -86,6 +91,9 @@ pub struct AddOption {
     pub required: bool,
     /// Concrete arms, when this is a `value[x]`.
     pub arms: Vec<String>,
+    pub must_support: bool,
+    /// The `short` label, shown as the option's description.
+    pub short: String,
 }
 
 #[derive(Template)]
@@ -429,6 +437,14 @@ fn build_rows(
                 })
             })
         }),
+        must_support: schema
+            .as_ref()
+            .and_then(|schema| schema.must_support)
+            .unwrap_or(false),
+        short: schema
+            .as_ref()
+            .and_then(|schema| schema.short.clone())
+            .unwrap_or_default(),
         errors: errors.get(&key).cloned().unwrap_or_default(),
         accepts_extension: !is_primitive && offered.iter().any(|option| option.name == "extension"),
         addable: if is_primitive {
@@ -470,5 +486,7 @@ fn to_option(addable: Addable) -> AddOption {
         type_label: addable.type_.unwrap_or_default(),
         required: addable.required,
         arms,
+        must_support: addable.must_support,
+        short: addable.short.unwrap_or_default(),
     }
 }

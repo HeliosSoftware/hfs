@@ -1664,8 +1664,72 @@ mod chaining {
         response.assert_status_ok();
         let body: Value = response.json();
 
-        // Should work the same as without type qualifier
-        assert_eq!(body["resourceType"], "Bundle");
+        // Works the same as without the qualifier — and actually matches:
+        // the qualifier used to be parsed as a modifier that swallowed the
+        // chain, silently degrading this into `subject=Smith` (zero results).
+        let entries = get_bundle_entries(&body);
+        assert!(
+            !entries.is_empty(),
+            "typed chain must match the same observations as the untyped one"
+        );
+        for entry in &entries {
+            let subject_ref = entry["resource"]["subject"]["reference"].as_str().unwrap();
+            assert!(
+                subject_ref.contains("patient-1") || subject_ref.contains("patient-2"),
+                "Should only include observations for patients named Smith"
+            );
+        }
+    }
+
+    /// `general-practitioner` declares multiple targets (Practitioner,
+    /// Organization, PractitionerRole). The resolver used to fall back to a
+    /// name heuristic that fabricated a resource type called
+    /// `General-practitioner`, so this chain silently matched nothing.
+    #[tokio::test]
+    async fn test_chained_multi_target_reference() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for url in [
+            "/Patient?general-practitioner.name=Brown",
+            "/Patient?general-practitioner:Practitioner.name=Brown",
+        ] {
+            let response = server
+                .get(url)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+            let entries = get_bundle_entries(&body);
+            let ids: Vec<&str> = entries
+                .iter()
+                .map(|e| e["resource"]["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["patient-1"], "{url}");
+        }
+    }
+
+    /// A forward chain and a reverse chain in one query intersect.
+    #[tokio::test]
+    async fn test_forward_and_reverse_chain_combined() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_has:Observation:subject:status=final&general-practitioner.name=Brown")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|e| e["resource"]["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids.contains(&"patient-1"),
+            "patient-1 has both a final Observation and GP Brown, got {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -2468,5 +2532,48 @@ mod contained_search {
             names.contains(&"_containedType"),
             "advertises _containedType"
         );
+    }
+}
+
+mod summary_count {
+    use super::*;
+
+    /// #254: `_summary=count` exists to return `Bundle.total`, so it implies
+    /// an accurate total without the client also sending `_total=accurate`.
+    #[tokio::test]
+    async fn test_summary_count_implies_accurate_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_summary=count")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            body["total"].is_u64(),
+            "count mode must carry the count: {body}"
+        );
+        assert!(body["total"].as_u64().unwrap() > 0);
+        assert!(
+            body.get("entry").is_none(),
+            "count mode returns no entries: {body}"
+        );
+    }
+
+    /// An explicit `_total` still wins over the implication.
+    #[tokio::test]
+    async fn test_summary_count_respects_explicit_total_none() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_summary=count&_total=none")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(body["total"].is_null(), "explicit _total=none wins: {body}");
     }
 }

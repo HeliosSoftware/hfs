@@ -104,6 +104,11 @@ pub struct Addable {
     /// resource*. It is a safety-relevant element and no editor surveyed
     /// surfaces it differently. This one will.
     pub is_modifier: bool,
+    /// `ElementDefinition.mustSupport` — profiles mark the elements a
+    /// consumer is expected to handle; editors emphasise them.
+    pub must_support: bool,
+    /// The `short` human label, when the pack carries one.
+    pub short: Option<String>,
 }
 
 /// An element that is *present* in the document at a cursor, paired with the
@@ -336,6 +341,8 @@ pub fn addable(
                 binding: element.binding.clone(),
                 refers: element.refers.clone(),
                 is_modifier: false,
+                must_support: element.must_support.unwrap_or(false),
+                short: element.short.clone(),
             });
             continue;
         }
@@ -359,6 +366,8 @@ pub fn addable(
             binding: element.binding.clone(),
             refers: element.refers.clone(),
             is_modifier: name == "modifierExtension" || element.modifier.unwrap_or(false),
+            must_support: element.must_support.unwrap_or(false),
+            short: element.short.clone(),
         });
     }
     out

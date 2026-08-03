@@ -3,7 +3,7 @@
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -313,6 +313,7 @@ async fn migrate_schema(
             12 => migrate_v12_to_v13(client).await?,
             13 => migrate_v13_to_v14(client).await?,
             14 => migrate_v14_to_v15(client).await?,
+            15 => migrate_v15_to_v16(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -703,6 +704,8 @@ async fn add_bulk_submit_worker_schema(
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS oauth_metadata_urls TEXT",
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS file_encryption_key TEXT",
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS last_processed_line BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS import_directives TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS submission_metadata TEXT",
     ];
     for sql in &migrations {
         client
@@ -824,6 +827,54 @@ async fn migrate_v12_to_v13(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v12->v13 failed: {}", e)))?;
+    Ok(())
+}
+
+/// v15 -> v16: covering indexes on token and date + wider MCV + date multivariate
+/// stat (issue #281).
+///
+/// `idx_search_token_code` and `idx_search_date` are rebuilt with `INCLUDE (resource_id)`
+/// so the subquery probes are index-only. `value_token_code` statistics are widened to
+/// 4,000 and a matching multivariate stat is added for `value_date`, giving the planner
+/// the same cross-column correlation data for date that token received in v14->v15.
+async fn migrate_v15_to_v16(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let index_stmts = [
+        "DROP INDEX IF EXISTS idx_search_token_code",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_code
+         ON search_index (tenant_id, resource_type, param_name, value_token_code, value_token_system)
+         INCLUDE (resource_id)
+         WHERE value_token_code IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_date",
+        "CREATE INDEX IF NOT EXISTS idx_search_date
+         ON search_index (tenant_id, resource_type, param_name, value_date)
+         INCLUDE (resource_id)
+         WHERE value_date IS NOT NULL",
+    ];
+
+    for sql in index_stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v15->v16 failed: {}", e)))?;
+    }
+
+    let stats_stmts = [
+        "ALTER TABLE search_index ALTER COLUMN value_token_code SET STATISTICS 4000",
+        "CREATE STATISTICS IF NOT EXISTS stx_search_type_param_date (mcv, dependencies)
+         ON resource_type, param_name, value_date FROM search_index",
+        "ANALYZE search_index",
+    ];
+
+    for sql in stats_stmts {
+        if let Err(e) = client.execute(sql, &[]).await {
+            tracing::warn!(
+                "Migration v15->v16: optional statistics step failed (plans may be \
+                 suboptimal, search remains correct): {}",
+                e
+            );
+        }
+    }
+
     Ok(())
 }
 

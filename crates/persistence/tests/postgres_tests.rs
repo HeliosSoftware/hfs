@@ -11,6 +11,16 @@
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
+/// The backend-agnostic `ifMatch` scenarios (issue #311), shared verbatim with
+/// the SQLite suite that owns the file.
+///
+/// Declared at the top level rather than inside `mod postgres_integration`
+/// because `#[path]` on a module nested in an *inline* module resolves relative
+/// to `tests/postgres_tests/postgres_integration/`, which does not exist. At the
+/// crate root it resolves relative to `tests/`, which does.
+#[path = "transactions/if_match_suite.rs"]
+mod if_match_suite;
+
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -4674,6 +4684,105 @@ mod postgres_integration {
         assert_eq!(ok.version, 2);
     }
 
+    /// Issue #313: a tenant purge must reach the PHI-derived query strings a
+    /// client stores in its settings document. Those rows are keyed by *user*,
+    /// so none of `purge_tenant_data`'s tenant-scoped deletes touch them.
+    ///
+    /// The PostgreSQL-specific risk this proves is that the sweep runs inside
+    /// the purge's own transaction (`SELECT … FOR UPDATE`), so the offboarding
+    /// commits atomically: it cannot leave a tenant's saved queries behind after
+    /// its records are gone.
+    #[tokio::test]
+    async fn postgres_integration_purge_tenant_settings() {
+        let backend = create_backend().await;
+        let user = unique_user_key("tenant-purge");
+        let dotted = unique_user_key("tenant-purge-dotted");
+
+        backend
+            .put_settings(
+                &user,
+                json!({
+                    "theme": "dark",
+                    "byTenant": {
+                        "acme-purge": {"savedQueries": {"Patient": {"q": {"query": "name=smith"}}}},
+                        "beta-keep": {"savedQueries": {"Patient": {"q": {"query": "name=jones"}}}}
+                    }
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        // A tenant id containing `.` and `/`, both permitted by
+        // `admin_tenants::validate_tenant_id` — the reason the sweep edits a
+        // parsed document rather than using a `jsonb` text path.
+        backend
+            .put_settings(
+                &dotted,
+                json!({"byTenant": {"org.a/b": {"savedQueries": {"Patient": {"q": {}}}}}}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let before = backend.get_settings(&user).await.unwrap().unwrap();
+
+        // Driven through `purge_tenant_data`, which is the single choke point
+        // both the admin API and the web UI go through.
+        backend.purge_tenant_data("acme-purge").await.unwrap();
+
+        let after = backend.get_settings(&user).await.unwrap().unwrap();
+        assert_eq!(after.document["theme"], "dark");
+        assert!(after.document["byTenant"].get("acme-purge").is_none());
+        assert_eq!(
+            after.document["byTenant"]["beta-keep"]["savedQueries"]["Patient"]["q"]["query"],
+            "name=jones"
+        );
+        assert!(
+            !serde_json::to_string(&after.document)
+                .unwrap()
+                .contains("smith"),
+            "purged content must not survive in the stored row"
+        );
+        assert_eq!(
+            after.version,
+            before.version + 1,
+            "the version must bump so a stale ETag cannot write the content back"
+        );
+
+        // A tenant whose id is a prefix of another must not take it with it.
+        backend.purge_tenant_data("org.a").await.unwrap();
+        let dotted_doc = backend.get_settings(&dotted).await.unwrap().unwrap();
+        assert!(
+            dotted_doc.document["byTenant"].get("org.a/b").is_some(),
+            "purging 'org.a' must not touch the tenant named 'org.a/b'"
+        );
+        backend.purge_tenant_data("org.a/b").await.unwrap();
+        let dotted_doc = backend.get_settings(&dotted).await.unwrap().unwrap();
+        assert_eq!(dotted_doc.document, json!({}));
+    }
+
+    /// A tenant with nothing in the settings store leaves every document at its
+    /// original version, so no client ETag is needlessly invalidated.
+    #[tokio::test]
+    async fn postgres_integration_purge_tenant_settings_is_a_no_op_when_nothing_matches() {
+        let backend = create_backend().await;
+        let user = unique_user_key("tenant-purge-noop");
+        backend
+            .put_settings(&user, json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        let before = backend.get_settings(&user).await.unwrap().unwrap();
+
+        backend
+            .purge_tenant_data("tenant-that-has-no-settings")
+            .await
+            .unwrap();
+
+        let after = backend.get_settings(&user).await.unwrap().unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.document, json!({"theme": "dark"}));
+    }
+
     // ========================================================================
     // _contained / _containedType search
     // ========================================================================
@@ -4918,4 +5027,192 @@ mod postgres_integration {
             "expected a backend error from an unmigrated database, got {create:?}"
         );
     }
+    /// The `import` / `metadata` kickoff directives must survive the PostgreSQL
+    /// round-trip and reach the worker, and `merge` must actually merge.
+    ///
+    /// This is the Postgres half of the coverage in
+    /// `core::bulk_submit_worker::tests` (which runs on SQLite): the plumbing is
+    /// shared but the SQL is not, so a typo in the new columns would otherwise
+    /// only surface in production.
+    #[tokio::test]
+    async fn postgres_bulk_submit_import_directives_round_trip() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, IMPORT_MODE_PARAMETER_URL, ImportMode,
+            ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitClaimStrategy,
+            SubmitWorkerStorage,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_import");
+        let sub_id = SubmissionId::generate("pg-import-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/m.json"), None)
+            .await
+            .unwrap();
+
+        let directives = vec![(IMPORT_MODE_PARAMETER_URL.to_string(), "merge".to_string())];
+        let metadata = vec![("https://ex/context".to_string(), "batch-7".to_string())];
+        backend
+            .set_manifest_fetch_params(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                ManifestFetchParams {
+                    fhir_base_url: Some("https://provider/fhir"),
+                    import_directives: &directives,
+                    metadata: &metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Claim the manifest the way the worker does, then read its view back.
+        let lease = backend
+            .claim_next_manifest(
+                &helios_persistence::core::WorkerId::new("pg-import-worker"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.import_directives, directives);
+        assert_eq!(view.metadata, metadata);
+        assert_eq!(
+            ImportMode::from_directives(&view.import_directives),
+            ImportMode::Merge
+        );
+
+        // And the resolved mode changes what ingestion writes.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "pg-merge-1",
+                    "gender": "female",
+                    "name": [{"family": "Stale"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let entry = NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "pg-merge-1", "name": [{"family": "New"}]}),
+        );
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                vec![entry],
+                &BulkProcessingOptions::new().with_import_mode(ImportMode::Merge),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success());
+
+        let stored = backend
+            .read(&tenant, "Patient", "pg-merge-1")
+            .await
+            .unwrap()
+            .expect("patient still stored");
+        assert_eq!(stored.content()["name"], json!([{"family": "New"}]));
+        assert_eq!(
+            stored.content()["gender"],
+            json!("female"),
+            "merge must retain elements the submission omitted"
+        );
+    }
+
+    // ========================================================================
+    // Issue #311 — `ifMatch` on bundle entries, on a real PostgreSQL instance
+    //
+    // PostgreSQL carried both #311 defects (batch arm ignored `ifMatch`; the
+    // field was compared as one opaque string), and its batch and transaction
+    // arms are separate code paths from SQLite's. Running the *shared* suite
+    // here is what makes "the backends agree" a checked claim rather than an
+    // assumption — the assertions are literally the same function bodies.
+    //
+    // Each test gets its own tenant, since the whole binary shares one
+    // container database and the scenarios reuse fixed resource ids.
+    // ========================================================================
+
+    /// Expands to a `#[tokio::test]` running one shared scenario against the
+    /// shared PostgreSQL container under an isolated tenant.
+    macro_rules! pg_if_match_test {
+        ($test_name:ident, $scenario:ident) => {
+            #[tokio::test]
+            async fn $test_name() {
+                let backend = create_backend().await;
+                let tenant = create_tenant(concat!("if_match_", stringify!($scenario)));
+                super::if_match_suite::$scenario(&backend, &tenant).await;
+            }
+        };
+    }
+
+    pg_if_match_test!(
+        postgres_integration_batch_put_honors_stale_if_match,
+        batch_put_honors_stale_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_put_accepts_matching_if_match,
+        batch_put_accepts_matching_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_multi_valued_if_match_matches_any_member,
+        multi_valued_if_match_matches_any_member
+    );
+    pg_if_match_test!(
+        postgres_integration_multi_valued_if_match_fails_when_no_member_matches,
+        multi_valued_if_match_fails_when_no_member_matches
+    );
+    pg_if_match_test!(
+        postgres_integration_strong_form_if_match_matches_weak_etag,
+        strong_form_if_match_matches_weak_etag
+    );
+    pg_if_match_test!(
+        postgres_integration_if_match_on_absent_resource_fails_instead_of_creating,
+        if_match_on_absent_resource_fails_instead_of_creating
+    );
+    pg_if_match_test!(
+        postgres_integration_star_if_match_requires_an_existing_resource,
+        star_if_match_requires_an_existing_resource
+    );
+    pg_if_match_test!(
+        postgres_integration_malformed_if_match_fails_closed,
+        malformed_if_match_fails_closed
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_put_if_match_on_deleted_resource_fails,
+        batch_put_if_match_on_deleted_resource_fails
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_delete_if_match_on_deleted_resource_fails,
+        batch_delete_if_match_on_deleted_resource_fails
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_delete_honors_stale_if_match,
+        batch_delete_honors_stale_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_batch_delete_accepts_matching_if_match,
+        batch_delete_accepts_matching_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_transaction_delete_honors_stale_if_match,
+        transaction_delete_honors_stale_if_match
+    );
+    pg_if_match_test!(
+        postgres_integration_transaction_delete_accepts_matching_if_match,
+        transaction_delete_accepts_matching_if_match
+    );
 }

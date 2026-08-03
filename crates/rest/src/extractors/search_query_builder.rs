@@ -112,6 +112,11 @@ pub fn build_search_query(
     // Process _summary
     if let Some(summary) = params.get("_summary") {
         query.summary = parse_summary_mode(summary);
+        // `_summary=count` exists to return Bundle.total and nothing else, so
+        // it implies an accurate total; an explicit `_total` still wins (#254).
+        if query.summary == Some(SummaryMode::Count) && query.total.is_none() {
+            query.total = Some(TotalMode::Accurate);
+        }
     }
 
     // Process _elements
@@ -276,7 +281,15 @@ fn parse_search_parameter(
     value: &str,
     registry: &SearchParameterRegistry,
 ) -> Result<SearchParameter, RestError> {
-    let (param_name, modifier) = parse_parameter_name(name);
+    // A dotted name is a chained parameter, and a colon inside it
+    // (`subject:Patient.name`) is the chain's type qualifier — modifier
+    // parsing must not eat it (it used to keep `subject` and drop the whole
+    // `.name` tail, turning the chain into a plain reference search).
+    let (param_name, modifier) = if name.contains('.') {
+        (name, None)
+    } else {
+        parse_parameter_name(name)
+    };
 
     // Check for chained parameters (e.g., "patient.name" or "subject:Patient.name")
     let (base_name, chain) = parse_chain(param_name);

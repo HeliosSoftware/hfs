@@ -98,6 +98,7 @@ pub mod bulk_submit_input;
 pub mod bulk_submit_worker;
 pub mod capabilities;
 pub mod history;
+pub mod preconditions;
 pub mod search;
 pub mod sof_runner;
 pub mod storage;
@@ -122,16 +123,18 @@ pub use bulk_export_worker::{
 };
 pub use bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, IMPORT_MODE_PARAMETER_URL,
+    ImportMode, ManifestStatus, NdjsonEntry, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    merge_resource,
 };
 pub use bulk_submit_input::{
     FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
 };
 pub use bulk_submit_worker::{
-    BulkSubmitJobStore, DefaultSubmitWorker, ManifestLease, ManifestWorkerView, PollTokenTarget,
-    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    BulkSubmitJobStore, DefaultSubmitWorker, ManifestFetchParams, ManifestLease,
+    ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow,
+    SubmitWorkerStorage,
 };
 pub use capabilities::{
     CapabilityProvider, GlobalSearchCapabilities, Interaction, ResourceCapabilities,
@@ -141,6 +144,10 @@ pub use capabilities::{
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+};
+pub use preconditions::{
+    EntityTag, EntityTagPrecondition, MalformedPrecondition, bundle_if_match_gate,
+    if_match_field_satisfied, precondition_failed_entry,
 };
 pub use search::{
     ChainedSearchProvider, FullSearchProvider, IncludeProvider, MultiTypeSearchProvider,
@@ -157,5 +164,8 @@ pub use transaction::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     IsolationLevel, LockingStrategy, Transaction, TransactionOptions, TransactionProvider,
 };
-pub use user_settings::{SettingsStore, StoredUserSettings, apply_merge_patch};
+pub use user_settings::{
+    BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,
+    normalize_legacy, project_for_tenant, purge_tenant_subtree, scope_merge_patch, stored_for_put,
+};
 pub use versioned::{VersionConflictInfo, VersionedStorage, check_version_match, normalize_etag};

@@ -22,9 +22,9 @@ use serde_json::json;
 use helios_persistence::backends::elasticsearch::{ElasticsearchBackend, ElasticsearchConfig};
 use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
 use helios_persistence::composite::{
-    CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage,
+    CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage, SyncMode,
 };
-use helios_persistence::core::search::SearchProvider;
+use helios_persistence::core::search::{SearchProvider, SearchResult};
 use helios_persistence::core::{Backend, BackendKind, ResourceStorage};
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
@@ -277,10 +277,17 @@ async fn make_harness(scope: &str) -> S3EsHarness {
         .await
         .expect("initialize ES backend");
 
-    // Composite
+    // Composite. Sync mode must be explicit: the default is Asynchronous,
+    // which requires start_sync_workers() (never called here) — without it
+    // every secondary sync fails with "async worker was never started", the
+    // composite swallows the error (primary succeeded), and nothing ever
+    // reaches ES, so every positive search assertion fails. Synchronous
+    // indexing is also what these tests want: create/update/delete must be
+    // searchable as soon as ES refreshes.
     let composite_config = CompositeConfig::builder()
         .primary("s3", BackendKind::S3)
         .search_backend("es", BackendKind::Elasticsearch)
+        .sync_mode(SyncMode::Synchronous)
         .build()
         .expect("build composite config");
 
@@ -302,6 +309,34 @@ async fn make_harness(scope: &str) -> S3EsHarness {
 
 fn tenant(id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
+}
+
+/// Poll a search until `pred` holds or ~10s elapse, returning the last result.
+/// The ES index is configured with a 1ms refresh interval, but on a loaded CI
+/// runner refresh visibility can lag well past any fixed sleep (#390), so
+/// visibility assertions poll instead of sleeping. On timeout the last result
+/// is returned and the caller's assertion reports the real failure.
+async fn search_until<F>(
+    harness: &S3EsHarness,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    pred: F,
+) -> SearchResult
+where
+    F: Fn(&SearchResult) -> bool,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let results = harness
+            .composite
+            .search(tenant, query)
+            .await
+            .expect("search should succeed");
+        if pred(&results) || std::time::Instant::now() >= deadline {
+            return results;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 // ============================================================================
@@ -333,9 +368,6 @@ async fn s3_es_test_create_then_search() {
         .await
         .expect("create should succeed");
 
-    // Allow ES refresh (1ms interval configured, but give a little time)
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "family".to_string(),
         param_type: SearchParamType::String,
@@ -345,11 +377,7 @@ async fn s3_es_test_create_then_search() {
         components: vec![],
     });
 
-    let results = harness
-        .composite
-        .search(&tenant, &query)
-        .await
-        .expect("search should succeed");
+    let results = search_until(&harness, &tenant, &query, |r| !r.resources.items.is_empty()).await;
 
     assert!(
         !results.resources.items.is_empty(),
@@ -398,8 +426,6 @@ async fn s3_es_test_update_then_search() {
         .await
         .expect("update should succeed");
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
     // Search by new family name — should find it
     let query_new = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "family".to_string(),
@@ -409,11 +435,10 @@ async fn s3_es_test_update_then_search() {
         chain: vec![],
         components: vec![],
     });
-    let results = harness
-        .composite
-        .search(&tenant, &query_new)
-        .await
-        .expect("search by new family should succeed");
+    let results = search_until(&harness, &tenant, &query_new, |r| {
+        r.resources.items.iter().any(|res| res.id() == created.id())
+    })
+    .await;
     assert!(
         results
             .resources
@@ -447,16 +472,6 @@ async fn s3_es_test_delete_then_search() {
         .await
         .expect("create should succeed");
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    harness
-        .composite
-        .delete(&tenant, "Patient", created.id())
-        .await
-        .expect("delete should succeed");
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "family".to_string(),
         param_type: SearchParamType::String,
@@ -465,11 +480,21 @@ async fn s3_es_test_delete_then_search() {
         chain: vec![],
         components: vec![],
     });
-    let results = harness
+
+    // Wait until the create is searchable so the post-delete absence check
+    // can't pass vacuously against a lagging index.
+    search_until(&harness, &tenant, &query, |r| !r.resources.items.is_empty()).await;
+
+    harness
         .composite
-        .search(&tenant, &query)
+        .delete(&tenant, "Patient", created.id())
         .await
-        .expect("search after delete should not error");
+        .expect("delete should succeed");
+
+    let results = search_until(&harness, &tenant, &query, |r| {
+        r.resources.items.iter().all(|res| res.id() != created.id())
+    })
+    .await;
     assert!(
         results
             .resources
@@ -606,8 +631,6 @@ async fn s3_es_test_multi_tenant_isolation() {
         .await
         .expect("create in tenant-a should succeed");
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
     let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "family".to_string(),
         param_type: SearchParamType::String,
@@ -616,6 +639,18 @@ async fn s3_es_test_multi_tenant_isolation() {
         chain: vec![],
         components: vec![],
     });
+
+    // tenant-a should see its own data. Waiting for this FIRST also makes the
+    // tenant-b absence check below meaningful: once the document is visible to
+    // tenant-a, its absence for tenant-b is isolation, not index lag.
+    let results_a = search_until(&harness, &tenant_a, &query, |r| {
+        !r.resources.items.is_empty()
+    })
+    .await;
+    assert!(
+        !results_a.resources.items.is_empty(),
+        "tenant-a should see its own resource"
+    );
 
     // tenant-b should NOT see tenant-a's data
     let results_b = harness
@@ -626,17 +661,6 @@ async fn s3_es_test_multi_tenant_isolation() {
     assert!(
         results_b.resources.items.is_empty(),
         "tenant-b should not see tenant-a's resource"
-    );
-
-    // tenant-a should see its own data
-    let results_a = harness
-        .composite
-        .search(&tenant_a, &query)
-        .await
-        .expect("tenant-a search should succeed");
-    assert!(
-        !results_a.resources.items.is_empty(),
-        "tenant-a should see its own resource"
     );
 }
 

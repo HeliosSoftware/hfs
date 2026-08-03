@@ -37,7 +37,7 @@ export class SearchBuilder {
   get sections(): Locator {
     return this.page.locator("#builder-sections");
   }
-  addButton(kind: "condition" | "include" | "control"): Locator {
+  addButton(kind: "condition" | "include" | "control" | "has" | "include-fwd" | "include-rev"): Locator {
     return this.page.locator(`[data-add='${kind}']`);
   }
   get conditionRows(): Locator {
@@ -45,6 +45,15 @@ export class SearchBuilder {
   }
   get paramOptions(): Locator {
     return this.page.locator("#param-options option");
+  }
+  get chainRows(): Locator {
+    return this.page.locator("#builder-conditions .builder-row--chain");
+  }
+  get hasRows(): Locator {
+    return this.page.locator("#builder-conditions .builder-row--has");
+  }
+  drillButton(row: Locator): Locator {
+    return row.locator("[data-chain-from]");
   }
 
   async run(query: string): Promise<void> {
@@ -57,6 +66,8 @@ export class SearchBuilder {
   async setUrl(query: string): Promise<void> {
     await this.url.fill(query);
     await this.url.dispatchEvent("change");
+    // Flush the native change (dirty-value flag) now, not mid-interaction.
+    await this.url.blur();
     await this.sections.waitFor({ state: "visible" });
   }
 }

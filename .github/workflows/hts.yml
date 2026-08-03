@@ -690,6 +690,11 @@ jobs:
       # it can never race a concurrent hts run (e.g. nightly + a release tag).
       MAX_CONTAINER_AGE_MIN: 90
     steps:
+      - name: Check out the Docker host GC action
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/actions
+
       - name: Sweep orphaned testcontainers from dead runs
         run: |
           # testcontainers-rs unconditionally applies
@@ -704,8 +709,14 @@ jobs:
             age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
             if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
               echo "Reaping orphan $id (age ${age_min}m)"
-              docker rm -f "$id" || true
+              docker rm -fv "$id" || true
               reaped=$((reaped + 1))
             fi
           done
           echo "Swept ${reaped} orphaned testcontainer(s)."
+
+      # This workflow runs on its own nightly cron and cannot rely on ci.yml's
+      # sweep (see the job comment above), so it carries the GC itself.
+      - name: GC the Docker host
+        if: always()
+        uses: ./.github/actions/docker-host-gc

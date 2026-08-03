@@ -211,12 +211,23 @@ them, and exposes results through a status manifest.
   status artifacts). See the [API Endpoints](#api-endpoints) table.
 - **Scope**: every surface requires the `system/bulk-submit` SMART scope when auth is
   enabled; status, cancel, and file surfaces also enforce submission ownership.
+- **Poll pacing**: an in-progress poll advertises `Retry-After`
+  (`HFS_BULK_SUBMIT_RETRY_AFTER`); a client that ignores it and hammers the poll URL
+  is throttled with `429` plus a `Retry-After` pointing at the end of the rate window
+  (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` / `_POLL_RATE_WINDOW`). Buckets are per client
+  (principal, else peer address) per poll token.
 - **Backends**: available on `sqlite`, `postgres`, and their `-elasticsearch`
   composites; other backends return `501`. Job state reuses the FHIR-resource
   backend — no separate job store to configure.
 - **Status manifest**: emits `output[]`, `outcome[]`, and `deleted[]` arrays (each
   entry carries `url`, `count`, and `fileSize`), plus `requiresAccessToken`,
-  `transactionTime`, and an always-present `link[]` (single, non-paginated).
+  `transactionTime`, and `link[]`.
+- **Status pagination**: entries are split across pages of
+  `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` (default `1000`); when more remain, `link[]`
+  carries one `{"relation": "next", "url": ".../bulk-submit-status/{token}?page=N"}`
+  entry and every other manifest field repeats identically on each page. Pages are
+  fetched from the same status URL with `?page=N` (1-based); an out-of-range page is
+  `404` and a malformed one `400`. Set the page size to `0` to disable pagination.
 
 Configured via `HFS_BULK_SUBMIT_*` environment variables:
 
@@ -230,6 +241,9 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact-URL lifetime, seconds. |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention after completion, seconds. |
 | `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll. |
+| `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max `output` + `outcome` + `deleted` entries per status-manifest page; further pages are chained by `link[]` `next`. `0` disables pagination. |
+| `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls allowed per client, per submission, per rate window. `0` disables poll rate limiting. |
+| `HFS_BULK_SUBMIT_POLL_RATE_WINDOW` | `60` | Sliding window for the poll rate limit, seconds. |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit-worker pool size. |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers. |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (kick-off returns `429` if exceeded). |
@@ -241,12 +255,54 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_PRIVATE_KEY` | *(none)* | PEM key for the `private_key_jwt` client assertion. |
 | `HFS_BULK_SUBMIT_SIGNING_ALG` | `ES384` | Client-assertion signing algorithm: `ES384` or `RS384`. |
 | `HFS_BULK_SUBMIT_OUTBOUND_SCOPE` | `system/*.rs` | Read scope requested for file-retrieval tokens (never `system/bulk-submit`). |
+| `HFS_BULK_SUBMIT_DECRYPTION_KEY` | *(none)* | P-256/P-384 private key(s) for `ECDH-ES*` JWE key management — PEM (PKCS#8/SEC1) or a JWK / JWK Set. |
 
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
-`HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set. JWE-encrypted
-files (`fileEncryptionKey`) are supported for `dir` + `A128GCM`/`A256GCM` when built
-with the `bulk-submit-jwe` feature.
+`HFS_BULK_SUBMIT_CLIENT_ID` and `HFS_BULK_SUBMIT_PRIVATE_KEY` are set.
+
+#### Encrypted submissions (`fileEncryptionKey`)
+
+JWE decryption is built unconditionally — the old `bulk-submit-jwe` feature is a
+deprecated no-op. When a submission carries a `fileEncryptionKey`, both the
+manifest and every output/deleted file are decrypted by the
+[`jwe`](src/jwe.rs) module (pure RustCrypto, no OpenSSL):
+
+| Layer | Supported |
+|-------|-----------|
+| `alg` | `dir`, `A128KW`/`A192KW`/`A256KW`, `A128GCMKW`/`A192GCMKW`/`A256GCMKW`, `ECDH-ES`, `ECDH-ES+A128KW`/`+A192KW`/`+A256KW` |
+| `enc` | `A128GCM`/`A192GCM`/`A256GCM`, `A128CBC-HS256`/`A192CBC-HS384`/`A256CBC-HS512` |
+| Serialization | compact, flattened JSON, general JSON |
+| Compression | `zip: "DEF"` |
+
+Deliberately unsupported, each rejected with an error naming the reason:
+
+- **`RSA-OAEP` / `RSA-OAEP-256`.** The only pure-Rust RSA implementation (the
+  `rsa` crate) carries [RUSTSEC-2023-0071] — the Marvin Attack, key recovery
+  through a decryption timing sidechannel — with no fixed release. Rather than
+  take a knowingly vulnerable RSA implementation into a server that handles PHI,
+  the RSA arms are refused; use the `ECDH-ES` family to deliver a
+  content-encryption key asymmetrically. RSA private keys are likewise rejected
+  by `HFS_BULK_SUBMIT_DECRYPTION_KEY` rather than silently ignored.
+- **`RSA1_5`.** RFC 8017 §7.2 padding-oracle exposure; deprecated for JOSE by
+  RFC 8725.
+- **`PBES2-*`.** Password-based — the submit flow has no shared password.
+
+Any other unknown `alg` or `enc` is rejected with the offending value in the
+message.
+
+[RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071
+
+`fileEncryptionKey.value` is accepted as base64url key material, an `oct` JWK, or
+— matching the spec's "JSON Web Encryption structure to deliver a Content
+Encryption Key" — a JWE that wraps the CEK. That last form, and any file using
+`ECDH-ES*` directly, needs a local P-256/P-384 private key in
+`HFS_BULK_SUBMIT_DECRYPTION_KEY`; `dir` and the `A*KW` families work from the
+provider-supplied symmetric key alone and need no configuration.
+
+A file that arrives in cleartext despite a `fileEncryptionKey` is rejected. A
+cleartext *manifest* is accepted with a warning, since manifests carry URLs
+rather than PHI and providers commonly leave them unencrypted.
 
 ### SQL-on-FHIR Async Export
 
@@ -411,7 +467,9 @@ curl -X POST http://localhost:8080/ \
 ### Conditional Operations in Bundles
 
 Bundle entries support conditional headers:
-- `ifMatch` - ETag for optimistic locking on updates
+- `ifMatch` - ETag for optimistic locking on `PUT` **and `DELETE`** entries, in
+  both `batch` and `transaction` bundles. Parsed as the comma-separated list
+  RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
 - `ifNoneMatch` - Prevent overwrites (`*` for conditional create)
 - `ifNoneExist` - Search query for conditional create
 
@@ -431,7 +489,7 @@ The server supports standard FHIR HTTP headers:
 |--------|---------|
 | `Accept` | Content negotiation |
 | `Content-Type` | Request body format |
-| `ETag` / `If-Match` | Optimistic locking |
+| `ETag` / `If-Match` | Optimistic locking on `PUT`, `PATCH` and `DELETE` |
 | `If-None-Match` | Conditional read |
 | `If-None-Exist` | Conditional create |
 | `If-Modified-Since` | Conditional read by date |

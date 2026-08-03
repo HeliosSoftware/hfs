@@ -96,10 +96,6 @@ helios-persistence/
 │   │   ├── writer.rs       # Search index writer
 │   │   ├── reindex.rs      # Reindexing operations
 │   │   └── errors.rs       # Search-specific error types
-│   ├── strategy/        # Tenancy SQL generators (unused by backends — see #370)
-│   │   ├── shared_schema.rs       # Emits tenant_id + RLS SQL text (not wired in)
-│   │   ├── schema_per_tenant.rs   # Emits search_path SQL/names (not wired in)
-│   │   └── database_per_tenant.rs # Emits per-tenant DB names/conn strings (not wired in)
 │   ├── backends/        # Backend implementations
 │   │   ├── sqlite/      # Reference implementation (complete)
 │   │   │   ├── backend.rs      # SqliteBackend with connection pooling
@@ -230,7 +226,7 @@ Backend (connection management, capabilities)
 ## Features
 
 - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, enforced at the type level (the S3 backend additionally offers a bucket-per-tenant mode)
+- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode)
 - **Full FHIR Search**: All parameter types, modifiers, chaining, \_include/\_revinclude
 - **Versioning**: Complete resource history with optimistic locking
 - **Transactions**: ACID transactions with FHIR bundle support
@@ -238,20 +234,40 @@ Backend (connection management, capabilities)
 
 ## Multitenancy
 
-All storage operations require a `TenantContext`, ensuring tenant isolation at the type level. There is no way to bypass this requirement—the compiler enforces it.
+Every tenant-scoped storage operation requires a `TenantContext` as its first argument, so the compiler guarantees tenant scope is *available* at the call site (a few operations are intentionally cross-tenant — `count_by_tenant`, the tenant-registry calls — and take none). This is a guarantee about call sites, not about the SQL each backend emits: the `tenant_id` predicate is hand-written per query, and the control on it is review. A database-enforced layer (PostgreSQL RLS) is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
-### How Tenants Are Separated
+### Tenant Isolation
 
-Every backend in this crate implements **shared-schema** multitenancy: all tenants' records live in one set of tables, collections, or indices, separated by a `tenant_id` discriminator that every query filters on. Isolation is logical and enforced at the query level. No backend gives a tenant its own database schema, its own database, or a Row-Level Security policy.
+There is one isolation model — **shared schema with a `tenant_id`
+discriminator** — chosen deliberately in [discussion #28](https://github.com/HeliosSoftware/hfs/discussions/28).
+All tenants' records live in one set of tables, collections, or indices;
+isolation is logical and enforced at the query level. No backend gives a tenant
+its own database schema, its own database, or a Row-Level Security policy. Each
+backend applies the discriminator in its own idiom:
 
-The one exception is the S3 backend, whose `S3TenancyMode::BucketPerTenant` maps each tenant to a dedicated bucket — the only per-tenant storage container implemented anywhere in the crate. S3's default mode, `PrefixPerTenant`, is shared storage (one bucket, tenant-scoped key prefixes).
+| Backend           | How the discriminator is applied                                          |
+| ----------------- | ------------------------------------------------------------------------- |
+| **SQLite**        | `tenant_id` column; composite indexes lead with `tenant_id`               |
+| **PostgreSQL**    | `tenant_id` column; `PRIMARY KEY (tenant_id, resource_type, id)`          |
+| **MongoDB**       | `tenant_id` field on every document                                       |
+| **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
+| **S3**            | Tenant-scoped key prefix, or a dedicated bucket per tenant (see below)    |
 
-| Where records live                                    | Backends                                                                              | Isolation boundary                                             |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| One shared table/collection/index, `tenant_id` column | SQLite, PostgreSQL, MongoDB, Elasticsearch, S3 (`PrefixPerTenant`)                     | Query-level: every statement filters on `tenant_id`            |
-| One bucket per tenant                                 | S3 (`BucketPerTenant`)                                                                | Storage container: separate bucket, credential, policy surface |
+The S3 backend is the one place HFS offers a genuine per-tenant *physical*
+boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
+bucket, with its own IAM/policy surface (tenants absent from the bucket map
+fall back to the shared system bucket). Every other backend is shared-schema.
+Note that Elasticsearch gives each tenant its own index, but within a single
+cluster and credential, so that is a naming boundary rather than a physical
+one — the term filter is what actually isolates.
 
-The `src/strategy/` module also defines `SchemaPerTenantStrategy` and `DatabasePerTenantStrategy`. These are configuration builders and SQL-string generators only: no backend calls them and no configuration selects them, so constructing one does not change where any tenant's data is stored. Do not cite them to satisfy an isolation, compliance, or data-residency requirement. Whether these get wired up or removed is tracked in [#370](https://github.com/HeliosSoftware/hfs/issues/370).
+Schema-per-tenant and database-per-tenant are **not** offered for the SQL
+backends, so neither can be cited to satisfy an isolation, compliance, or
+data-residency requirement. Unwired SQL generators for them were removed in
+[#370](https://github.com/HeliosSoftware/hfs/issues/370), after the capability
+advertisements that referenced them were corrected in
+[#369](https://github.com/HeliosSoftware/hfs/issues/369). A backend reports
+what it actually does through `Backend::capabilities()`.
 
 ### Hierarchical Tenants
 
@@ -423,10 +439,10 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and `BulkS
 **Multitenancy notes.** The four Multitenancy rows describe *where a tenant's records physically live*, not how strongly the boundary is enforced; a deployment sits in exactly one of the first three.
 
 - **‡ S3 tenancy is a property of the deployment, not the backend type.** A `PrefixPerTenant` instance (one shared bucket, tenant-scoped key prefixes) is *Shared Schema*; a `BucketPerTenant` instance (a dedicated bucket per tenant) is *Database-per-Tenant*. An instance declares exactly one — see `S3Backend::declared_capabilities_for`.
-- **○ means no backend implements it today.** The `TenancyStrategy` SQL generators in `src/strategy/` (shared-schema + RLS, schema-per-tenant `search_path`, database-per-tenant pools) are not wired into any backend; their fate is issue #370. Do not read a `○` cell as a deployable isolation guarantee.
+- **○ means no backend implements it today.** Unwired SQL generators for these topologies (shared-schema + RLS, schema-per-tenant `search_path`, database-per-tenant pools) once lived in `src/strategy/`; they were removed in issue #370. Do not read a `○` cell as a deployable isolation guarantee.
 - **✗ for PostgreSQL is a decision, not a gap.** Design discussion #28 chose shared-schema for PostgreSQL and declined the per-schema and per-database topologies; advertising them anyway was the defect issue #369 corrected.
 - **— Cassandra and Neo4j have no backend in this tree** (`src/backends/mod.rs`), so they have no tenant placement to report.
-- **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because `SharedSchemaConfig::with_rls()` only *generates* `ALTER TABLE … ENABLE ROW LEVEL SECURITY` text; no backend executes it.
+- **Row-Level Security has no `BackendCapability` counterpart**, so the contract test cannot police it. PostgreSQL is `○` because no backend issues `ALTER TABLE … ENABLE ROW LEVEL SECURITY`; a database-enforced layer is tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381).
 
 ### Primary/Secondary Role Matrix
 
@@ -1021,11 +1037,15 @@ cargo test -p helios-persistence --test s3_tests --features s3
 - [x] Transaction traits (ACID, bundles)
 - [x] Capabilities trait (CapabilityStatement generation)
 
-### Phase 3: Tenancy Strategies ✓
+### Phase 3: Tenant Isolation
 
-- [x] Shared schema strategy with RLS support (SQL generators in `src/strategy/`; not wired into any backend — see #370)
-- [x] Schema-per-tenant strategy with PostgreSQL search_path (SQL generators in `src/strategy/`; not wired into any backend — see #370)
-- [x] Database-per-tenant strategy with pool management (SQL generators in `src/strategy/`; not wired into any backend — see #370)
+- [x] Shared-schema isolation via a `tenant_id` discriminator, with a mandatory
+      `TenantContext` on every tenant-scoped `ResourceStorage` operation
+- [x] Per-tenant physical isolation for S3 (`S3TenancyMode::BucketPerTenant`)
+- [ ] Row-Level Security as a PostgreSQL database-enforced layer — not
+      implemented; tracked in [#381](https://github.com/HeliosSoftware/hfs/issues/381)
+- Schema-per-tenant and database-per-tenant for SQL backends: **not planned**
+  (design discussion #28). Unwired SQL generators removed in #370.
 
 ### Phase 4: SQLite Backend ✓
 

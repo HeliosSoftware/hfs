@@ -29,16 +29,14 @@ use axum::{
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::error::{RestError, RestResult};
 use crate::extractors::{PeerIp, SearchParams, TenantExtractor, UserKey, unknown_search_params};
 use crate::fhir_types::get_resource_type_names_for_version;
+use crate::rate_limit::{LimitKind, RateLimiter};
 use crate::state::AppState;
 
 /// The reviewable system prompt. The live prompt appends the server's real
@@ -331,6 +329,13 @@ async fn call_llm(
         })?;
 
     let status = response.status();
+    // Pass the provider's own back-off through when it gave one; inventing a
+    // number here would just be a guess about someone else's limiter.
+    let upstream_retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
     let payload: Value = response
         .json()
         .await
@@ -341,6 +346,7 @@ async fn call_llm(
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(RestError::TooManyRequests {
             message: "The translation service is rate-limited; try again shortly".to_string(),
+            retry_after_secs: upstream_retry_after,
         });
     }
     if !status.is_success() {
@@ -482,76 +488,22 @@ fn rate_limit_key(tenant: &str, user: &UserKey, peer: Option<IpAddr>) -> String 
     }
 }
 
-/// Keys are unbounded in principle (one per IP), so the map is pruned of
-/// inactive buckets once it grows past this.
-const RATE_MAP_PRUNE_AT: usize = 10_000;
-
-struct RateState {
-    window: VecDeque<Instant>,
-    day: u64,
-    day_count: u32,
-}
-
-fn rate_map() -> &'static Mutex<HashMap<String, RateState>> {
-    static MAP: OnceLock<Mutex<HashMap<String, RateState>>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn current_day() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or_default()
-}
+/// Buckets for this surface only — the operator's LLM budget is not shared
+/// with any other rate-limited endpoint.
+static NL_SEARCH_LIMITER: RateLimiter = RateLimiter::new();
 
 fn check_rate_limit(key: &str, limit: u32, window: Duration, daily_limit: u32) -> RestResult<()> {
-    let mut map = rate_map().lock().expect("rate limiter lock");
-    let now = Instant::now();
-    let today = current_day();
-
-    if map.len() > RATE_MAP_PRUNE_AT {
-        map.retain(|_, state| {
-            state.day == today
-                && (state.day_count > 0
-                    || state
-                        .window
-                        .back()
-                        .is_some_and(|t| now.duration_since(*t) <= window))
-        });
-    }
-
-    let state = map.entry(key.to_string()).or_insert_with(|| RateState {
-        window: VecDeque::new(),
-        day: today,
-        day_count: 0,
-    });
-
-    if state.day != today {
-        state.day = today;
-        state.day_count = 0;
-    }
-    while state
-        .window
-        .front()
-        .is_some_and(|t| now.duration_since(*t) > window)
-    {
-        state.window.pop_front();
-    }
-
-    if state.day_count >= daily_limit {
-        return Err(RestError::TooManyRequests {
-            message: "Daily natural-language search limit reached".to_string(),
-        });
-    }
-    if state.window.len() >= limit as usize {
-        return Err(RestError::TooManyRequests {
-            message: "Too many natural-language searches; slow down and retry".to_string(),
-        });
-    }
-
-    state.window.push_back(now);
-    state.day_count += 1;
-    Ok(())
+    NL_SEARCH_LIMITER
+        .check(key, limit, window, daily_limit)
+        .map_err(|limited| RestError::TooManyRequests {
+            message: match limited.kind {
+                LimitKind::Daily => "Daily natural-language search limit reached".to_string(),
+                LimitKind::Window => {
+                    "Too many natural-language searches; slow down and retry".to_string()
+                }
+            },
+            retry_after_secs: Some(limited.retry_after_secs),
+        })
 }
 
 #[cfg(test)]

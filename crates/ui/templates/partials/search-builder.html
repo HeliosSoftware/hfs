@@ -42,27 +42,93 @@
     <button class="btn btn--primary" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
   </div>
 
+  <p class="query-plain" id="query-plain" hidden>
+    <span class="query-plain__pill">{{ i18n.t("plain-pill") }}</span>
+    <span id="query-plain-text"></span>
+  </p>
+  <script type="application/json" id="plain-english-msgs">
+    {
+      "find": "{{ i18n.t("plain-find") }}",
+      "clause": "{{ i18n.t("plain-clause") }}",
+      "and": "{{ i18n.t("plain-and") }}",
+      "or": "{{ i18n.t("plain-or") }}",
+      "arrow": "{{ i18n.t("plain-arrow") }}",
+      "has": "{{ i18n.t("plain-has") }}",
+      "include": "{{ i18n.t("plain-include") }}",
+      "revinclude": "{{ i18n.t("plain-revinclude") }}",
+      "iterate": "{{ i18n.t("plain-iterate") }}",
+      "count": "{{ i18n.t("plain-count") }}",
+      "sort": "{{ i18n.t("plain-sort") }}",
+      "verbs": {
+        "": "{{ i18n.t("plain-verb-is") }}",
+        "contains": "{{ i18n.t("plain-verb-contains") }}",
+        "exact": "{{ i18n.t("plain-verb-exact") }}",
+        "missing": "{{ i18n.t("plain-verb-missing") }}",
+        "not": "{{ i18n.t("plain-verb-not") }}",
+        "text": "{{ i18n.t("plain-verb-text") }}",
+        "in": "{{ i18n.t("plain-verb-in") }}",
+        "not-in": "{{ i18n.t("plain-verb-not-in") }}",
+        "identifier": "{{ i18n.t("plain-verb-identifier") }}",
+        "of-type": "{{ i18n.t("plain-verb-of-type") }}",
+        "ge": "{{ i18n.t("plain-verb-ge") }}",
+        "le": "{{ i18n.t("plain-verb-le") }}",
+        "gt": "{{ i18n.t("plain-verb-gt") }}",
+        "lt": "{{ i18n.t("plain-verb-lt") }}",
+        "ne": "{{ i18n.t("plain-verb-ne") }}",
+        "eq": "{{ i18n.t("plain-verb-eq") }}",
+        "sa": "{{ i18n.t("plain-verb-sa") }}",
+        "eb": "{{ i18n.t("plain-verb-eb") }}",
+        "ap": "{{ i18n.t("plain-verb-ap") }}"
+      }
+    }
+  </script>
+
   <datalist id="param-options"></datalist>
+  <datalist id="resource-type-options">
+    {% for t in resource_types %}<option value="{{ t }}"></option>{% endfor %}
+  </datalist>
   <div class="builder-sections" id="builder-sections" hidden
        data-msg-param="{{ i18n.t("queries-param-placeholder") }}"
        data-msg-value="{{ i18n.t("queries-value-placeholder") }}"
-       data-msg-remove="{{ i18n.t("queries-remove") }}">
+       data-msg-remove="{{ i18n.t("queries-remove") }}"
+       data-msg-chain-into="{{ i18n.t("queries-chain-into") }}"
+       data-msg-any-target="{{ i18n.t("queries-chain-any-target") }}"
+       data-msg-has-pill="{{ i18n.t("queries-has-pill") }}"
+       data-msg-has-type="{{ i18n.t("queries-has-type-placeholder") }}"
+       data-msg-has-via="{{ i18n.t("queries-has-via") }}"
+       data-msg-has-where="{{ i18n.t("queries-has-where") }}"
+       data-msg-match-is="{{ i18n.t("queries-match-is") }}"
+       data-msg-iterate="{{ i18n.t("queries-iterate") }}"
+       data-msg-or="{{ i18n.t("queries-or") }}"
+       data-msg-modify-heading="{{ i18n.t("queries-modify-heading") }}"
+       data-msg-mod-exact="{{ i18n.t("queries-mod-exact") }}"
+       data-msg-mod-contains="{{ i18n.t("queries-mod-contains") }}"
+       data-msg-mod-missing="{{ i18n.t("queries-mod-missing") }}"
+       data-msg-mod-text="{{ i18n.t("queries-mod-text") }}"
+       data-msg-mod-not="{{ i18n.t("queries-mod-not") }}"
+       data-msg-mod-above="{{ i18n.t("queries-mod-above") }}"
+       data-msg-mod-below="{{ i18n.t("queries-mod-below") }}"
+       data-msg-mod-in="{{ i18n.t("queries-mod-in") }}"
+       data-msg-mod-not-in="{{ i18n.t("queries-mod-not-in") }}"
+       data-msg-mod-identifier="{{ i18n.t("queries-mod-identifier") }}"
+       data-msg-mod-of-type="{{ i18n.t("queries-mod-of-type") }}">
     <div class="builder-section">
       <h3 class="builder-section__title">{{ i18n.t("queries-conditions") }}</h3>
       <div class="builder-rows" id="builder-conditions"></div>
       <button class="btn builder-add" type="button" data-add="condition">+ {{ i18n.t("queries-add-condition") }}</button>
+      <button class="btn builder-add" type="button" data-add="has">{{ i18n.t("queries-add-has") }}</button>
     </div>
-    <div class="builder-grid">
-      <div class="builder-section">
-        <h3 class="builder-section__title">{{ i18n.t("queries-includes") }}</h3>
-        <div class="builder-rows" id="builder-includes"></div>
-        <button class="btn builder-add" type="button" data-add="include">+ _include</button>
-      </div>
-      <div class="builder-section">
-        <h3 class="builder-section__title">{{ i18n.t("queries-result-controls") }}</h3>
-        <div class="builder-rows" id="builder-controls"></div>
-        <button class="btn builder-add" type="button" data-add="control">+ _count</button>
-      </div>
+    <div class="builder-section">
+      <h3 class="builder-section__title">{{ i18n.t("queries-related-heading") }}</h3>
+      <p class="builder-section__sub">{{ i18n.t("queries-related-sub") }}</p>
+      <div class="builder-rows" id="builder-includes"></div>
+      <button class="btn builder-add" type="button" data-add="include-fwd">→ {{ i18n.t("queries-related-add-include") }}</button>
+      <button class="btn builder-add" type="button" data-add="include-rev">← {{ i18n.t("queries-related-add-revinclude") }}</button>
+    </div>
+    <div class="builder-section">
+      <h3 class="builder-section__title">{{ i18n.t("queries-result-controls") }}</h3>
+      <div class="builder-rows" id="builder-controls"></div>
+      <button class="btn builder-add" type="button" data-add="control">+ _count</button>
     </div>
   </div>
 
