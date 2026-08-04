@@ -615,6 +615,44 @@ mod tests {
         assert_eq!(op, FhirOperation::Read);
     }
 
+    /// Regression guard for the trap in the #317 fix.
+    ///
+    /// The reserved-tenant rejection MUST NOT be implemented by making
+    /// `extract_tenant_from_path` return `None` for `__system__`. If it did,
+    /// this classifier would fall through to `extract_operation` on the raw
+    /// path, which declines any first segment starting with `_` (see the
+    /// system-paths branch above) and returns `None` — meaning **the SMART scope
+    /// check is skipped entirely**. The un-stripped three-segment path then
+    /// still matches the compartment-search route, so the request reaches a
+    /// handler unauthorized. That would trade a tenant-isolation bug for an
+    /// authorization bypass.
+    ///
+    /// The rejection therefore lives in `TenantExtractor` (after stripping),
+    /// and path classification here is deliberately left unchanged.
+    #[test]
+    fn test_url_routing_reserved_tenant_still_classifies_for_scope_check() {
+        let (rt, op) =
+            extract_operation_for_routing("/__system__/Patient/123", "GET", true).unwrap();
+        assert_eq!(
+            rt, "Patient",
+            "reserved-tenant paths must still classify so the scope check runs"
+        );
+        assert_eq!(op, FhirOperation::Read);
+        // Specifically NOT the compartment reading of the un-stripped path,
+        // which would authorize against a resource type of "123".
+        assert_ne!(rt, "123");
+
+        // Same for the type-level and write paths.
+        let (rt, op) = extract_operation_for_routing("/__system__/Patient", "POST", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Create);
+
+        let (rt, op) =
+            extract_operation_for_routing("/__system__/Patient/123", "DELETE", true).unwrap();
+        assert_eq!(rt, "Patient");
+        assert_eq!(op, FhirOperation::Delete);
+    }
+
     #[test]
     fn test_url_routing_search_strips_tenant() {
         // GET /{tenant}/Patient must authorize Search on Patient, NOT the tenant.

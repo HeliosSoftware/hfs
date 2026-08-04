@@ -260,3 +260,164 @@ async fn delete_unknown_tenant_is_404() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 }
+
+// ── #317: the internal system tenant is not addressable from a request ───────
+
+/// Builds the same server as [`create_test_server`] but also hands back the
+/// backend, so a test can seed and re-read system-tenant data directly — the
+/// REST create path can no longer be used for that, which is the point.
+async fn create_test_server_with_backend() -> (TestServer, Arc<SqliteBackend>) {
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"));
+
+    let backend_config = SqliteBackendConfig {
+        data_dir: Some(data_dir),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(":memory:", backend_config)
+        .expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to init schema");
+    let backend = Arc::new(backend);
+
+    let config = ServerConfig {
+        multitenancy: MultitenancyConfig {
+            routing_mode: TenantRoutingMode::HeaderOnly,
+            ..Default::default()
+        },
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "default-tenant".to_string(),
+        seed_conformance: false,
+        ..ServerConfig::for_testing()
+    };
+
+    let state = helios_rest::AppState::new(Arc::clone(&backend), config);
+    let router = helios_rest::routing::fhir_routes::create_routes(state.clone())
+        .merge(helios_rest::routing::admin_tenants::routes(state));
+    (
+        TestServer::new(router).expect("Failed to create test server"),
+        backend,
+    )
+}
+
+/// Writes a resource into the system tenant the way the audit sink does — in
+/// process, with a `TenantContext::system()` — and returns its id.
+async fn seed_system_tenant_resource(backend: &Arc<SqliteBackend>) -> String {
+    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::tenant::TenantContext;
+
+    let stored = backend
+        .create(
+            &TenantContext::system(),
+            "AuditEvent",
+            json!({ "resourceType": "AuditEvent" }),
+            helios_fhir::FhirVersion::R4,
+        )
+        .await
+        .expect("seed system-tenant AuditEvent");
+    stored.id().to_string()
+}
+
+async fn system_tenant_resource_count(backend: &Arc<SqliteBackend>) -> u64 {
+    use helios_persistence::core::ResourceStorage;
+    backend
+        .count_by_tenant()
+        .await
+        .expect("count_by_tenant")
+        .into_iter()
+        .find(|(t, _)| t == helios_persistence::tenant::SYSTEM_TENANT)
+        .map(|(_, n)| n)
+        .unwrap_or(0)
+}
+
+/// The header door. With auth disabled — the default deployment shape — this
+/// needed no credentials at all, and returned the cross-tenant AuditEvent trail.
+#[tokio::test]
+async fn system_tenant_is_not_readable_via_header() {
+    let (server, backend) = create_test_server_with_backend().await;
+    seed_system_tenant_resource(&backend).await;
+
+    let res = server
+        .get("/AuditEvent")
+        .add_header(TENANT_HEADER, HeaderValue::from_static("__system__"))
+        .await;
+
+    res.assert_status(StatusCode::FORBIDDEN);
+    // The data consequence, not just the status: nothing from the shared tenant
+    // came back.
+    assert!(
+        !res.text().contains("AuditEvent"),
+        "system-tenant resources must not appear in the response body"
+    );
+}
+
+/// The destructive half. `delete_tenant_handler` never validated its path id, so
+/// this deregistered *and* purged the shared tenant — destroying the audit trail
+/// that records the attack.
+#[tokio::test]
+async fn deleting_the_system_tenant_is_refused_and_purges_nothing() {
+    let (server, backend) = create_test_server_with_backend().await;
+    let seeded_id = seed_system_tenant_resource(&backend).await;
+    let before = system_tenant_resource_count(&backend).await;
+    assert!(before > 0, "precondition: system tenant has data");
+
+    // 400, not 404 — validation must run before the existence probe, or a
+    // reserved id with data would sail past it into the purge.
+    server
+        .delete("/admin/tenants/__system__?purge=true")
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+
+    // Nothing was destroyed.
+    assert_eq!(
+        system_tenant_resource_count(&backend).await,
+        before,
+        "a refused delete must not purge any system-tenant data"
+    );
+    use helios_persistence::core::ResourceStorage;
+    // `read` returns `Ok(None)` for a purged resource, so assert on the payload,
+    // not merely on `is_ok()`.
+    let survivor = backend
+        .read(
+            &helios_persistence::tenant::TenantContext::system(),
+            "AuditEvent",
+            &seeded_id,
+        )
+        .await
+        .expect("read must not error");
+    assert!(
+        survivor.is_some(),
+        "the seeded system-tenant resource must still be readable"
+    );
+}
+
+/// The other reserved ids take the same door.
+#[tokio::test]
+async fn deleting_a_control_plane_namespace_tenant_is_refused() {
+    let server = create_test_server().await;
+    for reserved in ["tenants", "resources", "history", "bulk"] {
+        server
+            .delete(&format!("/admin/tenants/{reserved}?purge=true"))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+}
+
+/// The reservation is exact, not a `__` namespace ban: tenant id is a partition
+/// key with no rename, so a deployment already holding `__legacy` must keep
+/// being able to route to it and, crucially, to delete it.
+#[tokio::test]
+async fn underscore_prefixed_tenants_remain_usable() {
+    let server = create_test_server().await;
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "__legacy" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    server
+        .delete("/admin/tenants/__legacy")
+        .await
+        .assert_status(StatusCode::OK);
+}
