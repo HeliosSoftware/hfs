@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::core::user_settings::{SettingsStore, StoredUserSettings, apply_merge_patch};
+use crate::core::user_settings::{
+    SettingsStore, StoredUserSettings, apply_merge_patch, purge_tenant_subtree,
+};
 use crate::error::{BackendError, ConcurrencyError, StorageError, StorageResult};
 
 use super::PostgresBackend;
@@ -83,6 +85,53 @@ impl PostgresBackend {
             updated_at: now,
         })
     }
+
+    /// Sweeps `tenant_id` out of every settings document **using the caller's
+    /// transaction**, returning how many documents changed.
+    ///
+    /// Takes the transaction so the sweep commits atomically with the resource
+    /// deletes in
+    /// [`purge_tenant_data`](crate::core::ResourceStorage::purge_tenant_data):
+    /// an offboarding must not be able to half-apply, leaving a tenant's saved
+    /// queries behind after its records are gone. `FOR UPDATE` serialises against
+    /// a concurrent `/_user/settings` write, which locks the same rows.
+    ///
+    /// The edit is done on a parsed `Value` via the shared
+    /// [`purge_tenant_subtree`] rather than with `jsonb #-`, for two reasons: all
+    /// four backends then erase byte-identically, and a JSONB text path would
+    /// need care for tenant ids containing `.` or `/`, both of which
+    /// `admin_tenants::validate_tenant_id` permits.
+    pub(crate) async fn purge_tenant_settings_in_txn(
+        txn: &deadpool_postgres::Transaction<'_>,
+        tenant_id: &str,
+    ) -> StorageResult<u64> {
+        let rows = txn
+            .query(
+                "SELECT user_key, data, version FROM user_settings FOR UPDATE",
+                &[],
+            )
+            .await
+            .map_err(|e| backend_err(format!("scan user_settings: {e}")))?;
+
+        let mut changed = 0u64;
+        for row in rows {
+            let user_key: String = row.get(0);
+            let mut document: Value = row.get(1);
+            let version: i64 = row.get(2);
+            if !purge_tenant_subtree(&mut document, tenant_id) {
+                continue;
+            }
+            txn.execute(
+                "UPDATE user_settings SET data = $2, version = $3, updated_at = $4 \
+                 WHERE user_key = $1",
+                &[&user_key, &document, &(version + 1), &Utc::now()],
+            )
+            .await
+            .map_err(|e| backend_err(format!("purge user_settings: {e}")))?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
 }
 
 #[async_trait]
@@ -145,6 +194,19 @@ impl SettingsStore for PostgresBackend {
             .await
             .map_err(|e| backend_err(format!("delete user_settings: {e}")))?;
         Ok(removed > 0)
+    }
+
+    async fn purge_tenant_settings(&self, tenant_id: &str) -> StorageResult<u64> {
+        let mut client = self.get_client().await?;
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| backend_err(format!("begin user_settings purge: {e}")))?;
+        let changed = Self::purge_tenant_settings_in_txn(&txn, tenant_id).await?;
+        txn.commit()
+            .await
+            .map_err(|e| backend_err(format!("commit user_settings purge: {e}")))?;
+        Ok(changed)
     }
 }
 

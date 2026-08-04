@@ -1136,6 +1136,20 @@ impl ResourceStorage for S3Backend {
                     .map_err(|e| self.map_client_error(e))?;
             }
         }
+        // Per-user settings live outside every tenant prefix (they are
+        // user-global), so the sweep above structurally cannot reach them — see
+        // `S3Keyspace::user_settings_key`. They nonetheless hold PHI-derived
+        // query strings belonging to this tenant, so each object is *edited* to
+        // drop this tenant's subtree (issue #313). Never deleted: the same object
+        // holds other tenants' content and the user's global preferences.
+        let settings = crate::core::SettingsStore::purge_tenant_settings(self, id).await?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                objects = settings,
+                "purged tenant-scoped content from user settings objects"
+            );
+        }
         Ok(removed)
     }
 }
