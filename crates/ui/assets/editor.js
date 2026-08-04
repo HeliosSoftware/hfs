@@ -374,6 +374,48 @@
 
   /* ---- saving ---------------------------------------------------------- */
 
+  /* Every location an issue claims. `location` is the R4 spelling and is
+   * deprecated, so it only stands in when `expression` is absent. */
+  function expressionsOf(issue) {
+    var claimed = issue.expression || issue.location || [];
+    return Array.isArray(claimed) ? claimed : [claimed];
+  }
+
+  /* The row an OperationOutcome expression names, if we render one.
+   *
+   * The two sides spell the same path differently: the outcome carries
+   * bracket-indexed FHIRPath rooted at the resource type
+   * (`Patient.name[0].given`), while rows are keyed on the validator's dotted
+   * form (`name.0.given`). Normalise before comparing — a plain === beats
+   * building a selector out of server text. */
+  function rowFor(expression) {
+    var dotted = String(expression).replace(/\[(\d+)\]/g, ".$1");
+    var cut = dotted.indexOf(".");
+    if (cut <= 0) return null;
+    var path = dotted.slice(cut + 1);
+    var rows = body.querySelectorAll("[data-path]");
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.path === path) return rows[i];
+    }
+    return null;
+  }
+
+  /* Adds a message to a row, where the live pass puts its own: under the head,
+   * after any error already there. */
+  function anchor(row, text) {
+    if (!row) return;
+    var message = document.createElement("p");
+    message.className = "editor-row__error";
+    message.textContent = text;
+    var existing = row.querySelectorAll(":scope > .editor-row__error");
+    var after = existing.length
+      ? existing[existing.length - 1]
+      : row.querySelector(":scope > .editor-row__head");
+    if (after) after.insertAdjacentElement("afterend", message);
+    else row.appendChild(message);
+    row.classList.add("editor-row--error");
+  }
+
   function save() {
     var doc = currentDocument();
     var parsed;
@@ -410,10 +452,21 @@
         })
         .then(function (result) {
           if (!result.ok) {
-            // The server refused it. Show its OperationOutcome, not our guess.
-            var issue = result.payload && result.payload.issue && result.payload.issue[0];
+            // The server refused it. Show its OperationOutcome, not our guess —
+            // and anchor each issue to its row exactly like live errors (#366).
+            // Rows still carry the live pass's error count, which this does not
+            // touch: a refused save must stay retryable once you fix the field.
+            var issues = (result.payload && result.payload.issue) || [];
+            issues.forEach(function (issue) {
+              var text =
+                issue.diagnostics || (issue.details && issue.details.text) || "";
+              expressionsOf(issue).forEach(function (expr) {
+                anchor(rowFor(expr), text);
+              });
+            });
+            var first = issues[0];
             say(
-              (issue && (issue.diagnostics || (issue.details && issue.details.text))) ||
+              (first && (first.diagnostics || (first.details && first.details.text))) ||
                 "",
               "error"
             );

@@ -70,6 +70,17 @@
       </div>
     </div>
 
+    <!--
+      Live-vs-save legibility (#366): the per-keystroke pass is structural
+      plus the embedded required-binding check; FHIRPath constraints and the
+      configured terminology run on save. A clean form here is not the whole
+      story, and the legend says so instead of surprising on save.
+    -->
+    <p class="editor-legend">
+      <span class="editor-legend__live">{{ i18n.t("editor-legend-live") }}</span>
+      <span class="editor-legend__save">{{ i18n.t("editor-legend-save") }}</span>
+    </p>
+
     <div class="editor-tree">
       {% for row in rows %}
       <div class="editor-row{% if row.is_extension %} editor-row--extension{% endif %}{% if row.must_support %} editor-row--must-support{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
@@ -116,6 +127,7 @@
 
           {% if !row.binding_strength.is_empty() %}
           <span class="editor-row__bind" title="{{ i18n.t("editor-binding-hint") }}">{{ row.binding_strength }}</span>
+          <span class="editor-row__deferred" title="{{ i18n.t("editor-deferred-hint") }}">{{ i18n.t("editor-deferred-badge") }}</span>
           {% endif %}
 
           {% if row.is_primitive %}

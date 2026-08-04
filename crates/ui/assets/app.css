@@ -3975,3 +3975,38 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
   color: var(--accent);
   font-weight: 500;
 }
+
+/* Live-vs-save legend (#366). */
+.editor-legend {
+  display: flex;
+  gap: 14px;
+  margin: 4px 0 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.editor-legend__live::before,
+.editor-legend__save::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 5px;
+}
+
+.editor-legend__live::before {
+  background: var(--accent);
+}
+
+.editor-legend__save::before {
+  border: 1px dashed var(--muted);
+}
+
+.editor-row__deferred {
+  padding: 1px 5px;
+  border: 1px dashed var(--muted);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 9.5px;
+}
