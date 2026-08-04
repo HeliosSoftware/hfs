@@ -92,6 +92,13 @@ pub(crate) struct Ed {
     pub content_reference: Option<String>,
     pub slicing: Option<EdSlicing>,
     pub binding: Option<EdBinding>,
+    #[serde(rename = "mustSupport")]
+    pub must_support: Option<bool>,
+    #[serde(rename = "isModifier")]
+    pub is_modifier: Option<bool>,
+    #[serde(rename = "isSummary")]
+    pub is_summary: Option<bool>,
+    pub short: Option<String>,
     #[serde(default)]
     pub constraint: Vec<EdConstraint>,
     /// Everything else — scanned for `fixed[x]` / `pattern[x]`.
@@ -277,6 +284,23 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
     }
 
     let mut schema = tree::finalize(root, &mut warnings).unwrap_or_default();
+
+    // Extension applicability contexts (#363): element expressions only.
+    let contexts: Vec<String> = sd
+        .get("context")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|c| c.get("type").and_then(Value::as_str).unwrap_or("element") == "element")
+                .filter_map(|c| c.get("expression").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !contexts.is_empty() {
+        schema.context = Some(contexts);
+    }
 
     // Header fields.
     schema.url = Some(url);

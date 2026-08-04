@@ -306,6 +306,14 @@ jobs:
       # killed mid-test.
       MAX_CONTAINER_AGE_MIN: 90
     steps:
+      # Only the composite action is needed here, not the tree — a cone-mode
+      # sparse checkout keeps this job as cheap as it was before it had any
+      # checkout at all.
+      - name: Check out the Docker host GC action
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/actions
+
       - name: Reap this run's testcontainers
         run: |
           # testcontainers-rs removes a container only from `Drop for
@@ -348,6 +356,14 @@ jobs:
             fi
           done
           echo "Swept ${reaped} orphaned testcontainer(s)."
+
+      # Last, so it runs after the reaps above have released this run's volumes.
+      # `ci.yml` fires on every push and PR, which makes this the sweep that
+      # actually keeps the shared host below its quota — the other workflows
+      # carry it too, but far less often.
+      - name: GC the Docker host
+        if: always()
+        uses: ./.github/actions/docker-host-gc
 
   test-python:
     name: Test Python
@@ -588,6 +604,20 @@ jobs:
         # helios-serde's own quick-xml (client FHIR XML) is already on 0.41 and
         # sits behind the non-default `xml` feature. Remove these once
         # object_store and octofhir-ucum ship builds on quick-xml >= 0.41.
+        #
+        # rkyv 0.7.46 (RUSTSEC-2026-0235, out-of-bounds read when validating
+        # archives containing Rc/Arc). We never build it: it is an *optional*
+        # dependency of rust_decimal, and nothing in the workspace turns that
+        # feature on. Across `--all-features --target all` the activated
+        # rust_decimal features are default, macros, serde, serde_json,
+        # serde-with-arbitrary-precision and serde-with-float -- no `rkyv`, and
+        # `cargo tree -i rkyv --all-features --target all` reports "nothing to
+        # print". The crate is a Cargo.lock entry that is never compiled, let
+        # alone handed an untrusted archive. There is also no upgrade path:
+        # the advisory is patched in >= 0.8.17, the 0.7 line is unsupported
+        # upstream, and rust_decimal still declares optional `rkyv ^0.7.46`
+        # as of 1.42.1 (its 0.8 dependency is dev-only). Remove this once
+        # rust_decimal moves its optional rkyv to 0.8.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0098
@@ -595,6 +625,7 @@ jobs:
           --ignore RUSTSEC-2026-0104
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
+          --ignore RUSTSEC-2026-0235
  
   coverage:
     name: Code Coverage

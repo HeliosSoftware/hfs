@@ -486,3 +486,108 @@ async fn test_hierarchical_tenant_access() {
 
     // This test documents expected hierarchical access behavior
 }
+
+// ============================================================================
+// Reserved-tenant lifecycle guard (issue #317)
+// ============================================================================
+
+/// The storage-layer backstop: the tenant-lifecycle mutators must refuse the
+/// shared system tenant regardless of which handler reached them.
+///
+/// The primary control for #317 is at the REST ingress, but these three methods
+/// take a bare `&str` and are reachable from more than one caller — including,
+/// at the time of writing, an unauthenticated web-UI route. `__system__` holds
+/// the AuditEvent trail and shared terminology, so a purge of it is an
+/// anti-forensic primitive: it destroys the record of the attack that issued it.
+///
+/// Every backend calls `ensure_mutable_tenant` at the top of these methods. This
+/// asserts it on SQLite, which is the one backend that runs without a container;
+/// the guard is a plain string check with no backend-specific behaviour, so the
+/// per-backend container tests would assert nothing further.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_system_tenant_lifecycle_mutations_are_refused() {
+    let backend = create_sqlite_backend();
+    let system = TenantContext::system();
+
+    // Seed the shared tenant the way the database audit sink does.
+    let created = backend
+        .create(
+            &system,
+            "AuditEvent",
+            json!({ "resourceType": "AuditEvent" }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed system-tenant AuditEvent");
+
+    let system_id = helios_persistence::tenant::SYSTEM_TENANT;
+
+    assert!(
+        backend.register_tenant(system_id, None).await.is_err(),
+        "registering the system tenant must be refused"
+    );
+    assert!(
+        backend.deregister_tenant(system_id).await.is_err(),
+        "deregistering the system tenant must be refused"
+    );
+    assert!(
+        backend.purge_tenant_data(system_id).await.is_err(),
+        "purging the system tenant must be refused"
+    );
+
+    // The data consequence: the refused purge destroyed nothing.
+    let survivor = backend
+        .read(&system, "AuditEvent", created.id())
+        .await
+        .expect("read must not error");
+    assert!(
+        survivor.is_some(),
+        "a refused purge must leave the audit trail intact"
+    );
+}
+
+/// The other reserved ids (S3 control-plane namespaces, issue #271) share the
+/// same authority and are refused identically.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_control_plane_namespace_lifecycle_mutations_are_refused() {
+    let backend = create_sqlite_backend();
+
+    for reserved in helios_persistence::tenant::RESERVED_TENANT_IDS {
+        assert!(
+            backend.register_tenant(reserved, None).await.is_err(),
+            "registering reserved id {reserved} must be refused"
+        );
+        assert!(
+            backend.purge_tenant_data(reserved).await.is_err(),
+            "purging reserved id {reserved} must be refused"
+        );
+    }
+}
+
+/// The reservation is exact, not a `__` namespace ban. A tenant id is a
+/// partition key in every backend and there is no rename, so banning the prefix
+/// would strand any deployment already holding such a tenant: its data would
+/// keep serving while becoming permanently impossible to deregister or purge.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_underscore_prefixed_tenants_remain_mutable() {
+    let backend = create_sqlite_backend();
+
+    backend
+        .register_tenant("__legacy", None)
+        .await
+        .expect("__legacy is not reserved and must remain registrable");
+    assert!(
+        backend
+            .deregister_tenant("__legacy")
+            .await
+            .expect("deregister must not error"),
+        "__legacy must remain deregisterable"
+    );
+    backend
+        .purge_tenant_data("__legacy")
+        .await
+        .expect("__legacy must remain purgeable");
+}
