@@ -467,7 +467,9 @@ curl -X POST http://localhost:8080/ \
 ### Conditional Operations in Bundles
 
 Bundle entries support conditional headers:
-- `ifMatch` - ETag for optimistic locking on updates
+- `ifMatch` - ETag for optimistic locking on `PUT` **and `DELETE`** entries, in
+  both `batch` and `transaction` bundles. Parsed as the comma-separated list
+  RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
 - `ifNoneMatch` - Prevent overwrites (`*` for conditional create)
 - `ifNoneExist` - Search query for conditional create
 
@@ -487,7 +489,7 @@ The server supports standard FHIR HTTP headers:
 |--------|---------|
 | `Accept` | Content negotiation |
 | `Content-Type` | Request body format |
-| `ETag` / `If-Match` | Optimistic locking |
+| `ETag` / `If-Match` | Optimistic locking on `PUT`, `PATCH` and `DELETE` |
 | `If-None-Match` | Conditional read |
 | `If-None-Exist` | Conditional create |
 | `If-Modified-Since` | Conditional read by date |
