@@ -25,6 +25,7 @@ fn app() -> Router {
         "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
+        None,
     )
 }
 

@@ -109,7 +109,9 @@ helios-persistence = { path = "../persistence", version = "0.2.1", default-featu
 # Parses the .ftl sources so tests can enforce key-set parity across locales.
 fluent-syntax = "0.11"
 # Drive the mounted router end-to-end (locale middleware included) in tests.
-tokio = { version = "1", features = ["macros", "rt"] }
+# `net` backs the loopback stub that stands in for the terminology server in
+# the /ui/editor/expand proxy tests (#365).
+tokio = { version = "1", features = ["macros", "rt", "net"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # A real SQLite-backed store so the tenant-maintenance page tests exercise the
