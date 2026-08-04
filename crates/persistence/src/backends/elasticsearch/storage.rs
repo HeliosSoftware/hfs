@@ -989,6 +989,7 @@ impl ResourceStorage for ElasticsearchBackend {
     // composite storage can clear a purged tenant's offloaded search documents
     // (in `*-elasticsearch` modes the primary's own search index is empty).
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         // Documents are matched by an exact `tenant_id` term, not by the index
         // pattern alone: the pattern is a prefix glob, so tenant `a`'s pattern
         // `{prefix}_a_*` also matches tenant `a_b`'s indices. The term filter,

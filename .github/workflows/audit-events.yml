@@ -229,7 +229,7 @@ jobs:
         if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
         run: |
           ES_CONTAINER="es-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$ES_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$ES_CONTAINER" 2>/dev/null || true
           docker run -d --name "$ES_CONTAINER" -p 0:9200 \
             -e "discovery.type=single-node" \
             -e "xpack.security.enabled=false" \
@@ -260,7 +260,7 @@ jobs:
         if: matrix.backend == 'postgres'
         run: |
           PG_CONTAINER="pg-audit-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -291,7 +291,7 @@ jobs:
         if: matrix.backend == 'mongodb'
         run: |
           MONGO_CONTAINER="mongo-audit-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
@@ -383,7 +383,7 @@ jobs:
       - name: Start ephemeral Keycloak
         run: |
           KC_CONTAINER="kc-audit-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$KC_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$KC_CONTAINER" 2>/dev/null || true
 
           docker create --name "$KC_CONTAINER" -p 0:8080 \
             -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
@@ -760,16 +760,16 @@ jobs:
           fi
 
           echo "Stopping Keycloak..."
-          docker rm -f "${KC_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${KC_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Stopping Elasticsearch..."
-          docker rm -f "${ES_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${ES_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Stopping PostgreSQL..."
-          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${PG_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Stopping MongoDB..."
-          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${MONGO_CONTAINER:-none}" 2>/dev/null || true
 
           echo "Cleanup complete"
 
@@ -826,7 +826,7 @@ jobs:
         if: matrix.backend == 'postgres'
         run: |
           PG_CONTAINER="pg-audit-db-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" -p 0:5432 \
             -e POSTGRES_USER=helios \
             -e POSTGRES_PASSWORD=helios \
@@ -862,7 +862,7 @@ jobs:
         if: matrix.backend == 'mongodb'
         run: |
           MONGO_CONTAINER="mongo-audit-db-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}"
-          docker rm -f "$MONGO_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$MONGO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MONGO_CONTAINER" -p 0:27017 mongo:7.0 --replSet rs0 --bind_ip_all
 
           echo "MONGO_CONTAINER=$MONGO_CONTAINER" >> $GITHUB_ENV
@@ -1101,13 +1101,15 @@ jobs:
           EXAMPLE_FILE="audit-db-results/example-event.json"
           CHECK_COUNT=0
 
+          # Every arm reads the audit store directly. `shared` mode used to read
+          # over HTTP with `X-Tenant-ID: __system__`, but addressing the internal
+          # system tenant from the network is exactly the isolation hole closed
+          # in #317, so that door no longer opens. Reading the store is what the
+          # `dedicated` arms and the S3 arm always did, and it asserts the same
+          # thing — that the database sink persisted an AuditEvent — without
+          # depending on a request path that must now be refused.
           for _ in {1..20}; do
-            if [ "${{ matrix.mode }}" = "shared" ] && [ "${{ matrix.backend }}" != "s3" ]; then
-              curl -sS -H "X-Tenant-ID: __system__" \
-                "http://localhost:$HFS_PORT_SMOKE/AuditEvent?_count=20" > audit-db-results/auditevent-search.json
-              CHECK_COUNT=$(jq -r '.entry | length // 0' audit-db-results/auditevent-search.json)
-              jq '.entry[0].resource // {}' audit-db-results/auditevent-search.json > "$EXAMPLE_FILE"
-            elif [ "${{ matrix.backend }}" = "sqlite" ]; then
+            if [ "${{ matrix.backend }}" = "sqlite" ]; then
               DB_PATH="$PRIMARY_SQLITE_DB"
               if [ "${{ matrix.mode }}" = "dedicated" ]; then
                 DB_PATH="$AUDIT_SQLITE_DB"
@@ -1196,5 +1198,5 @@ jobs:
       - name: Cleanup smoke resources
         if: always()
         run: |
-          docker rm -f "${PG_CONTAINER:-none}" 2>/dev/null || true
-          docker rm -f "${MONGO_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${PG_CONTAINER:-none}" 2>/dev/null || true
+          docker rm -fv "${MONGO_CONTAINER:-none}" 2>/dev/null || true
