@@ -659,6 +659,7 @@ async fn serve(
             self_base_url,
             outbound_auth,
             config.default_fhir_version,
+            config.terminology_server.clone(),
         )
     };
     #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
