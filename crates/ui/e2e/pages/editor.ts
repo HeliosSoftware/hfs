@@ -71,13 +71,20 @@ export class Editor {
     await this.jsonView.waitFor({ state: "visible" });
   }
 
-  /** The guided-form row whose label/text matches `field`. */
+  /** The guided-form row at the exact dotted path (`gender`, `name.0`) —
+   * text matching went ambiguous once add panels list profiled extensions
+   * whose names embed other fields' names (genderIdentity vs gender). */
   row(field: string): Locator {
-    return this.root.locator(".editor-row", { hasText: field });
+    return this.root.locator('.editor-row[data-path="' + field + '"]');
   }
 
   rowError(field: string): Locator {
     return this.row(field).locator(".editor-row__error");
+  }
+
+  /** The row at an exact dotted path — `name.0.family`, the validator's form. */
+  rowAt(path: string): Locator {
+    return this.root.locator(`.editor-row[data-path='${path}']`);
   }
 
   // Fold controls.
