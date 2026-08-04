@@ -1825,7 +1825,7 @@
       "kinds": [
         "not-array"
       ],
-      "reason": "Suspected engine bug (unfiled): `contentReference` is lowered to `elementReference` and the target element's schema is merged wholesale, inheriting its `max=*`. E.g. `ExampleScenario.process.step.operation.request` is `max=1` but references `ExampleScenario.instance.containedInstance` (`max=*`), so a single object is reported as not-array."
+      "reason": "Engine bug #487: `contentReference` is lowered to `elementReference` and the target element's schema is merged wholesale, inheriting its `max=*`. E.g. `ExampleScenario.process.step.operation.request` is `max=1` but references `ExampleScenario.instance.containedInstance` (`max=*`), so a single object is reported as not-array."
     },
     {
       "file": "explanationofbenefit.profile.json",
