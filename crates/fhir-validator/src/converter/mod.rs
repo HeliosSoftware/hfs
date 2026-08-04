@@ -92,6 +92,13 @@ pub(crate) struct Ed {
     pub content_reference: Option<String>,
     pub slicing: Option<EdSlicing>,
     pub binding: Option<EdBinding>,
+    #[serde(rename = "mustSupport")]
+    pub must_support: Option<bool>,
+    #[serde(rename = "isModifier")]
+    pub is_modifier: Option<bool>,
+    #[serde(rename = "isSummary")]
+    pub is_summary: Option<bool>,
+    pub short: Option<String>,
     #[serde(default)]
     pub constraint: Vec<EdConstraint>,
     /// Everything else — scanned for `fixed[x]` / `pattern[x]`.

@@ -157,6 +157,33 @@ jobs:
       - name: Run tests with all features
         env:
           HFS_REQUIRE_R5: "1"
+          # Un-skips the S3+ES composite suite (s3_es_tests.rs), which had
+          # never run in CI — nothing set this variable, so every run passed it
+          # vacuously (#390).
+          #
+          # Unconditional, on every agent. It was briefly gated to Linux, for
+          # one measured reason that no longer applies. Run 30303350382 pinned
+          # this job to the Windows agent with the gate removed: 8 of 10 tests
+          # panicked in `crc-fast-1.6.0/src/arch/mod.rs:121` with "x86 features
+          # missing (SSE4.1 && PCLMULQDQ)". That agent is a virtualized guest
+          # without those instructions, and crc-fast 1.6.0 gates its software
+          # fallback behind `#[cfg(target_arch = "x86")]` — so on x86_64 the
+          # fallback never compiles and the arm falls straight into a panic.
+          # The AWS S3 SDK reaches it on every upload via aws-sdk-s3 ->
+          # aws-smithy-checksums -> crc-fast; the only two tests that passed
+          # were the two that never PUT an object.
+          #
+          # crc-fast fixed the fallback in 1.7.1. aws-smithy-checksums 0.63.12
+          # pinned `crc-fast ~1.6.0`, so reaching the fix meant moving
+          # aws-sdk-s3 to 1.122.0 (-> checksums 0.64.4 -> crc-fast 1.9.0),
+          # which this PR does. Elasticsearch was never a blocker: that same
+          # run had `s3_es_test_read_missing_returns_none` pass, which runs the
+          # whole `make_harness()` path including ES container start and
+          # `initialize()`.
+          #
+          # Keep this unconditional. Re-gating it to one OS is what let the
+          # suite pass vacuously for its entire existence (#390).
+          RUN_MINIO_S3_ES_TESTS: "1"
         run: |
           cargo test --workspace --all-features
 
@@ -229,22 +256,24 @@ jobs:
         env:
           RUN_MINIO_S3_TESTS: "1"
           EXPECTED_MINIO_SETTINGS_TESTS: "5"
-          # The single self-hosted Windows runner is a virtualized guest whose
-          # CPU does not advertise SSE4.1 + PCLMULQDQ. The AWS S3 SDK's default
-          # integrity protection computes a CRC32 on every upload via the
-          # `crc-fast` crate (aws-sdk-s3 -> aws-smithy-checksums -> crc-fast),
-          # and crc-fast 1.6.0 has no software fallback on x86_64 — it panics
-          # ("x86 features missing (SSE4.1 && PCLMULQDQ)"), failing all four
-          # tests before they can verify anything. Opt out of the default
-          # checksum calc/validation so the SDK never enters that code path.
-          # This step verifies the If-Match / If-None-Match precondition
-          # contract, not checksums, so no coverage is lost; the Linux leg above
-          # still exercises the default checksum path. Both the test's SDK
-          # client and the S3 backend build config via
-          # `aws_config::defaults(BehaviorVersion::latest())`, which reads these
-          # env vars, so setting them here is sufficient.
-          AWS_REQUEST_CHECKSUM_CALCULATION: "WHEN_REQUIRED"
-          AWS_RESPONSE_CHECKSUM_VALIDATION: "WHEN_REQUIRED"
+          # This step used to set AWS_REQUEST_CHECKSUM_CALCULATION and
+          # AWS_RESPONSE_CHECKSUM_VALIDATION to "WHEN_REQUIRED". That was not a
+          # preference — it was a workaround for crc-fast 1.6.0, which gates its
+          # software fallback behind `#[cfg(target_arch = "x86")]` and so panics
+          # ("x86 features missing (SSE4.1 && PCLMULQDQ)") on this virtualized
+          # x86_64 guest, whose CPU advertises neither. The AWS S3 SDK reaches it
+          # on every upload via aws-sdk-s3 -> aws-smithy-checksums -> crc-fast.
+          #
+          # Opting out dodged the panic but also disabled the SDK's default
+          # integrity protection, so this leg tested a different SDK
+          # configuration than the Linux leg above — and the checksum path, the
+          # part that was actually broken, was the one thing Windows never
+          # exercised. crc-fast 1.9.0 (via aws-sdk-s3 1.122.0) has a working
+          # software fallback, so the panic is gone and both legs can run the
+          # same defaults.
+          #
+          # Do not re-add the opt-out to silence a checksum panic; that would
+          # mean the SDK has been downgraded below crc-fast 1.7.1.
         # `runs-on: [self-hosted]` is unpinned, so this job can land on a Windows
         # runner, where `run:` defaults to PowerShell and cannot parse this bash
         # script (`set -o pipefail`, `| tee`, `if ! grep`, `\` continuations).
@@ -277,6 +306,14 @@ jobs:
       # killed mid-test.
       MAX_CONTAINER_AGE_MIN: 90
     steps:
+      # Only the composite action is needed here, not the tree — a cone-mode
+      # sparse checkout keeps this job as cheap as it was before it had any
+      # checkout at all.
+      - name: Check out the Docker host GC action
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/actions
+
       - name: Reap this run's testcontainers
         run: |
           # testcontainers-rs removes a container only from `Drop for
@@ -289,8 +326,16 @@ jobs:
           # The test helpers stamp `github.run_id`, which is exactly what makes
           # them reapable. No age guard: these are *this* run's containers, and
           # by construction they are only minutes old.
+          #
+          # `-v` is load-bearing. The postgres/elasticsearch/mongo images all
+          # declare VOLUME in their Dockerfiles, so every testcontainer gets an
+          # anonymous volume — and plain `docker rm -f` leaves it behind
+          # forever. That is what filled the shared host's 200G ZFS quota until
+          # containerd could not even write meta.db and *every* container start
+          # failed with "disk quota exceeded". `-v` removes only anonymous
+          # volumes; named volumes are never touched.
           docker ps -aq --filter "label=github.run_id=${{ github.run_id }}" \
-            | xargs -r docker rm -f || true
+            | xargs -r docker rm -fv || true
 
       - name: Sweep orphaned testcontainers from dead runs
         run: |
@@ -306,11 +351,19 @@ jobs:
             age_min=$(( (now - $(date -d "$started" +%s)) / 60 ))
             if [ "$age_min" -ge "$MAX_CONTAINER_AGE_MIN" ]; then
               echo "Reaping orphan $id (age ${age_min}m)"
-              docker rm -f "$id" || true
+              docker rm -fv "$id" || true
               reaped=$((reaped + 1))
             fi
           done
           echo "Swept ${reaped} orphaned testcontainer(s)."
+
+      # Last, so it runs after the reaps above have released this run's volumes.
+      # `ci.yml` fires on every push and PR, which makes this the sweep that
+      # actually keeps the shared host below its quota — the other workflows
+      # carry it too, but far less often.
+      - name: GC the Docker host
+        if: always()
+        uses: ./.github/actions/docker-host-gc
 
   test-python:
     name: Test Python

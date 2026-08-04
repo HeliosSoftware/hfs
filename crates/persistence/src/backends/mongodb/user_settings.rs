@@ -25,7 +25,9 @@ use mongodb::bson::{Document, doc};
 use mongodb::error::Error as MongoError;
 use serde_json::Value;
 
-use crate::core::user_settings::{SettingsStore, StoredUserSettings, apply_merge_patch};
+use crate::core::user_settings::{
+    SettingsStore, StoredUserSettings, apply_merge_patch, purge_tenant_subtree,
+};
 use crate::error::{BackendError, ConcurrencyError, StorageError, StorageResult};
 
 use super::MongoBackend;
@@ -239,6 +241,109 @@ impl SettingsStore for MongoBackend {
         .await
         .map_err(|e| backend_err(format!("delete user_settings: {e}")))?;
         Ok(result.deleted_count > 0)
+    }
+
+    /// Sweeps `tenant_id` out of every settings document.
+    ///
+    /// MongoDB standalone has no multi-document transactions, so — exactly as
+    /// [`write_settings`](MongoBackend::write_settings) does — each document is
+    /// rewritten with a **version-conditioned update**, and a document whose
+    /// version moved under us is re-read and re-swept. A concurrent
+    /// `/_user/settings` write therefore cannot be clobbered, and cannot slip a
+    /// purged subtree back in either: it either lands before the sweep (and is
+    /// then swept) or after it (and finds the subtree already gone).
+    ///
+    /// Deliberately **not** a `$unset` of the dotted path `byTenant.<id>`:
+    /// MongoDB has no escape for `.` in a field path, and
+    /// `admin_tenants::validate_tenant_id` permits tenant ids containing `.`, so
+    /// a tenant named `a.b` would have `$unset` target `byTenant.a` → `b` — the
+    /// wrong node, silently. Editing the parsed document with the shared
+    /// [`purge_tenant_subtree`] is both correct here and identical to the other
+    /// three backends.
+    async fn purge_tenant_settings(&self, tenant_id: &str) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        let collection = db.collection::<Document>(USER_SETTINGS_COLLECTION);
+
+        // Collect the keys first rather than editing while the cursor is open:
+        // each edit is its own version-conditioned update, and a long-lived
+        // cursor over a collection being written to can miss or repeat documents.
+        let mut cursor = collection
+            .find(doc! {})
+            .await
+            .map_err(|e| backend_err(format!("scan user_settings: {e}")))?;
+        let mut user_keys: Vec<String> = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| backend_err(format!("scan user_settings: {e}")))?
+        {
+            let stored = cursor
+                .deserialize_current()
+                .map_err(|e| backend_err(format!("decode user_settings: {e}")))?;
+            if let Ok(user_key) = stored.get_str("user_key") {
+                user_keys.push(user_key.to_string());
+            }
+        }
+
+        let mut changed = 0u64;
+        for user_key in user_keys {
+            let user_key = user_key.as_str();
+            for _ in 0..=MAX_WRITE_RETRIES {
+                // Re-read on every attempt after the first so a lost race is
+                // resolved against current state rather than the stale snapshot.
+                let current = retry_transient(|| async {
+                    collection.find_one(doc! { "user_key": user_key }).await
+                })
+                .await
+                .map_err(|e| backend_err(format!("read user_settings: {e}")))?;
+                let Some(current) = current else {
+                    // Deleted underneath us — nothing left to purge.
+                    break;
+                };
+
+                let version = current.get_i64("version").unwrap_or(0);
+                // A document this backend cannot decode is skipped rather than
+                // aborting the tenant purge; one corrupt row must not block an
+                // offboarding.
+                let Ok(mut document) = decode_document(&current) else {
+                    tracing::warn!(
+                        "skipping undecodable user_settings document during tenant purge; \
+                         it cannot hold tenant-scoped content this purge could reach"
+                    );
+                    break;
+                };
+                if !purge_tenant_subtree(&mut document, tenant_id) {
+                    break;
+                }
+
+                let data = serde_json::to_string(&document)
+                    .map_err(|e| backend_err(format!("encode user_settings: {e}")))?;
+                let now = Utc::now();
+                let now_bson = mongodb::bson::DateTime::from_millis(now.timestamp_millis());
+                let next_version = version + 1;
+                let result = retry_transient(|| async {
+                    collection
+                        .update_one(
+                            doc! { "user_key": user_key, "version": version },
+                            doc! { "$set": {
+                                "data": &data,
+                                "version": next_version,
+                                "updated_at": now_bson,
+                            }},
+                        )
+                        .await
+                })
+                .await
+                .map_err(|e| backend_err(format!("purge user_settings: {e}")))?;
+
+                if result.matched_count == 1 {
+                    changed += 1;
+                    break;
+                }
+                // Version moved under us: loop and re-sweep the new content.
+            }
+        }
+        Ok(changed)
     }
 }
 

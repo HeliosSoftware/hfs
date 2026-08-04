@@ -1,0 +1,82 @@
+name: Docker host GC
+description: >
+  Reclaim space on the shared remote Docker host. Runs at the end of every
+  workflow that stands up testcontainers, so the host is swept many times a day
+  rather than once a night.
+
+# Why this is a per-run step and not a scheduled janitor: the host is shared by
+# every concurrent CI run, and it fills during the working day. A nightly cron
+# cannot help a run that dies at 16:03 — by the time the sweep fires the damage
+# is twelve hours old and several runs have already gone red. Sweeping after
+# each run keeps the quota from ever being approached.
+#
+# Everything here is safe to run WHILE other runs are in flight, which is the
+# constraint that shapes every filter below:
+#   - volumes: only unreferenced ones are touched, and a live container's
+#     volumes are by definition referenced.
+#   - images: `until` protects anything pulled recently, including an image a
+#     concurrent run has pulled but not yet started a container from.
+#   - build cache / networks: age- and size-guarded for the same reason.
+
+inputs:
+  image-min-age:
+    description: Only prune unused images older than this (docker `until` filter).
+    required: false
+    default: 48h
+  builder-keep-storage:
+    description: Build cache to retain as a warm cache.
+    required: false
+    default: 20GB
+
+runs:
+  using: composite
+  steps:
+    - name: Docker disk usage before GC
+      shell: bash
+      run: docker system df || true
+
+    # Volumes FIRST, and every step non-fatal. On a host already at its quota
+    # even image *deletion* fails, because containerd needs a meta.db write to
+    # do it — while volume removal frees the same filesystem without one. The
+    # 2026-07 incident hit exactly this: image prunes erroring out while
+    # thousands of orphaned testcontainer volumes held the bulk of the usage.
+    # Free the bulk first and the rest starts working again.
+    - name: Remove orphaned anonymous volumes
+      shell: bash
+      run: |
+        # Deliberately NOT `docker volume prune -af`. This host also runs
+        # long-lived services, and `-a` includes *named* volumes — so a prune
+        # racing a service redeploy, at the moment its named volume is briefly
+        # unreferenced, would delete that service's data. There is no undo.
+        #
+        # Anonymous volumes (the only kind testcontainers leaks) are named with
+        # a 64-char hex string; named volumes never match that shape. Matching
+        # on it removes exactly the leak and structurally cannot touch anything
+        # a human named. This is also version-independent: the meaning of
+        # `volume prune` without `-a` changed in Docker 23, the hex shape did not.
+        #
+        # `|| true` guards the pipeline because `grep` exits 1 on no matches and
+        # these steps run under `set -o pipefail`.
+        before=$(docker volume ls -qf dangling=true | grep -cE '^[0-9a-f]{64}$' || true)
+        docker volume ls -qf dangling=true \
+          | grep -E '^[0-9a-f]{64}$' \
+          | xargs -r docker volume rm -f >/dev/null 2>&1 || true
+        after=$(docker volume ls -qf dangling=true | grep -cE '^[0-9a-f]{64}$' || true)
+        echo "Orphaned anonymous volumes: ${before} before, ${after} after."
+        # A volume still in use by a concurrently starting container refuses
+        # removal; that is the intended outcome, not an error worth failing on.
+
+    - name: Prune stale images, build cache and networks
+      shell: bash
+      run: |
+        # Age filters keep a warm pull cache for the heavy images the nightly
+        # suites depend on (Playwright, Elasticsearch, Postgres, Mongo). Without
+        # them every run would re-pull gigabytes and get slower, trading one
+        # problem for another.
+        docker image prune -af --filter "until=${{ inputs.image-min-age }}" || true
+        docker builder prune -af --keep-storage "${{ inputs.builder-keep-storage }}" || true
+        docker network prune -f --filter "until=6h" || true
+
+    - name: Docker disk usage after GC
+      shell: bash
+      run: docker system df || true

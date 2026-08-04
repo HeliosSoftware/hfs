@@ -47,7 +47,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::core::user_settings::{SettingsStore, StoredUserSettings, apply_merge_patch};
+use crate::core::user_settings::{
+    SettingsStore, StoredUserSettings, apply_merge_patch, purge_tenant_subtree,
+};
 use crate::error::{BackendError, ConcurrencyError, StorageError, StorageResult};
 
 use super::backend::{S3Backend, TenantLocation};
@@ -401,6 +403,124 @@ impl SettingsStore for S3Backend {
             .map_err(|e| context("delete user_settings", self.map_client_error(e)))?;
 
         Ok(existed)
+    }
+
+    /// Sweeps `tenant_id` out of every settings object, returning how many
+    /// changed.
+    ///
+    /// The objects are named by an opaque digest of the user key, so the only way
+    /// to reach the affected ones is to list the whole namespace — a tenant purge
+    /// therefore costs one `LIST` plus a `GET`/`PUT` per settings object. That is
+    /// acceptable for an administrative offboarding, and is the price of keeping
+    /// user identifiers out of S3 key names.
+    ///
+    /// Each object is rewritten with the same **compare-and-swap** the ordinary
+    /// write path uses — pinned to the S3 ETag it was read at — so a concurrent
+    /// `/_user/settings` write is never clobbered, and cannot reinstate a purged
+    /// subtree either: it either lands before the sweep (and is swept) or after it
+    /// (and finds the subtree already gone). A lost race is retried against fresh
+    /// state; exhausting the bound is an error rather than a silent skip, because
+    /// a settings object quietly left un-purged is exactly the gap this closes.
+    ///
+    /// Objects are **edited, never deleted**: they are user-global, and one
+    /// tenant's offboarding must not destroy another tenant's saved queries or a
+    /// user's theme.
+    async fn purge_tenant_settings(&self, tenant_id: &str) -> StorageResult<u64> {
+        // Bucket-per-tenant with no system bucket cannot host settings at all
+        // (`supports_user_settings`), so there is nothing to sweep.
+        if !self.supports_user_settings() {
+            return Ok(0);
+        }
+        let location = self.settings_location()?;
+        let bucket = location.bucket.as_str();
+        let prefix = location.keyspace.user_settings_prefix();
+
+        let objects = self.list_objects_all(bucket, &prefix).await?;
+        let mut changed = 0u64;
+
+        for item in objects {
+            let mut attempt = 0usize;
+            loop {
+                if attempt >= MAX_WRITE_ATTEMPTS {
+                    // Surfaced, not skipped: a settings object quietly left
+                    // un-purged is exactly the erasure gap this closes, so the
+                    // operator must be told the offboarding was incomplete.
+                    return Err(StorageError::Concurrency(
+                        ConcurrencyError::OptimisticLockFailure {
+                            resource_type: "UserSettings".to_string(),
+                            id: item.key.clone(),
+                            expected_etag: "W/\"*\"".to_string(),
+                            actual_etag: None,
+                        },
+                    ));
+                }
+                if attempt > 0 {
+                    tokio::time::sleep(retry_backoff(attempt - 1)).await;
+                }
+                attempt += 1;
+
+                let loaded = self
+                    .get_json_object::<SettingsObject>(bucket, &item.key)
+                    .await
+                    .map_err(|e| context("read user_settings", e))?;
+                let Some((stored, metadata)) = loaded else {
+                    // Deleted underneath us — nothing left to purge.
+                    break;
+                };
+                let Some(etag) = metadata.etag else {
+                    return Err(StorageError::Backend(BackendError::Internal {
+                        backend_name: "s3".to_string(),
+                        message: format!(
+                            "S3 returned no ETag for user_settings object {}; refusing an \
+                             unconditional write during a tenant purge",
+                            item.key
+                        ),
+                        source: None,
+                    }));
+                };
+
+                let mut document = stored.document;
+                if !purge_tenant_subtree(&mut document, tenant_id) {
+                    break;
+                }
+
+                let updated = SettingsObject {
+                    user_key: stored.user_key,
+                    document,
+                    version: stored.version + 1,
+                    updated_at: Utc::now(),
+                };
+                let payload = self.serialize_json(&updated)?;
+                match self
+                    .client
+                    .put_object(
+                        bucket,
+                        &item.key,
+                        payload,
+                        Some("application/json"),
+                        Some(&etag),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        changed += 1;
+                        break;
+                    }
+                    // Lost the compare-and-swap (or the object vanished under an
+                    // `If-Match`, which some S3-compatible stores answer 404):
+                    // re-read and re-sweep.
+                    Err(S3ClientError::PreconditionFailed) | Err(S3ClientError::NotFound) => {
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(context("purge user_settings", self.map_client_error(e)));
+                    }
+                }
+            }
+        }
+
+        Ok(changed)
     }
 }
 

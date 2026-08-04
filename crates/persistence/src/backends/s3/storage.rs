@@ -13,7 +13,9 @@ use crate::core::history::{
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
     SystemHistoryProvider, TypeHistoryProvider,
 };
-use crate::core::{PurgableStorage, ResourceStorage, VersionedStorage, normalize_etag};
+use crate::core::{
+    PurgableStorage, ResourceStorage, VersionedStorage, if_match_field_satisfied, normalize_etag,
+};
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, StorageResult,
 };
@@ -1134,6 +1136,20 @@ impl ResourceStorage for S3Backend {
                     .map_err(|e| self.map_client_error(e))?;
             }
         }
+        // Per-user settings live outside every tenant prefix (they are
+        // user-global), so the sweep above structurally cannot reach them — see
+        // `S3Keyspace::user_settings_key`. They nonetheless hold PHI-derived
+        // query strings belonging to this tenant, so each object is *edited* to
+        // drop this tenant's subtree (issue #313). Never deleted: the same object
+        // holds other tenants' content and the user's global preferences.
+        let settings = crate::core::SettingsStore::purge_tenant_settings(self, id).await?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                objects = settings,
+                "purged tenant-scoped content from user settings objects"
+            );
+        }
         Ok(removed)
     }
 }
@@ -1185,14 +1201,15 @@ impl VersionedStorage for S3Backend {
             }));
         }
 
-        let expected = normalize_etag(expected_version);
+        // `expected_version` is the client's `If-Match` field value, which is a
+        // LIST and is satisfied when any listed tag matches (issue #311).
         let actual_version = actual.resource.version_id();
-        if expected != actual_version {
+        if !if_match_field_satisfied(expected_version, actual_version) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
                     actual_version: actual_version.to_string(),
                 },
             ));
@@ -1218,14 +1235,15 @@ impl VersionedStorage for S3Backend {
             }));
         };
 
-        let expected = normalize_etag(expected_version);
+        // `expected_version` is the client's `If-Match` field value, which is a
+        // LIST and is satisfied when any listed tag matches (issue #311).
         let actual_version = actual.resource.version_id();
-        if expected != actual_version {
+        if !if_match_field_satisfied(expected_version, actual_version) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
                     actual_version: actual_version.to_string(),
                 },
             ));

@@ -15,7 +15,8 @@ use crate::core::transaction::{
 };
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
-    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage, normalize_etag,
+    PurgableStorage, ResourceStorage, SearchProvider, VersionedStorage, bundle_if_match_gate,
+    if_match_field_satisfied, normalize_etag,
 };
 use crate::error::TransactionError;
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
@@ -442,13 +443,46 @@ impl ResourceStorage for SqliteBackend {
         let new_version: u64 = current_version.parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
-        // Soft delete the resource
-        conn.execute(
-            "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
-             WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5",
-            params![deleted_at, new_version_str, tenant_id, resource_type, id],
-        )
-        .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+        // Soft delete the resource, guarded by the version we just read.
+        //
+        // The `version_id`/`is_deleted` predicates make this a compare-and-swap
+        // rather than a blind overwrite. Without them a concurrent writer that
+        // lands between the SELECT above and this UPDATE is silently clobbered,
+        // and worse: `new_version` was computed from the stale read, so the
+        // history INSERT below then collides with the row that writer already
+        // wrote and trips `PRIMARY KEY (tenant_id, resource_type, id,
+        // version_id)`. Because neither statement runs in a transaction, the
+        // UPDATE is already committed at that point — the caller gets a 500 and
+        // the current row now points at a version whose history entry holds
+        // someone else's content.
+        //
+        // MongoDB and S3 already guarded their equivalent writes (a
+        // `version_id` term in the update filter, and a conditional PUT
+        // respectively); this brings SQLite to parity. Losing the race is
+        // reported as `NotFound`, which is what a caller racing a concurrent
+        // delete would have seen anyway.
+        let updated = conn
+            .execute(
+                "UPDATE resources SET is_deleted = 1, deleted_at = ?1, version_id = ?2, last_updated = ?1
+                 WHERE tenant_id = ?3 AND resource_type = ?4 AND id = ?5
+                   AND version_id = ?6 AND is_deleted = 0",
+                params![
+                    deleted_at,
+                    new_version_str,
+                    tenant_id,
+                    resource_type,
+                    id,
+                    current_version
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+
+        if updated == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
 
         // Insert deletion record into history (preserve fhir_version)
         conn.execute(
@@ -887,8 +921,21 @@ impl ResourceStorage for SqliteBackend {
             tx.execute(sql, params![id])
                 .map_err(|e| internal_error(format!("purge delete: {e}")))?;
         }
+        // Per-user settings are keyed by user, not tenant, so they are not swept
+        // by the deletes above — but a client stores PHI-derived query strings in
+        // them, which belong to this tenant (issue #313). Same transaction: this
+        // connection already holds the write lock, and a second one would
+        // deadlock against it.
+        let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
         tx.commit()
             .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                documents = settings,
+                "purged tenant-scoped content from user settings documents"
+            );
+        }
         Ok(removed.max(0) as u64)
     }
 }
@@ -1517,16 +1564,16 @@ impl VersionedStorage for SqliteBackend {
             })
         })?;
 
-        // Check version match. `expected_version` may arrive in any ETag
-        // spelling (`W/"1"`, `"1"`, `1`), so normalise both sides — same as the
-        // MongoDB and S3 backends.
-        let expected = normalize_etag(expected_version);
-        if normalize_etag(current.version_id()) != expected {
+        // Check version match. `expected_version` is the client's `If-Match`
+        // field value, which is a LIST and is satisfied when any listed tag
+        // matches (issue #311); it may also arrive in any ETag spelling
+        // (`W/"1"`, `"1"`, `1`). All four backends share this comparison.
+        if !if_match_field_satisfied(expected_version, current.version_id()) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
                     actual_version: current.version_id().to_string(),
                 },
             ));
@@ -1570,13 +1617,16 @@ impl VersionedStorage for SqliteBackend {
             }
         };
 
-        let expected = normalize_etag(expected_version);
-        if normalize_etag(&current_version) != expected {
+        // List-aware `If-Match` comparison, shared with every other backend.
+        // This previously compared the raw current version against a normalized
+        // expected value, which happened to work only because stored values are
+        // always bare.
+        if !if_match_field_satisfied(expected_version, &current_version) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
                     actual_version: current_version,
                 },
             ));
@@ -3182,21 +3232,23 @@ impl SqliteBackend {
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
                 // Check if resource exists
-                match tx.read(&resource_type, &id).await? {
+                let existing = tx.read(&resource_type, &id).await?;
+
+                // `ifMatch` is a list and is satisfied when any listed tag
+                // matches; this used to compare the whole field value against
+                // `existing.etag()` as one raw string, so a multi-valued header
+                // could never match and `*` was unsupported (issue #311). An
+                // absent resource now also fails a supplied `ifMatch` instead of
+                // silently creating.
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    existing.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok(failure);
+                }
+
+                match existing {
                     Some(existing) => {
-                        // Check If-Match if provided
-                        if let Some(ref if_match) = entry.if_match {
-                            let current_etag = existing.etag();
-                            if current_etag != if_match.as_str() {
-                                return Ok(BundleEntryResult::error(
-                                    412,
-                                    serde_json::json!({
-                                        "resourceType": "OperationOutcome",
-                                        "issue": [{"severity": "error", "code": "conflict", "diagnostics": "ETag mismatch"}]
-                                    }),
-                                ));
-                            }
-                        }
                         let updated = tx.update(&existing, resource).await?;
                         Ok(BundleEntryResult::ok(updated))
                     }
@@ -3211,6 +3263,21 @@ impl SqliteBackend {
             }
             BundleMethod::Delete => {
                 let (resource_type, id) = self.parse_url(&entry.url)?;
+
+                // Honor `ifMatch` on DELETE — it was previously ignored here, so
+                // a client asking to delete only the version it had reviewed
+                // could destroy a concurrent amendment with no 412. The read is
+                // skipped entirely when no precondition was supplied.
+                if entry.if_match.is_some() {
+                    let existing = tx.read(&resource_type, &id).await?;
+                    if let Some(failure) = bundle_if_match_gate(
+                        entry.if_match.as_deref(),
+                        existing.as_ref().map(|r| r.version_id()),
+                    ) {
+                        return Ok(failure);
+                    }
+                }
+
                 tx.delete(&resource_type, &id).await?;
                 Ok(BundleEntryResult::deleted())
             }
@@ -3301,6 +3368,29 @@ impl SqliteBackend {
                 })?;
 
                 let (resource_type, id) = self.parse_url(&entry.url)?;
+
+                // `ifMatch` was previously dropped on the floor in the BATCH
+                // path (the transaction path did check it), so optimistic
+                // locking silently disappeared for anyone who wrapped a PUT in a
+                // `type: batch` Bundle — a lost update reported as 200 OK.
+                // Only pay for the extra read when a precondition was supplied.
+                if entry.if_match.is_some() {
+                    // A deleted resource has no current representation, so
+                    // `Gone` is `None` here; real storage errors must not be
+                    // swallowed into a bogus precondition failure.
+                    let existing = match self.read(tenant, &resource_type, &id).await {
+                        Ok(v) => v,
+                        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(failure) = bundle_if_match_gate(
+                        entry.if_match.as_deref(),
+                        existing.as_ref().map(|r| r.version_id()),
+                    ) {
+                        return Ok(failure);
+                    }
+                }
+
                 let (stored, _created) = self
                     .create_or_update(tenant, &resource_type, &id, resource, fhir_version)
                     .await?;
@@ -3308,6 +3398,25 @@ impl SqliteBackend {
             }
             BundleMethod::Delete => {
                 let (resource_type, id) = self.parse_url(&entry.url)?;
+
+                // As above: `ifMatch` on DELETE was ignored here entirely.
+                if entry.if_match.is_some() {
+                    // A deleted resource has no current representation, so
+                    // `Gone` is `None` here; real storage errors must not be
+                    // swallowed into a bogus precondition failure.
+                    let existing = match self.read(tenant, &resource_type, &id).await {
+                        Ok(v) => v,
+                        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(failure) = bundle_if_match_gate(
+                        entry.if_match.as_deref(),
+                        existing.as_ref().map(|r| r.version_id()),
+                    ) {
+                        return Ok(failure);
+                    }
+                }
+
                 match self.delete(tenant, &resource_type, &id).await {
                     Ok(()) => Ok(BundleEntryResult::deleted()),
                     Err(StorageError::Resource(ResourceError::NotFound { .. })) => {

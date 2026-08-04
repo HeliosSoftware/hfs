@@ -16,8 +16,8 @@ use serde_json::Value;
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
-    PurgableStorage, ResourceStorage, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
-    normalize_etag,
+    PurgableStorage, ResourceStorage, SettingsStore, SystemHistoryProvider, TypeHistoryProvider,
+    VersionedStorage, bundle_if_match_gate, if_match_field_satisfied, normalize_etag,
 };
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
@@ -1559,6 +1559,17 @@ impl ResourceStorage for MongoBackend {
                 .await
                 .map_err(|e| internal_error(format!("purge delete ({}): {}", collection, e)))?;
         }
+        // Per-user settings are keyed by user, not tenant, so the deletes above
+        // do not reach them — but a client stores PHI-derived query strings in
+        // them, which belong to this tenant (issue #313).
+        let settings = SettingsStore::purge_tenant_settings(self, id).await?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                documents = settings,
+                "purged tenant-scoped content from user settings documents"
+            );
+        }
         Ok(removed)
     }
 }
@@ -2118,16 +2129,15 @@ impl VersionedStorage for MongoBackend {
             })
         })?;
 
-        let expected = normalize_etag(expected_version);
-        let actual = normalize_etag(current.version_id());
-
-        if expected != actual {
+        // `expected_version` is the client's `If-Match` field value, which is a
+        // LIST and is satisfied when any listed tag matches (issue #311).
+        if !if_match_field_satisfied(expected_version, current.version_id()) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
-                    actual_version: actual.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
+                    actual_version: normalize_etag(current.version_id()).to_string(),
                 },
             ));
         }
@@ -2177,16 +2187,14 @@ impl VersionedStorage for MongoBackend {
             ))
         })?;
 
-        let expected = normalize_etag(expected_version);
-        let actual = normalize_etag(actual);
-
-        if expected != actual {
+        // List-aware `If-Match` comparison, shared with every other backend.
+        if !if_match_field_satisfied(expected_version, actual) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
-                    actual_version: actual.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
+                    actual_version: normalize_etag(actual).to_string(),
                 },
             ));
         }
@@ -2722,18 +2730,15 @@ impl MongoBackend {
                     .await?
                 {
                     Some(existing) => {
-                        if let Some(if_match) = entry.if_match.as_ref() {
-                            let expected = normalize_etag(if_match);
-                            let actual = normalize_etag(existing.version_id());
-                            if expected != actual {
-                                return Ok(BundleEntryResult::error(
-                                    412,
-                                    serde_json::json!({
-                                        "resourceType": "OperationOutcome",
-                                        "issue": [{"severity": "error", "code": "conflict", "diagnostics": "ETag mismatch"}]
-                                    }),
-                                ));
-                            }
+                        // Shared, list-aware gate: `ifMatch` is satisfied when
+                        // any listed tag matches. The hand-rolled single-value
+                        // comparison here could never match a comma-separated
+                        // header (issue #311).
+                        if let Some(failure) = bundle_if_match_gate(
+                            entry.if_match.as_deref(),
+                            Some(existing.version_id()),
+                        ) {
+                            return Ok(failure);
                         }
 
                         let updated = self
@@ -2749,6 +2754,14 @@ impl MongoBackend {
                         Ok(BundleEntryResult::ok(updated))
                     }
                     None => {
+                        // A supplied `ifMatch` — including `*` — cannot be
+                        // satisfied when there is no current representation, so
+                        // it must fail rather than silently create.
+                        if let Some(failure) = bundle_if_match_gate(entry.if_match.as_deref(), None)
+                        {
+                            return Ok(failure);
+                        }
+
                         let mut resource_with_id = resource;
                         resource_with_id["id"] = serde_json::json!(id);
 
@@ -3248,15 +3261,14 @@ impl MongoBackend {
                 })
             })?;
 
-        let expected = normalize_etag(expected_version);
-        let actual = normalize_etag(existing.version_id());
-        if expected != actual {
+        // List-aware `If-Match` comparison, shared with every other backend.
+        if !if_match_field_satisfied(expected_version, existing.version_id()) {
             return Err(StorageError::Concurrency(
                 ConcurrencyError::VersionConflict {
                     resource_type: resource_type.to_string(),
                     id: id.to_string(),
-                    expected_version: expected.to_string(),
-                    actual_version: actual.to_string(),
+                    expected_version: normalize_etag(expected_version).to_string(),
+                    actual_version: normalize_etag(existing.version_id()).to_string(),
                 },
             ));
         }
