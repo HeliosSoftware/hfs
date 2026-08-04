@@ -3725,6 +3725,96 @@ mod postgres_integration {
         assert!(ids.contains(&"obs-2"));
     }
 
+    /// A bare logical id must match a stored `Patient/<id>` reference.
+    ///
+    /// `Observation?patient=<id>` is the primary form in the spec and the shape
+    /// Inferno uses throughout, but Postgres compared the raw search value
+    /// against the stored `Patient/<id>` and so matched nothing — every clinical
+    /// search returned an empty Bundle (#490). The sibling test above covers the
+    /// `Type/id` form, which always worked; only that form was ever asserted,
+    /// which is how the gap survived.
+    #[tokio::test]
+    async fn postgres_integration_search_reference_bare_id() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for (id, subject) in [
+            ("obs-1", "Patient/patient-1"),
+            ("obs-2", "Patient/patient-1"),
+            ("obs-3", "Patient/patient-2"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "subject": {"reference": subject},
+                        "code": {"coding": [{"code": "8867-4"}]},
+                        "status": "final"
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let bare_id = |modifier: Option<SearchModifier>| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "subject".to_string(),
+                param_type: SearchParamType::Reference,
+                modifier,
+                values: vec![SearchValue::eq("patient-1")],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+
+        for (label, query) in [
+            ("bare id", bare_id(None)),
+            (
+                ":Type + bare id",
+                bare_id(Some(SearchModifier::Type("Patient".to_string()))),
+            ),
+        ] {
+            let result = backend.search(&tenant, &query).await.unwrap();
+            let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec!["obs-1", "obs-2"],
+                "{label} must match Patient/patient-1 and not the decoy patient-2"
+            );
+        }
+
+        // The suffix match must not become a wildcard: `subject=%` matches the
+        // literal id `%`, i.e. nothing, rather than every reference.
+        let wildcard = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("%")],
+            chain: vec![],
+            components: vec![],
+        });
+        assert!(
+            backend
+                .search(&tenant, &wildcard)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .is_empty(),
+            "a LIKE metacharacter must be matched literally, not as a wildcard"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_search_reference_identifier() {
         use helios_persistence::core::SearchProvider;
