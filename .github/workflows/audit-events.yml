@@ -1101,13 +1101,15 @@ jobs:
           EXAMPLE_FILE="audit-db-results/example-event.json"
           CHECK_COUNT=0
 
+          # Every arm reads the audit store directly. `shared` mode used to read
+          # over HTTP with `X-Tenant-ID: __system__`, but addressing the internal
+          # system tenant from the network is exactly the isolation hole closed
+          # in #317, so that door no longer opens. Reading the store is what the
+          # `dedicated` arms and the S3 arm always did, and it asserts the same
+          # thing — that the database sink persisted an AuditEvent — without
+          # depending on a request path that must now be refused.
           for _ in {1..20}; do
-            if [ "${{ matrix.mode }}" = "shared" ] && [ "${{ matrix.backend }}" != "s3" ]; then
-              curl -sS -H "X-Tenant-ID: __system__" \
-                "http://localhost:$HFS_PORT_SMOKE/AuditEvent?_count=20" > audit-db-results/auditevent-search.json
-              CHECK_COUNT=$(jq -r '.entry | length // 0' audit-db-results/auditevent-search.json)
-              jq '.entry[0].resource // {}' audit-db-results/auditevent-search.json > "$EXAMPLE_FILE"
-            elif [ "${{ matrix.backend }}" = "sqlite" ]; then
+            if [ "${{ matrix.backend }}" = "sqlite" ]; then
               DB_PATH="$PRIMARY_SQLITE_DB"
               if [ "${{ matrix.mode }}" = "dedicated" ]; then
                 DB_PATH="$AUDIT_SQLITE_DB"

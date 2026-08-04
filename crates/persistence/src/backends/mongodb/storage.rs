@@ -16,8 +16,8 @@ use serde_json::Value;
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
-    PurgableStorage, ResourceStorage, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
-    bundle_if_match_gate, if_match_field_satisfied, normalize_etag,
+    PurgableStorage, ResourceStorage, SettingsStore, SystemHistoryProvider, TypeHistoryProvider,
+    VersionedStorage, bundle_if_match_gate, if_match_field_satisfied, normalize_etag,
 };
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
@@ -1507,6 +1507,7 @@ impl ResourceStorage for MongoBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let db = self.get_database().await?;
         let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
         // RFC 3339 string, matching the SQLite registry's `created_at` format so
@@ -1531,6 +1532,7 @@ impl ResourceStorage for MongoBackend {
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let db = self.get_database().await?;
         let tenants = db.collection::<Document>(MongoBackend::TENANTS_COLLECTION);
         let result = tenants
@@ -1541,6 +1543,7 @@ impl ResourceStorage for MongoBackend {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let db = self.get_database().await?;
         // Count current-version docs first (soft-deleted included, mirroring the
         // SQLite purge) so we can report what was removed.
@@ -1558,6 +1561,17 @@ impl ResourceStorage for MongoBackend {
                 .delete_many(doc! { "tenant_id": id })
                 .await
                 .map_err(|e| internal_error(format!("purge delete ({}): {}", collection, e)))?;
+        }
+        // Per-user settings are keyed by user, not tenant, so the deletes above
+        // do not reach them — but a client stores PHI-derived query strings in
+        // them, which belong to this tenant (issue #313).
+        let settings = SettingsStore::purge_tenant_settings(self, id).await?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                documents = settings,
+                "purged tenant-scoped content from user settings documents"
+            );
         }
         Ok(removed)
     }
