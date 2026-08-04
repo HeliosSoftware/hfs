@@ -88,6 +88,25 @@ pub(super) struct WalkCtx<'a> {
     enforce_refers: bool,
 }
 
+impl<'a> WalkCtx<'a> {
+    /// A context that carries nothing but the resolver.
+    ///
+    /// For callers that need the walk's *pure* helpers — slice matching, above
+    /// all — without an in-flight validation: the guided-form editor, and unit
+    /// tests. Errors and deferred effects pushed onto it are discarded, so only
+    /// pass it to helpers that take `&self`. The struct's other fields are
+    /// private to this module, so a sibling module cannot build one directly.
+    pub(super) fn read_only(resolver: &'a dyn SchemaResolver) -> Self {
+        Self {
+            resolver,
+            errors: Vec::new(),
+            deferred: Vec::new(),
+            path: PathTracker::new(""),
+            enforce_refers: false,
+        }
+    }
+}
+
 impl WalkCtx<'_> {
     pub(super) fn error(&mut self, kind: ErrorKind, message: String) {
         self.errors.push(ValidationError::new(
@@ -757,6 +776,7 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         must_support,
         summary,
         short,
+        context,
         regex,
     );
     out

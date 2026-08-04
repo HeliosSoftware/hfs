@@ -109,6 +109,9 @@ pub struct Addable {
     pub must_support: bool,
     /// The `short` human label, when the pack carries one.
     pub short: Option<String>,
+    /// When set, this option adds an item into the named slice of the
+    /// element's array, seeded with the slice's pattern so it matches.
+    pub slice: Option<String>,
 }
 
 /// An element that is *present* in the document at a cursor, paired with the
@@ -343,6 +346,7 @@ pub fn addable(
                 is_modifier: false,
                 must_support: element.must_support.unwrap_or(false),
                 short: element.short.clone(),
+                slice: None,
             });
             continue;
         }
@@ -368,7 +372,62 @@ pub fn addable(
             is_modifier: name == "modifierExtension" || element.modifier.unwrap_or(false),
             must_support: element.must_support.unwrap_or(false),
             short: element.short.clone(),
+            slice: None,
         });
+
+        // Sliced arrays additionally offer one named add-choice per slice
+        // (#365), respecting per-slice cardinality against the document.
+        if let Some(slicing) = &element.slicing {
+            let items: Vec<Value> = node
+                .and_then(|value| value.get(name))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for (slice_name, slice) in &slicing.slices {
+                if slice_name == "@default" {
+                    continue;
+                }
+                if slice.max == Some(0) {
+                    continue;
+                }
+                let matched = items
+                    .iter()
+                    .filter(|item| crate::engine::slicing::slice_matches_for(resolver, slice, item))
+                    .count() as u64;
+                if let Some(max) = slice.max
+                    && matched >= max
+                {
+                    continue;
+                }
+                let slice_schema = slice.schema.as_deref();
+                out.push(Addable {
+                    name: name.clone(),
+                    kind: if matched > 0 {
+                        AddableKind::AddAnother
+                    } else {
+                        AddableKind::Add
+                    },
+                    type_: slice_schema
+                        .and_then(|s| s.type_.clone())
+                        .or_else(|| element.type_.clone()),
+                    is_primitive: false,
+                    required: slice.min.unwrap_or(0) > matched,
+                    binding: slice_schema
+                        .and_then(|s| s.binding.clone())
+                        .or_else(|| element.binding.clone()),
+                    refers: None,
+                    is_modifier: false,
+                    must_support: slice_schema
+                        .and_then(|s| s.must_support)
+                        .or(element.must_support)
+                        .unwrap_or(false),
+                    short: slice_schema
+                        .and_then(|s| s.short.clone())
+                        .or_else(|| element.short.clone()),
+                    slice: Some(slice_name.clone()),
+                });
+            }
+        }
     }
     out
 }
@@ -639,6 +698,81 @@ pub fn add_extension(
 /// opens resources.
 pub fn is_resource(schema: &FhirSchema) -> bool {
     schema.kind.as_deref() == Some(kind::RESOURCE)
+}
+
+/// The slice an existing array item matches, for labeling rows (#365).
+pub fn slice_label(
+    resolver: &dyn SchemaResolver,
+    root_type: &str,
+    path: &[Step],
+    item: &Value,
+) -> Option<String> {
+    let parent = schema_at(resolver, root_type, path)?;
+    let slicing = parent.slicing.as_ref()?;
+    slicing
+        .slices
+        .iter()
+        .find(|(name, slice)| {
+            name.as_str() != "@default"
+                && crate::engine::slicing::slice_matches_for(resolver, slice, item)
+        })
+        .map(|(name, _)| name.clone())
+}
+
+/// Adds an array item seeded so it matches the named slice: the slice's
+/// pattern/value match is merged into the seed. Falls back to `add_element`
+/// semantics when the slice has no concrete pattern.
+pub fn add_slice_element(
+    resolver: &dyn SchemaResolver,
+    root_type: &str,
+    document: &mut Value,
+    path: &[Step],
+    name: &str,
+    slice_name: &str,
+) -> Option<Path> {
+    let added = add_element(resolver, root_type, document, path, name)?;
+    let parent_schema = schema_at(resolver, root_type, path);
+    // Look the sliced element up through the same base/type merge that
+    // `schema_at` and `addable` use: a differential profile may inherit the
+    // sliced element rather than restating it, and the un-merged element map
+    // would miss it — offering the slice in `addable` but seeding nothing.
+    let element = parent_schema.as_ref().and_then(|schema| {
+        merged_elements(resolver, schema, &mut HashSet::new())
+            .get(name)
+            .cloned()
+    });
+    let seed = element
+        .as_ref()
+        .and_then(|element| element.slicing.as_ref())
+        .and_then(|slicing| slicing.slices.get(slice_name))
+        .and_then(|slice| {
+            // The converter carries the discriminating shape as the slice
+            // schema's pattern/fixed keyword; explicit Match values are the
+            // alternate encoding.
+            slice
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.pattern.clone().or_else(|| schema.fixed.clone()))
+                .or_else(|| slice.match_.as_ref().and_then(|m| m.value.clone()))
+        });
+    if let Some(Value::Object(pattern)) = seed {
+        // The freshly added item is the last in the array at `path.name`.
+        let mut item_path: Vec<Step> = path.to_vec();
+        item_path.push(Step::Field(name.to_string()));
+        if let Some(Value::Array(items)) = node_at_mut(document, &item_path) {
+            if let Some(last) = items.last_mut() {
+                if last.is_null() {
+                    *last = Value::Object(serde_json::Map::new());
+                }
+                if let Some(target) = last.as_object_mut() {
+                    for (key, value) in pattern {
+                        target.entry(key).or_insert(value);
+                    }
+                }
+            }
+        }
+    }
+    Some(added)
 }
 
 #[cfg(test)]
@@ -953,5 +1087,271 @@ mod tests {
         // Clearing a field removes it rather than storing "".
         set_value(&mut patient, &path_from_string("active"), "");
         assert!(patient.get("active").is_none());
+    }
+}
+
+#[cfg(test)]
+mod slice_tests {
+    use super::*;
+    use crate::converter::convert;
+    use serde_json::json;
+
+    fn sliced_registry() -> Arc<crate::SchemaRegistry> {
+        let sd = json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/Sliced",
+            "name": "Sliced",
+            "kind": "resource",
+            "derivation": "specialization",
+            "type": "Sliced",
+            "snapshot": { "element": [
+                { "path": "Sliced", "min": 0, "max": "*" },
+                {
+                    "path": "Sliced.identifier",
+                    "min": 0, "max": "*",
+                    "type": [{ "code": "Identifier" }],
+                    "slicing": {
+                        "discriminator": [{ "type": "pattern", "path": "system" }],
+                        "rules": "open"
+                    }
+                },
+                {
+                    "path": "Sliced.identifier",
+                    "sliceName": "mrn",
+                    "min": 1, "max": "1",
+                    "type": [{ "code": "Identifier" }],
+                    "patternIdentifier": { "system": "http://example.org/mrn" }
+                }
+            ]}
+        });
+        let conversion = convert(&sd).expect("conversion");
+        let mut registry = crate::SchemaRegistry::new();
+        registry.insert(conversion.schema);
+        Arc::new(registry)
+    }
+
+    #[test]
+    fn sliced_arrays_offer_named_add_choices_with_cardinality() {
+        let registry = sliced_registry();
+        let doc = json!({ "resourceType": "Sliced" });
+        let options = addable(registry.as_ref(), "Sliced", &doc, &[]);
+        let mrn: Vec<_> = options
+            .iter()
+            .filter(|option| option.slice.as_deref() == Some("mrn"))
+            .collect();
+        assert_eq!(mrn.len(), 1, "one add-choice per slice: {options:?}");
+
+        // With a matching item present, the max-1 slice is spent.
+        let filled = json!({
+            "resourceType": "Sliced",
+            "identifier": [{ "system": "http://example.org/mrn", "value": "42" }]
+        });
+        let options = addable(registry.as_ref(), "Sliced", &filled, &[]);
+        assert!(
+            !options.iter().any(|o| o.slice.as_deref() == Some("mrn")),
+            "spent slice not offered: {options:?}"
+        );
+    }
+
+    #[test]
+    fn slice_add_seeds_the_pattern_and_items_are_labeled() {
+        let registry = sliced_registry();
+        let mut doc = json!({ "resourceType": "Sliced" });
+        add_slice_element(
+            registry.as_ref(),
+            "Sliced",
+            &mut doc,
+            &[],
+            "identifier",
+            "mrn",
+        )
+        .expect("added");
+        assert_eq!(
+            doc["identifier"][0]["system"],
+            json!("http://example.org/mrn"),
+            "seeded so it matches: {doc}"
+        );
+
+        let label = slice_label(registry.as_ref(), "Sliced", &[], &doc["identifier"][0]);
+        assert_eq!(label, None, "slice_label reads the parent of the ITEM path");
+        let label = slice_label(
+            registry.as_ref(),
+            "Sliced",
+            &[Step::Field("identifier".to_string())],
+            &doc["identifier"][0],
+        );
+        assert_eq!(label.as_deref(), Some("mrn"));
+    }
+
+    /// A sparse derived profile inherits the sliced element from its base
+    /// instead of restating it. The slice lookup must go through the same
+    /// base-chain merge as `addable`, or the add-choice is offered but the
+    /// added item is seeded blank.
+    #[test]
+    fn slice_add_seeds_through_an_inherited_element() {
+        let base = json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/Sliced",
+            "name": "Sliced",
+            "kind": "resource",
+            "derivation": "specialization",
+            "type": "Sliced",
+            "snapshot": { "element": [
+                { "path": "Sliced", "min": 0, "max": "*" },
+                {
+                    "path": "Sliced.identifier",
+                    "min": 0, "max": "*",
+                    "type": [{ "code": "Identifier" }],
+                    "slicing": {
+                        "discriminator": [{ "type": "pattern", "path": "system" }],
+                        "rules": "open"
+                    }
+                },
+                {
+                    "path": "Sliced.identifier",
+                    "sliceName": "mrn",
+                    "min": 1, "max": "1",
+                    "type": [{ "code": "Identifier" }],
+                    "patternIdentifier": { "system": "http://example.org/mrn" }
+                }
+            ]}
+        });
+        let derived = json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/SlicedProfile",
+            "name": "SlicedProfile",
+            "kind": "resource",
+            "derivation": "constraint",
+            "type": "Sliced",
+            "baseDefinition": "http://example.org/StructureDefinition/Sliced",
+            "snapshot": { "element": [
+                { "path": "Sliced", "min": 0, "max": "*" }
+            ]}
+        });
+        let mut registry = crate::SchemaRegistry::new();
+        registry.insert(convert(&base).expect("base conversion").schema);
+        registry.insert(convert(&derived).expect("derived conversion").schema);
+        let registry = Arc::new(registry);
+
+        let mut doc = json!({ "resourceType": "SlicedProfile" });
+        add_slice_element(
+            registry.as_ref(),
+            "SlicedProfile",
+            &mut doc,
+            &[],
+            "identifier",
+            "mrn",
+        )
+        .expect("added");
+        assert_eq!(
+            doc["identifier"][0]["system"],
+            json!("http://example.org/mrn"),
+            "the inherited slice must still seed its pattern: {doc}"
+        );
+    }
+
+    /// A hand-written FHIR Schema (not converter output) can carry the
+    /// discriminator as an explicit `match` and prohibit a slice with max 0.
+    fn handwritten_registry() -> Arc<crate::SchemaRegistry> {
+        let schema: crate::FhirSchema = serde_json::from_value(json!({
+            "name": "Handmade",
+            "url": "http://example.org/StructureDefinition/Handmade",
+            "kind": "resource",
+            "elements": {
+                "identifier": {
+                    "array": true,
+                    "type": "Identifier",
+                    "slicing": {
+                        "slices": {
+                            "mrn": {
+                                "min": 0, "max": 1,
+                                "match": {
+                                    "type": "pattern",
+                                    "value": { "system": "http://example.org/mrn" }
+                                }
+                            },
+                            "forbidden": {
+                                "max": 0,
+                                "match": {
+                                    "type": "pattern",
+                                    "value": { "system": "http://example.org/none" }
+                                }
+                            },
+                            "repeatable": {
+                                "min": 0, "max": 2,
+                                "match": {
+                                    "type": "pattern",
+                                    "value": { "system": "http://example.org/rep" }
+                                }
+                            },
+                            "@default": {}
+                        },
+                        "rules": "open"
+                    }
+                }
+            }
+        }))
+        .expect("schema");
+        let mut registry = crate::SchemaRegistry::new();
+        registry.insert(schema);
+        Arc::new(registry)
+    }
+
+    #[test]
+    fn a_prohibited_slice_is_never_offered() {
+        let registry = handwritten_registry();
+        let doc = json!({ "resourceType": "Handmade" });
+        let options = addable(registry.as_ref(), "Handmade", &doc, &[]);
+        assert!(
+            options.iter().any(|o| o.slice.as_deref() == Some("mrn")),
+            "the open slice is offered: {options:?}"
+        );
+        assert!(
+            !options
+                .iter()
+                .any(|o| o.slice.as_deref() == Some("forbidden")),
+            "a max-0 slice is not: {options:?}"
+        );
+        assert!(
+            !options
+                .iter()
+                .any(|o| o.slice.as_deref() == Some("@default")),
+            "the catch-all pseudo-slice is not an add-choice: {options:?}"
+        );
+    }
+
+    #[test]
+    fn a_partly_filled_slice_is_offered_as_add_another() {
+        let registry = handwritten_registry();
+        let doc = json!({
+            "resourceType": "Handmade",
+            "identifier": [{ "system": "http://example.org/rep", "value": "1" }]
+        });
+        let options = addable(registry.as_ref(), "Handmade", &doc, &[]);
+        let rep = options
+            .iter()
+            .find(|o| o.slice.as_deref() == Some("repeatable"))
+            .expect("one matched of max 2 stays offered");
+        assert_eq!(rep.kind, AddableKind::AddAnother);
+    }
+
+    #[test]
+    fn slice_add_seeds_from_an_explicit_match_value() {
+        let registry = handwritten_registry();
+        let mut doc = json!({ "resourceType": "Handmade" });
+        add_slice_element(
+            registry.as_ref(),
+            "Handmade",
+            &mut doc,
+            &[],
+            "identifier",
+            "mrn",
+        )
+        .expect("added");
+        assert_eq!(
+            doc["identifier"][0]["system"],
+            json!("http://example.org/mrn"),
+            "the explicit match value seeds the item: {doc}"
+        );
     }
 }

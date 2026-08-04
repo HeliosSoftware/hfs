@@ -568,9 +568,7 @@ mod tests {
         });
         let errors = validate_questionnaire_response(&qr_bad, &q, None).await;
         assert!(
-            errors
-                .iter()
-                .any(|e| e.message.contains("answerOption")),
+            errors.iter().any(|e| e.message.contains("answerOption")),
             "{errors:?}"
         );
     }

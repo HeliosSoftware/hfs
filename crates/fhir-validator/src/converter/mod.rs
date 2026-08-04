@@ -290,6 +290,23 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
 
     let mut schema = tree::finalize(root, &mut warnings).unwrap_or_default();
 
+    // Extension applicability contexts (#363): element expressions only.
+    let contexts: Vec<String> = sd
+        .get("context")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|c| c.get("type").and_then(Value::as_str).unwrap_or("element") == "element")
+                .filter_map(|c| c.get("expression").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !contexts.is_empty() {
+        schema.context = Some(contexts);
+    }
+
     // Header fields.
     schema.url = Some(url);
     schema.name = name;

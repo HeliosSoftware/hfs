@@ -243,6 +243,20 @@ fn slice_matches_with_reslice(
     slice_matches(ctx, slice, item)
 }
 
+/// Slice matching for a caller that holds a resolver but no in-flight walk.
+///
+/// The guided-form editor (`crate::editor`) asks "which slice does this item
+/// belong to?" while rendering, outside any validation run. It gets the same
+/// matcher the walk uses — the two must agree, or the form would offer an add
+/// the validator then rejects.
+pub(crate) fn slice_matches_for(
+    resolver: &dyn crate::SchemaResolver,
+    slice: &Slice,
+    item: &Value,
+) -> bool {
+    slice_matches(&WalkCtx::read_only(resolver), slice, item)
+}
+
 /// Does an item belong to a slice?
 ///
 /// A missing `match` (constraining slice) matches nothing. A `match` with no
@@ -250,6 +264,18 @@ fn slice_matches_with_reslice(
 /// source). `type_` defaults to `pattern` when absent.
 fn slice_matches(ctx: &WalkCtx<'_>, slice: &Slice, item: &Value) -> bool {
     let Some(match_) = &slice.match_ else {
+        // No explicit `match`: the converter can instead carry the
+        // pattern/value discriminator as the slice schema's `pattern` (or
+        // `fixed`) keyword. Falling back to it here is what makes a
+        // converter-produced slice discriminate at all.
+        if let Some(schema) = &slice.schema {
+            if let Some(pattern) = &schema.pattern {
+                return is_partial_match(item, pattern);
+            }
+            if let Some(fixed) = &schema.fixed {
+                return is_partial_match(item, fixed);
+            }
+        }
         return false;
     };
     let Some(value) = match_.value.as_ref() else {
@@ -473,5 +499,62 @@ fn binding_matches(item: &Value, expected: &Value) -> bool {
             false
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod slice_match_tests {
+    use super::*;
+    use crate::SchemaRegistry;
+    use serde_json::json;
+
+    fn slice(v: serde_json::Value) -> Slice {
+        serde_json::from_value(v).expect("slice")
+    }
+
+    /// These cases exercise only the discriminator arms that never consult the
+    /// resolver, so an empty registry is enough context.
+    fn matches(s: &Slice, item: &serde_json::Value) -> bool {
+        let registry = SchemaRegistry::new();
+        let ctx = WalkCtx::read_only(&registry);
+        slice_matches(&ctx, s, item)
+    }
+
+    #[test]
+    fn an_explicit_match_value_is_a_partial_match() {
+        let s = slice(json!({ "match": { "type": "pattern", "value": { "system": "http://x" } } }));
+        assert!(matches(&s, &json!({ "system": "http://x", "value": "1" })));
+        assert!(!matches(&s, &json!({ "system": "http://y" })));
+    }
+
+    #[test]
+    fn a_match_without_a_value_matches_everything() {
+        let s = slice(json!({ "match": { "type": "pattern" } }));
+        assert!(matches(&s, &json!({ "anything": true })));
+    }
+
+    #[test]
+    fn a_schema_pattern_stands_in_for_the_match() {
+        let s = slice(json!({ "schema": { "pattern": { "system": "http://x" } } }));
+        assert!(matches(&s, &json!({ "system": "http://x" })));
+        assert!(!matches(&s, &json!({ "system": "http://y" })));
+    }
+
+    #[test]
+    fn a_schema_fixed_stands_in_for_the_match() {
+        let s = slice(json!({ "schema": { "fixed": { "system": "http://x" } } }));
+        assert!(matches(&s, &json!({ "system": "http://x" })));
+    }
+
+    #[test]
+    fn no_discriminator_at_all_matches_nothing() {
+        let s = slice(json!({ "min": 1 }));
+        assert!(!matches(&s, &json!({ "system": "http://x" })));
+    }
+
+    #[test]
+    fn a_schema_with_neither_pattern_nor_fixed_matches_nothing() {
+        let s = slice(json!({ "schema": { "type": "Identifier" } }));
+        assert!(!matches(&s, &json!({ "system": "http://x" })));
     }
 }

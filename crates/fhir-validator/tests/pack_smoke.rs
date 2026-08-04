@@ -1,7 +1,19 @@
-//! Whole-spec smoke tests over the embedded packs. `#[ignore]`d in normal
-//! runs (they parse full packs); run explicitly with
-//! `cargo test -p helios-fhir-validator -- --ignored`
-//! (add `--features R4B,R5,R6` for the other-version sweeps).
+//! Whole-spec smoke tests over the embedded packs.
+//!
+//! These are the only tests that exercise the *real* R4/R4B/R5/R6 schema
+//! packs the server actually ships — everything else in this crate runs
+//! against small inline fixtures. They therefore run by default: the pack
+//! parse is memoized in a `OnceLock` (see `packs::core_registry`), so the
+//! decompress-and-index cost is paid once per test binary regardless of how
+//! many of these run.
+//!
+//! Only `structural_validation_latency_smoke` stays `#[ignore]`d, because a
+//! wall-clock assertion is not trustworthy on shared self-hosted runners.
+//! It is not dead: `.github/workflows/validator-conformance.yml` runs the
+//! ignored tests explicitly and fails if none are collected.
+//!
+//! Add `--features R4B,R5,R6` (or `--all-features`) for the other-version
+//! sweeps; with only the default `R4` feature the sweep covers R4 alone.
 
 #![cfg(feature = "R4")]
 
@@ -26,7 +38,6 @@ fn r4_pack_loads_and_validates() {
 
 /// Every enabled version's pack loads and validates a minimal Patient.
 #[test]
-#[ignore = "whole-pack parse; run with --features R4B,R5,R6 -- --ignored"]
 fn all_enabled_packs_load_and_validate() {
     let versions = [
         FhirVersion::R4,
@@ -76,7 +87,8 @@ fn all_enabled_packs_load_and_validate() {
 /// Rough structural-validation latency check (debug builds are far slower
 /// than release; the plan's <5ms target refers to release).
 #[test]
-#[ignore = "timing; run with -- --ignored"]
+#[ignore = "wall-clock assertion; unreliable on shared runners. Run via the \
+            validator-conformance.yml pack-smoke step or `-- --ignored`"]
 fn structural_validation_latency_smoke() {
     let validator = Validator::new(core_registry(FhirVersion::R4));
     let opts = ValidationOptions::default();
@@ -114,7 +126,6 @@ fn structural_validation_latency_smoke() {
 }
 
 #[test]
-#[ignore = "whole-pack parse; run with -- --ignored"]
 fn r4_pack_loads_and_resolves_core_schemas() {
     let registry = core_registry(FhirVersion::R4);
     for name in [
@@ -161,7 +172,6 @@ fn r4_pack_loads_and_resolves_core_schemas() {
 }
 
 #[test]
-#[ignore = "whole-pack parse; run with -- --ignored"]
 fn r4_pack_validates_known_good_and_bad_resources() {
     let registry = core_registry(FhirVersion::R4);
     let validator = Validator::new(registry);
