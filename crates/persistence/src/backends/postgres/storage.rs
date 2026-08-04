@@ -435,15 +435,47 @@ impl ResourceStorage for PostgresBackend {
         let new_version_str = new_version.to_string();
         let is_deleted = true;
 
-        // Soft delete the resource
-        client
+        // Soft delete the resource, guarded by the version we just read.
+        //
+        // The `version_id`/`is_deleted` predicates make this a compare-and-swap
+        // rather than a blind overwrite. Without them a concurrent writer that
+        // lands between the SELECT above and this UPDATE is silently clobbered,
+        // and worse: `new_version` was computed from the stale read, so the
+        // history INSERT below then collides with the row that writer already
+        // wrote and trips `PRIMARY KEY (tenant_id, resource_type, id,
+        // version_id)` (schema.rs). Because neither statement runs inside a
+        // transaction, the UPDATE is already committed at that point — the
+        // caller gets a 500 and the current row now points at a version whose
+        // history entry holds someone else's content.
+        //
+        // MongoDB and S3 already guarded their equivalent writes (a
+        // `version_id` term in the update filter, and a conditional PUT
+        // respectively); this brings PostgreSQL to parity. Losing the race is
+        // reported as `NotFound`, which is what a caller racing a concurrent
+        // delete would have seen anyway.
+        let updated = client
             .execute(
                 "UPDATE resources SET is_deleted = TRUE, deleted_at = $1, version_id = $2, last_updated = $1
-                 WHERE tenant_id = $3 AND resource_type = $4 AND id = $5",
-                &[&now, &new_version_str, &tenant_id, &resource_type, &id],
+                 WHERE tenant_id = $3 AND resource_type = $4 AND id = $5
+                   AND version_id = $6 AND is_deleted = FALSE",
+                &[
+                    &now,
+                    &new_version_str,
+                    &tenant_id,
+                    &resource_type,
+                    &id,
+                    &current_version,
+                ],
             )
             .await
             .map_err(|e| internal_error(format!("Failed to delete resource: {}", e)))?;
+
+        if updated == 0 {
+            return Err(StorageError::Resource(ResourceError::NotFound {
+                resource_type: resource_type.to_string(),
+                id: id.to_string(),
+            }));
+        }
 
         // Insert deletion record into history (preserve fhir_version)
         client
@@ -802,6 +834,7 @@ impl ResourceStorage for PostgresBackend {
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let client = self.get_client().await?;
         let changed = client
             .execute("DELETE FROM tenants WHERE id = $1", &[&id])
@@ -811,6 +844,7 @@ impl ResourceStorage for PostgresBackend {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let mut client = self.get_client().await?;
         let tx = client
             .transaction()
@@ -838,9 +872,21 @@ impl ResourceStorage for PostgresBackend {
                 .await
                 .map_err(|e| internal_error(format!("purge delete: {e}")))?;
         }
+        // Per-user settings are keyed by user, not tenant, so they are not swept
+        // by the deletes above — but a client stores PHI-derived query strings in
+        // them, which belong to this tenant (issue #313). Same transaction, so an
+        // offboarding cannot half-apply.
+        let settings = PostgresBackend::purge_tenant_settings_in_txn(&tx, id).await?;
         tx.commit()
             .await
             .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                documents = settings,
+                "purged tenant-scoped content from user settings documents"
+            );
+        }
         Ok(removed.max(0) as u64)
     }
 }

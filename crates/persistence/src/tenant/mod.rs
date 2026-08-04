@@ -117,7 +117,10 @@ mod permissions;
 mod tenancy;
 
 pub use context::{TenantContext, TenantContextBuilder};
-pub use id::{MAX_TENANT_ID_LEN, RESERVED_TENANT_SEGMENTS, SYSTEM_TENANT, TenantId, TenantIdError};
+pub use id::{
+    MAX_TENANT_ID_LEN, RESERVED_TENANT_IDS, RESERVED_TENANT_SEGMENTS, SYSTEM_TENANT, TenantId,
+    TenantIdError, ensure_mutable_tenant,
+};
 pub use permissions::{
     CompartmentRestriction, Operation, TenantPermissions, TenantPermissionsBuilder,
 };

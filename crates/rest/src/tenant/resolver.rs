@@ -117,6 +117,23 @@ impl std::fmt::Display for TenantSourceError {
 
 impl std::error::Error for TenantSourceError {}
 
+/// Lets a whole-id reserved tenant through the source extractors unparsed.
+///
+/// `TenantId::parse` refuses a reserved id (issue #385: it is a reserved
+/// *segment*), but refusing it *here* would answer the wrong thing. Refusal for
+/// a reserved id is `TenantExtractor`'s job and is a `403` with a specific
+/// message — "you may not address this tenant" — whereas a rejection at this
+/// layer is a `400`/"malformed id", or, on the URL door, silently no tenant at
+/// all. Issue #317 chose the `403`, one status at one door, so an operator who
+/// pointed a client at `X-Tenant-ID: __system__` reads why.
+///
+/// So: extract it, let it reach `reject_reserved_tenant`. Only the exact
+/// reserved ids get this pass; `acme/__system__` is still a parse error, which
+/// is the shape #385 added the per-segment check for.
+fn reserved_id_passthrough(raw: &str) -> Option<TenantId> {
+    TenantId::is_reserved(raw).then(|| TenantId::new(raw))
+}
+
 /// Extracts tenant from URL path prefix.
 ///
 /// First checks for a tenant extracted by the middleware (stored in extensions).
@@ -169,6 +186,9 @@ impl TenantSourceExtractor for UrlPathTenantExtractor {
         // hierarchical id can never appear here — `acme/research` arrives as the
         // segment `acme` followed by a path. Hierarchical tenants are therefore
         // addressable by header and JWT claim, but not by URL-prefix routing.
+        if let Some(reserved) = reserved_id_passthrough(tenant) {
+            return Ok(Some(reserved));
+        }
         Ok(TenantId::parse(tenant).ok())
     }
 
@@ -209,6 +229,9 @@ impl TenantSourceExtractor for HeaderTenantExtractor {
         // produces.
         if raw.is_empty() {
             return Ok(None);
+        }
+        if let Some(reserved) = reserved_id_passthrough(raw) {
+            return Ok(Some(reserved));
         }
         TenantId::parse(raw).map(Some).map_err(|error| {
             debug!(error = %error, "Rejecting invalid X-Tenant-ID header");
@@ -253,6 +276,9 @@ impl TenantSourceExtractor for JwtTenantExtractor {
         else {
             return Ok(None);
         };
+        if let Some(reserved) = reserved_id_passthrough(raw) {
+            return Ok(Some(reserved));
+        }
         TenantId::parse(raw).map(Some).map_err(|error| {
             warn!(error = %error, "Rejecting invalid tenant claim in validated token");
             TenantSourceError {
@@ -504,8 +530,8 @@ mod tests {
         for bad in [
             "acme corp",
             "acme/",
-            "__system__",
-            "resources",
+            "acme/__system__",
+            "acme/resources",
             too_long.as_str(),
         ] {
             let parts = make_parts("/Patient/123", Some(bad));
@@ -513,6 +539,21 @@ mod tests {
                 .extract(&parts, &config)
                 .expect_err(&format!("{bad:?} must be rejected"));
             assert_eq!(err.source, TenantSource::Header);
+        }
+
+        // A *whole-id* reserved tenant is the one exception: it extracts here so
+        // `TenantExtractor` can answer 403 "may not be addressed" rather than
+        // 400 "malformed" (issue #317). See `reserved_id_passthrough`.
+        for reserved in ["__system__", "resources"] {
+            let parts = make_parts("/Patient/123", Some(reserved));
+            assert_eq!(
+                extractor
+                    .extract(&parts, &config)
+                    .expect("a reserved id extracts, and is refused one layer up")
+                    .as_ref()
+                    .map(TenantId::as_str),
+                Some(reserved)
+            );
         }
     }
 
@@ -676,6 +717,43 @@ mod tests {
         assert!(!is_reserved_path("my_tenant", &version));
     }
 
+    /// The resolver deliberately still *extracts* a reserved id (#317).
+    ///
+    /// Refusal happens one layer up, in `TenantExtractor`, which is the single
+    /// door every request-time tenant passes through. Teaching the resolver (or
+    /// `is_valid_tenant_id`) to drop reserved ids instead would silently change
+    /// what the authorization classifier sees for `/__system__/Patient/123`:
+    /// with no tenant extracted it falls back to the raw path, declines the
+    /// leading `_` segment, and skips the SMART scope check altogether. See
+    /// `middleware::auth::test_url_routing_reserved_tenant_still_classifies_for_scope_check`.
+    ///
+    /// If you are here because you want to reject earlier: reject in
+    /// `TenantExtractor`, not here.
+    #[test]
+    fn test_resolver_still_extracts_reserved_ids_for_consistent_classification() {
+        use helios_persistence::tenant::SYSTEM_TENANT;
+
+        let config = MultitenancyConfig {
+            routing_mode: TenantRoutingMode::Both,
+            ..Default::default()
+        };
+        let resolver = TenantResolver::new(&config);
+
+        let parts = make_parts("/Patient/123", Some(SYSTEM_TENANT));
+        let resolved = resolver
+            .resolve(&parts, &config, "default")
+            .expect("a reserved id must extract, not fail validation");
+        assert_eq!(resolved.tenant_id_str(), SYSTEM_TENANT);
+        assert_eq!(resolved.source, TenantSource::Header);
+
+        let parts = make_parts("/__system__/Patient/123", None);
+        let resolved = resolver
+            .resolve(&parts, &config, "default")
+            .expect("a reserved id must extract, not fail validation");
+        assert_eq!(resolved.tenant_id_str(), SYSTEM_TENANT);
+        assert_eq!(resolved.source, TenantSource::UrlPath);
+    }
+
     /// Replaces `test_is_valid_tenant_id`, which exercised this module's private
     /// copy of the charset. That copy is gone (issue #385) — validation is
     /// `TenantId::parse` — so the property worth pinning here is that the
@@ -701,8 +779,8 @@ mod tests {
             "ABC123",
             "tenant.com",
             "acme/research",
-            "resources",
-            "__system__",
+            "acme/resources",
+            "acme/__system__",
             "tenant path",
             too_long.as_str(),
         ] {
@@ -712,6 +790,15 @@ mod tests {
                 TenantId::parse(candidate).is_ok(),
                 "{candidate:?} classified differently from the canonical validator"
             );
+        }
+
+        // Whole-id reserved tenants are deliberately *not* held to this
+        // equivalence — they extract here and are refused with a 403 in
+        // `TenantExtractor` (issue #317, `reserved_id_passthrough`).
+        for reserved in ["resources", "__system__"] {
+            assert!(TenantId::parse(reserved).is_err());
+            let parts = make_parts("/Patient/123", Some(reserved));
+            assert!(extractor.extract(&parts, &config).is_ok());
         }
     }
 }

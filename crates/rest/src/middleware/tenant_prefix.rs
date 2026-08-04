@@ -84,8 +84,19 @@ fn is_fhir_resource_type(type_name: &str, fhir_version: &FhirVersion) -> bool {
 /// like a guard while guarding nothing reachable, and would reintroduce exactly
 /// what issue #385 removed: a second, subtly different charset alongside the
 /// canonical one.
+///
+/// The one addition on top of `parse` is a whole-id reserved tenant, which
+/// `parse` refuses (it is a reserved *segment*). Refusing it here would be a
+/// security regression, not a hardening: `authz_middleware` calls
+/// [`extract_tenant_from_path`] to decide what it is authorizing, so a `None`
+/// for `/__system__/Patient/123` makes it classify the raw path, decline the
+/// leading `_` segment, and skip the SMART scope check altogether — see
+/// `middleware::auth::test_url_routing_reserved_tenant_still_classifies_for_scope_check`.
+/// The reservation is enforced once, in `TenantExtractor`, as a `403`
+/// (issue #317). Only the exact reserved ids get this pass; a hierarchical
+/// `acme/__system__` cannot appear in a single path segment anyway.
 fn is_valid_tenant_id(s: &str) -> bool {
-    TenantId::parse(s).is_ok()
+    TenantId::parse(s).is_ok() || TenantId::is_reserved(s)
 }
 
 /// Extracts tenant from URL path if present.
@@ -302,9 +313,15 @@ mod tests {
         assert!(!is_valid_tenant_id("")); // empty
         assert!(!is_valid_tenant_id(&"a".repeat(100))); // too long
         assert!(!is_valid_tenant_id("tenant corp")); // whitespace
-        // Reserved control-plane segments are not tenants (issue #385).
-        assert!(!is_valid_tenant_id("resources"));
-        assert!(!is_valid_tenant_id("__system__"));
+        // A *whole-id* reserved tenant is accepted here so the router and the
+        // authz classifier still strip the prefix; the request is then refused
+        // with a 403 in `TenantExtractor` (issue #317). Accepting it is what
+        // keeps the SMART scope check running for `/__system__/Patient/123`.
+        assert!(is_valid_tenant_id("resources"));
+        assert!(is_valid_tenant_id("__system__"));
+        // A reserved segment *inside* a hierarchical id stays invalid (#385) —
+        // that is the S3 prefix-collision shape, and nothing refuses it later.
+        assert!(!is_valid_tenant_id("acme/resources"));
 
         // A hierarchical id *is* valid — this is a total delegation to
         // `TenantId::parse`, not a stricter single-segment check. The earlier
@@ -337,6 +354,11 @@ mod tests {
     /// `authz_middleware` and the tenant resolver must classify a path segment
     /// identically, or the request would be authorized as one tenant and served
     /// as another. Both now call `TenantId::parse`; this pins that they agree.
+    ///
+    /// The whole-id reserved names are excluded because both sides make the
+    /// same deliberate exception for them (see `is_valid_tenant_id` and
+    /// `tenant::resolver::reserved_id_passthrough`) — they are covered by
+    /// `reserved_ids_are_extracted_here_and_refused_in_the_extractor` instead.
     #[test]
     fn tenant_prefix_and_canonical_validator_agree() {
         for candidate in [
@@ -350,8 +372,8 @@ mod tests {
             // this test, which is the point.
             "acme/research",
             "",
-            "resources",
-            "__system__",
+            "acme/resources",
+            "acme/__system__",
             "tenant corp",
             "tenant%2F",
         ] {
@@ -360,6 +382,23 @@ mod tests {
                 TenantId::parse(candidate).is_ok(),
                 "{candidate:?} classified differently from the canonical validator"
             );
+        }
+    }
+
+    /// The reserved-id exception, stated once: the prefix is still stripped, so
+    /// the authz classifier sees `/Patient/123` and runs the scope check, and
+    /// the reservation is enforced later as a `403` (issue #317).
+    #[test]
+    fn reserved_ids_are_extracted_here_and_refused_in_the_extractor() {
+        let version = default_version();
+
+        for reserved in helios_persistence::tenant::RESERVED_TENANT_IDS {
+            assert!(TenantId::parse(reserved).is_err());
+            let (tenant, remaining) =
+                extract_tenant_from_path(&format!("/{reserved}/Patient/123"), &version)
+                    .unwrap_or_else(|| panic!("{reserved} must still strip as a tenant prefix"));
+            assert_eq!(&tenant, reserved);
+            assert_eq!(remaining, "/Patient/123");
         }
     }
 

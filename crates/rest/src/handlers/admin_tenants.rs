@@ -278,6 +278,12 @@ where
     S: ResourceStorage + Send + Sync,
 {
     require_registry(state.storage())?;
+    // Validate BEFORE the existence probe below. `__system__` has data (the
+    // AuditEvent trail), so probing first would let a reserved id past the 404
+    // check and straight into `deregister_tenant` + `purge_tenant_data` — the
+    // create path validated but this one never did (issue #317). Validating
+    // first also means a reserved id reports 400 rather than a misleading 404.
+    validate_tenant_id(&id)?;
 
     // Establish what exists before mutating so we can 404 on a no-op and report
     // accurately. A tenant may be registered, have data, both, or neither.

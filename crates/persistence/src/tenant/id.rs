@@ -8,11 +8,19 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{StorageResult, TenantError};
+
 /// The system tenant identifier, used for shared/global resources.
 ///
 /// Resources stored under the system tenant are accessible to all tenants
 /// (subject to permission checks). This is used for shared resources like
 /// CodeSystems, ValueSets, and other terminology resources.
+///
+/// This id names an *internal* tenant: it is only ever legitimate when the
+/// process itself authors it (via [`TenantId::system`] /
+/// [`TenantContext::system`](crate::tenant::TenantContext::system)). It must
+/// never be accepted from a request — see [`TenantId::parse`] and
+/// [`ensure_mutable_tenant`], and issue #317.
 pub const SYSTEM_TENANT: &str = "__system__";
 
 /// Maximum length of a tenant id, in bytes.
@@ -58,10 +66,61 @@ pub const RESERVED_TENANT_SEGMENTS: &[&str] = &[
     "..",
 ];
 
+/// Whole tenant ids that are reserved for internal use (issue #317).
+///
+/// A strict subset of [`RESERVED_TENANT_SEGMENTS`]: these are the reserved
+/// names as they appear when they *are* the entire id, which is the shape the
+/// non-storage doors care about. [`TenantId::parse`] does not consult this list
+/// — its per-segment check already subsumes it — but the REST tenant extractor,
+/// the `HFS_DEFAULT_TENANT` startup check, the console metrics filter, and the
+/// storage-layer lifecycle guard all ask "is *this id* reserved?" rather than
+/// "could this id be provisioned?", and for them a whole-id answer is the
+/// right one.
+pub const RESERVED_TENANT_IDS: &[&str] =
+    &[SYSTEM_TENANT, "tenants", "resources", "history", "bulk"];
+
+/// Refuses a tenant-lifecycle mutation that targets a reserved tenant.
+///
+/// This is the storage-layer backstop for issue #317. The primary control is at
+/// the REST ingress (`helios_rest::extractors::TenantExtractor`), but
+/// `register_tenant` / `deregister_tenant` / `purge_tenant_data` take a bare
+/// `&str` and are reachable from more than one handler — including, today, an
+/// unauthenticated web-UI route. Every backend calls this at the top of
+/// `deregister_tenant` and `purge_tenant_data` so no future call site can reach
+/// a destructive registry operation on the shared tenant.
+///
+/// `register_tenant` guards with
+/// [`ensure_canonical_tenant_id`](crate::ResourceStorage::ensure_canonical_tenant_id)
+/// instead, which is strictly stronger: it runs the full [`TenantId::parse`],
+/// whose per-segment reserved check refuses every id this function refuses and
+/// also refuses ids that merely *contain* a reserved segment (issue #385).
+/// Deregister and purge cannot use it — they must stay able to act on a
+/// non-canonical id that predates the validator, or such a tenant would be
+/// permanently unremovable.
+///
+/// Read operations are deliberately *not* guarded: `get_tenant(SYSTEM_TENANT)`
+/// truthfully returns `None` (the sentinel is never registered), and turning
+/// that into an error would convert a benign lookup into a 500 while adding a
+/// cleaner existence oracle rather than removing one.
+pub fn ensure_mutable_tenant(id: &str) -> StorageResult<()> {
+    if TenantId::is_reserved(id) {
+        return Err(TenantError::InvalidTenant {
+            tenant_id: TenantId::new(id),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Why a string is not a valid tenant id.
 ///
 /// Returned by [`TenantId::parse`], the canonical validating constructor.
+///
+/// `#[non_exhaustive]`: the REST and web-UI layers translate these into
+/// user-facing copy, and a new rejection reason must not break their build —
+/// they fall back to `Display`, which is written to be actionable on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TenantIdError {
     /// The id was empty.
     Empty,
@@ -264,6 +323,25 @@ impl TenantId {
     /// are accepting an id, so the caller gets a reason rather than a bool.
     pub fn is_canonical(&self) -> bool {
         Self::parse(&self.0).is_ok()
+    }
+
+    /// Returns `true` if `id` is, as a whole, reserved for internal use.
+    ///
+    /// Matching is exact and case-sensitive, mirroring how tenant ids are
+    /// compared everywhere else — a differently-cased id is a genuinely
+    /// different tenant, not an evasion.
+    ///
+    /// Only the exact reserved strings are refused, not a `__`-prefixed
+    /// namespace. A tenant id is a partition key in every backend and there is
+    /// no rename operation, so banning a prefix would strand any deployment that
+    /// already holds such a tenant — its data would keep serving while becoming
+    /// permanently impossible to deregister or purge.
+    ///
+    /// This is the question the *non*-provisioning doors ask. When you are
+    /// accepting an id for provisioning, use [`parse`](Self::parse), whose
+    /// per-segment check is stronger.
+    pub fn is_reserved(id: &str) -> bool {
+        RESERVED_TENANT_IDS.contains(&id)
     }
 
     /// Returns the system tenant ID.

@@ -127,28 +127,33 @@ pub struct DeleteQuery {
     purge: bool,
 }
 
-const MAX_TENANT_ID_LEN: usize = 128;
-
 /// Mirrors the API's id validation so the page rejects the same inputs.
+///
+/// Delegates to [`TenantId::parse`](helios_persistence::tenant::TenantId::parse),
+/// the single reservation authority shared with the `/admin/tenants` API, the
+/// request-time tenant extractor, and the storage-layer lifecycle guard, so this
+/// page cannot drift from them (issue #317).
 fn validate_id(id: &str) -> Result<(), String> {
-    if id.is_empty() {
-        return Err("Tenant id must not be empty.".to_string());
-    }
-    if id.len() > MAX_TENANT_ID_LEN {
-        return Err(format!("Tenant id exceeds {MAX_TENANT_ID_LEN} characters."));
-    }
-    if id == helios_persistence::tenant::SYSTEM_TENANT {
-        return Err("That id is reserved for internal shared resources.".to_string());
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-    {
-        return Err(
-            "Tenant id may contain only letters, digits, '-', '_', '.', and '/'.".to_string(),
-        );
-    }
-    Ok(())
+    use helios_persistence::tenant::{MAX_TENANT_ID_LEN, TenantId, TenantIdError};
+
+    TenantId::parse(id).map(|_| ()).map_err(|e| match e {
+        TenantIdError::Empty => "Tenant id must not be empty.".to_string(),
+        TenantIdError::TooLong { .. } => {
+            format!("Tenant id exceeds {MAX_TENANT_ID_LEN} characters.")
+        }
+        TenantIdError::ReservedSegment { .. } => {
+            "That id is reserved for internal shared resources.".to_string()
+        }
+        TenantIdError::InvalidCharacter { .. } => {
+            "Tenant id may contain only letters, digits, '-', '_', '.', and '/'.".to_string()
+        }
+        TenantIdError::EmptySegment => {
+            "Tenant id must not begin or end with '/' or contain an empty segment.".to_string()
+        }
+        // `TenantIdError` is `#[non_exhaustive]`; a variant added later falls
+        // back to its own `Display` rather than failing to compile here.
+        other => other.to_string(),
+    })
 }
 
 /// Builds the tenant rows from the registry joined with live per-tenant counts,
@@ -355,6 +360,21 @@ pub async fn delete(
         )
             .into_response();
     };
+
+    // Refuse reserved ids before touching the registry. This route is destructive
+    // (`?purge=true` permanently deletes the tenant's data) and, unlike the
+    // `/admin/tenants` API, it validated nothing — so `DELETE
+    // /ui/tenants/__system__?purge=true` would have wiped the AuditEvent trail
+    // and shared terminology (issue #317).
+    //
+    // This closes the reserved-id hole only. The separate, known question of
+    // `/ui/*` being mounted outside the auth layer is deliberately untouched
+    // here; the storage-layer guard in `helios-persistence` backs this up
+    // regardless of how the route is reached.
+    if let Err(message) = validate_id(&id) {
+        let rows = load_rows(storage, "").await.unwrap_or_default();
+        return rows_response(i18n, rows, Some(message));
+    }
 
     let _ = storage.deregister_tenant(&id).await;
     if query.purge {

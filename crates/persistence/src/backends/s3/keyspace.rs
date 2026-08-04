@@ -315,8 +315,34 @@ impl S3Keyspace {
     /// In particular, a future change that widened a tenant purge to sweep the
     /// whole tenant prefix would break the structural argument above and must
     /// exclude this namespace explicitly.
+    ///
+    /// # What a tenant purge *does* reach
+    ///
+    /// The paragraph above says a tenant purge cannot **delete** these objects,
+    /// and that remains true and deliberate: they are user-global, and one
+    /// tenant's offboarding must not destroy a user's theme or their other
+    /// tenants' saved queries. Since issue #313 a purge instead **edits** each
+    /// object, removing the `byTenant.{tenant}` subtree from the document inside
+    /// (see [`user_settings_prefix`](Self::user_settings_prefix) and
+    /// `crate::core::user_settings::purge_tenant_subtree`). The object survives;
+    /// the purged tenant's content in it does not.
     pub fn user_settings_key(&self, object_id: &str) -> String {
         self.join(&["_system.user-settings", &format!("{object_id}.json")])
+    }
+
+    /// Prefix covering every per-user settings object.
+    ///
+    /// Used only by the tenant-settings purge (issue #313), which must visit
+    /// every user's document to remove the offboarded tenant's subtree — the
+    /// settings store is keyed by an opaque digest of the user key, so there is
+    /// no way to select the affected documents other than listing them.
+    ///
+    /// Structurally disjoint from every tenant's keyspace, by the same argument
+    /// as [`user_settings_key`](Self::user_settings_key): a tenant's objects live
+    /// under `resources/`, `history/` or `bulk/` sub-prefixes of its own segment,
+    /// so listing this prefix can never return one.
+    pub fn user_settings_prefix(&self) -> String {
+        self.join(&["_system.user-settings/"])
     }
 
     /// Joins `parts` with `/`, prepending the base prefix when set.

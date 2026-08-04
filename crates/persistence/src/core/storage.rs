@@ -805,9 +805,22 @@ pub trait ResourceStorage: Send + Sync {
     /// current time. Returns [`StorageError`] if the tenant is already
     /// registered. Default: unsupported-capability error.
     ///
-    /// Implementations must call
+    /// # Implementor contract
+    ///
+    /// An override **must** begin with
     /// [`ensure_canonical_tenant_id`](Self::ensure_canonical_tenant_id) before
-    /// writing anything.
+    /// writing anything. That check runs the full [`TenantId::parse`]
+    /// (issue #385), whose per-segment reserved check also refuses the
+    /// reserved ids of issue #317 — `__system__` holds the AuditEvent trail and
+    /// shared terminology, and provisioning over it is the first step of an
+    /// anti-forensic primitive. [`deregister_tenant`](Self::deregister_tenant)
+    /// and [`purge_tenant_data`](Self::purge_tenant_data) take the same bare
+    /// `&str` but guard with
+    /// [`ensure_mutable_tenant`](crate::tenant::ensure_mutable_tenant) instead,
+    /// because they must stay able to act on a non-canonical id that predates
+    /// the validator. The REST ingress rejects reserved ids first, but this
+    /// family is reachable from more than one handler, so these guards are the
+    /// backstop rather than the only control.
     async fn register_tenant(
         &self,
         _id: &str,
