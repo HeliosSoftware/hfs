@@ -10,7 +10,7 @@
 mod errors;
 mod path;
 mod primitives;
-mod slicing;
+pub(crate) mod slicing;
 mod walk;
 
 pub use errors::{ErrorKind, Severity, ValidationError};

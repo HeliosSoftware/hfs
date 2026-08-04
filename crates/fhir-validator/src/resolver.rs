@@ -32,6 +32,28 @@ impl SchemaRegistry {
         Self::default()
     }
 
+    /// Extension definitions applicable at any of the given element
+    /// contexts (#363): schemas of kind `extension` whose declared context
+    /// expressions intersect `contexts`. Deduplicated by canonical URL and
+    /// sorted by name for a stable picker order.
+    pub fn extensions_applicable(&self, contexts: &[&str]) -> Vec<Arc<FhirSchema>> {
+        let mut out: Vec<Arc<FhirSchema>> = self
+            .map
+            .values()
+            .filter(|schema| schema.kind.as_deref() == Some(crate::schema::kind::EXTENSION))
+            .filter(|schema| {
+                schema
+                    .context
+                    .as_deref()
+                    .is_some_and(|cs| cs.iter().any(|c| contexts.contains(&c.as_str())))
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.dedup_by(|a, b| a.url == b.url);
+        out
+    }
+
     /// Number of distinct keys (aliases included).
     pub fn len(&self) -> usize {
         self.map.len()
@@ -165,6 +187,41 @@ mod tests {
         assert_eq!(
             composite.resolve("Patient").unwrap().kind.as_deref(),
             Some("constraint")
+        );
+    }
+}
+
+#[cfg(test)]
+mod extension_catalogue_tests {
+    use crate::packs::core_registry;
+    use helios_fhir::FhirVersion;
+
+    /// #363: the R4 pack now embeds the core extension definitions with
+    /// their applicability contexts, queryable by element context.
+    #[test]
+    fn r4_pack_offers_profiled_extensions_by_context() {
+        let registry = core_registry(FhirVersion::R4);
+        let for_patient = registry.extensions_applicable(&["Patient"]);
+        assert!(
+            for_patient.iter().any(|s| s.url.as_deref()
+                == Some("http://hl7.org/fhir/StructureDefinition/patient-birthPlace")),
+            "birthPlace applies to Patient: {:?}",
+            for_patient
+                .iter()
+                .filter_map(|s| s.url.clone())
+                .take(8)
+                .collect::<Vec<_>>()
+        );
+        let for_name = registry.extensions_applicable(&["HumanName.family"]);
+        assert!(
+            for_name.iter().any(|s| s.url.as_deref()
+                == Some("http://hl7.org/fhir/StructureDefinition/humanname-own-name")),
+            "own-name applies to HumanName"
+        );
+        assert!(
+            !for_name.iter().any(|s| s.url.as_deref()
+                == Some("http://hl7.org/fhir/StructureDefinition/patient-birthPlace")),
+            "contexts scope the offer"
         );
     }
 }

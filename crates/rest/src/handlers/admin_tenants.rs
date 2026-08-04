@@ -28,7 +28,6 @@ use axum::{
 };
 use helios_audit::{AuditAction, AuditEventBuilder};
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::tenant::SYSTEM_TENANT;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
@@ -36,15 +35,7 @@ use tracing::debug;
 use crate::error::{RestError, RestResult};
 use crate::state::AppState;
 
-/// Maximum accepted tenant-id length. Generous, but bounds the value that flows
-/// into schema names / storage keys.
-const MAX_TENANT_ID_LEN: usize = 128;
-
-/// Tenant ids that name a control-plane namespace in a storage backend's
-/// keyspace. Currently the S3 sibling prefixes of `tenants/` (see
-/// `S3Keyspace`); `__system__` is checked separately as the shared-tenant
-/// sentinel.
-const RESERVED_TENANT_IDS: &[&str] = &["tenants", "resources", "history", "bulk"];
+use helios_persistence::tenant::{MAX_TENANT_ID_LEN, SYSTEM_TENANT, TenantId, TenantIdError};
 
 /// Request body for `POST /admin/tenants`.
 #[derive(Debug, Deserialize)]
@@ -93,51 +84,37 @@ async fn seed_new_tenant<S: ResourceStorage>(
     .await;
 }
 
-/// Validates a tenant id: non-empty, within length, no whitespace, a
-/// conservative identifier charset, and never the internal system sentinel.
+/// Validates a tenant id: non-empty, within length, a conservative identifier
+/// charset, and never a reserved internal id.
+///
+/// Delegates to [`TenantId::parse`], the single reservation authority shared
+/// with the request-time tenant extractor, the web UI's tenant page, and the
+/// storage-layer lifecycle guard. Previously this function kept its own copy of
+/// the rules, which is how the reservation came to be enforced here but not on
+/// the doors an untrusted caller actually knocks on (issue #317).
+///
+/// The wording of each rejection is preserved so the API's error messages do not
+/// change.
 fn validate_tenant_id(id: &str) -> RestResult<()> {
-    if id.is_empty() {
-        return Err(RestError::BadRequest {
-            message: "tenant id must not be empty".to_string(),
-        });
-    }
-    if id.len() > MAX_TENANT_ID_LEN {
-        return Err(RestError::BadRequest {
-            message: format!("tenant id exceeds {MAX_TENANT_ID_LEN} characters"),
-        });
-    }
-    if id == SYSTEM_TENANT {
-        return Err(RestError::BadRequest {
-            message: "'__system__' is reserved for internal shared resources".to_string(),
-        });
-    }
-    // Names that collide with a control-plane namespace in the S3 keyspace.
-    //
-    // Defense in depth and a UX guardrail only — it is *not* what makes the
-    // keyspace safe. The S3 backend is safe structurally (registry records are
-    // direct `{id}.json` children of `tenants/`, tenant data is always nested
-    // deeper), because this check is reachable from the admin API alone: the JWT
-    // tenant extractor validates nothing. See `S3Keyspace::tenant_registry_prefix`
-    // and issue #271 — do not conclude from this list that the reader-side filter
-    // is redundant.
-    if RESERVED_TENANT_IDS.contains(&id) {
-        return Err(RestError::BadRequest {
-            message: format!("'{id}' is reserved for internal use"),
-        });
-    }
-    // Allow the characters that are safe across routing (header / URL prefix /
-    // JWT claim) and storage keys: alphanumerics plus `-`, `_`, `.`, and `/`
-    // (the hierarchy separator). Reject everything else, including whitespace.
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-    {
-        return Err(RestError::BadRequest {
-            message: "tenant id may contain only letters, digits, '-', '_', '.', and '/'"
-                .to_string(),
-        });
-    }
-    Ok(())
+    TenantId::parse(id).map(|_| ()).map_err(|e| {
+        let message = match e {
+            TenantIdError::Empty => "tenant id must not be empty".to_string(),
+            TenantIdError::TooLong { .. } => {
+                format!("tenant id exceeds {MAX_TENANT_ID_LEN} characters")
+            }
+            TenantIdError::Reserved { id } if id == SYSTEM_TENANT => {
+                "'__system__' is reserved for internal shared resources".to_string()
+            }
+            TenantIdError::Reserved { id } => format!("'{id}' is reserved for internal use"),
+            TenantIdError::InvalidChar { .. } => {
+                "tenant id may contain only letters, digits, '-', '_', '.', and '/'".to_string()
+            }
+            // `TenantIdError` is `#[non_exhaustive]`; a variant added later falls
+            // back to its own `Display` rather than failing to compile here.
+            other => other.to_string(),
+        };
+        RestError::BadRequest { message }
+    })
 }
 
 /// `GET /admin/tenants`
@@ -280,6 +257,12 @@ where
     S: ResourceStorage + Send + Sync,
 {
     require_registry(state.storage())?;
+    // Validate BEFORE the existence probe below. `__system__` has data (the
+    // AuditEvent trail), so probing first would let a reserved id past the 404
+    // check and straight into `deregister_tenant` + `purge_tenant_data` — the
+    // create path validated but this one never did (issue #317). Validating
+    // first also means a reserved id reports 400 rather than a misleading 404.
+    validate_tenant_id(&id)?;
 
     // Establish what exists before mutating so we can 404 on a no-op and report
     // accurately. A tenant may be registered, have data, both, or neither.
