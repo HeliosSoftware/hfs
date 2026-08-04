@@ -1248,4 +1248,109 @@ mod slice_tests {
             "the inherited slice must still seed its pattern: {doc}"
         );
     }
+
+    /// A hand-written FHIR Schema (not converter output) can carry the
+    /// discriminator as an explicit `match` and prohibit a slice with max 0.
+    fn handwritten_registry() -> Arc<crate::SchemaRegistry> {
+        let schema: crate::FhirSchema = serde_json::from_value(json!({
+            "name": "Handmade",
+            "url": "http://example.org/StructureDefinition/Handmade",
+            "kind": "resource",
+            "elements": {
+                "identifier": {
+                    "array": true,
+                    "type": "Identifier",
+                    "slicing": {
+                        "slices": {
+                            "mrn": {
+                                "min": 0, "max": 1,
+                                "match": {
+                                    "type": "pattern",
+                                    "value": { "system": "http://example.org/mrn" }
+                                }
+                            },
+                            "forbidden": {
+                                "max": 0,
+                                "match": {
+                                    "type": "pattern",
+                                    "value": { "system": "http://example.org/none" }
+                                }
+                            },
+                            "repeatable": {
+                                "min": 0, "max": 2,
+                                "match": {
+                                    "type": "pattern",
+                                    "value": { "system": "http://example.org/rep" }
+                                }
+                            },
+                            "@default": {}
+                        },
+                        "rules": "open"
+                    }
+                }
+            }
+        }))
+        .expect("schema");
+        let mut registry = crate::SchemaRegistry::new();
+        registry.insert(schema);
+        Arc::new(registry)
+    }
+
+    #[test]
+    fn a_prohibited_slice_is_never_offered() {
+        let registry = handwritten_registry();
+        let doc = json!({ "resourceType": "Handmade" });
+        let options = addable(registry.as_ref(), "Handmade", &doc, &[]);
+        assert!(
+            options.iter().any(|o| o.slice.as_deref() == Some("mrn")),
+            "the open slice is offered: {options:?}"
+        );
+        assert!(
+            !options
+                .iter()
+                .any(|o| o.slice.as_deref() == Some("forbidden")),
+            "a max-0 slice is not: {options:?}"
+        );
+        assert!(
+            !options
+                .iter()
+                .any(|o| o.slice.as_deref() == Some("@default")),
+            "the catch-all pseudo-slice is not an add-choice: {options:?}"
+        );
+    }
+
+    #[test]
+    fn a_partly_filled_slice_is_offered_as_add_another() {
+        let registry = handwritten_registry();
+        let doc = json!({
+            "resourceType": "Handmade",
+            "identifier": [{ "system": "http://example.org/rep", "value": "1" }]
+        });
+        let options = addable(registry.as_ref(), "Handmade", &doc, &[]);
+        let rep = options
+            .iter()
+            .find(|o| o.slice.as_deref() == Some("repeatable"))
+            .expect("one matched of max 2 stays offered");
+        assert_eq!(rep.kind, AddableKind::AddAnother);
+    }
+
+    #[test]
+    fn slice_add_seeds_from_an_explicit_match_value() {
+        let registry = handwritten_registry();
+        let mut doc = json!({ "resourceType": "Handmade" });
+        add_slice_element(
+            registry.as_ref(),
+            "Handmade",
+            &mut doc,
+            &[],
+            "identifier",
+            "mrn",
+        )
+        .expect("added");
+        assert_eq!(
+            doc["identifier"][0]["system"],
+            json!("http://example.org/mrn"),
+            "the explicit match value seeds the item: {doc}"
+        );
+    }
 }
