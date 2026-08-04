@@ -109,3 +109,44 @@ test("the standalone editor page loads a resource and round-trips a raw edit", a
     .then((r) => r.json());
   expect(saved.name?.[0]?.family).toBe("StandaloneEdited");
 });
+
+test("a refused save lands its issue on the row the expression names", async ({
+  page,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "Anchored" }] });
+  await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+
+  const ed = new Editor(page, page.locator("#editor-body"));
+  // The live pass is clean — the deferred half is exactly what it cannot see.
+  await expect(ed.form).toHaveAttribute("data-error-count", "0");
+
+  // Stand in for a server refusing on a constraint the editor defers. The
+  // outcome spells the location as bracket-indexed FHIRPath while rows are
+  // keyed on the validator's dotted form, and the two have to meet.
+  await page.route(`**/Patient/${id}`, async (route) => {
+    if (route.request().method() !== "PUT") return route.fallback();
+    await route.fulfill({
+      status: 422,
+      contentType: "application/fhir+json",
+      body: JSON.stringify({
+        resourceType: "OperationOutcome",
+        issue: [
+          {
+            severity: "error",
+            code: "invariant",
+            details: { text: "pat-1: refused on save" },
+            expression: ["Patient.name[0].family"],
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.locator("#editor-save").click();
+
+  await expect(page.locator("#editor-status")).toContainText("refused on save");
+  const row = ed.rowAt("name.0.family");
+  await expect(row).toHaveClass(/editor-row--error/);
+  await expect(row.locator(".editor-row__error")).toHaveText("pat-1: refused on save");
+});

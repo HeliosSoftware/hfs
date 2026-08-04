@@ -80,6 +80,11 @@ export class Editor {
     return this.row(field).locator(".editor-row__error");
   }
 
+  /** The row at an exact dotted path — `name.0.family`, the validator's form. */
+  rowAt(path: string): Locator {
+    return this.root.locator(`.editor-row[data-path='${path}']`);
+  }
+
   // Fold controls.
   async collapseAll(): Promise<void> {
     await this.root.locator("[data-json-fold='all']").click();
