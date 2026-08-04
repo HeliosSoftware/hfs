@@ -1,12 +1,19 @@
 //! Whole-spec smoke tests over the embedded packs.
 //!
-//! These parse full packs, but the whole file runs in well under a second even
-//! in a debug build, so they are *not* `#[ignore]`d: they run in the default
-//! `cargo test` (and therefore in CI and in the coverage job), where they are
-//! the only thing that exercises pack loading end to end. Enable `R4B`/`R5`/`R6`
-//! for the other-version sweeps. Only `structural_validation_latency_smoke`
-//! stays `#[ignore]`d — it asserts on wall-clock time, which is not a sound
-//! gate on a shared runner.
+//! These are the only tests that exercise the *real* R4/R4B/R5/R6 schema
+//! packs the server actually ships — everything else in this crate runs
+//! against small inline fixtures. They therefore run by default: the pack
+//! parse is memoized in a `OnceLock` (see `packs::core_registry`), so the
+//! decompress-and-index cost is paid once per test binary regardless of how
+//! many of these run.
+//!
+//! Only `structural_validation_latency_smoke` stays `#[ignore]`d, because a
+//! wall-clock assertion is not trustworthy on shared self-hosted runners.
+//! It is not dead: `.github/workflows/validator-conformance.yml` runs the
+//! ignored tests explicitly and fails if none are collected.
+//!
+//! Add `--features R4B,R5,R6` (or `--all-features`) for the other-version
+//! sweeps; with only the default `R4` feature the sweep covers R4 alone.
 
 #![cfg(feature = "R4")]
 
@@ -66,7 +73,8 @@ fn all_enabled_packs_load_and_validate() {
 /// Rough structural-validation latency check (debug builds are far slower
 /// than release; the plan's <5ms target refers to release).
 #[test]
-#[ignore = "timing; run with -- --ignored"]
+#[ignore = "wall-clock assertion; unreliable on shared runners. Run via the \
+            validator-conformance.yml pack-smoke step or `-- --ignored`"]
 fn structural_validation_latency_smoke() {
     let validator = Validator::new(core_registry(FhirVersion::R4));
     let opts = ValidationOptions::default();

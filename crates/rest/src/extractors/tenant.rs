@@ -142,6 +142,39 @@ where
     }
 }
 
+/// Refuses a tenant id that is reserved for internal use (issue #317).
+///
+/// This is the **single** place the whole REST surface enforces the reservation.
+/// `TenantExtractor::new` / `from_resolved` are constructed nowhere outside this
+/// module and `TenantResolver` is consulted nowhere else, so every request-time
+/// tenant — header, URL prefix, JWT claim, or configured default — passes
+/// through [`TenantExtractor::resolve`] and therefore through here. Enforcing it
+/// per-extractor instead would mean four denylists that must agree, which is the
+/// shape of the bug being fixed.
+///
+/// `403` rather than `400`: `__system__` is a well-formed id, and the statement
+/// being made is "you may not address this tenant", not "your request is
+/// malformed". The same status is returned regardless of which door the id
+/// arrived at, so an operator debugging a rejected client sees one behaviour.
+///
+/// The reason is logged at `WARN` with the offending id and its source, because
+/// the most likely non-attack cause is a deployment that was reading the audit
+/// trail through `X-Tenant-ID: __system__` and now needs to be repointed.
+fn reject_reserved_tenant(id: &str, source: TenantSource) -> Result<(), (StatusCode, String)> {
+    if !helios_persistence::tenant::TenantId::is_reserved(id) {
+        return Ok(());
+    }
+    tracing::warn!(
+        tenant = %id,
+        source = ?source,
+        "Rejected request naming a reserved internal tenant"
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        format!("tenant '{id}' is reserved for internal use and cannot be addressed by a request"),
+    ))
+}
+
 impl TenantExtractor {
     /// Resolves the tenant for a request from JWT claim / header / URL / default,
     /// applying strict-validation consistency checks. Provisioned-tenant
@@ -178,6 +211,11 @@ impl TenantExtractor {
                         ));
                     }
                 }
+                // A reserved id is refused even though it came from a validated
+                // token: the claim is authoritative for *which* tenant, not for
+                // whether that tenant may be addressed at all. An issuer able to
+                // set the tenant claim would otherwise reach the shared tenant.
+                reject_reserved_tenant(jwt_tenant, TenantSource::JwtClaim)?;
                 return Ok(TenantExtractor::new(
                     jwt_tenant,
                     crate::tenant::TenantSource::JwtClaim,
@@ -217,6 +255,12 @@ impl TenantExtractor {
             if config.default_tenant.is_empty() {
                 return Err((StatusCode::BAD_REQUEST, "Invalid tenant ID".to_string()));
             }
+            // `HFS_DEFAULT_TENANT` is rejected at startup by `ServerConfig::validate`,
+            // so this is unreachable in the server binary. It is kept because
+            // `AppState` can be built directly by an embedder or a test that
+            // never calls `validate()`, and collapsing to a reserved default
+            // would put every unauthenticated request in the shared tenant.
+            reject_reserved_tenant(&config.default_tenant, TenantSource::Default)?;
             return Ok(TenantExtractor::new(
                 &config.default_tenant,
                 TenantSource::Default,
@@ -244,15 +288,27 @@ impl TenantExtractor {
             return Err((StatusCode::BAD_REQUEST, "Invalid tenant ID".to_string()));
         }
 
+        // Covers the header, URL-path and (auth-disabled) JWT-claim doors in one
+        // place, plus the configured default when nothing was requested.
+        reject_reserved_tenant(resolved.tenant_id_str(), resolved.source)?;
+
         Ok(TenantExtractor::from_resolved(resolved))
     }
 }
 
 /// Rejects a resolved tenant that is not provisioned, when
 /// `HFS_TENANT_REQUIRE_PROVISIONED` is set and the backend maintains a tenant
-/// registry. The internal system tenant is always allowed; backends without a
-/// registry (mock stores, minimal deployments) are never enforced, so the
-/// common single-tenant and test configurations are unaffected.
+/// registry. Backends without a registry (mock stores, minimal deployments) are
+/// never enforced, so the common single-tenant and test configurations are
+/// unaffected.
+///
+/// This used to early-return `Ok` for the internal system tenant, which made the
+/// one control an operator can switch on useless against precisely the id it
+/// should have refused (issue #317). The exemption is gone:
+/// [`reject_reserved_tenant`] now refuses reserved ids before this runs, and the
+/// system tenant is never in the registry anyway, so a reserved id that somehow
+/// reached here would correctly fail the provisioned check rather than be waved
+/// through.
 async fn enforce_provisioned<S>(
     state: &AppState<S>,
     extractor: &TenantExtractor,
@@ -268,9 +324,6 @@ where
         return Ok(());
     }
     let id = extractor.tenant_id();
-    if id == helios_persistence::tenant::SYSTEM_TENANT {
-        return Ok(());
-    }
     match storage.get_tenant(id).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err((
@@ -518,6 +571,97 @@ mod tests {
                 .expect("JWT claim should win over a conflicting header in non-strict mode");
             assert_eq!(extractor.tenant_id(), "acme");
             assert_eq!(extractor.source(), TenantSource::JwtClaim);
+        }
+
+        // ── #317: the internal system tenant is not addressable from a request ──
+
+        /// Header door, auth disabled (no `Principal`) — the default deployment
+        /// shape, where this needs no credentials at all.
+        #[tokio::test]
+        async fn test_system_tenant_via_header_is_forbidden() {
+            let state = make_state(false, "test-tenant");
+            let mut parts = make_parts(Some(helios_persistence::tenant::SYSTEM_TENANT), None);
+
+            let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect_err("__system__ must not be addressable via X-Tenant-ID");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        /// JWT door. The claim is authoritative for *which* tenant, never for
+        /// whether the shared tenant may be addressed — and `JwtTenantExtractor`
+        /// validated nothing at all before this fix.
+        #[tokio::test]
+        async fn test_system_tenant_via_jwt_claim_is_forbidden() {
+            let state = make_state(false, "test-tenant");
+            let mut parts = make_parts(
+                None,
+                Some(make_principal(Some(
+                    helios_persistence::tenant::SYSTEM_TENANT,
+                ))),
+            );
+
+            let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect_err("__system__ must not be addressable via a JWT tenant claim");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        /// URL-path door. The router stores the extracted prefix in extensions,
+        /// which is what `UrlPathTenantExtractor` reads first.
+        #[tokio::test]
+        async fn test_system_tenant_via_url_path_is_forbidden() {
+            use crate::middleware::tenant_prefix::ExtractedTenantFromUrl;
+
+            let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite backend"));
+            let config = ServerConfig {
+                multitenancy: MultitenancyConfig {
+                    routing_mode: TenantRoutingMode::UrlPath,
+                    ..Default::default()
+                },
+                default_tenant: "test-tenant".to_string(),
+                ..ServerConfig::for_testing()
+            };
+            let state = AppState::new(backend, config);
+
+            let mut parts = make_parts(None, None);
+            parts.extensions.insert(ExtractedTenantFromUrl(
+                helios_persistence::tenant::SYSTEM_TENANT.to_string(),
+            ));
+
+            let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                .await
+                .expect_err("__system__ must not be addressable via a URL prefix");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        /// The other reserved ids (the S3 control-plane namespaces) go through
+        /// the same single authority, so they are refused identically.
+        #[tokio::test]
+        async fn test_other_reserved_ids_are_forbidden_too() {
+            for &id in helios_persistence::tenant::RESERVED_TENANT_IDS {
+                let state = make_state(false, "test-tenant");
+                let mut parts = make_parts(Some(id), None);
+                let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                    .await
+                    .expect_err("reserved id must be refused");
+                assert_eq!(err.0, StatusCode::FORBIDDEN, "reserved id {id}");
+            }
+        }
+
+        /// An ordinary id that merely *looks* internal is still a valid tenant:
+        /// the reservation is exact, not a `__` namespace ban, because tenant id
+        /// is a partition key with no rename.
+        #[tokio::test]
+        async fn test_underscore_prefixed_tenants_still_resolve() {
+            for id in ["__legacy", "__system", "_x"] {
+                let state = make_state(false, "test-tenant");
+                let mut parts = make_parts(Some(id), None);
+                let extractor = TenantExtractor::from_request_parts(&mut parts, &state)
+                    .await
+                    .unwrap_or_else(|e| panic!("{id} should still resolve: {e:?}"));
+                assert_eq!(extractor.tenant_id(), id);
+            }
         }
 
         #[tokio::test]

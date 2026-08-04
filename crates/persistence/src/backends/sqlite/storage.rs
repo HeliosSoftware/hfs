@@ -867,6 +867,7 @@ impl ResourceStorage for SqliteBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let conn = self.get_connection()?;
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here
@@ -891,6 +892,7 @@ impl ResourceStorage for SqliteBackend {
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let conn = self.get_connection()?;
         let changed = conn
             .execute("DELETE FROM tenants WHERE id = ?1", params![id])
@@ -899,6 +901,7 @@ impl ResourceStorage for SqliteBackend {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let mut conn = self.get_connection()?;
         let tx = conn
             .transaction()
@@ -921,8 +924,21 @@ impl ResourceStorage for SqliteBackend {
             tx.execute(sql, params![id])
                 .map_err(|e| internal_error(format!("purge delete: {e}")))?;
         }
+        // Per-user settings are keyed by user, not tenant, so they are not swept
+        // by the deletes above — but a client stores PHI-derived query strings in
+        // them, which belong to this tenant (issue #313). Same transaction: this
+        // connection already holds the write lock, and a second one would
+        // deadlock against it.
+        let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
         tx.commit()
             .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                documents = settings,
+                "purged tenant-scoped content from user settings documents"
+            );
+        }
         Ok(removed.max(0) as u64)
     }
 }
