@@ -70,6 +70,17 @@
       </div>
     </div>
 
+    <!--
+      Live-vs-save legibility (#366): the per-keystroke pass is structural
+      plus the embedded required-binding check; FHIRPath constraints and the
+      configured terminology run on save. A clean form here is not the whole
+      story, and the legend says so instead of surprising on save.
+    -->
+    <p class="editor-legend">
+      <span class="editor-legend__live">{{ i18n.t("editor-legend-live") }}</span>
+      <span class="editor-legend__save">{{ i18n.t("editor-legend-save") }}</span>
+    </p>
+
     <div class="editor-tree">
       {% for row in rows %}
       <div class="editor-row{% if row.is_extension %} editor-row--extension{% endif %}{% if row.must_support %} editor-row--must-support{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
@@ -116,6 +127,7 @@
 
           {% if !row.binding_strength.is_empty() %}
           <span class="editor-row__bind" title="{{ i18n.t("editor-binding-hint") }}">{{ row.binding_strength }}</span>
+          <span class="editor-row__deferred" title="{{ i18n.t("editor-deferred-hint") }}">{{ i18n.t("editor-deferred-badge") }}</span>
           {% endif %}
 
           {% if row.is_primitive %}
@@ -172,6 +184,18 @@
 
             {% if row.accepts_extension %}
             <div class="editor-add__ext">
+              {% if !row.ext_options.is_empty() %}
+              <div class="editor-add__extlist">
+                {% for ext in row.ext_options %}
+                <button type="button" class="editor-add__item" data-add-name="{{ ext.name }}"
+                        data-extension="{{ row.path }}" data-url="{{ ext.url }}"
+                        {% if !ext.short.is_empty() %}title="{{ ext.short }}"{% endif %}>
+                  <span class="editor-add__name">{{ ext.name }}</span>
+                  {% if !ext.short.is_empty() %}<span class="editor-add__short">{{ ext.short }}</span>{% endif %}
+                </button>
+                {% endfor %}
+              </div>
+              {% endif %}
               <label>{{ i18n.t("editor-extension-url") }}</label>
               <input type="url" class="editor-add__ext-url"
                      placeholder="http://example.org/fhir/StructureDefinition/…">

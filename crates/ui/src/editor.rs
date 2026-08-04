@@ -75,6 +75,9 @@ pub struct Row {
     /// Precomputed: Askama has no closures.
     pub accepts_extension: bool,
     pub can_remove: bool,
+    /// Profiled extensions applicable here, offered by name above the
+    /// ad-hoc URL entry.
+    pub ext_options: Vec<ExtOption>,
     /// `mustSupport` in the governing schema — emphasised in the form.
     pub must_support: bool,
     /// The slice this array item matches, when the element is sliced.
@@ -85,6 +88,13 @@ pub struct Row {
     pub binding_url: String,
     /// The `short` human label; the raw element name stays as the technical
     /// hint next to it.
+    pub short: String,
+}
+
+/// A profiled extension offered at a node (#363).
+pub struct ExtOption {
+    pub url: String,
+    pub name: String,
     pub short: String,
 }
 
@@ -322,6 +332,7 @@ fn build_body(
     let mut rows = Vec::new();
     build_rows(
         registry.as_ref(),
+        registry.as_ref(),
         &resource_type,
         &document,
         &[],
@@ -358,6 +369,7 @@ fn build_body(
 /// Walks the document, emitting one row per node, depth-first, in spec order.
 fn build_rows(
     resolver: &dyn helios_fhir_validator::SchemaResolver,
+    registry: &helios_fhir_validator::SchemaRegistry,
     resource_type: &str,
     document: &Value,
     path: &[Step],
@@ -379,6 +391,7 @@ fn build_rows(
             item_path.push(Step::Index(index));
             build_rows(
                 resolver,
+                registry,
                 resource_type,
                 document,
                 &item_path,
@@ -490,6 +503,39 @@ fn build_rows(
             .unwrap_or_default(),
         errors: errors.get(&key).cloned().unwrap_or_default(),
         accepts_extension: !is_primitive && offered.iter().any(|option| option.name == "extension"),
+        ext_options: if !is_primitive && offered.iter().any(|option| option.name == "extension") {
+            let dotted = std::iter::once(resource_type.to_string())
+                .chain(path.iter().filter_map(|step| match step {
+                    Step::Field(name) => Some(name.clone()),
+                    Step::Index(_) => None,
+                }))
+                .collect::<Vec<_>>()
+                .join(".");
+            let type_context = schema
+                .as_ref()
+                .and_then(|schema| schema.type_.clone())
+                .unwrap_or_default();
+            let contexts = [
+                resource_type,
+                dotted.as_str(),
+                type_context.as_str(),
+                "Element",
+                "Resource",
+                "DomainResource",
+            ];
+            registry
+                .extensions_applicable(&contexts)
+                .into_iter()
+                .take(30)
+                .map(|ext| ExtOption {
+                    url: ext.url.clone().unwrap_or_default(),
+                    name: ext.name.clone().unwrap_or_default(),
+                    short: ext.short.clone().unwrap_or_default(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         addable: if is_primitive {
             Vec::new()
         } else {
@@ -507,6 +553,7 @@ fn build_rows(
         child_path.push(Step::Field(child.name.clone()));
         build_rows(
             resolver,
+            registry,
             resource_type,
             document,
             &child_path,
