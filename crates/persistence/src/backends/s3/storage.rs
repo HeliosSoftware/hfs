@@ -1057,6 +1057,7 @@ impl ResourceStorage for S3Backend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let location = self
             .registry_location()
             .ok_or_else(|| self.tenant_registry_unsupported())?;
@@ -1078,6 +1079,7 @@ impl ResourceStorage for S3Backend {
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let location = self
             .registry_location()
             .ok_or_else(|| self.tenant_registry_unsupported())?;
@@ -1117,6 +1119,7 @@ impl ResourceStorage for S3Backend {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         // Resolve the tenant's data location exactly as request handling does.
         let tenant = TenantContext::new(TenantId::new(id), TenantPermissions::full_access());
         let location = self.tenant_location(&tenant)?;
