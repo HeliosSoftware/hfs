@@ -391,19 +391,6 @@ impl ValidationService {
     }
 }
 
-fn enabled_fhir_versions() -> Vec<FhirVersion> {
-    let mut versions = Vec::new();
-    #[cfg(feature = "R4")]
-    versions.push(FhirVersion::R4);
-    #[cfg(feature = "R4B")]
-    versions.push(FhirVersion::R4B);
-    #[cfg(feature = "R5")]
-    versions.push(FhirVersion::R5);
-    #[cfg(feature = "R6")]
-    versions.push(FhirVersion::R6);
-    versions
-}
-
 fn load_package_layers(
     config: &ValidationConfig,
     default_version: FhirVersion,
@@ -440,9 +427,12 @@ fn load_package_layers(
         roots
     };
 
-    let versions = enabled_fhir_versions();
+    // The compiled-in releases, straight from helios-fhir — this used to be a
+    // local cfg-ladder copy, which `--all-features` (where every cfg vanishes)
+    // tripped `clippy::vec_init_then_push` on.
+    let versions = FhirVersion::enabled_versions();
     let by_version =
-        materialize_package_layers_by_version(&cache, &roots, default_version, &versions)
+        materialize_package_layers_by_version(&cache, &roots, default_version, versions)
             .map_err(|e| format!("FHIR package materialization failed: {e}"))?;
 
     for (version, layers) in &by_version {
