@@ -432,6 +432,13 @@ editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. 
 editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
 
 editor-add = Add element
+editor-must-support-badge = MS
+editor-binding-hint = Bound to a value set — codes come from it; strength shown
+editor-legend-live = Checked as you type: structure, cardinality, required bindings
+editor-legend-save = Checked on save: constraints and terminology
+editor-deferred-badge = on save
+editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
+editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
 editor-add-filter = Filter elements
 editor-add-another = add another
 editor-pick-type = Pick a type…

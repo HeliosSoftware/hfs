@@ -126,7 +126,7 @@ curl http://localhost:8080/clinic-a/Patient
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources instead of 404 |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
-| `HFS_REQUIRE_IF_MATCH` | `false` | Require If-Match header for updates |
+| `HFS_REQUIRE_IF_MATCH` | `false` | Require If-Match header for updates and deletes |
 
 ## API Endpoints
 

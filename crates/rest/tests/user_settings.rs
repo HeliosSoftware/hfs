@@ -646,3 +646,441 @@ async fn migration_does_not_clobber_an_existing_current_document() {
     let get = server.get("/_user/settings").await;
     assert_eq!(get.json::<Value>(), json!({"theme": "current"}));
 }
+
+// ── Tenant scoping (issue #313) ─────────────────────────────────────────────
+//
+// The wire format is unchanged — a client still sends and receives a flat
+// document — but PHI-bearing keys are stored under `byTenant.{tenant}` so a
+// tenant purge can reach them. These exercise that through the full stack, with
+// the tenant selected by `X-Tenant-ID` (the default `header_only` routing mode).
+
+const TENANT: HeaderName = HeaderName::from_static("x-tenant-id");
+
+/// Builds a test server, returning the backend handle too so a test can inspect
+/// the *stored* document and drive `purge_tenant_data`.
+fn server_with_backend() -> (TestServer, Arc<SqliteBackend>) {
+    let backend = SqliteBackend::in_memory().expect("create in-memory SQLite backend");
+    backend.init_schema().expect("init schema");
+    let backend = Arc::new(backend);
+
+    let config = ServerConfig {
+        base_url: "http://localhost:8080".to_string(),
+        ..ServerConfig::for_testing()
+    };
+    let settings_store: Arc<dyn SettingsStore> = backend.clone();
+    let state =
+        helios_rest::AppState::new(backend.clone(), config).with_settings_store(settings_store);
+    let server = TestServer::new(helios_rest::routing::fhir_routes::create_routes(state))
+        .expect("create test server");
+    (server, backend)
+}
+
+/// A saved query written under one tenant is invisible under another, and each
+/// tenant's user-global preferences still roam.
+#[tokio::test]
+async fn saved_queries_are_scoped_per_tenant_but_theme_roams() {
+    let (server, _backend) = server_with_backend();
+
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(
+            &json!({"theme": "dark", "savedQueries": {"Patient": {"q1": {"query": "name=smith"}}}}),
+        )
+        .await;
+
+    // Same user, different tenant: the global preference roams, the query does not.
+    let beta = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .await;
+    assert_eq!(beta.status_code(), StatusCode::OK);
+    assert_eq!(beta.json::<Value>(), json!({"theme": "dark"}));
+
+    // Back in acme it is still there.
+    let acme = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(
+        acme.json::<Value>()["savedQueries"]["Patient"]["q1"]["query"],
+        "name=smith"
+    );
+}
+
+/// The storage layout must never appear on the wire.
+#[tokio::test]
+async fn the_by_tenant_key_is_never_returned_to_a_client() {
+    let (server, _backend) = server_with_backend();
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"savedQueries": {"Patient": {"q1": {}}}}))
+        .await;
+
+    let get = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert!(get.json::<Value>().get("byTenant").is_none());
+}
+
+/// …and a client cannot set it either, which would otherwise let a caller in one
+/// tenant plant content under another's subtree.
+#[tokio::test]
+async fn setting_the_reserved_key_is_rejected() {
+    let (server, _backend) = server_with_backend();
+
+    for method in ["put", "patch"] {
+        let body = json!({"byTenant": {"victim": {"savedQueries": {"Patient": {"x": {}}}}}});
+        let response = if method == "put" {
+            server
+                .put("/_user/settings")
+                .add_header(TENANT, HeaderValue::from_static("attacker"))
+                .json(&body)
+                .await
+        } else {
+            server
+                .patch("/_user/settings")
+                .add_header(TENANT, HeaderValue::from_static("attacker"))
+                .json(&body)
+                .await
+        };
+        assert_eq!(
+            response.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{method} of the reserved key must be rejected"
+        );
+    }
+
+    // Nothing landed under the victim tenant.
+    let victim = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("victim"))
+        .await;
+    assert_eq!(victim.json::<Value>(), json!({}));
+}
+
+/// A `PUT` replaces what the caller can see. Another tenant's saved queries were
+/// never in that view, so they must survive it.
+#[tokio::test]
+async fn put_in_one_tenant_does_not_erase_another_tenants_queries() {
+    let (server, _backend) = server_with_backend();
+
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"savedQueries": {"Patient": {"a": {"query": "name=smith"}}}}))
+        .await;
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .json(&json!({"savedQueries": {"Patient": {"b": {"query": "name=jones"}}}}))
+        .await;
+
+    let acme = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(
+        acme.json::<Value>()["savedQueries"]["Patient"]["a"]["query"],
+        "name=smith"
+    );
+    assert!(
+        acme.json::<Value>()["savedQueries"]["Patient"]
+            .get("b")
+            .is_none()
+    );
+}
+
+/// The other half of `PUT`-replaces-the-projection: the user-global keys are
+/// part of that view, so a `PUT` that omits one deletes it — from *every*
+/// tenant, since those keys are shared.
+///
+/// This is ordinary `PUT` semantics and is unchanged by tenant scoping (a `PUT`
+/// without `theme` always dropped it). It is pinned here because the scoping
+/// makes it newly surprising — "I only wrote my tenant's queries" — and because
+/// the fix is not to make `PUT` a merge: clients that want to touch one key use
+/// `PATCH`, which is what every shipped client does.
+#[tokio::test]
+async fn put_replaces_the_user_global_keys_too() {
+    let (server, _backend) = server_with_backend();
+
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"theme": "dark"}))
+        .await;
+
+    // A PUT from another tenant that does not echo `theme` back drops it.
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .json(&json!({"savedQueries": {"Patient": {"b": {}}}}))
+        .await;
+    let acme = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(acme.json::<Value>(), json!({}), "PUT replaces the globals");
+
+    // Echoing it back keeps it, and a PATCH never touches it.
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .json(&json!({"theme": "dark", "savedQueries": {"Patient": {"b": {}}}}))
+        .await;
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"savedQueries": {"Patient": {"a": {}}}}))
+        .await;
+    let acme = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(acme.json::<Value>()["theme"], "dark");
+    assert_eq!(
+        acme.json::<Value>()["savedQueries"]["Patient"],
+        json!({"a": {}})
+    );
+}
+
+/// Merge-patch semantics survive the rewrite: a `null` still deletes exactly one
+/// sibling entry, in this tenant only.
+#[tokio::test]
+async fn patch_null_deletes_one_scoped_entry_only() {
+    let (server, _backend) = server_with_backend();
+
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"savedQueries": {"Patient": {"keep": {}, "drop": {}}}}))
+        .await;
+    server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .json(&json!({"savedQueries": {"Patient": {"drop": {}}}}))
+        .await;
+
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"savedQueries": {"Patient": {"drop": null}}}))
+        .await;
+
+    let acme = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(
+        acme.json::<Value>()["savedQueries"]["Patient"],
+        json!({"keep": {}})
+    );
+    // beta's identically-named entry is untouched.
+    let beta = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .await;
+    assert_eq!(
+        beta.json::<Value>()["savedQueries"]["Patient"],
+        json!({"drop": {}})
+    );
+}
+
+/// The whole point: offboarding a tenant now reaches the PHI-derived query
+/// strings in every user's settings document, while leaving the other tenants'
+/// and the user's own preferences alone.
+#[tokio::test]
+async fn purging_a_tenant_erases_its_saved_queries_from_user_settings() {
+    use helios_persistence::core::ResourceStorage;
+
+    let (server, backend) = server_with_backend();
+
+    // Written the way the web UI actually writes: a merge patch per change
+    // (`saved-queries.js`, `theme.js` and `nav.js` all PATCH). A `PUT` here would
+    // additionally exercise the replace-the-globals semantics covered by
+    // `put_replaces_the_user_global_keys_too`, which is not what this is about.
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({
+            "theme": "dark",
+            "savedQueries": {"Patient": {"q": {"query": "name=smith&birthdate=1970-01-01"}}}
+        }))
+        .await;
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .json(&json!({"savedQueries": {"Patient": {"q": {"query": "name=jones"}}}}))
+        .await;
+
+    backend.purge_tenant_data("acme").await.expect("purge acme");
+
+    // acme's PHI is gone …
+    let acme = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(acme.json::<Value>(), json!({"theme": "dark"}));
+
+    // … from the stored document, not merely hidden by the projection …
+    let stored = SettingsStore::get_settings(backend.as_ref(), "l2:")
+        .await
+        .expect("read stored document")
+        .expect("document exists");
+    assert!(
+        !serde_json::to_string(&stored.document)
+            .unwrap()
+            .contains("smith"),
+        "purged content must not survive anywhere in the stored document"
+    );
+
+    // … while beta and the user's theme are untouched.
+    let beta = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .await;
+    assert_eq!(
+        beta.json::<Value>()["savedQueries"]["Patient"]["q"]["query"],
+        "name=jones"
+    );
+    assert_eq!(beta.json::<Value>()["theme"], "dark");
+}
+
+/// A document written before scoping existed keeps working: its queries are
+/// still readable, and the first write files them under a tenant so a later
+/// purge can reach them.
+#[tokio::test]
+async fn a_pre_scoping_document_is_readable_then_normalized_on_write() {
+    let (server, backend) = server_with_backend();
+
+    // Seed exactly what a previous release would have stored: flat, no `byTenant`.
+    SettingsStore::put_settings(
+        backend.as_ref(),
+        "l2:",
+        json!({"theme": "dark", "savedQueries": {"Patient": {"q": {"query": "name=smith"}}}}),
+        None,
+    )
+    .await
+    .expect("seed pre-scoping document");
+
+    // Unattributed, so it still reads as user-global — nobody's queries vanish
+    // on upgrade.
+    let get = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(
+        get.json::<Value>()["savedQueries"]["Patient"]["q"]["query"],
+        "name=smith"
+    );
+
+    // A read must not rewrite it: GET stays side-effect-free.
+    let stored = SettingsStore::get_settings(backend.as_ref(), "l2:")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.document.get("byTenant").is_none());
+    assert_eq!(stored.version, 1, "GET must not bump the version");
+
+    // The first write files it under the writing tenant …
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"theme": "light"}))
+        .await;
+    let stored = SettingsStore::get_settings(backend.as_ref(), "l2:")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.document["byTenant"]["acme"]["savedQueries"]["Patient"]["q"]["query"],
+        "name=smith"
+    );
+    assert!(stored.document.get("savedQueries").is_none());
+}
+
+/// A pre-scoping document that recorded a tenant choice is attributed to *that*
+/// tenant, not to whichever tenant happens to write next.
+#[tokio::test]
+async fn a_pre_scoping_document_is_attributed_by_its_recorded_tenant() {
+    let (server, backend) = server_with_backend();
+
+    SettingsStore::put_settings(
+        backend.as_ref(),
+        "l2:",
+        json!({"tenantId": "acme", "savedQueries": {"Patient": {"q": {"query": "name=smith"}}}}),
+        None,
+    )
+    .await
+    .expect("seed pre-scoping document");
+
+    // Writing from beta must not re-file acme's queries under beta.
+    server
+        .patch("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("beta"))
+        .json(&json!({"theme": "dark"}))
+        .await;
+
+    let stored = SettingsStore::get_settings(backend.as_ref(), "l2:")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.document["byTenant"]["acme"]["savedQueries"]["Patient"]["q"]["query"],
+        "name=smith"
+    );
+    assert!(stored.document["byTenant"].get("beta").is_none());
+}
+
+/// A pre-scoping document that no write ever normalized is still reachable by a
+/// purge — the dormant-user residual that would otherwise keep the erasure gap
+/// open. Unattributed content is swept by any tenant's purge, deliberately.
+#[tokio::test]
+async fn a_dormant_pre_scoping_document_is_still_purgeable() {
+    use helios_persistence::core::ResourceStorage;
+
+    let (server, backend) = server_with_backend();
+
+    SettingsStore::put_settings(
+        backend.as_ref(),
+        "l2:",
+        json!({"theme": "dark", "savedQueries": {"Patient": {"q": {"query": "name=smith"}}}}),
+        None,
+    )
+    .await
+    .expect("seed dormant document");
+
+    backend.purge_tenant_data("acme").await.expect("purge acme");
+
+    let stored = SettingsStore::get_settings(backend.as_ref(), "l2:")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.document, json!({"theme": "dark"}));
+
+    let get = server
+        .get("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .await;
+    assert_eq!(get.json::<Value>(), json!({"theme": "dark"}));
+}
+
+/// The per-type saved-query cap applies within each tenant, so it cannot be
+/// exceeded one tenant at a time.
+#[tokio::test]
+async fn the_saved_query_cap_applies_within_each_tenant() {
+    let (server, _backend) = server_with_backend();
+
+    let mut entries = serde_json::Map::new();
+    for i in 0..=100 {
+        entries.insert(format!("q{i}"), json!({}));
+    }
+    let response = server
+        .put("/_user/settings")
+        .add_header(TENANT, HeaderValue::from_static("acme"))
+        .json(&json!({"savedQueries": {"Patient": entries}}))
+        .await;
+    assert_eq!(response.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+}

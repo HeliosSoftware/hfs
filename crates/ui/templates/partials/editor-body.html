@@ -70,17 +70,41 @@
       </div>
     </div>
 
+    <!--
+      Live-vs-save legibility (#366): the per-keystroke pass is structural
+      plus the embedded required-binding check; FHIRPath constraints and the
+      configured terminology run on save. A clean form here is not the whole
+      story, and the legend says so instead of surprising on save.
+    -->
+    <p class="editor-legend">
+      <span class="editor-legend__live">{{ i18n.t("editor-legend-live") }}</span>
+      <span class="editor-legend__save">{{ i18n.t("editor-legend-save") }}</span>
+    </p>
+
     <div class="editor-tree">
       {% for row in rows %}
-      <div class="editor-row{% if row.is_extension %} editor-row--extension{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
+      <div class="editor-row{% if row.is_extension %} editor-row--extension{% endif %}{% if row.must_support %} editor-row--must-support{% endif %}{% if row.is_modifier %} editor-row--modifier{% endif %}{% if row.is_unknown %} editor-row--unknown{% endif %}{% if !row.errors.is_empty() %} editor-row--error{% endif %}"
            style="padding-left: {{ row.indent }}px"
            data-path="{{ row.path }}">
 
         <div class="editor-row__head">
+          {% if !row.short.is_empty() %}
+          <span class="editor-row__label" title="{{ row.label }}">{{ row.short }}</span>
+          <span class="editor-row__name">{{ row.label }}</span>
+          {% else %}
           <span class="editor-row__label">{{ row.label }}</span>
+          {% endif %}
 
           {% if !row.type_label.is_empty() %}
           <span class="editor-row__type">{{ row.type_label }}</span>
+          {% endif %}
+
+          {% if !row.slice.is_empty() %}
+          <span class="editor-row__slice">{{ row.slice }}</span>
+          {% endif %}
+
+          {% if row.must_support %}
+          <span class="editor-row__ms" title="{{ i18n.t("editor-must-support-hint") }}">{{ i18n.t("editor-must-support-badge") }}</span>
           {% endif %}
 
           {% if row.is_modifier %}
@@ -101,9 +125,15 @@
           </span>
           {% endif %}
 
+          {% if !row.binding_strength.is_empty() %}
+          <span class="editor-row__bind" title="{{ i18n.t("editor-binding-hint") }}">{{ row.binding_strength }}</span>
+          <span class="editor-row__deferred" title="{{ i18n.t("editor-deferred-hint") }}">{{ i18n.t("editor-deferred-badge") }}</span>
+          {% endif %}
+
           {% if row.is_primitive %}
           <input class="editor-row__input" type="text" value="{{ row.value }}"
                  data-set="{{ row.path }}"
+                 {% if !row.binding_url.is_empty() %}data-vs-url="{{ row.binding_url }}"{% endif %}
                  {% if let Some(vs) = row.binding %}list="vs-{{ vs }}" placeholder="{{ vs }}"{% endif %}>
           {% endif %}
 
@@ -137,10 +167,13 @@
                 </select>
               </div>
               {% else %}
-              <button type="button" class="editor-add__item" data-add-name="{{ option.name }}"
-                      data-add="{{ row.path }}" data-name="{{ option.name }}">
-                <span class="editor-add__name">{{ option.name }}{% if option.required %} <em>*</em>{% endif %}</span>
+              <button type="button" class="editor-add__item{% if option.must_support %} editor-add__item--ms{% endif %}" data-add-name="{{ option.name }}{% if !option.slice.is_empty() %} {{ option.slice }}{% endif %}"
+                      data-add="{{ row.path }}" data-name="{{ option.name }}"{% if !option.slice.is_empty() %} data-slice="{{ option.slice }}"{% endif %}{% if !option.short.is_empty() %} title="{{ option.short }}"{% endif %}>
+                <span class="editor-add__name">{{ option.name }}{% if !option.slice.is_empty() %} <span class="editor-add__slicename">· {{ option.slice }}</span>{% endif %}{% if option.required %} <em>*</em>{% endif %}{% if option.must_support %} <span class="editor-add__ms">{{ i18n.t("editor-must-support-badge") }}</span>{% endif %}</span>
                 <span class="editor-add__type">{{ option.type_label }}</span>
+                {% if !option.short.is_empty() %}
+                <span class="editor-add__short">{{ option.short }}</span>
+                {% endif %}
                 {% if option.kind == "another" %}
                 <span class="editor-add__again">{{ i18n.t("editor-add-another") }}</span>
                 {% endif %}
@@ -151,6 +184,18 @@
 
             {% if row.accepts_extension %}
             <div class="editor-add__ext">
+              {% if !row.ext_options.is_empty() %}
+              <div class="editor-add__extlist">
+                {% for ext in row.ext_options %}
+                <button type="button" class="editor-add__item" data-add-name="{{ ext.name }}"
+                        data-extension="{{ row.path }}" data-url="{{ ext.url }}"
+                        {% if !ext.short.is_empty() %}title="{{ ext.short }}"{% endif %}>
+                  <span class="editor-add__name">{{ ext.name }}</span>
+                  {% if !ext.short.is_empty() %}<span class="editor-add__short">{{ ext.short }}</span>{% endif %}
+                </button>
+                {% endfor %}
+              </div>
+              {% endif %}
               <label>{{ i18n.t("editor-extension-url") }}</label>
               <input type="url" class="editor-add__ext-url"
                      placeholder="http://example.org/fhir/StructureDefinition/…">
