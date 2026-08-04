@@ -944,6 +944,7 @@ impl ResourceStorage for PostgresBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let client = self.get_client().await?;
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here
@@ -964,6 +965,7 @@ impl ResourceStorage for PostgresBackend {
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let client = self.get_client().await?;
         let changed = client
             .execute("DELETE FROM tenants WHERE id = $1", &[&id])
@@ -973,6 +975,7 @@ impl ResourceStorage for PostgresBackend {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let mut client = self.get_client().await?;
         let tx = client
             .transaction()

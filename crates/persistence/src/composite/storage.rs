@@ -1116,14 +1116,17 @@ impl ResourceStorage for CompositeStorage {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         self.primary.register_tenant(id, display_name).await
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         self.primary.deregister_tenant(id).await
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let removed = self.primary.purge_tenant_data(id).await?;
         for (backend_id, secondary) in &self.secondaries {
             match secondary.purge_tenant_data(id).await {

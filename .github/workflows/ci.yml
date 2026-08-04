@@ -604,6 +604,20 @@ jobs:
         # helios-serde's own quick-xml (client FHIR XML) is already on 0.41 and
         # sits behind the non-default `xml` feature. Remove these once
         # object_store and octofhir-ucum ship builds on quick-xml >= 0.41.
+        #
+        # rkyv 0.7.46 (RUSTSEC-2026-0235, out-of-bounds read when validating
+        # archives containing Rc/Arc). We never build it: it is an *optional*
+        # dependency of rust_decimal, and nothing in the workspace turns that
+        # feature on. Across `--all-features --target all` the activated
+        # rust_decimal features are default, macros, serde, serde_json,
+        # serde-with-arbitrary-precision and serde-with-float -- no `rkyv`, and
+        # `cargo tree -i rkyv --all-features --target all` reports "nothing to
+        # print". The crate is a Cargo.lock entry that is never compiled, let
+        # alone handed an untrusted archive. There is also no upgrade path:
+        # the advisory is patched in >= 0.8.17, the 0.7 line is unsupported
+        # upstream, and rust_decimal still declares optional `rkyv ^0.7.46`
+        # as of 1.42.1 (its 0.8 dependency is dev-only). Remove this once
+        # rust_decimal moves its optional rkyv to 0.8.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0098
@@ -611,6 +625,7 @@ jobs:
           --ignore RUSTSEC-2026-0104
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
+          --ignore RUSTSEC-2026-0235
  
   coverage:
     name: Code Coverage

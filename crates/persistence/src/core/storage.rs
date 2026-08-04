@@ -873,6 +873,18 @@ pub trait ResourceStorage: Send + Sync {
     /// Registers (provisions) a new tenant, stamping `created_at` with the
     /// current time. Returns [`StorageError`] if the tenant is already
     /// registered. Default: unsupported-capability error.
+    ///
+    /// # Implementor contract
+    ///
+    /// This method, [`deregister_tenant`](Self::deregister_tenant) and
+    /// [`purge_tenant_data`](Self::purge_tenant_data) take a bare `&str` and
+    /// mutate or destroy tenant state, so an override **must** begin with
+    /// [`ensure_mutable_tenant`](crate::tenant::ensure_mutable_tenant) to refuse
+    /// reserved ids. `__system__` holds the AuditEvent trail and shared
+    /// terminology; a purge of it is an anti-forensic primitive (issue #317).
+    /// The REST ingress rejects reserved ids first, but this family is reachable
+    /// from more than one handler, so the guard is the backstop rather than the
+    /// only control.
     async fn register_tenant(
         &self,
         _id: &str,
