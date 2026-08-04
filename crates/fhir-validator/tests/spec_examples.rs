@@ -397,8 +397,7 @@ fn run_version(version: FhirVersion, version_dir: &str) {
     let baseline = existing.unwrap_or_else(|| {
         let e = read
             .as_ref()
-            .err()
-            .expect("the manifest is absent only when the read failed");
+            .expect_err("the manifest is absent only when the read failed");
         panic!(
             "cannot read baseline {}: {e}\n\
              If this is the first run, copy the freshly generated manifest into place:\n  \
