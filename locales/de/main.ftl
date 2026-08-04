@@ -429,6 +429,7 @@ editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln w
 
 editor-add = Element hinzufügen
 editor-must-support-badge = MS
+editor-binding-hint = An ein Value Set gebunden — Codes stammen daraus; Stärke angezeigt
 editor-must-support-hint = Must-support: Konsumenten dieses Profils müssen dieses Element verarbeiten können
 editor-add-filter = Elemente filtern
 editor-add-another = weiteres hinzufügen
