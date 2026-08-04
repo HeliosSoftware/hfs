@@ -25,10 +25,13 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const SOURCE_FILES: [&str; 3] = [
+const SOURCE_FILES: [&str; 4] = [
     "profiles-types.json",
     "profiles-resources.json",
     "profiles-others.json",
+    // Core extension definitions (#363) — vendored per version where the
+    // profiled-extension picker is wanted; absent files are skipped.
+    "extension-definitions.json",
 ];
 
 fn main() {

@@ -2,8 +2,17 @@
 # plus a static "Data Provider" serving a sample Bulk Export Manifest + NDJSON.
 #
 # Provided local example for manual smoke testing of $bulk-submit. Not used by the
-# GitHub Actions workflows. Bring it up with:
+# GitHub Actions workflows.
 #
+# The root Dockerfile is runtime-only — it copies a pre-built binary out of the
+# build context rather than compiling one. So the context must be *staged* first
+# (this mirrors the "Prepare Docker build context" step in ci.yml):
+#
+# The feature flags are required: this stack uses the postgres primary store and
+# the S3 (MinIO) status-artifact store, neither of which is in the default set.
+#
+#     cargo build --release -p helios-hfs --features postgres,s3
+#     ./docker/bulk-submit/stage-context.sh
 #     docker compose -f docker/bulk-submit/docker-compose.yml up --build
 #
 # Then POST a $bulk-submit Parameters body to http://localhost:8080/$bulk-submit
@@ -78,7 +87,9 @@ services:
 
   hfs:
     build:
-      context: ../..
+      # Staged context (binary + data/), produced by ./stage-context.sh.
+      context: ./context
+      dockerfile: ../../../Dockerfile
       args:
         BINARY_NAME: hfs
     depends_on:

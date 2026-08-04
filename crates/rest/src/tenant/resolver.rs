@@ -459,6 +459,39 @@ mod tests {
         assert!(!is_reserved_path("my_tenant", &version));
     }
 
+    /// The resolver deliberately still *extracts* a reserved id (#317).
+    ///
+    /// Refusal happens one layer up, in `TenantExtractor`, which is the single
+    /// door every request-time tenant passes through. Teaching the resolver (or
+    /// `is_valid_tenant_id`) to drop reserved ids instead would silently change
+    /// what the authorization classifier sees for `/__system__/Patient/123`:
+    /// with no tenant extracted it falls back to the raw path, declines the
+    /// leading `_` segment, and skips the SMART scope check altogether. See
+    /// `middleware::auth::test_url_routing_reserved_tenant_still_classifies_for_scope_check`.
+    ///
+    /// If you are here because you want to reject earlier: reject in
+    /// `TenantExtractor`, not here.
+    #[test]
+    fn test_resolver_still_extracts_reserved_ids_for_consistent_classification() {
+        use helios_persistence::tenant::SYSTEM_TENANT;
+
+        let config = MultitenancyConfig {
+            routing_mode: TenantRoutingMode::Both,
+            ..Default::default()
+        };
+        let resolver = TenantResolver::new(&config);
+
+        let parts = make_parts("/Patient/123", Some(SYSTEM_TENANT));
+        let resolved = resolver.resolve(&parts, &config, "default");
+        assert_eq!(resolved.tenant_id_str(), SYSTEM_TENANT);
+        assert_eq!(resolved.source, TenantSource::Header);
+
+        let parts = make_parts("/__system__/Patient/123", None);
+        let resolved = resolver.resolve(&parts, &config, "default");
+        assert_eq!(resolved.tenant_id_str(), SYSTEM_TENANT);
+        assert_eq!(resolved.source, TenantSource::UrlPath);
+    }
+
     #[test]
     fn test_is_valid_tenant_id() {
         assert!(is_valid_tenant_id("acme"));
