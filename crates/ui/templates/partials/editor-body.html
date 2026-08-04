@@ -184,6 +184,18 @@
 
             {% if row.accepts_extension %}
             <div class="editor-add__ext">
+              {% if !row.ext_options.is_empty() %}
+              <div class="editor-add__extlist">
+                {% for ext in row.ext_options %}
+                <button type="button" class="editor-add__item" data-add-name="{{ ext.name }}"
+                        data-extension="{{ row.path }}" data-url="{{ ext.url }}"
+                        {% if !ext.short.is_empty() %}title="{{ ext.short }}"{% endif %}>
+                  <span class="editor-add__name">{{ ext.name }}</span>
+                  {% if !ext.short.is_empty() %}<span class="editor-add__short">{{ ext.short }}</span>{% endif %}
+                </button>
+                {% endfor %}
+              </div>
+              {% endif %}
               <label>{{ i18n.t("editor-extension-url") }}</label>
               <input type="url" class="editor-add__ext-url"
                      placeholder="http://example.org/fhir/StructureDefinition/…">

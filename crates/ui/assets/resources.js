@@ -115,7 +115,7 @@
     var ext = event.target.closest("[data-extension]");
     if (ext) {
       var panel = ext.closest(".editor-add__ext");
-      var url = panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "";
+      var url = ext.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
       editorSend("extension", { path: ext.dataset.extension, url: url });
     }
   });

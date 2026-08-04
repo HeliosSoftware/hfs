@@ -79,7 +79,9 @@ test("an ad-hoc extension can be attached by URL", async ({ resources }) => {
   await ed.addPanel.locator("summary").first().click();
   const ext = ed.root.locator(".editor-add__ext").first();
   await ext.locator(".editor-add__ext-url").fill("http://example.org/fhir/StructureDefinition/e2e");
-  await ext.locator("[data-extension]").click();
+  // The ad-hoc button is the plain .btn; profiled-extension entries carry
+  // data-extension too but render as .editor-add__item (#363).
+  await ext.locator("button.btn[data-extension]").click();
 
   await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("extension");
 });
