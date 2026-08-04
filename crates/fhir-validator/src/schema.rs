@@ -152,6 +152,11 @@ pub struct FhirSchema {
     /// Mirrors `ElementDefinition.isSummary`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<bool>,
+    /// For extension definitions: the element expressions the extension
+    /// applies to (`StructureDefinition.context[].expression` where the type
+    /// is `element`). Powers the editor's profiled-extension offers (#363).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Vec<String>>,
     /// Mirrors `ElementDefinition.short` — the human label consumers render
     /// instead of the raw element name. The longer `definition` text is
     /// deliberately not carried (pack size); `short` is the label.
