@@ -1,0 +1,160 @@
+name: Validator Conformance
+
+# Authoritative-but-slow conformance signal for the FHIR validation engine
+# (`crates/fhir-validator`), per discussion #215: "These are slow and
+# authoritative -- nightly CI, not per-PR."
+#
+# Two things run here that the per-PR job cannot:
+#
+#   1. The `#[ignore]`d tests in `tests/pack_smoke.rs`. Only the wall-clock
+#      latency smoke is still ignored (timing assertions are not trustworthy
+#      on shared self-hosted runners); the pack-parse tests it used to sit
+#      alongside now run in the ordinary `cargo test --workspace` job. This
+#      step exists so the remaining ignored test is not dead code.
+#
+#   2. The official FHIR example corpus sweep (`tests/spec_examples.rs`) --
+#      ~8.7k published spec resources across R4/R4B/R5, ~600 MB of JSON,
+#      adjudicated against checked-in baselines.
+#
+# Posture: a tracking signal, not a merge gate -- same as inferno-us-core.yml.
+# It runs on PRs that touch the validator so changes there get feedback, and
+# nightly so corpus/engine drift surfaces on its own.
+
+on:
+  schedule:
+    # 04:00 UTC daily. Deliberately offset from the other self-hosted suites
+    # so they do not contend for runners: hts-ig 03:00, hts 05:00,
+    # ui-tests-matrix 06:00, ci-extended 07:00 weekdays, us-core Sun 08:00.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/fhir-validator/**"
+      # The baselines pin per-file results and resource counts for the
+      # vendored corpus, so a change to the corpus (or to the build script
+      # that manages it) breaks them just as surely as an engine change.
+      # Without these paths that break would only surface in the nightly run,
+      # for someone else to diagnose.
+      - "crates/fhir/tests/data/json/**"
+      - "crates/fhir/build.rs"
+      - ".github/workflows/validator-conformance.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  validator-conformance:
+    name: Pack smoke + spec example corpus
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure LLD
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo '[target.x86_64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      # The corpus is vendored (crates/fhir/tests/data/json/<VERSION>), so a
+      # missing directory means a bad checkout. Fail here with a clear message
+      # rather than letting the sweep report "0 resources validated".
+      - name: Verify the example corpus is present
+        run: |
+          set -euo pipefail
+          fail=0
+          for v in R4 R4B R5; do
+            dir="crates/fhir/tests/data/json/$v"
+            if [ ! -d "$dir" ]; then
+              echo "::error::[CORPUS-MISSING] $dir does not exist. It is vendored in this repo; a missing directory is a checkout problem."
+              fail=1
+              continue
+            fi
+            n=$(find "$dir" -maxdepth 1 -name '*.json' | wc -l)
+            echo "$v: $n json files"
+            if [ "$n" -lt 2000 ]; then
+              echo "::error::[CORPUS-SHORT] $dir has only $n json files (expected >2000). Refusing to run a sweep that would pass vacuously."
+              fail=1
+            fi
+          done
+          exit $fail
+
+      # `cargo test` exits 0 when a filter matches nothing, so the count of
+      # executed tests is asserted rather than assumed.
+      - name: Ignored pack-smoke tests
+        run: |
+          # No `set -e`: the exit code is read from PIPESTATUS so that the
+          # zero-tests-collected diagnostic below is always reached. Counting
+          # uses awk -- the runners have no `bc`.
+          set -uo pipefail
+          cargo test -p helios-fhir-validator --all-features --test pack_smoke \
+            -- --ignored --nocapture 2>&1 | tee pack-smoke.log
+          status=${PIPESTATUS[0]}
+          passed=$(awk '/^test result:/ { for (i = 2; i <= NF; i++) if ($i == "passed;") total += $(i - 1) } END { print total + 0 }' pack-smoke.log)
+          echo "ignored pack-smoke tests passed: $passed"
+          # Check the exit code before the count. A build failure also prints
+          # no `test result:` line, and reporting that as "0 tests collected"
+          # would send the reader looking for a filter bug that isn't there.
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::[NO-TESTS-RAN] The ignored pack-smoke filter collected 0 tests. cargo test exits 0 in that case, so this step would otherwise pass without asserting anything."
+            exit 1
+          fi
+
+      # Writes target/spec-examples/<version>.actual.json whether it passes or
+      # fails; the upload below is what you copy a new baseline from.
+      #
+      # `always()`: the pack smoke and the corpus sweep are independent
+      # signals. A failure in one must not skip the other and throw away the
+      # build -- the job still fails, but both results get reported.
+      - name: Official FHIR example corpus sweep
+        id: corpus
+        if: always()
+        run: |
+          cargo test -p helios-fhir-validator --all-features --test spec_examples \
+            -- --ignored --nocapture
+
+      - name: Upload regenerated baselines
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spec-example-manifests
+          path: target/spec-examples/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Validator conformance"
+            echo
+            if [ -d target/spec-examples ]; then
+              echo "| Version | Resources validated | Files with issues |"
+              echo "|---|---:|---:|"
+              for f in target/spec-examples/*.actual.json; do
+                [ -e "$f" ] || continue
+                v=$(jq -r '.fhirVersion' "$f")
+                n=$(jq -r '.resourcesValidated' "$f")
+                k=$(jq -r '.knownFailures | length' "$f")
+                echo "| $v | $n | $k |"
+              done
+              echo
+              echo "Sweep outcome: \`${{ steps.corpus.outcome }}\`. Baselines live in \`crates/fhir-validator/tests/fixtures/spec-examples/\`; the regenerated copies are attached as the **spec-example-manifests** artifact."
+            else
+              echo "No manifests were produced -- the sweep did not reach the reporting stage."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
