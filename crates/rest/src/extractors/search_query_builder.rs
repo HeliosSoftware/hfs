@@ -112,6 +112,11 @@ pub fn build_search_query(
     // Process _summary
     if let Some(summary) = params.get("_summary") {
         query.summary = parse_summary_mode(summary);
+        // `_summary=count` exists to return Bundle.total and nothing else, so
+        // it implies an accurate total; an explicit `_total` still wins (#254).
+        if query.summary == Some(SummaryMode::Count) && query.total.is_none() {
+            query.total = Some(TotalMode::Accurate);
+        }
     }
 
     // Process _elements
