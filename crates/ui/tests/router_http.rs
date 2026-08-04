@@ -40,6 +40,7 @@ fn app_with(nl: helios_ui::NlSearch) -> Router {
             std::path::Path::new("../../data"),
         )),
         helios_fhir::FhirVersion::R4,
+        None,
     )
 }
 
@@ -152,6 +153,7 @@ async fn non_ui_paths_fall_through_to_the_fhir_app() {
         "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
+        None,
     )
     .oneshot(Request::get("/Patient").body(Body::empty()).unwrap())
     .await
@@ -689,4 +691,148 @@ async fn version_selector_lists_the_enabled_versions() {
     assert!(html.contains(r#"aria-current="true""#));
     // The default label is server-derived, not hardcoded markup.
     assert!(html.contains("FHIR R4"));
+}
+
+/* The live terminology picker (#365): /ui/editor/expand proxies the bound
+ * value set's $expand through the server so the browser never talks to the
+ * terminology server directly. */
+
+fn app_with_terminology(terminology: Option<String>) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        helios_fhir::FhirVersion::R4,
+        terminology,
+    )
+}
+
+/// A loopback stand-in for the terminology server: one canned response for
+/// `GET /ValueSet/$expand`.
+async fn mock_terminology(status: StatusCode, body: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/ValueSet/$expand",
+        axum::routing::get(move || async move {
+            (
+                status,
+                [("content-type", "application/fhir+json")],
+                body.to_string(),
+            )
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn expand_without_a_terminology_server_returns_no_content() {
+    let response = app_with_terminology(None)
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn expand_proxies_the_expansion_as_a_compact_code_list() {
+    let base = mock_terminology(
+        StatusCode::OK,
+        r#"{"resourceType":"ValueSet","expansion":{"contains":[
+            {"system":"http://loinc.org","code":"8302-2","display":"Body height"},
+            {"system":"http://loinc.org","code":"8867-4","display":"Heart rate"}
+        ]}}"#,
+    )
+    .await;
+
+    let response = app_with_terminology(Some(base))
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs&filter=he")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let codes = body["codes"].as_array().unwrap();
+    assert_eq!(codes.len(), 2);
+    assert_eq!(codes[0]["code"], "8302-2");
+    assert_eq!(codes[0]["display"], "Body height");
+}
+
+#[tokio::test]
+async fn expand_turns_a_terminology_failure_into_no_content() {
+    let base = mock_terminology(StatusCode::INTERNAL_SERVER_ERROR, "boom").await;
+
+    let response = app_with_terminology(Some(base))
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn expand_turns_a_non_json_answer_into_no_content() {
+    let base = mock_terminology(StatusCode::OK, "<html>not fhir</html>").await;
+
+    let response = app_with_terminology(Some(base))
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn expand_tolerates_an_expansion_without_contains() {
+    let base = mock_terminology(StatusCode::OK, r#"{"resourceType":"ValueSet"}"#).await;
+
+    let response = app_with_terminology(Some(base))
+        .oneshot(
+            Request::get("/ui/editor/expand?url=http%3A%2F%2Floinc.org%2Fvs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["codes"].as_array().unwrap().len(), 0);
+}
+
+/// An add that names a slice routes through `add_slice_element`. Core schemas
+/// carry no slice definitions, so the seed lookup finds nothing and the item
+/// is appended blank — same outcome as a plain add, via the slice branch.
+#[tokio::test]
+async fn editor_add_with_a_slice_name_appends_the_item() {
+    let html =
+        edit("doc=%7B%22resourceType%22%3A%22Patient%22%7D&op=add&path=&name=identifier&slice=mrn")
+            .await;
+
+    assert!(html.contains(r#"data-path="identifier.0""#));
 }

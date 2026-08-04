@@ -120,6 +120,9 @@ struct WebState {
     /// The server's default tenant id — the fallback when no stored choice
     /// exists (#344).
     default_tenant: String,
+    /// Terminology server base URL (`HFS_TERMINOLOGY_SERVER`), when one is
+    /// configured — powers the editor's live `$expand` pickers (#365).
+    terminology: Option<String>,
     /// Per-user settings, for the persisted FHIR-version choice (#343). `None`
     /// when the backend has no settings store; the selector then applies
     /// per-page only.
@@ -132,6 +135,15 @@ struct WebState {
 /// authenticated principal, `l2:` when auth is disabled (`/ui` also sits
 /// outside the auth layer today; #320 tracks the authenticated modes). Keep in
 /// step with `crates/rest/src/extractors/user.rs`.
+///
+/// These two go through [`SettingsStore`] **directly**, not through
+/// `/_user/settings`, so they bypass the per-tenant scoping that handler applies
+/// (issue #313). That is correct precisely because both are in
+/// [`GLOBAL_SETTINGS_KEYS`](helios_persistence::core::GLOBAL_SETTINGS_KEYS) —
+/// they are user-global preferences, and `tenantId` in particular has to be
+/// readable *before* a tenant is known. Anything added here that is **not** in
+/// that list must go through the handler instead, or it will be written outside
+/// a tenant purge's reach.
 const SETTINGS_VERSION_KEY: &str = "fhirVersion";
 const SETTINGS_TENANT_KEY: &str = "tenantId";
 const LOCAL_USER_KEY: &str = "l2:";
@@ -552,6 +564,7 @@ pub fn mount(
     self_base_url: String,
     outbound_auth: Arc<dyn helios_auth::outbound::OutboundAuthProvider>,
     fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url,
@@ -567,6 +580,7 @@ pub fn mount(
         default_tenant,
         source,
         fhir_version,
+        terminology,
     )
 }
 
@@ -586,6 +600,7 @@ pub fn mount_with_conformance_source(
     default_tenant: String,
     source: Arc<dyn ConformanceSource>,
     fhir_version: helios_fhir::FhirVersion,
+    terminology: Option<String>,
 ) -> Router {
     let nl_enabled = nl.enabled;
 
@@ -609,6 +624,7 @@ pub fn mount_with_conformance_source(
         // Schema-driven resource editor (#264). One POST endpoint applies every
         // structural mutation and re-renders: the document rides with it.
         .route("/ui/editor", get(editor::page))
+        .route("/ui/editor/expand", get(editor::expand))
         .route(
             "/ui/editor/render",
             axum::routing::post(editor::render_body),
@@ -643,6 +659,7 @@ pub fn mount_with_conformance_source(
         data_dir,
         fhir_version,
         default_tenant,
+        terminology,
     };
 
     router

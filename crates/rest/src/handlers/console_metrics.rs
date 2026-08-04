@@ -475,6 +475,14 @@ where
         .clamp(60, 86_400);
 
     let mut resource_counts = state.storage().count_by_tenant().await?;
+    // `count_by_tenant` is a raw cross-tenant aggregate and includes the internal
+    // system tenant, which holds the AuditEvent trail under
+    // `HFS_AUDIT_BACKEND=database`. Publishing its live row count here made the
+    // roster an audit-volume side channel and confirmed the sentinel exists.
+    // `admin_tenants::list_tenants_handler` has always filtered it; this is the
+    // same filter, applied at the other presentation site (issue #317).
+    resource_counts
+        .retain(|(tenant, _)| !helios_persistence::tenant::TenantId::is_reserved(tenant.as_str()));
     resource_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let traffic = helios_observability::reqlog::per_tenant(window);

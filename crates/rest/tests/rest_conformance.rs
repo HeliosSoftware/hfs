@@ -30,6 +30,18 @@ const IF_NONE_EXIST: HeaderName = HeaderName::from_static("if-none-exist");
 
 /// Creates a test server.
 async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
+    create_test_server_with(|_| {}).await
+}
+
+/// Creates a test server, letting the caller adjust the [`ServerConfig`] first.
+///
+/// Used by the tests that need a non-default flag (e.g. `require_if_match`).
+/// The flag is set on the struct rather than through its environment variable:
+/// `HFS_REQUIRE_IF_MATCH` is read by clap at config-parse time, and
+/// `std::env::set_var` would race every other test in this binary.
+async fn create_test_server_with(
+    adjust: impl FnOnce(&mut ServerConfig),
+) -> (TestServer, Arc<SqliteBackend>) {
     // Configure with data directory to load spec SearchParameters
     // CARGO_MANIFEST_DIR for this test is crates/rest
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -47,7 +59,7 @@ async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
     backend.init_schema().expect("Failed to init schema");
     let backend = Arc::new(backend);
 
-    let config = ServerConfig {
+    let mut config = ServerConfig {
         multitenancy: MultitenancyConfig {
             routing_mode: TenantRoutingMode::HeaderOnly,
             ..Default::default()
@@ -56,6 +68,7 @@ async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
         default_tenant: "test-tenant".to_string(),
         ..ServerConfig::for_testing()
     };
+    adjust(&mut config);
 
     let state = helios_rest::AppState::new(Arc::clone(&backend), config);
     let app = helios_rest::routing::fhir_routes::create_routes(state);
@@ -848,6 +861,401 @@ mod conditional_update {
             .to_str()
             .unwrap()
             .to_string()
+    }
+}
+
+// =============================================================================
+// Conditional Delete Tests (If-Match on DELETE) — issue #312
+// =============================================================================
+
+/// `If-Match` on `DELETE [type]/[id]`.
+///
+/// Before #312 `delete_handler` took no `ConditionalHeaders` extractor at all,
+/// so a supplied precondition was unreachable and the resource was destroyed
+/// unconditionally.
+///
+/// Roughly half of these cells pass against the unfixed code. They are kept
+/// deliberately, as **controls**: without them, a "fix" that answered 412 to
+/// everything would look correct. Each is labelled. The regression evidence is
+/// the cells marked REGRESSION, which cannot pass while the header is unread.
+///
+/// Every REGRESSION cell asserts the resource **survives**, not merely that the
+/// status was 412 — a status-only assertion would also pass against a handler
+/// that refused *after* deleting.
+mod conditional_delete {
+    use super::*;
+
+    /// Asserts a resource is still readable, with the family name it was
+    /// seeded with. This is the assertion that makes a 412 meaningful.
+    async fn assert_still_present(server: &TestServer, id: &str, expect_family: &str) {
+        let read = server
+            .get(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        read.assert_status(StatusCode::OK);
+        let body: serde_json::Value = read.json();
+        assert_eq!(
+            body["name"][0]["family"], expect_family,
+            "a refused delete must leave the resource intact"
+        );
+    }
+
+    /// Reads the current `ETag` for a resource.
+    async fn etag_of(server: &TestServer, id: &str) -> String {
+        let response = server
+            .get(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response
+            .headers()
+            .get("etag")
+            .expect("ETag header")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn delete_req(server: &TestServer, id: &str) -> axum_test::TestRequest {
+        server
+            .delete(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+    }
+
+    /// CONTROL — no precondition still deletes. The majority population must
+    /// be untouched by #312.
+    #[tokio::test]
+    async fn absent_if_match_still_deletes() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        delete_req(&server, "patient-1")
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    /// CONTROL — a matching tag must not be over-rejected.
+    #[tokio::test]
+    async fn matching_if_match_deletes() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+        let etag = etag_of(&server, "patient-1").await;
+
+        delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_str(&etag).unwrap())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    /// REGRESSION — the headline case from #312. Client saw v1, someone else
+    /// advanced the resource, the client's delete must be refused.
+    #[tokio::test]
+    async fn stale_if_match_is_412_and_the_resource_survives() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_static("W/\"99\""))
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+
+        // Not merely a 412 — the resource must still be there.
+        assert_still_present(&server, "patient-1", "Smith").await;
+
+        // And it must be *this* precondition failing, not an unrelated 412.
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["issue"][0]["code"], "conflict");
+        let diagnostics = body["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            diagnostics.contains("If-Match"),
+            "diagnostics should name the failing precondition, got {diagnostics:?}"
+        );
+    }
+
+    /// CONTROL — the list semantics #311 established apply here too.
+    #[tokio::test]
+    async fn multi_valued_if_match_matching_any_member_deletes() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+        let etag = etag_of(&server, "patient-1").await;
+        let list = format!("W/\"99\", {etag}");
+
+        delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_str(&list).unwrap())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    /// REGRESSION — a list where nothing matches is still a failed precondition.
+    #[tokio::test]
+    async fn multi_valued_if_match_matching_nothing_is_412() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_static("W/\"98\", W/\"99\""))
+            .await
+            .assert_status(StatusCode::PRECONDITION_FAILED);
+
+        assert_still_present(&server, "patient-1", "Smith").await;
+    }
+
+    /// CONTROL — HFS compares the opaque tag value and ignores the `W/`
+    /// weakness flag, so the strong spelling of a weak ETag matches.
+    #[tokio::test]
+    async fn strong_form_matches_the_weak_etag() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+        let etag = etag_of(&server, "patient-1").await;
+        let strong = etag.trim_start_matches("W/").to_string();
+
+        delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_str(&strong).unwrap())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    /// REGRESSION — a malformed value must fail closed. Treating it as absent
+    /// is precisely what turns a guarded delete into an unconditional one.
+    #[tokio::test]
+    async fn malformed_if_match_is_412_not_an_unconditional_delete() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = delete_req(&server, "patient-1")
+            // Unquoted: not a valid entity-tag.
+            .add_header(IF_MATCH, HeaderValue::from_static("garbage"))
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+        assert_still_present(&server, "patient-1", "Smith").await;
+
+        let body: serde_json::Value = response.json();
+        let diagnostics = body["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            diagnostics.contains("If-Match"),
+            "diagnostics should name the failing precondition, got {diagnostics:?}"
+        );
+    }
+
+    /// REGRESSION — a non-UTF-8 field value is well-formed HTTP (`etagc` admits
+    /// `obs-text`) but cannot equal any tag this server issues. It must
+    /// evaluate to "no match", never to "absent".
+    #[tokio::test]
+    async fn non_utf8_if_match_is_412() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap())
+            .await
+            .assert_status(StatusCode::PRECONDITION_FAILED);
+
+        assert_still_present(&server, "patient-1", "Smith").await;
+    }
+
+    /// CONTROL — `*` is satisfied by any current representation.
+    #[tokio::test]
+    async fn star_deletes_an_existing_resource() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_static("*"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    /// REGRESSION — `*` asserts a current representation EXISTS, so it must
+    /// fail against a resource that was never created. 412, not 404: the
+    /// precondition is evaluated before the not-found answer, matching the
+    /// bundle path (`if_match_suite::star_if_match_requires_an_existing_resource`).
+    #[tokio::test]
+    async fn star_on_an_absent_resource_is_412() {
+        let (server, _backend) = create_test_server().await;
+
+        delete_req(&server, "never-existed")
+            .add_header(IF_MATCH, HeaderValue::from_static("*"))
+            .await
+            .assert_status(StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// REGRESSION — a soft-deleted resource has no current representation, so
+    /// `*` must not match the tombstone.
+    #[tokio::test]
+    async fn star_on_a_soft_deleted_resource_is_412() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        delete_req(&server, "patient-1")
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_static("*"))
+            .await
+            .assert_status(StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// REGRESSION — a concrete tag against a resource that does not exist.
+    #[tokio::test]
+    async fn concrete_tag_on_an_absent_resource_is_412() {
+        let (server, _backend) = create_test_server().await;
+
+        delete_req(&server, "never-existed")
+            .add_header(IF_MATCH, HeaderValue::from_static("W/\"1\""))
+            .await
+            .assert_status(StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// REGRESSION — the tombstone's own bumped version must not be matchable.
+    /// Comparing against it would let `DELETE If-Match: W/"2"` "succeed"
+    /// against an already-deleted resource whose delete bumped it to 2.
+    #[tokio::test]
+    async fn concrete_tag_on_a_soft_deleted_resource_is_412() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        delete_req(&server, "patient-1")
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        for tag in ["W/\"1\"", "W/\"2\"", "W/\"3\""] {
+            delete_req(&server, "patient-1")
+                .add_header(IF_MATCH, HeaderValue::from_str(tag).unwrap())
+                .await
+                .assert_status(StatusCode::PRECONDITION_FAILED);
+        }
+    }
+
+    /// CONTROL — a precondition-less delete of an already-deleted resource
+    /// keeps answering 404, exactly as it did before #312.
+    ///
+    /// This is the cell that pins the trap: evaluating the precondition needs a
+    /// `read()`, and `read()` returns `Gone` for a tombstone. Propagating that
+    /// instead of mapping it to "no current version" would have silently made
+    /// 410 the answer here in every build.
+    #[tokio::test]
+    async fn absent_if_match_on_a_soft_deleted_resource_is_still_404() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        delete_req(&server, "patient-1")
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        delete_req(&server, "patient-1")
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    /// REGRESSION — `HFS_REQUIRE_IF_MATCH` was honored only by the update
+    /// handler, so a deployment that had opted into mandatory preconditions
+    /// still got unconditional deletes.
+    #[tokio::test]
+    async fn require_if_match_rejects_a_delete_with_no_header() {
+        let (server, backend) = create_test_server_with(|c| c.require_if_match = true).await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        delete_req(&server, "patient-1")
+            .await
+            .assert_status(StatusCode::PRECONDITION_FAILED);
+
+        assert_still_present(&server, "patient-1", "Smith").await;
+    }
+
+    /// REGRESSION — under `require_if_match`, a malformed value counts as
+    /// SUPPLIED and then fails on its own merits. Reporting it as missing would
+    /// tell a client to retry with the header it already sent.
+    #[tokio::test]
+    async fn require_if_match_treats_a_malformed_value_as_supplied() {
+        let (server, backend) = create_test_server_with(|c| c.require_if_match = true).await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+
+        let response = delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_static("garbage"))
+            .await;
+
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+        let body: serde_json::Value = response.json();
+        let diagnostics = body["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            diagnostics.contains("Malformed"),
+            "a malformed value must be rejected on its merits, not reported as \
+             missing; got {diagnostics:?}"
+        );
+    }
+
+    /// CONTROL — the precondition check must not be hoisted above the
+    /// `AuditEvent` immutability guard. Audit records are immutable regardless
+    /// of any tag, and reordering these would turn a 405 into a 412 (and make
+    /// delete scope an existence probe over the audit trail).
+    #[tokio::test]
+    async fn audit_event_immutability_outranks_the_precondition() {
+        let (server, _backend) = create_test_server().await;
+
+        let response = server
+            .delete("/AuditEvent/any-id")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(IF_MATCH, HeaderValue::from_static("W/\"99\""))
+            .await;
+
+        response.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// The client-facing 412 must not echo the current version.
+    ///
+    /// `DELETE` is authorized by `FhirOperation::Delete` alone, so a
+    /// `system/Patient.d` principal with no read scope reaches this path.
+    /// Telling it the versionId would disclose how many times the record has
+    /// been amended. Operators still get the value from the debug log.
+    #[tokio::test]
+    async fn the_412_body_does_not_disclose_the_current_version() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "patient-1", "Smith").await;
+        // Advance it so the current version is distinctive.
+        let etag = etag_of(&server, "patient-1").await;
+        server
+            .put("/Patient/patient-1")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .add_header(IF_MATCH, HeaderValue::from_str(&etag).unwrap())
+            .json(&json!({
+                "resourceType": "Patient",
+                "id": "patient-1",
+                "name": [{"family": "Smith"}]
+            }))
+            .await
+            .assert_status(StatusCode::OK);
+
+        let current = etag_of(&server, "patient-1").await;
+        let version = current
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            .to_string();
+
+        let response = delete_req(&server, "patient-1")
+            .add_header(IF_MATCH, HeaderValue::from_static("W/\"99\""))
+            .await;
+        response.assert_status(StatusCode::PRECONDITION_FAILED);
+
+        let body: serde_json::Value = response.json();
+        let diagnostics = body["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !diagnostics.contains(&format!("\"{version}\"")),
+            "the 412 must not disclose the current version, got {diagnostics:?}"
+        );
     }
 }
 
