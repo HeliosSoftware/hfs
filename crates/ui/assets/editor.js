@@ -267,7 +267,7 @@
 
     var add = event.target.closest("[data-add]");
     if (add) {
-      send("add", { path: add.dataset.add, name: add.dataset.name });
+      send("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" });
       return;
     }
 
@@ -313,6 +313,52 @@
     },
     true
   );
+
+
+  /* Live $expand picker (#365): bound inputs carry data-vs-url; typing
+   * debounces a request to the UI's terminology proxy and fills a per-row
+   * datalist. 204 (no server configured) leaves the plain input alone. */
+  var expandTimer = null;
+  var expandSeq = 0;
+  var liveListSeq = 0;
+  body.addEventListener("input", function (event) {
+    var input = event.target.closest("[data-vs-url]");
+    if (!input) return;
+    clearTimeout(expandTimer);
+    expandTimer = setTimeout(function () {
+      var seq = ++expandSeq;
+      fetch(
+        "/ui/editor/expand?url=" +
+          encodeURIComponent(input.dataset.vsUrl) +
+          "&filter=" +
+          encodeURIComponent(input.value),
+        { credentials: "same-origin" },
+      )
+        .then(function (r) { return r.status === 200 ? r.json() : null; })
+        .then(function (data) {
+          if (!data || seq !== expandSeq) return;
+          var listId = input.getAttribute("list");
+          if (!listId) {
+            listId = "vs-live-" + (++liveListSeq);
+            input.setAttribute("list", listId);
+          }
+          var list = document.getElementById(listId);
+          if (!list) {
+            list = document.createElement("datalist");
+            list.id = listId;
+            input.parentElement.appendChild(list);
+          }
+          list.textContent = "";
+          data.codes.forEach(function (item) {
+            var opt = document.createElement("option");
+            opt.value = item.code;
+            if (item.display) opt.label = item.display;
+            list.appendChild(opt);
+          });
+        })
+        .catch(function () {});
+    }, 300);
+  });
 
   /* Typeahead over the "add" list -- the only thing here that is purely
    * cosmetic, and the only thing that would be silly to round-trip. */

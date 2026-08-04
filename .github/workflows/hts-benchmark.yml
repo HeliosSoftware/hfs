@@ -344,7 +344,7 @@ jobs:
         if: matrix.backend == 'postgres'
         run: |
           set -euo pipefail
-          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           # `-c shared_buffers=1GB -c work_mem=64MB` give the bench a fair
           # chance against SQLite's in-process locality; the defaults are
           # tuned for tiny VPS instances and would penalise PG unfairly when
@@ -677,7 +677,7 @@ jobs:
         if: always() && matrix.backend == 'postgres'
         run: |
           if [ -n "${PG_CONTAINER:-}" ]; then
-            docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+            docker rm -fv "$PG_CONTAINER" 2>/dev/null || true
           fi
 
       # Turn the job red if any arm never started/verified — but only after the

@@ -189,3 +189,44 @@ fn converts_primitive_with_regex() {
     });
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn carries_informational_mirrors_and_short_labels() {
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/Informational",
+        "name": "Informational",
+        "kind": "resource",
+        "derivation": "specialization",
+        "type": "Informational",
+        "snapshot": { "element": [
+            { "path": "Informational", "min": 0, "max": "*" },
+            {
+                "path": "Informational.status",
+                "min": 1, "max": "1",
+                "type": [{ "code": "code" }],
+                "mustSupport": true,
+                "isSummary": true,
+                "short": "Current lifecycle state"
+            },
+            {
+                "path": "Informational.note",
+                "min": 0, "max": "1",
+                "type": [{ "code": "string" }],
+                "short": "Free-text remark"
+            }
+        ]}
+    });
+    let conversion = convert(&sd).expect("conversion");
+    let value = serde_json::to_value(&conversion.schema).unwrap();
+
+    let status = &value["elements"]["status"];
+    assert_eq!(status["mustSupport"], json!(true));
+    assert_eq!(status["summary"], json!(true));
+    assert_eq!(status["short"], json!("Current lifecycle state"));
+    assert_eq!(status["modifier"], Value::Null, "unset flags stay absent");
+
+    let note = &value["elements"]["note"];
+    assert_eq!(note["short"], json!("Free-text remark"));
+    assert_eq!(note["mustSupport"], Value::Null);
+}

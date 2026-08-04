@@ -436,6 +436,9 @@ editor-invalid-json = Eso no es JSON válido, así que no puede editarse como fo
 editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
 
 editor-add = Añadir elemento
+editor-must-support-badge = MS
+editor-binding-hint = Ligado a un value set — los códigos salen de él; se muestra la fuerza
+editor-must-support-hint = Must-support: se espera que los consumidores de este perfil manejen este elemento
 editor-add-filter = Filtrar elementos
 editor-add-another = añadir otro
 editor-pick-type = Elige un tipo…

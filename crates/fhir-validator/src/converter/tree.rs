@@ -166,7 +166,25 @@ pub(super) fn apply(root: &mut Node, segments: &[Segment], ed: &Ed, warnings: &m
         element.slicing_ordered = slicing.ordered;
     }
     apply_shape(element, ed);
+    apply_informational(element, ed);
     apply_element_content(element, ed, warnings);
+}
+
+/// The informational mirrors (never enforced): `mustSupport`, `isModifier`,
+/// `isSummary`, and the `short` human label.
+fn apply_informational(element: &mut Node, ed: &Ed) {
+    if ed.must_support == Some(true) {
+        element.schema.must_support = Some(true);
+    }
+    if ed.is_modifier == Some(true) {
+        element.schema.modifier = Some(true);
+    }
+    if ed.is_summary == Some(true) {
+        element.schema.summary = Some(true);
+    }
+    if element.schema.short.is_none() {
+        element.schema.short = ed.short.clone();
+    }
 }
 
 fn descend<'a>(node: &'a mut Node, seg: &Segment) -> &'a mut Node {

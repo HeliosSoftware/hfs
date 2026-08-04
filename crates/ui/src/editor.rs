@@ -75,6 +75,17 @@ pub struct Row {
     /// Precomputed: Askama has no closures.
     pub accepts_extension: bool,
     pub can_remove: bool,
+    /// `mustSupport` in the governing schema — emphasised in the form.
+    pub must_support: bool,
+    /// The slice this array item matches, when the element is sliced.
+    pub slice: String,
+    /// The binding strength (`required`, `extensible`, …), for the chip.
+    pub binding_strength: String,
+    /// The bound value set's canonical URL, for the live `$expand` picker.
+    pub binding_url: String,
+    /// The `short` human label; the raw element name stays as the technical
+    /// hint next to it.
+    pub short: String,
 }
 
 /// An element offered under a node.
@@ -86,6 +97,11 @@ pub struct AddOption {
     pub required: bool,
     /// Concrete arms, when this is a `value[x]`.
     pub arms: Vec<String>,
+    pub must_support: bool,
+    /// The `short` label, shown as the option's description.
+    pub short: String,
+    /// Adds into this named slice (seeded so the item matches).
+    pub slice: String,
 }
 
 #[derive(Template)]
@@ -143,6 +159,8 @@ pub struct EditorForm {
     pub value: String,
     #[serde(default)]
     pub modifier: String,
+    #[serde(default)]
+    pub slice: String,
 }
 
 /// The editor shell. The resource itself is fetched by the browser from the
@@ -214,6 +232,16 @@ fn apply(
     let path = editor::path_from_string(&form.path);
 
     match form.op.as_str() {
+        "add" if !form.slice.is_empty() => {
+            editor::add_slice_element(
+                resolver,
+                resource_type,
+                document,
+                &path,
+                &form.name,
+                &form.slice,
+            );
+        }
         "add" => {
             editor::add_element(resolver, resource_type, document, &path, &form.name);
         }
@@ -429,6 +457,37 @@ fn build_rows(
                 })
             })
         }),
+        must_support: schema
+            .as_ref()
+            .and_then(|schema| schema.must_support)
+            .unwrap_or(false),
+        slice: match path.split_last() {
+            Some((Step::Index(_), parent_path)) => {
+                editor::slice_label(resolver, resource_type, parent_path, node).unwrap_or_default()
+            }
+            _ => String::new(),
+        },
+        binding_strength: schema
+            .as_ref()
+            .and_then(|schema| schema.binding.as_ref())
+            .and_then(|binding| binding.strength.clone())
+            .unwrap_or_default(),
+        binding_url: schema
+            .as_ref()
+            .and_then(|schema| schema.binding.as_ref())
+            .map(|binding| {
+                binding
+                    .value_set
+                    .split('|')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap_or_default(),
+        short: schema
+            .as_ref()
+            .and_then(|schema| schema.short.clone())
+            .unwrap_or_default(),
         errors: errors.get(&key).cloned().unwrap_or_default(),
         accepts_extension: !is_primitive && offered.iter().any(|option| option.name == "extension"),
         addable: if is_primitive {
@@ -458,6 +517,60 @@ fn build_rows(
     }
 }
 
+/// Live `$expand` proxy for bound fields (#365): forwards to the configured
+/// terminology server and returns a compact JSON code list for the picker.
+/// Responds 204 when no terminology server is configured — the picker then
+/// stays a plain input.
+#[derive(Deserialize)]
+pub struct ExpandQuery {
+    pub url: String,
+    #[serde(default)]
+    pub filter: String,
+}
+
+pub async fn expand(State(state): State<WebState>, Query(query): Query<ExpandQuery>) -> Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(base) = state.terminology.as_ref() else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let target = format!("{}/ValueSet/$expand", base.trim_end_matches('/'));
+    let mut params: Vec<(&str, &str)> = vec![("url", query.url.as_str()), ("count", "25")];
+    if !query.filter.is_empty() {
+        params.push(("filter", query.filter.as_str()));
+    }
+    let response = match reqwest::Client::new()
+        .get(&target)
+        .query(&params)
+        .header("Accept", "application/fhir+json")
+        .timeout(std::time::Duration::from_millis(2500))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return StatusCode::NO_CONTENT.into_response(),
+    };
+    let Ok(body) = response.json::<Value>().await else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let codes: Vec<Value> = body["expansion"]["contains"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "code": item["code"].as_str().unwrap_or_default(),
+                        "display": item["display"].as_str().unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({ "codes": codes })).into_response()
+}
+
 fn to_option(addable: Addable) -> AddOption {
     let (kind, arms) = match addable.kind {
         AddableKind::Add => ("add", Vec::new()),
@@ -470,5 +583,8 @@ fn to_option(addable: Addable) -> AddOption {
         type_label: addable.type_.unwrap_or_default(),
         required: addable.required,
         arms,
+        must_support: addable.must_support,
+        short: addable.short.unwrap_or_default(),
+        slice: addable.slice.unwrap_or_default(),
     }
 }
