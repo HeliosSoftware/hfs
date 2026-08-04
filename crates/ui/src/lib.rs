@@ -996,6 +996,8 @@ struct SearchParametersQuery {
     q: String,
     page: Option<usize>,
     sel: Option<String>,
+    /// Set by the CRUD flows after a write: drop the cached snapshot first.
+    refresh: Option<String>,
 }
 
 /// SearchParameter viewer page.
@@ -1016,6 +1018,9 @@ async fn search_parameters(
         page: raw.page.unwrap_or(1),
         sel: raw.sel.filter(|s| !s.is_empty()),
     };
+    if raw.refresh.is_some() {
+        state.sp_catalog.invalidate(&rt.id, query.fhir_version());
+    }
     let snapshot = state
         .sp_catalog
         .snapshot(&rt.id, query.fhir_version())
@@ -1039,6 +1044,8 @@ struct CompartmentsQuery {
     id: String,
     #[serde(default)]
     target: String,
+    /// Set by the CRUD flows after a write: drop the cached definitions first.
+    refresh: Option<String>,
 }
 
 /// Compartment viewer & tester page.
@@ -1058,6 +1065,9 @@ async fn compartments_page(
         id: raw.id,
         target: raw.target,
     };
+    if raw.refresh.is_some() {
+        state.compartments.invalidate(&rt.id, query.fhir_version());
+    }
     let defs = state
         .compartments
         .definitions(&rt.id, query.fhir_version())
