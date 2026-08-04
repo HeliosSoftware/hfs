@@ -67,7 +67,7 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_RETURN_GONE` | `true` | Return 410 Gone for deleted resources (vs 404) |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
-| `HFS_REQUIRE_IF_MATCH` | `false` | Require `If-Match` header for updates |
+| `HFS_REQUIRE_IF_MATCH` | `false` | Require `If-Match` header for updates and deletes |
 
 ## Natural-Language Search
 

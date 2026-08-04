@@ -4765,6 +4765,105 @@ mod postgres_integration {
         assert_eq!(ok.version, 2);
     }
 
+    /// Issue #313: a tenant purge must reach the PHI-derived query strings a
+    /// client stores in its settings document. Those rows are keyed by *user*,
+    /// so none of `purge_tenant_data`'s tenant-scoped deletes touch them.
+    ///
+    /// The PostgreSQL-specific risk this proves is that the sweep runs inside
+    /// the purge's own transaction (`SELECT … FOR UPDATE`), so the offboarding
+    /// commits atomically: it cannot leave a tenant's saved queries behind after
+    /// its records are gone.
+    #[tokio::test]
+    async fn postgres_integration_purge_tenant_settings() {
+        let backend = create_backend().await;
+        let user = unique_user_key("tenant-purge");
+        let dotted = unique_user_key("tenant-purge-dotted");
+
+        backend
+            .put_settings(
+                &user,
+                json!({
+                    "theme": "dark",
+                    "byTenant": {
+                        "acme-purge": {"savedQueries": {"Patient": {"q": {"query": "name=smith"}}}},
+                        "beta-keep": {"savedQueries": {"Patient": {"q": {"query": "name=jones"}}}}
+                    }
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        // A tenant id containing `.` and `/`, both permitted by
+        // `admin_tenants::validate_tenant_id` — the reason the sweep edits a
+        // parsed document rather than using a `jsonb` text path.
+        backend
+            .put_settings(
+                &dotted,
+                json!({"byTenant": {"org.a/b": {"savedQueries": {"Patient": {"q": {}}}}}}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let before = backend.get_settings(&user).await.unwrap().unwrap();
+
+        // Driven through `purge_tenant_data`, which is the single choke point
+        // both the admin API and the web UI go through.
+        backend.purge_tenant_data("acme-purge").await.unwrap();
+
+        let after = backend.get_settings(&user).await.unwrap().unwrap();
+        assert_eq!(after.document["theme"], "dark");
+        assert!(after.document["byTenant"].get("acme-purge").is_none());
+        assert_eq!(
+            after.document["byTenant"]["beta-keep"]["savedQueries"]["Patient"]["q"]["query"],
+            "name=jones"
+        );
+        assert!(
+            !serde_json::to_string(&after.document)
+                .unwrap()
+                .contains("smith"),
+            "purged content must not survive in the stored row"
+        );
+        assert_eq!(
+            after.version,
+            before.version + 1,
+            "the version must bump so a stale ETag cannot write the content back"
+        );
+
+        // A tenant whose id is a prefix of another must not take it with it.
+        backend.purge_tenant_data("org.a").await.unwrap();
+        let dotted_doc = backend.get_settings(&dotted).await.unwrap().unwrap();
+        assert!(
+            dotted_doc.document["byTenant"].get("org.a/b").is_some(),
+            "purging 'org.a' must not touch the tenant named 'org.a/b'"
+        );
+        backend.purge_tenant_data("org.a/b").await.unwrap();
+        let dotted_doc = backend.get_settings(&dotted).await.unwrap().unwrap();
+        assert_eq!(dotted_doc.document, json!({}));
+    }
+
+    /// A tenant with nothing in the settings store leaves every document at its
+    /// original version, so no client ETag is needlessly invalidated.
+    #[tokio::test]
+    async fn postgres_integration_purge_tenant_settings_is_a_no_op_when_nothing_matches() {
+        let backend = create_backend().await;
+        let user = unique_user_key("tenant-purge-noop");
+        backend
+            .put_settings(&user, json!({"theme": "dark"}), None)
+            .await
+            .unwrap();
+        let before = backend.get_settings(&user).await.unwrap().unwrap();
+
+        backend
+            .purge_tenant_data("tenant-that-has-no-settings")
+            .await
+            .unwrap();
+
+        let after = backend.get_settings(&user).await.unwrap().unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.document, json!({"theme": "dark"}));
+    }
+
     // ========================================================================
     // _contained / _containedType search
     // ========================================================================
