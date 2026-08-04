@@ -74,7 +74,7 @@ fn all_enabled_packs_load_and_validate() {
 /// than release; the plan's <5ms target refers to release).
 #[test]
 #[ignore = "wall-clock assertion; unreliable on shared runners. Run via the \
-            ci-extended.yml ignored-tests step or `-- --ignored`"]
+            validator-conformance.yml pack-smoke step or `-- --ignored`"]
 fn structural_validation_latency_smoke() {
     let validator = Validator::new(core_registry(FhirVersion::R4));
     let opts = ValidationOptions::default();

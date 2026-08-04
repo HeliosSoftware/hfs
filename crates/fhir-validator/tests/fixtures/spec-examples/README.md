@@ -8,11 +8,26 @@ core schema packs.
 
 The corpus is the set of example resources the FHIR spec publishes, vendored
 at `crates/fhir/tests/data/json/<VERSION>/`. Every one of them is *supposed*
-to be valid against the core spec. So each entry in `knownFailures` is a
-suspected **false positive in our engine** — not a defect in the example.
+to be valid against the core spec, so an entry in `knownFailures` is usually
+a **false positive in our engine**.
 
-That makes these files a running count of the engine's known
-over-reporting, per FHIR version, in a form review can see:
+Usually, not always. Sweeping the corpus turned up published examples that
+are genuinely invalid — R4's machine-generated `Questionnaire`s omit the
+required nested `linkId`, and 145 R4B `CodeSystem`s declare
+`meta.profile: shareablecodesystem` and then omit the `publisher` that
+profile requires. Do not assume an entry is ours to fix.
+
+**Read the `reason` before acting on an entry.** Every entry carries one, and
+it says which of three things you are looking at:
+
+| `reason` says | What to do |
+|---|---|
+| Engine bug (`#424`, `#425`, or an unfiled root cause) | Fix the engine; the entry then has to be deleted |
+| Documented engine limitation | Nothing, until the limitation is lifted |
+| Genuine defect in the published example | Nothing — the engine is right |
+
+That makes these files a running, adjudicated account of where the engine and
+the published corpus disagree, per FHIR version, in a form review can see:
 
 | File | Corpus |
 |---|---|
@@ -37,10 +52,11 @@ The test fails on divergence in **either** direction:
 - a change in the resource count or the non-resource file list (the corpus
   moved; regenerate).
 
-Entries may only be removed by fixing the engine. Adding one is a deliberate,
-reviewable act — it is a record that we report an issue on a valid published
-resource, never a way to silence one. Nothing here suppresses output: the
-issues are still emitted, still counted, and still printed by the sweep.
+Entries may only be removed by fixing the engine, or by adjudicating the
+example as genuinely invalid. Adding one is a deliberate, reviewable act — it
+is a record that we and the published corpus disagree, never a way to silence
+an issue. Nothing here suppresses output: the issues are still emitted, still
+counted, and still printed by the sweep.
 
 ## Regenerating
 
@@ -58,9 +74,14 @@ cp target/spec-examples/r4.actual.json \
    crates/fhir-validator/tests/fixtures/spec-examples/known-failures-r4.json
 ```
 
-The optional per-entry `reason` field is never generated — add it by hand when
-a group of entries shares an understood root cause, so the next reader knows
-which are explained and which are still unexamined.
+The per-entry `reason` is never *generated* by the sweep, but it is carried
+across a regeneration, so the `cp` above preserves the notes rather than
+wiping them. An entry whose issue count or error kinds changed loses its note
+on purpose: the recorded explanation may no longer describe what the engine
+reports, so it has to be re-established deliberately.
+
+Write a `reason` for any new entry. An unexplained entry is a number nobody
+can act on.
 
 ## Scope
 

@@ -30,6 +30,13 @@ on:
   pull_request:
     paths:
       - "crates/fhir-validator/**"
+      # The baselines pin per-file results and resource counts for the
+      # vendored corpus, so a change to the corpus (or to the build script
+      # that manages it) breaks them just as surely as an engine change.
+      # Without these paths that break would only surface in the nightly run,
+      # for someone else to diagnose.
+      - "crates/fhir/tests/data/json/**"
+      - "crates/fhir/build.rs"
       - ".github/workflows/validator-conformance.yml"
 
 env:
@@ -95,11 +102,16 @@ jobs:
           status=${PIPESTATUS[0]}
           passed=$(awk '/^test result:/ { for (i = 2; i <= NF; i++) if ($i == "passed;") total += $(i - 1) } END { print total + 0 }' pack-smoke.log)
           echo "ignored pack-smoke tests passed: $passed"
+          # Check the exit code before the count. A build failure also prints
+          # no `test result:` line, and reporting that as "0 tests collected"
+          # would send the reader looking for a filter bug that isn't there.
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
           if [ "$passed" -lt 1 ]; then
             echo "::error::[NO-TESTS-RAN] The ignored pack-smoke filter collected 0 tests. cargo test exits 0 in that case, so this step would otherwise pass without asserting anything."
             exit 1
           fi
-          exit "$status"
 
       # Writes target/spec-examples/<version>.actual.json whether it passes or
       # fails; the upload below is what you copy a new baseline from.
