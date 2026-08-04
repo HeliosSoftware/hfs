@@ -1,0 +1,1772 @@
+{
+  "description": "Baseline for the official FHIR example corpus sweep in crates/fhir-validator/tests/spec_examples.rs. Every entry is a published spec example that the structural validator reports issues on. Most are false positives in the engine, but not all -- some published examples are genuinely invalid. The per-entry 'reason' says which: engine bug (with issue number), documented engine limitation, or a defect in the example. Entries may only be removed by fixing the engine or re-adjudicating the example, never added without review. Regenerate with the copy of this file the test writes to target/spec-examples/<version>.actual.json; existing 'reason' notes are carried across.",
+  "version": "1.0.0",
+  "corpus": "crates/fhir/tests/data/json/R4",
+  "fhirVersion": "R4",
+  "resourcesValidated": 2912,
+  "nonResourceFiles": [
+    "package-min-ver.json"
+  ],
+  "knownFailures": [
+    {
+      "file": "account-questionnaire.json",
+      "issues": 32,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "activitydefinition-questionnaire.json",
+      "issues": 71,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "actualgroup-questionnaire.json",
+      "issues": 34,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "adverseevent-questionnaire.json",
+      "issues": 41,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "allergyintolerance-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "appointment-questionnaire.json",
+      "issues": 39,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "appointmentresponse-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "auditevent-questionnaire.json",
+      "issues": 66,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "basic-questionnaire.json",
+      "issues": 14,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "binary-questionnaire.json",
+      "issues": 9,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "biologicallyderivedproduct-questionnaire.json",
+      "issues": 46,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "bmi-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "bodyheight-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "bodystructure-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "bodytemp-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "bodyweight-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "bp-questionnaire.json",
+      "issues": 78,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "bundle-questionnaire.json",
+      "issues": 50,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "capabilitystatement-questionnaire.json",
+      "issues": 142,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "careplan-questionnaire.json",
+      "issues": 60,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "careteam-questionnaire.json",
+      "issues": 29,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "catalog-questionnaire.json",
+      "issues": 59,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "catalogentry-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "cdshooksguidanceresponse-questionnaire.json",
+      "issues": 25,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "cdshooksrequestgroup-questionnaire.json",
+      "issues": 62,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "cdshooksserviceplandefinition-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "chargeitem-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "chargeitemdefinition-questionnaire.json",
+      "issues": 54,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "cholesterol-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "claim-questionnaire.json",
+      "issues": 154,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "claimresponse-questionnaire.json",
+      "issues": 146,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "clinicaldocument-questionnaire.json",
+      "issues": 59,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "clinicalimpression-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "codesystem-contract-legalstate.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "codesystem-contract-publicationstatus.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "codesystem-contract-status.json",
+      "issues": 2,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-author.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-effective.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-end.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-keyword.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-extensions-CodeSystem-workflow.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "codesystem-medicationrequest-status.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "codesystem-program.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "codesystem-questionnaire.json",
+      "issues": 74,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "communication-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "communicationrequest-questionnaire.json",
+      "issues": 35,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "compartmentdefinition-questionnaire.json",
+      "issues": 32,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "composition-questionnaire.json",
+      "issues": 59,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "computableplandefinition-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "conceptmap-questionnaire.json",
+      "issues": 70,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "condition-questionnaire.json",
+      "issues": 38,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "consent-questionnaire.json",
+      "issues": 58,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "contract-questionnaire.json",
+      "issues": 185,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "coverage-questionnaire.json",
+      "issues": 46,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "coverageeligibilityrequest-questionnaire.json",
+      "issues": 54,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "coverageeligibilityresponse-questionnaire.json",
+      "issues": 59,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "cqf-questionnaire-questionnaire.json",
+      "issues": 72,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "cqllibrary-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "detectedissue-questionnaire.json",
+      "issues": 32,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "device-questionnaire.json",
+      "issues": 67,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "devicedefinition-questionnaire.json",
+      "issues": 65,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "devicemetric-questionnaire.json",
+      "issues": 26,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "devicemetricobservation-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "devicerequest-questionnaire.json",
+      "issues": 38,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "deviceusestatement-questionnaire.json",
+      "issues": 22,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "diagnosticreport-example-gingival-mass.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "diagnosticreport-genetics-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "diagnosticreport-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "documentmanifest-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "documentreference-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "effectevidencesynthesis-questionnaire.json",
+      "issues": 86,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "elementdefinition-de-questionnaire.json",
+      "issues": 512,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "encounter-questionnaire.json",
+      "issues": 76,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "endpoint-questionnaire.json",
+      "issues": 20,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "enrollmentrequest-questionnaire.json",
+      "issues": 16,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "enrollmentresponse-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "episodeofcare-questionnaire.json",
+      "issues": 32,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "eventdefinition-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "evidence-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "evidencevariable-questionnaire.json",
+      "issues": 97,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "examplescenario-example.json",
+      "issues": 4,
+      "kinds": [
+        "not-array"
+      ],
+      "reason": "Engine bug #487: `contentReference` is lowered to `elementReference` and the target element's schema is merged wholesale, inheriting its `max=*`. E.g. `ExampleScenario.process.step.operation.request` is `max=1` but references `ExampleScenario.instance.containedInstance` (`max=*`), so a single object is reported as not-array."
+    },
+    {
+      "file": "examplescenario-questionnaire.json",
+      "issues": 88,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "explanationofbenefit-questionnaire.json",
+      "issues": 261,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "familymemberhistory-genetic-questionnaire.json",
+      "issues": 35,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "familymemberhistory-questionnaire.json",
+      "issues": 35,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "flag-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "goal-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "graphdefinition-questionnaire.json",
+      "issues": 51,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "group-questionnaire.json",
+      "issues": 34,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "groupdefinition-questionnaire.json",
+      "issues": 34,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "guidanceresponse-questionnaire.json",
+      "issues": 24,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "hdlcholesterol-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "headcircum-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "healthcareservice-questionnaire.json",
+      "issues": 51,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "heartrate-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "hlaresult-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "imagingstudy-questionnaire.json",
+      "issues": 57,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "immunization-questionnaire.json",
+      "issues": 64,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "immunizationrecommendation-questionnaire.json",
+      "issues": 34,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "implementationguide-questionnaire.json",
+      "issues": 107,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "insuranceplan-questionnaire.json",
+      "issues": 81,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "invoice-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "json-edge-cases.json",
+      "issues": 1,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "ldlcholesterol-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "library-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "linkage-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "lipidprofile-questionnaire.json",
+      "issues": 37,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "list-questionnaire.json",
+      "issues": 30,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "location-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "measure-questionnaire.json",
+      "issues": 89,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "measurereport-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "media-questionnaire.json",
+      "issues": 31,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medication-questionnaire.json",
+      "issues": 29,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicationadministration-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicationdispense-questionnaire.json",
+      "issues": 46,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicationknowledge-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicationrequest-questionnaire.json",
+      "issues": 63,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicationstatement-questionnaire.json",
+      "issues": 28,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproduct-questionnaire.json",
+      "issues": 65,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductauthorization-questionnaire.json",
+      "issues": 40,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductcontraindication-questionnaire.json",
+      "issues": 21,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductindication-questionnaire.json",
+      "issues": 23,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductingredient-questionnaire.json",
+      "issues": 45,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductinteraction-questionnaire.json",
+      "issues": 20,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductmanufactured-questionnaire.json",
+      "issues": 16,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductpackaged-questionnaire.json",
+      "issues": 38,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductpharmaceutical-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "medicinalproductundesirableeffect-questionnaire.json",
+      "issues": 14,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "messagedefinition-questionnaire.json",
+      "issues": 49,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "messageheader-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "molecularsequence-questionnaire.json",
+      "issues": 101,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "namingsystem-questionnaire.json",
+      "issues": 33,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "nutritionorder-questionnaire.json",
+      "issues": 73,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "observation-example-bloodpressure-cancel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-bloodpressure-dar.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-bloodpressure.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-bmi.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-body-height.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-body-length.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-body-temperature.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-head-circumference.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-heart-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-respiratory-rate.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-satO2.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-example-vitals-panel.json",
+      "issues": 1,
+      "kinds": [
+        "slice-cardinality"
+      ],
+      "reason": "Documented engine limitation: only `pattern` slice discriminators are evaluated, so a value-based slice matches nothing and its minimum is reported as unmet (the vital-signs `Observation.category` slice; the examples do carry `category`)."
+    },
+    {
+      "file": "observation-genetics-questionnaire.json",
+      "issues": 54,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "observation-questionnaire.json",
+      "issues": 54,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "observationdefinition-questionnaire.json",
+      "issues": 41,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "operationdefinition-questionnaire.json",
+      "issues": 70,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "operationoutcome-questionnaire.json",
+      "issues": 20,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "organization-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "organizationaffiliation-questionnaire.json",
+      "issues": 21,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "oxygensat-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "parameters-questionnaire.json",
+      "issues": 120,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "patient-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "paymentnotice-questionnaire.json",
+      "issues": 21,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "paymentreconciliation-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "person-questionnaire.json",
+      "issues": 25,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "picoelement-questionnaire.json",
+      "issues": 97,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "plandefinition-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "practitioner-questionnaire.json",
+      "issues": 26,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "practitionerrole-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "procedure-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "provenance-questionnaire.json",
+      "issues": 35,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "provenance-relevant-history-questionnaire.json",
+      "issues": 44,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "questionnaire-cqf-example.json",
+      "issues": 1,
+      "kinds": [
+        "unknown-schema"
+      ],
+      "reason": "Documented gap: core extension StructureDefinitions (`extension-definitions.json`) are not in the vendored spec bundles, so these extension canonicals cannot be resolved."
+    },
+    {
+      "file": "questionnaire-questionnaire.json",
+      "issues": 72,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "questionnaireresponse-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "relatedperson-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "requestgroup-questionnaire.json",
+      "issues": 62,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "researchdefinition-questionnaire.json",
+      "issues": 46,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "researchelementdefinition-questionnaire.json",
+      "issues": 97,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "researchstudy-questionnaire.json",
+      "issues": 45,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "researchsubject-questionnaire.json",
+      "issues": 18,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "resprate-questionnaire.json",
+      "issues": 56,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "riskassessment-questionnaire.json",
+      "issues": 36,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "riskevidencesynthesis-questionnaire.json",
+      "issues": 78,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "schedule-questionnaire.json",
+      "issues": 17,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "searchparameter-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "servicerequest-genetics-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "servicerequest-questionnaire.json",
+      "issues": 42,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "shareableactivitydefinition-questionnaire.json",
+      "issues": 71,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "shareablecodesystem-questionnaire.json",
+      "issues": 74,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "shareablelibrary-questionnaire.json",
+      "issues": 43,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "shareablemeasure-questionnaire.json",
+      "issues": 89,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "shareableplandefinition-questionnaire.json",
+      "issues": 116,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "shareablevalueset-questionnaire.json",
+      "issues": 96,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "slot-questionnaire.json",
+      "issues": 20,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "specimen-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "specimendefinition-questionnaire.json",
+      "issues": 48,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "structuredefinition-questionnaire.json",
+      "issues": 58,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "structuremap-questionnaire.json",
+      "issues": 202,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "subscription-questionnaire.json",
+      "issues": 23,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "substance-questionnaire.json",
+      "issues": 27,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "substancenucleicacid-questionnaire.json",
+      "issues": 38,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "substancepolymer-questionnaire.json",
+      "issues": 53,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "substanceprotein-questionnaire.json",
+      "issues": 24,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "substancereferenceinformation-questionnaire.json",
+      "issues": 44,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "substancesourcematerial-questionnaire.json",
+      "issues": 63,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "substancespecification-questionnaire.json",
+      "issues": 115,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "supplydelivery-questionnaire.json",
+      "issues": 25,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "supplyrequest-questionnaire.json",
+      "issues": 29,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "synthesis-questionnaire.json",
+      "issues": 41,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "task-questionnaire.json",
+      "issues": 266,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "terminologycapabilities-questionnaire.json",
+      "issues": 92,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "testreport-questionnaire.json",
+      "issues": 70,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "testscript-questionnaire.json",
+      "issues": 170,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "triglyceride-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "v2-tables.json",
+      "issues": 6,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-author.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-effective.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-end.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-keyword.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-extensions-ValueSet-workflow.json",
+      "issues": 1,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the SearchParameter omits the required `base`."
+    },
+    {
+      "file": "valueset-questionnaire.json",
+      "issues": 96,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "valuesets.json",
+      "issues": 8,
+      "kinds": [
+        "primitive-value"
+      ],
+      "reason": "Engine bug #425: Rust's `regex` makes `\\s`/`\\S` Unicode-aware, so U+00A0 and U+202F fail the R4/R4B `string` and `code` patterns that XSD (ASCII-only `\\s`) accepts."
+    },
+    {
+      "file": "verificationresult-questionnaire.json",
+      "issues": 50,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "visionprescription-questionnaire.json",
+      "issues": 39,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "vitalsigns-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    },
+    {
+      "file": "vitalspanel-questionnaire.json",
+      "issues": 55,
+      "kinds": [
+        "required"
+      ],
+      "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
+    }
+  ]
+}
