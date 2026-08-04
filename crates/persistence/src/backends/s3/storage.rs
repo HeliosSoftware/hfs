@@ -1057,6 +1057,7 @@ impl ResourceStorage for S3Backend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let location = self
             .registry_location()
             .ok_or_else(|| self.tenant_registry_unsupported())?;
@@ -1078,6 +1079,7 @@ impl ResourceStorage for S3Backend {
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         let location = self
             .registry_location()
             .ok_or_else(|| self.tenant_registry_unsupported())?;
@@ -1117,6 +1119,7 @@ impl ResourceStorage for S3Backend {
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+        crate::tenant::ensure_mutable_tenant(id)?;
         // Resolve the tenant's data location exactly as request handling does.
         let tenant = TenantContext::new(TenantId::new(id), TenantPermissions::full_access());
         let location = self.tenant_location(&tenant)?;
@@ -1135,6 +1138,20 @@ impl ResourceStorage for S3Backend {
                     .await
                     .map_err(|e| self.map_client_error(e))?;
             }
+        }
+        // Per-user settings live outside every tenant prefix (they are
+        // user-global), so the sweep above structurally cannot reach them — see
+        // `S3Keyspace::user_settings_key`. They nonetheless hold PHI-derived
+        // query strings belonging to this tenant, so each object is *edited* to
+        // drop this tenant's subtree (issue #313). Never deleted: the same object
+        // holds other tenants' content and the user's global preferences.
+        let settings = crate::core::SettingsStore::purge_tenant_settings(self, id).await?;
+        if settings > 0 {
+            tracing::info!(
+                tenant = %id,
+                objects = settings,
+                "purged tenant-scoped content from user settings objects"
+            );
         }
         Ok(removed)
     }

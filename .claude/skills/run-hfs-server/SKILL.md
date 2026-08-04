@@ -140,9 +140,36 @@ rules to the FHIR prefixes.
 ## Per-user UI settings
 
 `GET`/`PUT`/`PATCH /_user/settings` stores an opaque, per-user JSON document (UI
-theme, default tenant, recent queries). It is keyed by user only, never by tenant.
-Responses carry a weak `ETag` (`W/"{version}"`); clients may send `If-Match` on a
-write for optimistic concurrency.
+theme, default tenant, saved and recent queries). It is keyed by user only, never
+by tenant. Responses carry a weak `ETag` (`W/"{version}"`); clients may send
+`If-Match` on a write for optimistic concurrency.
+
+### Tenant scoping inside the document (#313)
+
+The row is keyed by user, but most of what a client stores is derived from one
+*tenant's* data — a saved query like `Patient?name=smith&birthdate=1970-01-01` is
+a PHI-bearing string. Those keys are therefore stored under a reserved `byTenant`
+map so `purge_tenant_data` can reach them; only `theme`, `nav`, `fhirVersion` and
+`tenantId` stay user-global.
+
+**The wire format is unchanged** — the server projects on read and scopes on
+write, so clients still see a flat document and need no changes. Two operational
+consequences:
+
+- **Saved queries and recent searches now change when a user switches tenants.**
+  That is the intended semantics (a query saved against `acme` is meaningless in
+  `beta`), but it will be reported as "my queries disappeared" if unannounced.
+- **Deleting a tenant with `?purge=true` now also erases that tenant's saved and
+  recent queries from every user's settings document**, on all four backends and
+  through both the `/admin/tenants` API and the `/ui/tenants` page. The document
+  itself survives — it holds other tenants' content and the user's global
+  preferences — and its `version` is bumped, so a client holding a stale `ETag`
+  gets a `412` and re-reads rather than writing the purged content back.
+
+A document written before this existed keeps working: it is still readable, the
+first write files its keys under the tenant it recorded in `tenantId` (or the
+writing tenant if it never recorded one), and a purge sweeps any that remain
+unattributed. Sending `byTenant` in a request body is rejected with `422`.
 
 Supported on the **SQLite, PostgreSQL, MongoDB, and S3** backends. Elasticsearch is
 search-only and never a standalone primary, so an Elasticsearch-only deployment

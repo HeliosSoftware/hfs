@@ -211,12 +211,73 @@ pub(super) fn validate_slices(
 /// today; a missing `match` (constraining slice) matches nothing, and a
 /// `match` with no `value` matches everything (lodash `_.isMatch` semantics
 /// for an empty source).
-fn slice_matches(slice: &Slice, item: &Value) -> bool {
-    let Some(match_) = &slice.match_ else {
-        return false;
-    };
-    match match_.value.as_ref() {
-        Some(pattern) => is_partial_match(item, pattern),
-        None => true,
+pub(crate) fn slice_matches(slice: &Slice, item: &Value) -> bool {
+    if let Some(match_) = &slice.match_ {
+        return match match_.value.as_ref() {
+            Some(pattern) => is_partial_match(item, pattern),
+            None => true,
+        };
+    }
+    // The converter carries a pattern/value discriminator as the slice
+    // schema's pattern (or fixed) keyword rather than an explicit match.
+    if let Some(schema) = &slice.schema {
+        if let Some(pattern) = &schema.pattern {
+            return is_partial_match(item, pattern);
+        }
+        if let Some(fixed) = &schema.fixed {
+            return is_partial_match(item, fixed);
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod slice_match_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn slice(v: serde_json::Value) -> Slice {
+        serde_json::from_value(v).expect("slice")
+    }
+
+    #[test]
+    fn an_explicit_match_value_is_a_partial_match() {
+        let s = slice(json!({ "match": { "type": "pattern", "value": { "system": "http://x" } } }));
+        assert!(slice_matches(
+            &s,
+            &json!({ "system": "http://x", "value": "1" })
+        ));
+        assert!(!slice_matches(&s, &json!({ "system": "http://y" })));
+    }
+
+    #[test]
+    fn a_match_without_a_value_matches_everything() {
+        let s = slice(json!({ "match": { "type": "pattern" } }));
+        assert!(slice_matches(&s, &json!({ "anything": true })));
+    }
+
+    #[test]
+    fn a_schema_pattern_stands_in_for_the_match() {
+        let s = slice(json!({ "schema": { "pattern": { "system": "http://x" } } }));
+        assert!(slice_matches(&s, &json!({ "system": "http://x" })));
+        assert!(!slice_matches(&s, &json!({ "system": "http://y" })));
+    }
+
+    #[test]
+    fn a_schema_fixed_stands_in_for_the_match() {
+        let s = slice(json!({ "schema": { "fixed": { "system": "http://x" } } }));
+        assert!(slice_matches(&s, &json!({ "system": "http://x" })));
+    }
+
+    #[test]
+    fn no_discriminator_at_all_matches_nothing() {
+        let s = slice(json!({ "min": 1 }));
+        assert!(!slice_matches(&s, &json!({ "system": "http://x" })));
+    }
+
+    #[test]
+    fn a_schema_with_neither_pattern_nor_fixed_matches_nothing() {
+        let s = slice(json!({ "schema": { "type": "Identifier" } }));
+        assert!(!slice_matches(&s, &json!({ "system": "http://x" })));
     }
 }

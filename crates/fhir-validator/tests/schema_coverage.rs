@@ -118,6 +118,7 @@ fn declared_fields(ctx: Ctx) -> BTreeSet<String> {
             summary: Some(true),
             short: Some(String::new()),
             regex: Some(String::new()),
+            context: Some(Vec::new()),
         }),
         Ctx::Binding => keys_of(&Binding {
             value_set: String::new(),

@@ -3538,3 +3538,83 @@ async fn mongodb_integration_settings_get_surfaces_decode_error() {
     let err = backend.get_settings(&user).await.unwrap_err();
     assert!(matches!(err, StorageError::Backend(_)));
 }
+
+/// Issue #313: a tenant purge must reach the PHI-derived query strings a client
+/// stores in its settings document, which are keyed by *user* and so are not
+/// touched by the tenant-scoped deletes in `purge_tenant_data`.
+///
+/// The MongoDB-specific risk this proves is the write shape: with no
+/// multi-document transaction available, the sweep rewrites each document with a
+/// version-conditioned update, and it must remove exactly the named tenant's
+/// subtree — which is why it edits the parsed document rather than `$unset`ing a
+/// dotted path (`admin_tenants::validate_tenant_id` permits tenant ids containing
+/// `.`, which a dotted path would misparse).
+#[tokio::test]
+async fn mongodb_integration_purge_tenant_settings() {
+    let Some(backend) = settings_mongo::backend("settings_tenant_purge").await else {
+        eprintln!(
+            "Skipping mongodb_integration_purge_tenant_settings (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let user = unique_user_key("tenant-purge");
+    let dotted = unique_user_key("tenant-purge-dotted");
+
+    backend
+        .put_settings(
+            &user,
+            json!({
+                "theme": "dark",
+                "byTenant": {
+                    "acme": {"savedQueries": {"Patient": {"q": {"query": "name=smith"}}}},
+                    "beta": {"savedQueries": {"Patient": {"q": {"query": "name=jones"}}}}
+                }
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    // A tenant id containing a dot: `$unset: {"byTenant.a.b": 1}` would target
+    // `byTenant.a` → `b`, the wrong node.
+    backend
+        .put_settings(
+            &dotted,
+            json!({"byTenant": {"a.b": {"savedQueries": {"Patient": {"q": {}}}}}}),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let before = backend.get_settings(&user).await.unwrap().unwrap();
+    backend.purge_tenant_settings("acme").await.unwrap();
+
+    let after = backend.get_settings(&user).await.unwrap().unwrap();
+    assert_eq!(after.document["theme"], "dark");
+    assert!(after.document["byTenant"].get("acme").is_none());
+    assert_eq!(
+        after.document["byTenant"]["beta"]["savedQueries"]["Patient"]["q"]["query"],
+        "name=jones"
+    );
+    assert!(
+        !serde_json::to_string(&after.document)
+            .unwrap()
+            .contains("smith"),
+        "purged content must not survive in the stored document"
+    );
+    assert_eq!(
+        after.version,
+        before.version + 1,
+        "the version must bump so a stale ETag cannot write the content back"
+    );
+
+    // The dotted tenant is purgeable, and only by its own id.
+    backend.purge_tenant_settings("a").await.unwrap();
+    let dotted_doc = backend.get_settings(&dotted).await.unwrap().unwrap();
+    assert!(
+        dotted_doc.document["byTenant"].get("a.b").is_some(),
+        "purging 'a' must not touch the tenant literally named 'a.b'"
+    );
+    backend.purge_tenant_settings("a.b").await.unwrap();
+    let dotted_doc = backend.get_settings(&dotted).await.unwrap().unwrap();
+    assert_eq!(dotted_doc.document, json!({}));
+}

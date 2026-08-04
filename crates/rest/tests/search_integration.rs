@@ -2534,3 +2534,46 @@ mod contained_search {
         );
     }
 }
+
+mod summary_count {
+    use super::*;
+
+    /// #254: `_summary=count` exists to return `Bundle.total`, so it implies
+    /// an accurate total without the client also sending `_total=accurate`.
+    #[tokio::test]
+    async fn test_summary_count_implies_accurate_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_summary=count")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            body["total"].is_u64(),
+            "count mode must carry the count: {body}"
+        );
+        assert!(body["total"].as_u64().unwrap() > 0);
+        assert!(
+            body.get("entry").is_none(),
+            "count mode returns no entries: {body}"
+        );
+    }
+
+    /// An explicit `_total` still wins over the implication.
+    #[tokio::test]
+    async fn test_summary_count_respects_explicit_total_none() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_summary=count&_total=none")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(body["total"].is_null(), "explicit _total=none wins: {body}");
+    }
+}
