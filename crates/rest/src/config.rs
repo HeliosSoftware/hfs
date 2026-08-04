@@ -1261,6 +1261,21 @@ impl ServerConfig {
             errors.push("Default page size cannot exceed max page size".to_string());
         }
 
+        // A reserved default tenant is the isolation hole of issue #317 in
+        // configuration shape: `main.rs` auto-provisions the configured default
+        // at boot, which would materialise the sentinel in the registry, and
+        // every request that names no tenant would land in the shared tenant.
+        // Fail at startup rather than per request — a per-request rejection
+        // would be an outage with a confusing cause, and there is no sane
+        // fallback when the fallback itself is the invalid value.
+        if helios_persistence::tenant::TenantId::is_reserved(&self.default_tenant) {
+            errors.push(format!(
+                "HFS_DEFAULT_TENANT '{}' is reserved for internal use and cannot be \
+                 the default tenant",
+                self.default_tenant
+            ));
+        }
+
         if let Err(mut bulk_errors) = self.bulk_export.validate() {
             errors.append(&mut bulk_errors);
         }
@@ -1382,6 +1397,37 @@ mod tests {
     #[test]
     fn test_validate_valid() {
         let config = ServerConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    /// `HFS_DEFAULT_TENANT=__system__` is the #317 isolation hole in
+    /// configuration shape: the boot path auto-provisions the configured default,
+    /// which would put the sentinel in the registry, and every request naming no
+    /// tenant would land in the shared tenant. Fail at startup.
+    #[test]
+    fn test_validate_rejects_reserved_default_tenant() {
+        for id in helios_persistence::tenant::RESERVED_TENANT_IDS {
+            let config = ServerConfig {
+                default_tenant: id.to_string(),
+                ..Default::default()
+            };
+            let errors = config
+                .validate()
+                .expect_err("a reserved default tenant must fail startup validation");
+            assert!(
+                errors.iter().any(|e| e.contains("HFS_DEFAULT_TENANT")),
+                "expected a HFS_DEFAULT_TENANT error for {id}, got {errors:?}"
+            );
+        }
+    }
+
+    /// The reservation is exact — a merely internal-*looking* default still boots.
+    #[test]
+    fn test_validate_allows_underscore_prefixed_default_tenant() {
+        let config = ServerConfig {
+            default_tenant: "__legacy".to_string(),
+            ..Default::default()
+        };
         assert!(config.validate().is_ok());
     }
 

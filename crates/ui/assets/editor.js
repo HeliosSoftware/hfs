@@ -267,7 +267,7 @@
 
     var add = event.target.closest("[data-add]");
     if (add) {
-      send("add", { path: add.dataset.add, name: add.dataset.name });
+      send("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" });
       return;
     }
 
@@ -280,7 +280,7 @@
     var extension = event.target.closest("[data-extension]");
     if (extension) {
       var panel = extension.closest(".editor-add__ext");
-      var url = panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "";
+      var url = extension.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
       send("extension", { path: extension.dataset.extension, url: url });
       return;
     }
@@ -314,6 +314,52 @@
     true
   );
 
+
+  /* Live $expand picker (#365): bound inputs carry data-vs-url; typing
+   * debounces a request to the UI's terminology proxy and fills a per-row
+   * datalist. 204 (no server configured) leaves the plain input alone. */
+  var expandTimer = null;
+  var expandSeq = 0;
+  var liveListSeq = 0;
+  body.addEventListener("input", function (event) {
+    var input = event.target.closest("[data-vs-url]");
+    if (!input) return;
+    clearTimeout(expandTimer);
+    expandTimer = setTimeout(function () {
+      var seq = ++expandSeq;
+      fetch(
+        "/ui/editor/expand?url=" +
+          encodeURIComponent(input.dataset.vsUrl) +
+          "&filter=" +
+          encodeURIComponent(input.value),
+        { credentials: "same-origin" },
+      )
+        .then(function (r) { return r.status === 200 ? r.json() : null; })
+        .then(function (data) {
+          if (!data || seq !== expandSeq) return;
+          var listId = input.getAttribute("list");
+          if (!listId) {
+            listId = "vs-live-" + (++liveListSeq);
+            input.setAttribute("list", listId);
+          }
+          var list = document.getElementById(listId);
+          if (!list) {
+            list = document.createElement("datalist");
+            list.id = listId;
+            input.parentElement.appendChild(list);
+          }
+          list.textContent = "";
+          data.codes.forEach(function (item) {
+            var opt = document.createElement("option");
+            opt.value = item.code;
+            if (item.display) opt.label = item.display;
+            list.appendChild(opt);
+          });
+        })
+        .catch(function () {});
+    }, 300);
+  });
+
   /* Typeahead over the "add" list -- the only thing here that is purely
    * cosmetic, and the only thing that would be silly to round-trip. */
   root.addEventListener("input", function (event) {
@@ -327,6 +373,48 @@
   });
 
   /* ---- saving ---------------------------------------------------------- */
+
+  /* Every location an issue claims. `location` is the R4 spelling and is
+   * deprecated, so it only stands in when `expression` is absent. */
+  function expressionsOf(issue) {
+    var claimed = issue.expression || issue.location || [];
+    return Array.isArray(claimed) ? claimed : [claimed];
+  }
+
+  /* The row an OperationOutcome expression names, if we render one.
+   *
+   * The two sides spell the same path differently: the outcome carries
+   * bracket-indexed FHIRPath rooted at the resource type
+   * (`Patient.name[0].given`), while rows are keyed on the validator's dotted
+   * form (`name.0.given`). Normalise before comparing — a plain === beats
+   * building a selector out of server text. */
+  function rowFor(expression) {
+    var dotted = String(expression).replace(/\[(\d+)\]/g, ".$1");
+    var cut = dotted.indexOf(".");
+    if (cut <= 0) return null;
+    var path = dotted.slice(cut + 1);
+    var rows = body.querySelectorAll("[data-path]");
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.path === path) return rows[i];
+    }
+    return null;
+  }
+
+  /* Adds a message to a row, where the live pass puts its own: under the head,
+   * after any error already there. */
+  function anchor(row, text) {
+    if (!row) return;
+    var message = document.createElement("p");
+    message.className = "editor-row__error";
+    message.textContent = text;
+    var existing = row.querySelectorAll(":scope > .editor-row__error");
+    var after = existing.length
+      ? existing[existing.length - 1]
+      : row.querySelector(":scope > .editor-row__head");
+    if (after) after.insertAdjacentElement("afterend", message);
+    else row.appendChild(message);
+    row.classList.add("editor-row--error");
+  }
 
   function save() {
     var doc = currentDocument();
@@ -364,10 +452,21 @@
         })
         .then(function (result) {
           if (!result.ok) {
-            // The server refused it. Show its OperationOutcome, not our guess.
-            var issue = result.payload && result.payload.issue && result.payload.issue[0];
+            // The server refused it. Show its OperationOutcome, not our guess —
+            // and anchor each issue to its row exactly like live errors (#366).
+            // Rows still carry the live pass's error count, which this does not
+            // touch: a refused save must stay retryable once you fix the field.
+            var issues = (result.payload && result.payload.issue) || [];
+            issues.forEach(function (issue) {
+              var text =
+                issue.diagnostics || (issue.details && issue.details.text) || "";
+              expressionsOf(issue).forEach(function (expr) {
+                anchor(rowFor(expr), text);
+              });
+            });
+            var first = issues[0];
             say(
-              (issue && (issue.diagnostics || (issue.details && issue.details.text))) ||
+              (first && (first.diagnostics || (first.details && first.details.text))) ||
                 "",
               "error"
             );
