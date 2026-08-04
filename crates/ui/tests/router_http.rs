@@ -221,6 +221,8 @@ async fn compartments_degrade_to_a_warning_when_the_fetch_is_empty() {
         "default".to_string(),
         std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
         helios_fhir::FhirVersion::R4,
+        // No terminology server: this test is about the conformance fetch.
+        None,
     )
     .oneshot(
         Request::get("/ui/compartments")
