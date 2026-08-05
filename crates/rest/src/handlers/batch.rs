@@ -18,8 +18,9 @@ use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, ResourceStorage,
+    bundle_if_match_gate,
 };
-use helios_persistence::error::{StorageError, TransactionError};
+use helios_persistence::error::{ResourceError, StorageError, TransactionError};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -539,6 +540,57 @@ where
     }
 }
 
+/// Evaluates a batch entry's `ifMatch` precondition against stored state.
+///
+/// Returns `Some` when the entry must not proceed — either the 412 the gate
+/// produced, or a storage error rendered as an entry result. Returns `None`
+/// when there was no precondition to check, or it was satisfied.
+///
+/// `ifMatch` is a list, satisfied when any listed tag matches (#311), and `*`
+/// requires a current representation — so a supplied `ifMatch` against an
+/// absent or deleted resource fails rather than silently creating.
+///
+/// **This is a read-then-write check, not an atomic compare-and-swap.** The
+/// backends reach an atomic re-check through `update_with_match`, which lives on
+/// [`VersionedStorage`] — a trait the FHIR router does not bound `S` with, so
+/// this path cannot call it. The window is the same one `handlers::update`
+/// already carries for single-resource updates, with one addition worth naming:
+/// entries within a bundle now run concurrently, so two entries carrying
+/// `ifMatch` for the same id can both pass this gate and both write.
+///
+/// [`VersionedStorage`]: helios_persistence::core::VersionedStorage
+async fn check_entry_if_match<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    resource_type: &str,
+    id: &str,
+    if_match: Option<&str>,
+) -> Option<BundleEntryResult>
+where
+    S: ResourceStorage + Send + Sync,
+{
+    // Entries that send no precondition pay nothing — not even the read.
+    if_match?;
+
+    let current = match state
+        .storage()
+        .read(tenant.context(), resource_type, id)
+        .await
+    {
+        Ok(current) => current,
+        // A deleted resource has no current representation, which is a failed
+        // precondition rather than a storage error — the same mapping
+        // `handlers::update` and the backends' own batch arms make.
+        Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
+        Err(e) => {
+            let (status, message) = entry_error(e);
+            return Some(create_error_result(status, &message));
+        }
+    };
+
+    bundle_if_match_gate(if_match, current.as_ref().map(|r| r.version_id()))
+}
+
 /// Processes a single batch entry, returning a structured BundleEntryResult.
 async fn process_batch_entry<S>(
     state: &AppState<S>,
@@ -560,6 +612,7 @@ where
 
     let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let url = request.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let if_match = request.get("ifMatch").and_then(|v| v.as_str());
 
     // Parse the URL to extract resource type and ID
     let (resource_type, id) = match parse_request_url(url) {
@@ -653,6 +706,15 @@ where
                 }
             };
 
+            // Ahead of validation, because every backend evaluates `ifMatch`
+            // first: a stale precondition carrying an invalid body is a 412,
+            // not a 422.
+            if let Some(failure) =
+                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
+            {
+                return failure;
+            }
+
             // Write-path validation (per-entry outcome in batch semantics).
             if let Err(e) = state
                 .validation()
@@ -697,6 +759,14 @@ where
             }
         }
         "DELETE" => {
+            // Honour `ifMatch` on DELETE: a client asking to delete only the
+            // version it reviewed must not destroy a concurrent amendment.
+            if let Some(failure) =
+                check_entry_if_match(state, tenant, &resource_type, &id, if_match).await
+            {
+                return failure;
+            }
+
             // Delete operation
             match state
                 .storage()
