@@ -133,4 +133,41 @@ if [ "$FAILED" -eq 1 ]; then
     exit 1
 fi
 
+# Verify every resource the fixtures address by a concrete id is retrievable.
+#
+# A 2xx on the bundle POST is not proof the data landed where the tests expect.
+# The batch rewrite once relocated `Patient/85`, `/355`, `/907`, `/908` and
+# `/999` onto uuid ids: every POST still returned 2xx, resource counts were
+# unchanged, and Inferno still "passed" — because tests for a missing patient
+# *skip*, and the gate ignores skips (#491). This asserts the ids directly, so
+# that failure mode is loud instead of silent.
+#
+# Derived from the fixtures rather than hardcoded, so it keeps covering whatever
+# ids they use. Only `PUT Type/id` entries are checked: POST-created resources
+# get server-assigned ids that nothing addresses by name.
+echo ""
+echo "Verifying fixture-addressed resources are retrievable..."
+MISSING=0
+CHECKED=0
+for FILE in "$SCRIPT_DIR"/*.json; do
+    [ "$(jq -r '.type // empty' "$FILE")" = "transaction" ] || continue
+    while IFS= read -r URL; do
+        [ -n "$URL" ] || continue
+        CHECKED=$((CHECKED + 1))
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" "${HFS_URL}/${URL}")
+        if [ "$CODE" != "200" ]; then
+            echo "  MISSING: $URL (HTTP $CODE)"
+            MISSING=$((MISSING + 1))
+        fi
+    done <<EOF
+$(jq -r '.entry[]? | select(.request.method == "PUT" and (.request.url | test("^[A-Za-z]+/[^/?]+$"))) | .request.url' "$FILE" | sort -u)
+EOF
+done
+
+if [ "$MISSING" -gt 0 ]; then
+    echo "$MISSING of $CHECKED fixture-addressed resources are not retrievable"
+    exit 1
+fi
+echo "  All $CHECKED fixture-addressed resources retrievable"
+
 echo "All test data loaded successfully"
