@@ -446,7 +446,9 @@ The S3 backend is intentionally storage-focused (CRUD/version/history and `BulkS
 
 ### Primary/Secondary Role Matrix
 
-Backends can serve as primary (CRUD, versioning, transactions) or secondary (optimized for specific query patterns). When a secondary search backend is configured, the primary backend's search indexing is automatically disabled to avoid data duplication.
+Backends can serve as primary (CRUD, versioning, and — where the backend supports it — transactions) or secondary (optimized for specific query patterns). When a secondary search backend is configured, the primary backend's search indexing is automatically disabled to avoid data duplication.
+
+**Not every primary can offer transactions.** A FHIR `transaction` Bundle is all-or-nothing, which requires the primary to be able to unwind. SQLite and PostgreSQL provide it through `TransactionProvider`, and MongoDB through a server-side session transaction. S3 cannot: an object store has no atomic multi-object operation, so an S3-primary deployment declines transaction Bundles with 501 `not-supported` and advertises only `batch` in its CapabilityStatement (#489). This is the trait separation design discussion #28 describes — a backend without transaction support still handles batches, where entries are independent and partial success is the contract.
 
 | Configuration              | Primary    | Secondary              | Status                          | Use Case                                |
 | -------------------------- | ---------- | ---------------------- | ------------------------------- | --------------------------------------- |
@@ -459,8 +461,8 @@ Backends can serve as primary (CRUD, versioning, transactions) or secondary (opt
 | Cassandra + Elasticsearch  | Cassandra  | Elasticsearch (search) | Planned                         | Write-heavy + search                    |
 | MongoDB alone              | MongoDB    | —                      | ✓ Implemented                   | Document-centric                        |
 | MongoDB + Elasticsearch    | MongoDB    | Elasticsearch (search) | ✓ Implemented                   | Document-centric + offloaded search     |
-| S3 alone                   | S3         | —                      | ✓ Implemented (storage-focused) | Archival/history storage                |
-| S3 + Elasticsearch         | S3         | Elasticsearch (search) | ✓ Implemented                   | Large-scale + search                    |
+| S3 alone                   | S3         | —                      | ✓ Implemented (storage-focused, batch only) | Archival/history storage                |
+| S3 + Elasticsearch         | S3         | Elasticsearch (search) | ✓ Implemented (batch only, no transactions) | Large-scale + search                    |
 
 ### Backend Selection Guide
 
