@@ -1204,8 +1204,13 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             "transient",
             "The transaction could not be completed and was rolled back.".to_string(),
         ),
+        // 504, not 500: the backend is healthy and deliberately stopped work
+        // that exceeded its time budget. Kept in step with
+        // `From<TransactionError> for RestError`, so a transaction timeout
+        // reports the same status whether it surfaces through this bundle path
+        // or the single-resource one (issue #353).
         TransactionError::Timeout { timeout_ms } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::GATEWAY_TIMEOUT,
             "timeout",
             format!("Transaction timed out after {}ms", timeout_ms),
         ),
@@ -1442,9 +1447,11 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 "processing",
             ),
+            // 504 since #353 — a backend that stopped over-budget work is not
+            // reporting a server defect.
             (
                 TransactionError::Timeout { timeout_ms: 1500 },
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::GATEWAY_TIMEOUT,
                 "timeout",
             ),
             (
