@@ -389,7 +389,25 @@ pub enum BundleType {
     Batch,
 }
 
-/// Provider for FHIR bundle operations.
+/// Provider for FHIR `transaction` bundle operations.
+///
+/// # Why `batch` is not here
+///
+/// This trait once carried a `process_batch` sibling, implemented by all five
+/// backends and called by none of them: the REST layer runs its own entry loop
+/// (`helios_rest::handlers::batch`). That is not an oversight to be corrected
+/// by wiring the two together — batch requires two things this tier cannot see.
+/// Each entry is authorized individually against the request's SMART scopes,
+/// and each entry emits its own audit event; `POST [base]` has no other
+/// authorization gate, so moving execution down here would move the only check
+/// into a crate that has no notion of a principal.
+///
+/// A transaction has no such split, because it succeeds or fails as a unit and
+/// is scope-checked as a unit before it is handed over.
+///
+/// Five unreachable copies were deleted in #501 rather than left to accumulate
+/// fixes — #311's `ifMatch` handling had already landed in the half nothing
+/// calls, leaving the behaviour broken on the wire for two releases.
 #[async_trait]
 pub trait BundleProvider: ResourceStorage {
     /// Processes a transaction bundle (all-or-nothing).
@@ -413,28 +431,6 @@ pub trait BundleProvider: ResourceStorage {
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError>;
-
-    /// Processes a batch bundle (independent operations).
-    ///
-    /// Each entry is processed independently. Failures in one entry
-    /// do not affect other entries.
-    ///
-    /// # Arguments
-    ///
-    /// * `tenant` - The tenant context
-    /// * `entries` - The bundle entries to process
-    /// * `fhir_version` - The version created/updated resources are stamped
-    ///   with — the request's negotiated version (one bundle, one version)
-    ///
-    /// # Returns
-    ///
-    /// Results for each entry. Some may succeed while others fail.
-    async fn process_batch(
-        &self,
-        tenant: &TenantContext,
-        entries: Vec<BundleEntry>,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult>;
 }
 
 #[cfg(test)]

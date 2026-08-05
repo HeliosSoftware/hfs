@@ -14,7 +14,6 @@ use helios_persistence::core::bulk_submit::{
     BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
 };
 use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
-use helios_persistence::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
 use helios_persistence::core::{BackendCapability, ResourceStorage, VersionedStorage};
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -189,18 +188,15 @@ async fn test_aws_bundle_bulk_export_and_submit() {
     let backend = make_prefix_backend(format!("integration/{}/bulk", Uuid::new_v4()));
     let tenant = tenant("aws-tenant-b");
 
-    let entries = vec![BundleEntry {
-        method: BundleMethod::Post,
-        url: "Patient".to_string(),
-        resource: Some(json!({"resourceType":"Patient","id":format!("b-{}", Uuid::new_v4())})),
-        ..Default::default()
-    }];
-    let bundle = backend
-        .process_batch(&tenant, entries, FhirVersion::default())
+    // Seeded through `ResourceStorage` directly: this test's subject is the
+    // export/submit feed, not bundle processing. It previously seeded via
+    // `BundleProvider::process_batch`, which #501 removed as unreachable.
+    let patient = json!({"resourceType": "Patient", "id": format!("b-{}", Uuid::new_v4())});
+    let stored = backend
+        .create(&tenant, "Patient", patient, FhirVersion::default())
         .await
         .unwrap();
-    assert_eq!(bundle.entries.len(), 1);
-    assert_eq!(bundle.entries[0].status, 201);
+    assert_eq!(stored.resource_type(), "Patient");
 
     // S3 no longer implements `BulkExportStorage` (job state lives in
     // SQLite/Postgres); only `ExportDataProvider` remains. Verify the data

@@ -1707,30 +1707,6 @@ impl BundleProvider for CompositeStorage {
 
         Ok(result)
     }
-
-    async fn process_batch(
-        &self,
-        tenant: &TenantContext,
-        entries: Vec<BundleEntry>,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult> {
-        let provider = self.bundle_provider.as_ref().ok_or_else(|| {
-            StorageError::Backend(BackendError::UnsupportedCapability {
-                backend_name: "composite".to_string(),
-                capability: "BundleProvider".to_string(),
-            })
-        })?;
-
-        let result = provider
-            .process_batch(tenant, entries, fhir_version)
-            .await?;
-
-        // Sync successful entries to secondaries
-        self.sync_bundle_results(tenant, &result, fhir_version)
-            .await;
-
-        Ok(result)
-    }
 }
 
 #[async_trait]
@@ -3685,23 +3661,6 @@ mod tests {
         match result.unwrap_err() {
             StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
                 assert!(capability.contains("InstanceHistoryProvider"));
-            }
-            other => panic!("unexpected error: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_bundle_provider_process_batch_no_capability() {
-        use crate::core::BundleProvider;
-        let composite = make_composite_no_secondary();
-        let tenant = make_tenant();
-        let result = composite
-            .process_batch(&tenant, vec![], helios_fhir::FhirVersion::default())
-            .await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            StorageError::Backend(BackendError::UnsupportedCapability { capability, .. }) => {
-                assert!(capability.contains("BundleProvider"));
             }
             other => panic!("unexpected error: {:?}", other),
         }

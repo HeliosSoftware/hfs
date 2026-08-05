@@ -1057,16 +1057,17 @@ cargo test -p helios-persistence --test s3_tests --features s3
 - [x] TransactionProvider implementation
 - [x] Conditional operations (conditional create/update/delete)
 
-#### Transaction & Batch Support ◐
+#### Transaction Support ◐
 
-FHIR [transaction](https://build.fhir.org/http.html#transaction) and [batch](https://build.fhir.org/http.html#batch) bundle processing.
+FHIR [transaction](https://build.fhir.org/http.html#transaction) bundle processing, via `BundleProvider`.
 
 > **Backend Support:** Transaction bundles require ACID support. SQLite supports transactions. Cassandra, Elasticsearch, and S3 do not support transactions (batch only). See the capability matrix above.
+
+> **Where batch lives:** [batch](https://build.fhir.org/http.html#batch) Bundles are *not* processed by this crate. Each entry is authorized individually against the request's SMART scopes and emits its own audit event, neither of which the persistence tier can see, so the REST layer executes entries directly against `ResourceStorage` — with bounded concurrency taken from `bulk_write_concurrency()`. `BundleProvider` carried an unreachable `process_batch` until #501 removed it. Batch therefore works on **every** backend that implements `ResourceStorage`, independent of transaction support.
 
 **Implemented Features:**
 
 - [x] **Transaction bundles** - Atomic all-or-nothing processing with automatic rollback on failure
-- [x] **Batch bundles** - Independent entry processing (failures don't affect other entries)
 - [x] **Processing order** - Entries processed per FHIR spec: DELETE → POST → PUT/PATCH → GET
 - [x] **Reference resolution** - `urn:uuid:` references automatically resolved to assigned IDs after creates
 - [x] **fullUrl support** - Track temporary identifiers for intra-bundle references

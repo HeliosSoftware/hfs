@@ -2616,18 +2616,6 @@ impl BundleProvider for MongoBackend {
             entries: results,
         })
     }
-
-    async fn process_batch(
-        &self,
-        _tenant: &TenantContext,
-        _entries: Vec<BundleEntry>,
-        _fhir_version: helios_fhir::FhirVersion,
-    ) -> StorageResult<BundleResult> {
-        Err(StorageError::Backend(BackendError::UnsupportedCapability {
-            backend_name: "mongodb".to_string(),
-            capability: "BundleProvider".to_string(),
-        }))
-    }
 }
 
 impl MongoBackend {
