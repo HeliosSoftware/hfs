@@ -186,9 +186,25 @@ jobs:
           BIN=$(ls -t target/debug/deps/helios_rest-* 2>/dev/null | grep -v '\.d$' | head -1)
           echo "binary: $BIN"
           ls -l "$BIN"
-          echo "=== segment map (segname / vmaddr / vmsize) ==="
-          # macOS awk has no strtonum, so print raw and total it off-box.
-          otool -l "$BIN" | grep -E "^ *(segname|vmaddr|vmsize)" | head -30
+          # Full segment map with computed top addresses, for EVERY helios_rest
+          # binary present — a baseline and a post-#509 build have different
+          # metadata hashes, so both can coexist and be compared side by side.
+          #
+          # The previous run truncated at head -30 and so missed __LINKEDIT. That
+          # mattered: __TEXT/__DATA_CONST/__DATA topped out at ~0x13f760000, well
+          # under the 0x180000000 shared-cache base, so they are NOT what collides.
+          # With 1.7M symbols __LINKEDIT is the large one, and it is mapped too.
+          # macOS awk has no strtonum, but bash arithmetic takes 0x literals.
+          for B in $(ls target/debug/deps/helios_rest-* 2>/dev/null | grep -v '\.d$'); do
+            echo "### $B  ($(stat -f%z "$B") bytes)"
+            otool -l "$B" \
+              | awk '/^ *segname/{s=$2} /^ *vmaddr/{a=$2} /^ *vmsize/{if(a!=""){print s, a, $2; a=""}}' \
+              | while read -r seg addr size; do
+                  printf '  %-14s vmaddr=%#018x vmsize=%13d  top=%#x\n' \
+                    "$seg" "$((addr))" "$((size))" "$((addr + size))"
+                done
+            echo "  --- shared cache base on arm64 is 0x180000000; a top past it is the collision ---"
+          done
           echo "=== does it load? ==="
           "$BIN" --list | head -3
           echo "PROBE E rc=$?"
