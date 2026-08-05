@@ -404,8 +404,13 @@ where
                 // URL format instead. Decline here, before anything executes, so
                 // the bundle is declined intact (#503).
                 //
-                // GET is exempt: those URLs are searches, resolved by the REST
-                // layer rather than by a backend `parse_url` (#478).
+                // GET is exempt — but not because this path resolves searches.
+                // It does not: a GET entry still reaches the backend's
+                // `parse_url`, and a query-bearing one still fails there. The
+                // exemption keeps this guard off the arm #478 is rewriting, so
+                // that work lands on an untouched dispatch path instead of
+                // merging against a refusal it is about to replace.
+                //
                 // `ifNoneExist` is left alone too — MongoDB resolves it inside
                 // the session, so refusing it here would remove a working,
                 // atomic feature. Resolving URL criteria within a transaction's
