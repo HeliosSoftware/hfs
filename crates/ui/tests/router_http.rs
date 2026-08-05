@@ -204,6 +204,38 @@ async fn search_parameters_selection_renders_the_detail_panel() {
     assert!(html.contains("Patient.name"));
 }
 
+/// #320: when the conformance self-fetch yields nothing (an outage, or auth
+/// without an outbound service token), the compartments page degrades to a
+/// warning — it must not 404.
+#[tokio::test]
+async fn compartments_degrade_to_a_warning_when_the_fetch_is_empty() {
+    let response = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        // No terminology server: this test is about the conformance fetch.
+        None,
+    )
+    .oneshot(
+        Request::get("/ui/compartments")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+    assert!(html.contains("<!doctype html>"));
+}
+
 #[tokio::test]
 async fn compartments_page_defaults_to_patient() {
     let response = app()
