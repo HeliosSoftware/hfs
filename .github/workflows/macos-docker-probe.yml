@@ -29,6 +29,11 @@ on:
 
 env:
   DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+  # MUST match ci.yml's workflow-level env. Without it the probe built with
+  # debuginfo on while the real Test Rust job builds with it off, so the two
+  # produced different artifacts and the sizes were not comparable — the earlier
+  # 2.23 GiB reading was a debuginfo build, not the binary CI actually fails on.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   probe:
@@ -183,7 +188,18 @@ jobs:
         run: |
           set -uo pipefail
           cargo test -p helios-rest --lib --all-features --no-run 2>&1 | tail -5
-          BIN=$(ls -t target/debug/deps/helios_rest-* 2>/dev/null | grep -v '\.d$' | head -1)
+          # No `ls | grep | head` here: GitHub runs this shell with -e -o pipefail,
+          # and head -1 closing the pipe early sends SIGPIPE to grep, which failed
+          # the whole step before it printed anything (runs 31034309580, 31035937480).
+          # Glob and filter in-shell instead — no pipeline, nothing to break.
+          shopt -s nullglob
+          BIN=""
+          for f in target/debug/deps/helios_rest-*; do
+            case "$f" in *.d) continue;; esac
+            [ -x "$f" ] || continue
+            BIN="$f"
+          done
+          if [ -z "$BIN" ]; then echo "::error::no helios_rest test binary found"; exit 1; fi
           echo "binary: $BIN"
           ls -l "$BIN"
           # Full segment map with computed top addresses, for EVERY helios_rest
@@ -205,9 +221,18 @@ jobs:
                 done
             echo "  --- shared cache base on arm64 is 0x180000000; a top past it is the collision ---"
           done
+          # `if` guards this against -e, and captures the real exit status rather
+          # than head's (the old `"$BIN" --list | head -3; echo rc=$?` reported the
+          # wrong process's status entirely).
           echo "=== does it load? ==="
-          "$BIN" --list | head -3
-          echo "PROBE E rc=$?"
+          if "$BIN" --list > "$RUNNER_TEMP/list.out" 2>&1; then
+            echo "PROBE E: LOADED OK"
+            head -3 "$RUNNER_TEMP/list.out"
+          else
+            rc=$?
+            echo "PROBE E: ABORTED rc=$rc"
+            cat "$RUNNER_TEMP/list.out"
+          fi
 
       - name: Summary
         if: always()
