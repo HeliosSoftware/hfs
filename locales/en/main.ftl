@@ -85,14 +85,14 @@ nav-resource-editor = Resource Editor
 nav-history-versions = History & Versions
 nav-compartments = Compartments
 nav-batch-transaction = Batch / Transaction
-nav-bulk-export = Bulk Export
+nav-import = Import
+nav-export = Export
 nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capability & Conformance
 nav-search-parameters = Search Parameters
 nav-admin-ops = Admin / Ops
 nav-subscriptions = Subscriptions
 nav-tenants = Tenants
-nav-toggle = Collapse or expand the navigation
 
 ## Tenant maintenance (/ui/tenants)
 
@@ -206,7 +206,7 @@ queries-unavailable = Saved queries are unavailable: this server's storage backe
 ## SearchParameter viewer (#238)
 
 sp-heading = Search parameters
-sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Spec parameters are read-only; tenant-scoped editing arrives once search parameters live in storage.
+sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
 sp-spec-missing = The full spec bundle (search-parameters-*.json) was not found in the data directory — only the minimal embedded fallback parameters are shown.
 sp-rail-label = Resource filter
@@ -252,7 +252,15 @@ sp-note-shadowed = Shadowed by { $url } on (base, code): a higher-precedence sou
 sp-note-empty-expression = Empty expression: the extractor indexes zero rows, so every search on this parameter silently returns empty.
 sp-note-no-target = Reference parameter with no target types: chained search cannot resolve the referenced type.
 sp-note-choice-type = Choice-type expression: the extractor rewrites ofType(T) / as T to the concrete element (for example valueQuantity) before evaluating against raw stored JSON.
-sp-writes-pending = Creating, overriding, and deleting tenant parameters lands once search parameters are stored in the database (#235).
+sp-new = New search parameter
+sp-edit = Edit
+sp-delete = Delete
+sp-delete-confirm = Delete this stored search parameter? Searches that use it stop matching once the registry refreshes.
+cmp-new = New compartment definition
+cmp-edit = Edit
+cmp-delete = Delete
+cmp-delete-confirm = Delete this compartment definition? Its compartment routes stop resolving.
+crud-delete-failed = Delete failed
 
 ## Compartment viewer & tester (#237)
 
@@ -260,7 +268,8 @@ cmp-heading = Compartments
 cmp-lede = The compartment definitions this server routes /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"} requests with, and a tester that answers: is this type in this compartment, via which parameters, and what search does the server run?
 cmp-rail-label = Compartment definitions
 cmp-rail-heading = Compartments
-cmp-rail-note = Base definitions ship with the server (codegen'd from the FHIR spec). Editing them implies a tenant-scoped override layer — open question on the issue.
+cmp-degraded = Compartment definitions could not be loaded from this server right now — the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+cmp-rail-note = Definitions are stored resources, seeded from the FHIR spec at startup. Edits and deletions here are tenant-scoped.
 cmp-tabs-label = Compartment sections
 cmp-tab-definition = Definition
 cmp-tab-members = Members

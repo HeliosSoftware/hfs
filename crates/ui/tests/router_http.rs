@@ -63,23 +63,21 @@ async fn index_serves_the_full_landing_page() {
 }
 
 #[tokio::test]
-async fn page_wires_the_collapsible_nav() {
+async fn page_wires_the_hover_rail_nav() {
     let response = app()
         .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
         .await
         .unwrap();
     let html = body_text(response).await;
 
-    // The first-paint script is loaded (non-deferred, in <head>).
-    assert!(html.contains(r#"src="/ui/assets/nav.js""#));
-    // The toggle is a real, accessible button controlling the sidebar.
-    assert!(html.contains("data-toggle-nav"));
-    assert!(html.contains(r#"aria-controls="sidebar""#));
-    assert!(html.contains("aria-expanded"));
-    // Labels are wrapped so the collapsed rail can hide them (a11y-safe).
+    // The rail expands on hover (#438): no toggle button, no state script.
+    assert!(!html.contains("nav.js"));
+    assert!(!html.contains("data-toggle-nav"));
+    // Labels are wrapped so the resting rail can hide them (a11y-safe).
     assert!(html.contains("nav-item__label"));
-    // The sidebar is addressable by the toggle's aria-controls.
-    assert!(html.contains(r#"id="sidebar""#));
+    // The Batch & Data entries from the design: Import and Export.
+    assert!(html.contains("Import"));
+    assert!(html.contains("Export"));
 }
 
 #[tokio::test]
@@ -204,6 +202,38 @@ async fn search_parameters_selection_renders_the_detail_panel() {
     assert!(html.contains(r#"aria-selected="true""#));
     // The detail panel shows the FHIRPath expression of the spec parameter.
     assert!(html.contains("Patient.name"));
+}
+
+/// #320: when the conformance self-fetch yields nothing (an outage, or auth
+/// without an outbound service token), the compartments page degrades to a
+/// warning — it must not 404.
+#[tokio::test]
+async fn compartments_degrade_to_a_warning_when_the_fetch_is_empty() {
+    let response = helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        None,
+        "default".to_string(),
+        std::sync::Arc::new(helios_ui::StaticConformanceSource::empty()),
+        helios_fhir::FhirVersion::R4,
+        // No terminology server: this test is about the conformance fetch.
+        None,
+    )
+    .oneshot(
+        Request::get("/ui/compartments")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+    assert!(html.contains("<!doctype html>"));
 }
 
 #[tokio::test]

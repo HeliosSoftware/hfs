@@ -196,6 +196,7 @@ impl ElasticsearchBackend {
 
     /// Creates a new Elasticsearch backend with the given configuration.
     pub fn new(config: ElasticsearchConfig) -> StorageResult<Self> {
+        Self::validate_config(&config)?;
         let client = Self::build_client(&config)?;
 
         // Standalone ES has no store of its own, so tenants have no overlay:
@@ -240,6 +241,7 @@ impl ElasticsearchBackend {
         config: ElasticsearchConfig,
         registries: Arc<TenantSearchRegistries>,
     ) -> StorageResult<Self> {
+        Self::validate_config(&config)?;
         let client = Self::build_client(&config)?;
 
         Ok(Self {
@@ -325,14 +327,43 @@ impl ElasticsearchBackend {
         SearchParameterExtractor::new(self.registries.for_tenant(tenant_id))
     }
 
+    /// Validates configuration that the index-name legality proof depends on.
+    ///
+    /// [`super::naming`] guarantees the *tenant segment* is Elasticsearch-legal,
+    /// but two of Elasticsearch's rules constrain the name as a whole: it must
+    /// not begin with `-`, `_` or `+`, and must not be `.` or `..`. Both are
+    /// discharged by the index prefix, since the prefix always comes first — so
+    /// the prefix itself has to be well-formed. Checked once here rather than on
+    /// every derivation.
+    fn validate_config(config: &ElasticsearchConfig) -> StorageResult<()> {
+        super::naming::validate_index_prefix(&config.index_prefix).map_err(|message| {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name: "elasticsearch".to_string(),
+                message,
+                source: None,
+            })
+        })
+    }
+
     /// Returns the index name for a tenant and resource type.
+    ///
+    /// Delegates to [`naming::index_name`](super::naming::index_name), the single
+    /// injective tenant → index derivation in this backend. It used to lowercase
+    /// the tenant id inline, which made tenants `ACME` and `acme` share an index
+    /// and every `_id`-addressed write cross the tenant boundary (issue #384).
     pub fn index_name(&self, tenant_id: &str, resource_type: &str) -> String {
-        format!(
-            "{}_{}_{}",
-            self.config.index_prefix,
-            tenant_id.to_lowercase(),
-            resource_type.to_lowercase()
-        )
+        super::naming::index_name(&self.config.index_prefix, tenant_id, resource_type)
+    }
+
+    /// Returns the glob matching every index belonging to `tenant_id`.
+    ///
+    /// Shares [`index_name`](Self::index_name)'s encoder by construction, so the
+    /// glob can never stop matching the indices that exist. Four call sites used
+    /// to hand-roll `format!("{prefix}_{tenant.to_lowercase()}_*")` instead; if
+    /// one of them had drifted from the exact name, `purge_tenant_data` would
+    /// have deleted nothing while reporting success.
+    pub(crate) fn tenant_index_pattern(&self, tenant_id: &str) -> String {
+        super::naming::tenant_index_pattern(&self.config.index_prefix, tenant_id)
     }
 
     /// Returns the ES document ID for a resource.
@@ -626,23 +657,67 @@ mod tests {
         assert_eq!(config.nodes, vec!["http://localhost:9200"]);
     }
 
+    /// The method-level view of the injective derivation. The exhaustive
+    /// property tests (injectivity over an adversarial corpus, Elasticsearch
+    /// legality, round-tripping, glob/name agreement) live in
+    /// [`super::super::naming`]; this asserts only that the backend method is
+    /// actually wired to them.
+    ///
+    /// The test this replaces asserted `index_name("ACME", …) == "hfs_acme_…"`
+    /// — i.e. it pinned the #384 defect as intended behaviour.
     #[test]
-    fn test_index_name() {
+    fn index_name_delegates_to_the_injective_derivation() {
         let config = ElasticsearchConfig::default();
         let backend = ElasticsearchBackend::new(config).unwrap();
+        // Identity on an already-safe id: conforming deployments see no rename.
         assert_eq!(backend.index_name("acme", "Patient"), "hfs_acme_patient");
-        assert_eq!(
+        // Case variants must NOT share an index (issue #384).
+        assert_ne!(
             backend.index_name("ACME", "Observation"),
-            "hfs_acme_observation"
+            backend.index_name("acme", "Observation")
+        );
+        // The glob is derived from the same encoder as the exact name.
+        assert_eq!(backend.tenant_index_pattern("acme"), "hfs_acme_*");
+        assert_ne!(
+            backend.tenant_index_pattern("ACME"),
+            backend.tenant_index_pattern("acme")
         );
     }
 
+    /// `document_id` deliberately carries **no** tenant component, and this test
+    /// is the alarm if someone adds one.
+    ///
+    /// It is unnecessary: an Elasticsearch `_id` is unique only within its index,
+    /// and an injective `index_name` means every index belongs to exactly one
+    /// tenant — so no two tenants can ever contend for an `_id`. It would also be
+    /// actively harmful: changing `_id` changes the address of every document in
+    /// every deployment, including the conforming ones, and because `delete`
+    /// removes only the new `_id`, pre-upgrade documents would linger as
+    /// permanently-undeletable duplicate search hits. Issue #384 proposes this
+    /// change; it was considered and rejected for those reasons.
     #[test]
-    fn test_document_id() {
+    fn document_id_carries_no_tenant_component() {
         assert_eq!(
             ElasticsearchBackend::document_id("Patient", "123"),
             "Patient_123"
         );
+    }
+
+    /// The prefix is what keeps an index name from starting with a character
+    /// Elasticsearch reserves, so a bad one must fail at construction rather than
+    /// on the first write.
+    #[test]
+    fn construction_rejects_an_index_prefix_that_breaks_name_legality() {
+        for bad in ["", "_hfs", "-hfs", "+hfs", "HFS", "hfs/prod"] {
+            let config = ElasticsearchConfig {
+                index_prefix: bad.to_string(),
+                ..ElasticsearchConfig::default()
+            };
+            assert!(
+                ElasticsearchBackend::new(config).is_err(),
+                "index prefix {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
