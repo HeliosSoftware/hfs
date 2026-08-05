@@ -8,6 +8,9 @@
 <section class="page-head">
   <h1 class="page-head__title">{{ i18n.t("cmp-heading") }}</h1>
   <p class="page-head__lede">{{ i18n.t("cmp-lede") }}</p>
+  <div class="page-head__actions">
+    <a class="btn btn--primary" href="/ui/editor?type=CompartmentDefinition">{{ i18n.t("cmp-new") }}</a>
+  </div>
   {% if view.versions.len() > 1 %}
   <nav class="version-switch" aria-label="{{ i18n.t("sp-version-label") }}">
     {% for v in view.versions %}
@@ -44,10 +47,9 @@
 
     <section class="card panel">
       {% if view.tab == "definition" %}
-      <!-- Definition: read-only metadata. The base definitions are codegen'd
-           into the binary; an editor implies the override layer of issue
-           question 1, so every field states its value instead of inviting
-           an edit that cannot persist. -->
+      <!-- Definition metadata. Definitions the server stores (they carry an
+           id) can be edited in the schema-driven editor or deleted; ones it
+           synthesizes without an id stay read-only. -->
       <div class="kv-grid">
         <div class="detail__field"><span>{{ i18n.t("cmp-field-code") }}</span><div>{{ view.def.code }}</div></div>
         <div class="detail__field"><span>{{ i18n.t("cmp-field-status") }}</span><div>{{ view.def.status }}</div></div>
@@ -67,7 +69,18 @@
           <div>{% if view.def.experimental %}{{ i18n.t("cmp-yes") }}{% else %}{{ i18n.t("cmp-no") }}{% endif %}</div>
         </div>
       </div>
+      {% if !view.def.id.is_empty() %}
+      <div class="detail__actions">
+        <a class="btn" href="/ui/editor?type=CompartmentDefinition&id={{ view.def.id }}">{{ i18n.t("cmp-edit") }}</a>
+        <button type="button" class="btn btn--danger" data-crud-delete
+                data-type="CompartmentDefinition" data-id="{{ view.def.id }}"
+                data-confirm="{{ i18n.t("cmp-delete-confirm") }}"
+                data-failed="{{ i18n.t("crud-delete-failed") }}"
+                data-redirect="/ui/compartments?refresh=1">{{ i18n.t("cmp-delete") }}</button>
+      </div>
+      {% else %}
       <p class="detail__hint">{{ i18n.t("cmp-readonly-note") }}</p>
+      {% endif %}
 
       {% else if view.tab == "members" %}
       <div class="facets facets--bare">
@@ -149,4 +162,6 @@
     </section>
   </div>
 </div>
+
+<script src="/ui/assets/conformance-crud.js" defer></script>
 {% endblock %}

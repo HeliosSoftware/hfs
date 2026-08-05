@@ -30,8 +30,42 @@ Use this when working in `helios-subscriptions`, the FHIR topic-based Subscripti
 | `HFS_SUBSCRIPTION_MESSAGING_ENABLED` | Enable the messaging channel |
 | `HFS_SUBSCRIPTION_ALLOW_PRIVATE_ENDPOINTS` | Allow rest-hook delivery to private/loopback URLs (opt-in) |
 | `HFS_BASE_URL` | Base URL used in notification links |
+| `HFS_SUBSCRIPTION_PERSIST_STATUS` | Write server-driven status transitions back into the stored `Subscription` (default `true`) |
+| `HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS` | Per-write timeout for that write-back (default `5000`) |
+| `HFS_SUBSCRIPTION_REHYDRATE` | Replay stored topics/subscriptions into the engine at startup (default `true`) |
+| `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE` | Re-run activation for stored `requested`/`error` subscriptions (default `true`) |
+| `HFS_SUBSCRIPTION_REHYDRATE_HANDSHAKE_CONCURRENCY` | Cap on concurrent startup handshakes (default `8`) |
+| `HFS_SUBSCRIPTION_REHYDRATE_BATCH_SIZE` | Resources fetched per storage round-trip during rehydration (default `500`) |
 
 Exact defaults are read in `crates/rest/src/lib.rs` and `crates/subscriptions/src/config.rs`.
+
+## Status persistence (issue #357)
+
+Server-driven status transitions (`requested` → `active` after a successful
+handshake, `→ error`, `→ off` when the delivery circuit breaker trips) are
+written back into the stored `Subscription` resource through the ordinary
+`ResourceStorage::update`, so the behaviour is identical on SQLite, PostgreSQL,
+MongoDB, S3, and composite deployments with no schema change.
+
+Things to know when working here:
+
+- The write happens only when `SubscriptionManager::update_status` accepts the
+  transition, so it is bounded to at most three writes per subscription
+  lifetime. `SubscriptionEngine::transition_status` is the single choke point —
+  do not call `manager.update_status` directly from the engine.
+- It **bumps `meta.versionId`** and appends to `_history`, so a client holding
+  an ETag from its own POST can see `412` on a later `If-Match` write. That is
+  correct optimistic-locking behaviour, not a bug.
+- It fails **open**: a storage error leaves the in-memory transition in place
+  and logs at `error`. Grep for `Failed to persist subscription status
+  transition` to spot a server that has silently reverted to losing its
+  decisions on restart.
+- `off` and `entered-in-error` are terminal and are rehydrated **dormant**
+  (registered so `$status` still answers, never matched, never handshaken).
+  `error` is re-activated on restart, because nothing else ever performs
+  `error` → `active`.
+- `$status` / `$events` fall back to the stored resource when the engine does
+  not hold the subscription, instead of `404`.
 
 ## Key API
 

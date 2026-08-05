@@ -8,6 +8,9 @@
 <section class="page-head">
   <h1 class="page-head__title">{{ i18n.t("sp-heading") }}</h1>
   <p class="page-head__lede">{{ i18n.t("sp-lede") }}</p>
+  <div class="page-head__actions">
+    <a class="btn btn--primary" href="/ui/editor?type=SearchParameter">{{ i18n.t("sp-new") }}</a>
+  </div>
   {% if view.versions.len() > 1 %}
   <nav class="version-switch" aria-label="{{ i18n.t("sp-version-label") }}">
     {% for v in view.versions %}
@@ -140,6 +143,18 @@
     {% if d.source == "embedded" %}
     <p class="detail__hint">{{ i18n.t("sp-detail-readonly") }}</p>
     {% endif %}
+    {% if d.source == "stored" %}
+    {% if let Some(rid) = d.resource_id %}
+    <div class="detail__actions">
+      <a class="btn" href="/ui/editor?type=SearchParameter&id={{ rid }}">{{ i18n.t("sp-edit") }}</a>
+      <button type="button" class="btn btn--danger" data-crud-delete
+              data-type="SearchParameter" data-id="{{ rid }}"
+              data-confirm="{{ i18n.t("sp-delete-confirm") }}"
+              data-failed="{{ i18n.t("crud-delete-failed") }}"
+              data-redirect="/ui/search-parameters?refresh=1">{{ i18n.t("sp-delete") }}</button>
+    </div>
+    {% endif %}
+    {% endif %}
     <div class="detail__field"><span>{{ i18n.t("sp-field-url") }}</span><code>{{ d.url }}</code></div>
     <div class="detail__field"><span>{{ i18n.t("sp-field-name") }}</span><div>{{ d.name }}</div></div>
     <div class="detail__field"><span>{{ i18n.t("sp-col-type") }}</span><div><span class="tag tag--type">{{ d.type_label }}</span></div></div>
@@ -189,9 +204,9 @@
     <h2 class="detail__title">{{ i18n.t("sp-detail-empty") }}</h2>
     <p class="detail__hint">{{ i18n.t("sp-detail-empty-hint") }}</p>
     {% endif %}
-    <p class="detail__hint">{{ i18n.t("sp-writes-pending") }}</p>
   </aside>
 </div>
 
 <script src="/ui/assets/resource-filter.js" defer></script>
+<script src="/ui/assets/conformance-crud.js" defer></script>
 {% endblock %}

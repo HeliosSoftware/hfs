@@ -42,24 +42,39 @@
 //!
 //! | Stored status | Action | Why |
 //! |---|---|---|
-//! | `off` | skipped entirely | Terminal: `can_transition_to` permits no target, so a registered `off` subscription could never legally become useful. |
-//! | `active` | registered, no handshake | The handshake completed in a previous process lifetime; re-sending it is noise. |
-//! | `error` | registered, no handshake | Never matches (only `Active` does), but registering keeps `$status` honest instead of reporting an unknown subscription. |
 //! | `requested` | registered **and activated** | The spec state for "server has not yet activated"; runs the same activation path the write handler runs. |
+//! | `active` | registered, no handshake | The handshake completed in a previous process lifetime; re-sending it is noise. |
+//! | `error` | registered **and activated** | Nothing in the engine performs `error` → `active` while a subscription is dormant, so re-running activation here is its only recovery path. |
+//! | `off` | registered, dormant | Terminal. Registered so `$status` keeps answering; never handshaken, never matched. |
+//! | `entered-in-error` | registered, dormant | Client-retracted. Same treatment as `off`. |
 //!
-//! Activating `requested` subscriptions is not an optional nicety. Subscription
-//! status transitions are held **in memory only** —
-//! [`crate::manager::SubscriptionManager::update_status`] never writes back to
-//! storage — so a subscription that a client POSTed as `requested` and that
-//! handshook successfully still reads `"requested"` from the database forever.
-//! Rehydrating only `active` resources would therefore miss essentially every
-//! subscription the server itself activated, and would not fix the reported
-//! symptom at all.
+//! Two of those rows changed with #357, and both changes exist to stop a
+//! *persisted* status from being worse than the volatile one it replaced.
+//!
+//! `off` used to be skipped outright on the reasoning that a terminal status
+//! could never become useful again. That was defensible only while the status
+//! was volatile. Now that the delivery circuit breaker's decision survives a
+//! restart, skipping would mean an `off` subscription is absent from the engine
+//! forever — and `$status` answers `404` for a resource that reads back `200`
+//! from `GET /Subscription/{id}`. Registering it dormant costs one map entry and
+//! keeps the two endpoints telling the same story. It cannot leak delivery:
+//! [`crate::manager::SubscriptionManager::active_subscriptions_for_topic`]
+//! selects only `active`.
+//!
+//! `error` is now re-activated rather than left dormant, for the mirror reason.
+//! A dormant `error` subscription is never dispatched to, so it never succeeds,
+//! so nothing ever resets it — before #357 the *loss* of the status on restart
+//! was what quietly recovered it. Persisting `error` without re-running
+//! activation would have converted a transient subscriber outage into permanent
+//! silent death. Re-running it preserves the recovery a restart always gave,
+//! now explicitly rather than by accident.
 //!
 //! The cost is that a restart re-handshakes those subscriptions. That is bounded
 //! by [`RehydrationConfig::max_concurrent_handshakes`], and can be turned off
 //! with [`RehydrationConfig::handshake_requested`] by operators who would rather
-//! bring subscriptions back with no outbound traffic.
+//! bring subscriptions back with no outbound traffic. The population is much
+//! smaller than it used to be: with status write-back enabled, a subscription
+//! the server activated now reads back `active` and is not handshaken again.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -104,13 +119,16 @@ pub struct RehydrationConfig {
     /// batch is held at a time regardless of how many resources exist.
     pub batch_size: u32,
 
-    /// Whether stored `requested` subscriptions are activated (handshaked)
-    /// during rehydration.
+    /// Whether stored `requested` and `error` subscriptions are activated
+    /// (handshaked) during rehydration.
     ///
-    /// Defaults to `true` because status transitions are not persisted, so most
-    /// live subscriptions read back as `requested` — see the module docs. Set to
-    /// `false` to rehydrate with no outbound traffic at all, accepting that
-    /// `requested` subscriptions stay inert until they are re-written.
+    /// Defaults to `true`. With status write-back enabled (#357) this is no
+    /// longer the bulk-reactivation path it once was — a subscription the server
+    /// activated reads back `active` and is skipped — but it remains the only
+    /// recovery an `error` subscription has, and the only way a subscription
+    /// that died mid-handshake ever leaves `requested`. Set to `false` to
+    /// rehydrate with no outbound traffic at all, accepting that those two
+    /// populations stay inert until the resource is re-written.
     pub handshake_requested: bool,
 
     /// Maximum handshakes in flight at once, across all tenants.
@@ -149,8 +167,16 @@ pub struct RehydrationReport {
     pub subscriptions_registered: usize,
     /// Subscriptions that failed to register (unknown topic, bad channel, …).
     pub subscriptions_failed: usize,
-    /// Subscriptions skipped because their stored status is `off`.
-    pub subscriptions_skipped: usize,
+    /// Subscriptions registered in a terminal status (`off`, `entered-in-error`).
+    ///
+    /// They are counted in [`subscriptions_registered`](Self::subscriptions_registered)
+    /// too: they *are* registered, so `$status` answers for them, but they are
+    /// never handshaken and never matched against an event.
+    ///
+    /// Before #357 an `off` subscription was skipped outright and never entered
+    /// the engine at all, which made `$status` answer `404` for it after every
+    /// restart — a worse answer than the stale one it replaced.
+    pub subscriptions_dormant: usize,
     /// Subscriptions handed to the activation (handshake) path.
     pub handshakes_started: usize,
     /// Storage errors encountered while paging. A non-zero value means the pass
@@ -173,7 +199,7 @@ impl RehydrationReport {
         self.topics_failed += other.topics_failed;
         self.subscriptions_registered += other.subscriptions_registered;
         self.subscriptions_failed += other.subscriptions_failed;
-        self.subscriptions_skipped += other.subscriptions_skipped;
+        self.subscriptions_dormant += other.subscriptions_dormant;
         self.handshakes_started += other.handshakes_started;
         self.storage_errors += other.storage_errors;
     }
@@ -355,7 +381,7 @@ impl SubscriptionEngine {
                 tenants = report.tenants,
                 topics = report.topics_registered,
                 subscriptions = report.subscriptions_registered,
-                skipped = report.subscriptions_skipped,
+                dormant = report.subscriptions_dormant,
                 failed = report.subscriptions_failed,
                 handshakes = report.handshakes_started,
                 "Subscription engine rehydrated"
@@ -576,22 +602,6 @@ impl SubscriptionEngine {
                     continue;
                 };
 
-                // `off` is terminal — `can_transition_to` permits no target from
-                // it — so registering one could never lead anywhere useful.
-                let stored_status = resource
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .and_then(SubscriptionStatusCode::from_fhir_str);
-                if stored_status == Some(SubscriptionStatusCode::Off) {
-                    debug!(
-                        tenant = tenant_id,
-                        subscription_id = id,
-                        "Skipping `off` subscription during rehydration"
-                    );
-                    report.subscriptions_skipped += 1;
-                    continue;
-                }
-
                 let fhir_version = infer_fhir_version(resource, default_version);
                 match self
                     .manager()
@@ -609,11 +619,34 @@ impl SubscriptionEngine {
                         );
                         report.subscriptions_registered += 1;
 
-                        // Only `requested` needs the handshake. `active` was
-                        // established in a previous process lifetime; `error`
-                        // stays registered but dormant.
-                        if sub.status == SubscriptionStatusCode::Requested
-                            && config.handshake_requested
+                        // `off` and `entered-in-error` are terminal: registered
+                        // so `$status` keeps answering for them, never
+                        // handshaken, and never matched (the evaluator only
+                        // selects `active`). Counted separately because a
+                        // deployment wants to see how many of its subscriptions
+                        // are parked rather than serving.
+                        if sub.status.is_terminal() {
+                            debug!(
+                                tenant = tenant_id,
+                                subscription_id = %sub.id,
+                                status = %sub.status,
+                                "Registered terminal subscription as dormant"
+                            );
+                            report.subscriptions_dormant += 1;
+                            continue;
+                        }
+
+                        // `requested` has never been activated. `error` is a
+                        // subscription the delivery circuit breaker gave up on
+                        // — and, because nothing in the engine performs an
+                        // `error` → `active` transition while it is dormant, a
+                        // restart is the *only* recovery it has. Re-running
+                        // activation for both is what stops a persisted `error`
+                        // from becoming a permanent one.
+                        if matches!(
+                            sub.status,
+                            SubscriptionStatusCode::Requested | SubscriptionStatusCode::Error
+                        ) && config.handshake_requested
                         {
                             pending.push(sub);
                         }

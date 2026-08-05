@@ -288,10 +288,18 @@ async fn topic_is_registered_before_subscriptions() {
     );
 }
 
-/// `off` is a terminal status — it can transition nowhere — so rehydrating one
-/// would register a subscription that could never legally become useful.
+/// `off` is terminal — it can transition nowhere and is never dispatched to —
+/// but it is still **registered**, dormant (issue #357).
+///
+/// It used to be skipped outright. That was defensible only while the status
+/// was volatile: once the delivery circuit breaker's decision survives a
+/// restart, skipping means the subscription is absent from the engine forever,
+/// so `$status` answers `404` for a resource that `GET /Subscription/{id}`
+/// answers `200` for. Registering it dormant keeps the two endpoints telling the
+/// same story, and cannot leak delivery because the evaluator selects only
+/// `active`.
 #[tokio::test]
-async fn off_subscriptions_are_skipped() {
+async fn off_subscriptions_are_registered_dormant() {
     let backend = storage();
     seed(&backend, TENANT_ID, topic_resource_type(), topic_resource()).await;
     seed(
@@ -312,14 +320,102 @@ async fn off_subscriptions_are_skipped() {
         )
         .await;
 
-    assert_eq!(report.subscriptions_skipped, 1, "report: {report:?}");
-    assert_eq!(report.subscriptions_registered, 0, "report: {report:?}");
+    assert_eq!(report.subscriptions_dormant, 1, "report: {report:?}");
+    assert_eq!(report.subscriptions_registered, 1, "report: {report:?}");
+    assert_eq!(
+        report.handshakes_started, 0,
+        "a terminal subscription must never be handshaken: {report:?}"
+    );
+
+    let sub = engine
+        .manager()
+        .get_subscription(TENANT_ID, "sub-off")
+        .expect("an `off` subscription must be registered so $status can answer");
+    assert_eq!(sub.status, SubscriptionStatusCode::Off);
+
+    // Registered, but inert: it must not be selected for delivery.
     assert!(
         engine
             .manager()
-            .get_subscription(TENANT_ID, "sub-off")
-            .is_none(),
-        "an `off` subscription must not be registered"
+            .active_subscriptions_for_topic(TENANT_ID, TOPIC_URL)
+            .is_empty(),
+        "an `off` subscription must never be dispatched to"
+    );
+}
+
+/// `entered-in-error` gets the same dormant treatment as `off`.
+///
+/// It previously failed to parse, so `register` fell back to `requested` — and
+/// rehydration would then handshake and *activate* a subscription the client had
+/// explicitly retracted.
+#[tokio::test]
+async fn entered_in_error_subscriptions_are_registered_dormant() {
+    let backend = storage();
+    seed(&backend, TENANT_ID, topic_resource_type(), topic_resource()).await;
+    seed(
+        &backend,
+        TENANT_ID,
+        "Subscription",
+        subscription_resource("sub-eie", "entered-in-error", "http://127.0.0.1:1/hook"),
+    )
+    .await;
+
+    let engine = fresh_engine();
+    let report = engine
+        .rehydrate(
+            &backend,
+            TENANT_ID,
+            current_fhir_version(),
+            &RehydrationConfig::default(), // handshakes ENABLED — must still not fire
+        )
+        .await;
+
+    assert_eq!(report.subscriptions_dormant, 1, "report: {report:?}");
+    assert_eq!(
+        report.handshakes_started, 0,
+        "a retracted subscription must never be activated: {report:?}"
+    );
+    let sub = engine
+        .manager()
+        .get_subscription(TENANT_ID, "sub-eie")
+        .expect("registered so $status can answer");
+    assert_eq!(sub.status, SubscriptionStatusCode::EnteredInError);
+}
+
+/// An `error` subscription is re-activated on restart, not left dormant.
+///
+/// Nothing in the engine performs `error` → `active` while a subscription is
+/// dormant (the evaluator only selects `active`, so it is never dispatched to,
+/// so it never succeeds, so nothing resets it). Before #357 the *loss* of the
+/// status on restart is what quietly recovered it. Now that `error` persists,
+/// re-running activation here is what stops a transient subscriber outage from
+/// becoming permanent silent death.
+#[tokio::test]
+async fn error_subscriptions_are_reactivated_on_restart() {
+    let backend = storage();
+    seed(&backend, TENANT_ID, topic_resource_type(), topic_resource()).await;
+    seed(
+        &backend,
+        TENANT_ID,
+        "Subscription",
+        subscription_resource("sub-err", "error", "http://127.0.0.1:1/hook"),
+    )
+    .await;
+
+    let engine = fresh_engine();
+    let report = engine
+        .rehydrate(
+            &backend,
+            TENANT_ID,
+            current_fhir_version(),
+            &RehydrationConfig::default(),
+        )
+        .await;
+
+    assert_eq!(report.subscriptions_registered, 1, "report: {report:?}");
+    assert_eq!(
+        report.handshakes_started, 1,
+        "`error` must be handed to the activation path: {report:?}"
     );
 }
 
