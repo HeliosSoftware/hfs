@@ -392,6 +392,40 @@ where
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
             Ok((bundle_entry, full_url)) => {
+                // Entry URLs reach the backends unparsed, and every backend's
+                // `parse_url` splits on `/` alone and takes the last two
+                // segments — sqlite, postgres and mongodb carry byte-equivalent
+                // copies. A query string therefore lands in storage as part of
+                // the resource type or the id: `PUT Patient?identifier=http://…`
+                // commits a row typed `Patient?identifier=http:`, and
+                // `PUT Patient/123?_format=json` commits one whose id is
+                // `123?_format=json`. `PUT Patient?name=peter` yields a single
+                // segment and fails the whole bundle with a message about the
+                // URL format instead. Decline here, before anything executes, so
+                // the bundle is declined intact (#503).
+                //
+                // GET is exempt: those URLs are searches, resolved by the REST
+                // layer rather than by a backend `parse_url` (#478).
+                // `ifNoneExist` is left alone too — MongoDB resolves it inside
+                // the session, so refusing it here would remove a working,
+                // atomic feature. Resolving URL criteria within a transaction's
+                // atomic scope is #511.
+                if !matches!(bundle_entry.method, BundleMethod::Get)
+                    && bundle_entry.url.contains('?')
+                {
+                    return Err(RestError::NotSupported {
+                        feature: format!(
+                            "Transaction entry {} ({} {}) carries a query string. This \
+                             server cannot resolve one inside a transaction's atomic \
+                             scope, so no entries were applied. Submit it in a batch \
+                             Bundle, or address the instance directly.",
+                            index,
+                            bundle_method_to_http_method(&bundle_entry.method),
+                            bundle_entry.url
+                        ),
+                    });
+                }
+
                 // Enforce per-entry scope authorization for transactions.
                 // Transactions are atomic so any denied entry rejects the whole bundle.
                 if let Some(principal) = principal {
