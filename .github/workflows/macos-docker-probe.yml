@@ -171,68 +171,46 @@ jobs:
             -- --nocapture
           echo "PROBE D rc=$?"
 
-      # The dyld abort. On Linux this same target links to 1.53 GiB with
-      # debuginfo off (72% of it the four FHIR versions' serde derives), which is
-      # large enough to make an address-space collision with the dyld shared
-      # cache plausible but not proven: the executable loads at 0x100000000 and
-      # the arm64 shared cache sits above it, so a Mach-O whose segments run past
-      # ~2 GiB leaves dyld nowhere to map the cache — which is exactly the
-      # "syscall to map cache into shared region failed" we saw.
+      # THE EXPERIMENT. Every helios_rest test binary left in the target dir by
+      # past jobs is a data point, including `helios_rest-2bcca06fdfde1c19` — the
+      # exact artifact that aborted in Test Rust run 31023273581.
       #
-      # This measures the real Mach-O and then tries to load it. Size settles the
-      # mechanism; `--list` settles whether the abort is deterministic at all, or
-      # was resource pressure during that one job.
-      - name: 'Probe E: measure and load the binary that aborted'
+      # Measured on 2026-08-05: the ~2.2 GB binaries all place __LINKEDIT's top
+      # past 0x180000000 (the arm64 dyld shared-cache base) and abort; the ~1.3 GB
+      # ones stay under it. It is __LINKEDIT, not __TEXT, that overruns — with
+      # 1.7M symbols the symbol table is larger than the code. __TEXT ends around
+      # 0x13d52c000 on the failing binaries, nowhere near the boundary.
+      #
+      # So: load EVERY one and print top-address vs verdict side by side. If the
+      # boundary is the mechanism, over/under must predict abort/load with no
+      # exceptions. A single binary that loads while over the line, or aborts
+      # while under it, falsifies this.
+      - name: 'Probe E: does __LINKEDIT top predict the dyld abort?'
         continue-on-error: true
         shell: bash
         run: |
           set -uo pipefail
-          cargo test -p helios-rest --lib --all-features --no-run 2>&1 | tail -5
-          # No `ls | grep | head` here: GitHub runs this shell with -e -o pipefail,
-          # and head -1 closing the pipe early sends SIGPIPE to grep, which failed
-          # the whole step before it printed anything (runs 31034309580, 31035937480).
-          # Glob and filter in-shell instead — no pipeline, nothing to break.
+          cargo test -p helios-rest --lib --all-features --no-run 2>&1 | tail -3
+          # No `ls | grep | head`: this shell runs -e -o pipefail, and head closing
+          # the pipe SIGPIPEs grep, which killed the step outright before printing
+          # anything (runs 31034309580, 31035937480). Glob in-shell instead.
           shopt -s nullglob
-          BIN=""
-          for f in target/debug/deps/helios_rest-*; do
-            case "$f" in *.d) continue;; esac
-            [ -x "$f" ] || continue
-            BIN="$f"
+          CACHE_BASE=$((0x180000000))
+          printf '%-26s %14s  %-14s %-8s %s\n' BINARY BYTES LINKEDIT_TOP VS_BASE VERDICT
+          for B in target/debug/deps/helios_rest-*; do
+            case "$B" in *.d|*.o) continue;; esac
+            [ -x "$B" ] || continue
+            # macOS awk has no strtonum; bash arithmetic takes 0x literals.
+            top=0
+            while read -r seg addr size; do
+              [ "$seg" = "__LINKEDIT" ] || continue
+              top=$((addr + size))
+            done < <(otool -l "$B" | awk '/^ *segname/{s=$2} /^ *vmaddr/{a=$2} /^ *vmsize/{if(a!=""){print s, a, $2; a=""}}')
+            if [ "$top" -gt "$CACHE_BASE" ]; then vs="OVER"; else vs="under"; fi
+            if "$B" --list > "$RUNNER_TEMP/list.out" 2>&1; then verdict="LOADED"; else verdict="ABORTED rc=$?"; fi
+            printf '%-26s %14d  %#-14x %-8s %s\n' "$(basename "$B" | sed 's/helios_rest-//')" \
+              "$(stat -f%z "$B")" "$top" "$vs" "$verdict"
           done
-          if [ -z "$BIN" ]; then echo "::error::no helios_rest test binary found"; exit 1; fi
-          echo "binary: $BIN"
-          ls -l "$BIN"
-          # Full segment map with computed top addresses, for EVERY helios_rest
-          # binary present — a baseline and a post-#509 build have different
-          # metadata hashes, so both can coexist and be compared side by side.
-          #
-          # The previous run truncated at head -30 and so missed __LINKEDIT. That
-          # mattered: __TEXT/__DATA_CONST/__DATA topped out at ~0x13f760000, well
-          # under the 0x180000000 shared-cache base, so they are NOT what collides.
-          # With 1.7M symbols __LINKEDIT is the large one, and it is mapped too.
-          # macOS awk has no strtonum, but bash arithmetic takes 0x literals.
-          for B in $(ls target/debug/deps/helios_rest-* 2>/dev/null | grep -v '\.d$'); do
-            echo "### $B  ($(stat -f%z "$B") bytes)"
-            otool -l "$B" \
-              | awk '/^ *segname/{s=$2} /^ *vmaddr/{a=$2} /^ *vmsize/{if(a!=""){print s, a, $2; a=""}}' \
-              | while read -r seg addr size; do
-                  printf '  %-14s vmaddr=%#018x vmsize=%13d  top=%#x\n' \
-                    "$seg" "$((addr))" "$((size))" "$((addr + size))"
-                done
-            echo "  --- shared cache base on arm64 is 0x180000000; a top past it is the collision ---"
-          done
-          # `if` guards this against -e, and captures the real exit status rather
-          # than head's (the old `"$BIN" --list | head -3; echo rc=$?` reported the
-          # wrong process's status entirely).
-          echo "=== does it load? ==="
-          if "$BIN" --list > "$RUNNER_TEMP/list.out" 2>&1; then
-            echo "PROBE E: LOADED OK"
-            head -3 "$RUNNER_TEMP/list.out"
-          else
-            rc=$?
-            echo "PROBE E: ABORTED rc=$rc"
-            cat "$RUNNER_TEMP/list.out"
-          fi
 
       - name: Summary
         if: always()
