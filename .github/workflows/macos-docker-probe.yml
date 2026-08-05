@@ -1,0 +1,161 @@
+name: macOS Runner Docker Probe
+
+# TEMPORARY DIAGNOSTIC. Delete once the macOS agent's Docker access is fixed.
+#
+# The macOS/ARM64 agent cannot reach the shared remote Docker daemon: every
+# testcontainer-backed job that lands there fails with
+# `ConnectError("tcp connect error", ..., HostUnreachable)` while the very same
+# connection succeeds from an interactive Terminal session on that machine. On
+# macOS 15+ a denied Local Network (TCC) grant surfaces as exactly that errno,
+# so the suspicion is that the runner's process context has no usable grant.
+#
+# This workflow answers the three questions that can only be answered from
+# INSIDE the runner's process context:
+#
+#   1. What launchd session is the runner in? (`Aqua` can hold TCC grants;
+#      `Background`/`StandardIO` cannot prompt and are auto-denied.)
+#   2. Does a stable, Apple-signed binary (`nc`) get through?
+#   3. Does a freshly compiled, unsigned binary get through — and does that
+#      survive a rebuild that changes its code hash?
+#
+# (2) vs (3) is the decisive comparison. If nc succeeds and the Rust probes
+# fail, TCC is attributing per-binary, and grants can never hold for the
+# ephemeral `cargo test` binaries that CI builds on every commit.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/mac-docker-probe]
+
+env:
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+
+jobs:
+  probe:
+    name: Probe Docker reachability from the macOS agent
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 20
+    steps:
+      - name: Describe the runner's execution context
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "=== OS ==="
+          sw_vers
+          echo "=== user / session ==="
+          echo "user: $(id -un) (uid $(id -u))"
+          # The decisive session check. `Aqua` means a logged-in GUI session that
+          # can present and persist TCC prompts. `Background` or `StandardIO`
+          # means it cannot, and every Local Network request is auto-denied.
+          echo "launchd session: $(launchctl managername 2>&1)"
+          echo "=== runner process ancestry ==="
+          pid=$$
+          for _ in 1 2 3 4 5 6 7 8; do
+            [ "$pid" = "1" ] && break
+            ps -o pid=,ppid=,comm= -p "$pid" 2>/dev/null
+            pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+            [ -z "$pid" ] && break
+          done
+          echo "=== how the runner is installed ==="
+          ls ~/Library/LaunchAgents 2>/dev/null | grep -i actions || echo "(no LaunchAgent)"
+          ls /Library/LaunchDaemons 2>/dev/null | grep -i actions || echo "(no LaunchDaemon)"
+
+      - name: Resolve the Docker endpoint and check routing
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ -z "${DOCKER_HOST:-}" ]; then
+            echo "::error::DOCKER_HOST is not set."
+            exit 1
+          fi
+          hostport=${DOCKER_HOST#*://}
+          hostport=${hostport%%/*}
+          host=${hostport%%:*}
+          port=${hostport##*:}
+          [ "$port" = "$host" ] && port=2375
+          echo "PROBE_HOST=$host" >> "$GITHUB_ENV"
+          echo "PROBE_PORT=$port" >> "$GITHUB_ENV"
+          echo "=== route to the Docker host ==="
+          route get "$host" 2>&1 | sed -n '1,12p'
+          echo "=== local interfaces ==="
+          ifconfig 2>/dev/null | grep -E '^[a-z0-9]+:|inet ' | grep -v '127.0.0.1' | head -20
+
+      # (2) A stable, Apple-signed system binary. Its TCC identity never changes,
+      # so a grant for it persists indefinitely.
+      - name: 'Probe A: Apple-signed binary (nc)'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "nc -> ${PROBE_HOST}:${PROBE_PORT}"
+          nc -vz -G 5 -w 5 "$PROBE_HOST" "$PROBE_PORT"
+          echo "PROBE A rc=$?"
+
+      # (3) A freshly compiled, unsigned binary — the same TCC shape as the
+      # `cargo test` binaries that actually fail in CI, without the cost of
+      # building the workspace.
+      - name: 'Probe B: freshly built unsigned Rust binary'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/tcpprobe" && cd "$RUNNER_TEMP/tcpprobe"
+          cat > probe.rs <<'EOF'
+          use std::net::{TcpStream, ToSocketAddrs};
+          use std::time::Duration;
+
+          // BUILD_MARKER is rewritten between builds so the compiled binary gets a
+          // different code hash, which is what invalidates a TCC grant.
+          const BUILD_MARKER: &str = "MARKER_PLACEHOLDER";
+
+          fn main() {
+              let target = std::env::args().nth(1).expect("usage: probe <host:port>");
+              println!("build marker: {BUILD_MARKER}");
+              let addr = target
+                  .to_socket_addrs()
+                  .expect("resolve")
+                  .next()
+                  .expect("no address");
+              match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+                  Ok(_) => println!("CONNECT OK {target}"),
+                  Err(e) => {
+                      eprintln!("CONNECT FAILED {target}: {e} (kind={:?})", e.kind());
+                      std::process::exit(1);
+                  }
+              }
+          }
+          EOF
+          sed -i '' 's/MARKER_PLACEHOLDER/build-one/' probe.rs
+          rustc -O -o probe_one probe.rs
+          echo "--- run 1 (first-ever hash) ---"
+          ./probe_one "${PROBE_HOST}:${PROBE_PORT}"; echo "PROBE B1 rc=$?"
+
+      # If B1 was granted interactively, this proves whether the grant survives
+      # the next commit. A new marker means a new code hash means, if TCC keys on
+      # the hash, a fresh denial.
+      - name: 'Probe C: rebuild with a changed hash'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$RUNNER_TEMP/tcpprobe"
+          sed -i '' 's/build-one/build-two/' probe.rs
+          rustc -O -o probe_two probe.rs
+          echo "--- run 2 (different hash, same source shape) ---"
+          ./probe_two "${PROBE_HOST}:${PROBE_PORT}"; echo "PROBE C rc=$?"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "Read the results as:"
+          echo "  A ok, B/C fail        -> TCC attributes per-binary. Ephemeral cargo"
+          echo "                           test binaries can never hold a grant; a"
+          echo "                           loopback forwarder or a local Docker daemon"
+          echo "                           is the only durable fix."
+          echo "  A/B/C all fail        -> the runner's whole session is denied. Check"
+          echo "                           'launchd session' above: anything other than"
+          echo "                           Aqua cannot be granted at all."
+          echo "  A/B/C all ok          -> TCC is not the blocker; look at what differs"
+          echo "                           between this job and the real ones (env, VPN,"
+          echo "                           DOCKER_HOST value)."
