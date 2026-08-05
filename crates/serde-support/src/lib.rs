@@ -810,8 +810,8 @@ where
 {
     let (id, extension) = match extension {
         Some(extension) => {
-            let helper: IdAndExtensionOwned<E> =
-                serde::Deserialize::deserialize(extension).map_err(|e| {
+            let helper: IdAndExtensionOwned<E> = serde::Deserialize::deserialize(extension)
+                .map_err(|e| {
                     Err::custom(format!("Error deserializing extension _{}: {}", key, e))
                 })?;
             (helper.id, helper.extension)
@@ -819,12 +819,13 @@ where
         None => (None, None),
     };
 
-    let value = match value {
-        Some(value) => Some(V::deserialize(value).map_err(|e| {
-            Err::custom(format!("Error deserializing primitive {}: {}", key, e))
-        })?),
-        None => None,
-    };
+    let value =
+        match value {
+            Some(value) => Some(V::deserialize(value).map_err(|e| {
+                Err::custom(format!("Error deserializing primitive {}: {}", key, e))
+            })?),
+            None => None,
+        };
 
     Ok((value, id, extension))
 }
