@@ -4,6 +4,7 @@
 //! `POST [base]` with a Bundle of type "batch" or "transaction"
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
     Json,
@@ -11,6 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use futures::stream::{self, StreamExt};
 use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
@@ -131,6 +133,108 @@ where
     }
 }
 
+/// Hard ceiling on batch entry concurrency, independent of configuration.
+///
+/// Caps the damage a backend could do by returning an absurd
+/// [`ResourceStorage::bulk_write_concurrency`], and bounds a `ServerConfig`
+/// built programmatically without going through `validate()`.
+const MAX_BATCH_CONCURRENCY: usize = 64;
+
+/// Resolves how many entries of this bundle may execute at once.
+///
+/// The backend states its own tolerance via
+/// [`ResourceStorage::bulk_write_concurrency`] — SQLite keeps the default of 1
+/// (a single writer behind synchronous rusqlite, whose storage calls contain no
+/// await points, so they could not interleave regardless), PostgreSQL, MongoDB
+/// and Elasticsearch declare 8, S3 declares 32, and a composite delegates to
+/// its primary. `HFS_BATCH_MAX_CONCURRENCY` caps that answer; it never raises
+/// it, because only the backend knows what its pool absorbs.
+///
+/// The floor of 1 is load-bearing: `buffered(0)` never polls its inner futures,
+/// so a zero bound would hang the request until the timeout — precisely the
+/// symptom this bound exists to remove.
+fn batch_concurrency<S>(state: &AppState<S>, entries: &[Value]) -> usize
+where
+    S: ResourceStorage + Send + Sync,
+{
+    // A StructureDefinition written by entry i is folded into the tenant
+    // profile registry by `upsert_stored_profile` (the POST and PUT arms of
+    // `process_batch_entry`) before entry i+1's `check_write` resolves against
+    // it. That read-your-writes is the only cross-entry dependency on this
+    // path, and it is a server-side conformance side effect rather than a
+    // resource read, so FHIR's "entries are independent" does not sanction
+    // racing it. Fall back to today's exact semantics for exactly the bundles
+    // that rely on it.
+    //
+    // Keyed off `request.url` through the same `parse_request_url` the side
+    // effect itself keys off, so the scan and the write cannot disagree.
+    //
+    // NOTE: extend this scan in lockstep with any new cross-entry
+    // `state.validation()` mutation added to `process_batch_entry`.
+    let writes_conformance = entries.iter().any(|entry| {
+        entry
+            .get("request")
+            .and_then(|request| request.get("url"))
+            .and_then(Value::as_str)
+            .and_then(|url| parse_request_url(url).ok())
+            .is_some_and(|(resource_type, _)| resource_type == "StructureDefinition")
+    });
+    if writes_conformance {
+        return 1;
+    }
+
+    state
+        .storage()
+        .bulk_write_concurrency()
+        .min(state.config().batch_max_concurrency)
+        .clamp(1, MAX_BATCH_CONCURRENCY)
+}
+
+/// Records how far a batch got, and says so if the handler future is dropped.
+///
+/// On expiry the `TimeoutLayer` (`crate::lib`) drops the handler without
+/// propagating an error and manufactures an empty-bodied 408, so the
+/// batch-response Bundle naming the entries that committed is discarded before
+/// the client ever sees it. `Drop` still runs; this is the only place that can
+/// leave a trace of what landed.
+struct BatchProgress {
+    total: usize,
+    completed: AtomicUsize,
+    bundle_id: String,
+    finished: bool,
+}
+
+impl BatchProgress {
+    fn new(total: usize, bundle_id: String) -> Self {
+        Self {
+            total,
+            completed: AtomicUsize::new(0),
+            bundle_id,
+            finished: false,
+        }
+    }
+
+    fn record(&self) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for BatchProgress {
+    fn drop(&mut self) {
+        if !self.finished {
+            warn!(
+                completed = self.completed.load(Ordering::Relaxed),
+                total = self.total,
+                bundle_id = %self.bundle_id,
+                "Batch abandoned before completion (request timed out or client \
+                 disconnected). Entries already written are durable and were not \
+                 rolled back; where auditing is enabled, their events carry this \
+                 bundle-id."
+            );
+        }
+    }
+}
+
 /// Processes a batch Bundle.
 async fn process_batch<S>(
     state: &AppState<S>,
@@ -156,22 +260,79 @@ where
         .unwrap_or_default();
 
     let base_url = state.base_url();
-    let mut response_entries = Vec::with_capacity(entries.len());
+    let concurrency = batch_concurrency(state, &entries);
+    let mut progress = BatchProgress::new(entries.len(), correlation.bundle_id.clone());
 
-    for (index, entry) in entries.iter().enumerate() {
-        let result =
-            process_batch_entry(state, &tenant, fhir_version, entry, index, principal).await;
-        let correlation_details = EntryAuditCorrelation::from_bundle(&correlation, index);
-        emit_batch_entry_audit(
-            state,
-            entry,
-            &result,
-            principal,
-            None,
-            Some(&correlation_details),
-        );
-        response_entries.push(bundle_entry_result_to_json(&result, base_url, prefer));
-    }
+    // Re-borrow the owned locals. The per-entry closure is `FnMut`, so it can
+    // only capture things it may reproduce on every call — shared references
+    // are `Copy`, so they qualify while the values themselves would not.
+    //
+    // `buffered` polls its futures in place on this task and never spawns, so
+    // nothing here needs `'static` or an `Arc` clone, and dropping the handler
+    // drops every in-flight entry synchronously.
+    let entries_ref = &entries;
+    let tenant = &tenant;
+    let correlation = &correlation;
+    let progress_ref = &progress;
+
+    // Entries are independent per the FHIR spec ("the server may process the
+    // entries in any order"), so they run with bounded concurrency. The stream
+    // is driven over indices rather than over `entries.iter()` deliberately:
+    // a closure whose returned future borrows its *argument* needs a
+    // higher-ranked lifetime that inference cannot supply here, and the
+    // resulting error is reported against the route registration in
+    // `routing::fhir_routes` rather than against this function.
+    //
+    // `buffered` — NOT `buffer_unordered` — is backed by `FuturesOrdered` and
+    // yields in submission order, so response entry i answers request entry i
+    // by construction.
+    let results: Vec<(usize, Value)> = stream::iter(0..entries_ref.len())
+        .map(|index| async move {
+            let entry = &entries_ref[index];
+            let result =
+                process_batch_entry(state, tenant, fhir_version, entry, index, principal).await;
+
+            // Audit is emitted inside the entry future rather than after
+            // collection. `emit_batch_entry_audit` hands off to a detached
+            // task and carries position as an explicit `entry-index` detail,
+            // so completion-order emission costs nothing — and it means an
+            // entry whose write committed before a timeout still gets its
+            // event, which post-collection emission would drop for the whole
+            // bundle.
+            let correlation_details = EntryAuditCorrelation::from_bundle(correlation, index);
+            emit_batch_entry_audit(
+                state,
+                entry,
+                &result,
+                principal,
+                None,
+                Some(&correlation_details),
+            );
+
+            progress_ref.record();
+            (
+                index,
+                bundle_entry_result_to_json(&result, base_url, prefer),
+            )
+        })
+        .buffered(concurrency)
+        .collect()
+        .await;
+
+    // The positional contract is guaranteed by the combinator; assert it rather
+    // than trust it. Nothing in the response entry carries an index, so a
+    // regression here would be invisible to every existing test and to most
+    // clients.
+    debug_assert!(
+        results
+            .iter()
+            .enumerate()
+            .all(|(position, (index, _))| position == *index),
+        "batch response entries must remain positional"
+    );
+
+    let response_entries: Vec<Value> = results.into_iter().map(|(_, entry)| entry).collect();
+    progress.finished = true;
 
     let response_bundle = serde_json::json!({
         "resourceType": "Bundle",
@@ -181,7 +342,7 @@ where
 
     debug!(
         entries = response_entries.len(),
-        "Batch processing completed"
+        concurrency, "Batch processing completed"
     );
 
     Ok((StatusCode::OK, Json(response_bundle)).into_response())
@@ -1479,5 +1640,379 @@ mod tests {
             entry_indexes,
             HashSet::from_iter(["0".to_string(), "1".to_string()])
         );
+    }
+
+    // ---- Batch entry concurrency (#501) ------------------------------------
+
+    /// A backend that makes entry execution observable.
+    ///
+    /// It declares a `bulk_write_concurrency` — which is what the batch loop
+    /// actually consults, so a mock that does not override it pins nothing —
+    /// records the high-water mark of simultaneous reads, and delays each read
+    /// so that a sequential loop and a concurrent one are distinguishable in
+    /// both wall clock and completion order.
+    struct DelayStorage {
+        concurrency: usize,
+        delay: std::time::Duration,
+        /// When set, entry `n` of `total` sleeps `(total - n) * delay`, so
+        /// entry 0 finishes *last* and completion order is the exact reverse of
+        /// request order. That is what distinguishes `buffered` from
+        /// `buffer_unordered`.
+        reverse_of: Option<usize>,
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+    }
+
+    impl DelayStorage {
+        fn new(concurrency: usize, delay_ms: u64) -> Self {
+            Self {
+                concurrency,
+                delay: std::time::Duration::from_millis(delay_ms),
+                reverse_of: None,
+                in_flight: AtomicUsize::new(0),
+                peak_in_flight: AtomicUsize::new(0),
+            }
+        }
+
+        fn reversing(concurrency: usize, delay_ms: u64, total: usize) -> Self {
+            Self {
+                reverse_of: Some(total),
+                ..Self::new(concurrency, delay_ms)
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.peak_in_flight.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for DelayStorage {
+        fn backend_name(&self) -> &'static str {
+            "delay"
+        }
+
+        fn bulk_write_concurrency(&self) -> usize {
+            self.concurrency
+        }
+
+        async fn read(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            let entered = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(entered, Ordering::SeqCst);
+
+            let delay = match self.reverse_of {
+                Some(total) => {
+                    let n: usize = id.trim_start_matches('p').parse().unwrap_or(0);
+                    self.delay * (total.saturating_sub(n)) as u32
+                }
+                None => self.delay,
+            };
+            tokio::time::sleep(delay).await;
+
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            Ok(Some(StoredResource::new(
+                resource_type,
+                id,
+                tenant.tenant_id().clone(),
+                serde_json::json!({ "resourceType": resource_type, "id": id }),
+                FhirVersion::default(),
+            )))
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            unimplemented!()
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    /// A batch Bundle of `count` GET entries, targeting `Patient/p0..p{count}`.
+    fn get_bundle(count: usize) -> Value {
+        let entries: Vec<Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "request": { "method": "GET", "url": format!("Patient/p{i}") }
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": entries,
+        })
+    }
+
+    async fn run_batch<S>(
+        state: &AppState<S>,
+        bundle: &Value,
+        principal: Option<&Principal>,
+    ) -> Value
+    where
+        S: ResourceStorage + Send + Sync,
+    {
+        let tenant = TenantExtractor::new("test-tenant", crate::tenant::TenantSource::Default);
+        let response = process_batch(
+            state,
+            tenant,
+            FhirVersion::default(),
+            &PreferHeader::default(),
+            bundle,
+            principal,
+        )
+        .await
+        .expect("batch should always produce a response");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("response body is JSON")
+    }
+
+    fn state_with(storage: DelayStorage) -> AppState<DelayStorage> {
+        AppState::new(Arc::new(storage), crate::config::ServerConfig::default())
+    }
+
+    /// Response entry *i* must answer request entry *i*, even when entry *i*
+    /// finishes last.
+    ///
+    /// The mock resolves entries in exact reverse order, so this fails under
+    /// `buffer_unordered` and passes under `buffered`. Nothing in a response
+    /// entry carries its index, so without this test a scramble is invisible.
+    #[tokio::test]
+    async fn batch_response_entries_stay_positional_under_concurrency() {
+        const ENTRIES: usize = 16;
+
+        let state = state_with(DelayStorage::reversing(ENTRIES, 10, ENTRIES));
+        let body = run_batch(&state, &get_bundle(ENTRIES), None).await;
+
+        let entries = body["entry"].as_array().expect("entry array");
+        assert_eq!(entries.len(), ENTRIES);
+
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry["resource"]["id"].as_str(),
+                Some(format!("p{i}").as_str()),
+                "response entry {i} answered a different request entry"
+            );
+        }
+
+        assert!(
+            state.storage().peak() > 1,
+            "the ordering guarantee is only meaningful if entries really overlapped"
+        );
+    }
+
+    /// Entries run concurrently, and never more concurrently than the backend
+    /// declared.
+    #[tokio::test]
+    async fn batch_entries_run_concurrently_up_to_the_bound() {
+        const ENTRIES: usize = 32;
+        const BOUND: usize = 8;
+        const DELAY_MS: u64 = 40;
+
+        let state = state_with(DelayStorage::new(BOUND, DELAY_MS));
+        let started = std::time::Instant::now();
+        let body = run_batch(&state, &get_bundle(ENTRIES), None).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            body["entry"].as_array().expect("entry array").len(),
+            ENTRIES
+        );
+
+        let peak = state.storage().peak();
+        assert!(peak > 1, "entries did not overlap at all (peak {peak})");
+        assert!(
+            peak <= BOUND,
+            "exceeded the bound the backend declared: peak {peak} > {BOUND}"
+        );
+
+        // Sequential would be ENTRIES * DELAY_MS; half of that is a wide margin
+        // that still cannot be met without real concurrency.
+        let sequential = std::time::Duration::from_millis(DELAY_MS * ENTRIES as u64);
+        assert!(
+            elapsed < sequential / 2,
+            "no speedup: {elapsed:?} against a sequential floor of {sequential:?}"
+        );
+    }
+
+    /// A single-writer backend keeps today's behaviour exactly. This is the
+    /// claim that lets SQLite stay untouched by this change.
+    #[tokio::test]
+    async fn sequential_backend_still_processes_entries_one_at_a_time() {
+        let state = state_with(DelayStorage::new(1, 1));
+        let body = run_batch(&state, &get_bundle(8), None).await;
+
+        assert_eq!(body["entry"].as_array().expect("entry array").len(), 8);
+        assert_eq!(
+            state.storage().peak(),
+            1,
+            "a backend declaring 1 must never have two entries in flight"
+        );
+    }
+
+    /// The configured ceiling lowers a backend's declared tolerance and never
+    /// raises it.
+    #[test]
+    fn batch_concurrency_caps_but_never_raises() {
+        // (backend declares, HFS_BATCH_MAX_CONCURRENCY, effective)
+        let cases = [
+            (32, 4, 4),                          // config lowers
+            (1, 32, 1),                          // config cannot raise a single-writer backend
+            (32, 32, 32),                        // both agree
+            (8, 16, 8),                          // the default ceiling leaves 8 alone
+            (32, 0, 1),     // a config that skipped validate() still cannot hang
+            (9999, 16, 16), // absurd backend, capped by config first
+            (9999, 9999, MAX_BATCH_CONCURRENCY), // then by the hard ceiling
+        ];
+
+        for (declared, configured, expected) in cases {
+            let config = crate::config::ServerConfig {
+                batch_max_concurrency: configured,
+                ..Default::default()
+            };
+            let state = AppState::new(Arc::new(DelayStorage::new(declared, 0)), config);
+
+            assert_eq!(
+                batch_concurrency(&state, &[]),
+                expected,
+                "backend {declared} with config {configured}"
+            );
+        }
+    }
+
+    /// A bundle that writes a StructureDefinition falls back to sequential.
+    ///
+    /// `upsert_stored_profile` folds the profile into the tenant registry, and
+    /// later entries' `check_write` resolve against it — a read-your-writes
+    /// dependency that concurrency would make load-dependent.
+    #[test]
+    fn batch_concurrency_is_one_when_a_structure_definition_is_written() {
+        let state = state_with(DelayStorage::new(32, 0));
+
+        let conformance = [serde_json::json!({
+            "request": { "method": "POST", "url": "StructureDefinition" },
+            "resource": { "resourceType": "StructureDefinition", "id": "sd-1" }
+        })];
+        assert_eq!(batch_concurrency(&state, &conformance), 1);
+
+        // Keyed off `request.url`, exactly like the side effect it protects —
+        // a body without `resourceType` must still be caught.
+        let url_only = [serde_json::json!({
+            "request": { "method": "PUT", "url": "StructureDefinition/sd-1" },
+            "resource": { "id": "sd-1" }
+        })];
+        assert_eq!(batch_concurrency(&state, &url_only), 1);
+
+        // A bundle with no conformance writes resolves normally. Compared
+        // against the empty bundle rather than a literal, so this test stays
+        // about the carve-out; the cap itself is pinned by
+        // `batch_concurrency_caps_but_never_raises`.
+        let data_only = [serde_json::json!({
+            "request": { "method": "GET", "url": "Patient/p0" }
+        })];
+        assert_eq!(
+            batch_concurrency(&state, &data_only),
+            batch_concurrency(&state, &[])
+        );
+        assert!(batch_concurrency(&state, &data_only) > 1);
+    }
+
+    /// Scope enforcement stays per-entry when entries run concurrently: denied
+    /// entries become 403 response entries and permitted ones still succeed.
+    ///
+    /// `POST [base]` has no upstream authorization gate, so this inline check is
+    /// the only one — and there was no test asserting a batch scope denial
+    /// before this change made the loop concurrent.
+    #[tokio::test]
+    async fn batch_scope_denial_is_still_per_entry_under_concurrency() {
+        let state = state_with(DelayStorage::new(8, 1));
+
+        let entries: Vec<Value> = (0..8)
+            .map(|i| {
+                let resource_type = if i % 2 == 0 { "Patient" } else { "Observation" };
+                serde_json::json!({
+                    "request": { "method": "GET", "url": format!("{resource_type}/p{i}") }
+                })
+            })
+            .collect();
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": entries,
+        });
+
+        let principal = Principal {
+            subject: "client".to_string(),
+            issuer: "https://issuer.example".to_string(),
+            tenant_id: None,
+            scopes: helios_auth::ScopeSet::parse("system/Patient.rs"),
+            jti: None,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            custom_claims: serde_json::Map::new(),
+        };
+
+        let body = run_batch(&state, &bundle, Some(&principal)).await;
+        let entries = body["entry"].as_array().expect("entry array");
+        assert_eq!(entries.len(), 8);
+
+        for (i, entry) in entries.iter().enumerate() {
+            let status = entry["response"]["status"].as_str().unwrap_or_default();
+            if i % 2 == 0 {
+                assert!(status.starts_with("200"), "entry {i} (Patient): {status}");
+            } else {
+                assert!(
+                    status.starts_with("403"),
+                    "entry {i} (Observation) must be denied: {status}"
+                );
+            }
+        }
     }
 }
