@@ -416,6 +416,86 @@ async fn test_same_id_different_tenants() {
     assert_eq!(read_b.content()["name"][0]["family"], "B");
 }
 
+/// Tenants differing only by case must be distinct tenants here, as they are in
+/// every other backend.
+///
+/// SQLite is already correct: `tenant_id TEXT NOT NULL` under the default BINARY
+/// collation compares byte-exactly. This test exists so it *stays* correct. The
+/// risk is concrete rather than theoretical — `COLLATE NOCASE` is used liberally
+/// in this backend's search SQL (`search/parameter_handlers/string.rs`,
+/// `token.rs`, `reference.rs`, `search_impl.rs`), so the idiom is one copy-paste
+/// away from a tenant predicate, and a `citext`-style migration would do the same
+/// on PostgreSQL.
+///
+/// Added alongside the Elasticsearch fix for issue #384, where the equivalent
+/// property did *not* hold: the index name lowercased the tenant id, so `Acme`
+/// and `acme` shared an index and a document `_id`.
+#[tokio::test]
+async fn test_case_variant_tenants_do_not_collide() {
+    let backend = create_backend();
+    let upper = create_tenant("Acme");
+    let lower = create_tenant("acme");
+
+    backend
+        .create_or_update(
+            &upper,
+            "Patient",
+            "shared-id",
+            json!({"resourceType": "Patient", "name": [{"family": "UPPER"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // The case variant must not observe it...
+    assert!(
+        backend
+            .read(&lower, "Patient", "shared-id")
+            .await
+            .unwrap()
+            .is_none(),
+        "tenant `acme` must not read tenant `Acme`'s resource"
+    );
+
+    // ...must not overwrite it...
+    backend
+        .create_or_update(
+            &lower,
+            "Patient",
+            "shared-id",
+            json!({"resourceType": "Patient", "name": [{"family": "lower"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        backend
+            .read(&upper, "Patient", "shared-id")
+            .await
+            .unwrap()
+            .expect("tenant `Acme`'s resource must survive")
+            .content()["name"][0]["family"],
+        "UPPER"
+    );
+
+    // ...and must not delete it.
+    backend
+        .delete(&lower, "Patient", "shared-id")
+        .await
+        .unwrap();
+    assert_eq!(
+        backend
+            .read(&upper, "Patient", "shared-id")
+            .await
+            .unwrap()
+            .expect("tenant `Acme`'s resource must survive `acme`'s delete")
+            .content()["name"][0]["family"],
+        "UPPER"
+    );
+    assert_eq!(backend.count(&upper, Some("Patient")).await.unwrap(), 1);
+    assert_eq!(backend.count(&lower, Some("Patient")).await.unwrap(), 0);
+}
+
 #[tokio::test]
 async fn test_tenant_isolation_delete() {
     let backend = create_backend();

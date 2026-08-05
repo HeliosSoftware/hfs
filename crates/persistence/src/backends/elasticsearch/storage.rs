@@ -381,11 +381,7 @@ impl ElasticsearchBackend {
         container_type: &str,
         container_id: &str,
     ) -> StorageResult<()> {
-        let pattern = format!(
-            "{}_{}_*",
-            self.config().index_prefix,
-            tenant_id.to_lowercase()
-        );
+        let pattern = self.tenant_index_pattern(tenant_id);
         let body = json!({
             "query": { "bool": { "filter": [
                 { "term": { "tenant_id": tenant_id } },
@@ -610,13 +606,49 @@ impl ResourceStorage for ElasticsearchBackend {
         let (version_id, is_new) = match existing {
             Ok(resp) if resp.status_code().is_success() => {
                 let body = resp.json::<Value>().await.unwrap_or_default();
-                let current_version: u64 = body
-                    .get("_source")
-                    .and_then(|s| s.get("version_id"))
+                let source = body.get("_source");
+                // Belt-and-braces tenant guard, mirroring `read` (see below).
+                //
+                // After the #384 fix an injective `index_name` already guarantees
+                // this index belongs to exactly one tenant, so this check should
+                // never fire. It is kept because this is the one place the backend
+                // reads *foreign state* to make a *write* decision, and a future
+                // regression in the naming derivation would otherwise silently
+                // resume deriving one tenant's version from another's document.
+                //
+                // A mismatch is treated as **absent**, not as an error. An index
+                // upgraded from the pre-fix layout can still hold documents left
+                // behind by a colliding tenant; erroring would brick the rightful
+                // owner on exactly those ids, permanently, with no operator
+                // remedy. Treating them as absent is self-healing — the foreign
+                // document is overwritten and leaves an index it never belonged
+                // in — and is correct on the merits: from this tenant's
+                // perspective the resource genuinely does not exist. Resetting the
+                // version is harmless because Elasticsearch keeps no history and,
+                // in every supported composite mode, the primary is authoritative
+                // for version assignment (writes always land there first).
+                let doc_tenant = source
+                    .and_then(|s| s.get("tenant_id"))
                     .and_then(|v| v.as_str())
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                ((current_version + 1).to_string(), false)
+                    .unwrap_or("");
+                if doc_tenant != tenant_id {
+                    tracing::warn!(
+                        tenant = %tenant_id,
+                        found_tenant = %doc_tenant,
+                        resource_type,
+                        id,
+                        "Elasticsearch document at this address belongs to another tenant; \
+                         treating as absent and overwriting (see issue #384)"
+                    );
+                    ("1".to_string(), true)
+                } else {
+                    let current_version: u64 = source
+                        .and_then(|s| s.get("version_id"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    ((current_version + 1).to_string(), false)
+                }
             }
             Ok(resp) if resp.status_code().as_u16() == 404 => ("1".to_string(), true),
             Ok(resp) => {
@@ -908,11 +940,7 @@ impl ResourceStorage for ElasticsearchBackend {
 
         let index_pattern = match resource_type {
             Some(rt) => self.index_name(tenant_id, rt),
-            None => format!(
-                "{}_{}_*",
-                self.config().index_prefix,
-                tenant_id.to_lowercase()
-            ),
+            None => self.tenant_index_pattern(tenant_id),
         };
 
         let query = json!({
@@ -963,9 +991,10 @@ impl ResourceStorage for ElasticsearchBackend {
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
         crate::tenant::ensure_mutable_tenant(id)?;
         // Documents are matched by an exact `tenant_id` term, not by the index
-        // pattern alone: index names lowercase the tenant id, so the pattern
-        // for tenant `acme` would also sweep `acme_corp`'s indices.
-        let pattern = format!("{}_{}_*", self.config().index_prefix, id.to_lowercase());
+        // pattern alone: the pattern is a prefix glob, so tenant `a`'s pattern
+        // `{prefix}_a_*` also matches tenant `a_b`'s indices. The term filter,
+        // not the glob, is what bounds this to one tenant.
+        let pattern = self.tenant_index_pattern(id);
         let body = json!({
             "query": { "bool": { "filter": [
                 { "term": { "tenant_id": id } }
@@ -1200,9 +1229,10 @@ impl ReindexTarget for ElasticsearchBackend {
         // MUST be a delete-by-query with a `tenant_id` term filter, never a
         // delete of the indices matching the tenant's index pattern. The
         // pattern `{prefix}_{tenant}_*` is a prefix glob, so tenant "a" matches
-        // tenant "ab"'s indices — deleting by pattern would destroy a
-        // prefix-sharing tenant's data. The term filter is what actually bounds
-        // this to one tenant; the pattern only narrows which indices to scan.
+        // tenant "a_b"'s indices — deleting by pattern would destroy a
+        // separator-sharing tenant's data. The term filter is what actually
+        // bounds this to one tenant; the pattern only narrows which indices to
+        // scan. See `tenant_index_pattern` for why the over-match is deliberate.
         let pattern = tenant_index_pattern(self, tenant_id);
         delete_by_query_scoped(
             self,
@@ -1349,16 +1379,19 @@ impl ReindexSource for ElasticsearchBackend {
 
 /// The index glob covering every one of a tenant's type indices.
 ///
-/// This is a *prefix* glob: tenant "a" also matches tenant "ab"'s indices.
-/// Every query built on it MUST also carry a `tenant_id` term filter — the
-/// pattern narrows which indices are scanned, the filter is what enforces
-/// tenant isolation.
+/// This is a *prefix* glob, so it can over-match. The example previously given
+/// here — tenant "a" matching tenant "ab" — was wrong: the pattern is
+/// `{prefix}_a_*`, which requires the literal separator, so "ab" does not match.
+/// The real case is the *underscore-bearing* one: tenant "a"'s `{prefix}_a_*`
+/// does match tenant "a_b"'s `{prefix}_a_b_patient`.
+///
+/// That over-match is deliberate — `_` is kept in the encoder's safe set so that
+/// `my_tenant`-shaped ids need no escaping and conforming deployments never see
+/// an index rename (see [`super::naming`]). Every query built on this glob MUST
+/// therefore also carry a `tenant_id` term filter: the pattern narrows which
+/// indices are scanned, the filter is what enforces tenant isolation.
 fn tenant_index_pattern(backend: &ElasticsearchBackend, tenant_id: &str) -> String {
-    format!(
-        "{}_{}_*",
-        backend.config().index_prefix,
-        tenant_id.to_lowercase()
-    )
+    backend.tenant_index_pattern(tenant_id)
 }
 
 /// Runs a delete-by-query and returns how many documents it removed.
