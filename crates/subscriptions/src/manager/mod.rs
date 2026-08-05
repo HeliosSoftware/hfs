@@ -229,6 +229,33 @@ impl SubscriptionManager {
             .and_then(SubscriptionStatusCode::from_fhir_str)
             .unwrap_or(SubscriptionStatusCode::Requested);
 
+        // Carry the runtime counters across a re-registration.
+        //
+        // `register` runs on *every* write to the resource (create, update,
+        // patch — see `SubscriptionEngine::handle_subscription_event`), and it
+        // used to rebuild the entry with both counters at zero. That made an
+        // unrelated edit — adding a filter, rotating an endpoint header — a
+        // silent reset of the delivery circuit breaker, re-arming the server
+        // against an endpoint it had already given up on, with no restart
+        // involved. It also rewound `eventsSinceSubscriptionStart`, which
+        // subscribers use to detect missed notifications.
+        //
+        // The counters are therefore preserved unless the client is *re-arming*
+        // the subscription (see [`is_rearm`]), which is the one deliberate,
+        // client-driven reset and the documented way back from `error`/`off`.
+        let key = (tenant_id.to_string(), subscription_id.to_string());
+        let previous = self.subscriptions.get(&key).map(|entry| {
+            let sub = entry.value();
+            (sub.status, sub.events_since_start, sub.consecutive_failures)
+        });
+
+        let (events_since_start, consecutive_failures) = match previous {
+            Some((previous_status, events, failures)) if !is_rearm(previous_status, status) => {
+                (events, failures)
+            }
+            _ => (0, 0),
+        };
+
         let subscription = ActiveSubscription {
             id: subscription_id.to_string(),
             topic_url,
@@ -236,8 +263,8 @@ impl SubscriptionManager {
             channel,
             filters: parsed_filters,
             fhir_version,
-            events_since_start: 0,
-            consecutive_failures: 0,
+            events_since_start,
+            consecutive_failures,
             tenant_id: tenant_id.to_string(),
         };
 
@@ -245,10 +272,13 @@ impl SubscriptionManager {
             tenant = tenant_id,
             subscription_id,
             topic = %subscription.topic_url,
+            status = %subscription.status,
+            events_since_start,
+            consecutive_failures,
+            re_registered = previous.is_some(),
             "Registered subscription"
         );
 
-        let key = (tenant_id.to_string(), subscription_id.to_string());
         self.subscriptions.insert(key, subscription.clone());
 
         Ok(subscription)
@@ -365,6 +395,37 @@ impl SubscriptionManager {
             .map(|e| e.value().clone())
             .collect()
     }
+}
+
+/// Whether re-registering with `incoming` status re-arms a subscription that
+/// was previously in `previous` status, and so should reset its runtime
+/// counters.
+///
+/// Two cases count as re-arming, and nothing else does:
+///
+/// 1. The client wrote `requested` — the spec's "please (re-)activate this"
+///    signal, whatever state the subscription was in.
+/// 2. The client moved it out of a non-serving state (`error`, `off`,
+///    `entered-in-error`) under its own steam, e.g. straight to `active`.
+///
+/// An ordinary edit that leaves the status alone — or any server-authored
+/// status already written back into the resource — is *not* a re-arm, so it
+/// keeps the delivery failure streak and the event counter intact.
+fn is_rearm(previous: SubscriptionStatusCode, incoming: SubscriptionStatusCode) -> bool {
+    if incoming == SubscriptionStatusCode::Requested {
+        return true;
+    }
+    matches!(
+        previous,
+        SubscriptionStatusCode::Error
+            | SubscriptionStatusCode::Off
+            | SubscriptionStatusCode::EnteredInError
+    ) && !matches!(
+        incoming,
+        SubscriptionStatusCode::Error
+            | SubscriptionStatusCode::Off
+            | SubscriptionStatusCode::EnteredInError
+    )
 }
 
 // --- Version-aware field extraction ---
@@ -1285,5 +1346,194 @@ pub(crate) mod tests {
             result,
             Err(SubscriptionError::InvalidFilter { .. })
         ));
+    }
+
+    // ── Runtime counters across re-registration (issue #357) ──────────────
+    //
+    // `register` runs on every write to the Subscription resource. It used to
+    // rebuild the entry with both counters at zero, which made an ordinary edit
+    // a silent reset of the delivery circuit breaker.
+
+    /// Builds the default test subscription with `status` replaced.
+    fn subscription_with_status(status: &str) -> serde_json::Value {
+        let mut resource = default_subscription_json();
+        resource["status"] = json!(status);
+        resource
+    }
+
+    /// Drives a subscription to `status` with the given counters, the way the
+    /// engine does: register, then transition and record activity.
+    fn manager_with_state(
+        status: SubscriptionStatusCode,
+        events: u64,
+        failures: u32,
+    ) -> SubscriptionManager {
+        let manager =
+            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+        manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("requested"),
+                FhirVersion::default(),
+            )
+            .expect("initial register");
+        if status != SubscriptionStatusCode::Requested {
+            manager
+                .update_status("t1", "sub-1", status)
+                .expect("drive to status");
+        }
+        for _ in 0..events {
+            manager.increment_event_count("t1", "sub-1");
+        }
+        for _ in 0..failures {
+            manager.record_failure("t1", "sub-1");
+        }
+        manager
+    }
+
+    /// An edit that does not change the status must not reset the counters.
+    /// This is the client-PUT circuit-breaker reset: before #357, adding a
+    /// filter or rotating a header re-armed the server against an endpoint it
+    /// had already given up on, with no restart involved.
+    #[test]
+    fn test_reregistration_preserves_counters() {
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 7, 2);
+
+        let re = manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+            )
+            .expect("re-register");
+
+        assert_eq!(re.events_since_start, 7, "event counter must not rewind");
+        assert_eq!(
+            re.consecutive_failures, 2,
+            "failure streak must survive an ordinary edit"
+        );
+        assert_eq!(re.status, SubscriptionStatusCode::Active);
+    }
+
+    /// Writing `requested` is the spec's "please (re-)activate this" signal and
+    /// is the documented way back from `error`/`off`. It resets the counters.
+    #[test]
+    fn test_client_rearm_with_requested_resets_counters() {
+        let manager = manager_with_state(SubscriptionStatusCode::Error, 9, 5);
+
+        let re = manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("requested"),
+                FhirVersion::default(),
+            )
+            .expect("re-register");
+
+        assert_eq!(re.status, SubscriptionStatusCode::Requested);
+        assert_eq!(re.events_since_start, 0);
+        assert_eq!(re.consecutive_failures, 0);
+    }
+
+    /// Moving a subscription out of `off` under the client's own steam is also
+    /// a re-arm: keeping the failure streak would re-trip the breaker on the
+    /// very next failure.
+    #[test]
+    fn test_client_rearm_out_of_off_resets_counters() {
+        let manager = manager_with_state(SubscriptionStatusCode::Off, 4, 10);
+
+        let re = manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+            )
+            .expect("re-register");
+
+        assert_eq!(re.status, SubscriptionStatusCode::Active);
+        assert_eq!(re.consecutive_failures, 0);
+    }
+
+    /// A server-authored status written back into the resource (#357) is NOT a
+    /// re-arm — otherwise the write-back would erase the very counters it is
+    /// meant to make durable the next time the resource is registered.
+    #[test]
+    fn test_written_back_status_is_not_a_rearm() {
+        let manager = manager_with_state(SubscriptionStatusCode::Error, 3, 4);
+
+        // The resource now carries `error`, because write-back put it there.
+        let re = manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("error"),
+                FhirVersion::default(),
+            )
+            .expect("re-register");
+
+        assert_eq!(re.status, SubscriptionStatusCode::Error);
+        assert_eq!(re.events_since_start, 3);
+        assert_eq!(re.consecutive_failures, 4);
+    }
+
+    /// A first registration always starts from zero — there is nothing to carry.
+    #[test]
+    fn test_first_registration_starts_at_zero() {
+        let manager =
+            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+        let sub = manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+            )
+            .expect("register");
+        assert_eq!(sub.events_since_start, 0);
+        assert_eq!(sub.consecutive_failures, 0);
+    }
+
+    /// Counters are per `(tenant, subscription)`: re-registering one tenant's
+    /// subscription must not read another tenant's state.
+    #[test]
+    fn test_counters_are_tenant_scoped() {
+        let manager = manager_with_state(SubscriptionStatusCode::Active, 6, 3);
+
+        let other = manager
+            .register(
+                "t2",
+                "sub-1",
+                &subscription_with_status("active"),
+                FhirVersion::default(),
+            )
+            .expect("register for other tenant");
+
+        assert_eq!(other.events_since_start, 0);
+        assert_eq!(other.consecutive_failures, 0);
+        // The first tenant is untouched.
+        let first = manager.get_subscription("t1", "sub-1").unwrap();
+        assert_eq!(first.events_since_start, 6);
+    }
+
+    /// `entered-in-error` used to be unparseable, so `register` fell back to
+    /// `requested` and rehydration would handshake and activate a subscription
+    /// the client had explicitly retracted.
+    #[test]
+    fn test_entered_in_error_is_registered_as_itself() {
+        let manager =
+            SubscriptionManager::new(create_test_registry(), vec!["rest-hook".to_string()]);
+        let sub = manager
+            .register(
+                "t1",
+                "sub-1",
+                &subscription_with_status("entered-in-error"),
+                FhirVersion::default(),
+            )
+            .expect("register");
+        assert_eq!(sub.status, SubscriptionStatusCode::EnteredInError);
+        assert!(sub.status.is_terminal());
     }
 }
