@@ -101,9 +101,23 @@ body {
   margin: 0;
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 295px 1fr;
+  grid-template-columns: 76px 1fr;
   font-size: 15px;
   line-height: 1.2;
+}
+
+/* The fixed sidebar sits outside the grid flow, so the flow columns need
+   explicit placement — otherwise the pane auto-fills the rail column. */
+.pane {
+  grid-column: 2;
+}
+
+body.has-nav-panel .nav-panel {
+  grid-column: 2;
+}
+
+body.has-nav-panel .pane {
+  grid-column: 3;
 }
 
 svg {
@@ -119,13 +133,29 @@ svg {
 /* ---------- Sidebar ---------- */
 
 .sidebar {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 40;
+  box-sizing: border-box;
+  width: 295px;
   display: flex;
   flex-direction: column;
   gap: 20px;
   padding: 20px 24px;
   border-right: 1px solid var(--divider);
   box-shadow: 1px 0 0 var(--divider-glint);
-  min-height: 100vh;
+  background: var(--bg);
+  overflow-y: auto;
+  overflow-x: hidden;
+  transition: width 0.15s ease;
+}
+
+/* Expanded (hover / keyboard focus): overlay the content with a lift shadow. */
+.sidebar:hover,
+.sidebar:focus-within {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.14);
 }
 
 .brand {
@@ -218,71 +248,36 @@ a.nav-item:hover {
   white-space: nowrap;
 }
 
-/* ---------- Collapse toggle + collapsed (icon-only) rail ---------- */
+/* ---------- Collapsed (icon-only) rail ---------- */
 
 .brand__text {
   flex: 1;
   min-width: 0;
 }
 
-.nav-toggle {
-  display: grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  flex: none;
-  padding: 0;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-}
-
-.nav-toggle:hover {
-  background: var(--accent-soft);
-  color: var(--text-strong);
-}
-
 /*
- * The toggle icon is directional (a panel + chevron). The base glyph points
- * right (= expand), which is correct for the collapsed rail; while expanded,
- * mirror it so the chevron points left (= collapse).
+ * Collapsed rail: the resting state, whenever the pointer and the keyboard
+ * focus are both elsewhere (#438 dropped the explicit toggle). Labels are
+ * visually hidden but kept in the accessibility tree so screen readers still
+ * announce them; a `title` on each item gives a hover tooltip, and hovering
+ * or focusing the rail expands it in place.
  */
-.nav-toggle .icon {
-  transform: scaleX(-1);
-}
-
-html[data-nav="collapsed"] .nav-toggle .icon {
-  transform: none;
-}
-
-/*
- * Collapsed rail: driven by `data-nav="collapsed"` on <html> (set by nav.js
- * before first paint), and forced on narrow viewports (see the media query
- * below). Labels are visually hidden but kept in the accessibility tree so
- * screen readers still announce them; a `title` on each item gives a hover
- * tooltip.
- */
-html[data-nav="collapsed"] body {
-  grid-template-columns: 76px 1fr;
-}
-
-html[data-nav="collapsed"] .sidebar {
+.sidebar:not(:hover):not(:focus-within) {
+  width: 76px;
   padding: 20px 14px;
   align-items: center;
 }
 
-html[data-nav="collapsed"] .brand {
+.sidebar:not(:hover):not(:focus-within) .brand {
   flex-direction: column;
   gap: 10px;
 }
 
-html[data-nav="collapsed"] .brand__text {
+.sidebar:not(:hover):not(:focus-within) .brand__text {
   display: none;
 }
 
-html[data-nav="collapsed"] .nav__section {
+.sidebar:not(:hover):not(:focus-within) .nav__section {
   /* Group headers are decorative; drop them entirely when collapsed. */
   height: 1px;
   margin: 8px 0;
@@ -291,23 +286,23 @@ html[data-nav="collapsed"] .nav__section {
   border-top: 1px solid var(--divider);
 }
 
-html[data-nav="collapsed"] .nav-item {
+.sidebar:not(:hover):not(:focus-within) .nav-item {
   width: 48px;
   padding: 0;
   justify-content: center;
 }
 
-html[data-nav="collapsed"] .selector {
+.sidebar:not(:hover):not(:focus-within) .selector {
   width: 48px;
   padding: 8px;
   justify-content: center;
 }
 
 /* Hide the text of labels/selectors without removing them from the a11y tree. */
-html[data-nav="collapsed"] .nav-item__label,
-html[data-nav="collapsed"] .selector__label,
-html[data-nav="collapsed"] .selector__chevrons,
-html[data-nav="collapsed"] .brand__version {
+.sidebar:not(:hover):not(:focus-within) .nav-item__label,
+.sidebar:not(:hover):not(:focus-within) .selector__label,
+.sidebar:not(:hover):not(:focus-within) .selector__chevrons,
+.sidebar:not(:hover):not(:focus-within) .brand__version {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -1048,65 +1043,6 @@ button.pill {
 /* ---------- Narrow screens: stack the shell ---------- */
 
 @media (max-width: 900px) {
-  /*
-    Narrow viewports force the collapsed icon rail regardless of the persisted
-    preference. Reuse the collapsed-state rules by mapping them onto the base
-    selectors here (the `data-nav` attribute still controls wide screens).
-  */
-  body {
-    grid-template-columns: 76px 1fr;
-  }
-
-  .sidebar {
-    padding: 20px 14px;
-    align-items: center;
-  }
-
-  .brand {
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .brand__text,
-  .nav-toggle {
-    display: none;
-  }
-
-  .nav__section {
-    height: 1px;
-    margin: 8px 0;
-    overflow: hidden;
-    text-indent: -999px;
-    border-top: 1px solid var(--divider);
-  }
-
-  .nav-item {
-    width: 48px;
-    padding: 0;
-    justify-content: center;
-  }
-
-  .selector {
-    width: 48px;
-    padding: 8px;
-    justify-content: center;
-  }
-
-  .nav-item__label,
-  .selector__label,
-  .selector__chevrons,
-  .brand__version {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
-
   .stat-grid {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -3574,7 +3510,7 @@ button.filter-rail__item {
 
 /* Three columns when a nav panel is present: sidebar, the panel, content. */
 body.has-nav-panel {
-  grid-template-columns: 250px 232px 1fr;
+  grid-template-columns: 76px 232px 1fr;
 }
 
 .nav-panel {
@@ -3667,7 +3603,8 @@ body.has-nav-panel {
 }
 
 @media (max-width: 1100px) {
-  body.has-nav-panel { grid-template-columns: 250px 1fr; }
+  body.has-nav-panel { grid-template-columns: 76px 1fr; }
+  body.has-nav-panel .pane { grid-column: 2; }
   .nav-panel { display: none; }
 }
 
@@ -3687,18 +3624,6 @@ body.has-nav-panel {
   text-align: left;
   font-weight: 500;
 }
-
-/* ---------------------------------------------------------------------------
-   Collapsed sidebar + the Resources type panel. The sidebar collapse itself is
-   driven by `data-nav="collapsed"` (the block near the top of this file). Here
-   we only add the 3-column grid variant: when the type panel is present, the
-   collapsed sidebar rail must keep the panel and content in their own columns
-   (otherwise the content wraps below the two rails).
-   --------------------------------------------------------------------------- */
-html[data-nav="collapsed"] body.has-nav-panel {
-  grid-template-columns: 76px 232px 1fr;
-}
-html[data-nav="collapsed"] .menu__panel { left: 0; }
 
 /* OR value stacks (#414): one input per comma alternative. */
 .builder-row__values {
@@ -3922,6 +3847,27 @@ html[data-nav="collapsed"] .menu__panel { left: 0; }
   text-transform: uppercase;
   letter-spacing: 0.05em;
   white-space: nowrap;
+}
+
+/* Conformance CRUD (#237, #238): New in the page head, Edit/Delete in the
+   detail panels. */
+.page-head__actions {
+  margin-top: 10px;
+}
+
+.detail__actions {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.btn--danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn--danger:hover {
+  background: var(--danger-soft);
 }
 
 /* mustSupport emphasis + human labels (#364). */

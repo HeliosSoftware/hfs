@@ -27,7 +27,7 @@ export default defineConfig({
     {
       // The JS-enabled ring: theme behavior, axe-core a11y, no-CDN invariants.
       name: "chromium",
-      testIgnore: "**/nojs/**",
+      testIgnore: ["**/nojs/**", "**/auth/**"],
       use: { ...devices["Desktop Chrome"] },
     },
     {
@@ -36,6 +36,24 @@ export default defineConfig({
       testMatch: "**/nojs/**/*.spec.ts",
       use: { ...devices["Desktop Chrome"], javaScriptEnabled: false },
     },
+    // The auth legs (#320) drive their own servers (see webServer below), so
+    // they only exist when this run boots its servers itself.
+    ...(externalBase
+      ? []
+      : [
+          {
+            // Auth enabled + outbound service token: conformance self-fetch works.
+            name: "auth",
+            testMatch: "**/auth/conformance.spec.ts",
+            use: { ...devices["Desktop Chrome"], baseURL: `http://127.0.0.1:${PORT + 10}` },
+          },
+          {
+            // Auth enabled, no outbound token: the pages degrade, never 404.
+            name: "auth-degraded",
+            testMatch: "**/auth/degraded.spec.ts",
+            use: { ...devices["Desktop Chrome"], baseURL: `http://127.0.0.1:${PORT + 20}` },
+          },
+        ]),
   ],
   // Boot our own hfs only when no external server was handed to us. The backend
   // matrix launches hfs on the host and sets HFS_E2E_BASE_URL, so there we skip
@@ -43,14 +61,36 @@ export default defineConfig({
   ...(externalBase
     ? {}
     : {
-        webServer: {
-          command: "node boot.mjs",
-          // Readiness probe: the FHIR root does not 200, but /ui does.
-          url: `${baseURL}/ui`,
-          reuseExistingServer: !process.env.CI,
-          timeout: 120_000,
-          stdout: "pipe",
-          stderr: "pipe",
-        },
+        webServer: [
+          {
+            command: "node boot.mjs",
+            // Readiness probe: the FHIR root does not 200, but /ui does.
+            url: `${baseURL}/ui`,
+            reuseExistingServer: !process.env.CI,
+            timeout: 120_000,
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+          // The auth legs (#320): same binary, bearer auth enabled against a
+          // throwaway JWKS boot.mjs serves on the port next to the server's.
+          {
+            command: "node boot.mjs",
+            url: `http://127.0.0.1:${PORT + 10}/ui`,
+            env: { HFS_E2E_PORT: String(PORT + 10), HFS_E2E_AUTH: "token" },
+            reuseExistingServer: !process.env.CI,
+            timeout: 120_000,
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+          {
+            command: "node boot.mjs",
+            url: `http://127.0.0.1:${PORT + 20}/ui`,
+            env: { HFS_E2E_PORT: String(PORT + 20), HFS_E2E_AUTH: "degraded" },
+            reuseExistingServer: !process.env.CI,
+            timeout: 120_000,
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+        ],
       }),
 });
