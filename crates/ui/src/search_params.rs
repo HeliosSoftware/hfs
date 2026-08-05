@@ -40,6 +40,9 @@ pub(crate) struct VersionSnapshot {
     /// False when the fetch failed — the snapshot is then empty and the page
     /// says so instead of silently under-reporting.
     pub spec_loaded: bool,
+    /// Canonical URL → stored FHIR resource id, for the editor deep-links
+    /// (#238). Only resources the server returned with an id appear here.
+    pub resource_ids: std::collections::HashMap<String, String>,
 }
 
 impl SpCatalog {
@@ -74,6 +77,16 @@ impl SpCatalog {
             .or_insert_with(|| built.clone())
             .clone()
     }
+
+    /// Drops the cached snapshot for a tenant + version so the next request
+    /// re-fetches. The page calls this on `?refresh=1`, which the CRUD flows
+    /// append after a write lands through the FHIR API (#238).
+    pub fn invalidate(&self, tenant: &str, version: FhirVersion) {
+        self.versions
+            .lock()
+            .expect("catalog lock")
+            .remove(&(tenant.to_string(), version));
+    }
 }
 
 async fn fetch_snapshot(
@@ -97,10 +110,14 @@ fn build_snapshot(
     let loader = SearchParameterLoader::new(version);
     let mut params: Vec<Arc<SearchParameterDefinition>> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut resource_ids = std::collections::HashMap::new();
     for res in &resources {
         if let Ok(def) = loader.parse_resource(res)
             && seen.insert(def.url.clone())
         {
+            if let Some(id) = res.get("id").and_then(Value::as_str) {
+                resource_ids.insert(def.url.clone(), id.to_string());
+            }
             params.push(Arc::new(def));
         }
     }
@@ -108,6 +125,7 @@ fn build_snapshot(
     VersionSnapshot {
         params,
         spec_loaded,
+        resource_ids,
     }
 }
 
@@ -310,6 +328,9 @@ pub(crate) struct SpDetail {
     /// Fluent key for the localized source label.
     pub source_key: &'static str,
     pub notes: Vec<SpNote>,
+    /// The stored FHIR resource behind this parameter, when there is one —
+    /// the Edit deep-link and Delete need the id, not the canonical URL.
+    pub resource_id: Option<String>,
 }
 
 pub(crate) struct VersionLink {
@@ -601,6 +622,7 @@ pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView 
                 source: source_key(param.source),
                 source_key: source_fluent_key(source_key(param.source)),
                 notes,
+                resource_id: snapshot.resource_ids.get(&param.url).cloned(),
             }
         })
     });
@@ -764,6 +786,66 @@ mod tests {
         .with_source(source)
     }
 
+    #[tokio::test]
+    async fn invalidate_drops_the_cached_snapshot() {
+        let source = crate::conformance::StaticConformanceSource::empty().with(
+            "SearchParameter",
+            FhirVersion::default(),
+            vec![serde_json::json!({
+                "resourceType": "SearchParameter",
+                "id": "sp-1",
+                "url": "http://example.org/SearchParameter/color",
+                "name": "color",
+                "code": "color",
+                "status": "active",
+                "type": "token",
+                "base": ["Patient"],
+                "expression": "Patient.extension.value"
+            })],
+        );
+        let catalog = SpCatalog::new(Arc::new(source));
+        let first = catalog.snapshot("t1", FhirVersion::default()).await;
+        let cached = catalog.snapshot("t1", FhirVersion::default()).await;
+        assert!(Arc::ptr_eq(&first, &cached), "second read serves the cache");
+
+        catalog.invalidate("t1", FhirVersion::default());
+        let fresh = catalog.snapshot("t1", FhirVersion::default()).await;
+        assert!(!Arc::ptr_eq(&first, &fresh), "invalidate forces a re-fetch");
+        assert_eq!(fresh.params.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_keeps_resource_ids_for_the_editor_links() {
+        let resources = vec![serde_json::json!({
+            "resourceType": "SearchParameter",
+            "id": "sp-1",
+            "url": "http://example.org/SearchParameter/color",
+            "name": "color",
+            "code": "color",
+            "status": "active",
+            "type": "token",
+            "base": ["Patient"],
+            "expression": "Patient.extension.value"
+        })];
+        let snapshot = build_snapshot(FhirVersion::default(), resources, true);
+        assert_eq!(
+            snapshot
+                .resource_ids
+                .get("http://example.org/SearchParameter/color")
+                .map(String::as_str),
+            Some("sp-1")
+        );
+        let query = SpQuery {
+            sel: Some("http://example.org/SearchParameter/color".into()),
+            ..SpQuery::default()
+        };
+        let view = build_view(&snapshot, &query);
+        assert_eq!(
+            view.detail.expect("selected").resource_id.as_deref(),
+            Some("sp-1")
+        );
+    }
+
     #[test]
     fn snapshot_loads_the_full_spec_bundle() {
         let snapshot = snapshot();
@@ -849,6 +931,7 @@ mod tests {
         let snapshot = VersionSnapshot {
             params: vec![Arc::new(spec), Arc::new(stored)],
             spec_loaded: true,
+            resource_ids: Default::default(),
         };
         let view = build_view(&snapshot, &SpQuery::default());
 
@@ -879,6 +962,7 @@ mod tests {
         let snapshot = VersionSnapshot {
             params: vec![Arc::new(one), Arc::new(two)],
             spec_loaded: true,
+            resource_ids: Default::default(),
         };
         let view = build_view(&snapshot, &SpQuery::default());
         assert!(view.rows.iter().all(|r| r.chips[0].kind == "conflict"));
