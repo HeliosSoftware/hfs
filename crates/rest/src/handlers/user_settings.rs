@@ -430,22 +430,28 @@ fn parse_if_match(conditional: &ConditionalHeaders) -> RestResult<EntityTagPreco
 }
 
 /// Checks a parsed precondition against the currently stored `version`, where
-/// version `0` means "no document exists yet".
+/// version `0` means "no document has been written yet".
 ///
-/// Version `0` is mapped to "no current representation" so the shared evaluator
-/// gives the semantics this endpoint already had: `*` requires an existing
-/// document, and a concrete tag never matches a document that does not exist.
+/// The GET handler serves that state as a *real representation* — `{}` with
+/// `ETag: "0"` — so the validator it hands out must round-trip: a concrete
+/// `If-Match: "0"` matches version 0, or a fresh user's read-then-conditional-
+/// write could never succeed (#442). `If-Match: *` keeps requiring an actually
+/// stored document, per its "unless it does not exist" semantics.
 fn check_if_match(precondition: &EntityTagPrecondition, version: i64) -> RestResult<()> {
-    let current = (version > 0).then(|| version.to_string());
-    if precondition.if_match_satisfied(current.as_deref()) {
+    let satisfied = match precondition {
+        EntityTagPrecondition::Tags(_) => {
+            precondition.if_match_satisfied(Some(&version.to_string()))
+        }
+        _ => precondition.if_match_satisfied((version > 0).then(|| version.to_string()).as_deref()),
+    };
+    if satisfied {
         return Ok(());
     }
 
-    let message = match current {
-        Some(current) => {
-            format!("If-Match precondition failed: current settings version is {current}")
-        }
-        None => "If-Match precondition failed: no settings document exists yet".to_string(),
+    let message = if version > 0 {
+        format!("If-Match precondition failed: current settings version is {version}")
+    } else {
+        "If-Match precondition failed: no settings document exists yet".to_string()
     };
     Err(RestError::PreconditionFailed { message })
 }

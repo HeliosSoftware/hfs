@@ -1,17 +1,15 @@
-// The persistent app chrome (layouts/base.html): sidebar nav, collapse toggle,
-// theme buttons, and the language switcher. Present on every full page.
+// The persistent app chrome (layouts/base.html): the sidebar rail (expands on
+// hover, #438), theme buttons, and the language switcher. On every full page.
 import type { Page, Locator } from "@playwright/test";
 
 export type Theme = "light" | "dark";
 
 export class AppChrome {
   readonly sidebar: Locator;
-  readonly navToggle: Locator;
   readonly langSwitcher: Locator;
 
   constructor(readonly page: Page) {
     this.sidebar = page.locator("aside.sidebar");
-    this.navToggle = page.locator("[data-toggle-nav]");
     this.langSwitcher = page.locator(".lang-switcher");
   }
 
@@ -45,9 +43,5 @@ export class AppChrome {
 
   langLink(lang: string): Locator {
     return this.page.locator(`.lang-switcher a[href*='lang=${lang}']`);
-  }
-
-  async collapsed(): Promise<boolean> {
-    return (await this.page.locator("html").getAttribute("data-nav")) === "collapsed";
   }
 }
