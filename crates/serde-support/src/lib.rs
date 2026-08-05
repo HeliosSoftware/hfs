@@ -682,3 +682,172 @@ pub struct IdAndExtensionOwned<E> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<E>>,
 }
+
+/// The raw JSON pieces of a FHIR choice element (`value[x]`, `effective[x]`, …).
+///
+/// FHIR serialises a choice element as a *type-suffixed* key (`valueQuantity`),
+/// optionally paired with an underscore-prefixed sibling (`_valueString`) that
+/// carries `id`/`extension` metadata for primitive choices. [`deserialize_choice_parts`]
+/// locates that pair and reports which variant matched.
+pub struct ChoiceParts {
+    /// Index into the `variant_keys` slice that was matched.
+    pub index: usize,
+    /// The value under the type-suffixed key, when present.
+    pub value: Option<serde_json::Value>,
+    /// The value under the underscore-prefixed key, when present.
+    pub extension: Option<serde_json::Value>,
+}
+
+/// Scans a map for the single choice-element key it contains.
+///
+/// This exists so that the `FhirSerde` derive does not have to expand a
+/// per-variant key comparison into every generated `visit_map`. Choice enums
+/// carry one variant per permitted FHIR datatype — dozens each — and there are
+/// hundreds of such enums per FHIR version, so an inlined scan multiplies out
+/// into hundreds of megabytes of near-identical machine code in any binary that
+/// deserializes typed resources. Keying the scan on a `&'static [&'static str]`
+/// collapses all of it to one function per `MapAccess` implementation.
+///
+/// Keys that match neither a variant key nor its underscore-prefixed form are
+/// ignored, matching the previous generated behaviour.
+///
+/// # Errors
+///
+/// Returns an error when a key is not a string, when either the value or the
+/// extension key appears twice, when two *different* variant keys are present,
+/// or when no variant key is found at all.
+pub fn deserialize_choice_parts<'de, A>(
+    mut map: A,
+    variant_keys: &'static [&'static str],
+) -> Result<ChoiceParts, A::Error>
+where
+    A: serde::de::MapAccess<'de>,
+{
+    let mut index: Option<usize> = None;
+    let mut value: Option<serde_json::Value> = None;
+    let mut extension: Option<serde_json::Value> = None;
+
+    while let Some((key, current)) = map.next_entry::<serde_json::Value, serde_json::Value>()? {
+        let key = match key {
+            serde_json::Value::String(key) => key,
+            _ => {
+                return Err(serde::de::Error::invalid_type(
+                    serde::de::Unexpected::Other("non-string key"),
+                    &"a string key",
+                ));
+            }
+        };
+
+        // Exact match first, so a (hypothetical) variant key starting with `_`
+        // still wins over being read as another variant's metadata sibling.
+        let matched = if let Some(pos) = variant_keys.iter().position(|k| *k == key) {
+            if value.is_some() {
+                return Err(serde::de::Error::duplicate_field(variant_keys[pos]));
+            }
+            value = Some(current);
+            pos
+        } else if let Some(pos) = key
+            .strip_prefix('_')
+            .and_then(|base| variant_keys.iter().position(|k| *k == base))
+        {
+            if extension.is_some() {
+                // `duplicate_field` requires a `&'static str`, which we do not
+                // have for the underscore-prefixed form.
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate field '{}'",
+                    key
+                )));
+            }
+            extension = Some(current);
+            pos
+        } else {
+            continue;
+        };
+
+        match index {
+            Some(existing) if existing != matched => {
+                return Err(serde::de::Error::custom(format!(
+                    "Mismatched keys found: {} and {}",
+                    variant_keys[existing], key
+                )));
+            }
+            _ => index = Some(matched),
+        }
+    }
+
+    match index {
+        Some(index) => Ok(ChoiceParts {
+            index,
+            value,
+            extension,
+        }),
+        None => Err(serde::de::Error::custom(format!(
+            "Expected one of the variant keys {:?} (or their underscore-prefixed versions) but found none",
+            variant_keys
+        ))),
+    }
+}
+
+/// Deserializes the `value`/`id`/`extension` pieces of a primitive choice variant.
+///
+/// The caller assembles them into its concrete `Element<V, E>` or
+/// `DecimalElement<E>`; `V` and `E` are inferred from that assignment. Shared
+/// out of the derive for the same code-size reason as [`deserialize_choice_parts`].
+///
+/// # Errors
+///
+/// Returns an error when either piece fails to deserialize.
+#[allow(clippy::type_complexity)]
+pub fn deserialize_choice_element_parts<V, E, Err>(
+    value: Option<serde_json::Value>,
+    extension: Option<serde_json::Value>,
+    key: &str,
+) -> Result<(Option<V>, Option<String>, Option<Vec<E>>), Err>
+where
+    V: serde::de::DeserializeOwned,
+    E: serde::de::DeserializeOwned,
+    Err: serde::de::Error,
+{
+    let (id, extension) = match extension {
+        Some(extension) => {
+            let helper: IdAndExtensionOwned<E> =
+                serde::Deserialize::deserialize(extension).map_err(|e| {
+                    Err::custom(format!("Error deserializing extension _{}: {}", key, e))
+                })?;
+            (helper.id, helper.extension)
+        }
+        None => (None, None),
+    };
+
+    let value = match value {
+        Some(value) => Some(V::deserialize(value).map_err(|e| {
+            Err::custom(format!("Error deserializing primitive {}: {}", key, e))
+        })?),
+        None => None,
+    };
+
+    Ok((value, id, extension))
+}
+
+/// Deserializes the payload of a non-primitive choice variant.
+///
+/// `kind` only shapes the error message (`"non-element variant"`,
+/// `"tuple variant"`, …). Shared out of the derive for the same code-size
+/// reason as [`deserialize_choice_parts`].
+///
+/// # Errors
+///
+/// Returns an error when the value is absent or fails to deserialize.
+pub fn deserialize_choice_value<T, Err>(
+    value: Option<serde_json::Value>,
+    key: &'static str,
+    kind: &'static str,
+) -> Result<T, Err>
+where
+    T: serde::de::DeserializeOwned,
+    Err: serde::de::Error,
+{
+    let value = value.ok_or_else(|| Err::missing_field(key))?;
+    T::deserialize(value)
+        .map_err(|e| Err::custom(format!("Error deserializing {} {}: {}", kind, key, e)))
+}
