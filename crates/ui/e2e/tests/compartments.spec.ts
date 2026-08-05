@@ -37,3 +37,20 @@ test("tester: the wildcard target fans out across member types", async ({ compar
   await expect(compartments.resultTitle).toBeVisible();
   await expect(compartments.resultTitle).not.toHaveClass(/--danger/);
 });
+
+// CRUD (#237): the stored definitions carry ids, so the definition tab offers
+// Edit (editor deep-link) and Delete; New sits in the page head. The delete
+// round-trip itself is exercised on the SearchParameter page — same script —
+// so the seeded compartments stay intact for the other tests.
+test("the definition tab offers New, Edit, and Delete", async ({ page, compartments }) => {
+  await compartments.goto();
+  await expect(page.locator(".page-head__actions a.btn--primary")).toHaveAttribute(
+    "href",
+    "/ui/editor?type=CompartmentDefinition",
+  );
+  await expect(page.locator(".detail__actions a.btn")).toHaveAttribute(
+    "href",
+    /\/ui\/editor\?type=CompartmentDefinition&id=./,
+  );
+  await expect(page.locator(".detail__actions [data-crud-delete]")).toBeVisible();
+});
