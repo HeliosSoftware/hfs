@@ -1329,14 +1329,6 @@
       "reason": "Genuine defect in the published example, not an engine bug: the nested `Questionnaire.item` really omits the required `linkId` (verified in the corpus)."
     },
     {
-      "file": "questionnaire-cqf-example.json",
-      "issues": 1,
-      "kinds": [
-        "unknown-schema"
-      ],
-      "reason": "Documented gap: core extension StructureDefinitions (`extension-definitions.json`) are not in the vendored spec bundles, so these extension canonicals cannot be resolved."
-    },
-    {
       "file": "questionnaire-questionnaire.json",
       "issues": 72,
       "kinds": [
