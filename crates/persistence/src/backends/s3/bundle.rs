@@ -30,7 +30,15 @@ use super::backend::S3Backend;
 ///
 /// Applied in reverse order if a later step fails, approximating an atomic
 /// transaction rollback against an eventually-consistent object store.
+///
+/// Retained but no longer reachable from `process_transaction`, which now
+/// refuses outright — see [`BundleProvider::supports_atomic_transactions`] on
+/// this backend. It stays because `execute_bundle_entry` still records the
+/// snapshots, and because any future durable-intent design (the alternative
+/// considered in #489) needs exactly this vocabulary. It is *not* a live
+/// atomicity guarantee, and nothing in the batch path consults it.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum CompensationAction {
     /// Delete a newly-created resource to undo a POST entry.
     Delete { resource_type: String, id: String },
@@ -41,12 +49,49 @@ enum CompensationAction {
 
 #[async_trait]
 impl BundleProvider for S3Backend {
+    /// S3 has no multi-object atomicity, and the compensation log below cannot
+    /// substitute for one.
+    ///
+    /// Two independent reasons, both established by #489:
+    ///
+    /// 1. **The rollback is unreachable on the failure mode that matters.** The
+    ///    HTTP layer applies a `TimeoutLayer`, which on expiry *drops* the
+    ///    handler future. Async cancellation stops the task at its current await
+    ///    point without propagating an error, so every `Err`/`status >= 400` arm
+    ///    holding compensation logic is skipped by construction.
+    /// 2. **The compensation list is built after the writes.** Entries execute
+    ///    concurrently and the list is populated only once all of them have
+    ///    resolved, so at the moment of cancellation it is still empty — there
+    ///    is nothing to undo *with*, even given a cancellation-safe unwind.
+    ///
+    /// The observed result was 466 of 473 entries durably committed, with no
+    /// tombstone or compensating delete, while the client received a 408.
+    ///
+    /// This is also what the architecture already says. `crates/persistence`'s
+    /// README describes S3 as "intentionally storage-focused … archive/history
+    /// storage", and design discussion #28 places ACID on the relational tier.
+    /// Refusing here matches the documented role instead of approximating a
+    /// guarantee the tier was never meant to offer.
+    fn supports_atomic_transactions(&self) -> bool {
+        false
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
     ) -> Result<BundleResult, TransactionError> {
+        // Refuse before touching S3. A partial commit is worse than a rejection:
+        // the caller cannot tell 408-with-466-writes from 408-with-none, and a
+        // retry double-writes every POST entry (server-assigned ids, so no
+        // idempotency). See `supports_atomic_transactions`.
+        if !self.supports_atomic_transactions() {
+            return Err(TransactionError::AtomicityUnsupported {
+                backend_name: "s3".to_string(),
+            });
+        }
+
         let mut entries = entries;
         let mut reference_map: HashMap<String, String> = HashMap::new();
 

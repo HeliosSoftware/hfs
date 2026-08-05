@@ -818,6 +818,13 @@ impl From<TransactionError> for RestError {
             TransactionError::Timeout { .. } => RestError::GatewayTimeout {
                 message: err.to_string(),
             },
+            // A capability gap, not a fault: the backend is healthy and
+            // declined work it cannot perform correctly. Kept in step with
+            // `transaction_error_response_parts` in `handlers/batch.rs`, so the
+            // refusal reports the same status whichever path surfaces it.
+            TransactionError::AtomicityUnsupported { .. } => RestError::NotImplemented {
+                feature: err.to_string(),
+            },
             TransactionError::RolledBack { .. }
             | TransactionError::InvalidTransaction
             | TransactionError::NestedNotSupported
