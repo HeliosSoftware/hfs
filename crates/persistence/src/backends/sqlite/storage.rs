@@ -19,7 +19,9 @@ use crate::core::{
     if_match_field_satisfied, normalize_etag,
 };
 use crate::error::TransactionError;
-use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
+};
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
@@ -582,7 +584,7 @@ impl ResourceStorage for SqliteBackend {
                 |row| row.get(0),
             )
         }
-        .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))?;
+        .or_query_error("Failed to count resources")?;
 
         Ok(count as u64)
     }
@@ -620,7 +622,7 @@ impl ResourceStorage for SqliteBackend {
                    AND last_updated >= ?3 \
                  GROUP BY day ORDER BY day",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare count_by_day: {}", e)))?;
+            .or_query_error("Failed to prepare count_by_day")?;
 
         let rows = stmt
             .query_map(params![tenant_id, resource_type, since_bound], |row| {
@@ -628,12 +630,11 @@ impl ResourceStorage for SqliteBackend {
                 let n: i64 = row.get(1)?;
                 Ok((day, n))
             })
-            .map_err(|e| internal_error(format!("Failed to query count_by_day: {}", e)))?;
+            .or_query_error("Failed to query count_by_day")?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (day_str, n) =
-                row.map_err(|e| internal_error(format!("Failed to read count_by_day row: {}", e)))?;
+            let (day_str, n) = row.or_query_error("Failed to read count_by_day row")?;
             if let Ok(day) = chrono::NaiveDate::parse_from_str(&day_str, "%Y-%m-%d") {
                 out.push(crate::core::DailyResourceCount {
                     day,
@@ -682,9 +683,7 @@ impl ResourceStorage for SqliteBackend {
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
                  GROUP BY bucket HAVING delta != 0 ORDER BY bucket",
             )
-            .map_err(|e| {
-                internal_error(format!("Failed to prepare count_deltas_by_bucket: {}", e))
-            })?;
+            .or_query_error("Failed to prepare count_deltas_by_bucket")?;
 
         let rows = stmt
             .query_map(
@@ -695,15 +694,12 @@ impl ResourceStorage for SqliteBackend {
                     Ok((bucket, delta))
                 },
             )
-            .map_err(|e| {
-                internal_error(format!("Failed to query count_deltas_by_bucket: {}", e))
-            })?;
+            .or_query_error("Failed to query count_deltas_by_bucket")?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (bucket, delta) = row.map_err(|e| {
-                internal_error(format!("Failed to read count_deltas_by_bucket row: {}", e))
-            })?;
+            let (bucket, delta) =
+                row.or_query_error("Failed to read count_deltas_by_bucket row")?;
             if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
                 out.push(crate::core::ResourceCountDelta {
                     bucket_start,
@@ -743,7 +739,7 @@ impl ResourceStorage for SqliteBackend {
                  WHERE tenant_id = ?1 AND last_updated >= ?2 \
                  GROUP BY wd, hr",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare activity_histogram: {}", e)))?;
+            .or_query_error("Failed to prepare activity_histogram")?;
 
         let rows = stmt
             .query_map(params![tenant_id, since_bound], |row| {
@@ -752,12 +748,11 @@ impl ResourceStorage for SqliteBackend {
                 let n: i64 = row.get(2)?;
                 Ok((wd, hr, n))
             })
-            .map_err(|e| internal_error(format!("Failed to query activity_histogram: {}", e)))?;
+            .or_query_error("Failed to query activity_histogram")?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (wd, hr, n) =
-                row.map_err(|e| internal_error(format!("Failed to read activity row: {}", e)))?;
+            let (wd, hr, n) = row.or_query_error("Failed to read activity row")?;
             out.push(crate::core::ActivityCell {
                 weekday: wd.clamp(0, 6) as u8,
                 hour: hr.clamp(0, 23) as u8,
@@ -776,17 +771,17 @@ impl ResourceStorage for SqliteBackend {
                  WHERE tenant_id = ?1 AND is_deleted = 0 \
                  GROUP BY resource_type",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare count_all_types: {}", e)))?;
+            .or_query_error("Failed to prepare count_all_types")?;
         let rows = stmt
             .query_map(params![tenant_id], |row| {
                 let rt: String = row.get(0)?;
                 let n: i64 = row.get(1)?;
                 Ok((rt, n.max(0) as u64))
             })
-            .map_err(|e| internal_error(format!("Failed to query count_all_types: {}", e)))?;
+            .or_query_error("Failed to query count_all_types")?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| internal_error(format!("count_all_types row: {}", e)))?);
+            out.push(row.or_query_error("count_all_types row")?);
         }
         Ok(out)
     }
@@ -824,17 +819,17 @@ impl ResourceStorage for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare count_by_types: {}", e)))?;
+            .or_query_error("Failed to prepare count_by_types")?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(binds), |row| {
                 let rt: String = row.get(0)?;
                 let n: i64 = row.get(1)?;
                 Ok((rt, n.max(0) as u64))
             })
-            .map_err(|e| internal_error(format!("Failed to query count_by_types: {}", e)))?;
+            .or_query_error("Failed to query count_by_types")?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| internal_error(format!("count_by_types row: {}", e)))?);
+            out.push(row.or_query_error("count_by_types row")?);
         }
         Ok(out)
     }
@@ -847,17 +842,17 @@ impl ResourceStorage for SqliteBackend {
                 "SELECT tenant_id, COUNT(*) FROM resources \
                  WHERE is_deleted = 0 GROUP BY tenant_id",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare count_by_tenant: {}", e)))?;
+            .or_query_error("Failed to prepare count_by_tenant")?;
         let rows = stmt
             .query_map([], |row| {
                 let tid: String = row.get(0)?;
                 let n: i64 = row.get(1)?;
                 Ok((tid, n.max(0) as u64))
             })
-            .map_err(|e| internal_error(format!("Failed to query count_by_tenant: {}", e)))?;
+            .or_query_error("Failed to query count_by_tenant")?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| internal_error(format!("count_by_tenant row: {}", e)))?);
+            out.push(row.or_query_error("count_by_tenant row")?);
         }
         Ok(out)
     }
@@ -963,7 +958,7 @@ impl ResourceStorage for SqliteBackend {
         // busy_timeout does not cover it. Taking the write lock up front does.
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| internal_error(format!("purge begin: {e}")))?;
+            .or_query_error("purge begin")?;
         // Count current-version rows first so we can report what was removed.
         let removed: i64 = tx
             .query_row(
@@ -971,7 +966,7 @@ impl ResourceStorage for SqliteBackend {
                 params![id],
                 |row| row.get(0),
             )
-            .map_err(|e| internal_error(format!("purge count: {e}")))?;
+            .or_query_error("purge count")?;
         // search_index has ON DELETE CASCADE from resources, but delete it
         // explicitly too in case foreign keys are not enforced on this handle.
         // (That explicit delete is also what fires the `search_index_fts`
@@ -982,7 +977,7 @@ impl ResourceStorage for SqliteBackend {
             "DELETE FROM resources WHERE tenant_id = ?1",
         ] {
             tx.execute(sql, params![id])
-                .map_err(|e| internal_error(format!("purge delete: {e}")))?;
+                .or_query_error("purge delete")?;
         }
         // `resource_fts` is an FTS5 *virtual* table: it can carry no foreign key,
         // so the cascade above never reaches it and it must be deleted explicitly
@@ -1006,8 +1001,7 @@ impl ResourceStorage for SqliteBackend {
         // connection already holds the write lock, and a second one would
         // deadlock against it.
         let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
-        tx.commit()
-            .map_err(|e| internal_error(format!("purge commit: {e}")))?;
+        tx.commit().or_query_error("purge commit")?;
         if settings > 0 {
             tracing::info!(
                 tenant = %id,
@@ -1785,7 +1779,7 @@ impl InstanceHistoryProvider for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare history query: {}", e)))?;
+            .or_query_error("Failed to prepare history query")?;
 
         let rows = stmt
             .query_map(params![tenant_id, resource_type, id], |row| {
@@ -1796,14 +1790,14 @@ impl InstanceHistoryProvider for SqliteBackend {
                 let fhir_version: String = row.get(4)?;
                 Ok((version_id, data, last_updated, is_deleted, fhir_version))
             })
-            .map_err(|e| internal_error(format!("Failed to query history: {}", e)))?;
+            .or_query_error("Failed to query history")?;
 
         let mut entries = Vec::new();
         let mut last_version: Option<String> = None;
 
         for row in rows {
             let (version_id, data, last_updated_str, is_deleted, fhir_version_str) =
-                row.map_err(|e| internal_error(format!("Failed to read history row: {}", e)))?;
+                row.or_query_error("Failed to read history row")?;
 
             // Stop if we've collected enough items (we fetched count+1 to detect more)
             if entries.len() >= params.pagination.count as usize {
@@ -1891,7 +1885,7 @@ impl InstanceHistoryProvider for SqliteBackend {
                 params![tenant_id, resource_type, id],
                 |row| row.get(0),
             )
-            .map_err(|e| internal_error(format!("Failed to count history: {}", e)))?;
+            .or_query_error("Failed to count history")?;
 
         Ok(count as u64)
     }
@@ -1949,7 +1943,7 @@ impl InstanceHistoryProvider for SqliteBackend {
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND version_id != ?4",
                 params![tenant_id, resource_type, id, current_version],
             )
-            .map_err(|e| internal_error(format!("Failed to delete history: {}", e)))?;
+            .or_query_error("Failed to delete history")?;
 
         Ok(deleted as u64)
     }
@@ -2094,7 +2088,7 @@ impl TypeHistoryProvider for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare type history query: {}", e)))?;
+            .or_query_error("Failed to prepare type history query")?;
 
         let rows = stmt
             .query_map(params![tenant_id, resource_type], |row| {
@@ -2106,14 +2100,14 @@ impl TypeHistoryProvider for SqliteBackend {
                 let fhir_version: String = row.get(5)?;
                 Ok((id, version_id, data, last_updated, is_deleted, fhir_version))
             })
-            .map_err(|e| internal_error(format!("Failed to query type history: {}", e)))?;
+            .or_query_error("Failed to query type history")?;
 
         let mut entries = Vec::new();
         let mut last_entry: Option<(String, String)> = None; // (last_updated, id)
 
         for row in rows {
             let (id, version_id, data, last_updated_str, is_deleted, fhir_version_str) =
-                row.map_err(|e| internal_error(format!("Failed to read type history row: {}", e)))?;
+                row.or_query_error("Failed to read type history row")?;
 
             // Stop if we've collected enough items (we fetched count+1 to detect more)
             if entries.len() >= params.pagination.count as usize {
@@ -2276,9 +2270,9 @@ impl SystemHistoryProvider for SqliteBackend {
         sql.push_str(" ORDER BY last_updated DESC, resource_type DESC, id DESC, CAST(version_id AS INTEGER) DESC");
         sql.push_str(&format!(" LIMIT {}", params.pagination.count + 1)); // +1 to detect if there are more
 
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            internal_error(format!("Failed to prepare system history query: {}", e))
-        })?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .or_query_error("Failed to prepare system history query")?;
 
         let rows = stmt
             .query_map(params![tenant_id], |row| {
@@ -2299,7 +2293,7 @@ impl SystemHistoryProvider for SqliteBackend {
                     fhir_version,
                 ))
             })
-            .map_err(|e| internal_error(format!("Failed to query system history: {}", e)))?;
+            .or_query_error("Failed to query system history")?;
 
         let mut entries = Vec::new();
         let mut last_entry: Option<(String, String, String)> = None; // (last_updated, resource_type, id)
@@ -2313,8 +2307,7 @@ impl SystemHistoryProvider for SqliteBackend {
                 last_updated_str,
                 is_deleted,
                 fhir_version_str,
-            ) = row
-                .map_err(|e| internal_error(format!("Failed to read system history row: {}", e)))?;
+            ) = row.or_query_error("Failed to read system history row")?;
 
             // Stop if we've collected enough items (we fetched count+1 to detect more)
             if entries.len() >= params.pagination.count as usize {
@@ -2413,7 +2406,7 @@ impl SystemHistoryProvider for SqliteBackend {
                 params![tenant_id],
                 |row| row.get(0),
             )
-            .map_err(|e| internal_error(format!("Failed to count system history: {}", e)))?;
+            .or_query_error("Failed to count system history")?;
 
         Ok(count as u64)
     }
@@ -2474,21 +2467,21 @@ impl PurgableStorage for SqliteBackend {
             "DELETE FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             params![tenant_id, resource_type, id],
         )
-        .map_err(|e| internal_error(format!("Failed to purge resource: {}", e)))?;
+        .or_query_error("Failed to purge resource")?;
 
         // Delete from history table
         tx.execute(
             "DELETE FROM resource_history WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
             params![tenant_id, resource_type, id],
         )
-        .map_err(|e| internal_error(format!("Failed to purge resource history: {}", e)))?;
+        .or_query_error("Failed to purge resource history")?;
 
         // Delete from search index
         tx.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
             params![tenant_id, resource_type, id],
         )
-        .map_err(|e| internal_error(format!("Failed to purge search index: {}", e)))?;
+        .or_query_error("Failed to purge search index")?;
 
         // Delete the full-text rows: no cascade reaches an FTS5 virtual table.
         // See `purge_tenant_data` for why this is strict and ungated.
@@ -2527,21 +2520,21 @@ impl PurgableStorage for SqliteBackend {
             "DELETE FROM resources WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
-        .map_err(|e| internal_error(format!("Failed to purge resources: {}", e)))?;
+        .or_query_error("Failed to purge resources")?;
 
         // Delete from history table
         tx.execute(
             "DELETE FROM resource_history WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
-        .map_err(|e| internal_error(format!("Failed to purge resource history: {}", e)))?;
+        .or_query_error("Failed to purge resource history")?;
 
         // Delete from search index
         tx.execute(
             "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )
-        .map_err(|e| internal_error(format!("Failed to purge search index: {}", e)))?;
+        .or_query_error("Failed to purge search index")?;
 
         // Delete the full-text rows: no cascade reaches an FTS5 virtual table.
         // See `purge_tenant_data` for why this is strict and ungated.
@@ -3843,7 +3836,7 @@ impl ReindexTarget for SqliteBackend {
                 "DELETE FROM search_index WHERE tenant_id = ?1",
                 params![tenant_id],
             )
-            .map_err(|e| internal_error(format!("Failed to clear search index: {}", e)))?;
+            .or_query_error("Failed to clear search index")?;
 
         // Clear the full-text rows too, matching PostgreSQL. This is only sound
         // because `write_search_entries` above now repopulates them; adding this

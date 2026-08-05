@@ -81,14 +81,14 @@ nav-resource-editor = Editor de recursos
 nav-history-versions = Historial y versiones
 nav-compartments = Compartimentos
 nav-batch-transaction = Lote / Transacción
-nav-bulk-export = Exportación masiva
+nav-import = Importar
+nav-export = Exportar
 nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
 nav-admin-ops = Administración / Operaciones
 nav-subscriptions = Suscripciones
 nav-tenants = Tenants
-nav-toggle = Contraer o expandir la navegación
 
 ## Mantenimiento de tenants (/ui/tenants)
 
@@ -202,7 +202,7 @@ queries-unavailable = Las consultas guardadas no están disponibles: el backend 
 ## Visor de SearchParameters (#238)
 
 sp-heading = Parámetros de búsqueda
-sp-lede = Explora los parámetros con los que este servidor resuelve las búsquedas, filtrados por tipo de recurso base. Los parámetros de la especificación son de solo lectura; la edición por tenant llegará cuando los parámetros vivan en el almacenamiento.
+sp-lede = Explora los parámetros con los que este servidor resuelve las búsquedas, filtrados por tipo de recurso base. Los parámetros almacenados se pueden crear, editar y eliminar; el registro recoge los cambios por tenant.
 sp-version-label = Versión FHIR
 sp-spec-missing = No se encontró el bundle completo de la especificación (search-parameters-*.json) en el directorio de datos — solo se muestran los parámetros mínimos embebidos.
 sp-rail-label = Filtro de recursos
@@ -248,7 +248,15 @@ sp-note-shadowed = Eclipsado por { $url } en (base, code): un origen de mayor pr
 sp-note-empty-expression = Expresión vacía: el extractor no indexa ninguna fila, así que toda búsqueda con este parámetro devuelve vacío en silencio.
 sp-note-no-target = Parámetro de referencia sin tipos destino: la búsqueda encadenada no puede resolver el tipo referenciado.
 sp-note-choice-type = Expresión de tipo choice: el extractor reescribe ofType(T) / as T al elemento concreto (por ejemplo valueQuantity) antes de evaluar contra el JSON almacenado.
-sp-writes-pending = Crear, anular y borrar parámetros por tenant llegará cuando los parámetros de búsqueda se guarden en la base de datos (#235).
+sp-new = Nuevo parámetro de búsqueda
+sp-edit = Editar
+sp-delete = Eliminar
+sp-delete-confirm = ¿Eliminar este parámetro de búsqueda almacenado? Las búsquedas que lo usan dejarán de coincidir cuando el registro se actualice.
+cmp-new = Nueva definición de compartimento
+cmp-edit = Editar
+cmp-delete = Eliminar
+cmp-delete-confirm = ¿Eliminar esta definición de compartimento? Sus rutas de compartimento dejarán de resolverse.
+crud-delete-failed = Error al eliminar
 
 ## Visor y probador de compartments (#237)
 
@@ -256,7 +264,7 @@ cmp-heading = Compartimentos
 cmp-lede = Las definiciones de compartment con las que este servidor enruta las peticiones /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"}, y un probador que responde: ¿está este tipo en este compartment, mediante qué parámetros, y qué búsqueda ejecuta el servidor?
 cmp-rail-label = Definiciones de compartment
 cmp-rail-heading = Compartimentos
-cmp-rail-note = Las definiciones base vienen con el servidor (generadas desde la especificación FHIR). Editarlas implica una capa de overrides por tenant — pregunta abierta en el issue.
+cmp-rail-note = Las definiciones son recursos almacenados, sembrados desde la especificación FHIR al arrancar. Las ediciones y eliminaciones aquí son por tenant.
 cmp-tabs-label = Secciones del compartment
 cmp-tab-definition = Definición
 cmp-tab-members = Miembros
