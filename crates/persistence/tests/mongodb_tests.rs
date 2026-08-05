@@ -182,22 +182,6 @@ async fn mongodb_integration_transaction_bundle_topology_behavior() {
     }
 }
 
-#[tokio::test]
-async fn test_mongodb_bundle_provider_batch_not_supported() {
-    let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
-    let tenant = create_tenant("tenant-bundle-batch");
-
-    let result = backend
-        .process_batch(&tenant, vec![], FhirVersion::default())
-        .await;
-    assert!(matches!(
-        result,
-        Err(StorageError::Backend(
-            BackendError::UnsupportedCapability { .. }
-        ))
-    ));
-}
-
 async fn process_transaction_or_skip(
     backend: &MongoBackend,
     tenant: &TenantContext,

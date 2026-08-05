@@ -1,9 +1,14 @@
-//! Bundle processing (batch and transaction) for the S3 backend.
+//! Transaction bundle processing for the S3 backend.
 //!
 //! Transactions are implemented with a best-effort compensation log: each
 //! successful operation records a [`CompensationAction`] that is applied in
 //! reverse if a later operation fails. S3 does not provide atomic multi-object
 //! operations, so the rollback is advisory rather than strictly atomic.
+//!
+//! `batch` Bundles are **not** handled here. Each entry is authorized
+//! individually against the request's SMART scopes and emits its own audit
+//! event, neither of which this tier can see, so the REST layer executes them
+//! directly against `ResourceStorage`; see the note on [`BundleProvider`].
 
 use std::collections::HashMap;
 
@@ -15,7 +20,7 @@ use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     ResourceStorage, VersionedStorage, bundle_if_match_gate,
 };
-use crate::error::{BackendError, ResourceError, StorageError, TransactionError, ValidationError};
+use crate::error::{ResourceError, StorageError, TransactionError, ValidationError};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
@@ -145,43 +150,9 @@ impl BundleProvider for S3Backend {
             entries: results,
         })
     }
-
-    async fn process_batch(
-        &self,
-        tenant: &TenantContext,
-        entries: Vec<BundleEntry>,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> crate::error::StorageResult<BundleResult> {
-        let futs: Vec<_> = entries
-            .iter()
-            .map(|entry| self.process_batch_entry(tenant, entry, fhir_version))
-            .collect();
-
-        let results = futures::future::join_all(futs).await;
-
-        Ok(BundleResult {
-            bundle_type: BundleType::Batch,
-            entries: results,
-        })
-    }
 }
 
 impl S3Backend {
-    /// Executes a single batch entry and converts any error into a 5xx
-    /// `BundleEntryResult` rather than propagating it, preserving best-effort
-    /// batch semantics.
-    async fn process_batch_entry(
-        &self,
-        tenant: &TenantContext,
-        entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
-    ) -> BundleEntryResult {
-        match self.execute_bundle_entry(tenant, entry, fhir_version).await {
-            Ok((result, _)) => result,
-            Err(err) => Self::bundle_error_result(&err),
-        }
-    }
-
     /// Executes a single bundle entry and returns the result together with an
     /// optional compensation action for rollback.
     async fn execute_bundle_entry(
@@ -412,56 +383,6 @@ impl S3Backend {
                 Ok(())
             }
         }
-    }
-
-    /// Converts a storage error into a bundle entry result with an appropriate
-    /// HTTP status and a minimal OperationOutcome body.
-    fn bundle_error_result(err: &StorageError) -> BundleEntryResult {
-        BundleEntryResult::error(
-            Self::storage_error_status(err),
-            Self::operation_outcome(err),
-        )
-    }
-
-    /// Maps a `StorageError` to an HTTP status code suitable for a bundle entry.
-    fn storage_error_status(err: &StorageError) -> u16 {
-        match err {
-            StorageError::Validation(_) | StorageError::Search(_) => 400,
-            StorageError::Tenant(_) => 403,
-            StorageError::Resource(ResourceError::NotFound { .. }) => 404,
-            StorageError::Resource(ResourceError::VersionNotFound { .. }) => 404,
-            StorageError::Resource(ResourceError::Gone { .. }) => 410,
-            StorageError::Resource(ResourceError::AlreadyExists { .. }) => 409,
-            StorageError::Concurrency(_) => 409,
-            StorageError::Backend(BackendError::UnsupportedCapability { .. }) => 501,
-            StorageError::BulkExport(_) | StorageError::BulkSubmit(_) => 500,
-            StorageError::Transaction(_) => 409,
-            StorageError::Backend(_) => 500,
-        }
-    }
-
-    /// Builds a minimal OperationOutcome `Value` from a `StorageError`.
-    fn operation_outcome(err: &StorageError) -> Value {
-        let code = match err {
-            StorageError::Validation(_) => "invalid",
-            StorageError::Tenant(_) => "forbidden",
-            StorageError::Resource(ResourceError::NotFound { .. }) => "not-found",
-            StorageError::Resource(ResourceError::VersionNotFound { .. }) => "not-found",
-            StorageError::Resource(ResourceError::Gone { .. }) => "deleted",
-            StorageError::Resource(ResourceError::AlreadyExists { .. }) => "conflict",
-            StorageError::Concurrency(_) => "conflict",
-            StorageError::Backend(BackendError::UnsupportedCapability { .. }) => "not-supported",
-            _ => "exception",
-        };
-
-        json!({
-            "resourceType": "OperationOutcome",
-            "issue": [{
-                "severity": "error",
-                "code": code,
-                "diagnostics": err.to_string()
-            }]
-        })
     }
 
     /// Parses a bundle entry URL into `(resource_type, id)`.

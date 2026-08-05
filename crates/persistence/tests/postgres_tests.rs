@@ -5463,14 +5463,6 @@ mod postgres_integration {
     }
 
     pg_if_match_test!(
-        postgres_integration_batch_put_honors_stale_if_match,
-        batch_put_honors_stale_if_match
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_put_accepts_matching_if_match,
-        batch_put_accepts_matching_if_match
-    );
-    pg_if_match_test!(
         postgres_integration_multi_valued_if_match_matches_any_member,
         multi_valued_if_match_matches_any_member
     );
@@ -5481,34 +5473,6 @@ mod postgres_integration {
     pg_if_match_test!(
         postgres_integration_strong_form_if_match_matches_weak_etag,
         strong_form_if_match_matches_weak_etag
-    );
-    pg_if_match_test!(
-        postgres_integration_if_match_on_absent_resource_fails_instead_of_creating,
-        if_match_on_absent_resource_fails_instead_of_creating
-    );
-    pg_if_match_test!(
-        postgres_integration_star_if_match_requires_an_existing_resource,
-        star_if_match_requires_an_existing_resource
-    );
-    pg_if_match_test!(
-        postgres_integration_malformed_if_match_fails_closed,
-        malformed_if_match_fails_closed
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_put_if_match_on_deleted_resource_fails,
-        batch_put_if_match_on_deleted_resource_fails
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_delete_if_match_on_deleted_resource_fails,
-        batch_delete_if_match_on_deleted_resource_fails
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_delete_honors_stale_if_match,
-        batch_delete_honors_stale_if_match
-    );
-    pg_if_match_test!(
-        postgres_integration_batch_delete_accepts_matching_if_match,
-        batch_delete_accepts_matching_if_match
     );
     pg_if_match_test!(
         postgres_integration_transaction_delete_honors_stale_if_match,
