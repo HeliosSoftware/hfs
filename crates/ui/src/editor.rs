@@ -331,13 +331,15 @@ fn build_body(
 
     let mut rows = Vec::new();
     build_rows(
-        registry.as_ref(),
-        registry.as_ref(),
-        &resource_type,
-        &document,
+        &RowCtx {
+            resolver: registry.as_ref(),
+            registry: registry.as_ref(),
+            resource_type: &resource_type,
+            document: &document,
+            errors: &by_path,
+        },
         &[],
         0,
-        &by_path,
         &mut rows,
     );
 
@@ -366,17 +368,28 @@ fn build_body(
     }
 }
 
+/// What a row walk carries unchanged all the way down.
+///
+/// Bundled so [`build_rows`] takes the walk position (`path`, `depth`) and its
+/// sink separately from its fixed inputs — the recursion threads five constant
+/// arguments through every level otherwise.
+struct RowCtx<'a> {
+    resolver: &'a dyn helios_fhir_validator::SchemaResolver,
+    registry: &'a helios_fhir_validator::SchemaRegistry,
+    resource_type: &'a str,
+    document: &'a Value,
+    errors: &'a HashMap<String, Vec<String>>,
+}
+
 /// Walks the document, emitting one row per node, depth-first, in spec order.
-fn build_rows(
-    resolver: &dyn helios_fhir_validator::SchemaResolver,
-    registry: &helios_fhir_validator::SchemaRegistry,
-    resource_type: &str,
-    document: &Value,
-    path: &[Step],
-    depth: usize,
-    errors: &HashMap<String, Vec<String>>,
-    out: &mut Vec<Row>,
-) {
+fn build_rows(ctx: &RowCtx<'_>, path: &[Step], depth: usize, out: &mut Vec<Row>) {
+    let RowCtx {
+        resolver,
+        registry,
+        resource_type,
+        document,
+        errors,
+    } = *ctx;
     let key = editor::path_to_string(path);
     let node = match editor::node_at(document, path) {
         Some(node) => node,
@@ -389,16 +402,7 @@ fn build_rows(
         for index in 0..items.len() {
             let mut item_path = path.to_vec();
             item_path.push(Step::Index(index));
-            build_rows(
-                resolver,
-                registry,
-                resource_type,
-                document,
-                &item_path,
-                depth,
-                errors,
-                out,
-            );
+            build_rows(ctx, &item_path, depth, out);
         }
         return;
     }
@@ -551,16 +555,7 @@ fn build_rows(
     for child in children {
         let mut child_path = path.to_vec();
         child_path.push(Step::Field(child.name.clone()));
-        build_rows(
-            resolver,
-            registry,
-            resource_type,
-            document,
-            &child_path,
-            depth + 1,
-            errors,
-            out,
-        );
+        build_rows(ctx, &child_path, depth + 1, out);
     }
 }
 

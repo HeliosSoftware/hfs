@@ -71,19 +71,40 @@ fn test_backend_capabilities() {
     assert!(!backend.supports(BackendCapability::Versioning));
 }
 
+/// Index names must be injective in the tenant, because every `_id`-addressed
+/// operation (`create`, `update`, `delete`, and the `create_or_update` existence
+/// probe) is confined to a tenant *only* by the index it targets — those APIs
+/// admit no query filter.
+///
+/// This replaces a test that asserted `index_name("acme", …)` and
+/// `index_name("tenant-1", …)` only. Neither input exercised the derivation's
+/// lossy step, so the suite was green while `ACME` and `acme` shared an index
+/// (issue #384). The exhaustive property tests live beside the encoder in
+/// `backends/elasticsearch/naming.rs`.
 #[test]
-fn test_index_name() {
+fn test_index_name_is_injective_in_the_tenant() {
     let config = ElasticsearchConfig {
         index_prefix: "hfs".to_string(),
         ..Default::default()
     };
     let backend = ElasticsearchBackend::new(config).unwrap();
 
+    // Already-safe ids are unchanged, so conforming deployments do not migrate.
     assert_eq!(backend.index_name("acme", "Patient"), "hfs_acme_patient");
     assert_eq!(
         backend.index_name("tenant-1", "Observation"),
         "hfs_tenant-1_observation"
     );
+
+    // Case variants must not collide.
+    assert_ne!(
+        backend.index_name("ACME", "Patient"),
+        backend.index_name("acme", "Patient")
+    );
+    // A hierarchical id used to produce an illegal name and 500 on every write.
+    let hierarchical = backend.index_name("acme/research", "Patient");
+    assert!(!hierarchical.contains('/'));
+    assert_ne!(hierarchical, backend.index_name("acmeresearch", "Patient"));
 }
 
 // ============================================================================
@@ -1066,6 +1087,162 @@ mod es_integration {
 
         assert_eq!(read_a.content()["name"][0]["family"], "A");
         assert_eq!(read_b.content()["name"][0]["family"], "B");
+    }
+
+    /// Regression for issue #384, against a real cluster.
+    ///
+    /// The two isolation tests above use `tenant-a`/`tenant-b`, which differ in a
+    /// way the old lossy derivation *preserved* — so they passed while tenants
+    /// differing only by case shared an index and a document `_id`, and could
+    /// read, overwrite, and delete each other's documents.
+    ///
+    /// **The lesson to keep: an isolation test must use the tenant pair its
+    /// identifier derivation is most likely to conflate.**
+    ///
+    /// This exercises every `_id`-addressed path the issue names — the
+    /// `create_or_update` existence probe, `update`, and `delete` — plus the
+    /// glob-scoped paths (`count`, `clear_search_index`), because those derive
+    /// their index pattern separately. A fix that escapes `index_name` but leaves
+    /// a glob lowercased passes every unit test and fails here.
+    #[tokio::test]
+    async fn es_integration_case_variant_tenants_are_not_the_same_tenant() {
+        let backend = create_backend().await;
+        let upper = create_tenant("Acme");
+        let lower = create_tenant("acme");
+
+        // 1. `Acme` writes.
+        backend
+            .create_or_update(
+                &upper,
+                "Patient",
+                "shared-id",
+                json!({"resourceType": "Patient", "name": [{"family": "UPPER"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // 2. `acme` must not observe it — this is the existence probe, which
+        //    reads a document's version to decide "is this new?".
+        assert!(
+            !backend
+                .exists(&lower, "Patient", "shared-id")
+                .await
+                .unwrap(),
+            "tenant `acme` must not see tenant `Acme`'s document"
+        );
+
+        // 3. `acme` writes to the same logical id.
+        backend
+            .create_or_update(
+                &lower,
+                "Patient",
+                "shared-id",
+                json!({"resourceType": "Patient", "name": [{"family": "lower"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // 4. `Acme`'s document must survive intact. On `main` this fails in an
+        //    instructive way: the shared document's `_source.tenant_id` becomes
+        //    "acme", so `read`'s tenant re-check returns None and the resource
+        //    *vanishes* for its owner. Asserting the content catches both the
+        //    vanish and the silent-overwrite variants.
+        let read_upper = backend
+            .read(&upper, "Patient", "shared-id")
+            .await
+            .unwrap()
+            .expect("tenant `Acme`'s document must still exist");
+        assert_eq!(read_upper.content()["name"][0]["family"], "UPPER");
+
+        let read_lower = backend
+            .read(&lower, "Patient", "shared-id")
+            .await
+            .unwrap()
+            .expect("tenant `acme`'s document must exist");
+        assert_eq!(read_lower.content()["name"][0]["family"], "lower");
+
+        // 5. `acme`'s update must not touch `Acme`'s document. Without this, a
+        //    fix that hardens `create_or_update` but not `update` would pass.
+        backend
+            .update(
+                &lower,
+                &read_lower,
+                json!({"resourceType": "Patient", "name": [{"family": "lower-2"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .read(&upper, "Patient", "shared-id")
+                .await
+                .unwrap()
+                .expect("still present after the other tenant's update")
+                .content()["name"][0]["family"],
+            "UPPER"
+        );
+
+        // 6. `acme`'s delete must not remove `Acme`'s document.
+        backend
+            .delete(&lower, "Patient", "shared-id")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .read(&upper, "Patient", "shared-id")
+                .await
+                .unwrap()
+                .expect("tenant `Acme`'s document must survive `acme`'s delete")
+                .content()["name"][0]["family"],
+            "UPPER"
+        );
+
+        // 7. Both directions of the glob-scoped count. Asserting only one would
+        //    catch only one of the two ways the name/glob pair can drift apart.
+        backend.refresh_index("Acme", "Patient").await.ok();
+        backend.refresh_index("acme", "Patient").await.ok();
+        assert_eq!(
+            backend.count(&upper, Some("Patient")).await.unwrap(),
+            1,
+            "tenant `Acme` must still count its own document"
+        );
+        assert_eq!(
+            backend.count(&lower, Some("Patient")).await.unwrap(),
+            0,
+            "tenant `acme` deleted its only document"
+        );
+    }
+
+    /// The unit tests model Elasticsearch's index-naming rules; this is the
+    /// oracle. An encoding can be provably injective and still be rejected by a
+    /// real cluster, which no pure test can catch.
+    #[tokio::test]
+    async fn es_integration_non_conforming_tenant_ids_are_accepted_by_elasticsearch() {
+        let backend = create_backend().await;
+
+        // Uppercase (issue #384's collision) and hierarchical (which previously
+        // produced an illegal index name and 500'd on every write).
+        for tenant_id in ["ACME", "acme/research", "Acme.Corp"] {
+            let tenant = create_tenant(tenant_id);
+            backend
+                .create_or_update(
+                    &tenant,
+                    "Patient",
+                    "p1",
+                    json!({"resourceType": "Patient", "name": [{"family": tenant_id}]}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("write for tenant {tenant_id:?} must succeed: {e}"));
+
+            let read = backend
+                .read(&tenant, "Patient", "p1")
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("read back for tenant {tenant_id:?}"));
+            assert_eq!(read.content()["name"][0]["family"], tenant_id);
+        }
     }
 
     #[tokio::test]
