@@ -33,6 +33,34 @@ fi
 echo "Loading Inferno test data into HFS at ${HFS_URL}..."
 echo ""
 
+# Does this server support transaction bundles?
+#
+# Not every backend can. A transaction is all-or-nothing, which S3 cannot
+# provide — it has no atomic multi-object operation — so an s3-elasticsearch
+# deployment declines them rather than committing partially (#489). The
+# fixtures are all transaction bundles, so on those backends they are rewritten
+# to batch bundles first (see to_batch.jq).
+#
+# Asked, not assumed: the CapabilityStatement is derived from the configured
+# backend, so this stays correct as backends are added without the loader
+# needing to know their names.
+TRANSFORM=""
+SUPPORTS_TRANSACTION=$(curl -s "${HFS_URL}/metadata" \
+    | jq -r 'try ([.rest[]?.interaction[]?.code] | index("transaction") != null) catch false' 2>/dev/null)
+
+if [ "$SUPPORTS_TRANSACTION" = "true" ]; then
+    echo "Server advertises 'transaction'; loading bundles as-is."
+else
+    TRANSFORM="$SCRIPT_DIR/to_batch.jq"
+    if [ ! -f "$TRANSFORM" ]; then
+        echo "ERROR: server does not support transactions and $TRANSFORM is missing"
+        exit 1
+    fi
+    echo "Server does not advertise 'transaction'; rewriting bundles to batch."
+    echo "  (urn:uuid references are resolved client-side; POST becomes PUT)"
+fi
+echo ""
+
 FAILED=0
 SUCCESS=0
 SKIPPED=0
@@ -47,7 +75,11 @@ for FILE in "$SCRIPT_DIR"/*.json; do
 
     if [ "$BUNDLE_TYPE" = "transaction" ]; then
         ENDPOINT="/"
-        echo "  Type: transaction bundle -> POST $ENDPOINT"
+        if [ -n "$TRANSFORM" ]; then
+            echo "  Type: transaction bundle -> rewritten to batch -> POST $ENDPOINT"
+        else
+            echo "  Type: transaction bundle -> POST $ENDPOINT"
+        fi
     elif [ "$RESOURCE_TYPE" = "SearchParameter" ]; then
         ENDPOINT="/SearchParameter"
         echo "  Type: SearchParameter -> POST $ENDPOINT"
@@ -60,9 +92,24 @@ for FILE in "$SCRIPT_DIR"/*.json; do
         continue
     fi
 
+    # Rewrite only transaction bundles; SearchParameter and Group posts are
+    # single resources and unaffected.
+    PAYLOAD="$FILE"
+    if [ -n "$TRANSFORM" ] && [ "$BUNDLE_TYPE" = "transaction" ]; then
+        PAYLOAD=$(mktemp)
+        if ! jq -f "$TRANSFORM" "$FILE" > "$PAYLOAD"; then
+            echo "  FAILED (could not rewrite $FILENAME to batch)"
+            rm -f "$PAYLOAD"
+            FAILED=$((FAILED + 1))
+            continue
+        fi
+    fi
+
     RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${HFS_URL}${ENDPOINT}" \
         -H "Content-Type: application/fhir+json" \
-        -d @"$FILE")
+        --data-binary @"$PAYLOAD")
+
+    [ "$PAYLOAD" != "$FILE" ] && rm -f "$PAYLOAD"
 
     HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
     BODY=$(echo "$RESPONSE" | sed '$d')
