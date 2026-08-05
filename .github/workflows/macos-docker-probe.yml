@@ -166,6 +166,33 @@ jobs:
             -- --nocapture
           echo "PROBE D rc=$?"
 
+      # The dyld abort. On Linux this same target links to 1.53 GiB with
+      # debuginfo off (72% of it the four FHIR versions' serde derives), which is
+      # large enough to make an address-space collision with the dyld shared
+      # cache plausible but not proven: the executable loads at 0x100000000 and
+      # the arm64 shared cache sits above it, so a Mach-O whose segments run past
+      # ~2 GiB leaves dyld nowhere to map the cache — which is exactly the
+      # "syscall to map cache into shared region failed" we saw.
+      #
+      # This measures the real Mach-O and then tries to load it. Size settles the
+      # mechanism; `--list` settles whether the abort is deterministic at all, or
+      # was resource pressure during that one job.
+      - name: 'Probe E: measure and load the binary that aborted'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo test -p helios-rest --lib --all-features --no-run 2>&1 | tail -5
+          BIN=$(ls -t target/debug/deps/helios_rest-* 2>/dev/null | grep -v '\.d$' | head -1)
+          echo "binary: $BIN"
+          ls -l "$BIN"
+          echo "=== segment map (segname / vmaddr / vmsize) ==="
+          # macOS awk has no strtonum, so print raw and total it off-box.
+          otool -l "$BIN" | grep -E "^ *(segname|vmaddr|vmsize)" | head -30
+          echo "=== does it load? ==="
+          "$BIN" --list | head -3
+          echo "PROBE E rc=$?"
+
       - name: Summary
         if: always()
         shell: bash
