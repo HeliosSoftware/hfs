@@ -1006,6 +1006,8 @@ struct SearchParametersQuery {
     q: String,
     page: Option<usize>,
     sel: Option<String>,
+    /// Set by the CRUD flows after a write: drop the cached snapshot first.
+    refresh: Option<String>,
 }
 
 /// SearchParameter viewer page.
@@ -1026,6 +1028,9 @@ async fn search_parameters(
         page: raw.page.unwrap_or(1),
         sel: raw.sel.filter(|s| !s.is_empty()),
     };
+    if raw.refresh.is_some() {
+        state.sp_catalog.invalidate(&rt.id, query.fhir_version());
+    }
     let snapshot = state
         .sp_catalog
         .snapshot(&rt.id, query.fhir_version())
@@ -1049,6 +1054,8 @@ struct CompartmentsQuery {
     id: String,
     #[serde(default)]
     target: String,
+    /// Set by the CRUD flows after a write: drop the cached definitions first.
+    refresh: Option<String>,
 }
 
 /// Compartment viewer & tester page.
@@ -1068,6 +1075,9 @@ async fn compartments_page(
         id: raw.id,
         target: raw.target,
     };
+    if raw.refresh.is_some() {
+        state.compartments.invalidate(&rt.id, query.fhir_version());
+    }
     let defs = state
         .compartments
         .definitions(&rt.id, query.fhir_version())
@@ -1648,23 +1658,9 @@ mod tests {
     #[test]
     fn design_assets_are_embedded() {
         assert!(Assets::get("theme.js").is_some());
-        assert!(Assets::get("nav.js").is_some());
         assert!(Assets::get("fonts/figtree-latin.woff2").is_some());
         assert!(Assets::get("fonts/figtree-latin-ext.woff2").is_some());
         assert!(Assets::get("logo.png").is_some());
-    }
-
-    /// The collapsible-nav script persists the state to the per-user settings
-    /// document (like the theme, #197): read on load, merge-patch `nav` on
-    /// toggle, with a localStorage first-paint cache. Guards the wiring.
-    #[test]
-    fn nav_script_is_wired_to_user_settings() {
-        let file = Assets::get("nav.js").expect("nav.js embedded");
-        let source = std::str::from_utf8(&file.data).expect("nav.js is UTF-8");
-        assert!(source.contains("/_user/settings"));
-        assert!(source.contains("PATCH"));
-        assert!(source.contains("hfs-nav"), "localStorage cache stays");
-        assert!(source.contains("data-nav"), "sets the collapse attribute");
     }
 
     /// The theme script persists the choice to the per-user settings document

@@ -63,23 +63,21 @@ async fn index_serves_the_full_landing_page() {
 }
 
 #[tokio::test]
-async fn page_wires_the_collapsible_nav() {
+async fn page_wires_the_hover_rail_nav() {
     let response = app()
         .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
         .await
         .unwrap();
     let html = body_text(response).await;
 
-    // The first-paint script is loaded (non-deferred, in <head>).
-    assert!(html.contains(r#"src="/ui/assets/nav.js""#));
-    // The toggle is a real, accessible button controlling the sidebar.
-    assert!(html.contains("data-toggle-nav"));
-    assert!(html.contains(r#"aria-controls="sidebar""#));
-    assert!(html.contains("aria-expanded"));
-    // Labels are wrapped so the collapsed rail can hide them (a11y-safe).
+    // The rail expands on hover (#438): no toggle button, no state script.
+    assert!(!html.contains("nav.js"));
+    assert!(!html.contains("data-toggle-nav"));
+    // Labels are wrapped so the resting rail can hide them (a11y-safe).
     assert!(html.contains("nav-item__label"));
-    // The sidebar is addressable by the toggle's aria-controls.
-    assert!(html.contains(r#"id="sidebar""#));
+    // The Batch & Data entries from the design: Import and Export.
+    assert!(html.contains("Import"));
+    assert!(html.contains("Export"));
 }
 
 #[tokio::test]
