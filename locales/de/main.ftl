@@ -81,14 +81,14 @@ nav-resource-editor = Ressourcen-Editor
 nav-history-versions = Verlauf & Versionen
 nav-compartments = Compartments
 nav-batch-transaction = Batch / Transaktion
-nav-bulk-export = Bulk-Export
+nav-import = Importieren
+nav-export = Exportieren
 nav-sql-on-fhir = SQL-on-FHIR
 nav-capability-conformance = Capability & Konformität
 nav-search-parameters = Suchparameter
 nav-admin-ops = Admin / Betrieb
 nav-subscriptions = Abonnements
 nav-tenants = Mandanten
-nav-toggle = Navigation ein- oder ausklappen
 
 ## Mandantenverwaltung (/ui/tenants)
 
@@ -202,7 +202,7 @@ queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-B
 ## SearchParameter-Ansicht (#238)
 
 sp-heading = Suchparameter
-sp-lede = Durchsuche die Parameter, mit denen dieser Server Suchen auflöst, gefiltert nach Basis-Ressourcentyp. Spezifikationsparameter sind schreibgeschützt; tenant-spezifisches Bearbeiten kommt, sobald Suchparameter im Storage liegen.
+sp-lede = Durchsuche die Parameter, mit denen dieser Server Suchen auflöst, gefiltert nach Basis-Ressourcentyp. Gespeicherte Parameter lassen sich anlegen, bearbeiten und löschen; die Registry übernimmt Änderungen pro Tenant.
 sp-version-label = FHIR-Version
 sp-spec-missing = Das vollständige Spezifikations-Bundle (search-parameters-*.json) wurde im Datenverzeichnis nicht gefunden — es werden nur die minimalen eingebetteten Fallback-Parameter angezeigt.
 sp-rail-label = Ressourcenfilter
@@ -248,7 +248,15 @@ sp-note-shadowed = Verdeckt durch { $url } auf (base, code): eine Quelle mit hö
 sp-note-empty-expression = Leerer Ausdruck: der Extractor indexiert keine Zeilen, jede Suche über diesen Parameter liefert stillschweigend nichts.
 sp-note-no-target = Referenzparameter ohne Zieltypen: verkettete Suche kann den referenzierten Typ nicht auflösen.
 sp-note-choice-type = Choice-Typ-Ausdruck: der Extractor schreibt ofType(T) / as T vor der Auswertung gegen das gespeicherte JSON auf das konkrete Element um (z. B. valueQuantity).
-sp-writes-pending = Anlegen, Überschreiben und Löschen von Tenant-Parametern kommt, sobald Suchparameter in der Datenbank gespeichert werden (#235).
+sp-new = Neuer Suchparameter
+sp-edit = Bearbeiten
+sp-delete = Löschen
+sp-delete-confirm = Diesen gespeicherten Suchparameter löschen? Suchen, die ihn verwenden, finden nach der Aktualisierung der Registry keine Treffer mehr.
+cmp-new = Neue Compartment-Definition
+cmp-edit = Bearbeiten
+cmp-delete = Löschen
+cmp-delete-confirm = Diese Compartment-Definition löschen? Ihre Compartment-Routen funktionieren dann nicht mehr.
+crud-delete-failed = Löschen fehlgeschlagen
 
 ## Compartment-Ansicht & Tester (#237)
 
@@ -256,7 +264,8 @@ cmp-heading = Compartments
 cmp-lede = Die Compartment-Definitionen, mit denen dieser Server /{"{"}compartment{"}"}/{"{"}id{"}"}/{"{"}type{"}"}-Anfragen routet, und ein Tester, der beantwortet: Ist dieser Typ in diesem Compartment, über welche Parameter, und welche Suche führt der Server aus?
 cmp-rail-label = Compartment-Definitionen
 cmp-rail-heading = Compartments
-cmp-rail-note = Die Basisdefinitionen werden mit dem Server ausgeliefert (aus der FHIR-Spezifikation generiert). Sie zu bearbeiten setzt eine tenant-spezifische Override-Schicht voraus — offene Frage im Issue.
+cmp-degraded = Die Compartment-Definitionen konnten gerade nicht von diesem Server geladen werden — der Selbstaufruf an /CompartmentDefinition schlug fehl (bei aktivierter Authentifizierung fehlt meist das ausgehende Service-Token oder es ist ungültig). Die Seite versucht es bei der nächsten Anfrage erneut.
+cmp-rail-note = Die Definitionen sind gespeicherte Ressourcen, beim Start aus der FHIR-Spezifikation angelegt. Bearbeiten und Löschen wirken hier pro Tenant.
 cmp-tabs-label = Compartment-Bereiche
 cmp-tab-definition = Definition
 cmp-tab-members = Mitglieder

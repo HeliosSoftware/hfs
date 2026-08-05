@@ -32,6 +32,12 @@ const NAV = [
 for (const { href, url } of NAV) {
   test(`nav link ${href} navigates`, async ({ page, chrome }) => {
     await page.goto("/ui");
+    // Enter the rail and let it finish expanding (#438) so the link's position
+    // is stable before the click — pure CSS, so it works with JS disabled too.
+    await chrome.sidebar.hover();
+    await expect
+      .poll(async () => (await chrome.sidebar.boundingBox())?.width)
+      .toBeGreaterThan(290);
     const link = chrome.navLink(href);
     await expect(link).toBeVisible();
     await link.click();

@@ -706,7 +706,7 @@ mod postgres_integration {
     use helios_persistence::core::SettingsStore;
     use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
     use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
-    use helios_persistence::error::{ConcurrencyError, ResourceError, StorageError};
+    use helios_persistence::error::{BackendError, ConcurrencyError, ResourceError, StorageError};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
     use testcontainers::ImageExt;
@@ -881,6 +881,87 @@ mod postgres_integration {
                  expected {TIMEOUT_MS}ms — the GUC did not reach every connection"
             );
         }
+    }
+
+    /// A statement cancelled by `statement_timeout` must classify as
+    /// [`BackendError::Timeout`] (→ HTTP 504), not `Internal` (→ 500).
+    ///
+    /// Regression for issue #353. `tokio_postgres::Error` has no public
+    /// constructor, so the SQLSTATE-classification path can only be exercised
+    /// against a live server — hence a testcontainer test rather than a unit
+    /// test. `SELECT pg_sleep()` is the cheapest statement guaranteed to
+    /// outlive the deadline.
+    ///
+    /// Note this asserts on the SQLSTATE (`57014`) reaching the classifier, not
+    /// on the driver's message text: PostgreSQL localizes error messages via
+    /// `lc_messages`, so matching the English string would make this test (and
+    /// the classifier it guards) locale-dependent.
+    #[tokio::test]
+    async fn statement_timeout_cancellation_classifies_as_backend_timeout() {
+        use helios_persistence::error::classify_postgres_error;
+
+        let pg = shared_pg().await;
+        const TIMEOUT_MS: u64 = 250;
+
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            statement_timeout_ms: TIMEOUT_MS,
+            ..Default::default()
+        };
+        let backend = PostgresBackend::new(config).await.expect("create backend");
+        let client = backend.get_client().await.expect("get_client");
+
+        // Sleep well past the 250ms budget so the server cancels us.
+        let err = client
+            .query("SELECT pg_sleep(5)", &[])
+            .await
+            .expect_err("pg_sleep(5) must be cancelled by a 250ms statement_timeout");
+
+        assert_eq!(
+            err.code().map(|c| c.code()),
+            Some("57014"),
+            "expected SQLSTATE 57014 query_canceled, got {err}"
+        );
+
+        let classified = classify_postgres_error("Failed to execute search", err);
+        match classified {
+            BackendError::Timeout {
+                ref backend_name,
+                ref message,
+            } => {
+                assert_eq!(backend_name, "postgres");
+                assert!(
+                    message.starts_with("Failed to execute search: "),
+                    "caller context must survive classification, got {message:?}"
+                );
+            }
+            other => panic!(
+                "statement_timeout cancellation must classify as BackendError::Timeout \
+                 (HTTP 504), got {other:?} — this is the #353 regression"
+            ),
+        }
+
+        // Call sites that add no context of their own convert with a bare `?`,
+        // which goes through `impl From<tokio_postgres::Error> for StorageError`
+        // rather than the classifier directly. That path must classify
+        // identically, or the fix would hold only for the sites that happen to
+        // pass a context string.
+        let err = client
+            .query("SELECT pg_sleep(5)", &[])
+            .await
+            .expect_err("pg_sleep(5) must be cancelled by a 250ms statement_timeout");
+        let converted: StorageError = err.into();
+        assert!(
+            matches!(
+                converted,
+                StorageError::Backend(BackendError::Timeout { .. })
+            ),
+            "the `?` conversion must classify too, got {converted:?}"
+        );
     }
 
     // ========================================================================
