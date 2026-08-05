@@ -809,3 +809,146 @@ mod transaction_errors {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 }
+
+// =============================================================================
+// Conditional Entry Tests (#503)
+// =============================================================================
+
+/// Conditional interactions expressed in an entry URL (`[type]?[criteria]`) are
+/// refused rather than resolved, and — the point of #503 — nothing is written.
+///
+/// Before the fix the criteria rode along inside the parsed resource type, so a
+/// conditional `PUT`/`DELETE` addressed storage with a type like
+/// `Patient?identifier=http:` and an empty id. Resolving these is #511.
+mod conditional_entries {
+    use super::*;
+
+    async fn patient_count(backend: &SqliteBackend) -> u64 {
+        backend
+            .count(&test_tenant(), Some("Patient"))
+            .await
+            .expect("count failed")
+    }
+
+    #[tokio::test]
+    async fn conditional_put_is_refused_and_writes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": {
+                        "method": "PUT",
+                        "url": "Patient?identifier=http://example.org|12345"
+                    },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "Conditional"}] }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "a refused conditional PUT must not create a resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_is_refused_and_deletes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "DELETE", "url": "Patient?name=Nguyen" }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "a refused conditional DELETE must not remove a resource"
+        );
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "p1")
+                .await
+                .expect("read failed")
+                .is_some(),
+            "the seeded patient must survive"
+        );
+    }
+
+    /// The corruption #503 closes: `create_or_update` with an empty id inserts
+    /// `"id": ""` into the resource and delegates to `create`, whose id fallback
+    /// fires on an absent id rather than an empty one — so the row is written,
+    /// and every later type-level PUT reads it back and overwrites it.
+    #[tokio::test]
+    async fn a_type_level_put_never_writes_an_empty_id_row() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "PUT", "url": "Patient" },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "NoId"}] }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(patient_count(&backend).await, before);
+        assert!(
+            backend
+                .read(&test_tenant(), "Patient", "")
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "no resource may be stored under the empty id"
+        );
+    }
+
+    /// An instance URL carrying a control parameter still addresses its
+    /// instance — the query is dropped, not read as criteria.
+    #[tokio::test]
+    async fn an_instance_url_with_a_query_still_resolves() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let body = post_batch(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "batch",
+                "entry": [{
+                    "request": { "method": "GET", "url": "Patient/p1?_format=json" }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "200 OK");
+        assert_eq!(body["entry"][0]["resource"]["id"], "p1");
+    }
+}
