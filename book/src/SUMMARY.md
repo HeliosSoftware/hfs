@@ -7,6 +7,7 @@
 - [FHIRPath Expressions](ch05-fhirpath.md)
 - [SQL-on-FHIR](ch06-sql-on-fhir.md)
 - [Natural-Language Search](components/natural-language-search.md)
+- [Web UI Self-Calls and Authentication](components/web-ui-self-calls.md)
 - [Architecture Overview](ch07-architecture.md)
 - [Multi-Version FHIR Support](ch08-versions.md)
 - [Python Bindings (pysof)](ch09-pysof.md)

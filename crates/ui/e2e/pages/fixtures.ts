@@ -25,6 +25,19 @@ type Fixtures = {
 };
 
 export const test = base.extend<Fixtures>({
+  // The sidebar expands on hover (#438) and the mouse starts at (0,0) — over
+  // the rail — so a fresh page would open with the sidebar overlaying the
+  // left content edge and intercepting clicks. Park the pointer in the topbar
+  // after every navigation; tests that exercise the hover do so explicitly.
+  page: async ({ page }, use) => {
+    const goto = page.goto.bind(page);
+    page.goto = (async (url: string, opts?: Parameters<typeof goto>[1]) => {
+      const response = await goto(url, opts);
+      await page.mouse.move(700, 8);
+      return response;
+    }) as typeof page.goto;
+    await use(page);
+  },
   chrome: async ({ page }, use) => use(new AppChrome(page)),
   dashboard: async ({ page }, use) => use(new DashboardPage(page)),
   resources: async ({ page }, use) => use(new ResourcesPage(page)),

@@ -426,6 +426,32 @@ pub enum BackendError {
         backend_name: String,
     },
 
+    /// The backend cancelled the operation because it exceeded a server-side
+    /// time limit.
+    ///
+    /// This is a *statement*-level deadline (PostgreSQL `statement_timeout`
+    /// → SQLSTATE `57014`, MongoDB `maxTimeMS` → `MaxTimeMSExpired`, an
+    /// explicit SQLite `interrupt`), not a connection-level failure: the
+    /// backend is healthy and reachable, and it deliberately stopped *this*
+    /// statement. That distinction is why it does not map onto
+    /// [`Self::Unavailable`] — the server is fine, the query was too
+    /// expensive — and why the REST layer answers `504` rather than `503`
+    /// (see `helios_rest::error`, issue #353).
+    ///
+    /// Lock-wait expiry is deliberately **not** this variant. SQLite's
+    /// `SQLITE_BUSY` after `busy_timeout` means "someone else held the write
+    /// lock", which a retry genuinely resolves, so it classifies as
+    /// [`Self::Unavailable`] (503 + `Retry-After`) instead.
+    #[error("{backend_name} operation timed out: {message}")]
+    Timeout {
+        /// Backend identifier (e.g., `postgres`).
+        backend_name: String,
+        /// Human-readable failure detail, including the driver context. Never
+        /// surfaced to HTTP clients — the REST layer logs it and replies with a
+        /// fixed, backend-agnostic message.
+        message: String,
+    },
+
     /// The requested capability is not supported by this backend.
     #[error("capability '{capability}' not supported by {backend_name}")]
     UnsupportedCapability {
@@ -688,14 +714,59 @@ impl From<std::io::Error> for BackendError {
     }
 }
 
+/// Classifies a `rusqlite` error into a [`BackendError`], preserving the
+/// driver's `ErrorCode` rather than collapsing everything to `Internal`.
+///
+/// `context` is prepended to the driver text so the caller's description of
+/// *what* it was doing survives classification.
+///
+/// - `SQLITE_INTERRUPT` — the statement was deliberately cancelled
+///   (`Connection::interrupt`) → [`BackendError::Timeout`] (504).
+/// - `SQLITE_BUSY` / `SQLITE_LOCKED` — the `busy_timeout` elapsed waiting for
+///   the write lock. The database is healthy and merely contended, and a retry
+///   usually succeeds, so this is [`BackendError::Unavailable`] (503 +
+///   `Retry-After`) — *not* `Timeout`. Before #353 it was a 500, which told
+///   clients a transient lock conflict was a server defect.
+/// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
+///   message this helper's callers produced before.
+#[cfg(feature = "sqlite")]
+pub fn classify_sqlite_error(context: &str, err: rusqlite::Error) -> BackendError {
+    use rusqlite::ErrorCode;
+
+    // `sqlite_error_code()` is rusqlite's own accessor for the primary result
+    // code; it yields `None` for the non-`SqliteFailure` variants (e.g.
+    // `QueryReturnedNoRows`, a type-conversion failure), which correctly fall
+    // through to `Internal` below.
+    let code = err.sqlite_error_code();
+    let message = if context.is_empty() {
+        err.to_string()
+    } else {
+        format!("{context}: {err}")
+    };
+
+    match code {
+        Some(ErrorCode::OperationInterrupted) => BackendError::Timeout {
+            backend_name: "sqlite".to_string(),
+            message,
+        },
+        Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked) => {
+            BackendError::Unavailable {
+                backend_name: "sqlite".to_string(),
+                message,
+            }
+        }
+        _ => BackendError::Internal {
+            backend_name: "sqlite".to_string(),
+            message,
+            source: Some(Box::new(err)),
+        },
+    }
+}
+
 #[cfg(feature = "sqlite")]
 impl From<rusqlite::Error> for StorageError {
     fn from(err: rusqlite::Error) -> Self {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: "sqlite".to_string(),
-            message: err.to_string(),
-            source: Some(Box::new(err)),
-        })
+        StorageError::Backend(classify_sqlite_error("", err))
     }
 }
 
@@ -708,25 +779,215 @@ impl From<r2d2::Error> for StorageError {
     }
 }
 
+/// Classifies a `tokio_postgres` error into a [`BackendError`] by SQLSTATE,
+/// preserving the code rather than collapsing everything to `Internal`.
+///
+/// `context` is prepended to the driver text so the caller's description of
+/// *what* it was doing survives classification.
+///
+/// SQLSTATE is the only stable signal here: PostgreSQL localizes error
+/// *messages* through `lc_messages`, so matching on the text
+/// ("canceling statement due to statement timeout") breaks on any server not
+/// running an English locale. Classification must therefore happen while the
+/// typed error is still in hand — once it has been through `format!` the code
+/// is gone (issue #353).
+///
+/// - `57014 query_canceled` — the statement exceeded `statement_timeout` (see
+///   `HFS_PG_STATEMENT_TIMEOUT_MS`) or was cancelled by `pg_cancel_backend`
+///   → [`BackendError::Timeout`] (504).
+/// - `53300 too_many_connections`, `53400 configuration_limit_exceeded`,
+///   `57P01 admin_shutdown`, `57P02 crash_shutdown`, `57P03 cannot_connect_now`
+///   — the server is saturated or going away, and a retry may well land
+///   → [`BackendError::Unavailable`] (503 + `Retry-After`).
+/// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
+///   message this helper's callers produced before.
+///
+/// Deliberately **not** reclassified here: `40001 serialization_failure` and
+/// `40P01 deadlock_detected`. Both are retryable, but deciding what a FHIR
+/// client should see for a write conflict is a separate question from
+/// timeouts, and silently 503-ing a deadlock could mask a real lock-ordering
+/// defect.
+#[cfg(feature = "postgres")]
+pub fn classify_postgres_error(context: &str, err: tokio_postgres::Error) -> BackendError {
+    use tokio_postgres::error::SqlState;
+
+    // `SqlState` is compared with `==`, never matched as a pattern: it is a
+    // newtype over an enum with an `Other(Box<str>)` variant, which makes it
+    // non-structural-match, so `SqlState::QUERY_CANCELED` in a pattern position
+    // does not compile.
+    let code = err.code().cloned();
+    let message = if context.is_empty() {
+        err.to_string()
+    } else {
+        format!("{context}: {err}")
+    };
+
+    if code.as_ref() == Some(&SqlState::QUERY_CANCELED) {
+        return BackendError::Timeout {
+            backend_name: "postgres".to_string(),
+            message,
+        };
+    }
+
+    let unavailable = matches!(
+        code.as_ref(),
+        Some(c) if *c == SqlState::TOO_MANY_CONNECTIONS
+            || *c == SqlState::CONFIGURATION_LIMIT_EXCEEDED
+            || *c == SqlState::ADMIN_SHUTDOWN
+            || *c == SqlState::CRASH_SHUTDOWN
+            || *c == SqlState::CANNOT_CONNECT_NOW
+    );
+    if unavailable {
+        return BackendError::Unavailable {
+            backend_name: "postgres".to_string(),
+            message,
+        };
+    }
+
+    BackendError::Internal {
+        backend_name: "postgres".to_string(),
+        message,
+        source: Some(Box::new(err)),
+    }
+}
+
 #[cfg(feature = "postgres")]
 impl From<tokio_postgres::Error> for StorageError {
     fn from(err: tokio_postgres::Error) -> Self {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: "postgres".to_string(),
-            message: err.to_string(),
-            source: Some(Box::new(err)),
-        })
+        StorageError::Backend(classify_postgres_error("", err))
+    }
+}
+
+/// MongoDB server error code for a query that exceeded `maxTimeMS`.
+#[cfg(feature = "mongodb")]
+const MONGO_MAX_TIME_MS_EXPIRED: i32 = 50;
+/// MongoDB server error code for an operation that exceeded its time limit.
+#[cfg(feature = "mongodb")]
+const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
+
+/// Classifies a MongoDB driver error into a [`BackendError`], preserving the
+/// server error code rather than collapsing everything to `Internal`.
+///
+/// `context` is prepended to the driver text so the caller's description of
+/// *what* it was doing survives classification.
+///
+/// - `MaxTimeMSExpired` (50) / `ExceededTimeLimit` (262) — the server stopped
+///   the operation at its deadline → [`BackendError::Timeout`] (504).
+/// - `Io` / `ConnectionPoolCleared` / `ServerSelection` — transport or
+///   topology failure → [`BackendError::Unavailable`] (503 + `Retry-After`).
+/// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
+///   message this helper's callers produced before.
+///
+/// Note that HFS does not currently set `maxTimeMS` on its queries, so the
+/// timeout arm fires only when the deadline comes from the server or a
+/// connection-string option. Wiring an HFS-side query deadline is tracked
+/// separately; the classification is in place either way.
+#[cfg(feature = "mongodb")]
+pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> BackendError {
+    use mongodb::error::ErrorKind;
+
+    let message = if context.is_empty() {
+        err.to_string()
+    } else {
+        format!("{context}: {err}")
+    };
+
+    let timed_out = matches!(
+        err.kind.as_ref(),
+        ErrorKind::Command(cmd)
+            if cmd.code == MONGO_MAX_TIME_MS_EXPIRED || cmd.code == MONGO_EXCEEDED_TIME_LIMIT
+    );
+    if timed_out {
+        return BackendError::Timeout {
+            backend_name: "mongodb".to_string(),
+            message,
+        };
+    }
+
+    let unreachable = matches!(
+        err.kind.as_ref(),
+        ErrorKind::Io(_)
+            | ErrorKind::ConnectionPoolCleared { .. }
+            | ErrorKind::ServerSelection { .. }
+    );
+    if unreachable {
+        return BackendError::Unavailable {
+            backend_name: "mongodb".to_string(),
+            message,
+        };
+    }
+
+    BackendError::Internal {
+        backend_name: "mongodb".to_string(),
+        message,
+        source: Some(Box::new(err)),
     }
 }
 
 #[cfg(feature = "mongodb")]
 impl From<mongodb::error::Error> for StorageError {
     fn from(err: mongodb::error::Error) -> Self {
-        StorageError::Backend(BackendError::Internal {
-            backend_name: "mongodb".to_string(),
-            message: err.to_string(),
-            source: Some(Box::new(err)),
-        })
+        StorageError::Backend(classify_mongodb_error("", err))
+    }
+}
+
+/// Classifies a raw driver error into a [`StorageError`] in place, tagging it
+/// with `context` — what the caller was doing when the driver failed.
+///
+/// This is the form every backend call site uses. It replaces the pre-#353
+/// spelling, which stringified the driver error and so threw away the SQLSTATE
+/// / `ErrorCode` that distinguishes a cancelled statement from a real defect:
+///
+/// ```ignore
+/// // before — classification impossible, everything is a 500
+/// .map_err(|e| internal_error(format!("Failed to prepare count_by_types: {e}")))?
+/// // after
+/// .or_query_error("Failed to prepare count_by_types")?
+/// ```
+///
+/// A method rather than a `.map_err(|e| …)` closure, for two reasons beyond
+/// brevity. First, the driver error type is named once, here, instead of being
+/// re-bound at ~150 call sites. Second, the conversion sits on the call chain
+/// rather than inside a closure body that only ever runs on failure, so
+/// coverage tooling attributes it to the enclosing function instead of marking
+/// every error-handling site in the backends as unexecuted — #353 rewrote all
+/// of them at once, which made that reporting artifact impossible to miss.
+///
+/// The classification itself is unchanged and still lives in
+/// `classify_sqlite_error` / `classify_postgres_error` / `classify_mongodb_error`,
+/// where it is unit tested: a server-side deadline becomes
+/// [`BackendError::Timeout`] (504), an unreachable or saturated server becomes
+/// [`BackendError::Unavailable`] (503 + `Retry-After`), and everything else
+/// stays [`BackendError::Internal`] (500) with byte-identical text to the
+/// `internal_error(format!(…))` these call sites used before.
+///
+/// Because each impl is written for one concrete driver error type, a site
+/// whose `Result` carries some other error (serde, chrono, a parse) fails to
+/// compile rather than being silently mis-converted.
+pub trait QueryErrorExt<T> {
+    /// Converts a driver failure into a classified [`StorageError`], prefixing
+    /// the driver text with `context`.
+    fn or_query_error(self, context: &str) -> Result<T, StorageError>;
+}
+
+#[cfg(feature = "sqlite")]
+impl<T> QueryErrorExt<T> for Result<T, rusqlite::Error> {
+    fn or_query_error(self, context: &str) -> Result<T, StorageError> {
+        self.map_err(|err| StorageError::Backend(classify_sqlite_error(context, err)))
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl<T> QueryErrorExt<T> for Result<T, tokio_postgres::Error> {
+    fn or_query_error(self, context: &str) -> Result<T, StorageError> {
+        self.map_err(|err| StorageError::Backend(classify_postgres_error(context, err)))
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl<T> QueryErrorExt<T> for Result<T, mongodb::error::Error> {
+    fn or_query_error(self, context: &str) -> Result<T, StorageError> {
+        self.map_err(|err| StorageError::Backend(classify_mongodb_error(context, err)))
     }
 }
 
@@ -808,6 +1069,223 @@ mod tests {
             message: "invalid JSON".to_string(),
         };
         assert!(err.to_string().contains("line 42"));
+    }
+
+    // ── Driver-error classification (issue #353) ────────────────────────────
+    //
+    // `rusqlite::Error` is constructible, so the SQLite classifier is unit
+    // testable. `tokio_postgres::Error` and `mongodb::error::Error` have no
+    // public constructors, so their classifiers are covered by the
+    // testcontainer integration tests instead (see `tests/postgres_tests.rs`).
+
+    /// Builds a `rusqlite::Error` carrying the given primary result code.
+    #[cfg(feature = "sqlite")]
+    fn sqlite_failure(primary_code: std::os::raw::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(primary_code), None)
+    }
+
+    /// An interrupted statement is a server-side deadline, not a server fault:
+    /// it must classify as `Timeout` so the REST layer answers 504.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_classify_sqlite_interrupt_is_timeout() {
+        // SQLITE_INTERRUPT == 9
+        let err = classify_sqlite_error("Failed to execute search", sqlite_failure(9));
+        assert!(
+            matches!(err, BackendError::Timeout { ref backend_name, .. } if backend_name == "sqlite"),
+            "SQLITE_INTERRUPT must classify as Timeout, got {err:?}"
+        );
+        // The caller's context survives classification.
+        assert!(err.to_string().contains("Failed to execute search"));
+    }
+
+    /// A lock-wait expiry is contention, not an over-long query: a retry
+    /// genuinely succeeds, so it must be `Unavailable` (503 + Retry-After),
+    /// NOT `Timeout` (504, which advises against retrying). Before #353 this
+    /// was a 500.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_classify_sqlite_busy_and_locked_are_unavailable() {
+        // SQLITE_BUSY == 5, SQLITE_LOCKED == 6
+        for code in [5, 6] {
+            let err = classify_sqlite_error("Failed to insert resource", sqlite_failure(code));
+            assert!(
+                matches!(err, BackendError::Unavailable { .. }),
+                "SQLite primary code {code} must classify as Unavailable, got {err:?}"
+            );
+        }
+    }
+
+    /// Everything else keeps today's behaviour exactly: `Internal`, with the
+    /// same `"{context}: {err}"` message the call sites built before. This is
+    /// the property that makes the call-site conversion safe — an unclassified
+    /// error is byte-identical to the pre-#353 result.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_classify_sqlite_other_errors_are_unchanged_internal() {
+        // SQLITE_CONSTRAINT == 19 — a genuine defect, must stay a 500.
+        let raw = sqlite_failure(19);
+        let expected = format!("Failed to insert resource: {raw}");
+        let err = classify_sqlite_error("Failed to insert resource", sqlite_failure(19));
+        match err {
+            BackendError::Internal {
+                backend_name,
+                message,
+                ..
+            } => {
+                assert_eq!(backend_name, "sqlite");
+                assert_eq!(
+                    message, expected,
+                    "unclassified errors must keep the pre-#353 message verbatim"
+                );
+            }
+            other => panic!("SQLITE_CONSTRAINT must stay Internal, got {other:?}"),
+        }
+
+        // A non-`SqliteFailure` variant has no code at all and must also pass
+        // through untouched.
+        let err = classify_sqlite_error("ctx", rusqlite::Error::QueryReturnedNoRows);
+        assert!(matches!(err, BackendError::Internal { .. }));
+    }
+
+    /// The `From` impl (used by bare `?` call sites) classifies too, with no
+    /// context prefix — so the message is the driver text alone, as before.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_sqlite_from_impl_classifies_without_context_prefix() {
+        let raw = sqlite_failure(9);
+        let expected = raw.to_string();
+        let err: StorageError = sqlite_failure(9).into();
+        match err {
+            StorageError::Backend(BackendError::Timeout { message, .. }) => {
+                assert_eq!(message, expected, "empty context must add no prefix");
+            }
+            other => panic!("expected a classified Timeout, got {other:?}"),
+        }
+    }
+
+    /// Builds a `mongodb::error::Error` carrying a server command error with
+    /// the given code.
+    ///
+    /// `CommandError` is `#[non_exhaustive]` and has a private field, so it
+    /// cannot be built with a struct literal from outside the driver — but it
+    /// derives `Deserialize`, which is exactly how the driver itself builds one
+    /// from a server reply. Going through serde therefore constructs the same
+    /// value the driver would, rather than a test-only approximation.
+    #[cfg(feature = "mongodb")]
+    fn mongo_command_error(code: i32, code_name: &str) -> mongodb::error::Error {
+        let command_error: mongodb::error::CommandError =
+            serde_json::from_value(serde_json::json!({
+                "code": code,
+                "codeName": code_name,
+                "errmsg": "operation exceeded time limit",
+                "topologyVersion": null,
+            }))
+            .expect("CommandError deserializes from a server-shaped reply");
+        mongodb::error::ErrorKind::Command(command_error).into()
+    }
+
+    /// Both server-side deadline codes must classify as `Timeout` so the REST
+    /// layer answers 504 rather than 500.
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_classify_mongodb_deadline_codes_are_timeout() {
+        for (code, name) in [
+            (MONGO_MAX_TIME_MS_EXPIRED, "MaxTimeMSExpired"),
+            (MONGO_EXCEEDED_TIME_LIMIT, "ExceededTimeLimit"),
+        ] {
+            let err =
+                classify_mongodb_error("Failed to execute search", mongo_command_error(code, name));
+            assert!(
+                matches!(err, BackendError::Timeout { ref backend_name, .. } if backend_name == "mongodb"),
+                "MongoDB {name} ({code}) must classify as Timeout, got {err:?}"
+            );
+            // The caller's context survives classification.
+            assert!(err.to_string().contains("Failed to execute search"));
+        }
+    }
+
+    /// A transport failure is the server being unreachable, not a statement
+    /// running long: `Unavailable` (503 + `Retry-After`), not `Timeout` (504).
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_classify_mongodb_io_is_unavailable() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let err: mongodb::error::Error =
+            mongodb::error::ErrorKind::Io(std::sync::Arc::new(io)).into();
+        let err = classify_mongodb_error("Failed to read resource", err);
+        assert!(
+            matches!(err, BackendError::Unavailable { ref backend_name, .. } if backend_name == "mongodb"),
+            "a MongoDB I/O failure must classify as Unavailable, got {err:?}"
+        );
+    }
+
+    /// Any other command failure keeps today's behaviour exactly: `Internal`,
+    /// with the same `"{context}: {err}"` text the call sites built before —
+    /// the property that makes converting ~150 call sites safe.
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_classify_mongodb_other_errors_are_unchanged_internal() {
+        // 11000 DuplicateKey — a genuine defect at these call sites, stays 500.
+        let expected = format!(
+            "Failed to insert resource: {}",
+            mongo_command_error(11000, "DuplicateKey")
+        );
+        let err = classify_mongodb_error(
+            "Failed to insert resource",
+            mongo_command_error(11000, "DuplicateKey"),
+        );
+        match err {
+            BackendError::Internal {
+                backend_name,
+                message,
+                ..
+            } => {
+                assert_eq!(backend_name, "mongodb");
+                assert_eq!(
+                    message, expected,
+                    "unclassified errors must keep the pre-#353 message verbatim"
+                );
+            }
+            other => panic!("DuplicateKey must stay Internal, got {other:?}"),
+        }
+    }
+
+    /// The `From` impl (used by bare `?` call sites) classifies too, with no
+    /// context prefix — so the message is the driver text alone, as before.
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_mongodb_from_impl_classifies_without_context_prefix() {
+        let expected =
+            mongo_command_error(MONGO_MAX_TIME_MS_EXPIRED, "MaxTimeMSExpired").to_string();
+        let err: StorageError =
+            mongo_command_error(MONGO_MAX_TIME_MS_EXPIRED, "MaxTimeMSExpired").into();
+        match err {
+            StorageError::Backend(BackendError::Timeout { message, .. }) => {
+                assert_eq!(message, expected, "empty context must add no prefix");
+            }
+            other => panic!("expected a classified Timeout, got {other:?}"),
+        }
+    }
+
+    /// `QueryErrorExt` is the spelling every backend call site uses, so the
+    /// classification it performs is worth pinning independently of the free
+    /// functions: an `Ok` passes through untouched, and an `Err` arrives
+    /// classified and context-tagged.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_query_error_ext_classifies_in_place() {
+        let ok: Result<u8, rusqlite::Error> = Ok(7);
+        assert_eq!(ok.or_query_error("Failed to count resources").unwrap(), 7);
+
+        // SQLITE_INTERRUPT == 9
+        let err: Result<u8, rusqlite::Error> = Err(sqlite_failure(9));
+        match err.or_query_error("Failed to count resources") {
+            Err(StorageError::Backend(BackendError::Timeout { message, .. })) => {
+                assert!(message.starts_with("Failed to count resources: "));
+            }
+            other => panic!("expected a context-tagged Timeout, got {other:?}"),
+        }
     }
 
     #[test]
