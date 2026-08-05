@@ -79,8 +79,6 @@ struct MockState {
     etag_counter: u64,
     /// Total number of `put_object` calls received.
     put_count: u64,
-    /// When set, puts fail once this call count is exceeded (fault injection).
-    fail_put_after: Option<u64>,
     /// When true, all `delete_object` calls return an internal error.
     fail_deletes: bool,
     /// When true, every `put_object` fails its precondition, simulating a writer
@@ -125,14 +123,6 @@ impl MockS3Client {
         Self {
             state: Arc::new(Mutex::new(state)),
         }
-    }
-
-    /// Configures the mock to fail all `put_object` calls once `put_count`
-    /// successful puts have been observed. Used to simulate partial-write
-    /// failures during rollback testing.
-    fn set_fail_put_after(&self, put_count: u64) {
-        let mut state = self.state.lock().unwrap();
-        state.fail_put_after = Some(put_count);
     }
 
     /// Returns the number of objects currently stored in `bucket`.
@@ -266,12 +256,6 @@ impl S3Api for MockS3Client {
             if_match: if_match.map(str::to_string),
             if_none_match: if_none_match.map(str::to_string),
         });
-        if let Some(fail_after) = state.fail_put_after {
-            if state.put_count > fail_after {
-                return Err(S3ClientError::Internal("forced put failure".to_string()));
-            }
-        }
-
         if state.fail_all_puts_with_precondition {
             return Err(S3ClientError::PreconditionFailed);
         }
@@ -749,119 +733,22 @@ async fn history_instance_type_system_and_invalid_cursor() {
     ));
 }
 
-#[tokio::test]
-async fn bundle_transaction_success_and_reference_resolution() {
-    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
-    let backend = make_prefix_backend(mock);
-    let tenant = tenant("tenant-a");
-
-    let entries = vec![
-        BundleEntry {
-            method: BundleMethod::Post,
-            full_url: Some("urn:uuid:patient-1".to_string()),
-            url: "Patient".to_string(),
-            resource: Some(json!({"resourceType":"Patient","id":"tx-p1"})),
-            ..Default::default()
-        },
-        BundleEntry {
-            method: BundleMethod::Post,
-            url: "Observation".to_string(),
-            resource: Some(json!({
-                "resourceType":"Observation",
-                "id":"obs-1",
-                "subject": {"reference": "urn:uuid:patient-1"}
-            })),
-            ..Default::default()
-        },
-    ];
-
-    let result = backend
-        .process_transaction(&tenant, entries, FhirVersion::default())
-        .await
-        .unwrap();
-    assert_eq!(result.entries.len(), 2);
-
-    let obs = backend
-        .read(&tenant, "Observation", "obs-1")
-        .await
-        .unwrap()
-        .unwrap();
-    let reference = obs
-        .content()
-        .pointer("/subject/reference")
-        .and_then(|v| v.as_str())
-        .unwrap();
-
-    assert_eq!(reference, "Patient/tx-p1");
-}
-
-#[tokio::test]
-async fn bundle_transaction_failure_rolls_back() {
-    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
-    let backend = make_prefix_backend(mock);
-    let tenant = tenant("tenant-a");
-
-    let entries = vec![
-        BundleEntry {
-            method: BundleMethod::Post,
-            url: "Patient".to_string(),
-            resource: Some(json!({"resourceType":"Patient","id":"rollback-me"})),
-            ..Default::default()
-        },
-        BundleEntry {
-            method: BundleMethod::Post,
-            url: "Patient".to_string(),
-            resource: Some(json!({"id":"missing-resource-type"})),
-            ..Default::default()
-        },
-    ];
-
-    let result = backend
-        .process_transaction(&tenant, entries, FhirVersion::default())
-        .await;
-    assert!(matches!(result, Err(TransactionError::BundleError { .. })));
-
-    let read = backend.read(&tenant, "Patient", "rollback-me").await;
-    assert!(matches!(
-        read,
-        Err(StorageError::Resource(ResourceError::Gone { .. }))
-    ));
-}
-
-#[tokio::test]
-async fn bundle_transaction_reports_rollback_failure() {
-    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
-    // First create writes 4 objects (current + history + type index + system index).
-    // Start failing puts after that so compensation during rollback fails.
-    mock.set_fail_put_after(4);
-    let backend = make_prefix_backend(mock);
-    let tenant = tenant("tenant-a");
-
-    let entries = vec![
-        BundleEntry {
-            method: BundleMethod::Post,
-            url: "Patient".to_string(),
-            resource: Some(json!({"resourceType":"Patient","id":"rollback-failure"})),
-            ..Default::default()
-        },
-        BundleEntry {
-            method: BundleMethod::Post,
-            url: "Patient".to_string(),
-            resource: Some(json!({"id":"invalid"})),
-            ..Default::default()
-        },
-    ];
-
-    let result = backend
-        .process_transaction(&tenant, entries, FhirVersion::default())
-        .await;
-    match result {
-        Err(TransactionError::BundleError { message, .. }) => {
-            assert!(message.contains("rollback failed"));
-        }
-        other => panic!("expected rollback failure bundle error, got {other:?}"),
-    }
-}
+// The three `bundle_transaction_*` tests were removed here.
+//
+// They covered `S3Backend::process_transaction`'s happy path, its
+// compensation-log rollback, and its rollback-failure reporting. That whole
+// path is now unreachable: S3 answers `false` to
+// `supports_atomic_transactions` and the method refuses before doing any work,
+// because the rollback could never run on the failure mode that mattered — an
+// HTTP timeout drops the request future, so cancellation skips every error
+// branch (#489).
+//
+// Replaced by `transaction_bundle_is_refused_without_writing_anything` below,
+// which asserts the refusal *and* that nothing was written. Batch is not
+// re-asserted here: #501 removed `BundleProvider::process_batch` as
+// unreachable, so batch has no S3-level entry point to test. It is covered
+// over HTTP in `helios-rest` (`batch_conformance.rs`, `batch_if_match.rs`) and
+// end-to-end by the `s3-elasticsearch` Inferno leg.
 
 // `bulk_export_start_manifest_and_delete` was removed: S3 no longer
 // implements `BulkExportStorage` (job state lives in SQLite or PostgreSQL).
@@ -2541,4 +2428,65 @@ fn tenant_location_matches_the_declared_tenancy_topology() {
         b.keyspace.resources_prefix(),
         "PrefixPerTenant must separate tenants by key prefix"
     );
+}
+
+/// A transaction bundle must be refused outright, and refused *before* any
+/// object is written.
+///
+/// S3 has no atomic multi-object operation, and the compensation log cannot
+/// stand in for one: the HTTP `TimeoutLayer` drops the request future, so
+/// cancellation skips every error branch that would trigger a rollback, and the
+/// compensation list is only populated after all writes resolve — empty at the
+/// moment it would be needed. In production that left 466 of 473 entries
+/// durably committed while the client was told the transaction failed (#489).
+///
+/// The `count` assertion is the point of the test: a refusal that still wrote
+/// something would reproduce the original defect in miniature.
+#[tokio::test]
+async fn transaction_bundle_is_refused_without_writing_anything() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    assert!(
+        !backend.supports_atomic_transactions(),
+        "S3 must not claim atomicity it cannot provide"
+    );
+
+    let entries = vec![
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "active": true})),
+            full_url: Some("urn:uuid:11111111-1111-1111-1111-111111111111".to_string()),
+            ..Default::default()
+        },
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".to_string(),
+            resource: Some(json!({"resourceType": "Observation", "status": "final"})),
+            full_url: Some("urn:uuid:22222222-2222-2222-2222-222222222222".to_string()),
+            ..Default::default()
+        },
+    ];
+
+    let err = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .expect_err("transaction must be refused");
+
+    match err {
+        TransactionError::AtomicityUnsupported { backend_name } => {
+            assert_eq!(backend_name, "s3");
+        }
+        other => panic!("expected AtomicityUnsupported, got {other:?}"),
+    }
+
+    for resource_type in ["Patient", "Observation"] {
+        assert_eq!(
+            backend.count(&tenant, Some(resource_type)).await.unwrap(),
+            0,
+            "{resource_type}: refusal must happen before any write"
+        );
+    }
 }
