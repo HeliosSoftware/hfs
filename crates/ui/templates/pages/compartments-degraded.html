@@ -1,0 +1,15 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ i18n.t("cmp-heading") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("cmp-heading") }}</h1>
+  <p class="page-head__lede">{{ i18n.t("cmp-lede") }}</p>
+</section>
+
+<!-- The definitions self-fetch failed or returned nothing (an outage, or an
+     auth-enabled server whose outbound service token is missing, #320). The
+     failed fetch is not cached, so the next request tries again. -->
+<p class="notice notice--warn">{{ i18n.t("cmp-degraded") }}</p>
+{% endblock %}

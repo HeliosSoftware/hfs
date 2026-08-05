@@ -49,6 +49,34 @@ pub struct SubscriptionConfig {
 
     /// FHIR Messaging channel settings. `None` disables the messaging dispatcher.
     pub messaging: Option<MessagingSettings>,
+
+    /// Whether server-driven status transitions are written back into the
+    /// stored `Subscription` resource (issue #357).
+    ///
+    /// `true` (the default) makes the engine's own decisions durable and
+    /// visible: a subscription it activated reads back `active`, and one its
+    /// delivery circuit breaker turned `off` stays `off` across a restart
+    /// instead of resuming delivery to a dead endpoint.
+    ///
+    /// Set `HFS_SUBSCRIPTION_PERSIST_STATUS=false` to restore the previous
+    /// in-memory-only behaviour. That is the kill switch for the case where
+    /// this write-back is itself the incident: it costs at most three writes
+    /// per subscription lifetime, but it does write to the primary backend from
+    /// the delivery path.
+    pub persist_status: bool,
+
+    /// How long a single status write-back may take before it is abandoned.
+    ///
+    /// A hung backend must not pin the spawned dispatch task that is waiting on
+    /// it. On timeout the transition stays in memory and is logged at `error`.
+    pub status_write_timeout: Duration,
+
+    /// Maximum status write-backs in flight at once.
+    ///
+    /// A subscriber outage can trip every subscription in a tenant at nearly the
+    /// same instant; without a bound those transitions would each check out a
+    /// backend connection and could starve ordinary reads.
+    pub status_write_concurrency: usize,
 }
 
 /// FHIR Messaging channel configuration.
@@ -82,6 +110,9 @@ impl Default for SubscriptionConfig {
             ws_token_lifetime_secs: 30,
             smtp: None,
             messaging: None,
+            persist_status: true,
+            status_write_timeout: Duration::from_secs(5),
+            status_write_concurrency: 4,
         }
     }
 }

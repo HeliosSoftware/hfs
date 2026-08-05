@@ -16,7 +16,13 @@
 //! # Index Structure
 //!
 //! Each tenant+resource type combination gets its own index:
-//! `{prefix}_{tenant_id}_{resource_type_lowercase}` (e.g., `hfs_acme_patient`)
+//! `{prefix}_{encoded_tenant_id}_{resource_type_lowercase}` (e.g. `hfs_acme_patient`).
+//!
+//! The tenant segment is produced by an **injective** encoding — see [`naming`],
+//! which is the single derivation every index name and index glob in this backend
+//! goes through. That injectivity is what confines each `_id`-addressed operation
+//! (`create`, `update`, `delete`, and the `create_or_update` existence probe) to
+//! exactly one tenant's index, since those operations cannot carry a query filter.
 //!
 //! Documents use nested objects for search parameters to ensure correct
 //! multi-value matching (e.g., system+code must co-occur in the same token).
@@ -35,6 +41,7 @@
 //! ```
 
 mod backend;
+mod naming;
 mod schema;
 pub mod search;
 mod search_impl;

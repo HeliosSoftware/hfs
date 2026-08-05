@@ -801,6 +801,14 @@ where
                     "HFS_SUBSCRIPTION_HANDSHAKE_RETRY_MAX_MS",
                     default_sub_config.handshake_retry_max_delay,
                 ),
+                persist_status: subscription_bool_from_env(
+                    "HFS_SUBSCRIPTION_PERSIST_STATUS",
+                    default_sub_config.persist_status,
+                ),
+                status_write_timeout: subscription_duration_ms_from_env(
+                    "HFS_SUBSCRIPTION_STATUS_WRITE_TIMEOUT_MS",
+                    default_sub_config.status_write_timeout,
+                ),
                 ..default_sub_config
             };
             // Outbound auth provider was built above (static bearer when
@@ -810,7 +818,30 @@ where
                 config.base_url.clone(),
                 outbound_auth_provider,
             );
-            info!("Subscriptions engine ENABLED");
+            // Server-driven status transitions are written back into the stored
+            // `Subscription` (issue #357), so the engine's own decisions survive
+            // a restart and `GET /Subscription/{id}` stops contradicting
+            // `$status`.
+            //
+            // This is the same `storage_arc` the whole app is served from — on a
+            // composite deployment that is the *composite*, not the primary, so
+            // the rewritten resource also reaches the Elasticsearch index and
+            // `GET /Subscription?status=active` answers from current documents.
+            let engine =
+                engine
+                    .with_status_store(Arc::clone(&storage_arc)
+                        as Arc<dyn helios_persistence::core::ResourceStorage>);
+            // Reported from the engine rather than the config flag, so the line
+            // reflects what is actually wired: it reads OFF if either the flag is
+            // false or no store was attached.
+            if engine.persists_status() {
+                info!("Subscriptions engine ENABLED (status write-back ON)");
+            } else {
+                info!(
+                    "Subscriptions engine ENABLED (status write-back OFF; \
+                     transitions will not survive a restart)"
+                );
+            }
             let engine = Arc::new(engine);
             spawn_subscription_rehydration(Arc::clone(&engine), Arc::clone(&storage_arc), &config);
             state.with_subscription_engine(engine)
