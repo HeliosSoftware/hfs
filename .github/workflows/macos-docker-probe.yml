@@ -144,6 +144,28 @@ jobs:
           echo "--- run 2 (different hash, same source shape) ---"
           ./probe_two "${PROBE_HOST}:${PROBE_PORT}"; echo "PROBE C rc=$?"
 
+      # Probes A-C deliberately need no repo. Probe D does, so the checkout lands
+      # here rather than at the top — keeping the cheap probes ahead of it means
+      # they still report even if checkout is what breaks.
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: false
+
+      # A bare TCP connect is necessary but not sufficient: testcontainers also
+      # has to speak HTTP to the daemon, pull an image, and reach the published
+      # port. This is one real container test — the same suite that produced the
+      # original 37 panics — and it is the actual acceptance criterion.
+      - name: 'Probe D: a real testcontainers test end to end'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo test -p helios-hts --features postgres \
+            --test postgres_http_tests crud_value_set_create_read_delete \
+            -- --nocapture
+          echo "PROBE D rc=$?"
+
       - name: Summary
         if: always()
         shell: bash
