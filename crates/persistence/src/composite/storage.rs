@@ -1683,6 +1683,21 @@ impl SystemHistoryProvider for CompositeStorage {
 
 #[async_trait]
 impl BundleProvider for CompositeStorage {
+    /// Delegated to the primary, never assumed.
+    ///
+    /// A composite is exactly as atomic as the backend holding the resources —
+    /// `sqlite-elasticsearch` is atomic, `s3-elasticsearch` is not. Answering
+    /// `true` unconditionally is what let an `s3-elasticsearch` deployment
+    /// advertise transaction support it could not honour (#489).
+    ///
+    /// Absent a bundle provider there is nothing to delegate to, so the answer
+    /// is `false` — `process_transaction` fails on the same condition below.
+    fn supports_atomic_transactions(&self) -> bool {
+        self.bundle_provider
+            .as_ref()
+            .is_some_and(|p| p.supports_atomic_transactions())
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -2235,7 +2250,14 @@ impl CapabilityProvider for CompositeStorage {
         let resource_caps = HashMap::new();
 
         let mut system_interactions = HashSet::new();
-        system_interactions.insert(crate::core::SystemInteraction::Transaction);
+        // Advertise `transaction` only when the primary can actually honour it.
+        // This was inserted unconditionally, so an `s3-elasticsearch`
+        // deployment published transaction support in its CapabilityStatement
+        // while the S3 primary had no way to roll back (#489). `batch` is
+        // unconditional — every bundle provider can do independent entries.
+        if self.supports_atomic_transactions() {
+            system_interactions.insert(crate::core::SystemInteraction::Transaction);
+        }
         system_interactions.insert(crate::core::SystemInteraction::Batch);
         system_interactions.insert(crate::core::SystemInteraction::SearchSystem);
         system_interactions.insert(crate::core::SystemInteraction::HistorySystem);

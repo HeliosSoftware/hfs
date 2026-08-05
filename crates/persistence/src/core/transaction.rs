@@ -410,10 +410,37 @@ pub enum BundleType {
 /// calls, leaving the behaviour broken on the wire for two releases.
 #[async_trait]
 pub trait BundleProvider: ResourceStorage {
+    /// Whether this provider can honour FHIR transaction atomicity.
+    ///
+    /// A `transaction` bundle is all-or-nothing; a `batch` is not. Design
+    /// discussion #28 draws the line at the trait boundary — "code that
+    /// requires atomicity takes `&dyn TransactionProvider`, while code that can
+    /// tolerate partial failures takes `&dyn ResourceStorage`" — but
+    /// `process_transaction` lives here on `BundleProvider`, which every
+    /// backend implements regardless of whether it can roll back. That let the
+    /// S3 backend accept transaction bundles it could not unwind: a request
+    /// cancelled by the HTTP timeout left 466 of 473 entries durably committed
+    /// while the client was told the transaction failed (#489).
+    ///
+    /// This method restores the gate at the only place that can see the answer.
+    /// It is deliberately **required, not defaulted**: a new backend must state
+    /// its position rather than inherit one, because the wrong default here is
+    /// silent data corruption in one direction and a needless 422 in the other.
+    ///
+    /// Returning `false` does not disable bundles — `process_batch` remains
+    /// available, which is precisely what #28 prescribes for a backend without
+    /// transaction support.
+    fn supports_atomic_transactions(&self) -> bool;
+
     /// Processes a transaction bundle (all-or-nothing).
     ///
     /// All entries are processed atomically. If any entry fails,
     /// all changes are rolled back.
+    ///
+    /// Implementations that return `false` from
+    /// [`supports_atomic_transactions`](Self::supports_atomic_transactions)
+    /// must reject the call before performing any write, rather than making a
+    /// best-effort attempt.
     ///
     /// # Arguments
     ///
