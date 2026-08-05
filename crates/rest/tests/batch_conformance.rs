@@ -1046,3 +1046,211 @@ mod conditional_entries {
         );
     }
 }
+
+// =============================================================================
+// Entry Method Tests (#502)
+// =============================================================================
+
+/// The batch and transaction arms parse `request.method` through one shared
+/// matcher, so they accept exactly the same codes and refuse the rest with the
+/// same status.
+///
+/// `Bundle.entry.request.method` is a `code` with a required binding to
+/// `http-verb`, whose concepts are case-sensitive and uppercase — so a lowercase
+/// verb is invalid instance data, and the transaction arm's old `to_uppercase()`
+/// was the non-conformant matcher rather than batch being wrongly strict.
+mod entry_methods {
+    use super::*;
+
+    async fn post_bundle(server: &TestServer, bundle: Value) -> axum_test::TestResponse {
+        server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&bundle)
+            .await
+    }
+
+    async fn patient_count(backend: &SqliteBackend) -> u64 {
+        backend
+            .count(&test_tenant(), Some("Patient"))
+            .await
+            .expect("count failed")
+    }
+
+    fn batch_of(entries: Vec<Value>) -> Value {
+        json!({ "resourceType": "Bundle", "type": "batch", "entry": entries })
+    }
+
+    /// PATCH is declined at 501 — the status all three backends already return
+    /// from inside a transaction, and the one both READMEs already claimed.
+    #[tokio::test]
+    async fn batch_patch_is_declined_at_501_and_changes_nothing() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let body = post_batch(
+            &server,
+            batch_of(vec![json!({
+                "request": { "method": "PATCH", "url": "Patient/p1" },
+                "resource": { "resourceType": "Patient", "name": [{"family": "Patched"}] }
+            })]),
+        )
+        .await;
+
+        assert_eq!(
+            body["entry"][0]["response"]["status"],
+            "501 Not Implemented"
+        );
+        let stored = backend
+            .read(&test_tenant(), "Patient", "p1")
+            .await
+            .expect("read failed")
+            .expect("patient must survive");
+        assert_eq!(stored.content()["name"][0]["family"], "Nguyen");
+    }
+
+    /// HEAD is a legal http-verb code this server does not accept in a Bundle.
+    #[tokio::test]
+    async fn batch_head_is_refused_at_405() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = post_batch(
+            &server,
+            batch_of(vec![json!({
+                "request": { "method": "HEAD", "url": "Patient/p1" }
+            })]),
+        )
+        .await;
+
+        assert_eq!(
+            body["entry"][0]["response"]["status"],
+            "405 Method Not Allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_refuses_a_lowercase_verb_and_a_missing_one() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let body = post_batch(
+            &server,
+            batch_of(vec![
+                json!({
+                    "request": { "method": "post", "url": "Patient" },
+                    "resource": { "resourceType": "Patient" }
+                }),
+                json!({ "request": { "url": "Patient/p1" } }),
+            ]),
+        )
+        .await;
+
+        assert_eq!(body["entry"][0]["response"]["status"], "400 Bad Request");
+        assert_eq!(body["entry"][1]["response"]["status"], "400 Bad Request");
+        assert_eq!(patient_count(&backend).await, before);
+    }
+
+    /// **The regression test for #502.** On the old code this entry created a
+    /// Patient: the transaction matcher upper-cased `"post"` and dispatched it,
+    /// while the same Bundle 405'd as a batch.
+    #[tokio::test]
+    async fn a_transaction_lowercase_verb_no_longer_writes() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{
+                    "request": { "method": "post", "url": "Patient" },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "Lowercase"}] }
+                }]
+            }),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "a lowercase verb must not create a resource"
+        );
+    }
+
+    /// A PATCH transaction is declined before anything executes, so a sibling
+    /// create in the same bundle must not have landed.
+    #[tokio::test]
+    async fn a_transaction_patch_is_declined_intact_at_501() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    {
+                        "request": { "method": "POST", "url": "Patient" },
+                        "resource": { "resourceType": "Patient", "name": [{"family": "Sibling"}] }
+                    },
+                    {
+                        "request": { "method": "PATCH", "url": "Patient/p1" },
+                        "resource": { "resourceType": "Patient" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        response.assert_status(StatusCode::NOT_IMPLEMENTED);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "not-supported");
+        assert!(
+            body["issue"][0]["details"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("PATCH")),
+            "the outcome must name PATCH: {body}"
+        );
+        assert_eq!(patient_count(&backend).await, before);
+    }
+
+    /// The two arms agree on status, which is what #502 asks for: HEAD is 405
+    /// whether it arrives per-entry in a batch or as a whole-bundle transaction
+    /// failure. Flattening the refusal at the transaction boundary would have
+    /// made this 400 and re-created the divergence in a new place.
+    #[tokio::test]
+    async fn the_two_arms_agree_on_the_refusal_status() {
+        let (server, _backend) = create_test_server().await;
+
+        let batch = post_batch(
+            &server,
+            batch_of(vec![json!({
+                "request": { "method": "HEAD", "url": "Patient/p1" }
+            })]),
+        )
+        .await;
+        assert_eq!(
+            batch["entry"][0]["response"]["status"],
+            "405 Method Not Allowed"
+        );
+
+        let transaction = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{ "request": { "method": "HEAD", "url": "Patient/p1" } }]
+            }),
+        )
+        .await;
+        transaction.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+    }
+}
