@@ -251,6 +251,10 @@ pub async fn create_index_template(backend: &ElasticsearchBackend) -> StorageRes
         pattern
     );
 
+    // Startup is the one moment an operator is reading these logs, so it is where
+    // a pre-fix index layout gets surfaced. Best effort — never fails startup.
+    warn_on_misplaced_documents(backend).await;
+
     Ok(())
 }
 
@@ -322,46 +326,133 @@ pub async fn ensure_index(
     Ok(())
 }
 
-/// Deletes an index for the given tenant and resource type.
-#[allow(dead_code)]
-pub async fn delete_index(
-    backend: &ElasticsearchBackend,
-    tenant_id: &str,
-    resource_type: &str,
-) -> StorageResult<()> {
-    let index = backend.index_name(tenant_id, resource_type);
+// `delete_index` — a whole-index `DELETE` addressed by index name alone — was
+// removed here (issue #384). It was `#[allow(dead_code)]` with no callers, and it
+// was safe only because `index_name` is injective. Keeping an unreachable,
+// untested whole-index drop around is a latent footgun: the first caller to wire
+// it up would not re-derive that argument. Its plausible use — tenant offboarding
+// — is already served, document-level and tenant-term-filtered, by
+// `ResourceStorage::purge_tenant_data` and `PurgableStorage::purge_all`.
 
-    let response = backend
+/// Warns, once at startup, about documents sitting in an index that the current
+/// tenant → index derivation would not put them in.
+///
+/// # Why this exists
+///
+/// The #384 fix makes the derivation injective. For a tenant id that was already
+/// lowercase and Elasticsearch-safe the encoding is the identity, so nothing
+/// moves and this reports nothing. A deployment that actually had a
+/// non-conforming tenant id, however, now addresses a *different* index, and its
+/// pre-upgrade documents stay where the old derivation put them. The symptom is
+/// silent: that tenant's search results go empty (or, worse, stay partial) while
+/// reads, writes, and history — all served by the primary — look perfectly
+/// healthy. Nobody reindexes an index they do not know is wrong.
+///
+/// # Why this compares documents, not index names
+///
+/// The obvious check — "is this index name something the encoder could have
+/// produced?" — would miss the very case the issue is about. The old derivation
+/// *lowercased*, so tenant `ACME` wrote to `{prefix}_acme_patient`, which is a
+/// perfectly well-formed name for tenant `acme`. There is no malformed name to
+/// spot. What is actually wrong is the *contents*: that index holds documents
+/// whose `tenant_id` is `ACME`, which this build would place in
+/// `{prefix}_+41+43+4d+45_patient`.
+///
+/// So this aggregates the distinct `tenant_id` values present in each index and
+/// flags any whose encoded form does not match the index's own tenant segment.
+/// That detects both the collision case and any stranded-index case, and it needs
+/// no heuristic about name shape.
+///
+/// # Deliberate limits
+///
+/// - **Best effort; never fails startup.** Misplaced documents are inert — no
+///   query path reaches them across a tenant boundary (`read` re-checks
+///   `tenant_id`, every glob-scoped query carries a `term` filter), so refusing to
+///   boot would turn a search-completeness problem into a total outage. An
+///   unreachable cluster is silently ignored here; `health_check` reports that.
+/// - **One aggregation, at startup only.** Not on the write path.
+/// - It reports the condition; it does not repair it. Remediation is `$reindex`
+///   for the affected tenant, then a delete-by-query filtered on that tenant's
+///   exact `tenant_id` to remove the strays.
+async fn warn_on_misplaced_documents(backend: &ElasticsearchBackend) {
+    let prefix = &backend.config().index_prefix;
+    let pattern = format!("{prefix}_*");
+
+    let response = match backend
         .client()
-        .indices()
-        .delete(elasticsearch::indices::IndicesDeleteParts::Index(&[&index]))
+        .search(elasticsearch::SearchParts::Index(&[&pattern]))
+        .body(json!({
+            "size": 0,
+            "aggs": {
+                "per_index": {
+                    "terms": { "field": "_index", "size": 1000 },
+                    "aggs": {
+                        "tenants": { "terms": { "field": "tenant_id", "size": 100 } }
+                    }
+                }
+            }
+        }))
+        .allow_no_indices(true)
+        .ignore_unavailable(true)
         .send()
         .await
-        .map_err(|e| {
-            crate::error::StorageError::Backend(BackendError::Internal {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Failed to delete index {}: {}", index, e),
-                source: None,
-            })
-        })?;
+    {
+        Ok(r) if r.status_code().is_success() => r,
+        // Unreachable cluster, or a cluster with no indices yet. Not this
+        // function's job to report — stay silent rather than mislead.
+        _ => return,
+    };
 
-    let status = response.status_code();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        // 404 is OK (index doesn't exist)
-        if !body.contains("index_not_found_exception") {
-            return Err(crate::error::StorageError::Backend(
-                BackendError::Internal {
-                    backend_name: "elasticsearch".to_string(),
-                    message: format!("Failed to delete index {}: {}", index, body),
-                    source: None,
-                },
-            ));
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return;
+    };
+    let Some(index_buckets) = body
+        .pointer("/aggregations/per_index/buckets")
+        .and_then(|b| b.as_array())
+    else {
+        return;
+    };
+
+    let index_prefix = format!("{prefix}_");
+    for index_bucket in index_buckets {
+        let Some(index) = index_bucket.get("key").and_then(|k| k.as_str()) else {
+            continue;
+        };
+        // `{prefix}_{tenant}_{type}`: the tenant segment is everything between
+        // the prefix and the final `_`.
+        let Some((tenant_segment, type_segment)) = index
+            .strip_prefix(&index_prefix)
+            .and_then(|rest| rest.rsplit_once('_'))
+        else {
+            continue;
+        };
+
+        let tenant_buckets = index_bucket
+            .pointer("/tenants/buckets")
+            .and_then(|b| b.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        for tenant_bucket in tenant_buckets {
+            let Some(tenant_id) = tenant_bucket.get("key").and_then(|k| k.as_str()) else {
+                continue;
+            };
+            if super::naming::encode_tenant_segment(tenant_id) == tenant_segment {
+                continue;
+            }
+            tracing::warn!(
+                index = %index,
+                tenant_id = %tenant_id,
+                expected_index = %super::naming::index_name(prefix, tenant_id, type_segment),
+                doc_count = tenant_bucket.get("doc_count").and_then(|c| c.as_u64()).unwrap_or(0),
+                "Elasticsearch documents predate the injective tenant-index naming fix \
+                 (issue #384): they sit in an index this build would not write them to, so \
+                 they are invisible to that tenant's searches. Run `$reindex` for this \
+                 tenant, then remove the strays with a delete-by-query filtered on this \
+                 exact `tenant_id`."
+            );
         }
     }
-
-    tracing::debug!("Deleted Elasticsearch index '{}'", index);
-    Ok(())
 }
 
 #[cfg(test)]
