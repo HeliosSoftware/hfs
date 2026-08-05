@@ -823,6 +823,20 @@ mod transaction_errors {
 mod conditional_entries {
     use super::*;
 
+    /// Posts a bundle and returns the raw response without asserting on status,
+    /// so declined transactions can be inspected.
+    async fn post_bundle(server: &TestServer, bundle: Value) -> axum_test::TestResponse {
+        server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&bundle)
+            .await
+    }
+
     async fn patient_count(backend: &SqliteBackend) -> u64 {
         backend
             .count(&test_tenant(), Some("Patient"))
@@ -950,5 +964,78 @@ mod conditional_entries {
 
         assert_eq!(body["entry"][0]["response"]["status"], "200 OK");
         assert_eq!(body["entry"][0]["resource"]["id"], "p1");
+    }
+
+    /// A transaction carrying a query-bearing non-GET entry is declined whole,
+    /// before anything executes — so the sibling create in the same bundle must
+    /// not have landed. Backends parse entry URLs query-blind, so letting it
+    /// through commits the criteria as part of the resource type or the id.
+    #[tokio::test]
+    async fn a_transaction_with_a_conditional_url_is_declined_intact() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    {
+                        "request": { "method": "POST", "url": "Patient" },
+                        "resource": { "resourceType": "Patient", "name": [{"family": "Sibling"}] }
+                    },
+                    {
+                        "request": {
+                            "method": "PUT",
+                            "url": "Patient?identifier=http://example.org|12345"
+                        },
+                        "resource": { "resourceType": "Patient" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "not-supported");
+        assert_eq!(
+            patient_count(&backend).await,
+            before,
+            "the bundle must be declined before any entry is applied"
+        );
+    }
+
+    /// GET entries are left to #478: a transaction search URL is not declined
+    /// by the query guard, so that work lands on an untouched arm.
+    #[tokio::test]
+    async fn a_transaction_get_with_a_query_is_not_declined_by_the_query_guard() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let response = post_bundle(
+            &server,
+            json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{
+                    "request": { "method": "GET", "url": "Patient?name=Nguyen" }
+                }]
+            }),
+        )
+        .await;
+
+        let body: Value = response.json();
+        let declined_by_the_guard = body["resourceType"] == "OperationOutcome"
+            && body["issue"][0]["code"] == "not-supported"
+            && body["issue"][0]["diagnostics"]
+                .as_str()
+                .is_some_and(|d| d.contains("carries a query string"));
+        assert!(
+            !declined_by_the_guard,
+            "GET entries must stay on #478's path, not this guard: {body}"
+        );
     }
 }
