@@ -501,16 +501,32 @@ curl -X POST http://localhost:8080/ \
 
 ### Conditional Operations in Bundles
 
-Bundle entries support conditional headers:
-- `ifMatch` - ETag for optimistic locking on `PUT` **and `DELETE`** entries, in
-  both `batch` and `transaction` bundles. Parsed as the comma-separated list
-  RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
-- `ifNoneMatch` - Prevent overwrites (`*` for conditional create)
-- `ifNoneExist` - Search query for conditional create
+- `ifMatch` — **supported.** ETag for optimistic locking on `PUT` **and `DELETE`**
+  entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
+  list RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
+- `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
+  `BundleEntry.if_none_match`; no handler or backend reads it.
+- `ifNoneExist` — **MongoDB transactions only.** MongoDB resolves it inside the
+  bundle's session. The batch path never reads it, and SQLite/PostgreSQL ignore it
+  in a transaction and create a duplicate. Tracked by #511.
+
+Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
+`DELETE [type]?[criteria]`) are **not resolved**:
+
+- In a `batch`, such an entry is refused per-entry with `400`; nothing is written.
+- In a `transaction`, any non-`GET` entry whose URL carries a query string
+  declines the whole bundle with `400 not-supported` before anything executes,
+  because the backends parse entry URLs query-blind and would otherwise commit
+  the criteria as part of the resource type or the id.
+
+Note that `/metadata` advertises `conditionalCreate`, `conditionalUpdate` and
+`conditionalDelete` for every resource type. That is accurate for the resource
+endpoints and **not** for bundle entries; reconciling the two is #511.
 
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:
+- **Conditional interactions in bundle entries** - `[type]?[criteria]` URLs are refused rather than resolved (#511)
 - **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
 - **PATCH method** - PATCH operations in bundles return 501 Not Implemented
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
