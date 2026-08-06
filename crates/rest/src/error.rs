@@ -1482,6 +1482,30 @@ mod tests {
         assert_eq!(code, "timeout");
     }
 
+    /// A backend that cannot honour transaction atomicity is a capability gap,
+    /// not a fault: it is healthy and declined work it cannot perform
+    /// correctly, so 501 + `not-supported` is the answer, never a 500 (#489).
+    ///
+    /// This is the second path to that refusal. `transaction_error_response_parts`
+    /// in `handlers/batch.rs` carries the bundle-shaped message, and this `From`
+    /// impl catches the error anywhere else it surfaces; the two must not drift
+    /// apart, or the same condition reports two different statuses depending on
+    /// which layer saw it.
+    #[test]
+    fn test_transaction_atomicity_unsupported_maps_to_501() {
+        let err = TransactionError::AtomicityUnsupported {
+            backend_name: "s3".to_string(),
+        };
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(code, "not-supported");
+        assert!(message.contains("s3"), "should name the backend: {message}");
+        assert!(
+            message.contains("batch"),
+            "should point at the workable alternative: {message}"
+        );
+    }
+
     /// The 504 deliberately carries no `Retry-After`: a cancelled query is
     /// usually deterministically too slow, so inviting a prompt retry just
     /// multiplies load on a strained database. `Retry-After` stays on the 503
