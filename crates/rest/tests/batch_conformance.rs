@@ -1279,3 +1279,157 @@ mod entry_methods {
         );
     }
 }
+
+// =============================================================================
+// GET Search Entry Tests (#478)
+// =============================================================================
+
+mod search_entries {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_batch_get_search_entry_returns_searchset() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        seed_patient(&backend, "p2", "Smith").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": { "method": "GET", "url": "Patient?family=Nguyen" }
+            }]
+        });
+
+        let body = post_batch(&server, bundle).await;
+        let entry = &body["entry"][0];
+
+        assert_eq!(entry["response"]["status"].as_str().unwrap(), "200 OK");
+        let searchset = &entry["resource"];
+        assert_eq!(searchset["resourceType"].as_str().unwrap(), "Bundle");
+        assert_eq!(searchset["type"].as_str().unwrap(), "searchset");
+        assert_eq!(searchset["entry"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            searchset["entry"][0]["resource"]["name"][0]["family"]
+                .as_str()
+                .unwrap(),
+            "Nguyen"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_get_bare_type_is_a_search() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+        seed_patient(&backend, "p2", "Smith").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": { "method": "GET", "url": "Patient" }
+            }]
+        });
+
+        let body = post_batch(&server, bundle).await;
+        let searchset = &body["entry"][0]["resource"];
+
+        assert_eq!(searchset["type"].as_str().unwrap(), "searchset");
+        assert_eq!(searchset["entry"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_mixes_search_and_read_entries() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [
+                { "request": { "method": "GET", "url": "Patient/p1" } },
+                { "request": { "method": "GET", "url": "Patient?family=Nguyen" } }
+            ]
+        });
+
+        let body = post_batch(&server, bundle).await;
+
+        let read = &body["entry"][0];
+        assert_eq!(read["response"]["status"].as_str().unwrap(), "200 OK");
+        assert_eq!(
+            read["resource"]["resourceType"].as_str().unwrap(),
+            "Patient"
+        );
+
+        let search = &body["entry"][1];
+        assert_eq!(search["response"]["status"].as_str().unwrap(), "200 OK");
+        assert_eq!(search["resource"]["type"].as_str().unwrap(), "searchset");
+    }
+
+    #[tokio::test]
+    async fn test_transaction_get_search_sees_the_bundles_own_writes() {
+        let (server, _backend) = create_test_server().await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "Patient",
+                        "name": [{"family": "Tran"}]
+                    },
+                    "request": { "method": "POST", "url": "Patient" }
+                },
+                { "request": { "method": "GET", "url": "Patient?family=Tran" } }
+            ]
+        });
+
+        let body = post_batch(&server, bundle).await;
+        assert_eq!(body["type"].as_str().unwrap(), "transaction-response");
+
+        let created = &body["entry"][0];
+        assert_eq!(
+            created["response"]["status"].as_str().unwrap(),
+            "201 Created"
+        );
+
+        let search = &body["entry"][1];
+        assert_eq!(search["response"]["status"].as_str().unwrap(), "200 OK");
+        let searchset = &search["resource"];
+        assert_eq!(searchset["type"].as_str().unwrap(), "searchset");
+        assert_eq!(
+            searchset["entry"].as_array().unwrap().len(),
+            1,
+            "the search runs after the writes and must see the created patient"
+        );
+        assert_eq!(
+            searchset["entry"][0]["resource"]["name"][0]["family"]
+                .as_str()
+                .unwrap(),
+            "Tran"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transaction_get_by_id_still_reads_in_transaction() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Nguyen").await;
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [{
+                "request": { "method": "GET", "url": "Patient/p1" }
+            }]
+        });
+
+        let body = post_batch(&server, bundle).await;
+        let entry = &body["entry"][0];
+        assert_eq!(entry["response"]["status"].as_str().unwrap(), "200 OK");
+        assert_eq!(
+            entry["resource"]["resourceType"].as_str().unwrap(),
+            "Patient"
+        );
+    }
+}

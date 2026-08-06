@@ -3584,6 +3584,7 @@ dependencies = [
  "mime",
  "p256 0.13.2",
  "p384",
+ "parking_lot",
  "rand 0.8.6",
  "regex",
  "reqwest",
