@@ -608,7 +608,9 @@ mod tenant_source_tests {
         let resolver = TenantResolver::new(&config);
 
         let parts = make_parts("/acme/Patient/123", Some("other"));
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver
+            .resolve(&parts, &config, "default")
+            .expect("valid tenant");
 
         assert_eq!(resolved.tenant_id_str(), "acme");
         assert_eq!(resolved.source, TenantSource::UrlPath);
@@ -624,7 +626,9 @@ mod tenant_source_tests {
         let resolver = TenantResolver::new(&config);
 
         let parts = make_parts("/Patient/123", None);
-        let resolved = resolver.resolve(&parts, &config, "default-tenant");
+        let resolved = resolver
+            .resolve(&parts, &config, "default-tenant")
+            .expect("valid tenant");
 
         assert_eq!(resolved.tenant_id_str(), "default-tenant");
         assert_eq!(resolved.source, TenantSource::Default);
@@ -640,7 +644,9 @@ mod tenant_source_tests {
         let resolver = TenantResolver::new(&config);
 
         let parts = make_parts("/acme/Patient/123", Some("acme"));
-        let resolved = resolver.resolve(&parts, &config, "default");
+        let resolved = resolver
+            .resolve(&parts, &config, "default")
+            .expect("valid tenant");
 
         // Both sources found the same tenant
         assert_eq!(resolved.all_sources.len(), 2);

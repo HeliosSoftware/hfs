@@ -1037,7 +1037,12 @@ impl ResourceStorage for CompositeStorage {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
-        crate::tenant::ensure_mutable_tenant(id)?;
+        // Checked here as well as in the primary (issue #385). The composite is
+        // what a search-backed deployment actually calls, and its secondaries —
+        // Elasticsearch above all — derive index names from the tenant id. The
+        // primary's own check would still catch this, but only after the
+        // composite had already accepted the id as legitimate.
+        self.ensure_canonical_tenant_id(id)?;
         self.primary.register_tenant(id, display_name).await
     }
 

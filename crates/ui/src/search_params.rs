@@ -62,8 +62,11 @@ impl SpCatalog {
         let built = Arc::new(fetch_snapshot(&*self.source, version, tenant).await);
         // A failed fetch (`spec_loaded == false`) is served degraded for this
         // request only — caching it would pin the page to the failure until
-        // restart.
-        if !built.spec_loaded {
+        // restart. An *empty success* gets the same treatment (#462): storage
+        // seeds the spec parameters at startup, so an empty registry means
+        // the search path hasn't caught up yet (a composite backend's index
+        // still syncing), not that there is nothing to show.
+        if !built.spec_loaded || built.params.is_empty() {
             return built;
         }
         // Another task may have raced us here; keep whichever landed first.
@@ -716,6 +719,46 @@ fn page_links(page: usize, page_count: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source whose first fetch is empty and later fetches carry data, the
+    /// way a composite backend behaves while its search index still syncs.
+    struct WarmingSource(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ConformanceSource for WarmingSource {
+        async fn fetch(
+            &self,
+            _rt: &str,
+            _v: FhirVersion,
+            _t: &str,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![serde_json::json!({
+                "resourceType": "SearchParameter",
+                "url": "http://example.org/SearchParameter/color",
+                "name": "color",
+                "code": "color",
+                "status": "active",
+                "type": "token",
+                "base": ["Patient"],
+                "expression": "Patient.extension.value"
+            })])
+        }
+    }
+
+    /// #462: an empty success must not be cached — the next request retries
+    /// and sees the data once the backend's index catches up.
+    #[tokio::test]
+    async fn an_empty_snapshot_is_not_pinned() {
+        let catalog = SpCatalog::new(Arc::new(WarmingSource(0.into())));
+        let cold = catalog.snapshot("t", FhirVersion::default()).await;
+        assert!(cold.params.is_empty(), "first fetch is empty");
+        let warm = catalog.snapshot("t", FhirVersion::default()).await;
+        assert_eq!(warm.params.len(), 1, "second request re-fetched");
+    }
 
     fn snapshot() -> VersionSnapshot {
         // Tests run with the crate as CWD; the workspace spec bundles live two

@@ -46,6 +46,9 @@ helios-fhirpath = { path = "../fhirpath", version = "0.2.1", optional = true, de
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros"] }
+# tests/schema_coverage.rs reads the committed packs off disk (feature-agnostic,
+# unlike src/packs.rs which gates each pack behind its version feature).
+flate2 = "1"
 
 [[bin]]
 name = "generate-schema-packs"

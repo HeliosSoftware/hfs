@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -296,6 +296,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             12 => migrate_v12_to_v13(conn)?,
             13 => migrate_v13_to_v14(conn)?,
             14 => migrate_v14_to_v15(conn)?,
+            15 => migrate_v15_to_v16(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -376,8 +377,13 @@ fn migrate_v2_to_v3(conn: &Connection) -> StorageResult<()> {
         return Ok(());
     }
 
-    // Create the FTS5 virtual table for full-text search
-    // Uses external content mode for smaller index size
+    // Create the FTS5 virtual table for full-text search.
+    //
+    // NOTE: this is a plain fts5 table, NOT external-content mode — there is no
+    // `content=` clause. It therefore keeps a full second copy of every
+    // resource's narrative and serialized body in its `resource_fts_content`
+    // shadow table. That matters when reasoning about where purged PHI lives:
+    // deleting the `resources` row does not reach this copy (see issue #386).
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS resource_fts USING fts5(
             resource_id UNINDEXED,
@@ -1260,14 +1266,69 @@ fn migrate_v13_to_v14(conn: &Connection) -> StorageResult<()> {
     ensure_tenants_table(conn)
 }
 
-/// v14 -> v15 migration: `bulk_entry_results` gains `file_url` in its primary
+/// Migrate from schema version 14 to version 15.
+///
+/// Sweeps `resource_fts` rows orphaned by the pre-v15 purge paths (issue #386).
+///
+/// `resource_fts` is an FTS5 *virtual* table, so it can carry no foreign key and
+/// the `ON DELETE CASCADE` from `resources` never reached it — and no purge path
+/// deleted from it explicitly. Every database that has ever served `$purge`,
+/// type-level `$purge`, or a tenant purge is therefore still holding the
+/// narrative text and the complete serialized body of resources an operator was
+/// told had been removed. The code fix stops new orphans; this removes the ones
+/// already on disk, which is the half that matters to anyone running today.
+///
+/// Soft-deleted resources keep their `resources` row, so `NOT EXISTS` correctly
+/// preserves their entries — matching current behaviour, where a soft delete
+/// does not drop the FTS row.
+///
+/// The single statement runs in its own implicit transaction. It scans
+/// `resource_fts` once (unavoidable: its key columns are `UNINDEXED`, and an
+/// FTS5 virtual table admits no auxiliary index) and probes `resources` by
+/// primary key.
+fn migrate_v14_to_v15(conn: &Connection) -> StorageResult<()> {
+    // FTS5 is optional at compile time; a database built without it has no
+    // table to sweep.
+    let fts_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !fts_exists {
+        return Ok(());
+    }
+
+    let swept = conn
+        .execute(
+            "DELETE FROM resource_fts
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM resources r
+                   WHERE r.tenant_id     = resource_fts.tenant_id
+                     AND r.resource_type = resource_fts.resource_type
+                     AND r.id            = resource_fts.resource_id)",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v15 resource_fts orphan sweep: {e}")))?;
+
+    if swept > 0 {
+        tracing::info!(
+            orphaned_fts_rows = swept,
+            "Swept full-text rows left behind by pre-v15 purges (issue #386)"
+        );
+    }
+    Ok(())
+}
+
+/// v15 -> v16 migration: `bulk_entry_results` gains `file_url` in its primary
 /// key (#457). Line numbers restart in every manifest output file, so without
 /// the file in the key every file after the first collided on its first entry.
 /// SQLite cannot alter a primary key, so the table is rebuilt; pre-migration
 /// rows keep an empty file_url.
-fn migrate_v14_to_v15(conn: &Connection) -> StorageResult<()> {
+fn migrate_v15_to_v16(conn: &Connection) -> StorageResult<()> {
     conn.execute_batch(
-        "CREATE TABLE bulk_entry_results_v15 (
+        "CREATE TABLE bulk_entry_results_v16 (
             tenant_id TEXT NOT NULL,
             submitter TEXT NOT NULL,
             submission_id TEXT NOT NULL,
@@ -1283,16 +1344,16 @@ fn migrate_v14_to_v15(conn: &Connection) -> StorageResult<()> {
             FOREIGN KEY (tenant_id, submitter, submission_id, manifest_id)
                 REFERENCES bulk_manifests(tenant_id, submitter, submission_id, manifest_id) ON DELETE CASCADE
         );
-        INSERT INTO bulk_entry_results_v15
+        INSERT INTO bulk_entry_results_v16
             (tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, resource_id, created, outcome, operation_outcome)
         SELECT tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, resource_id, created, outcome, operation_outcome
         FROM bulk_entry_results;
         DROP TABLE bulk_entry_results;
-        ALTER TABLE bulk_entry_results_v15 RENAME TO bulk_entry_results;
+        ALTER TABLE bulk_entry_results_v16 RENAME TO bulk_entry_results;
         CREATE INDEX IF NOT EXISTS idx_bulk_entry_results_outcome
             ON bulk_entry_results(tenant_id, submitter, submission_id, manifest_id, outcome);",
     )
-    .map_err(|e| migration_err(format!("migrate bulk_entry_results to v15: {e}")))
+    .map_err(|e| migration_err(format!("migrate bulk_entry_results to v16: {e}")))
 }
 
 fn migration_err(message: String) -> crate::error::StorageError {
