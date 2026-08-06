@@ -274,6 +274,16 @@ jobs:
           HFS_LOG="$RESULTS_DIR/hfs.log"
           echo "HFS_LOG=$HFS_LOG" >> "$GITHUB_ENV"
 
+          # Defensive, and logged so a future incident can rule it in or out:
+          # if a pool runner ever carries http(s)_proxy with the private
+          # ranges excluded via CIDR in no_proxy, curl (the probes) honors the
+          # CIDR but reqwest (HFS's ES client) does not — HFS would detour its
+          # backend traffic through the proxy and time out while every probe
+          # passes. Naming the hosts exactly works for both clients (#449).
+          export NO_PROXY="$DOCKER_HOST_IP,$RUNNER_IP,localhost,127.0.0.1${NO_PROXY:+,$NO_PROXY}"
+          export no_proxy="$NO_PROXY"
+          echo "Proxy env: $(env | grep -i '^https\?_proxy=' | sed 's/=.*/=set/' | tr '\n' ' ')no_proxy=$no_proxy"
+
           # Shared UI env: serve the vendored SearchParameter specs (production
           # parity) and advertise natural-language search as configured so its
           # pane renders. The key is never exercised by the suite.
@@ -336,6 +346,18 @@ jobs:
 
           echo "HFS failed to start"
           tail -50 "$HFS_LOG"
+          if [ -n "${ES_CONTAINER:-}" ]; then
+            # Evidence for the next #449-shaped failure: did the container die,
+            # was it OOM-killed, and is the mapped port still answering? The
+            # 2026-07 incident (quota-choked host, ES stalling post-health-check)
+            # burned days for lack of exactly this.
+            echo "--- ES container state"
+            docker inspect -f 'status={{.State.Status}} oomkilled={{.State.OOMKilled}} exitcode={{.State.ExitCode}} started={{.State.StartedAt}}' "$ES_CONTAINER" || true
+            echo "--- ES container log tail"
+            docker logs --tail 40 "$ES_CONTAINER" 2>&1 || true
+            echo "--- ES reachability from the runner right now"
+            curl -sv -m 10 "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" 2>&1 | tail -8 || true
+          fi
           exit 1
 
       - name: Probe the conformance read path
