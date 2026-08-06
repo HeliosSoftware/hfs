@@ -1127,9 +1127,16 @@ mod conditional_entries {
         .await;
 
         let body: Value = response.json();
+        // `details.text`, not `diagnostics`: the guard raises
+        // `RestError::NotSupported`, and `create_operation_outcome` writes only
+        // `details.text` — `RestError` never renders a `diagnostics` field. As
+        // written against `diagnostics` the third conjunct was unsatisfiable,
+        // so `declined_by_the_guard` was permanently false and the negated
+        // assert below held even if a GET entry *were* declined by the guard,
+        // which is the one thing this test exists to catch.
         let declined_by_the_guard = body["resourceType"] == "OperationOutcome"
             && body["issue"][0]["code"] == "not-supported"
-            && body["issue"][0]["diagnostics"]
+            && body["issue"][0]["details"]["text"]
                 .as_str()
                 .is_some_and(|d| d.contains("carries a query string"));
         assert!(
