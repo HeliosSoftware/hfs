@@ -508,6 +508,39 @@ version — so a lowercase `"post"` is invalid instance data and is refused with
 `400`, not silently accepted. `GET`, `POST`, `PUT` and `DELETE` dispatch; `PATCH`
 and `HEAD` are refused as described under Current Limitations.
 
+### Per-entry outcomes
+
+A failed entry's `response.outcome` carries the **same issue code the equivalent
+single-resource request would return**, because both are rendered by one mapping
+(`RestError::client_outcome`). A batch `GET Patient/missing` and
+`GET [base]/Patient/missing` produce byte-identical OperationOutcomes.
+
+| Entry failure | Status | `issue.code` |
+|---|---|---|
+| `request` absent | 400 | `required` |
+| `request.method` absent | 400 | `required` |
+| `request.method` not an `http-verb` code | 400 | `value` |
+| `request.url` absent | 400 | `required` |
+| `request.url` names nothing | 400 | `value` |
+| `resource` absent on `POST`/`PUT` | 400 | `invalid` |
+| `PUT`/`DELETE` URL names no instance | 400 | `value` |
+| conditional criteria in the URL | 400 | `not-supported` |
+| insufficient scope | 403 | `forbidden` |
+| target not found | 404 | `not-found` |
+| `HEAD` | 405 | `not-supported` |
+| `ifMatch` precondition failed | 412 | `conflict` |
+| write validation failed | 422 | the validator's own issues |
+| `PATCH` | 501 | `not-supported` |
+| storage error | per class | `deleted`, `conflict`, `multiple-matches`, `transient`, `timeout`, `exception`, … |
+
+An entry that fails enforce-mode write validation carries the validator's **full
+multi-issue outcome** — per-issue `code`, `severity` and `expression` (the
+FHIRPath location of the failing element) — exactly as `POST [base]/[type]` does.
+
+`required` and `value` are both children of `invalid` in the `issue-type`
+hierarchy, and `invalid` is used where the distinction between an absent element
+and an unusable value does not apply.
+
 ### Conditional Operations in Bundles
 
 - `ifMatch` — **supported.** ETag for optimistic locking on `PUT` **and `DELETE`**
@@ -522,7 +555,8 @@ and `HEAD` are refused as described under Current Limitations.
 Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
 `DELETE [type]?[criteria]`) are **not resolved**:
 
-- In a `batch`, such an entry is refused per-entry with `400`; nothing is written.
+- In a `batch`, such an entry is refused per-entry with `400 not-supported`;
+  nothing is written. Both arms agree on the status **and** the issue code.
 - In a `transaction`, any non-`GET` entry whose URL carries a query string
   declines the whole bundle with `400 not-supported` before anything executes,
   because the backends parse entry URLs query-blind and would otherwise commit
@@ -537,10 +571,12 @@ endpoints and **not** for bundle entries; reconciling the two is #511.
 The following FHIR transaction features are not yet implemented:
 - **Conditional interactions in bundle entries** - `[type]?[criteria]` URLs are refused rather than resolved (#511)
 - **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
-- **PATCH method** - PATCH operations in bundles return 501 Not Implemented, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
-- **HEAD entries** - refused with 405. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle
+- **PATCH method** - PATCH operations in bundles return `501 not-supported`, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
+- **HEAD entries** - refused with `405 not-supported`. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
 - **Duplicate detection** - Same resource appearing twice in a transaction is not detected
+- **Transaction entry failures after dispatch** - a transaction entry that fails once the backend is executing it is still collapsed to `400 processing`, with the real status stringified into the message (`Entry failed with status 404`). The backends discard the entry result at their `status >= 400` guard and return `TransactionError::BundleError`, which carries neither. Tracked separately; the per-entry codes above are the `batch` arm and the transaction refusals raised *before* dispatch
+- **Bare type-level `GET`** - `GET Patient` in a batch entry is read as an instance read with an empty id and answers `404 not-found` with the message `Resource Patient/ not found`. Executing it as a search is #478
 
 ## HTTP Headers
 
@@ -573,6 +609,11 @@ All errors are returned as FHIR OperationOutcome resources:
   }]
 }
 ```
+
+The same shape is used for a failed Bundle entry, placed at
+`Bundle.entry.response.outcome` — see [Per-entry outcomes](#per-entry-outcomes).
+Both are built by `RestError::client_outcome`, so an error is described
+identically wherever it surfaces.
 
 ## Testing
 
