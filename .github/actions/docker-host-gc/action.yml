@@ -44,10 +44,17 @@ runs:
     - name: Remove orphaned anonymous volumes
       shell: bash
       run: |
-        # Deliberately NOT `docker volume prune -af`. This host also runs
-        # long-lived services, and `-a` includes *named* volumes — so a prune
-        # racing a service redeploy, at the moment its named volume is briefly
-        # unreferenced, would delete that service's data. There is no undo.
+        # Deliberately NOT `docker volume prune -af`. `-a` includes *named*
+        # volumes, so a prune racing a service redeploy — at the moment that
+        # service's named volume is briefly unreferenced — would delete its
+        # data, with no undo.
+        #
+        # Verified 2026-07-30: the host currently has *no* named volumes at all,
+        # so today the two forms would behave identically. The narrower filter
+        # is defence in depth, not a response to something already at risk: the
+        # host does run long-lived services alongside CI, and the day one of
+        # them gains a named volume, that must not silently turn a routine
+        # sweep into data loss.
         #
         # Anonymous volumes (the only kind testcontainers leaks) are named with
         # a 64-char hex string; named volumes never match that shape. Matching
