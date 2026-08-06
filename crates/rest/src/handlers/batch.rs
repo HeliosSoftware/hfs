@@ -815,14 +815,18 @@ where
             };
 
             // Write-path validation (per-entry outcome in batch semantics).
+            //
+            // The error carries the validator's own multi-issue outcome —
+            // per-issue code, severity and `expression` — and
+            // `client_outcome` surfaces it verbatim. It used to be flattened
+            // to a joined string of `details.text` and re-wrapped under
+            // `processing`, which is the lossiest case in #504.
             if let Err(e) = state
                 .validation()
                 .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
                 .await
             {
-                return entry_failure(RestError::UnprocessableEntity {
-                    message: validation_failure_message(&e),
-                });
+                return entry_failure(e);
             }
 
             match state
@@ -887,9 +891,7 @@ where
                 .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
                 .await
             {
-                return entry_failure(RestError::UnprocessableEntity {
-                    message: validation_failure_message(&e),
-                });
+                return entry_failure(e);
             }
 
             match state
@@ -1380,35 +1382,6 @@ impl EntryParseError {
             Self::MissingUrl => missing_url(index),
         }
     }
-}
-
-/// Flatten an enforce-mode validation failure into a per-entry message.
-///
-/// Left in place by the commit that introduced [`entry_failure`]: threading the
-/// validator's own outcome through is a separate change (#504).
-fn validation_failure_message(error: &RestError) -> String {
-    if let RestError::ValidationFailed { outcome } = error {
-        let details: Vec<String> = outcome
-            .get("issue")
-            .and_then(|i| i.as_array())
-            .map(|issues| {
-                issues
-                    .iter()
-                    .filter_map(|issue| {
-                        issue
-                            .get("details")
-                            .and_then(|d| d.get("text"))
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !details.is_empty() {
-            return format!("Validation failed: {}", details.join("; "));
-        }
-    }
-    format!("Validation failed: {error}")
 }
 
 /// Renders a failed Bundle entry.
@@ -2563,6 +2536,65 @@ mod tests {
 
     fn state_with(storage: DelayStorage) -> AppState<DelayStorage> {
         AppState::new(Arc::new(storage), crate::config::ServerConfig::default())
+    }
+
+    /// Like [`state_with`], but with write-path validation in `enforce` mode.
+    /// `ServerConfig::default()`'s validation mode is `off`, so no other test
+    /// in this module can reach the 422 arm.
+    fn enforcing_state_with(storage: DelayStorage) -> AppState<DelayStorage> {
+        AppState::new(
+            Arc::new(storage),
+            crate::config::ServerConfig {
+                validation: crate::config::ValidationConfig {
+                    mode: "enforce".to_string(),
+                    ..Default::default()
+                },
+                ..crate::config::ServerConfig::default()
+            },
+        )
+    }
+
+    /// A validation failure carries the validator's own issues, and is refused
+    /// before the entry reaches storage.
+    ///
+    /// The wire-level parity with `POST [base]/Patient` is asserted by
+    /// `the_two_surfaces_report_the_same_validation_issues` in
+    /// `tests/validation_enforcement_tests.rs`; what this adds is the ordering
+    /// guarantee. `DelayStorage::create` is `unimplemented!()`, so a validation
+    /// failure moved after dispatch panics here rather than quietly writing,
+    /// and `peak() == 0` proves not even a read occurred.
+    #[tokio::test]
+    async fn a_validation_failure_carries_the_validators_own_issues() {
+        let state = enforcing_state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": { "method": "POST", "url": "Patient" },
+                "resource": { "resourceType": "Patient", "bogusElement": true }
+            }]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entry = &response["entry"][0]["response"];
+        assert_eq!(entry["status"], "422 Unprocessable Entity", "{response}");
+
+        let issues = entry["outcome"]["issue"]
+            .as_array()
+            .expect("the validator's issue array");
+        assert!(
+            issues.iter().any(|i| {
+                i["code"] == "structure" && i["expression"][0] == "Patient.bogusElement"
+            }),
+            "the entry must carry the validator's coded, located issues: {entry}"
+        );
+
+        assert_eq!(
+            state.storage().peak(),
+            0,
+            "the entry must not reach storage"
+        );
     }
 
     /// Response entry *i* must answer request entry *i*, even when entry *i*
