@@ -39,6 +39,15 @@
 //! spec-defined parameters/features that the server explicitly refuses;
 //! [`RestError::NotImplemented`] (501 + `not-supported`) signals work that
 //! has not yet been wired up.
+//!
+//! Three variants share `400` and differ only in how precisely they classify
+//! the fault, using the `issue-type` hierarchy rather than three shades of the
+//! same code: [`RestError::MissingElement`] (`required`) for an absent
+//! mandatory element, [`RestError::InvalidElementValue`] (`value`) for one
+//! that is present but unusable, and [`RestError::BadRequest`] (`invalid`,
+//! their common parent) for everything else. Prefer a child where the
+//! distinction is real — `OperationOutcome.issue.code` is bound `required` to
+//! `issue-type` and its ElementDefinition asks for the most applicable code.
 
 use axum::{
     Json,
@@ -117,6 +126,45 @@ pub enum RestError {
     /// Bad request - validation error (HTTP 400).
     BadRequest {
         /// Error message.
+        message: String,
+    },
+
+    /// A mandatory element is absent (HTTP 400 + `required`).
+    ///
+    /// Split from [`RestError::BadRequest`] so the outcome can carry
+    /// `required` — "A required element is missing." — rather than its is-a
+    /// parent `invalid`. Nothing in this crate could say `required` before:
+    /// every handler reported an absent element as `BadRequest`, and the
+    /// Bundle arms were the first place the distinction mattered enough to
+    /// notice (#504).
+    ///
+    /// Use it only where the StructureDefinition gives `min=1` or a named
+    /// invariant makes the element mandatory — `Bundle.entry.request`
+    /// (`bdl-3` in R4/R4B, transitively `bdl-3c` in R5/R6),
+    /// `Bundle.entry.request.method` (1..1) and `Bundle.entry.request.url`
+    /// (1..1). It is deliberately **not** used for an absent
+    /// `Bundle.entry.resource`: that element is 0..1 and only R5/R6's
+    /// `bdl-3c` requires it for POST/PUT/PATCH, so claiming `required` there
+    /// would assert a rule R4 and R4B do not have.
+    MissingElement {
+        /// Message naming the absent element and the entry it belongs to.
+        message: String,
+    },
+
+    /// An element is present but its value cannot be used (HTTP 400 + `value`).
+    ///
+    /// Split from [`RestError::BadRequest`] for the same reason as
+    /// [`RestError::MissingElement`], one level down the other branch:
+    /// `value` — "An element or header value is invalid." — is a child of
+    /// `invalid`, and `OperationOutcome.issue.code`'s ElementDefinition
+    /// requires the most applicable code rather than an ancestor that happens
+    /// to be true.
+    ///
+    /// The distinction against `MissingElement` is absent-versus-unusable, and
+    /// it is the one a client acts on differently: a missing element is added,
+    /// an invalid value is corrected.
+    InvalidElementValue {
+        /// Message naming the element and why its value cannot be used.
         message: String,
     },
 
@@ -297,6 +345,12 @@ impl fmt::Display for RestError {
             RestError::BadRequest { message } => {
                 write!(f, "Bad request: {}", message)
             }
+            RestError::MissingElement { message } => {
+                write!(f, "Missing element: {}", message)
+            }
+            RestError::InvalidElementValue { message } => {
+                write!(f, "Invalid element value: {}", message)
+            }
             RestError::UnsupportedMediaType { content_type } => {
                 write!(f, "Unsupported media type: {}", content_type)
             }
@@ -416,6 +470,16 @@ impl RestError {
             RestError::BadRequest { message } => {
                 (StatusCode::BAD_REQUEST, "invalid", message.clone())
             }
+            // `required` and `value` are both children of `invalid` in the
+            // `issue-type` hierarchy (verified identical in R4/R4B/R5/R6 at
+            // `crates/fhir-gen/resources/*/valuesets.json`), so these two
+            // refine `BadRequest` rather than contradicting it.
+            RestError::MissingElement { message } => {
+                (StatusCode::BAD_REQUEST, "required", message.clone())
+            }
+            RestError::InvalidElementValue { message } => {
+                (StatusCode::BAD_REQUEST, "value", message.clone())
+            }
             RestError::UnsupportedMediaType { content_type } => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "not-supported",
@@ -429,6 +493,11 @@ impl RestError {
                 "processing",
                 message.clone(),
             ),
+            // Unreachable from either renderer since #504: both go through
+            // [`Self::client_outcome`], which intercepts `ValidationFailed`
+            // above this table and surfaces the validator's own multi-issue
+            // outcome. Kept so the match stays exhaustive, and because a
+            // caller wanting only a summary line is still entitled to one.
             RestError::ValidationFailed { .. } => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "processing",
@@ -516,21 +585,47 @@ impl RestError {
             ),
         }
     }
+
+    /// The client-facing `(status, OperationOutcome)` for this error.
+    ///
+    /// **This is the only place a [`RestError`] becomes an OperationOutcome.**
+    /// [`IntoResponse`] renders the pair as an HTTP response body and
+    /// `handlers::batch` renders it as a `Bundle.entry.response.outcome`;
+    /// neither builds its own. That is the point. Before #504 the batch
+    /// handler had a second renderer that hardcoded `"code": "processing"`,
+    /// so the identical failure carried `forbidden` at `GET [base]/Patient/1`
+    /// and `processing` for the same read inside a Bundle entry — and
+    /// [`Self::client_response`]'s promise one doc comment above, that it is
+    /// "shared by `IntoResponse` and the batch/transaction handler so both
+    /// sanitize identically", was not true.
+    ///
+    /// `ValidationFailed` is surfaced verbatim rather than collapsed, because
+    /// it already carries a fully-formed multi-issue outcome from the
+    /// write-path validator — per-issue `code`, `severity` and `expression`.
+    /// The interception has to happen **here** rather than at any call site:
+    /// [`Self::client_response`]'s own `ValidationFailed` arm returns
+    /// `(422, "processing", "Resource validation failed")`, so a caller that
+    /// reached the code table first would re-flatten it. `MultiIssue` is the
+    /// same shape for the request-level `400`: the outcome is the payload.
+    pub(crate) fn client_outcome(&self) -> (StatusCode, serde_json::Value) {
+        if let RestError::ValidationFailed { outcome } = self {
+            return (StatusCode::UNPROCESSABLE_ENTITY, outcome.clone());
+        }
+        if let RestError::MultiIssue { outcome } = self {
+            return (StatusCode::BAD_REQUEST, outcome.clone());
+        }
+        let (status, code, details) = self.client_response();
+        (status, create_operation_outcome("error", code, &details))
+    }
 }
 
 impl IntoResponse for RestError {
     fn into_response(self) -> Response {
-        // ValidationFailed carries a fully-formed OperationOutcome (potentially
-        // many issues from the write-path validator); surface it verbatim
-        // rather than collapsing it to the generic single-issue shape.
-        if let RestError::ValidationFailed { outcome } = &self {
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(outcome.clone())).into_response();
-        }
-        if let RestError::MultiIssue { outcome } = &self {
-            return (StatusCode::BAD_REQUEST, Json(outcome.clone())).into_response();
-        }
-        let (status, code, details) = self.client_response();
-        let operation_outcome = create_operation_outcome("error", code, &details);
+        // Both the HTTP body and a Bundle entry's `response.outcome` are
+        // rendered by `client_outcome`, so the two cannot describe the same
+        // failure differently (#504). It also carries the `ValidationFailed`
+        // pass-through that used to live here.
+        let (status, operation_outcome) = self.client_outcome();
 
         // Unauthorized additionally carries a Bearer challenge in the
         // WWW-Authenticate header.
@@ -589,7 +684,11 @@ impl IntoResponse for RestError {
 /// * `severity` - The issue severity (fatal, error, warning, information)
 /// * `code` - The FHIR issue code
 /// * `details` - Human-readable details
-fn create_operation_outcome(severity: &str, code: &str, details: &str) -> serde_json::Value {
+pub(crate) fn create_operation_outcome(
+    severity: &str,
+    code: &str,
+    details: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "resourceType": "OperationOutcome",
         "issue": [{
