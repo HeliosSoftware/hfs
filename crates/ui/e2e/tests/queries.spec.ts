@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource } from "../pages/api";
+import { createResource, waitForSearchHit } from "../pages/api";
 
 // The Saved Queries workspace (/ui/queries): the shared query builder and the
 // in-page results table — run a query, add builder rows, page through results,
@@ -68,12 +68,19 @@ test.describe("query builder", () => {
       subject: { reference: `Patient/${patient}` },
     });
 
+    // ES composite backends need the Observation (+ Practitioner name) indexed
+    // before chained/_has search can see them.
+    await waitForSearchHit(request, "Observation", `code=chain-94-${tag}`);
+    await waitForSearchHit(request, "Practitioner", `name=ChainSmith${tag}`);
+
     await queries.goto();
     await queries.builder.run(
       `Patient?_has:Observation:patient:code=chain-94-${tag}&general-practitioner.name=ChainSmith${tag}`,
     );
     await queries.results.waitShown();
-    await expect(queries.results.rows).toHaveCount(1);
+    await expect
+      .poll(async () => queries.results.rows.count(), { timeout: 15_000 })
+      .toBe(1);
     await expect(queries.results.rows.first()).toContainText(patient);
   });
 

@@ -46,6 +46,46 @@ export async function readResource(
 }
 
 /**
+ * Wait until a just-created resource is visible to FHIR search.
+ *
+ * On composite backends (sqlite/s3 + Elasticsearch) create returns as soon as
+ * the write store acknowledges; the search index can lag a few hundred ms.
+ * Nightly ui-tests-matrix flakes when the next step searches immediately.
+ */
+export async function waitForSearchHit(
+  request: APIRequestContext,
+  type: string,
+  query: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = 0;
+  let lastTotal = "n/a";
+  while (Date.now() < deadline) {
+    const res = await request.get(`/${type}?${query}`, {
+      headers: { Accept: FHIR_JSON },
+    });
+    lastStatus = res.status();
+    if (res.ok()) {
+      const bundle = await res.json();
+      const total =
+        typeof bundle.total === "number"
+          ? bundle.total
+          : Array.isArray(bundle.entry)
+            ? bundle.entry.length
+            : 0;
+      lastTotal = String(total);
+      if (total > 0) return;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(
+    `timed out waiting for ${type}?${query} (last status=${lastStatus}, total=${lastTotal})`,
+  );
+}
+
+/**
  * Create a resource and immediately update it, leaving two versions — the
  * minimum a history diff needs. Returns the id. `mutate` produces the second
  * version's body from the first.
