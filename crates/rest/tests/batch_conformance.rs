@@ -1226,8 +1226,14 @@ mod entry_methods {
     /// whether it arrives per-entry in a batch or as a whole-bundle transaction
     /// failure. Flattening the refusal at the transaction boundary would have
     /// made this 400 and re-created the divergence in a new place.
+    ///
+    /// They now agree on the issue code and the message too. #502 closed the
+    /// status half and named the rest as #504's: the batch entry said
+    /// `processing` while the transaction body said `not-supported`, and the
+    /// batch arm printed HEAD guidance the transaction arm dropped, because
+    /// `into_rest_error` computed a message and discarded it on that arm.
     #[tokio::test]
-    async fn the_two_arms_agree_on_the_refusal_status() {
+    async fn the_two_arms_agree_on_the_refusal_status_and_code() {
         let (server, _backend) = create_test_server().await;
 
         let batch = post_batch(
@@ -1241,6 +1247,7 @@ mod entry_methods {
             batch["entry"][0]["response"]["status"],
             "405 Method Not Allowed"
         );
+        let batch_issue = &batch["entry"][0]["response"]["outcome"]["issue"][0];
 
         let transaction = post_bundle(
             &server,
@@ -1252,5 +1259,23 @@ mod entry_methods {
         )
         .await;
         transaction.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+        let transaction_body: Value = transaction.json();
+        let transaction_issue = &transaction_body["issue"][0];
+
+        assert_eq!(batch_issue["code"], transaction_issue["code"]);
+        assert_eq!(
+            batch_issue["details"]["text"], transaction_issue["details"]["text"],
+            "one refusal, one sentence"
+        );
+
+        // Pinned literally: equality alone is satisfied by both arms being
+        // wrong in the same way.
+        assert_eq!(batch_issue["code"], "not-supported");
+        assert!(
+            batch_issue["details"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("send HEAD to the instance endpoint")),
+            "both arms must keep the guidance: {batch_issue}"
+        );
     }
 }
