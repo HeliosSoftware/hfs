@@ -41,6 +41,9 @@
 //! | `HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS` | 3000 | Per-check terminology timeout |
 //! | `HFS_VALIDATION_TERMINOLOGY_FAIL` | open | Terminology outage posture: open (warn) or closed (error) |
 //! | `HFS_VALIDATION_STORED_PROFILES` | true | Maintain per-tenant profile registries from stored StructureDefinitions |
+//! | `HFS_FHIR_PACKAGE_CACHE` | (none) | Curated FHIR NPM package cache root |
+//! | `HFS_FHIR_PACKAGE_SOURCES` | (none) | Comma-separated local paths or HTTP(S) URLs (`.tgz`, expanded package dir, or IG publisher `output/`) seeded into the cache at boot |
+//! | `HFS_FHIR_PACKAGES` | (none) | Comma-separated `name@version` roots; if empty and sources are set, uses packages installed from sources |
 //!
 //! # Example
 //!
@@ -490,6 +493,17 @@ pub struct ValidationConfig {
     /// Maintain per-tenant profile registries from stored
     /// StructureDefinitions (updated on StructureDefinition writes).
     pub stored_profiles: bool,
+    /// Curated FHIR NPM package cache directory (`HFS_FHIR_PACKAGE_CACHE`).
+    /// Empty disables package overlays.
+    pub package_cache: Option<String>,
+    /// Local paths or HTTP(S) URLs seeded into the cache at boot
+    /// (`HFS_FHIR_PACKAGE_SOURCES`). Each entry may be a `.tgz`, an expanded
+    /// package directory, an IG publisher `output/` dir, or a package URL.
+    pub package_sources: Vec<String>,
+    /// Comma-separated `name@version` roots (`HFS_FHIR_PACKAGES`). If empty
+    /// while [`Self::package_sources`] is set, roots are the packages
+    /// installed from those sources. Requires [`Self::package_cache`].
+    pub packages: Vec<String>,
 }
 
 impl Default for ValidationConfig {
@@ -504,6 +518,9 @@ impl Default for ValidationConfig {
             terminology_timeout_ms: 3000,
             terminology_fail: "open".to_string(),
             stored_profiles: true,
+            package_cache: None,
+            package_sources: Vec::new(),
+            packages: Vec::new(),
         }
     }
 }
@@ -549,6 +566,28 @@ impl ValidationConfig {
             terminology_fail: std::env::var("HFS_VALIDATION_TERMINOLOGY_FAIL")
                 .unwrap_or(d.terminology_fail),
             stored_profiles: env_bool("HFS_VALIDATION_STORED_PROFILES", d.stored_profiles),
+            package_cache: std::env::var("HFS_FHIR_PACKAGE_CACHE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            package_sources: std::env::var("HFS_FHIR_PACKAGE_SOURCES")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            packages: std::env::var("HFS_FHIR_PACKAGES")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -581,6 +620,21 @@ impl ValidationConfig {
         }
         if self.terminology_timeout_ms == 0 {
             errors.push("HFS_VALIDATION_TERMINOLOGY_TIMEOUT_MS must be > 0".to_string());
+        }
+        if (!self.packages.is_empty() || !self.package_sources.is_empty())
+            && self.package_cache.is_none()
+        {
+            errors.push(
+                "HFS_FHIR_PACKAGES / HFS_FHIR_PACKAGE_SOURCES require HFS_FHIR_PACKAGE_CACHE"
+                    .to_string(),
+            );
+        }
+        for pkg in &self.packages {
+            if helios_fhir_validator::PackageRef::parse(pkg).is_err() {
+                errors.push(format!(
+                    "HFS_FHIR_PACKAGES entry '{pkg}' invalid (expected name@version)"
+                ));
+            }
         }
         if errors.is_empty() {
             Ok(())

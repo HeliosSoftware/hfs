@@ -22,6 +22,20 @@ use helios_fhir_validator::packs::core_registry;
 use helios_fhir_validator::{SchemaResolver, ValidationOptions, Validator};
 use serde_json::json;
 
+/// Default (R4) pack loads and validates a minimal Patient — kept in the
+/// normal test suite so regressions surface without `--ignored`.
+#[test]
+fn r4_pack_loads_and_validates() {
+    let registry = core_registry(FhirVersion::R4);
+    assert!(registry.resolve("Patient").is_some());
+    let validator = Validator::new(registry);
+    let outcome = validator.validate_sync(
+        &json!({ "resourceType": "Patient", "active": true }),
+        &ValidationOptions::default(),
+    );
+    assert_eq!(outcome.errors, vec![]);
+}
+
 /// Every enabled version's pack loads and validates a minimal Patient.
 #[test]
 fn all_enabled_packs_load_and_validate() {

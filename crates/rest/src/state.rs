@@ -163,11 +163,14 @@ impl<S: ResourceStorage> AppState<S> {
     pub fn new(storage: Arc<S>, config: ServerConfig) -> Self {
         let bulk_export_config = Arc::new(config.bulk_export.clone());
         let bulk_submit_config = Arc::new(config.bulk_submit.clone());
-        let validation = Arc::new(crate::validation::ValidationService::from_config(
-            &config.validation,
-            config.terminology_server.as_deref(),
-            config.default_fhir_version,
-        ));
+        let validation = Arc::new(
+            crate::validation::ValidationService::from_config(
+                &config.validation,
+                config.terminology_server.as_deref(),
+                config.default_fhir_version,
+            )
+            .unwrap_or_else(|e| panic!("validation service configuration failed: {e}")),
+        );
         Self {
             storage,
             config: Arc::new(config),
@@ -216,11 +219,14 @@ impl<S: ResourceStorage> AppState<S> {
     ) -> Self {
         let bulk_export_config = Arc::new(config.bulk_export.clone());
         let bulk_submit_config = Arc::new(config.bulk_submit.clone());
-        let validation = Arc::new(crate::validation::ValidationService::from_config(
-            &config.validation,
-            config.terminology_server.as_deref(),
-            config.default_fhir_version,
-        ));
+        let validation = Arc::new(
+            crate::validation::ValidationService::from_config(
+                &config.validation,
+                config.terminology_server.as_deref(),
+                config.default_fhir_version,
+            )
+            .unwrap_or_else(|e| panic!("validation service configuration failed: {e}")),
+        );
         Self {
             storage,
             config: Arc::new(config),

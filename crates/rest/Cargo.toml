@@ -105,7 +105,7 @@ aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
 
 # HTTP client for terminology server integration (HTS)
-reqwest = { version = "0.12", features = ["json", "gzip"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "blocking"] }
 
 # JWT signing for the bulk-submit outbound SMART Backend Services client.
 jsonwebtoken = "9"

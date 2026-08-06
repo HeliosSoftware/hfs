@@ -59,6 +59,9 @@ pub(super) struct Node {
     pub schema: FhirSchema,
     pub children: IndexMap<String, Node>,
     pub slices: IndexMap<String, SliceNode>,
+    /// `type[].profile` URLs from the ElementDefinition (used when emitting
+    /// `profile` slice matchers; not part of the finalized schema IR).
+    pub type_profiles: Vec<String>,
     /// Slicing declaration from the sliced element's own ED.
     pub discriminators: Vec<EdDiscriminator>,
     pub slicing_rules: Option<String>,
@@ -85,6 +88,10 @@ pub(super) struct SliceNode {
     /// `type[0] == Extension` with a profile: compiles to the parent-level
     /// `extensions` sugar instead of raw slicing.
     pub extension_profile: Option<String>,
+    /// Parent slice name when `sliceName` uses `parent/child` reslice form.
+    pub reslice: Option<String>,
+    /// Further constrains a same-named slice from a parent schema.
+    pub slice_is_constraining: Option<bool>,
 }
 
 /// Apply one ElementDefinition at its navigated position.
@@ -112,15 +119,23 @@ pub(super) fn apply(root: &mut Node, segments: &[Segment], ed: &Ed, warnings: &m
         return;
     }
 
-    // Slice definition: `identifier:mrn`.
+    // Slice definition: `identifier:mrn` or reslice `identifier:mrn/secondary`.
     if let Some(slice_name) = &last.slice {
         let element = node
             .children
             .entry(last.name.clone())
             .or_insert_with(|| Node::new(last.name.clone()));
-        let slice = element.slices.entry(slice_name.clone()).or_default();
+        let (store_name, reslice_of) = match slice_name.rsplit_once('/') {
+            Some((parent, child)) if !parent.is_empty() && !child.is_empty() => {
+                (slice_name.clone(), Some(parent.to_string()))
+            }
+            _ => (slice_name.clone(), None),
+        };
+        let slice = element.slices.entry(store_name).or_default();
         slice.min = ed.min;
         slice.max = parse_numeric_max(ed.max.as_deref());
+        slice.reslice = reslice_of;
+        slice.slice_is_constraining = ed.slice_is_constraining;
         if matches!(
             element.element_name.as_str(),
             "extension" | "modifierExtension"
@@ -241,6 +256,9 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
         1 => {
             let t = &ed.types[0];
             element.schema.type_ = Some(t.effective_code());
+            if !t.profile.is_empty() {
+                element.type_profiles = t.profile.clone();
+            }
             if !t.target_profile.is_empty() {
                 element.schema.refers = Some(t.target_profile.clone());
             }
@@ -252,13 +270,17 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
                 ed.path
             ));
             element.schema.type_ = Some(ed.types[0].effective_code());
+            if !ed.types[0].profile.is_empty() {
+                element.type_profiles = ed.types[0].profile.clone();
+            }
         }
     }
     apply_value_keywords(&mut element.schema, ed, warnings);
 }
 
-/// Binding, constraints, fixed/pattern — the keywords that apply to a value
-/// wherever the ED lands (plain element, choice branch, or slice schema).
+/// Binding, constraints, fixed/pattern/maxLength/minValue/maxValue — keywords
+/// that apply to a value wherever the ED lands (plain element, choice branch,
+/// or slice schema).
 fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<String>) {
     if let Some(binding) = &ed.binding
         && let Some(value_set) = &binding.value_set
@@ -269,6 +291,9 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
         });
     }
     apply_constraints(schema, &ed.constraint, false);
+    if let Some(max_length) = ed.max_length {
+        schema.max_length = Some(max_length);
+    }
     for (key, value) in &ed.rest {
         if let Some(rest) = key.strip_prefix("fixed")
             && !rest.is_empty()
@@ -280,6 +305,16 @@ fn apply_value_keywords(schema: &mut FhirSchema, ed: &Ed, _warnings: &mut Vec<St
             && !key.starts_with('_')
         {
             schema.pattern = Some(value.clone());
+        } else if let Some(rest) = key.strip_prefix("minValue")
+            && !rest.is_empty()
+            && !key.starts_with('_')
+        {
+            schema.min_value = Some(value.clone());
+        } else if let Some(rest) = key.strip_prefix("maxValue")
+            && !rest.is_empty()
+            && !key.starts_with('_')
+        {
+            schema.max_value = Some(value.clone());
         }
     }
 }
@@ -359,6 +394,7 @@ pub(super) fn finalize(node: Node, warnings: &mut Vec<String>) -> Option<FhirSch
     let Node {
         element_name: _,
         mut schema,
+        type_profiles: _,
         children,
         slices,
         discriminators,
@@ -474,7 +510,7 @@ fn push_unique(list: &mut Option<Vec<String>>, value: &str) {
     }
 }
 
-fn capitalize(s: &str) -> String {
+pub(super) fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),

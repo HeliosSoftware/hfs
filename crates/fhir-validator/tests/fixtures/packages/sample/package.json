@@ -1,0 +1,17 @@
+{
+  "name": "example.fhir.r4.sample",
+  "version": "0.1.0",
+  "type": "IG",
+  "license": "CC0-1.0",
+  "canonical": "http://example.org/fhir/r4/sample",
+  "title": "Sample FHIR R4 profiles for validator package tests",
+  "description": "Minimal Implementation Guide package used by helios-fhir-validator tests. Shapes mirror common hospital IG patterns (required demographics, identifier slicing, extension slices) without vendor-specific naming.",
+  "fhirVersions": [
+    "4.0.1"
+  ],
+  "dependencies": {},
+  "author": "Helios FHIR Server contributors",
+  "directories": {
+    "lib": "package"
+  }
+}

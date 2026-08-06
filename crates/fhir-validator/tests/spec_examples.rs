@@ -232,6 +232,9 @@ fn sweep(version: FhirVersion, version_dir: &str) -> (Manifest, Samples) {
         // coverage is the Inferno job's business (issue #368).
         use_meta_profiles: true,
         unknown_profile: UnknownProfilePolicy::Ignore,
+        // `refers` enforcement is off for the core-spec sweep, matching the
+        // default and upstream conformance-suite parity.
+        ..Default::default()
     };
 
     // Sort for determinism: readdir order is filesystem-dependent and the

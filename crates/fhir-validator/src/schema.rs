@@ -117,7 +117,17 @@ pub struct FhirSchema {
     /// equal; extra data keys permitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<Value>,
-    /// Terminology binding. Only `required`-strength bindings are enforced.
+    /// Maximum string length (`ElementDefinition.maxLength`).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "maxLength")]
+    pub max_length: Option<u64>,
+    /// Inclusive minimum value (`ElementDefinition.minValue[x]`).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "minValue")]
+    pub min_value: Option<Value>,
+    /// Inclusive maximum value (`ElementDefinition.maxValue[x]`).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "maxValue")]
+    pub max_value: Option<Value>,
+    /// Terminology binding. Only `required`-strength bindings are enforced
+    /// by default; `extensible` may emit warnings when opted in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<Binding>,
     /// FHIRPath invariants, keyed by constraint id.
@@ -252,11 +262,13 @@ pub struct Slice {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Match {
-    /// `pattern` | `binding` | `profile` | `type` (the reference validator
-    /// only implements `pattern`; we start there too).
+    /// `pattern` | `binding` | `profile` | `type` | `exists` | `extension`
+    /// (the reference validator only implements `pattern`; `exists` carries
+    /// `[{path, exists}]` entries and `extension` a `{url, pattern |
+    /// extension}` chain, both Helios extensions of the IR).
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub type_: Option<String>,
-    /// The pattern / binding / profile / type payload.
+    /// The pattern / binding / profile / type / exists / extension payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
     /// Match against the resolved reference target instead of the reference

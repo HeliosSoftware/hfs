@@ -81,10 +81,30 @@ impl SchemaSet {
 }
 
 pub(super) struct WalkCtx<'a> {
-    resolver: &'a dyn SchemaResolver,
+    pub(super) resolver: &'a dyn SchemaResolver,
     errors: Vec<ValidationError>,
     deferred: Vec<Deferred>,
     pub(super) path: PathTracker,
+    enforce_refers: bool,
+}
+
+impl<'a> WalkCtx<'a> {
+    /// A context that carries nothing but the resolver.
+    ///
+    /// For callers that need the walk's *pure* helpers — slice matching, above
+    /// all — without an in-flight validation: the guided-form editor, and unit
+    /// tests. Errors and deferred effects pushed onto it are discarded, so only
+    /// pass it to helpers that take `&self`. The struct's other fields are
+    /// private to this module, so a sibling module cannot build one directly.
+    pub(super) fn read_only(resolver: &'a dyn SchemaResolver) -> Self {
+        Self {
+            resolver,
+            errors: Vec::new(),
+            deferred: Vec::new(),
+            path: PathTracker::new(""),
+            enforce_refers: false,
+        }
+    }
 }
 
 impl WalkCtx<'_> {
@@ -118,6 +138,7 @@ pub(super) fn validate(
         errors: Vec::new(),
         deferred: Vec::new(),
         path: PathTracker::new(resource_type),
+        enforce_refers: opts.enforce_refers,
     };
 
     // Root schema-set: resourceType, then meta.profile claims, then
@@ -343,6 +364,31 @@ fn eval_validators(ctx: &mut WalkCtx<'_>, set: &SchemaSet, data: &Value) {
                 ErrorKind::PatternValue,
                 errors::msg_pattern_value(pattern, data),
             );
+        }
+        if let Some(max_length) = schema.max_length
+            && let Some(s) = data.as_str()
+            && (s.chars().count() as u64) > max_length
+        {
+            ctx.error(
+                ErrorKind::MaxLength,
+                errors::msg_max_length(max_length, s.chars().count()),
+            );
+        }
+        if let Some(min_value) = &schema.min_value
+            && compare_ordered(data, min_value) == Some(std::cmp::Ordering::Less)
+        {
+            ctx.error(ErrorKind::MinValue, errors::msg_min_value(min_value, data));
+        }
+        if let Some(max_value) = &schema.max_value
+            && compare_ordered(data, max_value) == Some(std::cmp::Ordering::Greater)
+        {
+            ctx.error(ErrorKind::MaxValue, errors::msg_max_value(max_value, data));
+        }
+        if ctx.enforce_refers
+            && let Some(refers) = &schema.refers
+            && !refers.is_empty()
+        {
+            check_refers(ctx, refers, data);
         }
         if let Some(constraints) = &schema.constraints {
             let path = ctx.path.render_dotted();
@@ -718,6 +764,9 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         choice_of,
         fixed,
         pattern,
+        max_length,
+        min_value,
+        max_value,
         binding,
         constraints,
         refers,
@@ -731,6 +780,68 @@ fn merge_extension_schema(entry: &FhirSchema, resolved: Option<&FhirSchema>) -> 
         regex,
     );
     out
+}
+
+/// Compare ordered scalar values (numbers / ISO-ish date strings).
+fn compare_ordered(actual: &Value, bound: &Value) -> Option<std::cmp::Ordering> {
+    match (actual, bound) {
+        (Value::Number(a), Value::Number(b)) => {
+            let af = a.as_f64()?;
+            let bf = b.as_f64()?;
+            af.partial_cmp(&bf)
+        }
+        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
+/// Enforce `refers` against `Reference.reference` resource-type prefix.
+fn check_refers(ctx: &mut WalkCtx<'_>, refers: &[String], data: &Value) {
+    let Some(reference) = data
+        .as_object()
+        .and_then(|o| o.get("reference"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    // Absolute URLs / fragments / urns: skip type extraction.
+    if reference.starts_with("http://")
+        || reference.starts_with("https://")
+        || reference.starts_with("urn:")
+        || reference.starts_with('#')
+    {
+        return;
+    }
+    let type_name = reference
+        .split_once('/')
+        .map(|(ty, _)| ty)
+        .unwrap_or(reference);
+    if type_name.is_empty() || type_name.contains(':') {
+        return;
+    }
+    let allowed: Vec<String> = refers
+        .iter()
+        .map(|r| {
+            // Canonical profile URLs → last path segment; bare types kept.
+            r.rsplit('/').next().unwrap_or(r).to_string()
+        })
+        .collect();
+    // Profile URLs in refers do not yield a resource type — only bare type
+    // codes (and trailing segments that look like resource types) count.
+    let type_codes: Vec<String> = allowed
+        .iter()
+        .filter(|a| a.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+        .cloned()
+        .collect();
+    if type_codes.is_empty() {
+        return;
+    }
+    if !type_codes.iter().any(|t| t == type_name) {
+        ctx.error(
+            ErrorKind::ReferenceTarget,
+            errors::msg_reference_target(type_name, &type_codes),
+        );
+    }
 }
 
 /// Lodash-style `_.isMatch`: partial deep match. Every key present in

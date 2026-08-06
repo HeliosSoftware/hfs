@@ -1,0 +1,81 @@
+{
+  "resourceType": "StructureDefinition",
+  "id": "slice-discriminators",
+  "url": "http://example.org/StructureDefinition/slice-discriminators",
+  "name": "SliceDiscriminators",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Bundle",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Bundle",
+  "derivation": "constraint",
+  "differential": {
+    "element": [
+      { "id": "Bundle", "path": "Bundle" },
+      {
+        "id": "Bundle.entry",
+        "path": "Bundle.entry",
+        "slicing": {
+          "discriminator": [{ "type": "type", "path": "resource" }],
+          "rules": "closed",
+          "ordered": false
+        }
+      },
+      {
+        "id": "Bundle.entry:patient",
+        "path": "Bundle.entry",
+        "sliceName": "patient",
+        "min": 1,
+        "max": "1"
+      },
+      {
+        "id": "Bundle.entry:patient.resource",
+        "path": "Bundle.entry.resource",
+        "min": 1,
+        "type": [{ "code": "Patient" }]
+      },
+      {
+        "id": "Bundle.entry:observation",
+        "path": "Bundle.entry",
+        "sliceName": "observation",
+        "min": 0,
+        "max": "1"
+      },
+      {
+        "id": "Bundle.entry:observation.resource",
+        "path": "Bundle.entry.resource",
+        "type": [
+          {
+            "code": "Observation",
+            "profile": ["http://example.org/StructureDefinition/vital-observation"]
+          }
+        ]
+      },
+      {
+        "id": "Bundle.identifier",
+        "path": "Bundle.identifier",
+        "slicing": {
+          "discriminator": [{ "type": "profile", "path": "assigner" }],
+          "rules": "open"
+        }
+      },
+      {
+        "id": "Bundle.identifier:org",
+        "path": "Bundle.identifier",
+        "sliceName": "org",
+        "min": 0,
+        "max": "1"
+      },
+      {
+        "id": "Bundle.identifier:org.assigner",
+        "path": "Bundle.identifier.assigner",
+        "type": [
+          {
+            "code": "Reference",
+            "targetProfile": ["http://example.org/StructureDefinition/org-ref"]
+          }
+        ]
+      }
+    ]
+  }
+}

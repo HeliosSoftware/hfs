@@ -392,7 +392,7 @@ pub fn addable(
                 }
                 let matched = items
                     .iter()
-                    .filter(|item| crate::engine::slicing::slice_matches(slice, item))
+                    .filter(|item| crate::engine::slicing::slice_matches_for(resolver, slice, item))
                     .count() as u64;
                 if let Some(max) = slice.max
                     && matched >= max
@@ -713,7 +713,8 @@ pub fn slice_label(
         .slices
         .iter()
         .find(|(name, slice)| {
-            name.as_str() != "@default" && crate::engine::slicing::slice_matches(slice, item)
+            name.as_str() != "@default"
+                && crate::engine::slicing::slice_matches_for(resolver, slice, item)
         })
         .map(|(name, _)| name.clone())
 }

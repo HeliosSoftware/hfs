@@ -17,8 +17,10 @@
 //!   (never silent). An **empty** FHIRPath result counts as a pass, per
 //!   FHIR invariant semantics (the reference validator treats empty as a
 //!   failure — a known bug there).
-//! - bindings: only `strength: required` is enforced. The coded shape is
-//!   the element's declared type when known, else inferred from the value
+//! - bindings: `strength: required` is always enforced (error). When
+//!   [`EffectHandlers::check_extensible_bindings`] is set, `extensible`
+//!   bindings are also checked and emit warnings. The coded shape is the
+//!   element's declared type when known, else inferred from the value
 //!   (`code` string / Coding / CodeableConcept, mirroring the reference).
 //!   Provider errors surface as warning issues by default (fail-open) or
 //!   error issues when `terminology_fail_closed` is set.
@@ -141,6 +143,9 @@ pub struct EffectHandlers<'a> {
     pub suppress_constraints: &'a [String],
     /// Treat terminology-service failures as errors instead of warnings.
     pub terminology_fail_closed: bool,
+    /// When true, also check `extensible`-strength bindings and emit
+    /// warning-severity issues on failure (required bindings stay errors).
+    pub check_extensible_bindings: bool,
 }
 
 /// Execute the deferred obligations, appending issues to `errors`.
@@ -256,9 +261,12 @@ async fn execute_bindings(
         else {
             continue;
         };
-        if binding.strength.as_deref() != Some("required") {
-            continue;
-        }
+        let strength = binding.strength.as_deref().unwrap_or("required");
+        let issue_severity = match strength {
+            "required" => Severity::Error,
+            "extensible" if handlers.check_extensible_bindings => Severity::Warning,
+            _ => continue,
+        };
         let Some(coded) = coded_value(value, type_hint.as_deref()) else {
             continue; // shape not coded (e.g. null gap) — structural checks own it
         };
@@ -271,6 +279,7 @@ async fn execute_bindings(
                         path.clone(),
                         messages::terminology_binding(value, &binding.value_set),
                     )
+                    .with_severity(issue_severity)
                     .with_extra(
                         "binding",
                         serde_json::to_value(binding).expect("binding serializes"),

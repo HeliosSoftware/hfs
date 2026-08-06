@@ -1,0 +1,46 @@
+{
+  "resourceType": "StructureDefinition",
+  "id": "sample-encounter",
+  "url": "http://example.org/fhir/r4/sample/StructureDefinition/sample-encounter",
+  "name": "SampleEncounter",
+  "title": "Sample Encounter",
+  "status": "active",
+  "description": "Encounter profile requiring status, class, and a sample-patient subject.",
+  "fhirVersion": "4.0.1",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Encounter",
+  "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Encounter",
+  "derivation": "constraint",
+  "differential": {
+    "element": [
+      {
+        "id": "Encounter",
+        "path": "Encounter"
+      },
+      {
+        "id": "Encounter.status",
+        "path": "Encounter.status",
+        "min": 1
+      },
+      {
+        "id": "Encounter.class",
+        "path": "Encounter.class",
+        "min": 1
+      },
+      {
+        "id": "Encounter.subject",
+        "path": "Encounter.subject",
+        "min": 1,
+        "type": [
+          {
+            "code": "Reference",
+            "targetProfile": [
+              "http://example.org/fhir/r4/sample/StructureDefinition/sample-patient"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

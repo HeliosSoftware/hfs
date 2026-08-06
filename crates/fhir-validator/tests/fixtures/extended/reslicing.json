@@ -1,0 +1,71 @@
+{
+  "desc": "reslicing — Helios extended (parent/child slice names)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Resource": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "identifier": {
+          "array": true,
+          "elements": {
+            "system": { "type": "string" },
+            "value": { "type": "string" },
+            "use": { "type": "string" }
+          }
+        }
+      }
+    },
+    "ResliceProfile": {
+      "base": "Resource",
+      "elements": {
+        "identifier": {
+          "slicing": {
+            "rules": "open",
+            "slices": {
+              "mrn": {
+                "match": { "type": "pattern", "value": { "system": "http://example.org/mrn" } },
+                "min": 1,
+                "max": 2
+              },
+              "mrn/primary": {
+                "reslice": "mrn",
+                "match": { "type": "pattern", "value": { "use": "official" } },
+                "min": 1,
+                "max": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "reslice primary present",
+      "schemas": ["ResliceProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "identifier": [
+          { "system": "http://example.org/mrn", "value": "1", "use": "official" }
+        ]
+      }
+    },
+    {
+      "desc": "reslice primary missing",
+      "schemas": ["ResliceProfile"],
+      "data": {
+        "resourceType": "Resource",
+        "identifier": [
+          { "system": "http://example.org/mrn", "value": "1", "use": "usual" }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "Resource.identifier",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,301 @@
+{
+  "desc": "exists and extension slice matchers — Helios extended (exists presence/absence with choice-key fallback and multi-entry matchers; extension url+pattern matching including nested complex-extension chains)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+
+    "ResourceWithComponents": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "component": {
+          "array": true,
+          "elements": {
+            "code": {},
+            "valueQuantity": { "elements": { "value": {} } },
+            "dataAbsentReason": {}
+          }
+        }
+      }
+    },
+    "ExistsSlice": {
+      "base": "ResourceWithComponents",
+      "elements": {
+        "component": {
+          "slicing": {
+            "slices": {
+              "withValue": {
+                "match": {
+                  "type": "exists",
+                  "value": [{ "path": ["value"], "exists": true }]
+                },
+                "min": 1
+              },
+              "noValue": {
+                "match": {
+                  "type": "exists",
+                  "value": [{ "path": ["value"], "exists": false }]
+                },
+                "max": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "ExistsMultiSlice": {
+      "base": "ResourceWithComponents",
+      "elements": {
+        "component": {
+          "slicing": {
+            "slices": {
+              "codedNoValue": {
+                "match": {
+                  "type": "exists",
+                  "value": [
+                    { "path": ["code"], "exists": true },
+                    { "path": ["value"], "exists": false }
+                  ]
+                },
+                "min": 1
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "ResourceWithIdents": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "identifier": {
+          "array": true,
+          "elements": {
+            "system": {},
+            "extension": {
+              "array": true,
+              "elements": {
+                "url": {},
+                "valueString": {},
+                "valueCode": {},
+                "extension": {
+                  "array": true,
+                  "elements": {
+                    "url": {},
+                    "valueCode": {}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ExtensionValueSlice": {
+      "base": "ResourceWithIdents",
+      "elements": {
+        "identifier": {
+          "slicing": {
+            "slices": {
+              "kindA": {
+                "match": {
+                  "type": "extension",
+                  "value": {
+                    "url": "http://example.org/ext-kind",
+                    "pattern": { "valueString": "A" }
+                  }
+                },
+                "min": 1,
+                "max": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "NestedExtensionSlice": {
+      "base": "ResourceWithIdents",
+      "elements": {
+        "identifier": {
+          "slicing": {
+            "slices": {
+              "nested": {
+                "match": {
+                  "type": "extension",
+                  "value": {
+                    "url": "http://example.org/outer",
+                    "extension": {
+                      "url": "http://example.org/inner",
+                      "pattern": { "valueCode": "x" }
+                    }
+                  }
+                },
+                "min": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "exists: choice-key value satisfies exists: true; value-less item stays in noValue",
+      "schemas": ["ExistsSlice"],
+      "data": {
+        "resourceType": "ResourceWithComponents",
+        "component": [
+          { "code": "a", "valueQuantity": { "value": 1 } },
+          { "code": "b", "dataAbsentReason": "unknown" }
+        ]
+      }
+    },
+    {
+      "desc": "exists: no item with value violates withValue min",
+      "schemas": ["ExistsSlice"],
+      "data": {
+        "resourceType": "ResourceWithComponents",
+        "component": [{ "code": "b" }]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithComponents.component",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+    {
+      "desc": "exists: two value-less items exceed noValue max",
+      "schemas": ["ExistsSlice"],
+      "data": {
+        "resourceType": "ResourceWithComponents",
+        "component": [
+          { "code": "a", "valueQuantity": { "value": 1 } },
+          { "code": "b" },
+          { "code": "c" }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithComponents.component",
+          "message": "Slice defines the following max cardinality: '1', actual cardinality: '2'"
+        }
+      ]
+    },
+    {
+      "desc": "exists: multi-entry matcher requires code present and value absent",
+      "schemas": ["ExistsMultiSlice"],
+      "data": {
+        "resourceType": "ResourceWithComponents",
+        "component": [{ "code": "a" }]
+      }
+    },
+    {
+      "desc": "exists: multi-entry matcher unmet when value present on every coded item",
+      "schemas": ["ExistsMultiSlice"],
+      "data": {
+        "resourceType": "ResourceWithComponents",
+        "component": [{ "code": "a", "valueQuantity": { "value": 1 } }]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithComponents.component",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+
+    {
+      "desc": "extension: url + valueString pattern matches",
+      "schemas": ["ExtensionValueSlice"],
+      "data": {
+        "resourceType": "ResourceWithIdents",
+        "identifier": [
+          {
+            "system": "http://example.org/mrn",
+            "extension": [
+              { "url": "http://example.org/other", "valueString": "A" },
+              { "url": "http://example.org/ext-kind", "valueString": "A" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "desc": "extension: right url but wrong value does not satisfy required slice",
+      "schemas": ["ExtensionValueSlice"],
+      "data": {
+        "resourceType": "ResourceWithIdents",
+        "identifier": [
+          {
+            "extension": [{ "url": "http://example.org/ext-kind", "valueString": "B" }]
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithIdents.identifier",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+    {
+      "desc": "extension: item without extensions does not satisfy required slice",
+      "schemas": ["ExtensionValueSlice"],
+      "data": {
+        "resourceType": "ResourceWithIdents",
+        "identifier": [{ "system": "http://example.org/mrn" }]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithIdents.identifier",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    },
+    {
+      "desc": "extension: nested complex-extension chain matches",
+      "schemas": ["NestedExtensionSlice"],
+      "data": {
+        "resourceType": "ResourceWithIdents",
+        "identifier": [
+          {
+            "extension": [
+              {
+                "url": "http://example.org/outer",
+                "extension": [{ "url": "http://example.org/inner", "valueCode": "x" }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "desc": "extension: nested chain with wrong inner code does not match",
+      "schemas": ["NestedExtensionSlice"],
+      "data": {
+        "resourceType": "ResourceWithIdents",
+        "identifier": [
+          {
+            "extension": [
+              {
+                "url": "http://example.org/outer",
+                "extension": [{ "url": "http://example.org/inner", "valueCode": "y" }]
+              }
+            ]
+          }
+        ]
+      },
+      "errors": [
+        {
+          "type": "slice-cardinality",
+          "path": "ResourceWithIdents.identifier",
+          "message": "Slice defines the following min cardinality: '1', actual cardinality: '0'"
+        }
+      ]
+    }
+  ]
+}

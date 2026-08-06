@@ -1,0 +1,39 @@
+{
+  "desc": "refers target-type enforcement — Helios extended (requires enforce_refers)",
+  "schemas": {
+    "string": { "kind": "primitive-type" },
+    "Reference": {
+      "elements": {
+        "reference": { "type": "string" },
+        "display": { "type": "string" }
+      }
+    },
+    "Resource": {
+      "elements": {
+        "resourceType": { "type": "string" },
+        "subject": {
+          "type": "Reference",
+          "refers": ["Patient", "Group"]
+        }
+      }
+    }
+  },
+  "tests": [
+    {
+      "desc": "allowed Patient reference",
+      "data": {
+        "resourceType": "Resource",
+        "subject": { "reference": "Patient/123" }
+      }
+    },
+    {
+      "desc": "disallowed Organization reference",
+      "skip": true,
+      "comment": "refers enforcement is opt-in via ValidationOptions.enforce_refers; covered by unit test refers_enforcement.rs",
+      "data": {
+        "resourceType": "Resource",
+        "subject": { "reference": "Organization/1" }
+      }
+    }
+  ]
+}
