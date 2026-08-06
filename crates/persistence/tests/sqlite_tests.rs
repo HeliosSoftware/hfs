@@ -3340,13 +3340,15 @@ async fn test_content_search_basic() {
 
     let result = backend.search(&tenant, &query).await.unwrap();
 
-    // Should find patients from Illinois (FTS5 must be available)
-    // If FTS5 is not available, no results will be returned
-    let count = result.resources.items.len();
-    assert!(
-        count == 0 || count == 2,
-        "Should find 0 (FTS unavailable) or 2 (FTS available) patients, found {}",
-        count
+    // `rusqlite` is pinned with the `bundled` feature, whose amalgamation is
+    // built with `-DSQLITE_ENABLE_FTS5`, so FTS5 is always available here.
+    // This used to accept 0 as well ("FTS unavailable"), which meant it stayed
+    // green through a *total* full-text outage — exactly what happened while
+    // `$reindex` was silently dropping every `resource_fts` row (issue #386).
+    assert_eq!(
+        result.resources.items.len(),
+        2,
+        "Should find both Illinois patients"
     );
 }
 
@@ -3392,16 +3394,16 @@ async fn test_text_search_narrative() {
 
     let result = backend.search(&tenant, &query).await.unwrap();
 
-    // FTS5 dependent - either finds 1 or 0
-    let count = result.resources.items.len();
-    assert!(
-        count <= 1,
-        "Should find at most 1 patient with diabetes in narrative"
+    // Was `count <= 1`, which is satisfied by zero and so could not detect
+    // full-text search being broken at all (issue #386). FTS5 is always
+    // compiled in via rusqlite's `bundled` feature, so assert the real result.
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "Should find the patient with diabetes in the narrative"
     );
 
-    if count == 1 {
-        assert_eq!(result.resources.items[0].id(), "text-1");
-    }
+    assert_eq!(result.resources.items[0].id(), "text-1");
 }
 
 // ============================================================================

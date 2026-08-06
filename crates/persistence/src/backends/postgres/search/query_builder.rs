@@ -527,6 +527,19 @@ impl PostgresQueryBuilder {
             "_lastUpdated" => {
                 return Self::build_last_updated_condition(&param.values, param_offset);
             }
+            // Full text over the generated narrative (`_text`) and over the whole
+            // serialized resource (`_content`), against the same `resource_fts`
+            // tsvector columns the write path populates.
+            "_text" => {
+                return Self::build_fts_condition(
+                    &param.values,
+                    "narrative_tsvector",
+                    param_offset,
+                );
+            }
+            "_content" => {
+                return Self::build_fts_condition(&param.values, "content_tsvector", param_offset);
+            }
             _ => {}
         }
 
@@ -556,6 +569,72 @@ impl PostgresQueryBuilder {
         if conditions.is_empty() {
             return None;
         }
+        let mut combined = conditions.remove(0);
+        for cond in conditions {
+            combined = combined.or(cond);
+        }
+        Some(combined)
+    }
+
+    /// Builds the `_text` / `_content` full-text condition against
+    /// `resource_fts`.
+    ///
+    /// Without this, `SearchParamType::Special` fell through to the `None` arm
+    /// below and the parameter contributed **no** condition. A search whose only
+    /// parameter was `_text` therefore produced an empty filter and returned
+    /// every resource of the type — a text query answered with the whole
+    /// compartment, not a narrower or empty result. SQLite has handled both
+    /// parameters (via FTS5 `MATCH`) all along; this is the PostgreSQL half.
+    ///
+    /// `plainto_tsquery('english', …)` matches `search_text`/`search_content` in
+    /// `search_impl.rs`, and it parameterises the user's term rather than
+    /// splicing it, so a term containing tsquery operators is data, not syntax.
+    ///
+    /// `tenant_id = $1` is not optional: the sub-select yields a bare
+    /// `resource_id` set that the outer query intersects with *this* tenant's
+    /// resources, so omitting it would let tenant B's Patient/123 select tenant
+    /// A's Patient/123 — a cross-tenant match oracle. `resource_type = $2`
+    /// likewise keeps an Observation's narrative from selecting a Patient of the
+    /// same id. Both are already bound as tenant and resource type by every
+    /// caller of `build_search_query` (`search`, `search_count`), the same
+    /// invariant `build_missing_condition` and `build_compartment_condition`
+    /// rely on.
+    fn build_fts_condition(
+        values: &[SearchValue],
+        column: &str,
+        offset: usize,
+    ) -> Option<SqlFragment> {
+        let mut conditions = Vec::new();
+        // Numbered off the running count of *accepted* values, not the loop
+        // index: a skipped value must not leave a gap, because the caller binds
+        // this fragment's params consecutively from `offset`.
+        let mut param_num = offset;
+        for value in values {
+            let term = value.value.trim();
+            if term.is_empty() {
+                continue;
+            }
+            param_num += 1;
+            conditions.push(SqlFragment::with_params(
+                format!(
+                    "id IN (SELECT resource_id FROM resource_fts \
+                     WHERE tenant_id = $1 AND resource_type = $2 \
+                     AND {} @@ plainto_tsquery('english', ${}))",
+                    column, param_num
+                ),
+                vec![SqlParam::text(term)],
+            ));
+        }
+        if conditions.is_empty() {
+            // Every value was blank. Returning `None` here would drop the
+            // parameter and hand back the entire resource type — the defect this
+            // function exists to fix — so fail closed instead. A term of nothing
+            // matches nothing, which is also what a stopword-only term already
+            // does through `plainto_tsquery`.
+            return Some(SqlFragment::new("FALSE".to_string()));
+        }
+        // Repeated values of one parameter are a logical OR, as elsewhere in
+        // this builder.
         let mut combined = conditions.remove(0);
         for cond in conditions {
             combined = combined.or(cond);
@@ -1623,6 +1702,105 @@ mod tests {
         assert!(frag.sql.contains("value_quantity_value < $5"));
         // token (system+code) = 2 params, quantity (no unit) = 1 param.
         assert_eq!(frag.params.len(), 3);
+    }
+
+    fn special_param(name: &str, values: Vec<SearchValue>) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Special,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    #[test]
+    fn text_search_filters_instead_of_returning_everything() {
+        // Regression: `SearchParamType::Special` fell through to `None`, so a
+        // `_text`-only query built no filter at all and `search` answered a
+        // full-text query with every resource of the type.
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_text",
+            vec![SearchValue::eq("Zebracrossingdiagnosis")],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("_text must produce a condition, not an empty filter");
+
+        assert!(
+            frag.sql.contains("FROM resource_fts"),
+            "must resolve through the full-text table: {}",
+            frag.sql
+        );
+        assert!(
+            frag.sql
+                .contains("narrative_tsvector @@ plainto_tsquery('english', $3)"),
+            "_text matches the narrative column: {}",
+            frag.sql
+        );
+        // Tenant and type scoping keep the sub-select from selecting another
+        // tenant's — or another resource type's — row of the same id.
+        assert!(frag.sql.contains("tenant_id = $1"), "{}", frag.sql);
+        assert!(frag.sql.contains("resource_type = $2"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn content_search_uses_the_content_column() {
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_content",
+            vec![SearchValue::eq("Quokkaflavoured")],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("_content must produce a condition");
+
+        assert!(
+            frag.sql
+                .contains("content_tsvector @@ plainto_tsquery('english', $3)"),
+            "{}",
+            frag.sql
+        );
+        assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn text_or_list_placeholders_are_gap_free() {
+        // Two terms OR together, and a blank one must not consume a placeholder
+        // number it never binds — the caller binds this fragment's params
+        // consecutively.
+        let query = SearchQuery::new("Patient").with_parameter(special_param(
+            "_text",
+            vec![
+                SearchValue::eq("   "),
+                SearchValue::eq("fracture"),
+                SearchValue::eq("sprain"),
+            ],
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("_text OR-list should produce a condition");
+
+        assert_eq!(frag.params.len(), 2, "the blank term binds nothing");
+        assert!(frag.sql.contains("$3"), "{}", frag.sql);
+        assert!(frag.sql.contains("$4"), "{}", frag.sql);
+        assert!(
+            !frag.sql.contains("$5"),
+            "placeholder numbering must be gap-free: {}",
+            frag.sql
+        );
+        assert!(frag.sql.contains(" OR "), "{}", frag.sql);
+    }
+
+    #[test]
+    fn blank_text_term_fails_closed() {
+        // Dropping the parameter would return the whole resource type, which is
+        // the exact failure mode being fixed.
+        let query = SearchQuery::new("Patient")
+            .with_parameter(special_param("_text", vec![SearchValue::eq("")]));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+            .expect("a blank _text must still constrain the query");
+
+        assert_eq!(frag.sql, "FALSE");
+        assert!(frag.params.is_empty());
     }
 
     #[test]
