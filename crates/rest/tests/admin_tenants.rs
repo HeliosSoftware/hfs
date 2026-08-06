@@ -111,6 +111,39 @@ async fn create_then_list_round_trips() {
     assert_eq!(acme["resources"], 0);
 }
 
+/// The listing reports whether each id satisfies the canonical validator, so an
+/// operator can find tenants stranded by the tightening in issue #385.
+///
+/// Only the `true` side is reachable here, and that is the point: since this
+/// change, neither the admin API nor `ResourceStorage::register_tenant` will
+/// mint a non-canonical id, and a resource cannot be written under one either
+/// (the tenant header is validated). A `canonical: false` row can therefore only
+/// come from data that predates the validator — which a fresh test database has
+/// none of. The `false` side is covered where it can be constructed, against the
+/// unchecked constructor: `TenantId::is_canonical`'s unit tests in
+/// `helios-persistence`.
+#[tokio::test]
+async fn listing_reports_canonicality_so_legacy_ids_can_be_found() {
+    let server = create_test_server().await;
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme/research" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_for(&server, "beta", "Patient").await;
+
+    let list = server.get("/admin/tenants").await.json::<Value>();
+
+    // Registered and data-discovered rows both carry the flag.
+    assert_eq!(
+        find(&list, "acme/research").expect("acme")["canonical"],
+        true
+    );
+    assert_eq!(find(&list, "beta").expect("beta")["canonical"], true);
+    // And the summary an operator actually reads.
+    assert_eq!(list["non_canonical_count"], 0);
+}
+
 #[tokio::test]
 async fn duplicate_create_conflicts() {
     let server = create_test_server().await;
@@ -140,9 +173,10 @@ async fn invalid_ids_are_rejected() {
 
 /// Ids naming a control-plane namespace are refused at creation (issue #271).
 ///
-/// This is a guardrail, not the fix: the backend is safe structurally, because
-/// this check only covers the admin API and the JWT tenant extractor validates
-/// nothing.
+/// Still defence in depth rather than what makes the S3 keyspace safe — that is
+/// structural — but it is no longer admin-API-only. Since issue #385 the same
+/// rule is applied by `TenantId::parse` at every ingress, including the JWT
+/// claim, and again by `ResourceStorage::register_tenant` on all backends.
 #[tokio::test]
 async fn control_plane_namespace_ids_are_reserved() {
     let server = create_test_server().await;
@@ -153,6 +187,92 @@ async fn control_plane_namespace_ids_are_reserved() {
             .await;
         res.assert_status(StatusCode::BAD_REQUEST);
     }
+}
+
+/// A reserved name is reserved in **every** segment, not just as the whole id
+/// (issue #385).
+///
+/// `acme/resources` passed the old whole-id check. On S3 its objects land under
+/// `acme/resources/…`, which is inside the prefix tenant `acme` lists — and that
+/// `purge_tenant_data("acme")` deletes. Two tenants, one keyspace, with the
+/// deletion crossing the boundary.
+#[tokio::test]
+async fn reserved_names_are_rejected_in_any_hierarchy_segment() {
+    let server = create_test_server().await;
+    for bad in [
+        "acme/resources",
+        "acme/history",
+        "acme/bulk",
+        "acme/tenants",
+        "acme/__system__",
+        "acme/../evil",
+    ] {
+        server
+            .post("/admin/tenants")
+            .json(&json!({ "id": bad }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // Only whole segments are reserved — a substring must stay usable.
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme/resources-archive" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+}
+
+/// The length cap is the canonical 64, not the 128 this handler used to apply
+/// on its own (issue #385).
+///
+/// An id in 65..=128 bytes was registrable but unroutable: both the header and
+/// URL-prefix validators capped at 64, so it could only ever be reached through
+/// the JWT claim — the ingress that validated nothing at all.
+#[tokio::test]
+async fn ids_longer_than_the_canonical_cap_are_rejected() {
+    let server = create_test_server().await;
+
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "a".repeat(64) }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "a".repeat(65) }))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+}
+
+/// Malformed hierarchy is rejected: `/` is a separator, so it cannot lead,
+/// trail, or repeat.
+#[tokio::test]
+async fn malformed_hierarchy_is_rejected() {
+    let server = create_test_server().await;
+    for bad in ["/acme", "acme/", "acme//research"] {
+        server
+            .post("/admin/tenants")
+            .json(&json!({ "id": bad }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+}
+
+/// The rejection body names the reason, so an operator can act on it without
+/// reading the source.
+#[tokio::test]
+async fn rejection_explains_why() {
+    let server = create_test_server().await;
+    let body = server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme corp" }))
+        .await
+        .text();
+    assert!(
+        body.contains("letters, digits"),
+        "expected an actionable reason, got: {body}"
+    );
 }
 
 /// Hierarchical ids stay valid — `TenantId` models `/` as the hierarchy

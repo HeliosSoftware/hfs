@@ -159,6 +159,70 @@ pub trait IntoEvaluationResult {
     fn to_evaluation_result(&self) -> EvaluationResult;
 }
 
+/// Stamps the FHIR type a choice element's key implies onto its evaluation result.
+///
+/// A choice element (`value[x]`) encodes its datatype in the JSON key — `valueString`,
+/// `valueQuantity` — so the type is known from the variant alone and has to be attached
+/// to the result for `.ofType()` to work. `String` results always take the key-derived
+/// type; the other primitives keep a type the inner conversion already supplied.
+///
+/// This is shared out of the `FhirPath` derive rather than inlined per variant: choice
+/// enums have one variant per permitted datatype, and repeating this match in each of
+/// them across four FHIR versions is worth tens of megabytes of near-identical code in
+/// any binary that links the models.
+pub fn with_choice_type_info(result: EvaluationResult, fhir_type: &str) -> EvaluationResult {
+    match result {
+        EvaluationResult::String(s, _existing_type_info, m) => {
+            // Always use the determined type from the field name for choice types
+            EvaluationResult::String(s, Some(TypeInfoResult::new("FHIR", fhir_type)), m)
+        }
+        EvaluationResult::Integer(i, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Integer(i, Some(type_info), m)
+        }
+        EvaluationResult::Decimal(d, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Decimal(d, Some(type_info), m)
+        }
+        EvaluationResult::Boolean(b, existing_type_info, m) => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Boolean(b, Some(type_info), m)
+        }
+        EvaluationResult::Object {
+            map,
+            type_info: existing_type_info,
+        } => {
+            let type_info =
+                existing_type_info.unwrap_or_else(|| TypeInfoResult::new("FHIR", fhir_type));
+            EvaluationResult::Object {
+                map,
+                type_info: Some(type_info),
+            }
+        }
+        // For other types, return as-is
+        other => other,
+    }
+}
+
+/// Wraps a choice element's result in the single-key object FHIRPath expects.
+///
+/// The key is the type-suffixed field name (`valueString`), so navigation over the
+/// parent resource sees the polymorphic field under its concrete name. The wrapper
+/// object itself carries no type info.
+///
+/// Shared out of the `FhirPath` derive for the same reason as [`with_choice_type_info`].
+pub fn wrap_choice_field(result: EvaluationResult, field_name: &str) -> EvaluationResult {
+    let mut map = std::collections::HashMap::new();
+    map.insert(field_name.to_string(), result);
+    EvaluationResult::Object {
+        map,
+        type_info: None,
+    }
+}
+
 /// Universal result type for FHIRPath expression evaluation.
 ///
 /// This enum represents any value that can result from evaluating a FHIRPath expression

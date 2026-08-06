@@ -3,7 +3,7 @@
 //! Each handler knows how to generate SQL conditions for its parameter type.
 
 mod composite;
-mod date;
+pub(crate) mod date;
 mod number;
 mod quantity;
 mod reference;

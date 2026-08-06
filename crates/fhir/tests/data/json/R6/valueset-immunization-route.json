@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "immunization-route",
   "meta": {
-    "lastUpdated": "2026-07-21T14:21:49.952+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "extensions",

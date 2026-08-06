@@ -2,7 +2,7 @@
   "resourceType": "ValueSet",
   "id": "narrative-status",
   "meta": {
-    "lastUpdated": "2026-07-21T14:21:49.952+00:00"
+    "lastUpdated": "2026-07-17T03:44:13.245+00:00"
   },
   "text": {
     "status": "generated",
@@ -26,7 +26,7 @@
   "title": "NarrativeStatus",
   "status": "draft",
   "experimental": false,
-  "date": "2026-07-21T14:21:49+00:00",
+  "date": "2026-07-17T03:44:13+00:00",
   "publisher": "HL7 International / FHIR Infrastructure",
   "contact": [
     {

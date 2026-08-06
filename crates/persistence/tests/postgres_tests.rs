@@ -21,6 +21,20 @@ use helios_persistence::core::BackendKind;
 #[path = "transactions/if_match_suite.rs"]
 mod if_match_suite;
 
+/// The backend-agnostic full-text purge-completeness scenarios (issue #386),
+/// shared verbatim with the SQLite suite that owns the file.
+///
+/// PostgreSQL already deleted `resource_fts` in its purge paths — the defect was
+/// SQLite-only — so these lock the *reference* backend's behaviour in place so a
+/// future change cannot silently regress it. The `$reindex` scenarios are a
+/// different matter: those failed on PostgreSQL too, because
+/// `write_search_entries` never rebuilt the full-text row.
+///
+/// Declared at the top level for the same `#[path]` resolution reason as
+/// `if_match_suite` above.
+#[path = "search/fts_purge_suite.rs"]
+mod fts_purge_suite;
+
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -5296,4 +5310,149 @@ mod postgres_integration {
         postgres_integration_transaction_delete_accepts_matching_if_match,
         transaction_delete_accepts_matching_if_match
     );
+
+    // ========================================================================
+    // Full-text purge completeness (issue #386)
+    // ========================================================================
+
+    use crate::fts_purge_suite::{self as fts_suite, FtsProbe};
+
+    /// Reads `resource_fts` directly over the backend's own pool.
+    ///
+    /// `PostgresBackend::get_client` is `#[doc(hidden)] pub` precisely so
+    /// out-of-crate tests can run raw SQL; other tests in this module already
+    /// do the same.
+    struct PgFtsProbe(PostgresBackend);
+
+    #[async_trait::async_trait]
+    impl FtsProbe for PgFtsProbe {
+        async fn fts_row_count(&self, tenant_id: &str) -> u64 {
+            let client = self.0.get_client().await.expect("get_client");
+            let row = client
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM resource_fts WHERE tenant_id = $1",
+                    &[&tenant_id],
+                )
+                .await
+                .expect("count resource_fts");
+            row.get::<_, i64>(0) as u64
+        }
+
+        async fn fts_rows_containing(&self, needle: &str) -> u64 {
+            let client = self.0.get_client().await.expect("get_client");
+            let pattern = format!("%{needle}%");
+            let row = client
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM resource_fts \
+                     WHERE full_content LIKE $1 OR narrative_text LIKE $1",
+                    &[&pattern],
+                )
+                .await
+                .expect("count resource_fts by content");
+            row.get::<_, i64>(0) as u64
+        }
+    }
+
+    /// One `#[tokio::test]` per shared scenario, each on its own UUID-suffixed
+    /// tenant so they cannot collide on the shared container.
+    macro_rules! pg_fts_test {
+        ($name:ident, $scenario:ident) => {
+            #[tokio::test]
+            async fn $name() {
+                let backend = create_backend().await;
+                let probe = PgFtsProbe(create_backend().await);
+                let tenant = create_tenant(stringify!($scenario));
+                fts_suite::$scenario(&backend, &probe, &tenant).await;
+            }
+        };
+    }
+
+    pg_fts_test!(
+        postgres_integration_purge_removes_fts_rows,
+        purge_removes_fts_rows
+    );
+    pg_fts_test!(
+        postgres_integration_purge_all_removes_fts_rows,
+        purge_all_removes_fts_rows
+    );
+    pg_fts_test!(
+        postgres_integration_purge_tenant_data_removes_fts_rows,
+        purge_tenant_data_removes_fts_rows
+    );
+    pg_fts_test!(
+        postgres_integration_reuse_after_purge_does_not_resurrect_narrative,
+        reuse_after_purge_does_not_resurrect_narrative
+    );
+    pg_fts_test!(
+        postgres_integration_tenant_reuse_does_not_resurrect_narrative,
+        tenant_reuse_does_not_resurrect_narrative
+    );
+    pg_fts_test!(
+        postgres_integration_repeated_purge_and_recreate_does_not_grow_fts,
+        repeated_purge_and_recreate_does_not_grow_fts
+    );
+
+    #[tokio::test]
+    async fn postgres_integration_purge_tenant_data_leaves_other_tenants_intact() {
+        let backend = create_backend().await;
+        let probe = PgFtsProbe(create_backend().await);
+        fts_suite::purge_tenant_data_leaves_other_tenants_intact(
+            &backend,
+            &probe,
+            &create_tenant("fts_victim"),
+            &create_tenant("fts_bystander"),
+        )
+        .await;
+    }
+
+    /// `$reindex` must rebuild full-text search, not destroy it.
+    ///
+    /// This failed on PostgreSQL before the fix, in both modes: `run_reindex`
+    /// drops each resource's `resource_fts` row via `delete_search_entries`, and
+    /// `write_search_entries` never put it back.
+    #[tokio::test]
+    async fn postgres_integration_reindex_preserves_full_text_search_without_clear() {
+        pg_reindex_case(false, "fts_reindex_noclear").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_preserves_full_text_search_with_clear() {
+        pg_reindex_case(true, "fts_reindex_clear").await;
+    }
+
+    async fn pg_reindex_case(clear_existing: bool, tenant_label: &str) {
+        use helios_persistence::search::ReindexOperation;
+        use std::sync::Arc;
+
+        let backend = Arc::new(create_backend().await);
+        let probe = PgFtsProbe(create_backend().await);
+        let tenant = create_tenant(tenant_label);
+        let reindex = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        fts_suite::reindex_preserves_full_text_search(
+            backend.as_ref(),
+            &probe,
+            &tenant,
+            &reindex,
+            clear_existing,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_repeated_reindex_does_not_duplicate_fts_rows() {
+        use helios_persistence::search::ReindexOperation;
+        use std::sync::Arc;
+
+        let backend = Arc::new(create_backend().await);
+        let probe = PgFtsProbe(create_backend().await);
+        let tenant = create_tenant("fts_reindex_repeat");
+        let reindex = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        fts_suite::repeated_reindex_does_not_duplicate_fts_rows(
+            backend.as_ref(),
+            &probe,
+            &tenant,
+            &reindex,
+        )
+        .await;
+    }
 }
