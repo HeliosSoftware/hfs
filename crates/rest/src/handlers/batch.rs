@@ -1163,14 +1163,20 @@ fn bundle_method_to_http_method(method: &BundleMethod) -> &'static str {
     }
 }
 
+/// Reads the first issue's text for an audit event's `outcomeDesc`.
+///
+/// Falls back to `diagnostics`. The one batch entry outcome #504 deliberately
+/// leaves alone — the 412 from
+/// [`helios_persistence::core::preconditions::precondition_failed_entry`] —
+/// writes its text there rather than to `details.text`, so a failed `ifMatch`
+/// produced an AuditEvent with no description at all.
 fn extract_outcome_description(outcome: Option<&Value>) -> Option<String> {
-    outcome
-        .and_then(|value| value.get("issue"))
-        .and_then(|issues| issues.as_array())
-        .and_then(|issues| issues.first())
-        .and_then(|issue| issue.get("details"))
+    let issue = outcome?.get("issue")?.as_array()?.first()?;
+    issue
+        .get("details")
         .and_then(|details| details.get("text"))
         .and_then(|text| text.as_str())
+        .or_else(|| issue.get("diagnostics").and_then(Value::as_str))
         .map(ToString::to_string)
 }
 
@@ -1409,6 +1415,12 @@ fn entry_storage_failure(err: StorageError) -> BundleEntryResult {
 }
 
 /// Returns HTTP status text for a status code.
+///
+/// Every status [`RestError::client_response`] can produce for an entry has an
+/// arm here; anything else renders as `"<code> Unknown"`. The 413/429/503/504
+/// arms were missing while every entry error carried `processing`, so nothing
+/// noticed — an entry hitting an exhausted pool rendered `"503 Unknown"`
+/// beside a correct `transient` code once the codes were threaded (#504).
 fn status_text(code: &str) -> &'static str {
     match code {
         "200" => "OK",
@@ -1423,10 +1435,14 @@ fn status_text(code: &str) -> &'static str {
         "409" => "Conflict",
         "410" => "Gone",
         "412" => "Precondition Failed",
+        "413" => "Payload Too Large",
         "415" => "Unsupported Media Type",
         "422" => "Unprocessable Entity",
+        "429" => "Too Many Requests",
         "500" => "Internal Server Error",
         "501" => "Not Implemented",
+        "503" => "Service Unavailable",
+        "504" => "Gateway Timeout",
         _ => "Unknown",
     }
 }
@@ -2077,6 +2093,31 @@ mod tests {
         }
     }
 
+    /// A failed `ifMatch` must still produce an audit description.
+    ///
+    /// The 412 gate is the one entry outcome #504 leaves alone, and it writes
+    /// its text to `diagnostics` rather than `details.text` — so before the
+    /// fallback below, `outcomeDesc` was absent for exactly that case.
+    #[test]
+    fn extract_outcome_description_reads_the_gates_diagnostics() {
+        let gate = helios_persistence::core::preconditions::precondition_failed_entry("stale tag");
+        assert_eq!(
+            extract_outcome_description(gate.outcome.as_ref()),
+            Some("stale tag".to_string()),
+            "the 412 gate writes to `diagnostics`"
+        );
+
+        // `details.text` still wins, and still works on its own.
+        let both = serde_json::json!({
+            "issue": [{ "details": { "text": "text wins" }, "diagnostics": "ignored" }]
+        });
+        assert_eq!(
+            extract_outcome_description(Some(&both)),
+            Some("text wins".to_string())
+        );
+        assert_eq!(extract_outcome_description(None), None);
+    }
+
     #[test]
     fn test_status_text_covers_known_and_unknown_codes() {
         // The batch response builder renders a reason phrase per entry status; the
@@ -2094,16 +2135,28 @@ mod tests {
             ("409", "Conflict"),
             ("410", "Gone"),
             ("412", "Precondition Failed"),
+            // Reachable, and unmapped until #504. `BackendError::PoolExhausted`
+            // / `Unavailable` / `ConnectionFailed` reach an entry as 503 and
+            // `Timeout` as 504, so an entry hitting an exhausted pool rendered
+            // `"503 Unknown"` beside a correct `transient` code.
+            ("413", "Payload Too Large"),
             ("415", "Unsupported Media Type"),
             ("422", "Unprocessable Entity"),
+            ("429", "Too Many Requests"),
             ("500", "Internal Server Error"),
             ("501", "Not Implemented"),
+            ("503", "Service Unavailable"),
+            ("504", "Gateway Timeout"),
         ];
         for (code, phrase) in known {
             assert_eq!(status_text(code), phrase, "reason phrase for {code}");
         }
         // Any unmapped code falls through to the catch-all.
         assert_eq!(status_text("418"), "Unknown");
+        // Every status a batch entry can now carry has a phrase.
+        for (code, _) in known {
+            assert_ne!(status_text(code), "Unknown", "unmapped entry status {code}");
+        }
         assert_eq!(status_text(""), "Unknown");
     }
 
