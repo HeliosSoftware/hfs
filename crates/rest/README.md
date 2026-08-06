@@ -513,7 +513,8 @@ and `HEAD` are refused as described under Current Limitations.
 A failed entry's `response.outcome` carries the **same issue code the equivalent
 single-resource request would return**, because both are rendered by one mapping
 (`RestError::client_outcome`). A batch `GET Patient/missing` and
-`GET [base]/Patient/missing` produce byte-identical OperationOutcomes.
+`GET [base]/Patient/missing` produce byte-identical OperationOutcomes, and so do a failed
+search entry and the same search at `GET [base]/[type]?…`.
 
 | Entry failure | Status | `issue.code` |
 |---|---|---|
@@ -527,6 +528,7 @@ single-resource request would return**, because both are rendered by one mapping
 | conditional criteria in the URL | 400 | `not-supported` |
 | insufficient scope | 403 | `forbidden` |
 | target not found | 404 | `not-found` |
+| search entry failed (`_query`, `:not-in`, …) | per class | `invalid`, `not-supported`, … |
 | `HEAD` | 405 | `not-supported` |
 | `ifMatch` precondition failed | 412 | `conflict` |
 | write validation failed | 422 | the validator's own issues |
@@ -576,7 +578,6 @@ The following FHIR transaction features are not yet implemented:
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
 - **Duplicate detection** - Same resource appearing twice in a transaction is not detected
 - **Transaction entry failures after dispatch** - a transaction entry that fails once the backend is executing it is still collapsed to `400 processing`, with the real status stringified into the message (`Entry failed with status 404`). The backends discard the entry result at their `status >= 400` guard and return `TransactionError::BundleError`, which carries neither. Tracked separately; the per-entry codes above are the `batch` arm and the transaction refusals raised *before* dispatch
-- **Bare type-level `GET`** - `GET Patient` in a batch entry is read as an instance read with an empty id and answers `404 not-found` with the message `Resource Patient/ not found`. Executing it as a search is #478
 
 ## HTTP Headers
 
