@@ -133,6 +133,12 @@ helios-observability = { path = "../observability" }
 # Key generation for the JWE round-trip tests
 rand = "0.8"
 
+# `SearchProvider::search_param_registry` returns a `parking_lot::RwLock`, and
+# the batch unit tests' mock storage has to satisfy that trait since #478
+# widened `process_batch`'s bound. Test-only: the crate's own code reaches the
+# registry through `helios-persistence` and never names the lock type.
+parking_lot = "0.12"
+
 # Temp files
 tempfile = "3"
 

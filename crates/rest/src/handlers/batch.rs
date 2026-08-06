@@ -17,8 +17,8 @@ use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
-    BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, ResourceStorage,
-    bundle_if_match_gate,
+    BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, IncludeProvider, ResourceStorage,
+    RevincludeProvider, SearchProvider, bundle_if_match_gate,
 };
 use helios_persistence::error::{ResourceError, StorageError, TransactionError};
 use serde_json::Value;
@@ -60,7 +60,13 @@ pub async fn batch_handler<S>(
     request: Request,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + BundleProvider + helios_persistence::core::SearchProvider + Send + Sync,
+    S: ResourceStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + BundleProvider
+        + Send
+        + Sync,
 {
     // Extract the Principal from request extensions (set by auth middleware).
     // If present, per-entry scope checks will be enforced.
@@ -251,7 +257,7 @@ async fn process_batch<S>(
     principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
     debug!(
         tenant = %tenant.tenant_id(),
@@ -371,7 +377,13 @@ async fn process_transaction<S>(
     principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + BundleProvider + helios_persistence::core::SearchProvider + Send + Sync,
+    S: ResourceStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + BundleProvider
+        + Send
+        + Sync,
 {
     debug!(
         tenant = %tenant.tenant_id(),
@@ -484,7 +496,40 @@ where
     // fail the bundle (#459). They used to be stored verbatim — unsearchable
     // and unresolvable. References to entries created by this same bundle use
     // `fullUrl`s, which the storage layer resolves during processing.
+    //
+    // This runs on the full entry set, before the GET search entries are
+    // partitioned out below: those carry no `resource`, so they contribute no
+    // conditional references either way.
     resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
+
+    // GET search entries (`Patient?name=x`, bare `Patient`) cannot run inside
+    // the storage transaction; the spec orders GETs after all writes, so they
+    // execute against the just-committed state instead (#478). Their queries
+    // are still validated up front, where a malformed search can reject the
+    // whole bundle before anything executes.
+    let (search_entries, remaining): (Vec<_>, Vec<_>) = indexed_entries.into_iter().partition(
+        |(_, entry, _): &(usize, BundleEntry, Option<String>)| {
+            matches!(entry.method, BundleMethod::Get)
+                && parse_search_entry_url(&entry.url).is_some()
+        },
+    );
+    let mut indexed_entries = remaining;
+    for (index, entry, _) in &search_entries {
+        let (search_type, pairs) =
+            parse_search_entry_url(&entry.url).expect("partitioned on is_some");
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        crate::extractors::build_search_query_from_pairs(&search_type, &pairs, &registry).map_err(
+            |e| RestError::BadRequest {
+                message: format!(
+                    "Entry {}: invalid search '{}': {}",
+                    index,
+                    entry.url,
+                    e.client_response().2
+                ),
+            },
+        )?;
+    }
 
     // Write-path validation: transactions are atomic, so any invalid write
     // entry rejects the whole bundle before anything executes.
@@ -543,6 +588,35 @@ where
                 }
             }
 
+            // GET searches run against the committed state (see above). A
+            // failure here cannot roll the transaction back, so it surfaces
+            // as that entry's own error outcome rather than a misleading
+            // whole-bundle failure for writes that did commit.
+            let mut search_results: Vec<(usize, BundleEntry, BundleEntryResult)> =
+                Vec::with_capacity(search_entries.len());
+            for (index, entry, _) in &search_entries {
+                let (search_type, pairs) =
+                    parse_search_entry_url(&entry.url).expect("partitioned on is_some");
+                let result = match crate::handlers::search::execute_search_bundle(
+                    state,
+                    &tenant,
+                    &search_type,
+                    pairs,
+                    false,
+                )
+                .await
+                {
+                    Ok(bundle) => searchset_result(bundle),
+                    // The second of #481's two code-discarding call sites, and
+                    // the more consequential one: this loop bypasses the
+                    // backend executor, so it is the first *reachable*
+                    // per-entry outcome on the transaction arm. Rendered
+                    // through the funnel like every other entry failure.
+                    Err(e) => entry_failure(e),
+                };
+                search_results.push((*index, entry.clone(), result));
+            }
+
             // Reorder results back to original entry order
             let mut ordered_results: Vec<(usize, &BundleEntry, &BundleEntryResult)> =
                 indexed_entries
@@ -550,6 +624,9 @@ where
                     .zip(bundle_result.entries.iter())
                     .map(|((orig_idx, entry, _), result)| (*orig_idx, entry, result))
                     .collect();
+            for (orig_idx, entry, result) in &search_results {
+                ordered_results.push((*orig_idx, entry, result));
+            }
             ordered_results.sort_by_key(|(idx, _, _)| *idx);
 
             for (orig_idx, entry, result) in &ordered_results {
@@ -607,7 +684,7 @@ where
                     &format!("Transaction rolled back: {rollback_reason}"),
                 ),
             );
-            for (orig_idx, entry, _) in &indexed_entries {
+            for (orig_idx, entry, _) in indexed_entries.iter().chain(&search_entries) {
                 let correlation_details =
                     EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
                 emit_transaction_entry_audit(
@@ -683,7 +760,7 @@ async fn process_batch_entry<S>(
     principal: Option<&Principal>,
 ) -> BundleEntryResult
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
     let request = match entry.get("request") {
         Some(r) => r,
@@ -778,6 +855,28 @@ where
 
     match method {
         BundleMethod::Get => {
+            // A GET entry is either a search (`Patient?name=x`, bare
+            // `Patient`) or an instance read (`Patient/123`), per the spec's
+            // "read or search" wording for bundle GETs (#478).
+            if let Some((search_type, pairs)) = parse_search_entry_url(url) {
+                return match crate::handlers::search::execute_search_bundle(
+                    state,
+                    tenant,
+                    &search_type,
+                    pairs,
+                    false,
+                )
+                .await
+                {
+                    Ok(bundle) => searchset_result(bundle),
+                    // Rendered through the funnel like every other entry
+                    // failure. #481 wrote this as `let (status, _, details) =
+                    // e.client_response()` — the same code-discard #504
+                    // deleted everywhere else, which would have made a search
+                    // entry the one path still answering `processing`.
+                    Err(e) => entry_failure(e),
+                };
+            }
             // Read operation
             match state
                 .storage()
@@ -1390,6 +1489,46 @@ impl EntryParseError {
     }
 }
 
+/// Interprets a bundle-entry GET url as a type-level search, if it is one.
+///
+/// Per the FHIR spec, a GET entry may carry any read OR search URL
+/// (`Patient?name=x`, or bare `Patient` for an unfiltered type search).
+/// Returns the resource type and the parsed query pairs, or `None` when the
+/// url addresses a specific instance (`Patient/123`) and should be a read.
+fn parse_search_entry_url(url: &str) -> Option<(String, Vec<(String, String)>)> {
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (url, None),
+    };
+    let parts: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    match parts.as_slice() {
+        [resource_type] => Some((
+            resource_type.to_string(),
+            crate::extractors::query_pairs::parse_query_pairs(query),
+        )),
+        _ => None,
+    }
+}
+
+/// Builds the entry result embedding a searchset Bundle (bundle GET search).
+fn searchset_result(bundle: Value) -> BundleEntryResult {
+    BundleEntryResult {
+        status: 200,
+        location: None,
+        etag: None,
+        last_modified: None,
+        resource: Some(bundle),
+        outcome: None,
+    }
+}
+
+/// Creates an error BundleEntryResult.
+/// Flatten an enforce-mode validation failure into a per-entry message
+/// (batch entry outcomes are message-based).
 /// Renders a failed Bundle entry.
 ///
 /// **Replaces `create_error_result`,** which hardcoded `"code": "processing"`
@@ -2545,6 +2684,62 @@ mod tests {
         }
     }
 
+    // #478's search-entry dispatch widened `process_batch`'s bound to
+    // `SearchProvider + IncludeProvider + RevincludeProvider`, so this mock has
+    // to satisfy them. Every method is `unimplemented!()`, which is the same
+    // lever the write methods above use: no unit test in this module drives a
+    // search entry, and one that started to would panic loudly rather than
+    // silently exercising a stub.
+    #[async_trait]
+    impl helios_persistence::core::SearchProvider for DelayStorage {
+        async fn search(
+            &self,
+            _tenant: &TenantContext,
+            _query: &helios_persistence::types::SearchQuery,
+        ) -> StorageResult<helios_persistence::core::SearchResult> {
+            unimplemented!()
+        }
+
+        async fn search_count(
+            &self,
+            _tenant: &TenantContext,
+            _query: &helios_persistence::types::SearchQuery,
+        ) -> StorageResult<u64> {
+            unimplemented!()
+        }
+
+        fn search_param_registry(
+            &self,
+            _tenant: &TenantContext,
+        ) -> Arc<parking_lot::RwLock<helios_persistence::search::SearchParameterRegistry>> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl helios_persistence::core::IncludeProvider for DelayStorage {
+        async fn resolve_includes(
+            &self,
+            _tenant: &TenantContext,
+            _resources: &[StoredResource],
+            _includes: &[helios_persistence::types::IncludeDirective],
+        ) -> StorageResult<Vec<StoredResource>> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl helios_persistence::core::RevincludeProvider for DelayStorage {
+        async fn resolve_revincludes(
+            &self,
+            _tenant: &TenantContext,
+            _resources: &[StoredResource],
+            _revincludes: &[helios_persistence::types::IncludeDirective],
+        ) -> StorageResult<Vec<StoredResource>> {
+            unimplemented!()
+        }
+    }
+
     /// A batch Bundle of `count` GET entries, targeting `Patient/p0..p{count}`.
     fn get_bundle(count: usize) -> Value {
         let entries: Vec<Value> = (0..count)
@@ -2567,7 +2762,7 @@ mod tests {
         principal: Option<&Principal>,
     ) -> Value
     where
-        S: ResourceStorage + Send + Sync,
+        S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
     {
         let tenant = TenantExtractor::new("test-tenant", crate::tenant::TenantSource::Default);
         let response = process_batch(

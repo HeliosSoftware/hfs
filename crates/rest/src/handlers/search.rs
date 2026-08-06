@@ -159,6 +159,29 @@ async fn execute_search<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    let bundle_json = execute_search_bundle(state, &tenant, resource_type, pairs, strict).await?;
+    format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format).map_err(|_| {
+        RestError::InternalError {
+            message: "Failed to serialize response".to_string(),
+        }
+    })
+}
+
+/// Executes a type-level search and returns the searchset Bundle as JSON.
+///
+/// The HTTP search handlers wrap this in content negotiation; bundle
+/// processing (`GET [type]?params` entries in batch/transaction Bundles,
+/// #478) embeds the returned Bundle as an entry resource.
+pub(crate) async fn execute_search_bundle<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    resource_type: &str,
+    pairs: Vec<(String, String)>,
+    strict: bool,
+) -> RestResult<serde_json::Value>
+where
+    S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
+{
     // Reject known-but-unimplemented control parameters instead of silently
     // ignoring them (which returns an unfiltered, misleading `200`). `_query`
     // (named queries) is not implemented by any backend. (`_list` is implemented
@@ -423,15 +446,15 @@ where
     // after subsetting so `_elements`/`_summary` don't strip the outcome.
     // `_summary=count` returns only `Bundle.total`, so there is no entry list to
     // attach it to.
+    //
+    // This sits below the `execute_search`/`execute_search_bundle` split so a
+    // search dispatched as a bundle entry reports its ignored parameters the
+    // same way the HTTP surface does.
     if !ignored_params.is_empty() && summary_mode != Some(SummaryMode::Count) {
         append_ignored_params_outcome(&mut bundle_json, &ignored_params);
     }
 
-    format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format).map_err(|_| {
-        RestError::InternalError {
-            message: "Failed to serialize response".to_string(),
-        }
-    })
+    Ok(bundle_json)
 }
 
 /// Appends a `search.mode = outcome` entry to a searchset bundle reporting the
