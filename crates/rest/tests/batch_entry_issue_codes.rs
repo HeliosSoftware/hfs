@@ -272,3 +272,144 @@ async fn a_missing_resource_is_described_identically_by_both_surfaces() {
         "Could not find the resource 'Patient/ghost'."
     );
 }
+
+// =============================================================================
+// Search entries (#478)
+// =============================================================================
+//
+// #478 added two failure sites — one per arm — and covered neither: all five of
+// its tests are happy-path `200 OK`. Both were written with the same
+// `let (status, _, details) = e.client_response()` code-discard #504 removed
+// everywhere else, so without these a search entry would have been the one path
+// left answering `processing`.
+
+/// Post `bundle` and return the parsed body, asserting HTTP 200.
+async fn post_bundle_ok(server: &TestServer, bundle: Value) -> Value {
+    let response = server
+        .post("/")
+        .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+        .add_header(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/fhir+json"),
+        )
+        .json(&bundle)
+        .await;
+    response.assert_status_ok();
+    response.json()
+}
+
+/// A search entry that fails carries the issue code for *why* it failed.
+#[tokio::test]
+async fn a_failed_search_entry_reports_its_issue_code() {
+    let (server, backend) = create_test_server().await;
+    seed_patient(&backend, "p1").await;
+
+    // (entry url, expected status prefix, expected issue code)
+    let cases: Vec<(&str, &str, &str)> = vec![
+        // `_query` is a known-but-unimplemented control parameter.
+        ("Patient?_query=byName", "400", "invalid"),
+        // `:not-in` needs negated value-set filtering no backend implements.
+        (
+            "Patient?code:not-in=http://example.org/vs",
+            "501",
+            "not-supported",
+        ),
+    ];
+
+    let body = post_batch(
+        &server,
+        cases
+            .iter()
+            .map(|(url, _, _)| json!({ "request": { "method": "GET", "url": url } }))
+            .collect(),
+    )
+    .await;
+
+    for (index, (url, status, code)) in cases.iter().enumerate() {
+        let response = &body["entry"][index]["response"];
+        assert!(
+            response["status"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(status),
+            "entry {index} ({url}) status: {response}"
+        );
+        assert_eq!(
+            response["outcome"]["issue"][0]["code"], *code,
+            "entry {index} ({url}) issue code: {response}"
+        );
+    }
+}
+
+/// The transaction arm's search loop is the **first reachable** per-entry
+/// outcome on that arm.
+///
+/// #504 could accurately say none existed: the backends discard an entry result
+/// at their `status >= 400` guard, so a transaction never surfaced a per-entry
+/// outcome. #478's search loop bypasses the backend executor entirely and
+/// surfaces the failure as that entry's own outcome — deliberately, since a
+/// search failure cannot roll back writes that already committed. So this is a
+/// per-entry code on the transaction arm, and it must not be `processing`.
+#[tokio::test]
+async fn a_failed_transaction_search_entry_reports_its_issue_code() {
+    let (server, backend) = create_test_server().await;
+    seed_patient(&backend, "p1").await;
+
+    let body = post_bundle_ok(
+        &server,
+        json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [{
+                "request": { "method": "GET", "url": "Patient?_query=byName" }
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(body["type"], "transaction-response", "{body}");
+    let response = &body["entry"][0]["response"];
+    assert!(
+        response["status"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("400"),
+        "entry status: {response}"
+    );
+    assert_eq!(
+        response["outcome"]["issue"][0]["code"], "invalid",
+        "{response}"
+    );
+}
+
+/// The same bad search, described identically by both surfaces — the parity
+/// claim extended to the arm #478 added.
+#[tokio::test]
+async fn a_failed_search_is_described_identically_by_both_surfaces() {
+    let (server, backend) = create_test_server().await;
+    seed_patient(&backend, "p1").await;
+
+    let single: Value = server
+        .get("/Patient?_query=byName")
+        .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+        .await
+        .json();
+
+    let batch = post_batch(
+        &server,
+        vec![json!({ "request": { "method": "GET", "url": "Patient?_query=byName" } })],
+    )
+    .await;
+    let entry_issue = &batch["entry"][0]["response"]["outcome"]["issue"][0];
+    let endpoint_issue = &single["issue"][0];
+
+    assert_eq!(entry_issue["severity"], endpoint_issue["severity"]);
+    assert_eq!(entry_issue["code"], endpoint_issue["code"]);
+    assert_eq!(
+        entry_issue["details"]["text"],
+        endpoint_issue["details"]["text"]
+    );
+
+    // Pinned literally: `processing == processing` would satisfy the equalities.
+    assert_eq!(entry_issue["code"], "invalid");
+}

@@ -543,7 +543,8 @@ and `HEAD` are refused as described under Current Limitations.
 A failed entry's `response.outcome` carries the **same issue code the equivalent
 single-resource request would return**, because both are rendered by one mapping
 (`RestError::client_outcome`). A batch `GET Patient/missing` and
-`GET [base]/Patient/missing` produce byte-identical OperationOutcomes.
+`GET [base]/Patient/missing` produce byte-identical OperationOutcomes, and so do a failed
+search entry and the same search at `GET [base]/[type]?…`.
 
 | Entry failure | Status | `issue.code` |
 |---|---|---|
@@ -559,6 +560,7 @@ single-resource request would return**, because both are rendered by one mapping
 | `ifMatch` on a conditional entry | 400 | `invalid` |
 | insufficient scope | 403 | `forbidden` |
 | target not found | 404 | `not-found` |
+| search entry failed (`_query`, `:not-in`, …) | per class | `invalid`, `not-supported`, … |
 | `HEAD` | 405 | `not-supported` |
 | `ifMatch` precondition failed | 412 | `conflict` |
 | write validation failed | 422 | the validator's own issues |
