@@ -8,7 +8,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::tenant::TenantId;
+use crate::tenant::{TenantId, TenantIdError};
 
 /// The primary error type for all storage operations.
 ///
@@ -166,6 +166,19 @@ pub enum TenantError {
     InvalidTenant {
         /// Tenant identifier that failed validation.
         tenant_id: TenantId,
+    },
+
+    /// A tenant id offered for provisioning is not canonical.
+    ///
+    /// Distinct from [`InvalidTenant`](Self::InvalidTenant) because it carries
+    /// the *reason*: this reaches an operator through the admin API, where "the
+    /// id is 71 bytes" is actionable and "invalid tenant" is not.
+    #[error("tenant id '{tenant_id}' is not valid: {reason}")]
+    NonCanonicalTenantId {
+        /// The rejected identifier, as supplied.
+        tenant_id: String,
+        /// Why [`TenantId::parse`](crate::tenant::TenantId::parse) rejected it.
+        reason: TenantIdError,
     },
 
     /// Tenant is suspended and cannot perform operations.

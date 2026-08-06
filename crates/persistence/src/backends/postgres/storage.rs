@@ -811,7 +811,11 @@ impl ResourceStorage for PostgresBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
-        crate::tenant::ensure_mutable_tenant(id)?;
+        // Backstop for the canonical tenant-id contract (issue #385). As with
+        // SQLite, PostgreSQL keys tenants by an exact-match, case-sensitive
+        // `tenant_id` column and has no derivation to protect — this keeps the
+        // precondition uniform across every implementation.
+        self.ensure_canonical_tenant_id(id)?;
         let client = self.get_client().await?;
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here

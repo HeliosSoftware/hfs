@@ -141,11 +141,14 @@ fn validate_id(id: &str) -> Result<(), String> {
         TenantIdError::TooLong { .. } => {
             format!("Tenant id exceeds {MAX_TENANT_ID_LEN} characters.")
         }
-        TenantIdError::Reserved { .. } => {
+        TenantIdError::ReservedSegment { .. } => {
             "That id is reserved for internal shared resources.".to_string()
         }
-        TenantIdError::InvalidChar { .. } => {
+        TenantIdError::InvalidCharacter { .. } => {
             "Tenant id may contain only letters, digits, '-', '_', '.', and '/'.".to_string()
+        }
+        TenantIdError::EmptySegment => {
+            "Tenant id must not begin or end with '/' or contain an empty segment.".to_string()
         }
         // `TenantIdError` is `#[non_exhaustive]`; a variant added later falls
         // back to its own `Display` rather than failing to compile here.
