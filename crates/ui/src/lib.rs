@@ -471,6 +471,16 @@ struct CompartmentsPage {
     view: compartments::CmpView,
 }
 
+/// The compartments page when no definitions could be fetched (#320): the
+/// shell with a warning, in place of the data-bearing view.
+#[derive(Template)]
+#[template(path = "pages/compartments-degraded.html")]
+struct CompartmentsDegradedPage {
+    status: Status,
+    i18n: I18n,
+    active_page: &'static str,
+}
+
 #[derive(Template)]
 #[template(path = "partials/status.html")]
 struct StatusPartial {
@@ -1079,7 +1089,14 @@ async fn compartments_page(
             active_page: "compartments",
             view,
         }),
-        None => StatusCode::NOT_FOUND.into_response(),
+        // No definitions means the self-fetch degraded (an outage, or auth
+        // without an outbound token, #320) — a warning, not a 404. The failed
+        // fetch is not cached, so the next request re-attempts it.
+        None => render(CompartmentsDegradedPage {
+            status: current_status(state.version, rv.0, &rt),
+            i18n: I18n::new(locale),
+            active_page: "compartments",
+        }),
     }
 }
 
