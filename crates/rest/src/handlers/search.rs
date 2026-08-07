@@ -227,7 +227,47 @@ where
         pairs
     };
 
-    let search_params = SearchParams::from_pairs(pairs);
+    let mut search_params = SearchParams::from_pairs(pairs);
+
+    // Unknown search parameters. Per FHIR search error handling these may be
+    // ignored only under lenient handling and only if that is reported; under
+    // `Prefer: handling=strict` they are an error.
+    //
+    // Scope the registry read guard tightly so it doesn't span any await —
+    // parking_lot guards aren't Send by default, which would make this async fn
+    // !Send.
+    let ignored_params = {
+        let reg = state.storage().search_param_registry(tenant.context());
+        let registry = reg.read();
+        unknown_search_params(resource_type, &search_params, &registry)
+    };
+    if !ignored_params.is_empty() {
+        if strict {
+            return Err(RestError::InvalidParameter {
+                param: ignored_params.join(", "),
+                message: format!(
+                    "unknown search parameter(s) rejected under Prefer: handling=strict: {}",
+                    ignored_params.join(", ")
+                ),
+            });
+        }
+        // Lenient: ignore them for real. Dropping them here keeps the filter out
+        // of the executed query (an unrecognized name would otherwise be matched
+        // against the search index and quietly return nothing), keeps them out of
+        // the self link built below, and they are reported as an OperationOutcome
+        // entry on the bundle.
+        debug!(
+            resource_type = %resource_type,
+            params = %ignored_params.join(", "),
+            "Ignoring unknown search parameter(s) under lenient handling"
+        );
+        let retained: Vec<(String, String)> = search_params
+            .iter()
+            .filter(|(k, _)| !ignored_params.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        search_params = SearchParams::from_pairs(retained);
+    }
 
     // Convert REST params to persistence SearchQuery. Scope the registry read
     // guard tightly so it doesn't span any await — parking_lot guards aren't
@@ -235,20 +275,6 @@ where
     let mut query = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        // Under `Prefer: handling=strict`, reject unknown search parameters
-        // (the lenient default ignores them).
-        if strict {
-            let unknown = unknown_search_params(resource_type, &search_params, &registry);
-            if !unknown.is_empty() {
-                return Err(RestError::InvalidParameter {
-                    param: unknown.join(", "),
-                    message: format!(
-                        "unknown search parameter(s) rejected under Prefer: handling=strict: {}",
-                        unknown.join(", ")
-                    ),
-                });
-            }
-        }
         let built = build_search_query(resource_type, &search_params, &registry)?;
         // Under strict handling, reject a `_sort` on a field the server cannot
         // actually sort by (it would otherwise silently fall back to `id`). Only
@@ -390,14 +416,47 @@ where
     // Get FHIR version from config for subsetting
     let fhir_version = state.config().default_fhir_version;
 
-    let bundle_json =
+    let mut bundle_json =
         bundle_to_json_with_subsetting(bundle, summary_mode, elements.as_deref(), fhir_version);
+
+    // Report the parameters that were ignored under lenient handling. Added
+    // after subsetting so `_elements`/`_summary` don't strip the outcome.
+    // `_summary=count` returns only `Bundle.total`, so there is no entry list to
+    // attach it to.
+    if !ignored_params.is_empty() && summary_mode != Some(SummaryMode::Count) {
+        append_ignored_params_outcome(&mut bundle_json, &ignored_params);
+    }
 
     format_resource_response(StatusCode::OK, HeaderMap::new(), &bundle_json, format).map_err(|_| {
         RestError::InternalError {
             message: "Failed to serialize response".to_string(),
         }
     })
+}
+
+/// Appends a `search.mode = outcome` entry to a searchset bundle reporting the
+/// search parameters the server ignored under lenient handling.
+///
+/// FHIR allows an unsupported parameter to be ignored only if the server says
+/// so; the self link already omits it, and this outcome names it explicitly.
+fn append_ignored_params_outcome(bundle_json: &mut serde_json::Value, ignored: &[String]) {
+    let outcome = crate::responses::OperationOutcomeBuilder::new()
+        .warning(
+            crate::responses::operation_outcome::IssueType::NotSupported,
+            format!(
+                "search parameter(s) not supported by this server and ignored: {}",
+                ignored.join(", ")
+            ),
+        )
+        .build();
+    let entry = serde_json::json!({
+        "search": { "mode": "outcome" },
+        "resource": outcome,
+    });
+    match bundle_json.get_mut("entry").and_then(|e| e.as_array_mut()) {
+        Some(entries) => entries.push(entry),
+        None => bundle_json["entry"] = serde_json::json!([entry]),
+    }
 }
 
 /// Executes a system-level search across all resource types.

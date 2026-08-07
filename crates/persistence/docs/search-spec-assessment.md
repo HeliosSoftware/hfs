@@ -246,7 +246,11 @@ Ordered roughly by impact:
 
 **Recently landed (REST layer).** Repeated query parameters are now preserved as FHIR AND semantics
 (previously collapsed to last-wins by `HashMap` extraction); `Prefer: handling=strict` rejects
-unknown search parameters with `400` on type-level search (lenient default still ignores them);
+unknown search parameters with `400` on type-level search — including `_`-prefixed names outside
+the set of global parameters the server honours (`_typo`, `_language`, …), which used to bypass the
+check wholesale — while the lenient default ignores them for real: dropped from the executed query,
+omitted from the searchset `self` link, and reported in an `entry.search.mode = outcome`
+`OperationOutcome`;
 `_include`/`_revinclude` (with `:iterate` and `Type:*` wildcard) resolve on SQLite/Postgres;
 nested `_has` resolves; `Bundle.total` populates on SQLite/Postgres; and `_summary`/`_elements`
 responses carry the `SUBSETTED` tag.

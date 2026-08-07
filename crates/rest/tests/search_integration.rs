@@ -406,6 +406,139 @@ mod basic_search {
         ok.assert_status_ok();
     }
 
+    /// Returns the bundle's `self` link URL.
+    fn self_link(body: &Value) -> String {
+        body["link"]
+            .as_array()
+            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+            .and_then(|l| l["url"].as_str())
+            .expect("searchset must carry a self link")
+            .to_string()
+    }
+
+    /// Returns the `search.mode = outcome` entries of a searchset bundle.
+    fn outcome_entries(body: &Value) -> Vec<&Value> {
+        get_bundle_entries(body)
+            .into_iter()
+            .filter(|e| e["search"]["mode"] == "outcome")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_unknown_underscore_param_rejected_under_strict() {
+        // Regression for #524: `_`-prefixed names used to bypass the unknown
+        // parameter check entirely, so strict handling could never reject one.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for param in ["_typo=foo", "_whatever=foo", "_language=en"] {
+            let strict = server
+                .get(&format!("/Patient?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            assert_eq!(
+                strict.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{param} must be rejected under Prefer: handling=strict"
+            );
+        }
+
+        // Global parameters the server does honour are still accepted.
+        for param in ["_id=patient-1", "_lastUpdated=gt2000-01-01", "_tag=foo"] {
+            let ok = server
+                .get(&format!("/Patient?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            ok.assert_status_ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ignored_param_dropped_from_self_link_and_reported() {
+        // Under lenient handling an unsupported parameter may be ignored only if
+        // the server says so: it must not appear in the self link (which states
+        // what was applied) and is reported as an OperationOutcome entry.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let all: Value = server
+            .get("/Patient")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let total = get_bundle_entries(&all).len();
+        assert!(total > 0, "fixture should seed patients");
+
+        for query in ["_typo=foo", "nonsense-param=foo"] {
+            let response = server
+                .get(&format!("/Patient?{query}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+
+            let link = self_link(&body);
+            assert!(
+                !link.contains("typo") && !link.contains("nonsense-param"),
+                "self link must not echo the ignored parameter ({query}): {link}"
+            );
+
+            let outcomes = outcome_entries(&body);
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "ignored parameter must be reported ({query})"
+            );
+            let issue = &outcomes[0]["resource"]["issue"][0];
+            assert_eq!(issue["severity"], "warning");
+            assert_eq!(issue["code"], "not-supported");
+            let text = issue["details"]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(query.split('=').next().unwrap()),
+                "outcome must name the ignored parameter: {text}"
+            );
+
+            // "Ignored" is literal: the filter is not applied, so the result set
+            // is the same as the unfiltered search (previously the parameter
+            // reached the backend and silently matched nothing).
+            let matches = get_bundle_entries(&body)
+                .into_iter()
+                .filter(|e| e["search"]["mode"] == "match")
+                .count();
+            assert_eq!(
+                matches, total,
+                "ignored parameter must not filter ({query})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_known_params_survive_lenient_handling() {
+        // The self link still carries every parameter that was applied, and no
+        // outcome entry is added when nothing was ignored.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body: Value = server
+            .get("/Patient?name=Smith&_count=5")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+
+        let link = self_link(&body);
+        assert!(link.contains("name=Smith"), "self link: {link}");
+        assert!(link.contains("_count=5"), "self link: {link}");
+        assert!(outcome_entries(&body).is_empty());
+    }
+
     #[tokio::test]
     async fn test_date_prefix_uses_precision_boundaries() {
         let (server, backend) = create_test_server().await;
