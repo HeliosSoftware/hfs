@@ -159,6 +159,113 @@ async fn test_not_modifier() {
     }
 }
 
+/// :not means "no value of the parameter matches" — a resource whose element
+/// is absent entirely has no matching value, so it must be returned (#473).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_not_modifier_includes_resources_missing_the_element() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    let male = json!({"resourceType": "Patient", "gender": "male"});
+    let female = json!({"resourceType": "Patient", "gender": "female"});
+    let no_gender = json!({"resourceType": "Patient"});
+    backend
+        .create(&tenant, "Patient", male, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", female, FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .create(&tenant, "Patient", no_gender, FhirVersion::default())
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::token(None, "male")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let result = backend
+        .search(&tenant, &query.with_count(100))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.resources.len(),
+        2,
+        "gender:not=male must return the female patient and the one with no gender"
+    );
+    assert!(
+        result
+            .resources
+            .items
+            .iter()
+            .any(|r| r.content().get("gender").is_none()),
+        "a patient without a gender element must match gender:not=male"
+    );
+}
+
+/// :not must exclude a resource when ANY of its values matches — negating per
+/// row let multi-valued resources leak back in through their other rows (#473).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_not_modifier_excludes_multi_valued_match() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    let dual_coded = json!({
+        "resourceType": "Observation",
+        "status": "final",
+        "code": {"coding": [
+            {"system": "http://loinc.org", "code": "8302-2"},
+            {"system": "http://snomed.info/sct", "code": "50373000"}
+        ]}
+    });
+    let other = json!({
+        "resourceType": "Observation",
+        "status": "final",
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]}
+    });
+    backend
+        .create(&tenant, "Observation", dual_coded, FhirVersion::default())
+        .await
+        .unwrap();
+    let other_id = backend
+        .create(&tenant, "Observation", other, FhirVersion::default())
+        .await
+        .unwrap()
+        .id()
+        .to_string();
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::token(Some("http://loinc.org"), "8302-2")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let result = backend
+        .search(&tenant, &query.with_count(100))
+        .await
+        .unwrap();
+
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(
+        ids,
+        vec![other_id.as_str()],
+        "the observation carrying 8302-2 must not leak in via its SNOMED coding"
+    );
+}
+
 // ============================================================================
 // :text Modifier Tests
 // ============================================================================

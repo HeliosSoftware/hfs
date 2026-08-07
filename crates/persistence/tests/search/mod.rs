@@ -40,6 +40,10 @@ pub fn make_sqlite_backend() -> SqliteBackend {
 
 pub mod chained_tests;
 pub mod date_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL test binary via
+/// `#[path]` (issue #386).
+pub mod fts_purge_suite;
+pub mod fts_purge_tests;
 pub mod include_tests;
 pub mod meta_params_tests;
 pub mod modifier_tests;

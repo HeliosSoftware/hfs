@@ -25,10 +25,13 @@ impl TokenHandler {
     ) -> SqlFragment {
         let param_num = param_offset + 1;
 
-        // Handle :not modifier
+        // :not builds the POSITIVE predicate here; the query builder negates
+        // at the resource level (`resource_id NOT IN (…)`, #473). Negating the
+        // row predicate turned :not into "some row differs": any multi-valued
+        // resource leaked in through its other rows, and resources with no
+        // rows for the parameter — matches, per FHIR — never joined at all.
         if matches!(modifier, Some(SearchModifier::Not)) {
-            let inner = Self::build_sql(value, None, param_offset);
-            return SqlFragment::with_params(format!("NOT ({})", inner.sql), inner.params);
+            return Self::build_sql(value, None, param_offset);
         }
 
         // Handle :text modifier - search on display text (Coding.display, CodeableConcept.text)
@@ -266,11 +269,14 @@ mod tests {
     }
 
     #[test]
-    fn test_token_not_modifier() {
+    fn test_token_not_modifier_builds_positive_predicate() {
+        // :not is negated at the resource level by the query builder
+        // (resource_id NOT IN …, #473); the row predicate must stay positive.
         let value = SearchValue::new(SearchPrefix::Eq, "12345");
         let frag = TokenHandler::build_sql(&value, Some(&SearchModifier::Not), 0);
 
-        assert!(frag.sql.starts_with("NOT ("));
+        assert!(!frag.sql.contains("NOT"));
+        assert!(frag.sql.contains("value_token_code = ?1"));
     }
 
     #[test]

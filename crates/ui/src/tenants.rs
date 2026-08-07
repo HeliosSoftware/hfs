@@ -141,11 +141,14 @@ fn validate_id(id: &str) -> Result<(), String> {
         TenantIdError::TooLong { .. } => {
             format!("Tenant id exceeds {MAX_TENANT_ID_LEN} characters.")
         }
-        TenantIdError::Reserved { .. } => {
+        TenantIdError::ReservedSegment { .. } => {
             "That id is reserved for internal shared resources.".to_string()
         }
-        TenantIdError::InvalidChar { .. } => {
+        TenantIdError::InvalidCharacter { .. } => {
             "Tenant id may contain only letters, digits, '-', '_', '.', and '/'.".to_string()
+        }
+        TenantIdError::EmptySegment => {
+            "Tenant id must not begin or end with '/' or contain an empty segment.".to_string()
         }
         // `TenantIdError` is `#[non_exhaustive]`; a variant added later falls
         // back to its own `Display` rather than failing to compile here.
@@ -374,13 +377,25 @@ pub async fn delete(
     }
 
     let _ = storage.deregister_tenant(&id).await;
-    if query.purge {
-        let _ = storage.purge_tenant_data(&id).await;
-    }
+    // A failed purge must be surfaced, not swallowed. The tenant has already
+    // been deregistered by the line above, so discarding this error leaves the
+    // data on disk with nothing in the registry pointing at it, while the page
+    // renders an ordinary success — an operator told "purged" who still holds
+    // every resource. `purge_tenant_data` is transactional on the SQL backends,
+    // so on failure nothing was removed and a retry is safe.
+    let purge_error = if query.purge {
+        storage
+            .purge_tenant_data(&id)
+            .await
+            .err()
+            .map(|e| format!("Tenant '{id}' was deregistered but its data was NOT purged: {e}"))
+    } else {
+        None
+    };
 
     match load_rows(storage, "").await {
-        Ok(rows) => rows_response(i18n, rows, None),
-        Err(e) => rows_response(i18n, Vec::new(), Some(e)),
+        Ok(rows) => rows_response(i18n, rows, purge_error),
+        Err(e) => rows_response(i18n, Vec::new(), purge_error.or(Some(e))),
     }
 }
 

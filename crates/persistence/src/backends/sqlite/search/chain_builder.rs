@@ -740,30 +740,13 @@ impl ChainQueryBuilder {
 
 /// Builds a date comparison condition.
 fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
-    use crate::types::SearchPrefix;
-
-    let (op, val) = match value.prefix {
-        SearchPrefix::Eq => ("=", &value.value),
-        SearchPrefix::Ne => ("!=", &value.value),
-        SearchPrefix::Gt => (">", &value.value),
-        SearchPrefix::Lt => ("<", &value.value),
-        SearchPrefix::Ge => (">=", &value.value),
-        SearchPrefix::Le => ("<=", &value.value),
-        SearchPrefix::Sa => (">", &value.value),
-        SearchPrefix::Eb => ("<", &value.value),
-        SearchPrefix::Ap => {
-            // Approximately equal: within a day for dates
-            return (
-                format!("DATE({}) = DATE(?{})", column, param_num),
-                SqlParam::String(value.value.clone()),
-            );
-        }
-    };
-
-    (
-        format!("{} {} ?{}", column, op, param_num),
-        SqlParam::String(val.clone()),
-    )
+    let (sql, bound) = super::parameter_handlers::date::date_condition(
+        column,
+        value.prefix,
+        &value.value,
+        param_num,
+    );
+    (sql, SqlParam::String(bound))
 }
 
 /// Builds a number comparison condition.
@@ -974,5 +957,34 @@ mod tests {
 
         assert_eq!(outer.depth(), 2);
         assert!(!outer.is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod date_condition_tests {
+    use super::*;
+    use crate::types::SearchPrefix;
+
+    /// #456: chained date terminals use the precision-aware normalized
+    /// comparison, not the raw text `=` this used to emit.
+    #[test]
+    fn chained_dates_are_precision_aware() {
+        let value = SearchValue::new(SearchPrefix::Eq, "1995-10-02");
+        let (sql, param) = build_date_condition("t2.value_date", &value, 7);
+        assert_eq!(
+            sql,
+            "(datetime(t2.value_date) >= datetime(?7) AND datetime(t2.value_date) < datetime(?7, '+1 day'))"
+        );
+        match param {
+            SqlParam::String(s) => assert_eq!(s, "1995-10-02T00:00:00"),
+            _ => panic!("expected string param"),
+        }
+    }
+
+    #[test]
+    fn chained_full_precision_is_equality() {
+        let value = SearchValue::new(SearchPrefix::Eq, "2016-01-23T13:07:42-04:00");
+        let (sql, _) = build_date_condition("t2.value_date", &value, 3);
+        assert_eq!(sql, "datetime(t2.value_date) = datetime(?3)");
     }
 }

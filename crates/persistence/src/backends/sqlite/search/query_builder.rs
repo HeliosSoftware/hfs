@@ -424,11 +424,21 @@ impl QueryBuilder {
             combined = combined.or(cond);
         }
 
-        // Wrap in subquery to ensure proper AND/OR semantics
+        // Wrap in subquery to ensure proper AND/OR semantics. `:not` negates
+        // HERE, at the resource level, not inside the row predicate (#473):
+        // FHIR's :not means "no value of the parameter matches", so a
+        // multi-valued resource must not slip through via its other rows, and
+        // resources with no rows for the parameter count as matches — both of
+        // which NOT IN gives and a row-level NOT cannot.
+        let membership = if matches!(param.modifier, Some(SearchModifier::Not)) {
+            "NOT IN"
+        } else {
+            "IN"
+        };
         Some(SqlFragment::with_params(
             format!(
-                "resource_id IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
-                param.name, combined.sql
+                "resource_id {} (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
+                membership, param.name, combined.sql
             ),
             combined.params,
         ))
@@ -552,7 +562,15 @@ impl QueryBuilder {
 
         let mut conditions = Vec::new();
 
-        for (i, value) in values.iter().enumerate() {
+        // Numbered off the running count of *accepted* terms rather than the
+        // loop index: escaping can empty a term (`_text=*` escapes to nothing),
+        // and the caller binds this fragment's params consecutively from
+        // `param_offset`, so a skipped value must not leave a placeholder gap.
+        // `_text=*,fracture` used to emit `?4` while binding only one param,
+        // which SQLite rejects at prepare time.
+        let mut param_num = param_offset;
+
+        for value in values {
             // Escape and prepare the search term
             let search_term = Fts5Search::escape_fts_query(&value.value);
             if search_term.is_empty() {
@@ -561,7 +579,7 @@ impl QueryBuilder {
 
             // Build the FTS match query
             // Use the column prefix to search only the specified column
-            let param_num = param_offset + i + 1;
+            param_num += 1;
             // `tenant_id = ?1` is not optional. Without it this sub-select
             // matches *every* tenant's `resource_fts` rows and yields a bare
             // `resource_id` set, which the outer query then intersects with this
@@ -581,7 +599,10 @@ impl QueryBuilder {
         }
 
         if conditions.is_empty() {
-            return None;
+            // Every term escaped to nothing. Returning `None` would drop the
+            // parameter and answer a full-text query with every resource of the
+            // type; a term that cannot match must match nothing instead.
+            return Some(SqlFragment::new("0"));
         }
 
         // OR together multiple search terms
@@ -909,6 +930,39 @@ mod tests {
 
         let combined = frag1.or(frag2);
         assert!(combined.sql.contains("OR"));
+    }
+
+    #[test]
+    fn fts_placeholders_are_gap_free() {
+        // `*` escapes to nothing and binds no parameter, so the term after it
+        // must still take the next consecutive placeholder. The old index-based
+        // numbering emitted `?4` while binding a single param, and SQLite
+        // rejects the prepared statement.
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let values = vec![SearchValue::eq("*"), SearchValue::eq("fracture")];
+
+        let frag = builder
+            .build_fts_condition(&values, "narrative_text", 2)
+            .expect("a matchable term must produce a condition");
+
+        assert_eq!(frag.params.len(), 1);
+        assert!(frag.sql.contains("?3"), "{}", frag.sql);
+        assert!(!frag.sql.contains("?4"), "{}", frag.sql);
+    }
+
+    #[test]
+    fn fts_unmatchable_term_fails_closed() {
+        // Nothing survives escaping. Dropping the parameter would answer a
+        // full-text query with every resource of the type.
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let values = vec![SearchValue::eq("*")];
+
+        let frag = builder
+            .build_fts_condition(&values, "narrative_text", 2)
+            .expect("an unmatchable term must still constrain the query");
+
+        assert_eq!(frag.sql, "0");
+        assert!(frag.params.is_empty());
     }
 
     #[test]

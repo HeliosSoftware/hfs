@@ -5,6 +5,7 @@ import { test, expect } from "../pages/fixtures";
 const ROUTES = [
   "/ui",
   "/ui/resources",
+  "/ui/batch",
   "/ui/compartments",
   "/ui/search-parameters",
   "/ui/queries",

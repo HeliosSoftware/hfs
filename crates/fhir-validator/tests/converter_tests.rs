@@ -230,3 +230,139 @@ fn carries_informational_mirrors_and_short_labels() {
     assert_eq!(note["short"], json!("Free-text remark"));
     assert_eq!(note["mustSupport"], Value::Null);
 }
+
+/// `ordered: true` slicing carries each slice's declaration ordinal as
+/// `order` — without it the engine's ordered check has nothing to compare and
+/// silently passes (`engine/slicing.rs`).
+#[test]
+fn converts_ordered_slicing_with_slice_ordinals() {
+    let actual = convert_to_value("mini-ordered-slicing.json");
+    let expected = json!({
+        "url": "http://example.org/StructureDefinition/mini-ordered-slicing",
+        "name": "MiniOrderedSlicing",
+        "base": "http://hl7.org/fhir/StructureDefinition/Patient",
+        "kind": "resource",
+        "derivation": "constraint",
+        "type": "Patient",
+        "required": ["telecom"],
+        "elements": {
+            "telecom": {
+                "array": true,
+                "min": 1,
+                "slicing": {
+                    "slices": {
+                        "phone": {
+                            "match": {
+                                "type": "pattern",
+                                "value": { "system": "phone" }
+                            },
+                            "min": 1,
+                            "max": 1,
+                            "order": 0,
+                            "schema": {
+                                "required": ["system"],
+                                "elements": {
+                                    "system": { "fixed": "phone" }
+                                }
+                            }
+                        },
+                        "email": {
+                            "match": {
+                                "type": "pattern",
+                                "value": { "system": "email" }
+                            },
+                            "min": 0,
+                            "max": 2,
+                            "order": 1,
+                            "schema": {
+                                "required": ["system"],
+                                "elements": {
+                                    "system": { "fixed": "email" }
+                                }
+                            }
+                        }
+                    },
+                    "rules": "closed",
+                    "ordered": true
+                }
+            }
+        }
+    });
+    assert_eq!(actual, expected);
+}
+
+/// End-to-end: the ordinals the converter emits are what makes the engine's
+/// ordered-slicing check fire. Without `order` the check reads `None` for
+/// every slice and passes silently, so this is the test that would have caught
+/// the gap.
+#[test]
+fn converted_ordered_slicing_is_enforced_by_the_engine() {
+    use helios_fhir_validator::{
+        FhirSchema, SchemaRegistry, UnknownProfilePolicy, ValidationOptions, Validator,
+    };
+    use std::sync::Arc;
+
+    const PROFILE_URL: &str = "http://example.org/StructureDefinition/mini-ordered-slicing";
+    const PATIENT_URL: &str = "http://hl7.org/fhir/StructureDefinition/Patient";
+
+    let profile = convert(&load_sd("mini-ordered-slicing.json"))
+        .expect("fixture converts")
+        .schema;
+
+    // Just enough of the base layer for the profile to resolve and walk.
+    let named = |v: Value| -> FhirSchema { serde_json::from_value(v).expect("schema parses") };
+    let patient = named(json!({
+        "kind": "resource", "type": "Patient",
+        "elements": {
+            "resourceType": { "type": "code" },
+            "telecom": { "type": "ContactPoint", "array": true }
+        }
+    }));
+    let mut registry = SchemaRegistry::new();
+    registry.insert_named("Patient", patient.clone());
+    registry.insert_named(PATIENT_URL, patient);
+    registry.insert_named(
+        "ContactPoint",
+        named(json!({ "kind": "complex-type", "elements": { "system": { "type": "code" } } })),
+    );
+    registry.insert_named("code", named(json!({ "kind": "primitive-type" })));
+    registry.insert_named(PROFILE_URL, profile);
+
+    let validator = Validator::new(Arc::new(registry));
+    let opts = ValidationOptions {
+        profiles: vec![PROFILE_URL.to_string()],
+        use_meta_profiles: true,
+        unknown_profile: UnknownProfilePolicy::Error,
+    };
+    let kinds = |data: &Value| -> Vec<String> {
+        validator
+            .validate_sync(data, &opts)
+            .errors
+            .iter()
+            .map(|e| {
+                serde_json::to_value(e).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+
+    // phone (order 0) before email (order 1): clean.
+    assert_eq!(
+        kinds(&json!({
+            "resourceType": "Patient",
+            "telecom": [{ "system": "phone" }, { "system": "email" }]
+        })),
+        Vec::<String>::new(),
+    );
+
+    // email before phone violates the declared order.
+    assert_eq!(
+        kinds(&json!({
+            "resourceType": "Patient",
+            "telecom": [{ "system": "email" }, { "system": "phone" }]
+        })),
+        vec!["slice-order".to_string()],
+    );
+}

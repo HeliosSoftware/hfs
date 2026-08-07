@@ -5,6 +5,7 @@
 //! derives every key shape used by the backend from a common base prefix.
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
 /// Keyspace builder for S3 object paths.
 ///
@@ -216,11 +217,15 @@ impl S3Keyspace {
     }
 
     /// Key for a single raw NDJSON line within a submission manifest.
+    ///
+    /// `file_url` names the manifest output file the line came from; see
+    /// [`submit_file_segment`] for why it is part of the key.
     pub fn submit_raw_line_key(
         &self,
         submitter: &str,
         submission_id: &str,
         manifest_id: &str,
+        file_url: Option<&str>,
         line: u64,
     ) -> String {
         self.join(&[
@@ -230,16 +235,21 @@ impl S3Keyspace {
             submission_id,
             "raw",
             manifest_id,
+            &submit_file_segment(file_url),
             &format!("line-{}.ndjson", line),
         ])
     }
 
     /// Key for the processing result of a single NDJSON line.
+    ///
+    /// `file_url` names the manifest output file the line came from; see
+    /// [`submit_file_segment`] for why it is part of the key.
     pub fn submit_result_line_key(
         &self,
         submitter: &str,
         submission_id: &str,
         manifest_id: &str,
+        file_url: Option<&str>,
         line: u64,
     ) -> String {
         self.join(&[
@@ -249,6 +259,7 @@ impl S3Keyspace {
             submission_id,
             "results",
             manifest_id,
+            &submit_file_segment(file_url),
             &format!("line-{}.json", line),
         ])
     }
@@ -304,11 +315,14 @@ impl S3Keyspace {
     /// `{digest}.json` leaf — and `purge_tenant_data` sweeps only those
     /// sub-prefixes, so it cannot delete a settings object either.
     ///
-    /// Do **not** weaken this to "tenant IDs cannot contain `.`". That is true of
-    /// the routing validators (`is_valid_tenant_id`), but *not* of
-    /// `admin_tenants::validate_tenant_id`, which permits `.` and `/`, nor of the
-    /// JWT tenant extractor, which validates nothing. The name is dotted to keep
-    /// it unroutable, but the safety of this namespace must not depend on that.
+    /// Do **not** weaken this to "tenant IDs cannot contain `.`". That was never
+    /// reliably true, and since issue #385 it is plainly false: the canonical
+    /// charset ([`TenantId::parse`](crate::tenant::TenantId::parse)) permits `.`
+    /// on every ingress, so `_system.user-settings` is a *well-formed* tenant id.
+    /// It is refused only because it is listed in
+    /// [`RESERVED_TENANT_SEGMENTS`](crate::tenant::RESERVED_TENANT_SEGMENTS) —
+    /// and that list is a guardrail, not this namespace's safety proof.
+    ///
     /// In particular, a future change that widened a tenant purge to sweep the
     /// whole tenant prefix would break the structural argument above and must
     /// exclude this namespace explicitly.
@@ -403,9 +417,43 @@ fn sanitize(value: &str) -> String {
 /// tenant is worth more here than fixed-length keys. Ids reaching this point are
 /// length-capped upstream, so S3's 1024-byte key limit is not a concern.
 ///
-/// Only `/` is reachable through the admin API's charset — `\` and space are
-/// already rejected there — so in practice this changes the key of exactly the
-/// hierarchical ids that were previously colliding.
+/// Only `/` is reachable through the canonical charset
+/// ([`TenantId::parse`](crate::tenant::TenantId::parse)) — `\`, space, and `%`
+/// are rejected on every ingress since issue #385 — so in practice this changes
+/// the key of exactly the hierarchical ids that were previously colliding. The
+/// `\`/space/`%` arms are kept anyway: this function's contract is to be
+/// injective for *any* input, so it does not inherit the validator's bounds.
+/// Escapes a manifest output file URL into one S3 key segment.
+///
+/// Line numbers restart at 1 in every output file of a manifest, so the file a
+/// line came from is part of that entry's identity. Without this segment the
+/// second file's line 1 silently overwrites the first file's (issue #457 — the
+/// SQL backends carry the same discriminator in the `bulk_entry_results`
+/// primary key, where the collision surfaces as a UNIQUE violation instead).
+///
+/// Hashed rather than escaped, for the reasons `settings_object_id` documents:
+/// the URL comes from a submitted manifest, is unbounded in length, and is full
+/// of `/` — so escaping it would risk both a lossy collision (the very bug this
+/// fixes) and a key that walks out of the manifest's prefix. The digest is over
+/// raw bytes, so no Unicode normalisation is applied: two URLs differing only in
+/// normalisation form get two prefixes, which is the fail-safe direction.
+///
+/// `None` — a `process_entries` call made outside any manifest file — yields an
+/// empty segment, which [`S3Keyspace::join`] drops, reproducing the pre-#457
+/// flat layout. That is deliberate on two counts: it mirrors the SQL backends'
+/// `''` default for the same case, and it leaves entry results written before
+/// this change readable, since they still sit under the `results/<manifest>/`
+/// prefix that `load_entry_results` sweeps recursively.
+fn submit_file_segment(file_url: Option<&str>) -> String {
+    match file_url {
+        Some(url) if !url.is_empty() => {
+            let digest = Sha256::digest(url.as_bytes());
+            digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+        _ => String::new(),
+    }
+}
+
 fn registry_object_id(tenant_id: &str) -> String {
     let mut out = String::with_capacity(tenant_id.len());
     for c in tenant_id.chars() {
@@ -423,6 +471,51 @@ fn registry_object_id(tenant_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Demonstrates the collision the canonical validator's per-segment reserved
+    /// list exists to prevent (issue #385), and pins that the validator prevents
+    /// it.
+    ///
+    /// `with_tenant_prefix` does not escape, so tenant `acme/resources` nests its
+    /// data at `acme/resources/resources/…` — *inside* the `acme/resources/`
+    /// prefix that tenant `acme` lists and that `purge_tenant_data("acme")`
+    /// deletes. This is a cross-tenant destructive collision, and it survives
+    /// entirely at the keyspace level: nothing here can tell the two apart.
+    ///
+    /// The fix is upstream — such an id can no longer be constructed — so this
+    /// test asserts both halves: the keyspace really does overlap, and
+    /// `TenantId::parse` really does refuse the id. If someone ever removes the
+    /// reserved segment, the second assertion fails and points at the first.
+    #[test]
+    fn hierarchical_id_naming_a_keyspace_namespace_would_overlap_its_parent() {
+        use crate::tenant::TenantId;
+
+        let base = S3Keyspace::new(None);
+        let parent = base.with_tenant_prefix("acme");
+        let nested = base.with_tenant_prefix("acme/resources");
+
+        // The overlap is real: everything the nested tenant writes sits under the
+        // prefix the parent sweeps.
+        let parent_scan = parent.resources_prefix();
+        assert!(
+            nested.resources_prefix().starts_with(&parent_scan),
+            "expected {} to sit inside {parent_scan}",
+            nested.resources_prefix()
+        );
+        assert!(
+            nested.history_root_prefix().starts_with(&parent_scan),
+            "expected {} to sit inside {parent_scan}",
+            nested.history_root_prefix()
+        );
+
+        // Which is why the id is unconstructible.
+        assert!(
+            TenantId::parse("acme/resources").is_err(),
+            "the reserved segment is what keeps the overlap unreachable"
+        );
+        // The parent itself stays perfectly valid.
+        assert!(TenantId::parse("acme").is_ok());
+    }
 
     /// The registry key establishes tenant identity: ids that a lossy sanitiser
     /// would collapse together must map to distinct objects. A collision here

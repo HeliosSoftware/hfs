@@ -9,6 +9,7 @@ const WCAG = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 const ROUTES = [
   "/ui",
   "/ui/resources",
+  "/ui/batch",
   "/ui/compartments",
   "/ui/search-parameters",
   "/ui/queries",
