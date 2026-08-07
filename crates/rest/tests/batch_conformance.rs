@@ -809,3 +809,102 @@ mod transaction_errors {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 }
+
+/// #459: conditional references (`Type?query`) resolve against the server's
+/// content before the transaction executes — exactly one match rewrites the
+/// reference; zero or several reject the bundle. They used to be stored
+/// verbatim, unsearchable and unresolvable.
+mod conditional_references {
+    use super::*;
+
+    async fn seed_location(backend: &SqliteBackend, id: &str, ident: &str) {
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Location",
+                json!({
+                    "resourceType": "Location",
+                    "id": id,
+                    "status": "active",
+                    "name": format!("Location {id}"),
+                    "identifier": [{"system": "https://example.org/locs", "value": ident}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed location");
+    }
+
+    fn immunization_bundle() -> serde_json::Value {
+        json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [{
+                "fullUrl": "urn:uuid:11111111-1111-1111-1111-111111111111",
+                "resource": {
+                    "resourceType": "Immunization",
+                    "status": "completed",
+                    "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "140"}]},
+                    "patient": {"reference": "Patient/p1"},
+                    "occurrenceDateTime": "2020-01-01",
+                    "location": {"reference": "Location?identifier=https://example.org/locs|loc-a"}
+                },
+                "request": {"method": "POST", "url": "Immunization"}
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_unique_match_is_rewritten_into_storage() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "CondRef").await;
+        seed_location(&backend, "loc-1", "loc-a").await;
+
+        let response = server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&immunization_bundle())
+            .await;
+        response.assert_status_ok();
+
+        let stored = server
+            .get("/Immunization?_count=5")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        let body: serde_json::Value = stored.json();
+        let imm = &body["entry"][0]["resource"];
+        assert_eq!(
+            imm["location"]["reference"], "Location/loc-1",
+            "the conditional reference is resolved, not stored verbatim: {imm}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_match_rejects_the_bundle() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "CondRef").await;
+
+        let response = server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&immunization_bundle())
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_match_rejects_the_bundle() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "CondRef").await;
+        seed_location(&backend, "loc-1", "loc-a").await;
+        seed_location(&backend, "loc-2", "loc-a").await;
+
+        let response = server
+            .post("/")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&immunization_bundle())
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+}
