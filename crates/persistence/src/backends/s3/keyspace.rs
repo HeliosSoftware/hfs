@@ -33,13 +33,68 @@ impl S3Keyspace {
     /// Returns a new keyspace with `tenant_id` appended to the base prefix.
     ///
     /// Used in `PrefixPerTenant` mode to scope all keys under a per-tenant
-    /// directory segment without changing the bucket.
+    /// directory segment without changing the bucket. This is the *only* place
+    /// a tenant id becomes a data-key location, reached through the single
+    /// funnel `S3Backend::tenant_location`, so the two guarantees below are
+    /// what tenant isolation on S3 rests on.
+    ///
+    /// # Guarantees
+    ///
+    /// 1. **Injective** — distinct ids yield distinct prefixes.
+    /// 2. **Prefix-disjoint** — no tenant's *sweep* prefix
+    ///    (`{prefix}/resources/`, `{prefix}/history/`, `{prefix}/bulk/`) is a
+    ///    prefix of another tenant's keys.
+    ///
+    /// Both are needed, and neither implies the other. (1) alone would still let
+    /// a tenant named `acme/resources` nest its whole keyspace inside the prefix
+    /// `acme` sweeps; (2) alone would still let `/a` and `a` share one prefix.
+    ///
+    /// # Why this is not a plain escape of the whole id
+    ///
+    /// S3 is the **system of record**, not a derived index: there is no
+    /// `$reindex`-equivalent that could rebuild objects at a new key. A
+    /// derivation change does not move objects — it makes the old ones
+    /// unreachable, and a later `purge_tenant_data` will not reach them either.
+    /// So the derivation escapes exactly the ids that are *not already safe* and
+    /// is the **identity** for every id that is:
+    ///
+    /// | tenant id | before | after |
+    /// |---|---|---|
+    /// | `acme`            | `acme`            | `acme` (unchanged) |
+    /// | `acme/research`   | `acme/research`   | `acme/research` (unchanged) |
+    /// | `__system__`      | `__system__`      | `__system__` (unchanged) |
+    /// | `/acme`           | `acme` ⚠ shared   | `%2Facme` |
+    /// | `acme/`           | `acme` ⚠ shared   | `acme%2F` |
+    /// | `//acme`          | `acme` ⚠ shared   | `%2F%2Facme` |
+    /// | `acme/resources`  | `acme/resources` ⚠ inside `acme`'s sweep | `acme%2Fresources` |
+    ///
+    /// Every id whose prefix moves is one whose objects are *currently*
+    /// commingled with another tenant's, or sitting inside another tenant's
+    /// purge radius. There is no coherent single-tenant dataset at the old
+    /// location to preserve — relocating it **is** the remediation. Every id a
+    /// deployment can already be storing safely keeps its exact prefix, so an
+    /// upgrade moves nothing that was working. See issue #447.
+    ///
+    /// # Why the guarantees hold
+    ///
+    /// [`is_keyspace_safe`] rejects any id containing a character
+    /// [`registry_object_id`] escapes (`%`, `\`, space) and any id whose
+    /// structure is unsafe (an empty segment, or a sweep-root segment after the
+    /// first) — and every such structural defect implies the id contains `/`.
+    /// So an escaped prefix always contains `%`, and a safe prefix never can:
+    /// the two ranges are disjoint, and each mapping is injective on its own
+    /// domain, giving (1). For (2), an escaped prefix contains no `/` at all and
+    /// so cannot end in `/{sweep-root}`, while a safe prefix is barred from a
+    /// non-first sweep-root segment by construction.
     pub fn with_tenant_prefix(&self, tenant_id: &str) -> Self {
-        let tenant = tenant_id.trim_matches('/');
+        let tenant = tenant_prefix_component(tenant_id);
         let merged = match &self.base_prefix {
             Some(base) => format!("{}/{}", base, tenant),
-            None => tenant.to_string(),
+            None => tenant,
         };
+        // `new`'s slash trim is a no-op on the tenant component by construction
+        // (a safe id has no empty segment, an escaped one has no `/`), so it can
+        // no longer erase the distinction between `a`, `/a`, `a/`, and `//a`.
         Self::new(Some(merged))
     }
 
@@ -405,24 +460,6 @@ fn sanitize(value: &str) -> String {
         .collect()
 }
 
-/// Escapes a tenant id into a single, injective S3 key segment.
-///
-/// Unlike [`sanitize`], distinct ids always produce distinct segments, so this
-/// is safe for a key that establishes identity. `%` is escaped first so the
-/// mapping stays reversible and no other escape can be forged; `/`, `\`, and
-/// space — the characters `sanitize` collapses — follow.
-///
-/// Percent-encoding rather than a hash (as `settings_object_id` uses) because a
-/// tenant id is validated and non-secret, and keeping the bucket greppable by
-/// tenant is worth more here than fixed-length keys. Ids reaching this point are
-/// length-capped upstream, so S3's 1024-byte key limit is not a concern.
-///
-/// Only `/` is reachable through the canonical charset
-/// ([`TenantId::parse`](crate::tenant::TenantId::parse)) — `\`, space, and `%`
-/// are rejected on every ingress since issue #385 — so in practice this changes
-/// the key of exactly the hierarchical ids that were previously colliding. The
-/// `\`/space/`%` arms are kept anyway: this function's contract is to be
-/// injective for *any* input, so it does not inherit the validator's bounds.
 /// Escapes a manifest output file URL into one S3 key segment.
 ///
 /// Line numbers restart at 1 in every output file of a manifest, so the file a
@@ -454,6 +491,28 @@ fn submit_file_segment(file_url: Option<&str>) -> String {
     }
 }
 
+/// Escapes a tenant id into a single, injective S3 key segment.
+///
+/// Unlike [`sanitize`], distinct ids always produce distinct segments, so this
+/// is safe for a key that establishes identity. `%` is escaped first so the
+/// mapping stays reversible and no other escape can be forged; `/`, `\`, and
+/// space — the characters `sanitize` collapses — follow.
+///
+/// Used for the tenant registry key and, for the ids [`is_keyspace_safe`]
+/// rejects, for the tenant data prefix as well — see
+/// [`S3Keyspace::with_tenant_prefix`] for why the latter is conditional.
+///
+/// Percent-encoding rather than a hash (as `settings_object_id` uses) because a
+/// tenant id is validated and non-secret, and keeping the bucket greppable by
+/// tenant is worth more here than fixed-length keys. Ids reaching this point are
+/// length-capped upstream, so S3's 1024-byte key limit is not a concern.
+///
+/// Only `/` is reachable through the canonical charset
+/// ([`TenantId::parse`](crate::tenant::TenantId::parse)) — `\`, space, and `%`
+/// are rejected on every ingress since issue #385 — so in practice this changes
+/// the key of exactly the hierarchical ids that were previously colliding. The
+/// `\`/space/`%` arms are kept anyway: this function's contract is to be
+/// injective for *any* input, so it does not inherit the validator's bounds.
 fn registry_object_id(tenant_id: &str) -> String {
     let mut out = String::with_capacity(tenant_id.len());
     for c in tenant_id.chars() {
@@ -468,50 +527,409 @@ fn registry_object_id(tenant_id: &str) -> String {
     out
 }
 
+/// Path segments the keyspace reserves *beneath* a tenant prefix.
+///
+/// These are the roots every tenant-scoped key hangs off, and — the reason they
+/// matter here — the prefixes `S3Backend::purge_tenant_data` sweeps and
+/// `list_current_keys` enumerates. A tenant whose id carried one of these as a
+/// later segment would place its entire keyspace *inside* another tenant's
+/// radius: tenant `acme` sweeps `acme/resources/`, which contains every object
+/// of a tenant literally named `acme/resources` — a cross-tenant purge, and a
+/// cross-tenant read, since `list_current_keys` selects on `/current.json`
+/// anywhere under the prefix.
+///
+/// `tenants` and `_system.user-settings` are deliberately absent: those live on
+/// the *base* keyspace, never under a tenant prefix, and are already protected
+/// structurally by the direct-child filter in `list_tenants` and the digest leaf
+/// in `user_settings_key` (see [`S3Keyspace::tenant_registry_prefix`], #271).
+/// Adding them here would relocate a top-level tenant named `tenants` for no
+/// gain.
+const SWEEP_ROOT_SEGMENTS: [&str; 3] = ["resources", "history", "bulk"];
+
+/// Prefix component standing in for the empty tenant id.
+///
+/// `registry_object_id("")` is `""`, which would collapse the tenant prefix into
+/// the *base* keyspace — the one namespace no tenant may occupy. A bare `%` is
+/// used instead: [`registry_object_id`] emits `%` only as the first byte of a
+/// three-byte escape, so no non-empty id can produce it, and [`is_keyspace_safe`]
+/// bars `%` from every unescaped prefix. The empty id is unreachable through
+/// every ingress today; this exists so the derivation is total and disjoint
+/// without depending on that.
+const EMPTY_TENANT_PREFIX: &str = "%";
+
+/// Whether `tenant_id` can be used verbatim as its tenant prefix component.
+///
+/// This is deliberately the **complement of "currently broken"**: an id is unsafe
+/// exactly when using it raw would either collide with another id's prefix or
+/// nest inside another tenant's sweep radius. Keeping the predicate that tight is
+/// what makes [`S3Keyspace::with_tenant_prefix`] an identity for every id a
+/// deployment can already be storing safely — see that function for why moving
+/// objects on a system of record is the cost that governs this design.
+///
+/// Do **not** widen this into a general tenant-id validator. It answers one
+/// question — "is this id safe as an S3 key prefix?" — and nothing here may
+/// depend on ingress validation having run: `purge_tenant_data` constructs its
+/// `TenantId` directly from an operator-supplied path segment, with no validator
+/// in the path. (The canonical ingress validator is issue #385 / PR #450; it
+/// bounds the input, it does not make a lossy mapping safe.)
+fn is_keyspace_safe(tenant_id: &str) -> bool {
+    // The empty id has no prefix of its own; see `EMPTY_TENANT_PREFIX`.
+    if tenant_id.is_empty() {
+        return false;
+    }
+    // Exactly the characters `registry_object_id` escapes. Barring them from the
+    // unescaped range is what keeps the two ranges disjoint, and hence the whole
+    // derivation injective.
+    if tenant_id.contains(['%', '\\', ' ']) {
+        return false;
+    }
+
+    let mut segments = tenant_id.split('/');
+    // An empty first segment is a leading `/` — the many-to-one case issue #447
+    // is named for (`a`, `/a`, `a/`, `//a` all trimmed to `a`).
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    if first.is_empty() {
+        return false;
+    }
+    for segment in segments {
+        // Empty: a trailing or repeated `/`.
+        if segment.is_empty() {
+            return false;
+        }
+        // A sweep root anywhere but the first segment nests this tenant inside
+        // the parent id's purge/list radius. The first segment is exempt: it
+        // sits directly under the base prefix, where nothing sweeps a bare
+        // `resources/`, so a top-level tenant named `resources` is harmless and
+        // must not be relocated.
+        if SWEEP_ROOT_SEGMENTS.contains(&segment) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Derives the tenant's prefix component: the id itself when
+/// [`is_keyspace_safe`], otherwise one opaque [`registry_object_id`] segment.
+fn tenant_prefix_component(tenant_id: &str) -> String {
+    if is_keyspace_safe(tenant_id) {
+        return tenant_id.to_string();
+    }
+    let escaped = registry_object_id(tenant_id);
+    if escaped.is_empty() {
+        return EMPTY_TENANT_PREFIX.to_string();
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Demonstrates the collision the canonical validator's per-segment reserved
-    /// list exists to prevent (issue #385), and pins that the validator prevents
-    /// it.
+    // ── Tenant prefix derivation (issue #447) ──────────────────────────────
+    //
+    // `with_tenant_prefix` is the single derivation every S3 data key passes
+    // through, so these are property assertions over an adversarial corpus
+    // rather than example-by-example checks: the properties are what tenant
+    // isolation rests on, and a new id shape should be added to the corpus
+    // rather than given its own test.
+
+    /// Ids that collided under the old `trim_matches('/')`, ids that nested
+    /// inside another tenant's sweep radius, ordinary ids that must not move,
+    /// and forged-escape attempts.
+    const TENANT_ID_CORPUS: &[&str] = &[
+        // Ordinary ids — the derivation must be the identity for these.
+        "default",
+        "acme",
+        "__system__",
+        "acme-research",
+        "tenant_123",
+        "acme.org",
+        "acme/research",
+        "acme/research/oncology",
+        // Slash padding: all of these trimmed to `acme` before the fix.
+        "/acme",
+        "acme/",
+        "//acme",
+        "acme//",
+        "/acme/",
+        "acme//research",
+        // Nested inside a parent tenant's purge/list radius.
+        "acme/resources",
+        "acme/history",
+        "acme/bulk",
+        "acme/research/resources",
+        // Top-level namespace names: harmless (nothing sweeps a bare
+        // `resources/`), so these must NOT be relocated.
+        "resources",
+        "history",
+        "bulk",
+        "tenants",
+        // Characters the escape itself uses — a literal must not be able to
+        // forge another id's escaped form.
+        "%2Facme",
+        "acme%2Fresearch",
+        "acme%25",
+        "acme\\research",
+        "acme research",
+        // Degenerate.
+        "",
+    ];
+
+    /// The subset of the corpus that must round-trip unchanged. Anything here
+    /// that started moving would be silent data loss on upgrade: S3 is the
+    /// system of record and there is no `$reindex` to rebuild objects at a new
+    /// key. `__system__` in particular holds every shared terminology resource.
+    const UNCHANGED_TENANT_IDS: &[&str] = &[
+        "default",
+        "acme",
+        "__system__",
+        "acme-research",
+        "tenant_123",
+        "acme.org",
+        "acme/research",
+        "acme/research/oncology",
+        "resources",
+        "history",
+        "bulk",
+        "tenants",
+    ];
+
+    /// Every key a tenant can write, for prefix-containment checks.
+    fn sample_keys(ks: &S3Keyspace) -> Vec<String> {
+        vec![
+            ks.current_resource_key("Patient", "p1"),
+            ks.history_version_key("Patient", "p1", "2"),
+            ks.resource_type_prefix("Patient"),
+            ks.history_system_prefix(),
+            ks.submit_state_key("submitter", "sub-1"),
+        ]
+    }
+
+    /// The prefixes a tenant sweeps on purge / enumerates on list. Anything of
+    /// another tenant's underneath one of these is a cross-tenant purge and a
+    /// cross-tenant read.
+    fn sweep_prefixes(ks: &S3Keyspace) -> Vec<String> {
+        vec![
+            ks.resources_prefix(),
+            ks.history_root_prefix(),
+            ks.submit_root_prefix(),
+        ]
+    }
+
+    /// Guarantee 1: distinct tenant ids never share a prefix.
     ///
-    /// `with_tenant_prefix` does not escape, so tenant `acme/resources` nests its
-    /// data at `acme/resources/resources/…` — *inside* the `acme/resources/`
-    /// prefix that tenant `acme` lists and that `purge_tenant_data("acme")`
-    /// deletes. This is a cross-tenant destructive collision, and it survives
-    /// entirely at the keyspace level: nothing here can tell the two apart.
-    ///
-    /// The fix is upstream — such an id can no longer be constructed — so this
-    /// test asserts both halves: the keyspace really does overlap, and
-    /// `TenantId::parse` really does refuse the id. If someone ever removes the
-    /// reserved segment, the second assertion fails and points at the first.
+    /// Before the fix `trim_matches('/')` made this many-to-one — `acme`,
+    /// `/acme`, `acme/` and `//acme` all resolved to `acme`, so the registry
+    /// held four tenants while the keyspace held one (issue #447).
     #[test]
-    fn hierarchical_id_naming_a_keyspace_namespace_would_overlap_its_parent() {
+    fn tenant_prefix_derivation_is_injective() {
+        for base in [None, Some("hfs".to_string())] {
+            let ks = S3Keyspace::new(base.clone());
+            for (i, x) in TENANT_ID_CORPUS.iter().enumerate() {
+                for y in TENANT_ID_CORPUS.iter().skip(i + 1) {
+                    assert_ne!(
+                        ks.with_tenant_prefix(x).resources_prefix(),
+                        ks.with_tenant_prefix(y).resources_prefix(),
+                        "tenants {x:?} and {y:?} share a data prefix (base={base:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Guarantee 2: no tenant's sweep prefix covers another tenant's keys.
+    ///
+    /// Injectivity alone does not give this. Tenant `acme/resources` has a
+    /// prefix all its own, yet every one of its objects used to sit under
+    /// `acme/resources/` — exactly what `purge_tenant_data("acme")` deletes and
+    /// `list_current_keys` enumerates.
+    #[test]
+    fn no_tenant_sweep_prefix_covers_another_tenants_keys() {
+        for base in [None, Some("hfs".to_string())] {
+            let ks = S3Keyspace::new(base.clone());
+            for x in TENANT_ID_CORPUS {
+                for y in TENANT_ID_CORPUS {
+                    if x == y {
+                        continue;
+                    }
+                    let victim = ks.with_tenant_prefix(y);
+                    for prefix in sweep_prefixes(&ks.with_tenant_prefix(x)) {
+                        for key in sample_keys(&victim) {
+                            assert!(
+                                !key.starts_with(&prefix),
+                                "tenant {x:?} sweeping {prefix:?} would reach \
+                                 tenant {y:?}'s key {key:?} (base={base:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The derivation is the identity for every id that is already safe, so an
+    /// upgrade relocates no object that was working. This is the constraint that
+    /// ruled out escaping the whole id unconditionally.
+    #[test]
+    fn safe_tenant_ids_keep_their_existing_prefix() {
+        for base in [None, Some("hfs".to_string())] {
+            let ks = S3Keyspace::new(base.clone());
+            for id in UNCHANGED_TENANT_IDS {
+                let expected = match &base {
+                    Some(b) => format!("{b}/{id}/resources/"),
+                    None => format!("{id}/resources/"),
+                };
+                assert_eq!(
+                    ks.with_tenant_prefix(id).resources_prefix(),
+                    expected,
+                    "id {id:?} must keep its pre-fix prefix (base={base:?})"
+                );
+            }
+        }
+    }
+
+    /// The ids that *do* move, and where to. These are exactly the ids whose
+    /// objects are currently commingled with another tenant's or sitting inside
+    /// another tenant's purge radius, so relocating them is the remediation —
+    /// there is no coherent single-tenant dataset at the old location.
+    #[test]
+    fn unsafe_tenant_ids_move_to_one_escaped_segment() {
+        let ks = S3Keyspace::new(None);
+        for (id, expected) in [
+            ("/acme", "%2Facme"),
+            ("acme/", "acme%2F"),
+            ("//acme", "%2F%2Facme"),
+            ("acme/resources", "acme%2Fresources"),
+            ("acme//research", "acme%2F%2Fresearch"),
+            ("acme\\research", "acme%5Cresearch"),
+            ("acme research", "acme%20research"),
+            ("%2Facme", "%252Facme"),
+            ("", "%"),
+        ] {
+            assert_eq!(
+                ks.with_tenant_prefix(id).resources_prefix(),
+                format!("{expected}/resources/"),
+                "id {id:?}"
+            );
+        }
+    }
+
+    /// The escape must not be forgeable: a tenant whose id is the literal text
+    /// `%2Facme` must not land where `/acme` lands. `%` is escaped first, which
+    /// is what makes the mapping reversible.
+    #[test]
+    fn an_escaped_prefix_cannot_be_forged_by_a_literal() {
+        let ks = S3Keyspace::new(None);
+        assert_ne!(
+            ks.with_tenant_prefix("/acme").resources_prefix(),
+            ks.with_tenant_prefix("%2Facme").resources_prefix(),
+        );
+        assert_ne!(
+            ks.with_tenant_prefix("acme/resources").resources_prefix(),
+            ks.with_tenant_prefix("acme%2Fresources").resources_prefix(),
+        );
+    }
+
+    /// The empty id must not collapse into the base keyspace, where the tenant
+    /// registry and the user-settings store live.
+    #[test]
+    fn the_empty_tenant_id_does_not_become_the_base_keyspace() {
+        for base in [None, Some("hfs".to_string())] {
+            let ks = S3Keyspace::new(base);
+            assert_ne!(
+                ks.with_tenant_prefix("").resources_prefix(),
+                ks.resources_prefix(),
+            );
+            assert_ne!(
+                ks.with_tenant_prefix("").tenant_registry_prefix(),
+                ks.tenant_registry_prefix(),
+            );
+        }
+    }
+
+    /// The headline scenario from issue #447, stated as the operator sees it:
+    /// purging `/acme` must not touch `acme`'s resources or its version history.
+    #[test]
+    fn purging_a_slash_padded_id_no_longer_reaches_the_bare_id() {
+        let ks = S3Keyspace::new(None);
+        let padded = ks.with_tenant_prefix("/acme");
+        let bare = ks.with_tenant_prefix("acme");
+
+        for prefix in sweep_prefixes(&padded) {
+            for key in sample_keys(&bare) {
+                assert!(
+                    !key.starts_with(&prefix),
+                    "purging `/acme` ({prefix}) would delete `acme`'s {key}"
+                );
+            }
+        }
+    }
+
+    /// `is_keyspace_safe` is the whole rule; assert it directly so a change to
+    /// the predicate has to confront each clause.
+    #[test]
+    fn keyspace_safety_predicate_clauses() {
+        // Ordinary and hierarchical ids are safe.
+        assert!(is_keyspace_safe("acme"));
+        assert!(is_keyspace_safe("acme/research"));
+        assert!(is_keyspace_safe("__system__"));
+        // Empty segments — leading, trailing, repeated.
+        assert!(!is_keyspace_safe("/acme"));
+        assert!(!is_keyspace_safe("acme/"));
+        assert!(!is_keyspace_safe("//acme"));
+        assert!(!is_keyspace_safe("acme//research"));
+        assert!(!is_keyspace_safe(""));
+        // Characters the escape uses.
+        assert!(!is_keyspace_safe("acme%25"));
+        assert!(!is_keyspace_safe("acme\\research"));
+        assert!(!is_keyspace_safe("acme research"));
+        // Sweep roots after the first segment.
+        for ns in SWEEP_ROOT_SEGMENTS {
+            assert!(!is_keyspace_safe(&format!("acme/{ns}")));
+            assert!(!is_keyspace_safe(&format!("acme/research/{ns}")));
+            // ...but harmless as the first segment: nothing sweeps a bare
+            // `resources/`, so a top-level tenant so named must not move.
+            assert!(is_keyspace_safe(ns));
+            assert!(is_keyspace_safe(&format!("{ns}/acme")));
+        }
+    }
+
+    /// The `acme/resources` overlap (issue #385) is now closed at *both* layers,
+    /// and neither layer is redundant.
+    ///
+    /// Upstream, `TenantId::parse`'s per-segment reserved list means such an id
+    /// can no longer be minted. Downstream, this file's derivation escapes it, so
+    /// the keyspace does not overlap even for an id already sitting in a registry
+    /// — which matters, because `purge_tenant_data` builds its `TenantId` from an
+    /// operator-supplied path segment with no validator in the way (issue #447).
+    ///
+    /// Asserting both halves together is what keeps either from being quietly
+    /// dropped on the grounds that "the other layer covers it".
+    #[test]
+    fn hierarchical_id_naming_a_keyspace_namespace_cannot_overlap_its_parent() {
         use crate::tenant::TenantId;
 
         let base = S3Keyspace::new(None);
         let parent = base.with_tenant_prefix("acme");
         let nested = base.with_tenant_prefix("acme/resources");
 
-        // The overlap is real: everything the nested tenant writes sits under the
-        // prefix the parent sweeps.
-        let parent_scan = parent.resources_prefix();
-        assert!(
-            nested.resources_prefix().starts_with(&parent_scan),
-            "expected {} to sit inside {parent_scan}",
-            nested.resources_prefix()
-        );
-        assert!(
-            nested.history_root_prefix().starts_with(&parent_scan),
-            "expected {} to sit inside {parent_scan}",
-            nested.history_root_prefix()
-        );
+        // The keyspace layer: nothing the nested tenant writes sits under a
+        // prefix the parent sweeps or enumerates.
+        for prefix in sweep_prefixes(&parent) {
+            for key in sample_keys(&nested) {
+                assert!(
+                    !key.starts_with(&prefix),
+                    "expected {key} to sit outside {prefix}"
+                );
+            }
+        }
 
-        // Which is why the id is unconstructible.
+        // The validator layer: the id cannot be minted in the first place.
         assert!(
             TenantId::parse("acme/resources").is_err(),
-            "the reserved segment is what keeps the overlap unreachable"
+            "the reserved segment is what keeps the id unmintable"
         );
         // The parent itself stays perfectly valid.
         assert!(TenantId::parse("acme").is_ok());

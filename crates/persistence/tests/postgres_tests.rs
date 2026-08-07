@@ -21,6 +21,12 @@ use helios_persistence::core::BackendKind;
 #[path = "transactions/if_match_suite.rs"]
 mod if_match_suite;
 
+/// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
+/// verbatim with the SQLite and MongoDB suites. Declared at the top level for
+/// the same `#[path]` resolution reason as `if_match_suite` above.
+#[path = "multitenancy/tenant_id_fidelity_suite.rs"]
+mod tenant_id_fidelity_suite;
+
 /// The backend-agnostic full-text purge-completeness scenarios (issue #386),
 /// shared verbatim with the SQLite suite that owns the file.
 ///
@@ -5452,6 +5458,49 @@ mod postgres_integration {
             &probe,
             &tenant,
             &reindex,
+        )
+        .await;
+    }
+
+    // ========================================================================
+    // Issue #447 — tenant-id fidelity, on a real PostgreSQL instance
+    //
+    // The #447 defect is S3's: it *derives* a key prefix from the tenant id and
+    // the derivation was many-to-one. PostgreSQL derives nothing — `tenant_id`
+    // is a `TEXT` column in each composite primary key, bound and compared with
+    // `=` — so the scoping is the identity mapping and the defect cannot occur
+    // here.
+    //
+    // That is a code reading, and a code reading is precisely what let the same
+    // defect class sit undiscovered in the two backends that *do* derive (#384
+    // on Elasticsearch, #447 on S3). So it is checked rather than asserted in
+    // prose, against a real server: bound parameters, collation, and index
+    // behaviour are properties of the engine, not of the Rust.
+    //
+    // Each test takes a unique base id — the whole binary shares one container
+    // database, and the scenarios derive fixed resource ids from it.
+    // ========================================================================
+
+    fn unique_base(label: &str) -> String {
+        format!("{}_{}", label, uuid::Uuid::new_v4().simple())
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_distinct_tenant_ids_never_share_data() {
+        let backend = create_backend().await;
+        super::tenant_id_fidelity_suite::distinct_tenant_ids_never_share_data(
+            &backend,
+            &unique_base("fidelity"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_purging_one_tenant_leaves_the_look_alikes_intact() {
+        let backend = create_backend().await;
+        super::tenant_id_fidelity_suite::purging_one_tenant_leaves_the_look_alikes_intact(
+            &backend,
+            &unique_base("fidelity_purge"),
         )
         .await;
     }
