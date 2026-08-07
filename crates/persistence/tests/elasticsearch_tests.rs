@@ -421,11 +421,15 @@ mod parameter_handler_tests {
         }
 
         #[test]
-        fn test_not_modifier() {
+        fn test_not_modifier_builds_positive_clause() {
+            // The negation is applied once by the query builder, around the OR
+            // of every value (#473) — the per-value clause stays positive.
             let param = make_param("gender", SearchParamType::Token, Some(SearchModifier::Not));
             let clause = token::build_clause(&param, "male").unwrap();
             let s = serde_json::to_string(&clause).unwrap();
-            assert!(s.contains("must_not"));
+            assert!(!s.contains("must_not"));
+            assert!(s.contains("search_params.token.code"));
+            assert!(s.contains("male"));
         }
 
         #[test]
@@ -2092,6 +2096,119 @@ mod es_integration {
             result.resources.items.len(),
             2,
             "Should find 2 patients with code 12345"
+        );
+    }
+
+    /// `:not` means "no value of the parameter matches" (#473). Three cases
+    /// that a per-value or per-row negation gets wrong:
+    /// resources whose element is absent must be returned; a multi-valued
+    /// element must not leak back in through its other values; and `:not=a,b`
+    /// is `NOT (a OR b)`, not `NOT a OR NOT b`.
+    #[tokio::test]
+    async fn es_integration_search_token_not_modifier() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        let communication = |codes: &[&str]| {
+            codes
+                .iter()
+                .map(|code| {
+                    json!({ "language": { "coding": [{
+                        "system": "urn:ietf:bcp:47",
+                        "code": code
+                    }]}})
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (id, langs) in [
+            ("lang-en", vec!["en-US"]),
+            // Multi-valued: holds the excluded code AND another one.
+            ("lang-en-es", vec!["en-US", "es"]),
+            ("lang-fr", vec!["fr"]),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "communication": communication(&langs)
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // No communication element at all — has no value, so it matches :not.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "lang-none" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = |values: Vec<SearchValue>| {
+            SearchQuery::new("Patient")
+                .with_parameter(SearchParameter {
+                    name: "language".to_string(),
+                    param_type: SearchParamType::Token,
+                    modifier: Some(SearchModifier::Not),
+                    values,
+                    chain: vec![],
+                    components: vec![],
+                })
+                .with_count(100)
+        };
+
+        let ids = |result: &helios_persistence::core::SearchResult| {
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let result = backend
+            .search(&tenant, &query(vec![SearchValue::token(None, "en-US")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&result),
+            vec!["lang-fr", "lang-none"],
+            "language:not=en-US excludes both en-US patients (incl. the one that also has 'es') \
+             and returns the patient with no communication element"
+        );
+
+        let result = backend
+            .search(
+                &tenant,
+                &query(vec![
+                    SearchValue::token(None, "en-US"),
+                    SearchValue::token(None, "fr"),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&result),
+            vec!["lang-none"],
+            "language:not=en-US,fr is NOT (en-US OR fr) — only the patient with no language remains"
         );
     }
 
