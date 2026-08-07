@@ -317,6 +317,7 @@ impl BulkSubmitProvider for S3Backend {
 
         let mut results = Vec::new();
         let mut error_count = 0u32;
+        let file_url = options.file_url.as_deref();
 
         for entry in entries {
             if options.max_errors > 0 && error_count >= options.max_errors {
@@ -334,13 +335,19 @@ impl BulkSubmitProvider for S3Backend {
                     &entry.resource_type,
                     "max errors exceeded",
                 );
-                self.persist_entry_result(&location, submission_id, manifest_id, &skipped)
-                    .await?;
+                self.persist_entry_result(
+                    &location,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &skipped,
+                )
+                .await?;
                 results.push(skipped);
                 continue;
             }
 
-            self.persist_raw_entry(&location, submission_id, manifest_id, &entry)
+            self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
                 .await?;
 
             let result = match self
@@ -359,7 +366,7 @@ impl BulkSubmitProvider for S3Backend {
                 error_count += 1;
             }
 
-            self.persist_entry_result(&location, submission_id, manifest_id, &result)
+            self.persist_entry_result(&location, submission_id, manifest_id, file_url, &result)
                 .await?;
             results.push(result);
         }
@@ -747,19 +754,23 @@ impl S3Backend {
 
     /// Archives the raw NDJSON payload for a single entry to S3.
     ///
-    /// Stored under `raw/<manifest>/<line>.ndjson` so that the original data
-    /// is preserved for auditing after ingestion.
+    /// Stored under `raw/<manifest>/<file>/<line>.ndjson` so that the original
+    /// data is preserved for auditing after ingestion. `file_url` is the
+    /// manifest output file the line came from, and is required for the same
+    /// reason it is on [`Self::persist_entry_result`].
     async fn persist_raw_entry(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,
         manifest_id: &str,
+        file_url: Option<&str>,
         entry: &NdjsonEntry,
     ) -> StorageResult<()> {
         let key = location.keyspace.submit_raw_line_key(
             &submission_id.submitter,
             &submission_id.submission_id,
             manifest_id,
+            file_url,
             entry.line_number,
         );
 
@@ -783,17 +794,25 @@ impl S3Backend {
     }
 
     /// Persists the processing result for a single entry to S3.
+    ///
+    /// `file_url` is the manifest output file the line came from. It is part of
+    /// the key because line numbers restart in every file, so without it the
+    /// results of a multi-file manifest overwrite each other — the S3 shape of
+    /// issue #457, silent here because a `PutObject` has no primary key to
+    /// violate.
     async fn persist_entry_result(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,
         manifest_id: &str,
+        file_url: Option<&str>,
         result: &BulkEntryResult,
     ) -> StorageResult<()> {
         let key = location.keyspace.submit_result_line_key(
             &submission_id.submitter,
             &submission_id.submission_id,
             manifest_id,
+            file_url,
             result.line_number,
         );
         let payload = self.serialize_json(result)?;
