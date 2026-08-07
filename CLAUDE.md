@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Workspace Structure
 
-The project is a Rust workspace with 19 crates (18 default-members; `pysof` excluded from the default build):
+The project is a Rust workspace with 20 crates (19 default-members; `pysof` excluded from the default build):
 
 | Crate | Description |
 |-------|-------------|
@@ -27,7 +27,8 @@ The project is a Rust workspace with 19 crates (18 default-members; `pysof` excl
 | **`helios-audit`** | Audit logging — FHIR AuditEvent with IHE BALP profiles; pluggable sinks (database, file, CloudWatch, S3). Configured via `HFS_AUDIT_*`. |
 | **`helios-subscriptions`** | FHIR topic-based Subscriptions engine — rest-hook, websocket, email, and messaging channels. Configured via `HFS_SUBSCRIPTION(S)_*`. |
 | **`helios-cds-hooks`** | CDS Hooks protocol types and async service trait (HL7 CDS Hooks v3.0.0-ballot). Standalone library. |
-| **`helios-web`** | HTMX-first web UI foundation for HFS. |
+| **`helios-observability`** | Shared observability wiring (uptime, Prometheus `/metrics`, OTLP traces) for Helios servers. |
+| **`helios-ui`** (`crates/ui`) | Optional server-rendered HTMX web UI for HFS — Askama templates, vendored/pinned htmx, vanilla JS assets, no SPA framework and no runtime CDN. |
 | **`pysof`** | Python bindings (PyO3/maturin) for SQL-on-FHIR. Excluded from default workspace build. |
 
 ### Binaries
