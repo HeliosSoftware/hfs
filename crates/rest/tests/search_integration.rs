@@ -2578,6 +2578,76 @@ mod summary_count {
     }
 }
 
+// ============================================================================
+// Meta Parameter Tests (_tag / _profile / _security, #474)
+// ============================================================================
+
+mod meta_params {
+    use super::*;
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+
+    async fn seed_tagged_patient(backend: &SqliteBackend) {
+        let tenant = TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let tagged = json!({
+            "resourceType": "Patient",
+            "meta": {
+                "tag": [{"system": "http://example.org/tags", "code": "test-data"}],
+                "profile": ["http://example.org/StructureDefinition/custom-patient"]
+            },
+            "name": [{"family": "Tagged"}]
+        });
+        backend
+            .create(&tenant, "Patient", tagged, FhirVersion::R4)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tag_filters_over_http() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        seed_tagged_patient(&backend).await;
+
+        let response = server
+            .get("/Patient?_tag=http%3A%2F%2Fexample.org%2Ftags%7Ctest-data")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(
+            entries.len(),
+            1,
+            "_tag must filter instead of returning every patient"
+        );
+        assert_eq!(entries[0]["resource"]["name"][0]["family"], "Tagged");
+    }
+
+    #[tokio::test]
+    async fn test_profile_filters_over_http() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        seed_tagged_patient(&backend).await;
+
+        let response = server
+            .get(
+                "/Patient?_profile=http%3A%2F%2Fexample.org%2FStructureDefinition%2Fcustom-patient",
+            )
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resource"]["name"][0]["family"], "Tagged");
+    }
+}
+
 /// #456: date search must honor the value's precision at every boundary.
 /// Stored dates keep their source precision while bounds are full datetimes,
 /// and SQLite compares text — so a day never fell inside its own range, and a

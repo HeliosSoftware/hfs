@@ -45,6 +45,7 @@ pub mod date_tests;
 pub mod fts_purge_suite;
 pub mod fts_purge_tests;
 pub mod include_tests;
+pub mod meta_params_tests;
 pub mod modifier_tests;
 pub mod number_tests;
 pub mod pagination_tests;
