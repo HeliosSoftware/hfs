@@ -211,16 +211,29 @@ impl<'a> EsQueryBuilder<'a> {
         }
 
         // Multiple values for the same parameter are ORed
-        if clauses.len() == 1 {
-            Some(clauses.into_iter().next().unwrap())
+        let combined = if clauses.len() == 1 {
+            clauses.into_iter().next().unwrap()
         } else {
-            Some(json!({
+            json!({
                 "bool": {
                     "should": clauses,
                     "minimum_should_match": 1
                 }
-            }))
+            })
+        };
+
+        // `:not` negates HERE, around the OR of every value, not per value
+        // (#473). FHIR's `:not` means "no value of the parameter matches", so
+        // `:not=a,b` is `NOT (a OR b)`; negating each value first would give
+        // `NOT a OR NOT b` and return every resource holding both values.
+        // `must_not` over the nested query is already resource-level: a nested
+        // clause matches when *some* indexed value matches, so its negation
+        // covers resources with no value for the parameter at all.
+        if matches!(param.modifier, Some(SearchModifier::Not)) {
+            return Some(json!({ "bool": { "must_not": [combined] } }));
         }
+
+        Some(combined)
     }
 
     /// Builds a clause for a single value of a parameter.
@@ -411,6 +424,57 @@ mod tests {
         let es_query = builder.build(&query);
         let body_str = serde_json::to_string(&es_query.body).unwrap();
         assert!(body_str.contains("resource_id"));
+    }
+
+    fn not_param(values: Vec<SearchValue>) -> SearchQuery {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "language".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values,
+            chain: vec![],
+            components: vec![],
+        })
+    }
+
+    /// `:not` wraps the token clause in a single resource-level `must_not`.
+    #[test]
+    fn test_not_modifier_negates_once() {
+        let query = not_param(vec![SearchValue::eq("en-US")]);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+        let negated = &clause["bool"]["must_not"][0];
+        assert!(
+            negated["nested"].is_object(),
+            "must_not wraps the nested query"
+        );
+        // The negated clause itself is positive — no double negation.
+        let inner = serde_json::to_string(negated).unwrap();
+        assert!(!inner.contains("must_not"));
+    }
+
+    /// `:not=a,b` is `NOT (a OR b)`, not `NOT a OR NOT b` (#473): the OR of the
+    /// positive value clauses sits inside one `must_not`, so a resource holding
+    /// both values is excluded rather than matching through the other value.
+    #[test]
+    fn test_not_modifier_multi_value_negates_the_or() {
+        let query = not_param(vec![SearchValue::eq("en-US"), SearchValue::eq("es")]);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+        let negated = &clause["bool"]["must_not"][0];
+        let should = negated["bool"]["should"].as_array().expect("OR of values");
+        assert_eq!(should.len(), 2);
+
+        let inner = serde_json::to_string(negated).unwrap();
+        assert!(
+            !inner.contains("must_not"),
+            "values must not be negated individually"
+        );
+        assert!(inner.contains("en-US") && inner.contains("es"));
     }
 
     #[test]
