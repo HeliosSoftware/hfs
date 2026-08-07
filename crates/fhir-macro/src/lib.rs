@@ -284,16 +284,88 @@ pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     )
     .unwrap_or_default();
 
-    let expanded = quote! {
-        // --- Serialize Implementation ---
-        impl #impl_generics serde::Serialize for #name #ty_generics #where_clause {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                #serialize_impl
+    // `serialize` genuinely consumes the `S` type parameter, so unlike the
+    // struct constructor #509 hoisted, it cannot simply move into a non-generic
+    // nested `fn`. Instead `S` is *erased* at the impl boundary: the generic
+    // wrapper stays a handful of instructions and the body behind it is
+    // compiled exactly once, against `&mut dyn erased_serde::Serializer`.
+    //
+    // Without this the same body lands in a binary once per `(FHIR type,
+    // Serializer)` pair — measured at 8.4 copies across the ~3,700 FHIR types
+    // in `helios-rest --lib`, or 134.5 MB where one copy each is 24.8 MB.
+    //
+    // `Deserialize` is deliberately left monomorphized. The identical treatment
+    // saves a comparable ~110 MB, but `erased_serde`'s deserializer returns
+    // every value through a type-erased `Any`, which heap-allocates anything
+    // over 16 bytes — and the `Temp*` structs are kilobytes. That measured 2.7x
+    // slower on a 202 MB corpus of R4 spec examples, against 2.0x for
+    // `Serialize` on a path that starts out 4x faster. See #510.
+    //
+    // Generic FHIR types keep the old monomorphized shape: the erasure anchor
+    // has to be non-generic to be emitted once, and there are no generic
+    // `FhirSerde` types in the generated models anyway.
+    let serialize_impls = if generics.params.is_empty() {
+        quote! {
+            const _: () = {
+                // The serialized shape, written against a shim so the body can
+                // be reached through `erased_serde` without recursing back into
+                // `<#name as Serialize>::serialize`. Instantiated at exactly one
+                // `S` — erased-serde's internal serializer.
+                struct __FhirSerShim<'__a>(&'__a #name);
+
+                impl<'__a> serde::Serialize for __FhirSerShim<'__a> {
+                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: serde::Serializer,
+                    {
+                        #[allow(unused_variables)]
+                        let __value = self.0;
+                        #serialize_impl
+                    }
+                }
+
+                // Non-generic (lifetimes do not monomorphize), so the unsizing
+                // coercion — and with it the vtable and everything it reaches —
+                // is emitted here, once, rather than in each crate that
+                // instantiates `serialize::<S>`.
+                #[inline(never)]
+                fn __fhir_erase_ser<'__a, '__b>(
+                    shim: &'__a __FhirSerShim<'__b>,
+                ) -> &'__a (dyn ::helios_serde_support::erased_serde::Serialize + '__a) {
+                    shim
+                }
+
+                impl serde::Serialize for #name {
+                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: serde::Serializer,
+                    {
+                        ::helios_serde_support::erased_serde::serialize(
+                            __fhir_erase_ser(&__FhirSerShim(self)),
+                            serializer,
+                        )
+                    }
+                }
+            };
+        }
+    } else {
+        quote! {
+            impl #impl_generics serde::Serialize for #name #ty_generics #where_clause {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    #[allow(unused_variables)]
+                    let __value = self;
+                    #serialize_impl
+                }
             }
         }
+    };
+
+    let expanded = quote! {
+        // --- Serialize Implementation ---
+        #serialize_impls
 
         // --- Deserialize Implementation ---
         impl<'de> #impl_generics serde::Deserialize<'de> for #name #ty_generics #where_clause
@@ -760,7 +832,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                             match_arms.push(quote! {
                                 // Removed 'ref' from pattern
-                                Self::#variant_name(value) => {
+                                #name::#variant_name(value) => {
                                     // Check if the element has id or extension that needs to be serialized
                                     let has_extension = value.id.is_some() || value.extension.is_some();
                                     // Serialize the primitive value
@@ -784,7 +856,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // Regular newtype variant
                             match_arms.push(quote! {
                                 // Removed 'ref' from pattern
-                                Self::#variant_name(value) => {
+                                #name::#variant_name(value) => {
                                     state.serialize_entry(#variant_key, value)?;
                                 }
                             });
@@ -793,7 +865,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     Fields::Unnamed(_) => {
                         // Tuple variant with multiple fields
                         match_arms.push(quote! {
-                            Self::#variant_name(ref value) => {
+                            #name::#variant_name(ref value) => {
                                 state.serialize_entry(#variant_key, value)?;
                             }
                         });
@@ -801,15 +873,15 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     Fields::Named(_fields) => {
                         // Struct variant
                         match_arms.push(quote! {
-                            Self::#variant_name { .. } => {
-                                state.serialize_entry(#variant_key, self)?;
+                            #name::#variant_name { .. } => {
+                                state.serialize_entry(#variant_key, __value)?;
                             }
                         });
                     }
                     Fields::Unit => {
                         // Unit variant
                         match_arms.push(quote! {
-                            Self::#variant_name => {
+                            #name::#variant_name => {
                                 state.serialize_entry(#variant_key, &())?;
                             }
                         });
@@ -828,8 +900,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                 // Create a serialization state
                 let mut state = serializer.serialize_map(Some(count))?;
 
-                // Match on self to determine which variant to serialize
-                match self {
+                // Match on the value to determine which variant to serialize.
+                // It is bound as `__value` rather than read off `self` so the
+                // same body can be emitted inside the erasure shim, which is a
+                // different type from the enum it serializes.
+                match __value {
                     #(#match_arms)*
                 }
 
@@ -867,7 +942,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let is_fhir_element = is_element || is_decimal_element;
 
                         // Use field_name_ident for accessing the struct field
-                        let field_access = quote! { self.#field_name_ident };
+                        let field_access = quote! { __value.#field_name_ident };
 
                         let extension_field_ident =
                             format_ident!("is_{}_extension", field_name_ident);

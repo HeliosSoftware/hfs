@@ -3627,6 +3627,7 @@ dependencies = [
 name = "helios-serde-support"
 version = "0.2.1"
 dependencies = [
+ "erased-serde",
  "serde",
  "serde_json",
 ]
