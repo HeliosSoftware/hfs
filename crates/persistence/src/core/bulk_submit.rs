@@ -674,6 +674,11 @@ pub struct BulkProcessingOptions {
     /// How a submitted resource is applied over an existing one with the same id.
     #[serde(default)]
     pub import_mode: ImportMode,
+    /// The manifest output file the processed entries come from. Part of each
+    /// entry result's identity: line numbers restart per file, so without the
+    /// file every file after the first collides on the stored key (#457).
+    #[serde(default)]
+    pub file_url: Option<String>,
 }
 
 fn default_submit_batch_size() -> u32 {
@@ -703,7 +708,14 @@ impl BulkProcessingOptions {
             max_errors: 0,
             allow_updates: default_allow_updates(),
             import_mode: ImportMode::default(),
+            file_url: None,
         }
+    }
+
+    /// Names the manifest output file the entries come from (#457).
+    pub fn with_file_url(mut self, file_url: impl Into<String>) -> Self {
+        self.file_url = Some(file_url.into());
+        self
     }
 
     /// Sets the batch size.

@@ -5,6 +5,7 @@
 //! derives every key shape used by the backend from a common base prefix.
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
 /// Keyspace builder for S3 object paths.
 ///
@@ -216,11 +217,15 @@ impl S3Keyspace {
     }
 
     /// Key for a single raw NDJSON line within a submission manifest.
+    ///
+    /// `file_url` names the manifest output file the line came from; see
+    /// [`submit_file_segment`] for why it is part of the key.
     pub fn submit_raw_line_key(
         &self,
         submitter: &str,
         submission_id: &str,
         manifest_id: &str,
+        file_url: Option<&str>,
         line: u64,
     ) -> String {
         self.join(&[
@@ -230,16 +235,21 @@ impl S3Keyspace {
             submission_id,
             "raw",
             manifest_id,
+            &submit_file_segment(file_url),
             &format!("line-{}.ndjson", line),
         ])
     }
 
     /// Key for the processing result of a single NDJSON line.
+    ///
+    /// `file_url` names the manifest output file the line came from; see
+    /// [`submit_file_segment`] for why it is part of the key.
     pub fn submit_result_line_key(
         &self,
         submitter: &str,
         submission_id: &str,
         manifest_id: &str,
+        file_url: Option<&str>,
         line: u64,
     ) -> String {
         self.join(&[
@@ -249,6 +259,7 @@ impl S3Keyspace {
             submission_id,
             "results",
             manifest_id,
+            &submit_file_segment(file_url),
             &format!("line-{}.json", line),
         ])
     }
@@ -412,6 +423,37 @@ fn sanitize(value: &str) -> String {
 /// the key of exactly the hierarchical ids that were previously colliding. The
 /// `\`/space/`%` arms are kept anyway: this function's contract is to be
 /// injective for *any* input, so it does not inherit the validator's bounds.
+/// Escapes a manifest output file URL into one S3 key segment.
+///
+/// Line numbers restart at 1 in every output file of a manifest, so the file a
+/// line came from is part of that entry's identity. Without this segment the
+/// second file's line 1 silently overwrites the first file's (issue #457 — the
+/// SQL backends carry the same discriminator in the `bulk_entry_results`
+/// primary key, where the collision surfaces as a UNIQUE violation instead).
+///
+/// Hashed rather than escaped, for the reasons `settings_object_id` documents:
+/// the URL comes from a submitted manifest, is unbounded in length, and is full
+/// of `/` — so escaping it would risk both a lossy collision (the very bug this
+/// fixes) and a key that walks out of the manifest's prefix. The digest is over
+/// raw bytes, so no Unicode normalisation is applied: two URLs differing only in
+/// normalisation form get two prefixes, which is the fail-safe direction.
+///
+/// `None` — a `process_entries` call made outside any manifest file — yields an
+/// empty segment, which [`S3Keyspace::join`] drops, reproducing the pre-#457
+/// flat layout. That is deliberate on two counts: it mirrors the SQL backends'
+/// `''` default for the same case, and it leaves entry results written before
+/// this change readable, since they still sit under the `results/<manifest>/`
+/// prefix that `load_entry_results` sweeps recursively.
+fn submit_file_segment(file_url: Option<&str>) -> String {
+    match file_url {
+        Some(url) if !url.is_empty() => {
+            let digest = Sha256::digest(url.as_bytes());
+            digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+        _ => String::new(),
+    }
+}
+
 fn registry_object_id(tenant_id: &str) -> String {
     let mut out = String::with_capacity(tenant_id.len());
     for c in tenant_id.chars() {
