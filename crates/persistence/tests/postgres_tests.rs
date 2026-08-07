@@ -3656,6 +3656,118 @@ mod postgres_integration {
         assert_eq!(result.resources.items[0].id(), "date-1");
     }
 
+    /// Dates carrying a negative UTC offset must index as the instant they name.
+    ///
+    /// The writer treated `2019-05-04T12:12:29-07:00` as zone-less, appended
+    /// `+00:00`, and the resulting `...-07:00+00:00` failed to parse — at which
+    /// point it silently indexed `Utc::now()`. Every date search over such a row
+    /// was then answered against the ingestion time: `gt<any past date>` matched
+    /// and `lt` did not (#494). The sibling test above uses a date-only
+    /// `birthDate`, the one shape that always worked, which is how this survived.
+    #[tokio::test]
+    async fn postgres_integration_search_date_negative_utc_offset() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for (id, effective) in [
+            ("obs-2019", "2019-05-04T12:12:29-07:00"),
+            ("obs-2025", "2025-05-04T12:12:29-07:00"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": {"coding": [{"code": "8867-4"}]},
+                        "effectiveDateTime": effective
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let date_query = |prefix: SearchPrefix, value: &str| {
+            SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "date".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        fn ids(items: &[helios_persistence::types::StoredResource]) -> Vec<String> {
+            let mut v: Vec<String> = items.iter().map(|r| r.id().to_string()).collect();
+            v.sort();
+            v
+        }
+
+        // Before the fix both rows carried the ingestion timestamp, so `gt` on a
+        // past date matched both and `lt` matched neither.
+        let after = backend
+            .search(
+                &tenant,
+                &date_query(SearchPrefix::Gt, "2023-01-01T00:00:00+00:00"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&after.resources.items),
+            vec!["obs-2025"],
+            "gt must exclude the 2019 row"
+        );
+
+        let before = backend
+            .search(
+                &tenant,
+                &date_query(SearchPrefix::Lt, "2023-01-01T00:00:00+00:00"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&before.resources.items),
+            vec!["obs-2019"],
+            "lt must find the 2019 row"
+        );
+
+        // Pin the offset arithmetic, not just parseability: 12:12:29-07:00 is
+        // 19:12:29Z, so this one-hour window brackets it. A fix that merely
+        // stripped the offset would store 12:12:29Z and fall outside.
+        let bracketed = backend
+            .search(
+                &tenant,
+                &date_query(SearchPrefix::Gt, "2019-05-04T19:00:00+00:00").with_parameter(
+                    SearchParameter {
+                        name: "date".to_string(),
+                        param_type: SearchParamType::Date,
+                        modifier: None,
+                        values: vec![SearchValue::new(
+                            SearchPrefix::Lt,
+                            "2019-05-04T20:00:00+00:00",
+                        )],
+                        chain: vec![],
+                        components: vec![],
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&bracketed.resources.items),
+            vec!["obs-2019"],
+            "-07:00 must convert to 19:12:29Z"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_search_reference() {
         use helios_persistence::core::SearchProvider;

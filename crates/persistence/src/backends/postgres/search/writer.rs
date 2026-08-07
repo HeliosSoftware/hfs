@@ -13,6 +13,26 @@ fn internal_error(message: String) -> crate::error::StorageError {
     })
 }
 
+/// Parses an extracted date value into the UTC timestamp stored in `value_date`.
+///
+/// Returns `None` when the value cannot be parsed, so the caller can skip the
+/// index row. This previously fell back to `Utc::now()`, which turned a parse
+/// failure into a plausible-looking timestamp: the row was silently indexed at
+/// ingestion time, so `date=gt<any past date>` matched it and `date=lt…` did
+/// not. Nothing was logged, and the resource itself read back correctly, so the
+/// corruption was visible only by querying `search_index` directly (#494).
+///
+/// A missing index row makes the parameter behave as absent for that resource —
+/// still a gap, but a silent under-match is recoverable and a silent *wrong*
+/// match is not.
+fn parse_index_date(value: &str) -> Option<DateTime<Utc>> {
+    let normalized = normalize_date_for_pg(value);
+    DateTime::parse_from_rfc3339(&normalized)
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|_| normalized.parse::<DateTime<Utc>>())
+        .ok()
+}
+
 /// PostgreSQL implementation of SearchIndexWriter.
 pub struct PostgresSearchIndexWriter;
 
@@ -88,11 +108,16 @@ impl PostgresSearchIndexWriter {
             }
             IndexValue::Date { value, precision } => {
                 let precision_str = precision.to_string();
-                let normalized = normalize_date_for_pg(value);
-                let timestamp: DateTime<Utc> = DateTime::parse_from_rfc3339(&normalized)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .or_else(|_| normalized.parse::<DateTime<Utc>>())
-                    .unwrap_or_else(|_| Utc::now());
+                let Some(timestamp) = parse_index_date(value) else {
+                    tracing::warn!(
+                        param_name = %extracted.param_name,
+                        resource_type = %resource_type,
+                        resource_id = %resource_id,
+                        value = %value,
+                        "skipping date search index entry: unparseable date value"
+                    );
+                    return Ok(());
+                };
                 client
                     .execute(
                         "INSERT INTO search_index (
@@ -293,13 +318,18 @@ impl PostgresSearchIndexWriter {
             }
             IndexValue::Date { value, precision } => {
                 date_precision = Some(precision.to_string());
-                let normalized = normalize_date_for_pg(value);
-                value_date = Some(
-                    DateTime::parse_from_rfc3339(&normalized)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .or_else(|_| normalized.parse::<DateTime<Utc>>())
-                        .unwrap_or_else(|_| Utc::now()),
-                );
+                let Some(timestamp) = parse_index_date(value) else {
+                    tracing::warn!(
+                        param_name = %extracted.param_name,
+                        container_type = %container_type,
+                        container_id = %container_id,
+                        contained_type = %contained_type,
+                        value = %value,
+                        "skipping contained date search index entry: unparseable date value"
+                    );
+                    return Ok(());
+                };
+                value_date = Some(timestamp);
             }
             IndexValue::Number(n) => value_number = Some(*n),
             IndexValue::Quantity {
@@ -397,10 +427,23 @@ impl PostgresSearchIndexWriter {
 /// - "2024-01" -> "2024-01-01T00:00:00+00:00"
 /// - "2024-01-15" -> "2024-01-15T00:00:00+00:00"
 /// - "2024-01-15T10:30:00" -> "2024-01-15T10:30:00+00:00"
+/// - "2024-01-15T10:30:00-07:00" -> unchanged (already zoned)
 fn normalize_date_for_pg(value: &str) -> String {
-    if value.contains('T') {
-        // Already has time component - ensure timezone
-        if value.contains('+') || value.contains('Z') || value.ends_with("-00:00") {
+    if let Some((_, time_part)) = value.split_once('T') {
+        // Already has a time component — append UTC only if it carries no zone.
+        //
+        // The zone test must look at the *time* component alone. Testing the
+        // whole value for `-` would match the date's own `YYYY-MM-DD`
+        // separators, and testing only for `+`/`Z`/`-00:00` (as this did) misses
+        // every other negative offset: `2019-05-04T12:12:29-07:00` was treated
+        // as zone-less and became `...-07:00+00:00`, which is not valid RFC3339.
+        // Per the FHIR `dateTime`/`instant` grammar the only `+` or `-` that can
+        // appear after `T` is the offset sign, so their presence is decisive.
+        let has_zone = time_part.ends_with('Z')
+            || time_part.ends_with('z')
+            || time_part.contains('+')
+            || time_part.contains('-');
+        if has_zone {
             value.to_string()
         } else {
             format!("{}+00:00", value)
@@ -417,5 +460,85 @@ fn normalize_date_for_pg(value: &str) -> String {
     } else {
         // Best effort
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The defect behind #494: a negative UTC offset was not recognised as a
+    /// zone, so `+00:00` was appended and the result stopped being valid
+    /// RFC3339. US/Americas data is overwhelmingly negative-offset, so this was
+    /// the common case rather than an edge case.
+    #[test]
+    fn negative_offsets_are_recognised_as_zoned() {
+        for value in [
+            "2019-05-04T12:12:29-07:00",
+            "1941-09-05T01:11:45-04:00",
+            "2021-11-10T16:48:57.246958-08:00",
+            "2024-01-15T10:30:00-00:00",
+        ] {
+            assert_eq!(
+                normalize_date_for_pg(value),
+                value,
+                "an already-zoned value must be left alone"
+            );
+            assert!(
+                parse_index_date(value).is_some(),
+                "{value} must parse rather than be dropped"
+            );
+        }
+    }
+
+    /// A negative offset must survive as an *instant*, not just parse. Appending
+    /// `+00:00` to `...-07:00` happened to be unparseable, but the failure mode
+    /// worth pinning is the resulting timestamp being wrong.
+    #[test]
+    fn negative_offset_converts_to_the_right_instant() {
+        let parsed = parse_index_date("2019-05-04T12:12:29-07:00").expect("parses");
+        assert_eq!(
+            parsed.to_rfc3339(),
+            "2019-05-04T19:12:29+00:00",
+            "-07:00 is seven hours behind UTC"
+        );
+    }
+
+    #[test]
+    fn positive_offsets_and_z_are_still_recognised() {
+        for value in [
+            "2024-01-15T10:30:00Z",
+            "2024-01-15T10:30:00+05:30",
+            "2024-01-15T10:30:00.123Z",
+        ] {
+            assert_eq!(normalize_date_for_pg(value), value);
+            assert!(parse_index_date(value).is_some());
+        }
+    }
+
+    #[test]
+    fn zone_less_and_partial_values_are_completed_as_utc() {
+        for (input, expected) in [
+            ("2024-01-15T10:30:00", "2024-01-15T10:30:00+00:00"),
+            ("2024-01-15", "2024-01-15T00:00:00+00:00"),
+            ("2024-01", "2024-01-01T00:00:00+00:00"),
+            ("2024", "2024-01-01T00:00:00+00:00"),
+        ] {
+            assert_eq!(normalize_date_for_pg(input), expected);
+            assert!(parse_index_date(input).is_some(), "{input} must parse");
+        }
+    }
+
+    /// An unparseable value yields `None` so the caller skips the row. It must
+    /// never resolve to a timestamp — the old `unwrap_or_else(|_| Utc::now())`
+    /// wrote ingestion time and made every date search over the row wrong.
+    #[test]
+    fn unparseable_values_are_dropped_not_substituted() {
+        for value in ["", "not-a-date", "2024-13-45T99:99:99", "T00:00:00"] {
+            assert!(
+                parse_index_date(value).is_none(),
+                "{value:?} must not resolve to a timestamp"
+            );
+        }
     }
 }
