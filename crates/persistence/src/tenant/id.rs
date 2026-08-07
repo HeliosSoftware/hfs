@@ -23,76 +23,61 @@ use crate::error::{StorageResult, TenantError};
 /// [`ensure_mutable_tenant`], and issue #317.
 pub const SYSTEM_TENANT: &str = "__system__";
 
-/// Maximum accepted length of a caller-supplied tenant id.
+/// Maximum length of a tenant id, in bytes.
 ///
-/// Bounds the value that flows into storage keys, index terms and (for S3)
-/// object key prefixes.
-pub const MAX_TENANT_ID_LEN: usize = 128;
+/// 64 rather than something larger for two reasons. It is what the REST
+/// tenant-routing surfaces have always enforced, so it is the widest bound that
+/// every *routable* tenant already satisfies. And the Elasticsearch backend's
+/// index-name derivation escapes unsafe bytes as three-byte sequences against a
+/// 255-byte Elasticsearch limit; 64 × 3 = 192 leaves room for the index prefix
+/// and resource type, whereas a 128-byte id could not fit.
+pub const MAX_TENANT_ID_LEN: usize = 64;
 
-/// Tenant ids that are reserved for internal use and may never be supplied by
-/// a caller.
+/// Segments a tenant id may not contain, in any position.
 ///
-/// [`SYSTEM_TENANT`] is the shared-tenant sentinel. The remainder name
-/// control-plane namespaces in the S3 backend's keyspace (the sibling prefixes
-/// of `tenants/`; see `S3Keyspace` and issue #271).
+/// These name control-plane namespaces inside a storage backend's keyspace.
+/// The check is **per segment**, not on the whole id, because the hierarchy
+/// separator is what makes them dangerous: on S3 a tenant's data lives under
+/// `{tenant}/resources/…` and `{tenant}/history/…`, so tenant `a/resources`
+/// stores at `a/resources/resources/…` — inside the prefix tenant `a` scans and
+/// purges. `S3Backend::purge_tenant_data("a")` would delete it. Rejecting the
+/// segment anywhere makes that shape unconstructible.
 ///
-/// This is the single authority: the REST tenant extractor, the `/admin/tenants`
-/// API, the web UI's tenant page, and the storage-layer tenant-lifecycle guard
-/// all consult it, so a new reserved id cannot be added to one door and
-/// forgotten on another.
+/// `__system__` is listed here too so `a/__system__` cannot be used to smuggle
+/// the shared-tenant sentinel past a check that only compares the whole id.
+///
+/// Kept in sync with `backends::s3::keyspace::S3Keyspace`, which owns
+/// `tenants/`, `resources/`, `history/`, `bulk/`, and `_system.user-settings/`.
+/// Each of those is *also* safe structurally — a tenant so named writes to a
+/// `resources/`/`history/` **sub**-prefix, which can never equal a control-plane
+/// leaf — so this list is defence in depth, not the proof. Do not delete the
+/// structural arguments in `S3Keyspace` on the strength of it.
+pub const RESERVED_TENANT_SEGMENTS: &[&str] = &[
+    SYSTEM_TENANT,
+    "tenants",
+    "resources",
+    "history",
+    "bulk",
+    "_system.user-settings",
+    // Relative-path segments. No backend resolves `..`, but a tenant id flows
+    // into object keys and filesystem-shaped paths, where a normalising
+    // intermediary would make `a/../b` and `b` the same location.
+    ".",
+    "..",
+];
+
+/// Whole tenant ids that are reserved for internal use (issue #317).
+///
+/// A strict subset of [`RESERVED_TENANT_SEGMENTS`]: these are the reserved
+/// names as they appear when they *are* the entire id, which is the shape the
+/// non-storage doors care about. [`TenantId::parse`] does not consult this list
+/// — its per-segment check already subsumes it — but the REST tenant extractor,
+/// the `HFS_DEFAULT_TENANT` startup check, the console metrics filter, and the
+/// storage-layer lifecycle guard all ask "is *this id* reserved?" rather than
+/// "could this id be provisioned?", and for them a whole-id answer is the
+/// right one.
 pub const RESERVED_TENANT_IDS: &[&str] =
     &[SYSTEM_TENANT, "tenants", "resources", "history", "bulk"];
-
-/// Why a caller-supplied tenant id was rejected by [`TenantId::parse`].
-///
-/// Deliberately carries no HTTP status: mapping a rejection onto a response
-/// code depends on *which door* the id arrived at (a reserved id in a JWT claim
-/// is a different statement from one in a URL), and that is the REST layer's
-/// business. See `helios_rest::extractors::TenantExtractor`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TenantIdError {
-    /// The id was empty.
-    Empty,
-    /// The id exceeded [`MAX_TENANT_ID_LEN`].
-    TooLong {
-        /// Actual length, in bytes.
-        len: usize,
-        /// The maximum permitted length.
-        max: usize,
-    },
-    /// The id contained a character outside the permitted set.
-    InvalidChar {
-        /// The offending character.
-        ch: char,
-    },
-    /// The id is reserved for internal use (see [`RESERVED_TENANT_IDS`]).
-    Reserved {
-        /// The rejected id.
-        id: String,
-    },
-}
-
-impl fmt::Display for TenantIdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => write!(f, "tenant id must not be empty"),
-            Self::TooLong { len, max } => {
-                write!(f, "tenant id is {len} characters, maximum is {max}")
-            }
-            Self::InvalidChar { ch } => write!(
-                f,
-                "tenant id contains unsupported character {ch:?}; \
-                 only letters, digits, '-', '_', '.', and '/' are allowed"
-            ),
-            Self::Reserved { id } => {
-                write!(f, "tenant id {id:?} is reserved for internal use")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TenantIdError {}
 
 /// Refuses a tenant-lifecycle mutation that targets a reserved tenant.
 ///
@@ -100,9 +85,18 @@ impl std::error::Error for TenantIdError {}
 /// the REST ingress (`helios_rest::extractors::TenantExtractor`), but
 /// `register_tenant` / `deregister_tenant` / `purge_tenant_data` take a bare
 /// `&str` and are reachable from more than one handler — including, today, an
-/// unauthenticated web-UI route. Every backend calls this at the top of those
-/// three methods so no future call site can reach a destructive registry
-/// operation on the shared tenant.
+/// unauthenticated web-UI route. Every backend calls this at the top of
+/// `deregister_tenant` and `purge_tenant_data` so no future call site can reach
+/// a destructive registry operation on the shared tenant.
+///
+/// `register_tenant` guards with
+/// [`ensure_canonical_tenant_id`](crate::ResourceStorage::ensure_canonical_tenant_id)
+/// instead, which is strictly stronger: it runs the full [`TenantId::parse`],
+/// whose per-segment reserved check refuses every id this function refuses and
+/// also refuses ids that merely *contain* a reserved segment (issue #385).
+/// Deregister and purge cannot use it — they must stay able to act on a
+/// non-canonical id that predates the validator, or such a tenant would be
+/// permanently unremovable.
 ///
 /// Read operations are deliberately *not* guarded: `get_tenant(SYSTEM_TENANT)`
 /// truthfully returns `None` (the sentinel is never registered), and turning
@@ -117,6 +111,64 @@ pub fn ensure_mutable_tenant(id: &str) -> StorageResult<()> {
     }
     Ok(())
 }
+
+/// Why a string is not a valid tenant id.
+///
+/// Returned by [`TenantId::parse`], the canonical validating constructor.
+///
+/// `#[non_exhaustive]`: the REST and web-UI layers translate these into
+/// user-facing copy, and a new rejection reason must not break their build —
+/// they fall back to `Display`, which is written to be actionable on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TenantIdError {
+    /// The id was empty.
+    Empty,
+    /// The id exceeded [`MAX_TENANT_ID_LEN`] bytes.
+    TooLong {
+        /// The offending length, in bytes.
+        len: usize,
+    },
+    /// The id contained a character outside the permitted set.
+    InvalidCharacter {
+        /// The first offending character.
+        found: char,
+    },
+    /// The id had a leading `/`, a trailing `/`, or an empty segment (`a//b`).
+    EmptySegment,
+    /// A segment named a reserved control-plane namespace.
+    ReservedSegment {
+        /// The offending segment.
+        segment: String,
+    },
+}
+
+impl fmt::Display for TenantIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "tenant id must not be empty"),
+            Self::TooLong { len } => write!(
+                f,
+                "tenant id is {len} bytes; the maximum is {MAX_TENANT_ID_LEN}"
+            ),
+            Self::InvalidCharacter { found } => write!(
+                f,
+                "tenant id contains {found:?}; only letters, digits, '-', '_', '.', \
+                 and '/' (the hierarchy separator) are permitted"
+            ),
+            Self::EmptySegment => write!(
+                f,
+                "tenant id must not begin or end with '/' or contain an empty segment"
+            ),
+            Self::ReservedSegment { segment } => write!(
+                f,
+                "tenant id segment '{segment}' is reserved for internal use"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TenantIdError {}
 
 /// An opaque tenant identifier with hierarchical namespace support.
 ///
@@ -147,7 +199,23 @@ pub fn ensure_mutable_tenant(id: &str) -> StorageResult<()> {
 pub struct TenantId(String);
 
 impl TenantId {
-    /// Creates a new tenant ID from the given string.
+    /// Creates a tenant ID **without validating it**.
+    ///
+    /// This is the constructor for *trusted reconstruction*: rebuilding a
+    /// `TenantId` from a value that was already validated when it entered the
+    /// system — a `tenant_id` column read back out of a row, a value round-tripped
+    /// through a `TenantContext`, a literal in a test. It stores the string
+    /// verbatim and cannot fail.
+    ///
+    /// Use [`parse`](Self::parse) for anything derived from a request: an
+    /// `X-Tenant-ID` header, a URL path prefix, a JWT claim, an admin-API body.
+    /// Those are the paths that must not admit an id the storage backends cannot
+    /// keep distinct.
+    ///
+    /// It stays infallible deliberately. Making it fallible would force an
+    /// `unwrap()` at every trusted reconstruction site, which converts a
+    /// data-integrity problem into a panic without catching anything new — the
+    /// value is already in the database by then.
     ///
     /// # Arguments
     ///
@@ -165,72 +233,113 @@ impl TenantId {
         Self(id.into())
     }
 
-    /// Parses a **caller-supplied** tenant id, rejecting ids that are empty,
-    /// over-long, outside the permitted character set, or reserved for internal
-    /// use.
+    /// Parses and validates a tenant ID — the canonical constructor for any id
+    /// that arrives from outside the server.
     ///
-    /// Use this — never [`TenantId::new`] — for any id that originates outside
-    /// the process: an `X-Tenant-ID` header, a `/{tenant}/…` URL prefix, a JWT
-    /// tenant claim, or an admin-API request body. [`TenantId::new`] stays
-    /// infallible for ids the process itself authored (constants, validated
-    /// configuration, values read back from storage), which is why
-    /// `TenantContext::system()` and the ~120 terminology-server call sites are
-    /// unaffected.
+    /// # The charset
     ///
-    /// The permitted character set is `[A-Za-z0-9._/-]`, matching what the
-    /// `/admin/tenants` provisioning API has always accepted. Note that `/` is
-    /// meaningful — it is the hierarchy separator (see
-    /// [`TenantId::is_descendant_of`]) — and that URL-path tenant *routing*
-    /// accepts a narrower set still (no `.` or `/`), so a hierarchical tenant is
-    /// addressable by header or JWT claim but not as a URL prefix. That
-    /// long-standing divergence is documented, not introduced, here.
+    /// A valid tenant id is 1..=[`MAX_TENANT_ID_LEN`] bytes drawn from ASCII
+    /// letters, ASCII digits, `-`, `_`, `.`, and `/`. `/` separates hierarchy
+    /// levels (see [`parent`](Self::parent)), so it may not lead, trail, or
+    /// repeat, and no segment may name a [reserved namespace](RESERVED_TENANT_SEGMENTS).
+    ///
+    /// Case is **preserved**, not folded: `ACME` and `acme` are two different
+    /// tenants and every backend keeps them apart. Folding would be a silent
+    /// data-visibility change for any deployment already using a mixed-case id.
+    ///
+    /// # Why this exists
+    ///
+    /// Before this, four surfaces validated tenant ids and all four disagreed —
+    /// the header and URL extractors on one charset, the admin API on a wider
+    /// one, the JWT claim on nothing at all — and `new` imposed no constraint
+    /// beneath them. Backends were left to defend individually, which is how the
+    /// Elasticsearch case-collision (issue #384) became reachable. One
+    /// definition here lets a backend state a precondition instead of deriving
+    /// its own (issue #385).
+    ///
+    /// What this does *not* cover, deliberately: whether an id shadows a FHIR
+    /// resource type or a reserved route (`metadata`, `console`, …). That is a
+    /// property of the REST routing surface, not of storage, and depends on the
+    /// configured FHIR version — so it is layered on top in `helios-rest`, not
+    /// duplicated here.
     ///
     /// # Examples
     ///
     /// ```
-    /// use helios_persistence::tenant::TenantId;
+    /// use helios_persistence::tenant::{TenantId, TenantIdError};
     ///
-    /// assert!(TenantId::parse("acme").is_ok());
-    /// assert!(TenantId::parse("acme/research").is_ok());
-    /// assert!(TenantId::parse("__system__").is_err());
-    /// assert!(TenantId::parse("bad tenant").is_err());
+    /// assert_eq!(TenantId::parse("acme").unwrap().as_str(), "acme");
+    /// assert_eq!(TenantId::parse("acme/research").unwrap().depth(), 1);
+    /// // Case is preserved, so these are distinct tenants.
+    /// assert_ne!(TenantId::parse("ACME").unwrap(), TenantId::parse("acme").unwrap());
+    ///
+    /// assert!(matches!(TenantId::parse(""), Err(TenantIdError::Empty)));
+    /// assert!(matches!(
+    ///     TenantId::parse("acme corp"),
+    ///     Err(TenantIdError::InvalidCharacter { found: ' ' })
+    /// ));
+    /// // Would otherwise land inside the prefix tenant `acme` scans and purges.
+    /// assert!(matches!(
+    ///     TenantId::parse("acme/resources"),
+    ///     Err(TenantIdError::ReservedSegment { .. })
+    /// ));
     /// ```
     pub fn parse(id: &str) -> Result<Self, TenantIdError> {
         if id.is_empty() {
             return Err(TenantIdError::Empty);
         }
+        // Bytes, not chars: the length that matters is what reaches a storage
+        // key. The charset check below rejects every non-ASCII byte anyway, so
+        // the two measures coincide for accepted ids — this only makes the
+        // rejection of an over-long non-ASCII id report a truthful length.
         if id.len() > MAX_TENANT_ID_LEN {
-            return Err(TenantIdError::TooLong {
-                len: id.len(),
-                max: MAX_TENANT_ID_LEN,
-            });
+            return Err(TenantIdError::TooLong { len: id.len() });
         }
-        if let Some(ch) = id
+        if let Some(found) = id
             .chars()
             .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
         {
-            return Err(TenantIdError::InvalidChar { ch });
+            return Err(TenantIdError::InvalidCharacter { found });
         }
-        if Self::is_reserved(id) {
-            return Err(TenantIdError::Reserved { id: id.to_string() });
+        // `split('/')` yields an empty piece for a leading `/`, a trailing `/`,
+        // and each `//`, so one emptiness check covers all three shapes.
+        for segment in id.split('/') {
+            if segment.is_empty() {
+                return Err(TenantIdError::EmptySegment);
+            }
+            if RESERVED_TENANT_SEGMENTS.contains(&segment) {
+                return Err(TenantIdError::ReservedSegment {
+                    segment: segment.to_string(),
+                });
+            }
         }
         Ok(Self(id.to_string()))
     }
 
-    /// Returns `true` if `id` is reserved for internal use and must never be
-    /// accepted from a caller.
+    /// Returns `true` if this id satisfies [`parse`](Self::parse)'s rules.
     ///
-    /// Matching is exact and case-sensitive, mirroring how the ids are compared
-    /// everywhere else (tenant ids are opaque and case-sensitive throughout the
-    /// storage layer, so a case-insensitive check here would reject ids that are
-    /// in fact distinct tenants).
+    /// For auditing ids that entered through [`new`](Self::new) — a value read
+    /// back from storage that predates validation, say. Prefer `parse` when you
+    /// are accepting an id, so the caller gets a reason rather than a bool.
+    pub fn is_canonical(&self) -> bool {
+        Self::parse(&self.0).is_ok()
+    }
+
+    /// Returns `true` if `id` is, as a whole, reserved for internal use.
+    ///
+    /// Matching is exact and case-sensitive, mirroring how tenant ids are
+    /// compared everywhere else — a differently-cased id is a genuinely
+    /// different tenant, not an evasion.
     ///
     /// Only the exact reserved strings are refused, not a `__`-prefixed
     /// namespace. A tenant id is a partition key in every backend and there is
     /// no rename operation, so banning a prefix would strand any deployment that
     /// already holds such a tenant — its data would keep serving while becoming
-    /// permanently impossible to deregister or purge. Reserving the wider space
-    /// is a follow-up that has to start on the provisioning path, not here.
+    /// permanently impossible to deregister or purge.
+    ///
+    /// This is the question the *non*-provisioning doors ask. When you are
+    /// accepting an id for provisioning, use [`parse`](Self::parse), whose
+    /// per-segment check is stronger.
     pub fn is_reserved(id: &str) -> bool {
         RESERVED_TENANT_IDS.contains(&id)
     }
@@ -239,6 +348,12 @@ impl TenantId {
     ///
     /// The system tenant is used for shared resources that should be
     /// accessible across all tenants.
+    ///
+    /// This is trusted internal construction, so it bypasses
+    /// [`parse`](Self::parse) — which rejects `__system__` precisely so that no
+    /// client-supplied id can ever name it. [`is_canonical`](Self::is_canonical)
+    /// is therefore `false` for the system tenant, and that is correct: it means
+    /// "not a value a client may assert", not "malformed".
     ///
     /// # Examples
     ///
@@ -393,20 +508,29 @@ impl fmt::Debug for TenantId {
     }
 }
 
+/// Validating. `str::parse` is where a Rust reader expects a fallible,
+/// checked conversion, so it routes through [`TenantId::parse`].
+///
+/// The `From` impls below are deliberately *not* validating — they mirror
+/// [`TenantId::new`], the unchecked trusted-reconstruction constructor, because
+/// an infallible `From` has nowhere to report a rejection. The asymmetry is the
+/// point: `"acme".parse::<TenantId>()` checks, `TenantId::from("acme")` does not.
 impl FromStr for TenantId {
-    type Err = std::convert::Infallible;
+    type Err = TenantIdError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(TenantId::new(s))
+        TenantId::parse(s)
     }
 }
 
+/// Unchecked — see the note on [`FromStr`]'s impl above.
 impl From<&str> for TenantId {
     fn from(s: &str) -> Self {
         TenantId::new(s)
     }
 }
 
+/// Unchecked — see the note on [`FromStr`]'s impl above.
 impl From<String> for TenantId {
     fn from(s: String) -> Self {
         TenantId::new(s)
@@ -539,106 +663,205 @@ mod tests {
         assert_eq!(tenant2.as_str(), "my-tenant");
     }
 
-    // ── `parse` — the validating constructor for caller-supplied ids (#317) ──
+    // ── The canonical validator (issue #385) ────────────────────────────────
 
     #[test]
-    fn test_parse_accepts_ordinary_ids() {
+    fn parse_accepts_every_shape_the_routing_surfaces_already_accepted() {
+        // The union of what `resolver.rs`, `tenant_prefix.rs`, and the admin API
+        // accepted before this validator existed. Anything here that started
+        // failing would orphan a deployment's data, since no rename exists.
         for id in [
             "acme",
             "tenant-123",
             "my_tenant",
             "ABC123",
-            "a.b",
+            "tenant.example",
             "acme/research",
+            "acme/research/oncology",
+            "a",
         ] {
-            assert!(TenantId::parse(id).is_ok(), "{id} should parse");
-        }
-    }
-
-    /// The whole point of #317: the shared-tenant sentinel must never survive
-    /// parsing of a caller-supplied id.
-    #[test]
-    fn test_parse_rejects_system_tenant() {
-        assert_eq!(
-            TenantId::parse(SYSTEM_TENANT),
-            Err(TenantIdError::Reserved {
-                id: SYSTEM_TENANT.to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_rejects_every_reserved_id() {
-        for id in RESERVED_TENANT_IDS {
             assert!(
-                TenantId::parse(id).is_err(),
-                "reserved id {id} must not parse"
+                TenantId::parse(id).is_ok(),
+                "{id:?} was accepted before this validator and must stay valid"
             );
-            assert!(TenantId::is_reserved(id));
         }
-    }
-
-    /// Reservation is exact, not a `__` namespace ban — a deployment that
-    /// already holds a `__`-prefixed tenant must keep working, because tenant id
-    /// is a partition key with no rename. Guards against someone "hardening"
-    /// this into a prefix check without a migration story.
-    #[test]
-    fn test_parse_reserves_exact_ids_not_the_underscore_namespace() {
-        assert!(TenantId::parse("__system").is_ok());
-        assert!(TenantId::parse("__system__x").is_ok());
-        assert!(TenantId::parse("__legacy").is_ok());
-        // Single-underscore tenants are a supported, separately-tested feature
-        // of URL-path routing (`/_x/Patient/123`).
-        assert!(TenantId::parse("_x").is_ok());
-    }
-
-    /// Tenant ids are opaque and case-sensitive in the storage layer, so a
-    /// differently-cased id is a genuinely different tenant, not an evasion.
-    #[test]
-    fn test_parse_reservation_is_case_sensitive() {
-        assert!(TenantId::parse("__SYSTEM__").is_ok());
-        assert!(!TenantId::is_reserved("__SYSTEM__"));
+        // Exactly at the cap, which both routing validators already enforced.
+        let at_cap = "a".repeat(MAX_TENANT_ID_LEN);
+        assert!(TenantId::parse(&at_cap).is_ok());
     }
 
     #[test]
-    fn test_parse_rejects_empty_overlong_and_bad_charset() {
+    fn parse_preserves_case_so_mixed_case_tenants_stay_distinct() {
+        // Folding case would silently merge two tenants that every backend
+        // currently keeps apart — a data-visibility change, not a fix. The
+        // Elasticsearch collision (#384) is closed by making *its* derivation
+        // injective, not by narrowing the charset here.
+        let upper = TenantId::parse("ACME").expect("uppercase is valid");
+        let lower = TenantId::parse("acme").expect("lowercase is valid");
+        assert_eq!(upper.as_str(), "ACME");
+        assert_ne!(upper, lower);
+    }
+
+    #[test]
+    fn parse_rejects_empty_and_over_long() {
         assert_eq!(TenantId::parse(""), Err(TenantIdError::Empty));
 
         let long = "a".repeat(MAX_TENANT_ID_LEN + 1);
         assert_eq!(
             TenantId::parse(&long),
             Err(TenantIdError::TooLong {
-                len: MAX_TENANT_ID_LEN + 1,
-                max: MAX_TENANT_ID_LEN,
+                len: MAX_TENANT_ID_LEN + 1
             })
         );
-        assert!(TenantId::parse(&"a".repeat(MAX_TENANT_ID_LEN)).is_ok());
-
-        for (id, ch) in [("bad tenant", ' '), ("a:b", ':'), ("a\0b", '\0')] {
-            assert_eq!(TenantId::parse(id), Err(TenantIdError::InvalidChar { ch }));
-        }
     }
 
-    /// `new` must stay infallible: `TenantContext::system()` and the ~120
-    /// terminology-server call sites depend on constructing the sentinel
-    /// in-process.
     #[test]
-    fn test_new_still_builds_the_system_tenant() {
-        assert_eq!(TenantId::new(SYSTEM_TENANT).as_str(), SYSTEM_TENANT);
-        assert!(TenantId::system().is_system());
-    }
-
-    // ── `ensure_mutable_tenant` — the storage-layer backstop ──
-
-    #[test]
-    fn test_ensure_mutable_tenant_refuses_reserved_ids() {
-        assert!(ensure_mutable_tenant("acme").is_ok());
-        assert!(ensure_mutable_tenant("acme/research").is_ok());
-        for id in RESERVED_TENANT_IDS {
-            assert!(
-                ensure_mutable_tenant(id).is_err(),
-                "lifecycle mutation on reserved id {id} must be refused"
+    fn parse_rejects_characters_outside_the_charset() {
+        // Whitespace and the shapes that break a storage key or a URL. `%` and
+        // `+` matter specifically: both are escape introducers in a backend
+        // keyspace encoding, so letting one through as a literal would make the
+        // escape forgeable.
+        for (id, found) in [
+            ("acme corp", ' '),
+            ("acme\tcorp", '\t'),
+            ("acme:corp", ':'),
+            ("acme%2Fcorp", '%'),
+            ("acme+corp", '+'),
+            ("acme\\corp", '\\'),
+            ("acme?x", '?'),
+            ("acme#x", '#'),
+            ("acme*", '*'),
+            ("acmé", 'é'),
+        ] {
+            assert_eq!(
+                TenantId::parse(id),
+                Err(TenantIdError::InvalidCharacter { found }),
+                "{id:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn parse_rejects_malformed_hierarchy() {
+        for id in ["/acme", "acme/", "acme//research", "/", "//"] {
+            assert_eq!(
+                TenantId::parse(id),
+                Err(TenantIdError::EmptySegment),
+                "{id:?} must be rejected"
+            );
+        }
+    }
+
+    /// Guards the S3 cross-tenant *destructive* collision that motivated the
+    /// per-segment check.
+    ///
+    /// On S3 a tenant's data lives under `{tenant}/resources/…` and
+    /// `{tenant}/history/…`. Tenant `acme/resources` therefore stores at
+    /// `acme/resources/resources/…`, which is inside the `acme/resources/`
+    /// prefix that tenant `acme` lists — and that
+    /// `S3Backend::purge_tenant_data("acme")` deletes. The admin API's old
+    /// whole-id reserved list did not catch this because the id is not equal to
+    /// a reserved name, it merely contains one as a segment.
+    #[test]
+    fn parse_rejects_reserved_segments_in_any_position() {
+        for id in [
+            "resources",
+            "acme/resources",
+            "acme/history/x",
+            "tenants",
+            "acme/bulk",
+            "__system__",
+            "acme/__system__",
+            "..",
+            "acme/../evil",
+            ".",
+            "acme/./x",
+        ] {
+            assert!(
+                matches!(
+                    TenantId::parse(id),
+                    Err(TenantIdError::ReservedSegment { .. })
+                ),
+                "{id:?} must be rejected as reserved, got {:?}",
+                TenantId::parse(id)
+            );
+        }
+
+        // A reserved word is only reserved as a whole segment — it must stay
+        // usable as a substring, or we would reject ordinary names.
+        assert!(TenantId::parse("resources-team").is_ok());
+        assert!(TenantId::parse("acme/resources-archive").is_ok());
+        assert!(TenantId::parse("prehistory").is_ok());
+    }
+
+    #[test]
+    fn parse_is_injective_over_accepted_ids() {
+        // `parse` stores the input verbatim — it normalises nothing. That is
+        // what lets a backend treat the validated id as the identity it keys on.
+        for id in [
+            "acme",
+            "ACME",
+            "AcMe",
+            "acme.corp",
+            "acme_corp",
+            "acme-corp",
+        ] {
+            assert_eq!(TenantId::parse(id).unwrap().as_str(), id);
+        }
+    }
+
+    #[test]
+    fn system_tenant_is_trusted_construction_not_a_parsable_id() {
+        // `system()` bypasses `parse` by design; `parse` rejects the sentinel so
+        // no client-supplied id can name it.
+        let system = TenantId::system();
+        assert!(system.is_system());
+        assert!(
+            !system.is_canonical(),
+            "the sentinel is reachable only through trusted construction"
+        );
+        assert!(TenantId::parse(SYSTEM_TENANT).is_err());
+    }
+
+    #[test]
+    fn from_str_validates_but_from_does_not() {
+        // The deliberate asymmetry documented on the impls.
+        assert!("acme corp".parse::<TenantId>().is_err());
+        assert!("acme".parse::<TenantId>().is_ok());
+        // `From` mirrors the unchecked `new`, so it still accepts anything.
+        assert_eq!(TenantId::from("acme corp").as_str(), "acme corp");
+    }
+
+    #[test]
+    fn is_canonical_flags_legacy_ids_reconstructed_through_new() {
+        // `new` is unchecked, so a value that predates the validator round-trips
+        // out of storage unchanged; `is_canonical` is how an operator finds it.
+        assert!(TenantId::new("acme").is_canonical());
+        assert!(!TenantId::new("acme corp").is_canonical());
+        assert!(!TenantId::new("a".repeat(MAX_TENANT_ID_LEN + 1)).is_canonical());
+    }
+
+    #[test]
+    fn error_messages_name_the_reason() {
+        // These strings reach the client in a 400/403 body, so they have to be
+        // actionable rather than a bare "invalid".
+        assert!(
+            TenantId::parse("acme corp")
+                .unwrap_err()
+                .to_string()
+                .contains('\'')
+        );
+        assert!(
+            TenantId::parse(&"a".repeat(100))
+                .unwrap_err()
+                .to_string()
+                .contains("100")
+        );
+        assert!(
+            TenantId::parse("acme/resources")
+                .unwrap_err()
+                .to_string()
+                .contains("resources")
+        );
     }
 }

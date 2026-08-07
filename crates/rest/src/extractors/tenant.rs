@@ -25,7 +25,28 @@ use axum::{
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use crate::state::AppState;
-use crate::tenant::{ResolvedTenant, TenantResolver, TenantSource, TenantValidator};
+use crate::tenant::{
+    ResolvedTenant, TenantResolver, TenantSource, TenantSourceError, TenantValidator,
+};
+
+/// Maps a rejected tenant assertion onto a status code by *who* asserted it.
+///
+/// A malformed `X-Tenant-ID` or URL prefix is the client's mistake, so `400`. A
+/// malformed JWT claim is not — the request is well-formed and the token is
+/// authenticated; it is the authorization context that cannot be used, so `403`,
+/// matching the claimless-token path in [`TenantExtractor::resolve`].
+fn source_error_to_rejection(err: TenantSourceError) -> (StatusCode, String) {
+    match err.source {
+        TenantSource::JwtClaim => (
+            StatusCode::FORBIDDEN,
+            format!("Authenticated token carries an invalid tenant claim: {err}"),
+        ),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid tenant id from {}: {err}", err.source),
+        ),
+    }
+}
 
 /// Axum extractor for tenant context.
 ///
@@ -195,12 +216,29 @@ impl TenantExtractor {
         // confusion between URL context and actual data access.
         if let Some(principal) = parts.extensions.get::<helios_auth::Principal>() {
             if let Some(jwt_tenant) = principal.tenant_id().filter(|t| !t.is_empty()) {
+                // The claim is authoritative for every request below, so it is
+                // validated *first* — before any consistency check and before it
+                // can reach a storage key. It used to be validated by nothing at
+                // all (issue #385), making it the one ingress that could put an
+                // arbitrary string into a backend keyspace.
+                //
+                // 403 rather than 400: the token is well-formed and
+                // authenticated, so nothing about the *request* is malformed —
+                // it is the authorization context that is unusable. This matches
+                // the claimless-token case below.
+                let jwt_tenant = TenantId::parse(jwt_tenant).map_err(|e| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        format!("Authenticated token carries an invalid tenant claim: {e}"),
+                    )
+                })?;
                 if config.multitenancy.strict_validation {
                     let resolver = TenantResolver::new(&config.multitenancy);
-                    let resolved =
-                        resolver.resolve(parts, &config.multitenancy, &config.default_tenant);
+                    let resolved = resolver
+                        .resolve(parts, &config.multitenancy, &config.default_tenant)
+                        .map_err(source_error_to_rejection)?;
                     // If a non-default source provided a tenant, it must match the JWT
-                    if !resolved.is_default() && resolved.tenant_id_str() != jwt_tenant {
+                    if !resolved.is_default() && resolved.tenant_id_str() != jwt_tenant.as_str() {
                         return Err((
                             StatusCode::BAD_REQUEST,
                             format!(
@@ -215,9 +253,9 @@ impl TenantExtractor {
                 // token: the claim is authoritative for *which* tenant, not for
                 // whether that tenant may be addressed at all. An issuer able to
                 // set the tenant claim would otherwise reach the shared tenant.
-                reject_reserved_tenant(jwt_tenant, TenantSource::JwtClaim)?;
+                reject_reserved_tenant(jwt_tenant.as_str(), TenantSource::JwtClaim)?;
                 return Ok(TenantExtractor::new(
-                    jwt_tenant,
+                    jwt_tenant.as_str(),
                     crate::tenant::TenantSource::JwtClaim,
                 ));
             }
@@ -235,7 +273,9 @@ impl TenantExtractor {
             // If nothing (or only the default) was requested, fall back to the
             // configured default so single-tenant-with-auth deployments keep working.
             let resolver = TenantResolver::new(&config.multitenancy);
-            let resolved = resolver.resolve(parts, &config.multitenancy, &config.default_tenant);
+            let resolved = resolver
+                .resolve(parts, &config.multitenancy, &config.default_tenant)
+                .map_err(source_error_to_rejection)?;
             // An empty resolved tenant means nothing real was requested — e.g. an
             // empty JWT tenant claim re-surfaced by the resolver's JwtTenantExtractor
             // (which runs even in HeaderOnly mode), with no header/URL tenant
@@ -271,7 +311,9 @@ impl TenantExtractor {
         let resolver = TenantResolver::new(&config.multitenancy);
 
         // Resolve tenant from request
-        let resolved = resolver.resolve(parts, &config.multitenancy, &config.default_tenant);
+        let resolved = resolver
+            .resolve(parts, &config.multitenancy, &config.default_tenant)
+            .map_err(source_error_to_rejection)?;
 
         // Validate consistency if strict mode is enabled
         if config.multitenancy.strict_validation {
@@ -381,6 +423,7 @@ mod tests {
         use axum::http::{HeaderValue, Request, StatusCode};
         use helios_auth::{Principal, ScopeSet};
         use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::tenant::MAX_TENANT_ID_LEN;
 
         use super::super::*;
         use crate::config::{MultitenancyConfig, ServerConfig, TenantRoutingMode};
@@ -675,6 +718,91 @@ mod tests {
                 .await
                 .expect_err("empty claim + non-default header should be forbidden");
             assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        // ── Canonical tenant-id validation at the ingresses (issue #385) ────
+
+        /// The JWT claim is authoritative and used to be validated by nothing,
+        /// making it the one ingress that could put an arbitrary string into a
+        /// storage key.
+        ///
+        /// `403` rather than `400`: the request is well-formed and the token is
+        /// authenticated — it is the authorization context that is unusable,
+        /// matching the claimless-token path above.
+        #[tokio::test]
+        async fn invalid_jwt_tenant_claim_is_forbidden() {
+            let state = make_state(false, "test-tenant");
+            let too_long = "a".repeat(MAX_TENANT_ID_LEN + 1);
+
+            for bad in [
+                "acme corp",       // whitespace
+                "acme/resources",  // reserved segment — the S3 purge collision
+                "__system__",      // the shared-tenant sentinel
+                "acme%2Fresearch", // escape introducer
+                "../etc",          // relative-path segment
+                "acme/",           // malformed hierarchy
+                too_long.as_str(), // over the canonical length cap
+            ] {
+                let mut parts = make_parts(None, Some(make_principal(Some(bad))));
+                let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{bad:?} must be rejected, but resolved"));
+                assert_eq!(
+                    err.0,
+                    StatusCode::FORBIDDEN,
+                    "{bad:?} should be 403, got {err:?}"
+                );
+            }
+        }
+
+        /// Regression for the silent cross-tenant fallback.
+        ///
+        /// With auth disabled, a malformed `X-Tenant-ID` used to be filtered to
+        /// `None`, so the resolver fell through to the **default tenant** and the
+        /// request was served against it — a `200` reading and writing someone
+        /// else's data because of a typo.
+        #[tokio::test]
+        async fn invalid_header_is_bad_request_not_the_default_tenant() {
+            let state = make_state(false, "test-tenant");
+            let too_long = "a".repeat(MAX_TENANT_ID_LEN + 1);
+
+            // `__system__` is deliberately absent: it is well-formed as a
+            // *request*, and the statement being made is "you may not address
+            // this tenant" (403, issue #317), not "your request is malformed".
+            // See `test_other_reserved_ids_are_forbidden_too`.
+            for bad in [
+                "acme corp",
+                "acme/resources",
+                "acme/__system__",
+                too_long.as_str(),
+            ] {
+                let mut parts = make_parts(Some(bad), None);
+                let err = TenantExtractor::from_request_parts(&mut parts, &state)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    err.0,
+                    StatusCode::BAD_REQUEST,
+                    "{bad:?} should be 400, got {err:?}"
+                );
+            }
+        }
+
+        /// A valid hierarchical id resolves through the header, and a dotted id
+        /// — provisionable by the admin API but previously unroutable — now works.
+        #[tokio::test]
+        async fn canonical_ids_the_old_header_charset_rejected_now_resolve() {
+            let state = make_state(false, "test-tenant");
+
+            for good in ["acme/research", "tenant.example"] {
+                let mut parts = make_parts(Some(good), None);
+                let extractor = TenantExtractor::from_request_parts(&mut parts, &state)
+                    .await
+                    .unwrap_or_else(|e| panic!("{good:?} should resolve, got {e:?}"));
+                assert_eq!(extractor.tenant_id(), good);
+                assert_eq!(extractor.source(), TenantSource::Header);
+            }
         }
     }
 }

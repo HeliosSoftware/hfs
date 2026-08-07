@@ -57,7 +57,7 @@ pub async fn batch_handler<S>(
     request: Request,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + BundleProvider + Send + Sync,
+    S: ResourceStorage + BundleProvider + helios_persistence::core::SearchProvider + Send + Sync,
 {
     // Extract the Principal from request extensions (set by auth middleware).
     // If present, per-entry scope checks will be enforced.
@@ -204,7 +204,7 @@ async fn process_transaction<S>(
     principal: Option<&Principal>,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + BundleProvider + Send + Sync,
+    S: ResourceStorage + BundleProvider + helios_persistence::core::SearchProvider + Send + Sync,
 {
     debug!(
         tenant = %tenant.tenant_id(),
@@ -253,6 +253,14 @@ where
             }
         }
     }
+
+    // Conditional references (`Type?query`) resolve against the server's
+    // content before anything executes, per the transaction processing rules:
+    // exactly one match rewrites the reference to `Type/id`; zero or several
+    // fail the bundle (#459). They used to be stored verbatim — unsearchable
+    // and unresolvable. References to entries created by this same bundle use
+    // `fullUrl`s, which the storage layer resolves during processing.
+    resolve_conditional_references(state, &tenant, &mut indexed_entries).await?;
 
     // Write-path validation: transactions are atomic, so any invalid write
     // entry rejects the whole bundle before anything executes.
@@ -839,6 +847,149 @@ fn status_text(code: &str) -> &'static str {
 /// Parses a bundle entry from JSON into a BundleEntry struct.
 ///
 /// Returns the BundleEntry and optionally the fullUrl for reference resolution.
+/// Resolves conditional references (`Type?query`) in the bundle's resources
+/// against the server's content, per the transaction processing rules:
+/// exactly one match rewrites the reference to `Type/id`, zero or several
+/// fail the bundle (#459). They used to pass through into storage verbatim,
+/// where nothing can search or resolve them.
+async fn resolve_conditional_references<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    indexed_entries: &mut [(usize, BundleEntry, Option<String>)],
+) -> RestResult<()>
+where
+    S: ResourceStorage + helios_persistence::core::SearchProvider + Send + Sync,
+{
+    use std::collections::HashMap;
+
+    // Collect every distinct conditional reference first: bundles repeat the
+    // same one heavily (every Synthea entry names its location), and each
+    // lookup is a search.
+    let mut conditionals: HashMap<String, Option<String>> = HashMap::new();
+    for (_, entry, _) in indexed_entries.iter() {
+        if let Some(resource) = &entry.resource {
+            collect_conditional_references(resource, &mut conditionals);
+        }
+    }
+    if conditionals.is_empty() {
+        return Ok(());
+    }
+
+    for (reference, resolved) in conditionals.iter_mut() {
+        let (resource_type, query_string) =
+            reference.split_once('?').expect("collected with a '?'");
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query_string.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let registry = state.storage().search_param_registry(tenant.context());
+        let mut query = {
+            let registry = registry.read();
+            crate::extractors::build_search_query_from_pairs(resource_type, &pairs, &registry)
+                .map_err(|e| RestError::BadRequest {
+                    message: format!(
+                        "Conditional reference '{reference}' is not a valid search: {e}"
+                    ),
+                })?
+        };
+        // Two is enough to prove the match is not unique.
+        query.count = Some(2);
+        let result = state
+            .storage()
+            .search(tenant.context(), &query)
+            .await
+            .map_err(RestError::from)?;
+        match result.resources.items.as_slice() {
+            [only] => {
+                *resolved = Some(format!("{}/{}", only.resource_type(), only.id()));
+            }
+            [] => {
+                return Err(RestError::BadRequest {
+                    message: format!(
+                        "Conditional reference '{reference}' matches no existing resource"
+                    ),
+                });
+            }
+            _ => {
+                return Err(RestError::BadRequest {
+                    message: format!(
+                        "Conditional reference '{reference}' matches more than one resource"
+                    ),
+                });
+            }
+        }
+    }
+
+    for (_, entry, _) in indexed_entries.iter_mut() {
+        if let Some(resource) = &mut entry.resource {
+            rewrite_conditional_references(resource, &conditionals);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a reference literal is a conditional reference (`Type?query`).
+fn is_conditional_reference(reference: &str) -> bool {
+    match reference.split_once('?') {
+        Some((head, query)) => {
+            !head.is_empty()
+                && !query.is_empty()
+                && head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && head.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Walks a resource collecting conditional `reference` literals.
+fn collect_conditional_references(
+    value: &Value,
+    out: &mut std::collections::HashMap<String, Option<String>>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get("reference")
+                && is_conditional_reference(reference)
+            {
+                out.entry(reference.clone()).or_insert(None);
+            }
+            for v in map.values() {
+                collect_conditional_references(v, out);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                collect_conditional_references(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrites collected conditional `reference` literals to their resolutions.
+fn rewrite_conditional_references(
+    value: &mut Value,
+    resolved: &std::collections::HashMap<String, Option<String>>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get("reference")
+                && let Some(Some(target)) = resolved.get(reference)
+            {
+                map.insert("reference".to_string(), Value::String(target.clone()));
+            }
+            for v in map.values_mut() {
+                rewrite_conditional_references(v, resolved);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                rewrite_conditional_references(item, resolved);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), String> {
     let request = entry
         .get("request")

@@ -671,9 +671,16 @@ impl BulkSubmitProvider for SqliteBackend {
                 error_count += 1;
             }
 
-            // Store the result
-            self.store_entry_result(tenant, submission_id, manifest_id, &entry_result)
-                .await?;
+            // Store the result, keyed by the file it came from (#457): line
+            // numbers restart per file, so the file is part of the identity.
+            self.store_entry_result(
+                tenant,
+                submission_id,
+                manifest_id,
+                options.file_url.as_deref().unwrap_or(""),
+                &entry_result,
+            )
+            .await?;
 
             results.push(entry_result);
         }
@@ -937,6 +944,7 @@ impl SqliteBackend {
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
+        file_url: &str,
         result: &BulkEntryResult,
     ) -> StorageResult<()> {
         let conn = self.get_connection()?;
@@ -947,15 +955,19 @@ impl SqliteBackend {
             .as_ref()
             .and_then(|o| serde_json::to_vec(o).ok());
 
+        // OR REPLACE: the worker re-fetches a whole file after a transient
+        // failure, and the retry must overwrite its own earlier rows instead
+        // of colliding with them (#457).
         conn.execute(
-            "INSERT INTO bulk_entry_results
-             (tenant_id, submitter, submission_id, manifest_id, line_number, resource_type, resource_id, created, outcome, operation_outcome)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR REPLACE INTO bulk_entry_results
+             (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 tenant_id,
                 &submission_id.submitter,
                 &submission_id.submission_id,
                 manifest_id,
+                file_url,
                 result.line_number as i64,
                 &result.resource_type,
                 &result.resource_id,
@@ -2055,6 +2067,49 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
         assert!(results.iter().all(|r| r.created));
+    }
+
+    /// #457: a manifest with several output files restarts line numbers in
+    /// each file, so the stored entry-result key must include the file — the
+    /// old key collided on every file after the first.
+    #[tokio::test]
+    async fn test_process_entries_from_multiple_files_do_not_collide() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        for (file, family) in [
+            ("http://provider/Patient.ndjson", "FromPatients"),
+            ("http://provider/Practitioner.ndjson", "FromPractitioners"),
+        ] {
+            // Both files start at line 1 — the collision of the old key.
+            let entries = vec![NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "name": [{"family": family}]}),
+            )];
+            let options = BulkProcessingOptions::new().with_file_url(file);
+            let results = backend
+                .process_entries(&tenant, &sub_id, &manifest.manifest_id, entries, &options)
+                .await
+                .unwrap_or_else(|e| panic!("file {file} must ingest: {e}"));
+            assert!(results.iter().all(|r| r.is_success()), "{file}");
+        }
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 2, "one stored entry result per file");
     }
 
     #[tokio::test]

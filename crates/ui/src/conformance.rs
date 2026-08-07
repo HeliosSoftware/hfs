@@ -63,38 +63,75 @@ impl ConformanceSource for HttpConformanceSource {
         _version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String> {
-        // A single page large enough to hold the whole conformance set (~1.4k
-        // SearchParameters per version): the UI needs the full list for its
-        // facets and rail, and paginates in-memory. Capped at 10000 — the
-        // Elasticsearch max_result_window — so the search also succeeds on
-        // backends that delegate search to ES.
-        let url = format!("{}/{}?_count=10000", self.base_url, resource_type);
-        let mut request = self
-            .client
-            .get(&url)
-            .header("Accept", "application/fhir+json");
-        // Scope the self-call to the effective tenant (#344); an empty id means
-        // the server default and needs no header.
-        if !tenant.is_empty() {
-            request = request.header("X-Tenant-ID", tenant);
+        // Ask for everything at once, then follow `next` links for whatever
+        // the server's `_count` policy withheld (#460): the request says
+        // 10000, but a server capping at 1000 used to silently truncate the
+        // registry (1377 R4 SearchParameters served as 1000). The UI needs
+        // the full list for its facets and rail, and paginates in-memory.
+        let mut url = format!("{}/{}?_count=10000", self.base_url, resource_type);
+        let mut resources = Vec::new();
+        // Generous page bound — only a runaway self-linking server hits it.
+        for _ in 0..100 {
+            let mut request = self
+                .client
+                .get(&url)
+                .header("Accept", "application/fhir+json");
+            // Scope the self-call to the effective tenant (#344); an empty id
+            // means the server default and needs no header.
+            if !tenant.is_empty() {
+                request = request.header("X-Tenant-ID", tenant);
+            }
+            let request = self
+                .outbound_auth
+                .authorize(request, &self.base_url)
+                .await
+                .map_err(|e| format!("outbound auth failed: {e}"))?;
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("request to {url} failed: {e}"))?;
+            if !response.status().is_success() {
+                // A failed page fails the fetch: serving a silently partial
+                // registry is exactly the bug this loop exists to fix.
+                return Err(format!("{url} returned {}", response.status()));
+            }
+            let bundle: Value = response
+                .json()
+                .await
+                .map_err(|e| format!("parsing {resource_type} bundle failed: {e}"))?;
+            resources.extend(extract_bundle_resources(&bundle));
+            match next_link(&bundle) {
+                // The advertised link carries the server's own idea of its base
+                // URL, which need not be the loopback this client targets —
+                // keep the path + query, swap in our base.
+                Some(next) => url = rebase_link(&next, &self.base_url),
+                None => break,
+            }
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("request to {url} failed: {e}"))?;
-        if !response.status().is_success() {
-            return Err(format!("{url} returned {}", response.status()));
+        Ok(resources)
+    }
+}
+
+/// The `next` page URL of a searchset Bundle, if any.
+fn next_link(bundle: &Value) -> Option<String> {
+    bundle
+        .get("link")?
+        .as_array()?
+        .iter()
+        .find(|l| l.get("relation").and_then(Value::as_str) == Some("next"))?
+        .get("url")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Points a server-advertised link at `base_url`, keeping its path and query.
+fn rebase_link(link: &str, base_url: &str) -> String {
+    match link.find("://").and_then(|i| link[i + 3..].find('/')) {
+        Some(slash) => {
+            let i = link.find("://").unwrap() + 3;
+            format!("{}{}", base_url, &link[i + slash..])
         }
-        let bundle: Value = response
-            .json()
-            .await
-            .map_err(|e| format!("parsing {resource_type} bundle failed: {e}"))?;
-        Ok(extract_bundle_resources(&bundle))
+        None => link.to_string(),
     }
 }
 
@@ -174,5 +211,81 @@ impl ConformanceSource for StaticConformanceSource {
             .get(&(resource_type.to_string(), version))
             .cloned()
             .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_link_finds_the_next_relation() {
+        let bundle = serde_json::json!({
+            "link": [
+                {"relation": "self", "url": "http://s/SearchParameter?_count=1000"},
+                {"relation": "next", "url": "http://s/SearchParameter?_count=1000&_offset=1000"}
+            ]
+        });
+        assert_eq!(
+            next_link(&bundle).as_deref(),
+            Some("http://s/SearchParameter?_count=1000&_offset=1000")
+        );
+        assert_eq!(next_link(&serde_json::json!({"link": []})), None);
+    }
+
+    #[test]
+    fn rebase_link_swaps_the_advertised_base_for_ours() {
+        assert_eq!(
+            rebase_link(
+                "http://localhost:8080/SearchParameter?_offset=1000",
+                "http://127.0.0.1:9999"
+            ),
+            "http://127.0.0.1:9999/SearchParameter?_offset=1000"
+        );
+    }
+
+    /// #460: a server that caps `_count` answers in pages; the fetch must
+    /// follow `next` links and return the union, not the first page.
+    #[tokio::test]
+    async fn http_fetch_follows_next_links() {
+        use axum::{Router, extract::Query, routing::get};
+        use std::collections::HashMap;
+
+        async fn page(Query(q): Query<HashMap<String, String>>) -> axum::Json<Value> {
+            let offset: usize = q.get("_offset").map(|o| o.parse().unwrap()).unwrap_or(0);
+            let mut bundle = serde_json::json!({
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [{"resource": {"resourceType": "SearchParameter", "id": format!("sp-{offset}")}}]
+            });
+            if offset == 0 {
+                // Advertise the next page under a base URL that is not the
+                // one the client dialed, like a server with a configured
+                // public base does.
+                bundle["link"] = serde_json::json!([
+                    {"relation": "next", "url": "http://advertised.invalid/SearchParameter?_offset=1"}
+                ]);
+            }
+            axum::Json(bundle)
+        }
+
+        let app = Router::new().route("/SearchParameter", get(page));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+        );
+        let resources = source
+            .fetch("SearchParameter", FhirVersion::R4, "")
+            .await
+            .expect("fetch succeeds");
+        let ids: Vec<_> = resources
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["sp-0", "sp-1"]);
     }
 }

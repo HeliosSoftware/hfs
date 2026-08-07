@@ -811,7 +811,11 @@ impl ResourceStorage for PostgresBackend {
         id: &str,
         display_name: Option<&str>,
     ) -> StorageResult<crate::core::TenantRecord> {
-        crate::tenant::ensure_mutable_tenant(id)?;
+        // Backstop for the canonical tenant-id contract (issue #385). As with
+        // SQLite, PostgreSQL keys tenants by an exact-match, case-sensitive
+        // `tenant_id` column and has no derivation to protect — this keeps the
+        // precondition uniform across every implementation.
+        self.ensure_canonical_tenant_id(id)?;
         let client = self.get_client().await?;
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here
@@ -3330,6 +3334,19 @@ impl ReindexTarget for PostgresBackend {
             .index_contained_resources(&client, tenant_id, resource_type, resource_id, content)
             .await?;
 
+        // Rebuild the full-text row as well. `run_reindex` deletes each
+        // resource's search entries first (`delete_search_entries` ->
+        // `delete_search_index`), and that drops the `resource_fts` row; without
+        // this call nothing put it back, so `$reindex` silently disabled
+        // `_text`/`_content` on every reindex, with or without `clear_existing`.
+        // Same defect as the SQLite side — this is not PostgreSQL-specific.
+        //
+        // Not counted in `count`, which reports `search_index` entries only.
+        // `index_fts_content` is DELETE-then-INSERT here, so it is idempotent
+        // regardless of what ran before it.
+        self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
+            .await?;
+
         Ok(count)
     }
 
@@ -3397,10 +3414,29 @@ impl SearchableContent {
 }
 
 /// Extracts searchable text content from a FHIR resource.
+///
+/// `full_content` backs `_content`, which FHIR defines as a search over *the
+/// entire content of the resource* — so it must be a superset of `_text`, the
+/// narrative-only search. `collect_strings` skips the `div` key deliberately, to
+/// keep raw XHTML markup (`div`, `p`, `xmlns`, attribute values) out of the
+/// index; that left the narrative missing from `_content` altogether, so a term
+/// that appeared only in `text.div` was findable through `_text` and invisible
+/// to `_content`. Appending the already-stripped narrative restores the
+/// superset relationship without indexing the markup, and matches SQLite, which
+/// has always had the narrative in `_content`. `data` stays excluded — base64
+/// attachment blobs are not text.
 fn extract_searchable_content(resource: &Value) -> SearchableContent {
+    let narrative = extract_narrative(resource);
+    let mut full_content = extract_all_strings(resource);
+    if !narrative.is_empty() {
+        if !full_content.is_empty() {
+            full_content.push(' ');
+        }
+        full_content.push_str(&narrative);
+    }
     SearchableContent {
-        narrative: extract_narrative(resource),
-        full_content: extract_all_strings(resource),
+        narrative,
+        full_content,
     }
 }
 
@@ -3462,5 +3498,87 @@ fn collect_strings(value: &Value, parts: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod fts_extraction_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn patient_with_narrative() -> Value {
+        json!({
+            "resourceType": "Patient",
+            "name": [{"family": "Purgetest"}],
+            "text": {
+                "status": "generated",
+                "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>Assessment: \
+                        Zebracrossingdiagnosis.</p></div>"
+            },
+            "photo": [{"contentType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUg=="}]
+        })
+    }
+
+    #[test]
+    fn content_includes_the_narrative() {
+        // Regression: `_content` is "the entire content of the resource", so a
+        // term that only appears in the narrative must be reachable through it.
+        // `collect_strings` skips the `div` key, which used to drop the
+        // narrative from `full_content` entirely — `_text` found the term,
+        // `_content` did not.
+        let content = extract_searchable_content(&patient_with_narrative());
+
+        assert!(
+            content.narrative.contains("Zebracrossingdiagnosis"),
+            "narrative: {}",
+            content.narrative
+        );
+        assert!(
+            content.full_content.contains("Zebracrossingdiagnosis"),
+            "_content must be a superset of _text: {}",
+            content.full_content
+        );
+        assert!(
+            content.full_content.contains("Purgetest"),
+            "the non-narrative fields must still be there: {}",
+            content.full_content
+        );
+    }
+
+    #[test]
+    fn content_excludes_markup_and_binary_payloads() {
+        // The narrative goes in stripped, not raw: tag and attribute noise would
+        // make every resource match `xmlns` or `div`. Base64 attachment data
+        // stays out for the same reason plus index size.
+        let content = extract_searchable_content(&patient_with_narrative());
+
+        assert!(
+            !content.full_content.contains("xmlns"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("<p>"),
+            "{}",
+            content.full_content
+        );
+        assert!(
+            !content.full_content.contains("iVBORw0KGgo"),
+            "{}",
+            content.full_content
+        );
+    }
+
+    #[test]
+    fn narrative_only_resource_is_not_empty() {
+        // `index_fts_content` returns early on `is_empty()`; a resource whose
+        // only text is its narrative must still be indexed.
+        let content = extract_searchable_content(&json!({
+            "resourceType": "Binary",
+            "text": {"div": "<div><p>Solitary</p></div>"}
+        }));
+
+        assert!(!content.is_empty());
+        assert!(content.full_content.contains("Solitary"));
     }
 }

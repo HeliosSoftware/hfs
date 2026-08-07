@@ -8,6 +8,12 @@
 //! match and no minimum**: it can never produce false cardinality errors,
 //! its constraints simply stay dormant until the matcher lands (Phase 7),
 //! and the generator surfaces a warning.
+//!
+//! Under `ordered: true` each slice also gets its declaration ordinal as
+//! `order` — FHIR's ordered slicing means "matched items appear in the order
+//! the slices are declared", and the engine's check needs a number to compare.
+//! Emitted only when the slicing is ordered, matching upstream's generated
+//! schemas (an unordered slicing carries no `order`).
 
 use super::EdDiscriminator;
 use super::tree::{SliceNode, finalize};
@@ -23,8 +29,9 @@ pub(super) fn build_slicing(
     ordered: Option<bool>,
     warnings: &mut Vec<String>,
 ) -> Option<Slicing> {
+    let is_ordered = ordered == Some(true);
     let mut out: IndexMap<String, Slice> = IndexMap::new();
-    for (name, slice_node) in slices {
+    for (position, (name, slice_node)) in slices.into_iter().enumerate() {
         let SliceNode {
             node,
             min,
@@ -53,7 +60,9 @@ pub(super) fn build_slicing(
                 min: if match_.is_some() { min } else { None },
                 max,
                 match_,
-                order: None,
+                // Ordinals are relative — only their sequence is compared —
+                // so gaps from lifted extension-sugar slices are harmless.
+                order: is_ordered.then_some(position as u64),
                 reslice: None,
                 slice_is_constraining: None,
                 schema: schema.map(Arc::new),

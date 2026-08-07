@@ -1006,6 +1006,79 @@ async fn bulk_submit_lifecycle_and_processing() {
     assert_eq!(completed.status, SubmissionStatus::Complete);
 }
 
+/// Two output files of one manifest, both starting at line 1, must each keep
+/// their own entry result and raw archive (issue #457).
+///
+/// The S3 shape of that bug is quieter than the SQL backends': a `PutObject`
+/// has no primary key to violate, so the second file's line 1 landed on the
+/// first file's key and silently replaced it — no error, just an entry result
+/// and an audit payload gone, and counts reporting one file's worth of lines
+/// instead of the sum.
+#[tokio::test]
+async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-multifile");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    for (file, family) in [
+        ("http://provider/Patient.ndjson", "FromPatients"),
+        ("http://provider/Practitioner.ndjson", "FromPractitioners"),
+    ] {
+        let entries = vec![NdjsonEntry::new(
+            1,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": family}]}),
+        )];
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new().with_file_url(file),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("file {file} must ingest: {e}"));
+        assert!(results.iter().all(|r| r.is_success()), "{file}");
+    }
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success, 2, "one stored entry result per file");
+
+    let stored = backend
+        .get_entry_results(&tenant, &submission_id, &manifest.manifest_id, None, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 2, "both files' line 1 must survive");
+
+    // The raw NDJSON archive is discriminated too, so the auditable copy of the
+    // first file's payload is not replaced by the second's.
+    let raw_keys: Vec<String> = mock
+        .recorded_puts()
+        .into_iter()
+        .map(|put| put.key)
+        .filter(|key| key.contains("/raw/") && key.ends_with("line-1.ndjson"))
+        .collect();
+    assert_eq!(raw_keys.len(), 2, "one raw archive put per file");
+    assert_ne!(
+        raw_keys[0], raw_keys[1],
+        "raw archives must not share a key"
+    );
+}
+
 #[tokio::test]
 async fn bulk_submit_duplicate_abort_and_rollback() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
