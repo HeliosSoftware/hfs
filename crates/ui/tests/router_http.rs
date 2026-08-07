@@ -836,3 +836,25 @@ async fn editor_add_with_a_slice_name_appends_the_item() {
 
     assert!(html.contains(r#"data-path="identifier.0""#));
 }
+
+/// #476: the Batch/Transaction workspace mounts and the nav links it.
+#[tokio::test]
+async fn batch_page_serves_the_workspace_shell() {
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<!doctype html>"));
+    // The three client-driven stages are all in the shell.
+    assert!(html.contains(r#"id="batch-upload""#));
+    assert!(html.contains(r#"id="batch-preflight""#));
+    assert!(html.contains(r#"id="batch-response""#));
+    // The nav entry is a real link now, current on this page.
+    assert!(html.contains(r#"href="/ui/batch" aria-current="page""#));
+    // The semantics copy rides in as data for batch.js.
+    assert!(html.contains("data-msg-semantics-transaction"));
+    assert!(html.contains(r#"src="/ui/assets/batch.js""#));
+}
