@@ -93,6 +93,7 @@ Use those skills instead of expanding this always-loaded file:
 - `/work-with-audit` - FHIR AuditEvent logging, IHE BALP, audit sinks, and `HFS_AUDIT_*` config.
 - `/work-with-subscriptions` - Topic-based Subscriptions engine, channels (rest-hook/websocket/email/messaging), and config.
 - `/work-with-cds-hooks` - CDS Hooks protocol types and async service trait for clinical decision support.
+- `/work-with-ui` - The `crates/ui` web UI: Askama templates, htmx fragments, `/ui` routes, vendored assets, i18n, and the Rust + Playwright test rings.
 - `/bulk-data-export` - FHIR Bulk Data Access `$export` jobs, manifests, output storage, and behavior notes.
 - `/bulk-data-submit` - FHIR Bulk Data Submit `$bulk-submit` ingestion, status, OAuth, JWE, and worker settings.
 - `/docker-and-release` - Docker image builds and release workflow.
