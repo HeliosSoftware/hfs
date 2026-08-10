@@ -81,7 +81,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_BLOCK_CONCURRENT_SUBMISSION` | `false` | Reject a new submission while one is in-progress; returns `429` |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | none | P-256/P-384 private key(s) for `ECDH-ES*` `fileEncryptionKey` unwrapping — PEM (PKCS#8/SEC1) or a JWK / JWK Set |
 
-Job state reuses the same backend as the FHIR resources. SQLite shares `./data/hfs.db`; PostgreSQL shares `HFS_DATABASE_URL`. Bulk submit is available on `sqlite`, `postgres`, and their `-elasticsearch` composites. Other backends return `501`. The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubmitProvider` ingestion engine) and `BulkSubmitRestWorker` (full `$bulk-submit` REST worker/job-store): SQLite and Postgres advertise both, while S3 advertises only `BulkSubmitIngest` and never owns REST-worker job state.
+Job state reuses the same backend as the FHIR resources — unlike bulk *export*, which sidecars its job store on MongoDB. Every backend that runs `$bulk-submit` hosts its own: SQLite shares `./data/hfs.db`, PostgreSQL shares `HFS_DATABASE_URL`, and MongoDB uses its own `bulk_*` collections. Bulk submit is available on `sqlite`, `postgres`, `mongodb`, and their `-elasticsearch` composites; other backends return `501`. The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubmitProvider` ingestion engine) and `BulkSubmitRestWorker` (full `$bulk-submit` REST worker/job-store): those three advertise both, while S3 advertises only `BulkSubmitIngest` and never owns REST-worker job state.
 
 ## Behavior Notes
 

@@ -206,6 +206,11 @@ impl CapabilityMatrix {
                 (BackendCapability::OffsetPagination, SupportLevel::Implemented),
                 (BackendCapability::Sorting, SupportLevel::Implemented),
                 (BackendCapability::BulkExport, SupportLevel::Planned),
+                (BackendCapability::BulkSubmitIngest, SupportLevel::Implemented),
+                (
+                    BackendCapability::BulkSubmitRestWorker,
+                    SupportLevel::Implemented,
+                ),
                 (BackendCapability::SharedSchema, SupportLevel::Implemented),
                 (BackendCapability::SchemaPerTenant, SupportLevel::NotPlanned),
                 (BackendCapability::DatabasePerTenant, SupportLevel::Planned),
