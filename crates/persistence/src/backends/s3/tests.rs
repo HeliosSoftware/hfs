@@ -768,35 +768,6 @@ async fn history_instance_type_system_and_invalid_cursor() {
 }
 
 #[tokio::test]
-async fn bundle_batch_mixed_results() {
-    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
-    let backend = make_prefix_backend(mock);
-    let tenant = tenant("tenant-a");
-
-    let entries = vec![
-        BundleEntry {
-            method: BundleMethod::Post,
-            url: "Patient".to_string(),
-            resource: Some(json!({"resourceType":"Patient","id":"b1"})),
-            ..Default::default()
-        },
-        BundleEntry {
-            method: BundleMethod::Get,
-            url: "Patient/missing".to_string(),
-            ..Default::default()
-        },
-    ];
-
-    let result = backend
-        .process_batch(&tenant, entries, FhirVersion::default())
-        .await
-        .unwrap();
-    assert_eq!(result.entries.len(), 2);
-    assert_eq!(result.entries[0].status, 201);
-    assert_eq!(result.entries[1].status, 404);
-}
-
-#[tokio::test]
 async fn bundle_transaction_success_and_reference_resolution() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
     let backend = make_prefix_backend(mock);

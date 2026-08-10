@@ -150,12 +150,47 @@ The server is configured via environment variables:
 | `HFS_LOG_LEVEL` | info | Log level |
 | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
+| `HFS_BATCH_MAX_CONCURRENCY` | 16 | Ceiling on concurrent entries within one `batch` Bundle (see below) |
 | `HFS_ENABLE_CORS` | true | Enable CORS |
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 | `HFS_DATABASE_URL` | - | Database connection string |
 | `HFS_TENANT_ROUTING_MODE` | header_only | Tenant routing mode |
 | `HFS_TENANT_STRICT_VALIDATION` | false | Error on tenant mismatch |
 | `HFS_JWT_TENANT_CLAIM` | tenant_id | JWT claim name (future) |
+
+### Batch entry concurrency
+
+Entries of a `batch` Bundle execute concurrently, bounded by whatever the
+storage backend declares it tolerates (`ResourceStorage::bulk_write_concurrency`)
+capped by `HFS_BATCH_MAX_CONCURRENCY`. The setting is a **ceiling**: it can
+lower a backend's declared tolerance but never raise it, because only the
+backend knows what its connection pool absorbs. Raise throughput by raising the
+backend's own limit — pool size, for instance — not this one.
+
+The bound exists so a large bundle finishes inside `HFS_REQUEST_TIMEOUT`. At a
+bound of 1 the wall clock is the *sum* of every entry's storage round trips, so
+against a latency-bound backend a few hundred entries will exceed the timeout
+and the client receives a 408 with no body — while the entries that already
+committed stay committed.
+
+Points worth knowing before raising it:
+
+- **It multiplies per concurrent request.** Twenty simultaneous batches at a
+  bound of 16 put 320 storage operations in flight. This is a per-request bound,
+  not a server-wide budget.
+- **Entries are not ordered relative to one another.** FHIR states that a server
+  may process batch entries in any order, and at a bound above 1 it does. Two
+  entries writing the same id, or an entry reading what another entry in the
+  same bundle writes, resolve by timing. Put ordered work in a `transaction`, or
+  in separate requests.
+- **Response entries stay positional** regardless: response entry *i* always
+  answers request entry *i*.
+- **A bundle that writes a `StructureDefinition` drops to sequential**
+  automatically, because later entries validate against profiles earlier entries
+  register.
+- **Auditing amplifies with it.** Per-entry audit events are emitted as the
+  entries complete, so a database or S3 audit sink sees the same event count
+  compressed into a much shorter window.
 
 ### HTTP Compression
 

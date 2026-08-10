@@ -737,11 +737,25 @@ pub trait ResourceStorage: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// How many concurrent `create` calls this backend absorbs well during bulk
-    /// writes (e.g. conformance seeding). Latency-bound backends — object
-    /// stores, networked databases — override this so a ~1.4k-resource seed is
+    /// How many concurrent storage calls this backend absorbs well when a
+    /// caller fans out over a collection of resources. Latency-bound backends —
+    /// object stores, networked databases — override this so a large fan-out is
     /// bounded by round trips divided by this factor rather than their sum. The
     /// default of 1 keeps single-writer backends (SQLite) strictly sequential.
+    ///
+    /// Two callers rely on this, and both are request- or startup-scoped rather
+    /// than global:
+    ///
+    /// - conformance seeding ([`crate::search::seeder`]), a ~1.4k-resource
+    ///   startup write;
+    /// - `batch` Bundle entries (`helios_rest::handlers::batch`), where the
+    ///   fan-out is caller-controlled and must finish inside the HTTP request
+    ///   timeout.
+    ///
+    /// Consumers must clamp: a bound of 0 never polls anything, and no backend
+    /// should be trusted to bound request-scoped traffic on its own. The batch
+    /// caller additionally caps this with `HFS_BATCH_MAX_CONCURRENCY`, so the
+    /// number returned here is a tolerance an operator may lower, never a floor.
     fn bulk_write_concurrency(&self) -> usize {
         1
     }
