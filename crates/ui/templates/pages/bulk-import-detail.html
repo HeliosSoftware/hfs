@@ -11,7 +11,7 @@
     <h1 class="page-title">{{ name }}</h1>
   </div>
 
-  <details class="addbox">
+  <details class="addbox addbox--modal">
     <summary class="button button--primary">
       {% include "icons/plus.svg" %}
       {{ i18n.t("bulk-import-add-manifest") }}
@@ -56,32 +56,12 @@
 {% when None %}{% endmatch %}
 
 <section class="card detail">
-  <div class="detail__grid">
-    <div class="detail__field">
-      <span class="detail__label">{{ i18n.t("bulk-import-detail-recipient") }}</span>
-      <span class="detail__value">{{ recipient }}</span>
-    </div>
-    <div class="detail__field">
-      <span class="detail__label">{{ i18n.t("bulk-import-detail-id") }}</span>
-      <span class="detail__value">{{ id }}</span>
-    </div>
-    <div class="detail__field">
-      <span class="detail__label">{{ i18n.t("bulk-import-detail-submitter") }}</span>
-      <span class="detail__value">{{ submitter_display }}</span>
-    </div>
-    <div class="detail__field">
-      <span class="detail__label">{{ i18n.t("bulk-import-detail-created") }}</span>
-      <span class="detail__value">{{ created_at }}</span>
-    </div>
-    <div class="detail__field">
-      <span class="detail__label">{{ i18n.t("bulk-import-detail-status") }}</span>
-      <span class="detail__value">{{ status_label }}</span>
-    </div>
-    <div class="detail__field">
-      <span class="detail__label">{{ i18n.t("bulk-import-detail-auth") }}</span>
-      <span class="detail__value">{{ auth }}</span>
-    </div>
-  </div>
+  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-recipient") }}</span><code>{{ recipient }}</code></div>
+  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-id") }}</span><code>{{ id }}</code></div>
+  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-submitter") }}</span><code>{{ submitter_display }}</code></div>
+  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-created") }}</span><div>{{ created_at }}</div></div>
+  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-status") }}</span><div>{{ status_label }}</div></div>
+  <div class="detail__field"><span>{{ i18n.t("bulk-import-detail-auth") }}</span><div>{{ auth }}</div></div>
 
   <div class="detail__actions">
     <form method="post" action="/ui/bulk-import/{{ id }}/abort">
@@ -143,13 +123,10 @@
     <h2 class="toolbar__title">{{ i18n.t("bulk-import-log") }}</h2>
   </div>
   {% if log.is_empty() %}
-  <p class="detail__value">{{ i18n.t("bulk-import-log-empty") }}</p>
+  <p>{{ i18n.t("bulk-import-log-empty") }}</p>
   {% else %}
-  <ul class="log">
-    {% for line in log %}
-    <li class="log__line"><code>{{ line.at }}</code> {{ line.message }}</li>
-    {% endfor %}
-  </ul>
+  <pre class="detail__code">{% for line in log %}{{ line.at }}  {{ line.message }}
+{% endfor %}</pre>
   {% endif %}
 </section>
 {% endblock %}
