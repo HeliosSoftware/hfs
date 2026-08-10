@@ -457,9 +457,14 @@ mod s3 {
         }
     }
 
-    /// Only the tenancy claim may vary with configuration. Config refines *which*
-    /// member of a mutually exclusive group is reported; it must never change
-    /// anything else.
+    /// Only the tenancy claim may vary with the *placement* topology. Config
+    /// refines *which* member of a mutually exclusive group is reported; the
+    /// topology itself must never change anything else.
+    ///
+    /// `bucket_mode(Some("system"))` is the comparison point deliberately: it is
+    /// the bucket-per-tenant configuration that, like prefix-per-tenant, *can*
+    /// store cross-tenant state. That second axis is asserted separately by
+    /// [`bulk_submit_rest_worker_follows_cross_tenant_storability`].
     #[test]
     fn only_the_tenancy_claim_varies_between_modes() {
         let strip_tenancy = |mode: &S3TenancyMode| -> Vec<BackendCapability> {
@@ -474,6 +479,46 @@ mod s3 {
             strip_tenancy(&bucket_mode(Some("system"))),
             "S3 tenancy mode must affect only the tenant-placement claim"
         );
+    }
+
+    /// `BulkSubmitRestWorker` tracks whether the configuration can store
+    /// cross-tenant state, not how tenants are placed.
+    ///
+    /// The `$bulk-submit` job store keeps its claim queue and poll-token index
+    /// outside every tenant prefix, because a worker claims manifests and
+    /// resolves poll tokens with no tenant in hand. Bucket-per-tenant with no
+    /// `default_system_bucket` has nowhere to put that, so it must not advertise
+    /// the REST worker — the same axis `supports_user_settings` answers.
+    ///
+    /// `BulkSubmitIngest` is unaffected: synchronous ingestion is tenant-scoped
+    /// throughout, so every configuration keeps it.
+    #[test]
+    fn bulk_submit_rest_worker_follows_cross_tenant_storability() {
+        for (label, mode, expected) in [
+            ("PrefixPerTenant", prefix_mode(), true),
+            (
+                "BucketPerTenant + system bucket",
+                bucket_mode(Some("system")),
+                true,
+            ),
+            (
+                "BucketPerTenant, no system bucket",
+                bucket_mode(None),
+                false,
+            ),
+        ] {
+            let declared = S3Backend::declared_capabilities_for(&mode);
+            assert_eq!(
+                declared.contains(&BackendCapability::BulkSubmitRestWorker),
+                expected,
+                "s3 ({label}) must {} BulkSubmitRestWorker",
+                if expected { "declare" } else { "not declare" }
+            );
+            assert!(
+                declared.contains(&BackendCapability::BulkSubmitIngest),
+                "s3 ({label}) always ingests: BulkSubmitIngest is tenant-scoped"
+            );
+        }
     }
 
     #[test]
@@ -491,6 +536,7 @@ mod s3 {
                 BackendCapability::CursorPagination,
                 BackendCapability::BulkExport,
                 BackendCapability::BulkSubmitIngest,
+                BackendCapability::BulkSubmitRestWorker,
                 BackendCapability::SharedSchema,
             ],
         );
@@ -498,27 +544,35 @@ mod s3 {
 
     /// The `BucketPerTenant` counterpart. Without it only the tenancy claim of
     /// that mode was pinned, so any *other* capability could drift on the bucket
-    /// path unnoticed. Its golden list is the `PrefixPerTenant` one with the
-    /// tenancy variant swapped, asserted for both `default_system_bucket`
-    /// settings because that field must not influence any capability.
+    /// path unnoticed.
+    ///
+    /// Its golden list is the `PrefixPerTenant` one with the tenancy variant
+    /// swapped — plus `BulkSubmitRestWorker` only when a `default_system_bucket`
+    /// gives the cross-tenant `$bulk-submit` index somewhere to live. That is the
+    /// one capability `default_system_bucket` may influence; see
+    /// [`bulk_submit_rest_worker_follows_cross_tenant_storability`].
     #[test]
     fn s3_bucket_per_tenant_declares_exactly_its_golden_capabilities() {
         for default_system_bucket in [None, Some("system")] {
+            let mut expected = vec![
+                BackendCapability::Crud,
+                BackendCapability::Versioning,
+                BackendCapability::InstanceHistory,
+                BackendCapability::TypeHistory,
+                BackendCapability::SystemHistory,
+                BackendCapability::OptimisticLocking,
+                BackendCapability::CursorPagination,
+                BackendCapability::BulkExport,
+                BackendCapability::BulkSubmitIngest,
+                BackendCapability::DatabasePerTenant,
+            ];
+            if default_system_bucket.is_some() {
+                expected.push(BackendCapability::BulkSubmitRestWorker);
+            }
             assert_declares_exactly(
                 "s3 (BucketPerTenant)",
                 &S3Backend::declared_capabilities_for(&bucket_mode(default_system_bucket)),
-                &[
-                    BackendCapability::Crud,
-                    BackendCapability::Versioning,
-                    BackendCapability::InstanceHistory,
-                    BackendCapability::TypeHistory,
-                    BackendCapability::SystemHistory,
-                    BackendCapability::OptimisticLocking,
-                    BackendCapability::CursorPagination,
-                    BackendCapability::BulkExport,
-                    BackendCapability::BulkSubmitIngest,
-                    BackendCapability::DatabasePerTenant,
-                ],
+                &expected,
             );
         }
     }

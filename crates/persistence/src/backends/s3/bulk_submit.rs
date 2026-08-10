@@ -61,9 +61,16 @@ impl BulkSubmitProvider for S3Backend {
         let state = SubmissionState {
             summary: summary.clone(),
             abort_reason: None,
+            owner_subject: None,
+            request_url: None,
+            requires_access_token: None,
+            poll_token: None,
+            transaction_time: None,
         };
 
         self.save_submission_state(&location, id, &state).await?;
+        self.touch_submit_registry(tenant, id, summary.status)
+            .await?;
         Ok(summary)
     }
 
@@ -145,6 +152,8 @@ impl BulkSubmitProvider for S3Backend {
         state.summary.completed_at = Some(now);
 
         self.save_submission_state(&location, id, &state).await?;
+        self.touch_submit_registry(tenant, id, state.summary.status)
+            .await?;
         Ok(state.summary)
     }
 
@@ -171,8 +180,14 @@ impl BulkSubmitProvider for S3Backend {
                 ManifestStatus::Pending | ManifestStatus::Processing
             ) {
                 pending_count += 1;
+                let manifest_id = manifest.manifest.manifest_id.clone();
                 manifest.manifest.status = ManifestStatus::Failed;
+                manifest.worker_id = None;
+                manifest.lease_expiry = None;
                 self.save_manifest_state(&location, id, &manifest).await?;
+                // An aborted submission's manifests must leave the claim queue,
+                // or a worker keeps picking up work the submitter cancelled.
+                self.dequeue_manifest(tenant, id, &manifest_id).await?;
             }
         }
 
@@ -183,6 +198,8 @@ impl BulkSubmitProvider for S3Backend {
         state.abort_reason = Some(reason.to_string());
 
         self.save_submission_state(&location, id, &state).await?;
+        self.touch_submit_registry(tenant, id, state.summary.status)
+            .await?;
         Ok(pending_count)
     }
 
@@ -228,15 +245,23 @@ impl BulkSubmitProvider for S3Backend {
         self.save_manifest_state(
             &location,
             submission_id,
-            &SubmissionManifestState {
-                manifest: manifest.clone(),
-            },
+            &SubmissionManifestState::new(manifest.clone()),
         )
         .await?;
+
+        // A manifest with somewhere to fetch from is work for the REST worker;
+        // one without (a status-only kickoff) is not. This is the same predicate
+        // the SQL job stores put in their claim query's `WHERE`.
+        if manifest.manifest_url.is_some() {
+            self.enqueue_manifest(tenant, submission_id, &manifest)
+                .await?;
+        }
 
         submission.summary.manifest_count += 1;
         submission.summary.updated_at = Utc::now();
         self.save_submission_state(&location, submission_id, &submission)
+            .await?;
+        self.touch_submit_registry(tenant, submission_id, submission.summary.status)
             .await?;
 
         Ok(manifest)
@@ -381,11 +406,17 @@ impl BulkSubmitProvider for S3Backend {
         manifest_state.manifest.total_entries += results.len() as u64;
         manifest_state.manifest.processed_entries += results.len() as u64;
         manifest_state.manifest.failed_entries += failed_count;
-        manifest_state.manifest.status = if failed_count > 0 {
-            ManifestStatus::Failed
-        } else {
-            ManifestStatus::Completed
-        };
+        // A leased manifest's terminal status belongs to the worker, which calls
+        // this once per manifest output file and only then decides. Settling it
+        // here would take the manifest out of `processing` mid-run, so a worker
+        // that died on the next file would never be reclaimed.
+        if manifest_state.worker_id.is_none() {
+            manifest_state.manifest.status = if failed_count > 0 {
+                ManifestStatus::Failed
+            } else {
+                ManifestStatus::Completed
+            };
+        }
 
         self.save_manifest_state(&location, submission_id, &manifest_state)
             .await?;
@@ -396,6 +427,8 @@ impl BulkSubmitProvider for S3Backend {
         submission.summary.skipped_count += skipped_count;
         submission.summary.updated_at = Utc::now();
         self.save_submission_state(&location, submission_id, &submission)
+            .await?;
+        self.touch_submit_registry(tenant, submission_id, submission.summary.status)
             .await?;
 
         Ok(results)
@@ -969,7 +1002,7 @@ impl S3Backend {
     }
 
     /// Lists all manifest state objects for a submission.
-    async fn list_manifest_states(
+    pub(super) async fn list_manifest_states(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,

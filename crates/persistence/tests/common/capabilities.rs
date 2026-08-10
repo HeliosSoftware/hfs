@@ -332,6 +332,15 @@ impl CapabilityMatrix {
                 (BackendCapability::Sorting, SupportLevel::NotPlanned),
                 (BackendCapability::BulkExport, SupportLevel::Implemented),
                 (BackendCapability::BulkSubmitIngest, SupportLevel::Implemented),
+                // Also mode-dependent, on a different axis than tenancy: the
+                // `$bulk-submit` job store needs somewhere cross-tenant for its
+                // claim queue and poll-token index, which bucket-per-tenant
+                // without a `default_system_bucket` does not have. See
+                // `S3Backend::supports_bulk_submit_worker`.
+                (
+                    BackendCapability::BulkSubmitRestWorker,
+                    SupportLevel::Implemented,
+                ),
                 // S3 tenancy is mode-dependent (`S3TenancyMode`): a
                 // `PrefixPerTenant` instance is shared-schema, a
                 // `BucketPerTenant` instance is database-per-tenant, and an

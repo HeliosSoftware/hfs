@@ -340,7 +340,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 
 > **Note:** Documentation links reference [build.fhir.org](https://build.fhir.org), which contains the current FHIR development version. Some features marked as planned are new and may be labeled "Trial Use" in the specification.
 
-**Legend:** ✓ Implemented | ◐ Partial | ○ Planned | ✗ Not planned | † Requires external service | ‡ Mode-dependent — see multitenancy notes | — Backend not present in this tree
+**Legend:** ✓ Implemented | ◐ Partial | ○ Planned | ✗ Not planned | † Requires external service | ‡ Mode-dependent — see the notes below the table | — Backend not present in this tree
 
 | Feature                                                                     | SQLite | PostgreSQL | MongoDB | Cassandra | Neo4j | Elasticsearch | S3  |
 | --------------------------------------------------------------------------- | ------ | ---------- | ------- | --------- | ----- | ------------- | --- |
@@ -399,7 +399,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | **[Bulk Operations](https://hl7.org/fhir/uv/bulkdata/)**                    |
 | [Bulk Export](https://hl7.org/fhir/uv/bulkdata/export.html)                 | ✓      | ✓          | ○       | ○         | ○     | ○             | ◐   |
 | [Bulk Submit ingest](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)                | ✓      | ✓          | ✓       | ○         | ○     | ○             | ✓   |
-| [Bulk Submit REST worker](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)           | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ✗   |
+| [Bulk Submit REST worker](https://build.fhir.org/ig/HL7/bulk-data/en/submit.html)           | ✓      | ✓          | ✓       | ✗         | ✗     | ✗             | ‡✓  |
 
 **Notes on partial cells:**
 
@@ -434,10 +434,17 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   each instance as one nested object with inline component values and matches with a single nested
   query. See `docs/search-spec-assessment.md`.
 
-The S3 backend is intentionally storage-focused (CRUD/version/history and `BulkSubmitProvider` ingestion) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but job state belongs to SQLite or PostgreSQL. `$bulk-submit` REST worker/job state also belongs to SQLite or PostgreSQL; S3 supports only the synchronous ingest provider. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
+The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
 **Multitenancy notes.** The four Multitenancy rows describe *where a tenant's records physically live*, not how strongly the boundary is enforced; a deployment sits in exactly one of the first three.
 
+- **‡ The S3 `$bulk-submit` REST worker needs somewhere cross-tenant to write.** Its claim queue and
+  poll-token index live outside every tenant prefix, because a worker claims manifests and resolves
+  poll tokens with no tenant in hand. Every configuration has such a place except `BucketPerTenant`
+  with no `default_system_bucket`, which does not declare the capability and reports `501` from
+  `$bulk-submit` — the same axis `supports_user_settings` answers. Synchronous *ingest* is
+  tenant-scoped throughout and is available on every configuration. See
+  `S3Backend::supports_bulk_submit_worker`.
 - **‡ S3 tenancy is a property of the deployment, not the backend type.** A `PrefixPerTenant` instance (one shared bucket, tenant-scoped key prefixes) is *Shared Schema*; a `BucketPerTenant` instance (a dedicated bucket per tenant) is *Database-per-Tenant*. An instance declares exactly one — see `S3Backend::declared_capabilities_for`.
 - **○ means no backend implements it today.** Unwired SQL generators for these topologies (shared-schema + RLS, schema-per-tenant `search_path`, database-per-tenant pools) once lived in `src/strategy/`; they were removed in issue #370. Do not read a `○` cell as a deployable isolation guarantee.
 - **✗ for PostgreSQL is a decision, not a gap.** Design discussion #28 chose shared-schema for PostgreSQL and declined the per-schema and per-database topologies; advertising them anyway was the defect issue #369 corrected.
@@ -676,7 +683,7 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### S3 + Elasticsearch
 
-S3 handles CRUD, versioning, history, and bulk-submit artifacts. Elasticsearch handles all search operations. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
+S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
 
 - CRUD persistence via S3 objects (current pointer + immutable history versions)
 - Versioning (`vread`, optimistic locking via version checks)
@@ -835,7 +842,7 @@ let composite = CompositeStorage::new(config, backends)?
 
 ## S3 Backend
 
-The S3 backend is a storage-focused persistence backend using AWS S3 object storage. It handles CRUD, versioning/history, and synchronous bulk-submit ingest provider workflows, but is intentionally not a FHIR search engine. For bulk export, S3 participates in two narrower roles: `S3Backend` can provide resource batches for system-level exports, and `S3OutputStore` can store finalized NDJSON output files. Bulk-export and `$bulk-submit` REST worker job state, progress, manifests, leases, and file metadata are not stored in S3; they live in SQLite or PostgreSQL.
+The S3 backend is a storage-focused persistence backend using AWS S3 object storage. It handles CRUD, versioning/history, and the whole `$bulk-submit` surface, but is intentionally not a FHIR search engine. For bulk export, S3 participates in two narrower roles: `S3Backend` can provide resource batches for system-level exports, and `S3OutputStore` can store finalized NDJSON output files; bulk-*export* job state, progress, manifests, leases, and file metadata are not stored in S3, and live in SQLite or PostgreSQL. `$bulk-submit` job state *is* stored in S3, alongside the submission objects it belongs to.
 
 ### Scope
 

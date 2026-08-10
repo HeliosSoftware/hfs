@@ -534,6 +534,12 @@ impl BackendInfo {
                     "Delete",
                     "BulkExport",
                     "BulkSubmitIngest",
+                    // Except in bucket-per-tenant mode with no
+                    // `default_system_bucket`, which has nowhere to keep the
+                    // worker's cross-tenant claim queue. This list describes the
+                    // backend, not a particular deployment; the instance answer
+                    // is `S3Backend::declared_capabilities_for`.
+                    "BulkSubmitRestWorker",
                 ]
                 .into_iter()
                 .map(String::from)
