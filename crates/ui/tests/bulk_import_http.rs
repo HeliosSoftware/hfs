@@ -249,7 +249,7 @@ async fn submitting_a_manifest_posts_the_kickoff_and_logs_the_outcome() {
         .unwrap()
         .iter()
         .find(|p| p["name"] == "fhirBaseUrl")
-        .and_then(|p| p["valueString"].as_str())
+        .and_then(|p| p["valueUrl"].as_str())
         .unwrap();
     assert_eq!(
         fhir_base, "http://example.org",
@@ -464,7 +464,7 @@ async fn manifest_options_ride_the_kickoff() {
     };
     // The explicit FHIR base wins over the manifest-derived fallback.
     assert_eq!(
-        value_of("fhirBaseUrl")["valueString"],
+        value_of("fhirBaseUrl")["valueUrl"],
         "http://base.example/fhir"
     );
     assert_eq!(

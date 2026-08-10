@@ -474,9 +474,10 @@ fn kickoff_parameters(id: &str, status: &str, manifest: Option<&Manifest>) -> Va
             "system": "http://hl7.org/fhir/event-status", "code": status } }),
     ];
     if let Some(m) = manifest {
-        // valueString, not valueUrl: HFS's consumer accepts either spelling,
-        // but the SMART reference recipient reads valueString only.
-        parameter.push(json!({ "name": "manifestUrl", "valueString": m.manifest_url }));
+        // valueUrl per the Bulk Data IG (STU4 ballot: both parameters are
+        // type `url`). The SMART reference recipient reads valueString
+        // instead -- an off-spec leniency gap on its side, not ours.
+        parameter.push(json!({ "name": "manifestUrl", "valueUrl": m.manifest_url }));
         // fhirBaseUrl is required alongside manifestUrl; an empty field falls
         // back to the manifest URL's origin, matching the reference provider
         // (`new URL(manifestUrl).origin`).
@@ -485,7 +486,7 @@ fn kickoff_parameters(id: &str, status: &str, manifest: Option<&Manifest>) -> Va
         } else {
             m.fhir_base_url.clone()
         };
-        parameter.push(json!({ "name": "fhirBaseUrl", "valueString": base }));
+        parameter.push(json!({ "name": "fhirBaseUrl", "valueUrl": base }));
         if !m.output_format.is_empty() {
             parameter.push(json!({ "name": "outputFormat", "valueString": m.output_format }));
         }
