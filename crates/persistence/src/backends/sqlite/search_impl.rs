@@ -1301,8 +1301,8 @@ mod tests {
 
     fn create_test_backend() -> SqliteBackend {
         // Point at the workspace's data directory so the search-parameter
-        // registry loads the full FHIR spec (otherwise only the 5 minimal
-        // embedded params are available and chained-search tests fail to
+        // registry loads the full FHIR spec (otherwise only the handful of
+        // minimal embedded params are available and chained-search tests fail to
         // resolve param types like Observation.code → Token).
         let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")

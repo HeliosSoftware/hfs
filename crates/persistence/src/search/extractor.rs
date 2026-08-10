@@ -328,18 +328,29 @@ impl SearchParameterExtractor {
     ///
     /// This method extracts only the parts that start with the given resource type and
     /// simplifies common patterns that use `resolve()`.
+    ///
+    /// Parts prefixed with an abstract base type (`Resource.`, `DomainResource.`)
+    /// apply to every resource, so the prefix is stripped instead of being matched
+    /// literally — see [`strip_abstract_base_prefix`].
     fn filter_expression_for_resource(&self, expression: &str, resource_type: &str) -> String {
         // Split by | and filter to parts starting with our resource type
         let parts: Vec<String> = expression
             .split('|')
             .map(|p| p.trim())
-            .filter(|p| {
+            .filter_map(|p| {
+                // Abstract-base parts first: when `resource_type` is itself
+                // "Resource", the literal prefix match below would keep the
+                // unevaluable form.
+                if let Some(rest) = strip_abstract_base_prefix(p) {
+                    return Some(rest);
+                }
                 // Check if this part starts with our resource type
-                p.starts_with(resource_type)
+                let matches_type = p.starts_with(resource_type)
                     && (p.len() == resource_type.len()
-                        || p.chars().nth(resource_type.len()) == Some('.'))
+                        || p.chars().nth(resource_type.len()) == Some('.'));
+                matches_type.then(|| p.to_string())
             })
-            .map(|p| self.simplify_resolve_pattern(p))
+            .map(|p| self.simplify_resolve_pattern(&p))
             .collect();
 
         if parts.is_empty() {
@@ -396,6 +407,40 @@ impl SearchParameterExtractor {
         // Convert EvaluationResult back to JSON values
         evaluation_result_to_json_values(&result)
     }
+}
+
+/// Abstract base types every FHIR resource conforms to. A SearchParameter
+/// expression may be written against one of them instead of a concrete type.
+const ABSTRACT_BASE_TYPES: [&str; 2] = ["Resource", "DomainResource"];
+
+/// Strips a leading abstract base type from one union member of a FHIRPath
+/// expression, returning the resource-relative remainder.
+///
+/// The `Resource`-level SearchParameters carry expressions like
+/// `Resource.meta.source` (`_source`) and `Resource.id` (`_id`). Evaluated
+/// against a concrete resource these resolve to nothing — FHIRPath matches the
+/// leading identifier against the resource's own type, so `Patient.meta.source`
+/// and `meta.source` both work but `Resource.meta.source` yields an empty
+/// collection, and the parameter is never indexed (#523). Since these
+/// expressions apply to every resource, the prefix is dropped and the rest is
+/// evaluated relative to the resource.
+///
+/// Returns `None` for parts that are not abstract-base-prefixed, so concrete
+/// prefixes (`Patient.name`) keep their normal filtering behaviour.
+fn strip_abstract_base_prefix(part: &str) -> Option<String> {
+    for base in ABSTRACT_BASE_TYPES {
+        if let Some(rest) = part.strip_prefix(base) {
+            if let Some(path) = rest.strip_prefix('.') {
+                return Some(path.to_string());
+            }
+            // The bare type name selects the resource itself (composite base
+            // expressions use this form, e.g. `Observation`).
+            if rest.is_empty() {
+                return Some("$this".to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Rewrites FHIRPath choice-type casts to concrete element names.
@@ -905,6 +950,129 @@ mod tests {
         assert_eq!(careplan_filtered, "CarePlan.subject");
         let obs_filtered = extractor.filter_expression_for_resource(patient_expr, "Observation");
         assert_eq!(obs_filtered, "Observation.subject");
+    }
+
+    #[test]
+    fn test_filter_expression_strips_abstract_base_prefix() {
+        let extractor = create_test_extractor();
+
+        // `Resource.`-prefixed expressions apply to every resource; the prefix
+        // has to go, or FHIRPath resolves nothing against a concrete resource.
+        assert_eq!(
+            extractor.filter_expression_for_resource("Resource.meta.source", "Patient"),
+            "meta.source"
+        );
+        assert_eq!(
+            extractor.filter_expression_for_resource("Resource.id", "Observation"),
+            "id"
+        );
+        assert_eq!(
+            extractor.filter_expression_for_resource("DomainResource.meta.tag", "Patient"),
+            "meta.tag"
+        );
+
+        // Also when the resource type is itself the abstract base.
+        assert_eq!(
+            extractor.filter_expression_for_resource("Resource.meta.source", "Resource"),
+            "meta.source"
+        );
+
+        // A bare abstract base selects the resource itself. No shipped parameter
+        // uses that form, but a composite base expression could; assert the
+        // substitution and that the evaluator actually resolves it.
+        assert_eq!(
+            extractor.filter_expression_for_resource("Resource", "Patient"),
+            "$this"
+        );
+        let patient = json!({"resourceType": "Patient", "id": "p1"});
+        let this = extractor.evaluate_fhirpath(&patient, "$this").unwrap();
+        assert_eq!(this.len(), 1);
+        assert_eq!(this[0]["id"], "p1");
+
+        // A concrete type that merely starts with the same letters is untouched.
+        assert_eq!(
+            extractor.filter_expression_for_resource("ResourceThing.name", "ResourceThing"),
+            "ResourceThing.name"
+        );
+
+        // Union members are handled independently.
+        assert_eq!(
+            extractor.filter_expression_for_resource(
+                "Patient.name | Resource.meta.source | Observation.code",
+                "Patient"
+            ),
+            "Patient.name | meta.source"
+        );
+    }
+
+    /// Every `Resource`-level meta parameter must produce a positive index row —
+    /// the failure in #523 was silent, because an unindexed parameter simply
+    /// matches nothing (or, on backends that drop it, everything).
+    #[test]
+    fn test_extract_meta_level_parameters() {
+        let extractor = create_test_extractor();
+
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {
+                "source": "http://example.org/src",
+                "profile": ["http://example.org/StructureDefinition/my-patient"],
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "tag": [{"system": "http://example.org/tags", "code": "t1"}],
+                "security": [{"system": "http://example.org/labels", "code": "R"}]
+            }
+        });
+
+        let values = extractor.extract(&patient, "Patient").unwrap();
+        let find = |name: &str| -> Vec<&ExtractedValue> {
+            values.iter().filter(|v| v.param_name == name).collect()
+        };
+
+        let source = find("_source");
+        assert_eq!(source.len(), 1, "_source should be indexed exactly once");
+        match &source[0].value {
+            IndexValue::Uri(value) => assert_eq!(value, "http://example.org/src"),
+            other => panic!("_source should index as a URI, got {:?}", other),
+        }
+
+        match &find("_profile")[..] {
+            [v] => match &v.value {
+                IndexValue::Uri(value) => {
+                    assert_eq!(value, "http://example.org/StructureDefinition/my-patient")
+                }
+                other => panic!("_profile should index as a URI, got {:?}", other),
+            },
+            other => panic!("_profile should be indexed exactly once, got {:?}", other),
+        }
+
+        match &find("_tag")[..] {
+            [v] => match &v.value {
+                IndexValue::Token { system, code, .. } => {
+                    assert_eq!(system.as_deref(), Some("http://example.org/tags"));
+                    assert_eq!(code, "t1");
+                }
+                other => panic!("_tag should index as a token, got {:?}", other),
+            },
+            other => panic!("_tag should be indexed exactly once, got {:?}", other),
+        }
+
+        match &find("_security")[..] {
+            [v] => match &v.value {
+                IndexValue::Token { system, code, .. } => {
+                    assert_eq!(system.as_deref(), Some("http://example.org/labels"));
+                    assert_eq!(code, "R");
+                }
+                other => panic!("_security should index as a token, got {:?}", other),
+            },
+            other => panic!("_security should be indexed exactly once, got {:?}", other),
+        }
+
+        assert!(
+            !find("_lastUpdated").is_empty(),
+            "_lastUpdated should be indexed"
+        );
+        assert!(!find("_id").is_empty(), "_id should be indexed");
     }
 
     #[test]

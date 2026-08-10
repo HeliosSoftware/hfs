@@ -181,9 +181,12 @@ async fn seeding_with_missing_spec_bundle_seeds_only_fallbacks() {
         seed_spec_search_parameters(&backend, FhirVersion::R4, empty_dir.path(), "default")
             .await
             .expect("seed fallbacks");
-    // Only the handful of embedded fallbacks are seeded — no spec set.
+    // Only the handful of embedded fallbacks are seeded — no spec set. The
+    // upper bound tracks `get_minimal_fallback_parameters`: five meta-level
+    // params plus `_source` (added with #523), plus ViewDefinition/Library
+    // url+version.
     assert!(
-        outcome.created > 0 && outcome.created <= 9,
+        outcome.created > 0 && outcome.created <= 10,
         "expected only embedded fallbacks, got {outcome:?}"
     );
     assert_eq!(outcome.failed, 0);
