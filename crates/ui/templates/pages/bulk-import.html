@@ -28,6 +28,22 @@
           <span class="field__hint">{{ i18n.t("bulk-import-field-recipient-hint") }}</span>
         </label>
 
+        <label class="field">
+          <span class="field__label">{{ i18n.t("bulk-import-field-submitter-system") }}</span>
+          <input class="field__input" type="text" name="submitter_system" autocomplete="off"
+                 placeholder="urn:helios:hfs:bulk-submit">
+        </label>
+        <label class="field">
+          <span class="field__label">{{ i18n.t("bulk-import-field-submitter-value") }}</span>
+          <input class="field__input" type="text" name="submitter_value" autocomplete="off">
+          <span class="field__hint">{{ i18n.t("bulk-import-field-submitter-hint") }}</span>
+        </label>
+        <label class="field">
+          <span class="field__label">{{ i18n.t("bulk-import-field-submission-id") }}</span>
+          <input class="field__input" type="text" name="submission_id" autocomplete="off">
+          <span class="field__hint">{{ i18n.t("bulk-import-field-submission-id-hint") }}</span>
+        </label>
+
         <fieldset class="field">
           <legend class="field__label">{{ i18n.t("bulk-import-auth") }}</legend>
           <span class="field__hint">{{ i18n.t("bulk-import-auth-hint") }}</span>

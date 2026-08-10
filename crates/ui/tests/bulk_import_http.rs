@@ -770,3 +770,152 @@ async fn an_unreachable_recipient_fails_the_manifest_submit() {
     assert!(html.contains("Bulk Submit request failed!"));
     assert!(html.contains("Failed to submit manifest"));
 }
+
+/// A recipient implementing the full status flow: kick-off returns a
+/// Content-Location poll URL; the first poll answers 202 + X-Progress, the
+/// second 200 with a status manifest.
+async fn mock_recipient_with_status() -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+    use axum::extract::State as AxState;
+    #[derive(Clone)]
+    struct S {
+        kickoffs: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        polls: Arc<std::sync::Mutex<u32>>,
+        base: Arc<std::sync::Mutex<String>>,
+    }
+    let state = S {
+        kickoffs: Arc::new(std::sync::Mutex::new(Vec::new())),
+        polls: Arc::new(std::sync::Mutex::new(0)),
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let kickoffs = Arc::clone(&state.kickoffs);
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(
+                |AxState(s): AxState<S>, axum::Json(b): axum::Json<serde_json::Value>| async move {
+                    s.kickoffs.lock().unwrap().push(b);
+                    axum::Json(serde_json::json!({"resourceType": "OperationOutcome"}))
+                },
+            ),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let base = s.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/poll",
+            axum::routing::get(|AxState(s): AxState<S>| async move {
+                let mut polls = s.polls.lock().unwrap();
+                *polls += 1;
+                if *polls == 1 {
+                    (
+                        StatusCode::ACCEPTED,
+                        [
+                            ("x-progress", "processing 0% complete".to_string()),
+                            ("content-type", "text/plain".to_string()),
+                        ],
+                        String::new(),
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(serde_json::json!({
+                        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+                        "error": []
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), kickoffs)
+}
+
+use axum::response::IntoResponse;
+
+#[tokio::test]
+async fn status_polling_tracks_progress_and_lands_the_result() {
+    let settings = settings_store();
+    let (recipient_url, kickoffs) = mock_recipient_with_status().await;
+
+    let (_, detail_path, _) = post_form(
+        &settings,
+        "/ui/bulk-import",
+        &format!(
+            "name=Polling&recipient_base_url={}&auth=none&submitter_system=http%3A%2F%2Fexample.org%2Fsubmitters&submitter_value=acme&submission_id=pinned-42",
+            urlencode(&recipient_url)
+        ),
+    )
+    .await;
+    assert!(detail_path.ends_with("/pinned-42"), "{detail_path}");
+
+    post_form(
+        &settings,
+        &format!("{detail_path}/manifests"),
+        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
+    )
+    .await;
+    post_form(&settings, &format!("{detail_path}/submit-all"), "").await;
+
+    // The submit kick-off carried the pinned id and the custom submitter,
+    // and the status kick-off went out with the same identity.
+    let bodies = kickoffs.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "one manifest kick-off");
+    let submitter = bodies[0]["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "submitter")
+        .unwrap()["valueIdentifier"]
+        .clone();
+    assert_eq!(submitter["system"], "http://example.org/submitters");
+    assert_eq!(submitter["value"], "acme");
+
+    // First status fetch: one poll happens -> 202 progress recorded, and the
+    // fragment keeps polling.
+    let (status, html) = get(&settings, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("processing 0% complete"), "{html}");
+    assert!(html.contains("every 5s"), "keeps polling: {html}");
+
+    // Second fetch: the mock flips to 200 -> result summary, polling stops.
+    let (_, html) = get(&settings, &format!("{detail_path}/status")).await;
+    assert!(!html.contains("every 5s"), "polling stopped: {html}");
+    assert!(html.contains("Output files"), "{html}");
+
+    // The log recorded the whole journey and the detail shows the summary.
+    let (_, detail) = get(&settings, &detail_path).await;
+    assert!(detail.contains("Bulk status kick-off request"));
+    assert!(detail.contains("got 200 OK"));
+}
+
+#[tokio::test]
+async fn the_keys_endpoint_serves_the_configured_jwks() {
+    let settings = settings_store();
+
+    unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PUBLIC_JWK") };
+    let (status, _) = get(&settings, "/ui/bulk-import/keys").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    unsafe {
+        std::env::set_var(
+            "HFS_BULK_SUBMIT_PUBLIC_JWK",
+            r#"{"kty":"EC","crv":"P-384","x":"abc","y":"def","alg":"ES384","kid":"hfs-1"}"#,
+        )
+    };
+    let (status, body) = get(&settings, "/ui/bulk-import/keys").await;
+    assert_eq!(status, StatusCode::OK);
+    let jwks: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(jwks["keys"][0]["kid"], "hfs-1");
+    unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PUBLIC_JWK") };
+}
