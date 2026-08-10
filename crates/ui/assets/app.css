@@ -928,6 +928,41 @@ button.pill {
   margin-top: 4px;
 }
 
+/* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
+   same no-JS <details> mechanics, presented as a modal. While open, the
+   summary itself stretches over the viewport as the backdrop, so clicking
+   outside the panel closes the dialog without any script. */
+.addbox--modal[open] > summary {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgb(10 14 20 / 45%);
+  border-radius: 0;
+  cursor: default;
+  /* The summary's label is a text node, which `> *` cannot hide. */
+  color: transparent;
+}
+
+.addbox--modal[open] > summary > * {
+  visibility: hidden;
+}
+
+.addbox--modal[open] > .addbox__panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  right: auto;
+  z-index: 50;
+  width: min(460px, calc(100vw - 40px));
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  transform: translate(-50%, -50%);
+}
+
+.field__hint--error {
+  color: rgb(220 38 38);
+}
+
 .form-error {
   margin-bottom: 12px;
   padding: 10px 14px;
