@@ -655,7 +655,19 @@ pub fn mount_with_conformance_source(
             "/ui/bulk-import/test-auth",
             axum::routing::post(bulk_import::test_auth),
         )
+        .route(
+            "/ui/bulk-import/empty-manifest.json",
+            get(bulk_import::empty_manifest),
+        )
         .route("/ui/bulk-import/keys", get(bulk_import::keys))
+        .route(
+            "/ui/bulk-import/{id}/manifests/{mid}/replace",
+            axum::routing::post(bulk_import::replace_manifest),
+        )
+        .route(
+            "/ui/bulk-import/{id}/manifests/{mid}/abort",
+            axum::routing::post(bulk_import::abort_manifest),
+        )
         .route("/ui/bulk-import/{id}", get(bulk_import::detail))
         .route(
             "/ui/bulk-import/{id}/status",

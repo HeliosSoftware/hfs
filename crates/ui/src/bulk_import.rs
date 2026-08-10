@@ -512,6 +512,7 @@ fn kickoff_parameters(
     id: &str,
     status: &str,
     manifest: Option<&Manifest>,
+    replaces: Option<&str>,
 ) -> Value {
     let system = if submission.submitter_system.is_empty() {
         "urn:helios:hfs:bulk-submit"
@@ -545,6 +546,9 @@ fn kickoff_parameters(
         parameter.push(json!({ "name": "fhirBaseUrl", "valueUrl": base }));
         if !m.output_format.is_empty() {
             parameter.push(json!({ "name": "outputFormat", "valueString": m.output_format }));
+        }
+        if let Some(old) = replaces {
+            parameter.push(json!({ "name": "replacesManifestUrl", "valueUrl": old }));
         }
         for line in m.file_request_headers.lines() {
             if let Some((name, value)) = line.split_once(':') {
@@ -671,7 +675,7 @@ async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, Str
         submission.recipient_base_url.trim_end_matches('/')
     );
     // Only the identifying parameters ride the status kick-off.
-    let parameters = kickoff_parameters(submission, id, "", None);
+    let parameters = kickoff_parameters(submission, id, "", None, None);
     let identifying: Vec<Value> = parameters["parameter"]
         .as_array()
         .into_iter()
@@ -818,7 +822,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
         submission,
         format!("Submitting manifest \"{}\"...", m.manifest_url),
     );
-    let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m));
+    let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m), None);
     match post_kickoff(submission, &parameters).await {
         Ok((status, _)) if (200..300).contains(&status) => {
             push_log(
@@ -895,7 +899,7 @@ async fn set_status(
     let user_key = settings_user_key(principal.as_deref());
     if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
         push_log(&mut s, format!("Marking submission {status}..."));
-        let parameters = kickoff_parameters(&s, &id, status, None);
+        let parameters = kickoff_parameters(&s, &id, status, None, None);
         match post_kickoff(&s, &parameters).await {
             Ok((code, _)) if (200..300).contains(&code) => {
                 push_log(&mut s, format!("Recipient acknowledged ({code})."));
@@ -971,6 +975,134 @@ pub async fn keys() -> Response {
         Some(jwk) => axum::Json(json!({ "keys": [jwk] })).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// `GET /ui/bulk-import/empty-manifest.json` — an empty Bulk Export Manifest.
+/// Aborting a single manifest is spec'd as replacing it with an empty one;
+/// this is the empty one, hosted where the recipient can fetch it.
+pub async fn empty_manifest() -> Response {
+    axum::Json(json!({
+        "transactionTime": now_stamp(),
+        "request": "",
+        "requiresAccessToken": false,
+        "output": [],
+        "error": []
+    }))
+    .into_response()
+}
+
+/// `POST /ui/bulk-import/{id}/manifests/{mid}/replace` — submit a new
+/// manifest carrying `replacesManifestUrl` = the old one, then store the
+/// replacement under the same id.
+pub async fn replace_manifest(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    Path((id, mid)): Path<(String, String)>,
+    axum::Form(form): axum::Form<ManifestForm>,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
+        let old_url = s
+            .manifests
+            .get(&mid)
+            .and_then(|m| m["manifestUrl"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        if !old_url.is_empty() {
+            let replacement = Manifest {
+                manifest_url: form.manifest_url.trim().to_string(),
+                fhir_base_url: form.fhir_base_url.trim().to_string(),
+                output_format: form.output_format.trim().to_string(),
+                file_request_headers: form.file_request_headers.trim().to_string(),
+                last_submitted_at: String::new(),
+            };
+            push_log(
+                &mut s,
+                format!(
+                    "Replacing manifest \"{old_url}\" with \"{}\"...",
+                    replacement.manifest_url
+                ),
+            );
+            let parameters =
+                kickoff_parameters(&s, &id, "in-progress", Some(&replacement), Some(&old_url));
+            match post_kickoff(&s, &parameters).await {
+                Ok((code, _)) if (200..300).contains(&code) => {
+                    push_log(&mut s, format!("Replacement accepted ({code})."));
+                    let mut entry = serde_json::to_value(&replacement).unwrap_or(Value::Null);
+                    entry["lastSubmittedAt"] = json!(now_stamp());
+                    s.manifests.insert(mid, entry);
+                }
+                Ok((code, body)) => {
+                    push_log(
+                        &mut s,
+                        format!("Replacement rejected: {code} {}", body.replace('\n', " ")),
+                    );
+                }
+                Err(e) => {
+                    push_log(&mut s, format!("Replacement failed: {e}"));
+                }
+            }
+            let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+        }
+    }
+    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
+}
+
+/// `POST /ui/bulk-import/{id}/manifests/{mid}/abort` — abort one manifest by
+/// replacing it with the empty manifest this server hosts. The empty
+/// manifest's URL is derived from the request's Host header, since that is
+/// the address the recipient reached us... the address the *browser* reached
+/// us on, which is the best externally-visible base the UI can know.
+pub async fn abort_manifest(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: axum::http::HeaderMap,
+    Path((id, mid)): Path<(String, String)>,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
+        let old_url = s
+            .manifests
+            .get(&mid)
+            .and_then(|m| m["manifestUrl"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        if !old_url.is_empty() {
+            let host = headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("localhost:8080");
+            let empty = Manifest {
+                manifest_url: format!("http://{host}/ui/bulk-import/empty-manifest.json"),
+                fhir_base_url: format!("http://{host}"),
+                ..Default::default()
+            };
+            push_log(&mut s, format!("Aborting manifest \"{old_url}\"..."));
+            let parameters =
+                kickoff_parameters(&s, &id, "in-progress", Some(&empty), Some(&old_url));
+            match post_kickoff(&s, &parameters).await {
+                Ok((code, _)) if (200..300).contains(&code) => {
+                    push_log(&mut s, format!("Abort accepted ({code})."));
+                    if let Some(entry) = s.manifests.get_mut(&mid) {
+                        entry["abortedAt"] = json!(now_stamp());
+                    }
+                }
+                Ok((code, body)) => {
+                    push_log(
+                        &mut s,
+                        format!("Abort rejected: {code} {}", body.replace('\n', " ")),
+                    );
+                }
+                Err(e) => {
+                    push_log(&mut s, format!("Abort failed: {e}"));
+                }
+            }
+            let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+        }
+    }
+    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
 }
 
 #[derive(Deserialize)]

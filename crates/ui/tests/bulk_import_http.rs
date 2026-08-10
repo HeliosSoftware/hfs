@@ -919,3 +919,132 @@ async fn the_keys_endpoint_serves_the_configured_jwks() {
     assert_eq!(jwks["keys"][0]["kid"], "hfs-1");
     unsafe { std::env::remove_var("HFS_BULK_SUBMIT_PUBLIC_JWK") };
 }
+
+#[tokio::test]
+async fn the_empty_manifest_is_served() {
+    let settings = settings_store();
+    let (status, body) = get(&settings, "/ui/bulk-import/empty-manifest.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(m["output"].as_array().unwrap().len(), 0);
+    assert_eq!(m["requiresAccessToken"], false);
+}
+
+#[tokio::test]
+async fn replacing_a_manifest_sends_replaces_manifest_url() {
+    let settings = settings_store();
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let (_, detail_path, _) = post_form(
+        &settings,
+        "/ui/bulk-import",
+        &format!(
+            "name=R&recipient_base_url={}&auth=none",
+            urlencode(&recipient_url)
+        ),
+    )
+    .await;
+    post_form(
+        &settings,
+        &format!("{detail_path}/manifests"),
+        "manifest_url=http%3A%2F%2Fold.example%2Fm.json",
+    )
+    .await;
+    let (_, html) = get(&settings, &detail_path).await;
+    let marker = format!("{detail_path}/manifests/");
+    let mid = html
+        .split(&marker)
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap()
+        .to_string();
+
+    post_form(
+        &settings,
+        &format!("{detail_path}/manifests/{mid}/replace"),
+        "manifest_url=http%3A%2F%2Fnew.example%2Fm.json",
+    )
+    .await;
+
+    let bodies = received.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1);
+    let params = bodies[0]["parameter"].as_array().unwrap();
+    let get_p = |n: &str| {
+        params
+            .iter()
+            .find(|p| p["name"] == n)
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        get_p("manifestUrl")["valueUrl"],
+        "http://new.example/m.json"
+    );
+    assert_eq!(
+        get_p("replacesManifestUrl")["valueUrl"],
+        "http://old.example/m.json"
+    );
+
+    let (_, html) = get(&settings, &detail_path).await;
+    assert!(html.contains("http://new.example/m.json"));
+    assert!(html.contains("Replacement accepted (200)"));
+}
+
+#[tokio::test]
+async fn aborting_one_manifest_replaces_it_with_the_empty_manifest() {
+    let settings = settings_store();
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let (_, detail_path, _) = post_form(
+        &settings,
+        "/ui/bulk-import",
+        &format!(
+            "name=A&recipient_base_url={}&auth=none",
+            urlencode(&recipient_url)
+        ),
+    )
+    .await;
+    post_form(
+        &settings,
+        &format!("{detail_path}/manifests"),
+        "manifest_url=http%3A%2F%2Fold.example%2Fm.json",
+    )
+    .await;
+    let (_, html) = get(&settings, &detail_path).await;
+    let marker = format!("{detail_path}/manifests/");
+    let mid = html
+        .split(&marker)
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap()
+        .to_string();
+
+    post_form(
+        &settings,
+        &format!("{detail_path}/manifests/{mid}/abort"),
+        "",
+    )
+    .await;
+
+    let bodies = received.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1);
+    let params = bodies[0]["parameter"].as_array().unwrap();
+    let get_p = |n: &str| {
+        params
+            .iter()
+            .find(|p| p["name"] == n)
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert!(
+        get_p("manifestUrl")["valueUrl"]
+            .as_str()
+            .unwrap()
+            .ends_with("/ui/bulk-import/empty-manifest.json")
+    );
+    assert_eq!(
+        get_p("replacesManifestUrl")["valueUrl"],
+        "http://old.example/m.json"
+    );
+
+    let (_, html) = get(&settings, &detail_path).await;
+    assert!(html.contains("Abort accepted (200)"));
+}
