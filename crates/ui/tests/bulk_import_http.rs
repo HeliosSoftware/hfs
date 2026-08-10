@@ -249,9 +249,12 @@ async fn submitting_a_manifest_posts_the_kickoff_and_logs_the_outcome() {
         .unwrap()
         .iter()
         .find(|p| p["name"] == "fhirBaseUrl")
-        .and_then(|p| p["valueUrl"].as_str())
+        .and_then(|p| p["valueString"].as_str())
         .unwrap();
-    assert_eq!(fhir_base, "http://example.org/exports");
+    assert_eq!(
+        fhir_base, "http://example.org",
+        "origin, not parent directory"
+    );
 
     // The log recorded the attempt and the submission moved to In Progress.
     let (_, html) = get(&settings, &detail_path).await;
@@ -461,7 +464,7 @@ async fn manifest_options_ride_the_kickoff() {
     };
     // The explicit FHIR base wins over the manifest-derived fallback.
     assert_eq!(
-        value_of("fhirBaseUrl")["valueUrl"],
+        value_of("fhirBaseUrl")["valueString"],
         "http://base.example/fhir"
     );
     assert_eq!(

@@ -474,18 +474,18 @@ fn kickoff_parameters(id: &str, status: &str, manifest: Option<&Manifest>) -> Va
             "system": "http://hl7.org/fhir/event-status", "code": status } }),
     ];
     if let Some(m) = manifest {
-        parameter.push(json!({ "name": "manifestUrl", "valueUrl": m.manifest_url }));
+        // valueString, not valueUrl: HFS's consumer accepts either spelling,
+        // but the SMART reference recipient reads valueString only.
+        parameter.push(json!({ "name": "manifestUrl", "valueString": m.manifest_url }));
         // fhirBaseUrl is required alongside manifestUrl; an empty field falls
-        // back to the manifest's own base, per the design's hint text.
+        // back to the manifest URL's origin, matching the reference provider
+        // (`new URL(manifestUrl).origin`).
         let base = if m.fhir_base_url.is_empty() {
-            m.manifest_url
-                .rsplit_once('/')
-                .map(|(base, _)| base.to_string())
-                .unwrap_or_else(|| m.manifest_url.clone())
+            url_origin(&m.manifest_url)
         } else {
             m.fhir_base_url.clone()
         };
-        parameter.push(json!({ "name": "fhirBaseUrl", "valueUrl": base }));
+        parameter.push(json!({ "name": "fhirBaseUrl", "valueString": base }));
         if !m.output_format.is_empty() {
             parameter.push(json!({ "name": "outputFormat", "valueString": m.output_format }));
         }
@@ -499,6 +499,18 @@ fn kickoff_parameters(id: &str, status: &str, manifest: Option<&Manifest>) -> Va
         }
     }
     json!({ "resourceType": "Parameters", "parameter": parameter })
+}
+
+/// `scheme://authority` of a URL, dropping the path — the reference provider's
+/// fallback for an empty FHIR base.
+fn url_origin(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    match url[scheme_end + 3..].find('/') {
+        Some(path_start) => url[..scheme_end + 3 + path_start].to_string(),
+        None => url.to_string(),
+    }
 }
 
 /// Mints a SMART Backend Services access token (`client_credentials` +
@@ -531,7 +543,13 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
         "exp": Utc::now().timestamp() + 300,
         "jti": uuid::Uuid::new_v4().to_string(),
     });
-    let assertion = encode(&Header::new(algorithm), &claims, &key).map_err(|e| e.to_string())?;
+    let mut header = Header::new(algorithm);
+    // SMART Backend Services requires `kid` in the assertion header; it must
+    // match the key's id in the JWKS registered with the recipient.
+    if let Ok(kid) = std::env::var("HFS_BULK_SUBMIT_KID") {
+        header.kid = Some(kid);
+    }
+    let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
 
     let response = reqwest::Client::new()
         .post(token_url)
@@ -542,7 +560,9 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
                 "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
             ),
             ("client_assertion", &assertion),
-            ("scope", "system/*.rs"),
+            // The scope the recipient's $bulk-submit endpoints require —
+            // HFS's own consumer and the SMART reference both gate on it.
+            ("scope", "system/bulk-submit"),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .send()
