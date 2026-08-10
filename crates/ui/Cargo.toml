@@ -58,6 +58,11 @@ axum = "0.8"
 # series rendered when no dashboard provider is registered.
 chrono.workspace = true
 
+# Submission/manifest ids and the backend-services client assertion for the
+# Bulk Import workspace (#527).
+uuid = { version = "1", features = ["v4"] }
+jsonwebtoken = "9"
+
 # Compile-time, type-checked, auto-escaping templates (Jinja2-like).
 # Markup lives in templates/, never in Rust source.
 askama = "0.16"

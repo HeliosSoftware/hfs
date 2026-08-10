@@ -42,7 +42,9 @@ test("there is no expand/collapse toggle", async ({ page }) => {
 test("the Batch & Data section lists Import and Export", async ({ page, chrome }) => {
   await page.goto("/ui", { waitUntil: "networkidle" });
   await chrome.sidebar.hover();
-  await expect(chrome.soonItem("Import")).toBeVisible();
+  // Import went live with the Bulk Import workspace (#527); Export and
+  // SQL-on-FHIR are still placeholders.
+  await expect(chrome.navLink("/ui/bulk-import")).toBeVisible();
   await expect(chrome.soonItem("Export")).toBeVisible();
   await expect(chrome.soonItem("SQL-on-FHIR")).toBeVisible();
 });

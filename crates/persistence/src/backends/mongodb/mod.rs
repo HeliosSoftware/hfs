@@ -17,6 +17,7 @@
 
 pub(crate) mod backend;
 mod bulk_export;
+mod bulk_submit;
 pub(crate) mod schema;
 mod search_impl;
 mod storage;
