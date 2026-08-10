@@ -336,9 +336,79 @@ impl S3Keyspace {
         ])
     }
 
+    /// Key for one finalized status-manifest artifact row of a submission.
+    ///
+    /// The identity is `(file_type, resource_type, part_index, fencing_token)`,
+    /// matching the `bulk_submit_files` uniqueness the SQL backends carry. The
+    /// fencing token is in the key so a worker that re-writes an artifact after
+    /// reclaiming a manifest replaces its own row and never collides with the
+    /// row a *previous* lease holder left behind.
+    pub fn submit_file_key(
+        &self,
+        submitter: &str,
+        submission_id: &str,
+        file_type: &str,
+        resource_type: Option<&str>,
+        part_index: u32,
+        fencing_token: u64,
+    ) -> String {
+        self.join(&[
+            "bulk",
+            "submit",
+            submitter,
+            submission_id,
+            "files",
+            &format!(
+                "{}-{}-{}-{}.json",
+                sanitize(file_type),
+                sanitize(resource_type.unwrap_or("_")),
+                part_index,
+                fencing_token
+            ),
+        ])
+    }
+
+    /// Prefix covering the status-manifest artifact rows of a submission.
+    pub fn submit_files_prefix(&self, submitter: &str, submission_id: &str) -> String {
+        self.join(&["bulk", "submit", submitter, submission_id, "files/"])
+    }
+
     /// Prefix covering all objects belonging to a single submission.
     pub fn submit_prefix(&self, submitter: &str, submission_id: &str) -> String {
         self.join(&["bulk", "submit", submitter, submission_id, "/"])
+    }
+
+    /// Key for one entry in the cross-tenant `$bulk-submit` worker index.
+    ///
+    /// `namespace` is `queue` (manifests awaiting or under a worker lease),
+    /// `tokens` (poll token → submission), or `submissions` (TTL sweep records).
+    /// `object_id` **must** be an opaque, injective digest — see
+    /// [`submit_index_object_id`] — never a raw submitter, submission id, or
+    /// poll token: all three are client-supplied, and `sanitize` is lossy, so two
+    /// submissions could otherwise collide on one index entry and a poll token
+    /// could be made to resolve to another submitter's submission.
+    ///
+    /// Like [`user_settings_key`](Self::user_settings_key) this is built from the
+    /// *base* keyspace, not a tenant's: the worker claims manifests and resolves
+    /// poll tokens with no tenant in hand, so the index must span tenants. The
+    /// same structural argument applies — index objects sit under a `queue/`,
+    /// `tokens/`, or `submissions/` segment of `_system.bulk-submit/`, whereas
+    /// every tenant-scoped key lives under a `resources/`, `history/`, or `bulk/`
+    /// sub-prefix of its tenant segment, so even a tenant named
+    /// `_system.bulk-submit` cannot reach one. (`_system.bulk-submit` is also in
+    /// [`RESERVED_TENANT_SEGMENTS`](crate::tenant::RESERVED_TENANT_SEGMENTS), as
+    /// defence in depth rather than as the proof.)
+    pub fn submit_index_key(&self, namespace: &str, object_id: &str) -> String {
+        self.join(&[
+            "_system.bulk-submit",
+            namespace,
+            &format!("{object_id}.json"),
+        ])
+    }
+
+    /// Prefix covering one namespace of the cross-tenant worker index.
+    pub fn submit_index_prefix(&self, namespace: &str) -> String {
+        self.join(&["_system.bulk-submit", &format!("{namespace}/")])
     }
 
     /// Prefix covering all bulk-submit objects across all submissions.
@@ -489,6 +559,33 @@ fn submit_file_segment(file_url: Option<&str>) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Digests the identifying parts of a cross-tenant `$bulk-submit` index entry
+/// into one opaque, injective key segment.
+///
+/// Every input here is client-supplied — the submitter, the submission id, the
+/// manifest id, and a poll token — so this hashes rather than escapes, for the
+/// same reason `settings_object_id` does: a lossy mapping would let two
+/// submissions share one queue entry, or let a crafted poll token resolve to
+/// another submitter's submission.
+///
+/// Parts are joined with `\u{1}`, a byte no caller can supply through a URL path
+/// or JSON string identifier, so `["a", "b/c"]` and `["a/b", "c"]` digest
+/// differently.
+pub fn submit_index_object_id(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            hasher.update([0x01]);
+        }
+        hasher.update(part.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Escapes a tenant id into a single, injective S3 key segment.

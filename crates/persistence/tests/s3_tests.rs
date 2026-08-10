@@ -86,7 +86,9 @@ fn test_s3_capabilities_declared() {
     assert!(capabilities.contains(&BackendCapability::SystemHistory));
     assert!(capabilities.contains(&BackendCapability::BulkExport));
     assert!(capabilities.contains(&BackendCapability::BulkSubmitIngest));
-    assert!(!capabilities.contains(&BackendCapability::BulkSubmitRestWorker));
+    // A shared bucket has room for the cross-tenant claim queue and poll-token
+    // index the `$bulk-submit` worker needs.
+    assert!(capabilities.contains(&BackendCapability::BulkSubmitRestWorker));
     assert!(!capabilities.contains(&BackendCapability::BasicSearch));
     assert!(!capabilities.contains(&BackendCapability::Transactions));
 
