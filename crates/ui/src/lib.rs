@@ -36,6 +36,7 @@
 //! selector. Both selectors are plain links, so the dashboard stays navigable
 //! without JavaScript.
 
+mod bulk_import;
 mod compartments;
 mod conformance;
 mod editor;
@@ -646,6 +647,43 @@ pub fn mount_with_conformance_source(
         // docs/history-diff-rendering.md); the browser posts the two versions
         // it fetched from `_history`.
         .route("/ui/history/diff", axum::routing::post(history_diff))
+        .route(
+            "/ui/bulk-import",
+            get(bulk_import::page).post(bulk_import::create),
+        )
+        .route(
+            "/ui/bulk-import/test-auth",
+            axum::routing::post(bulk_import::test_auth),
+        )
+        .route("/ui/bulk-import/{id}", get(bulk_import::detail))
+        .route(
+            "/ui/bulk-import/{id}/delete",
+            axum::routing::post(bulk_import::delete),
+        )
+        .route(
+            "/ui/bulk-import/{id}/abort",
+            axum::routing::post(bulk_import::abort),
+        )
+        .route(
+            "/ui/bulk-import/{id}/complete",
+            axum::routing::post(bulk_import::complete),
+        )
+        .route(
+            "/ui/bulk-import/{id}/submit-all",
+            axum::routing::post(bulk_import::submit_all),
+        )
+        .route(
+            "/ui/bulk-import/{id}/manifests",
+            axum::routing::post(bulk_import::add_manifest),
+        )
+        .route(
+            "/ui/bulk-import/{id}/manifests/{mid}/delete",
+            axum::routing::post(bulk_import::delete_manifest),
+        )
+        .route(
+            "/ui/bulk-import/{id}/manifests/{mid}/submit",
+            axum::routing::post(bulk_import::submit_manifest),
+        )
         .route("/ui/tenants", get(tenants::page).post(tenants::create))
         .route("/ui/tenants/rows", get(tenants::rows))
         .route("/ui/tenants/{id}", axum::routing::delete(tenants::delete))

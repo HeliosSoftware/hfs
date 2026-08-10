@@ -3721,6 +3721,7 @@ dependencies = [
  "helios-persistence",
  "http-body-util",
  "json-patch",
+ "jsonwebtoken",
  "reqwest",
  "rust-embed",
  "serde",
@@ -3730,6 +3731,7 @@ dependencies = [
  "tower",
  "tracing",
  "unic-langid",
+ "uuid",
 ]
 
 [[package]]
