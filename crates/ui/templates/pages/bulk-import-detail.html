@@ -76,6 +76,10 @@
   </div>
 </section>
 
+<div hx-get="/ui/bulk-import/{{ id }}/status" hx-trigger="load" hx-swap="outerHTML">
+  <div id="bulk-status"></div>
+</div>
+
 <section class="card table-card">
   <div class="toolbar">
     <h2 class="toolbar__title">

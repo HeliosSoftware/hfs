@@ -45,6 +45,20 @@ pub struct Submission {
     /// `none` or `backend-services`.
     #[serde(default)]
     pub auth: String,
+    /// The submitter Identifier, coordinated out-of-band with the recipient.
+    /// Empty falls back to `urn:helios:hfs:bulk-submit` / the submission id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub submitter_system: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub submitter_value: String,
+    /// Recipient status-poll URL (the `$bulk-submit-status` kick-off's
+    /// Content-Location) plus the latest poll observations.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub poll_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub result: Value,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -284,6 +298,12 @@ pub struct CreateForm {
     pub client_id: String,
     #[serde(default)]
     pub token_url: String,
+    #[serde(default)]
+    pub submitter_system: String,
+    #[serde(default)]
+    pub submitter_value: String,
+    #[serde(default)]
+    pub submission_id: String,
 }
 
 /// `POST /ui/bulk-import` — create a submission, then land on its detail page.
@@ -294,7 +314,12 @@ pub async fn create(
     axum::Form(form): axum::Form<CreateForm>,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
-    let id = uuid::Uuid::new_v4().to_string();
+    // The user may pin the submission id (it must be unique per submitter,
+    // coordinated with the recipient); empty generates one.
+    let id = match form.submission_id.trim() {
+        "" => uuid::Uuid::new_v4().to_string(),
+        pinned => pinned.to_string(),
+    };
     let submission = Submission {
         name: form.name.trim().to_string(),
         recipient_base_url: form
@@ -307,6 +332,11 @@ pub async fn create(
         } else {
             "none".to_string()
         },
+        submitter_system: form.submitter_system.trim().to_string(),
+        submitter_value: form.submitter_value.trim().to_string(),
+        poll_url: String::new(),
+        progress: String::new(),
+        result: Value::Null,
         client_id: form.client_id.trim().to_string(),
         token_url: form.token_url.trim().to_string(),
         status: "not-started".to_string(),
@@ -382,7 +412,19 @@ pub async fn detail(
         status,
         i18n,
         active_page: "bulk-import",
-        submitter_display: format!("urn:helios:hfs:bulk-submit | {id}"),
+        submitter_display: {
+            let system = if s.submitter_system.is_empty() {
+                "urn:helios:hfs:bulk-submit"
+            } else {
+                &s.submitter_system
+            };
+            let value = if s.submitter_value.is_empty() {
+                &id
+            } else {
+                &s.submitter_value
+            };
+            format!("{system} | {value}")
+        },
         id,
         name: s.name,
         recipient: s.recipient_base_url,
@@ -465,10 +507,24 @@ pub async fn delete_manifest(
 
 /// Builds the `$bulk-submit` kick-off `Parameters`, mirroring the vocabulary
 /// HFS's own consumer parses (`helios-rest` `parse_submit_request`).
-fn kickoff_parameters(id: &str, status: &str, manifest: Option<&Manifest>) -> Value {
+fn kickoff_parameters(
+    submission: &Submission,
+    id: &str,
+    status: &str,
+    manifest: Option<&Manifest>,
+) -> Value {
+    let system = if submission.submitter_system.is_empty() {
+        "urn:helios:hfs:bulk-submit"
+    } else {
+        &submission.submitter_system
+    };
+    let value = if submission.submitter_value.is_empty() {
+        id
+    } else {
+        &submission.submitter_value
+    };
     let mut parameter = vec![
-        json!({ "name": "submitter", "valueIdentifier": {
-            "system": "urn:helios:hfs:bulk-submit", "value": id } }),
+        json!({ "name": "submitter", "valueIdentifier": { "system": system, "value": value } }),
         json!({ "name": "submissionId", "valueString": id }),
         json!({ "name": "submissionStatus", "valueCoding": {
             "system": "http://hl7.org/fhir/event-status", "code": status } }),
@@ -606,6 +662,110 @@ async fn post_kickoff(
     Ok((status, body))
 }
 
+/// Kicks off recipient-side status tracking: `POST $bulk-submit-status`
+/// (submitter + submissionId, `Prefer: respond-async`), returning the poll
+/// URL the recipient hands back in `Content-Location`.
+async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, String> {
+    let target = format!(
+        "{}/$bulk-submit-status",
+        submission.recipient_base_url.trim_end_matches('/')
+    );
+    // Only the identifying parameters ride the status kick-off.
+    let parameters = kickoff_parameters(submission, id, "", None);
+    let identifying: Vec<Value> = parameters["parameter"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["name"] == "submitter" || p["name"] == "submissionId")
+        .cloned()
+        .collect();
+    let body = json!({ "resourceType": "Parameters", "parameter": identifying });
+
+    let mut request = reqwest::Client::new()
+        .post(&target)
+        .header("Content-Type", "application/fhir+json")
+        .header("Prefer", "respond-async")
+        .timeout(std::time::Duration::from_secs(15))
+        .json(&body);
+    if submission.auth == "backend-services" {
+        let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    response
+        .headers()
+        .get("content-location")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .ok_or_else(|| format!("status kick-off answered {status} without Content-Location"))
+}
+
+/// One poll of the recipient's status URL: `202` records `X-Progress`, `200`
+/// records the status manifest as the submission's result, anything else is
+/// logged and polling stops (the poll URL is cleared).
+async fn poll_status(submission: &mut Submission) {
+    let poll_url = submission.poll_url.clone();
+    let response = match reqwest::Client::new()
+        .get(&poll_url)
+        .header("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            push_log(submission, format!("Status poll failed: {e}"));
+            return;
+        }
+    };
+    match response.status().as_u16() {
+        202 => {
+            let progress = response
+                .headers()
+                .get("x-progress")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("in progress")
+                .to_string();
+            if submission.progress != progress {
+                push_log(submission, format!("Status: {progress}"));
+            }
+            submission.progress = progress;
+        }
+        200 => {
+            let manifest: Value = response.json().await.unwrap_or(Value::Null);
+            let outputs = manifest["output"].as_array().map(Vec::len).unwrap_or(0);
+            let errors = manifest["error"].as_array().map(Vec::len).unwrap_or(0);
+            submission.result = json!({
+                "completedAt": now_stamp(),
+                "outputs": outputs,
+                "errors": errors,
+            });
+            submission.progress = String::new();
+            submission.poll_url = String::new();
+            push_log(
+                submission,
+                format!(
+                    "Status: got 200 OK — processing finished ({outputs} outputs, {errors} error files)."
+                ),
+            );
+        }
+        429 => {
+            push_log(
+                submission,
+                "Status poll throttled (429); backing off.".to_string(),
+            );
+        }
+        other => {
+            push_log(
+                submission,
+                format!("Status poll answered {other}; polling stopped."),
+            );
+            submission.poll_url = String::new();
+        }
+    }
+}
+
 /// `POST /ui/bulk-import/{id}/manifests/{mid}/submit`.
 pub async fn submit_manifest(
     State(state): State<WebState>,
@@ -658,7 +818,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
         submission,
         format!("Submitting manifest \"{}\"...", m.manifest_url),
     );
-    let parameters = kickoff_parameters(id, "in-progress", Some(&m));
+    let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m));
     match post_kickoff(submission, &parameters).await {
         Ok((status, _)) if (200..300).contains(&status) => {
             push_log(
@@ -668,6 +828,20 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
             submission.status = "in-progress".to_string();
             if let Some(entry) = submission.manifests.get_mut(mid) {
                 entry["lastSubmittedAt"] = json!(now_stamp());
+            }
+            // Start recipient-side status tracking on the first accepted
+            // manifest; later submissions reuse the same poll URL.
+            if submission.poll_url.is_empty() {
+                match status_kickoff(submission, id).await {
+                    Ok(poll_url) => {
+                        push_log(submission, "Bulk status kick-off request".to_string());
+                        submission.poll_url = poll_url;
+                        submission.result = Value::Null;
+                    }
+                    Err(e) => {
+                        push_log(submission, format!("Status kick-off failed: {e}"));
+                    }
+                }
             }
         }
         Ok((status, body)) => {
@@ -721,7 +895,7 @@ async fn set_status(
     let user_key = settings_user_key(principal.as_deref());
     if let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await {
         push_log(&mut s, format!("Marking submission {status}..."));
-        let parameters = kickoff_parameters(&id, status, None);
+        let parameters = kickoff_parameters(&s, &id, status, None);
         match post_kickoff(&s, &parameters).await {
             Ok((code, _)) if (200..300).contains(&code) => {
                 push_log(&mut s, format!("Recipient acknowledged ({code})."));
@@ -740,6 +914,63 @@ async fn set_status(
         let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
     }
     Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
+}
+
+/// The recipient-status card fragment, polled by htmx while a poll URL is
+/// live. Each fetch performs at most one poll against the recipient, so the
+/// cadence is the page's `every 5s` trigger — no background tasks.
+#[derive(Template)]
+#[template(path = "partials/bulk_import_status.html")]
+struct StatusCard {
+    i18n: I18n,
+    id: String,
+    polling: bool,
+    progress: String,
+    outputs: u64,
+    errors: u64,
+    completed_at: String,
+}
+
+/// `GET /ui/bulk-import/{id}/status` — one poll, then the refreshed card.
+pub async fn status_fragment(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    Path(id): Path<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let user_key = settings_user_key(principal.as_deref());
+    let Some(mut s) = load_one(&state, &user_key, &rt.id, &id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !s.poll_url.is_empty() {
+        poll_status(&mut s).await;
+        let _ = store_submission(&state, &user_key, &rt.id, &id, &s).await;
+    }
+    render(StatusCard {
+        i18n,
+        id,
+        polling: !s.poll_url.is_empty(),
+        progress: s.progress.clone(),
+        outputs: s.result["outputs"].as_u64().unwrap_or(0),
+        errors: s.result["errors"].as_u64().unwrap_or(0),
+        completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// `GET /ui/bulk-import/keys` — this data provider's JWKS, for registration
+/// with recipients. Serves the JWK configured in
+/// `HFS_BULK_SUBMIT_PUBLIC_JWK` verbatim (the public half of the signing
+/// key), mirroring the reference provider's /keys endpoint. 404 when unset.
+pub async fn keys() -> Response {
+    match std::env::var("HFS_BULK_SUBMIT_PUBLIC_JWK")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    {
+        Some(jwk) => axum::Json(json!({ "keys": [jwk] })).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[derive(Deserialize)]
