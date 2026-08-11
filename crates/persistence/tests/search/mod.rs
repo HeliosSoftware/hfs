@@ -45,6 +45,12 @@ pub mod date_tests;
 pub mod fts_purge_suite;
 pub mod fts_purge_tests;
 pub mod include_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL test binary via
+/// `#[path]` (issue #523). Complements the SQLite-only `meta_params_tests`
+/// from #474: those cover the query side on one engine, this covers indexing
+/// and querying on both.
+pub mod meta_params_suite;
+pub mod meta_params_suite_tests;
 pub mod meta_params_tests;
 pub mod modifier_tests;
 pub mod number_tests;

@@ -655,6 +655,25 @@ impl SearchParameterLoader {
             .with_source(SearchParameterSource::Embedded),
         );
 
+        // `_source` completes the meta-level set. Its absence here is what made
+        // #523 a `_source`-only defect: the other four were shadowed by these
+        // embedded definitions, whose expressions carry no `Resource.` prefix,
+        // so only `_source` kept the spec file's unevaluable
+        // `Resource.meta.source` and went unindexed. Without it, a registry
+        // built from the fallbacks alone also types `_source` by value-shape
+        // heuristic (String), which would look for the value in the wrong
+        // index column.
+        params.push(
+            SearchParameterDefinition::new(
+                "http://hl7.org/fhir/SearchParameter/Resource-source",
+                "_source",
+                SearchParamType::Uri,
+                "meta.source",
+            )
+            .with_base(vec!["Resource"])
+            .with_source(SearchParameterSource::Embedded),
+        );
+
         // SQL-on-FHIR canonical resources: `url` and `version` are not in the
         // base FHIR R4/R4B search-parameters bundle for ViewDefinition (which
         // first appears in R5+). The SoF `$viewdefinition-run`,
@@ -706,13 +725,33 @@ mod tests {
         let params = loader.load_embedded().unwrap();
 
         assert!(!params.is_empty());
-        assert!(params.len() <= 9, "Minimal fallback should have ~9 params");
+        assert!(
+            params.len() <= 10,
+            "Minimal fallback should have ~10 params"
+        );
 
-        let has_id = params.iter().any(|p| p.code == "_id");
-        assert!(has_id, "Should have _id parameter");
-
-        let has_last_updated = params.iter().any(|p| p.code == "_lastUpdated");
-        assert!(has_last_updated, "Should have _lastUpdated parameter");
+        // The whole `Resource`-level meta set, asserted by name. `_source` was
+        // the one omission, and because these definitions shadow the spec
+        // file's `Resource.`-prefixed expressions, its absence is what left
+        // `_source` unindexed (#523). Losing any of them again is the same bug.
+        for code in [
+            "_id",
+            "_lastUpdated",
+            "_tag",
+            "_profile",
+            "_security",
+            "_source",
+        ] {
+            let def = params
+                .iter()
+                .find(|p| p.code == code)
+                .unwrap_or_else(|| panic!("Should have {code} parameter"));
+            assert!(
+                !def.expression.starts_with("Resource."),
+                "{code} fallback expression must be resource-relative, got {:?}",
+                def.expression
+            );
+        }
 
         let has_patient_specific = params
             .iter()

@@ -41,6 +41,21 @@ mod tenant_id_fidelity_suite;
 #[path = "search/fts_purge_suite.rs"]
 mod fts_purge_suite;
 
+/// The backend-agnostic `Resource`-level meta-parameter scenarios (#523),
+/// shared verbatim with the SQLite suite that owns the file.
+///
+/// `_source` matched nothing on every index-backed backend until the extractor
+/// stopped evaluating the spec's `Resource.meta.source` verbatim. Running one
+/// scenario on both engines is what keeps that honest — the SQLite-only
+/// `meta_params_tests.rs` from #474 cannot see an extraction bug, because a
+/// dropped filter and a correct filter over a missing index row look identical
+/// from there.
+///
+/// Declared at the top level for the same `#[path]` resolution reason as
+/// `if_match_suite` above.
+#[path = "search/meta_params_suite.rs"]
+mod meta_params_suite;
+
 // ============================================================================
 // Backend Configuration Tests (no PostgreSQL instance required)
 // ============================================================================
@@ -2055,6 +2070,15 @@ mod postgres_integration {
             "Search by name should find the patient"
         );
         assert_eq!(result.resources.items[0].id(), "p1");
+    }
+
+    /// The backend-agnostic meta-parameter scenario (#523), shared verbatim
+    /// with the SQLite suite that owns the file.
+    #[tokio::test]
+    async fn postgres_integration_search_by_meta_parameters() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("meta-params");
+        crate::meta_params_suite::meta_parameters_match_only_their_carrier(&backend, &tenant).await;
     }
 
     #[tokio::test]

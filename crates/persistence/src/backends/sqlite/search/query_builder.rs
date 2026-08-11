@@ -545,7 +545,13 @@ impl QueryBuilder {
                 self.build_filter_condition(&param.values, param_offset)
             }
             _ => {
-                // Other special parameters - fall through to regular handling
+                // Not "fall through to regular handling", as this comment used
+                // to claim: the caller returns whatever this yields, so `None`
+                // *drops* the parameter and the search answers with every
+                // resource of the type. That is how `_tag`/`_profile`/
+                // `_security`/`_source` came to be unfiltered (#474). Anything
+                // that must actually filter belongs in an arm above, or in the
+                // caller's exclusion list so it never reaches here.
                 None
             }
         }
