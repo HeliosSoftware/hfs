@@ -587,3 +587,4 @@ bulk-import-result = Resultado
 bulk-import-result-finished = Procesamiento terminado a las
 bulk-import-result-outputs = Archivos de salida
 bulk-import-result-errors = Archivos de error
+bulk-import-abort-manifest = Abortar
