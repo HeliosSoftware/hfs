@@ -83,10 +83,10 @@
         <span class="icon">{% include "icons/import.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-import") }}</span>
       </a>
-      <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-export") }}">
+      <a class="nav-item" href="/ui/bulk-export"{% if active_page == "bulk-export" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-export") }}">
         <span class="icon">{% include "icons/export.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-export") }}</span>
-      </span>
+      </a>
       <span class="nav-item nav-item--soon" title="{{ i18n.t("nav-sql-on-fhir") }}">
         <span class="icon">{% include "icons/grid.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-sql-on-fhir") }}</span>

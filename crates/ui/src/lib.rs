@@ -36,6 +36,7 @@
 //! selector. Both selectors are plain links, so the dashboard stays navigable
 //! without JavaScript.
 
+mod bulk_export;
 mod bulk_import;
 mod compartments;
 mod conformance;
@@ -647,6 +648,20 @@ pub fn mount_with_conformance_source(
         // docs/history-diff-rendering.md); the browser posts the two versions
         // it fetched from `_history`.
         .route("/ui/history/diff", axum::routing::post(history_diff))
+        .route(
+            "/ui/bulk-export",
+            get(bulk_export::page).post(bulk_export::start),
+        )
+        .route("/ui/bulk-export/active", get(bulk_export::active))
+        .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
+        .route(
+            "/ui/bulk-export/active/{id}/cancel",
+            axum::routing::post(bulk_export::cancel),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/retry",
+            axum::routing::post(bulk_export::retry),
+        )
         .route(
             "/ui/bulk-import",
             get(bulk_import::page).post(bulk_import::create),
