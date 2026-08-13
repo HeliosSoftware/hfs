@@ -574,6 +574,41 @@ fn url_origin(url: &str) -> String {
     }
 }
 
+/// Computes the RFC 7638 thumbprint of a private key as the `kid`.
+/// Supports ES384 (P-384) and RS384. Returns `None` when the PEM cannot be parsed.
+fn signing_kid(pem: &str, alg: &str) -> Option<String> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::{Digest, Sha256};
+
+    match alg {
+        "RS384" => {
+            use rsa::pkcs8::DecodePrivateKey;
+            use rsa::traits::PublicKeyParts;
+
+            let private_key = rsa::RsaPrivateKey::from_pkcs8_pem(pem).ok()?;
+            let pub_key = private_key.to_public_key();
+            let n = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
+            let e = URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
+            let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
+            Some(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
+        }
+        _ => {
+            use p384::elliptic_curve::sec1::ToEncodedPoint;
+            use p384::pkcs8::DecodePrivateKey;
+
+            let secret = p384::SecretKey::from_pkcs8_pem(pem)
+                .or_else(|_| p384::SecretKey::from_sec1_pem(pem))
+                .ok()?;
+            let point = secret.public_key().to_encoded_point(false);
+            let x = URL_SAFE_NO_PAD.encode(point.x()?);
+            let y = URL_SAFE_NO_PAD.encode(point.y()?);
+            let canonical = format!(r#"{{"crv":"P-384","kty":"EC","x":"{x}","y":"{y}"}}"#);
+            Some(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
+        }
+    }
+}
+
 /// Mints a SMART Backend Services access token (`client_credentials` +
 /// `private_key_jwt`) against the submission's token endpoint. The signing key
 /// is the server-wide `HFS_BULK_SUBMIT_PRIVATE_KEY`, shared with the consumer
@@ -605,11 +640,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let mut header = Header::new(algorithm);
-    // SMART Backend Services requires `kid` in the assertion header; it must
-    // match the key's id in the JWKS registered with the recipient.
-    if let Ok(kid) = std::env::var("HFS_BULK_SUBMIT_KID") {
-        header.kid = Some(kid);
-    }
+    header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
 
     let response = reqwest::Client::new()
@@ -963,18 +994,14 @@ pub async fn status_fragment(
     })
 }
 
-/// `GET /ui/bulk-import/keys` — this data provider's JWKS, for registration
-/// with recipients. Serves the JWK configured in
-/// `HFS_BULK_SUBMIT_PUBLIC_JWK` verbatim (the public half of the signing
-/// key), mirroring the reference provider's /keys endpoint. 404 when unset.
+/// `GET /ui/bulk-import/keys` — redirects to the canonical JWKS endpoint.
+///
+/// The authoritative key set is now served at
+/// `/.well-known/bulk-submit-jwks.json` by the REST layer, which derives the
+/// JWK directly from `HFS_BULK_SUBMIT_PRIVATE_KEY` (#529). This redirect keeps
+/// any existing bookmarks working.
 pub async fn keys() -> Response {
-    match std::env::var("HFS_BULK_SUBMIT_PUBLIC_JWK")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-    {
-        Some(jwk) => axum::Json(json!({ "keys": [jwk] })).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+    axum::response::Redirect::permanent("/.well-known/bulk-submit-jwks.json").into_response()
 }
 
 /// `GET /ui/bulk-import/empty-manifest.json` — an empty Bulk Export Manifest.
