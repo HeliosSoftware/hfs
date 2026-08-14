@@ -2730,6 +2730,14 @@ impl PostgresBackend {
 
 #[async_trait]
 impl BundleProvider for PostgresBackend {
+    /// PostgreSQL provides real ACID transactions; `PostgresBackend` also
+    /// implements [`TransactionProvider`](crate::core::TransactionProvider),
+    /// and `process_transaction` runs inside one, so a failure unwinds
+    /// completely.
+    fn supports_atomic_transactions(&self) -> bool {
+        true
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,

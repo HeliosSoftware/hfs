@@ -409,6 +409,23 @@ pub enum TransactionError {
         /// Isolation level requested but not supported.
         level: String,
     },
+
+    /// The backend cannot provide the all-or-nothing semantics a FHIR
+    /// `transaction` bundle requires.
+    ///
+    /// Distinct from [`RolledBack`](Self::RolledBack): nothing was attempted,
+    /// so no partial state exists. Raised *before* the first write so the
+    /// refusal is total — the failure mode in #489 was the opposite, a
+    /// best-effort attempt that committed 466 of 473 entries and reported
+    /// failure. Callers should surface this as a client error suggesting a
+    /// `batch` bundle, which carries no atomicity requirement.
+    #[error(
+        "backend '{backend_name}' cannot guarantee transaction atomicity; use a batch bundle instead"
+    )]
+    AtomicityUnsupported {
+        /// Backend identifier (e.g., `s3`).
+        backend_name: String,
+    },
 }
 
 /// Errors originating from the database backend.
