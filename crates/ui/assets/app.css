@@ -4210,3 +4210,11 @@ body.has-nav-panel {
   gap: 8px;
   justify-content: flex-end;
 }
+
+/* The Recent/Saved dropdown scrolls instead of growing unbounded (#542):
+   the recents are capped at ten, but every saved query renders in the same
+   panel, and a long collection was pushing it off-screen. */
+.query-recent #recent-searches {
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+}

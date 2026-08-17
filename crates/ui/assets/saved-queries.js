@@ -121,9 +121,11 @@
   function recentSearches(doc) {
     var list = doc && doc.recentSearches;
     if (!Array.isArray(list)) return [];
-    return list.filter(function (item) {
-      return item && typeof item.query === "string";
-    });
+    return list
+      .filter(function (item) {
+        return item && typeof item.query === "string";
+      })
+      .slice(0, MAX_RECENT); // the cap is enforced on write; re-assert on read
   }
 
   /* Accepts "GET /Patient?name=smith", "/Patient?...", or an absolute URL;
