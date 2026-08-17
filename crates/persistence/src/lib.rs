@@ -6,7 +6,7 @@
 //!
 //! # Features
 //!
-//! - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
+//! - **Multiple Backends**: SQLite, PostgreSQL, MongoDB, Elasticsearch, S3
 //! - **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on
 //!   every backend; the S3 backend additionally offers a bucket-per-tenant mode
 //! - **Full FHIR Search**: All parameter types, modifiers, chaining, _include/_revinclude
@@ -25,11 +25,13 @@
 //! Available backend features:
 //! - `sqlite` (default) - SQLite with in-memory and file modes
 //! - `postgres` - PostgreSQL with JSONB storage
-//! - `cassandra` - Apache Cassandra via cdrs-tokio
 //! - `mongodb` - MongoDB document storage
-//! - `neo4j` - Neo4j graph database
 //! - `elasticsearch` - Elasticsearch for full-text search
 //! - `s3` - AWS S3 object storage
+//!
+//! The `cassandra` and `neo4j` features are placeholders: they pull in driver
+//! dependencies but no backend is implemented behind them. See [`backends`] for
+//! details.
 //!
 //! FHIR version features:
 //! - `R4`, `R4B`, `R5`, `R6`
