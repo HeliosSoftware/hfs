@@ -4173,3 +4173,40 @@ body.has-nav-panel {
   color: var(--muted);
   font-size: 9.5px;
 }
+
+/* The JSON-pane header (#548): fold controls hug the heading on the left,
+   Edit raw stays alone at the end. */
+.card-head__tools--start {
+  margin-right: auto;
+}
+
+/* Addbox close affordances (#545). */
+.addbox__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.addbox__x {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.addbox__x:hover,
+.addbox__x:focus-visible {
+  color: var(--text-strong);
+  background: var(--accent-soft);
+}
+
+.addbox__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}

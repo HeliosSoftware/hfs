@@ -591,3 +591,5 @@ bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
 bulk-import-abort-manifest = Abort
+ui-cancel = Cancel
+ui-close = Close

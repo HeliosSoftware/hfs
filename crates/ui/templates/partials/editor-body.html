@@ -30,9 +30,11 @@
   <section class="card editor-json">
     <div class="card-head">
       <h3><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("editor-view-json") }}</h3>
-      <div class="card-head__tools">
+      <div class="card-head__tools card-head__tools--start">
         <button type="button" class="editor-json__act" data-json-fold="all" title="{{ i18n.t("editor-collapse-all") }}">{{ i18n.t("editor-collapse-all") }}</button>
         <button type="button" class="editor-json__act" data-json-fold="none" title="{{ i18n.t("editor-expand-all") }}">{{ i18n.t("editor-expand-all") }}</button>
+      </div>
+      <div class="card-head__tools">
         <button type="button" class="editor-json__act" id="editor-json-edit">{{ i18n.t("editor-edit-raw") }}</button>
       </div>
     </div>
