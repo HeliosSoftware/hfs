@@ -858,3 +858,46 @@ async fn batch_page_serves_the_workspace_shell() {
     assert!(html.contains("data-msg-semantics-transaction"));
     assert!(html.contains(r#"src="/ui/assets/batch.js""#));
 }
+
+/* #546: creating a resource with required elements must not dump duplicated,
+ * unanchored error lines. */
+
+#[tokio::test]
+async fn editor_orphan_issues_are_deduped_and_titled() {
+    // A brand-new Claim: several required elements, none present, no rows.
+    let html = edit("doc=%7B%22resourceType%22%3A%22Claim%22%7D&op=").await;
+
+    // Styled panel with a heading, not bare lines.
+    assert!(html.contains("editor__orphans-title"), "titled panel");
+    // The old "priority: priority is required" duplication is gone.
+    assert!(
+        !html.contains("priority: priority"),
+        "no duplicated element name"
+    );
+    assert!(html.contains("priority"), "the issue itself still shows");
+}
+
+/* #549: temporal primitives get format assistance. */
+
+#[tokio::test]
+async fn editor_temporal_primitives_carry_format_assistance() {
+    // A Patient with a birthDate (type `date`) present renders its row.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22birthDate%22%3A%222024-01-01%22%7D&op=",
+    )
+    .await;
+    assert!(
+        html.contains(r#"placeholder="2024-05-17""#),
+        "date placeholder"
+    );
+    assert!(
+        html.contains(r#"pattern="\d{4}(-\d{2}(-\d{2})?)?""#),
+        "date pattern"
+    );
+    // Non-temporal primitives stay bare.
+    let html = edit(
+        "doc=%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22X%22%7D%5D%7D&op=",
+    )
+    .await;
+    assert!(!html.contains(r#"placeholder="14:30:00""#));
+}

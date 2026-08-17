@@ -4218,3 +4218,33 @@ body.has-nav-panel {
   max-height: min(420px, 60vh);
   overflow-y: auto;
 }
+
+/* Issues that have no field yet (#546): a bounded, styled panel instead of a
+   wall of bare red lines under the tree. */
+.editor__orphans {
+  margin-top: 14px;
+  padding: 12px 16px;
+  border-left: 3px solid #C0362C;
+  border-radius: 0 10px 10px 0;
+  background: rgb(192 54 44 / 8%);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.editor__orphans-title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.editor__orphans .editor__orphan {
+  margin: 2px 0;
+  font-size: 13px;
+}
+
+/* Temporal-primitive assistance (#549): the pattern attribute drives live
+   native validity — a malformed date shows before any server round trip. */
+.editor-row__input:invalid {
+  border-color: #C0362C;
+  box-shadow: 0 0 0 3px rgb(192 54 44 / 12%);
+}

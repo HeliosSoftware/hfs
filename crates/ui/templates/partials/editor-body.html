@@ -135,6 +135,23 @@
           {% if row.is_primitive %}
           <input class="editor-row__input" type="text" value="{{ row.value }}"
                  data-set="{{ row.path }}"
+                 {% if row.type_label == "date" %}
+                 placeholder="2024-05-17" inputmode="numeric"
+                 pattern="\d{4}(-\d{2}(-\d{2})?)?"
+                 title="{{ i18n.t("editor-hint-date") }}"
+                 {% else if row.type_label == "dateTime" %}
+                 placeholder="2024-05-17T14:30:00+02:00"
+                 pattern="\d{4}(-\d{2}(-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+\-]\d{2}:\d{2}))?)?)?"
+                 title="{{ i18n.t("editor-hint-datetime") }}"
+                 {% else if row.type_label == "time" %}
+                 placeholder="14:30:00" inputmode="numeric"
+                 pattern="\d{2}:\d{2}:\d{2}(\.\d+)?"
+                 title="{{ i18n.t("editor-hint-time") }}"
+                 {% else if row.type_label == "instant" %}
+                 placeholder="2024-05-17T14:30:00.000Z"
+                 pattern="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+\-]\d{2}:\d{2})"
+                 title="{{ i18n.t("editor-hint-instant") }}"
+                 {% endif %}
                  {% if !row.binding_url.is_empty() %}data-vs-url="{{ row.binding_url }}"{% endif %}
                  {% if let Some(vs) = row.binding %}list="vs-{{ vs }}" placeholder="{{ vs }}"{% endif %}>
           {% endif %}
@@ -213,9 +230,14 @@
       {% endfor %}
     </div>
 
-    {% for message in orphan_errors %}
-    <p class="editor__orphan">{{ message }}</p>
-    {% endfor %}
+    {% if !orphan_errors.is_empty() %}
+    <div class="editor__orphans" role="alert">
+      <div class="editor__orphans-title">{{ i18n.t("editor-orphans-title") }}</div>
+      {% for message in orphan_errors %}
+      <p class="editor__orphan">{{ message }}</p>
+      {% endfor %}
+    </div>
+    {% endif %}
   </section>
 </div>
 

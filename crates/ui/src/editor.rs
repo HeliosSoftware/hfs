@@ -346,15 +346,26 @@ fn build_body(
     // Anything that did not land on a row still has to be seen.
     let claimed: std::collections::HashSet<&str> =
         rows.iter().map(|row| row.path.as_str()).collect();
-    let orphan_errors = by_path
+    let mut orphan_errors: Vec<String> = by_path
         .iter()
         .filter(|(path, _)| !claimed.contains(path.as_str()) && !path.is_empty())
         .flat_map(|(path, messages)| {
-            messages
-                .iter()
-                .map(move |message| format!("{path}: {message}"))
+            messages.iter().map(move |message| {
+                // The validator's message usually opens with the element name
+                // ("priority is required"); prefixing the path then reads
+                // "priority: priority is required". Only prefix when the
+                // message doesn't already carry the leaf name.
+                let leaf = path.rsplit('.').next().unwrap_or(path);
+                if message.starts_with(leaf) {
+                    message.clone()
+                } else {
+                    format!("{path}: {message}")
+                }
+            })
         })
         .collect();
+    orphan_errors.sort();
+    orphan_errors.dedup();
 
     EditorBody {
         i18n,
